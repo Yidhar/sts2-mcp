@@ -186,6 +186,44 @@ internal static class BridgeServer
                 return;
             }
 
+            if (method.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/env/spec", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http GET /env/spec authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http GET /env/spec authorized");
+                var payload = BridgeGameApi.GetEnvSpecResponse();
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http GET /env/spec ok");
+                return;
+            }
+
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/env/reset", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http POST /env/reset authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http POST /env/reset authorized");
+                var request = await ReadJsonAsync<BridgeEnvResetRequest>(context.Request, cancellationToken);
+                var payload = await BridgeGameApi.ResetEnvResponseAsync(request, cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http POST /env/reset ok");
+                return;
+            }
+
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/env/step", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http POST /env/step authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http POST /env/step authorized");
+                var request = await ReadJsonAsync<BridgeEnvStepRequest>(context.Request, cancellationToken);
+                var payload = await BridgeGameApi.StepEnvResponseAsync(request, cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http POST /env/step ok");
+                return;
+            }
+
             var notFound = new
             {
                 ok = false,

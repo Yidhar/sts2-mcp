@@ -23,6 +23,20 @@ scratch/
 新建游戏项目/
 release-assets/
 
+# Python virtual environments
+**/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# RL training artifacts
+packages/rl-agent/runs/
+packages/rl-agent/.text_cache/
+packages/rl-agent/checkpoints/
+packages/rl-agent/logs/
+packages/rl-agent/wandb/
+
 # Docs are intentionally excluded from the public code repo
 docs/
 schemas/
@@ -30,3 +44,10 @@ packages/**/README.md
 mods/**/README.md
 !/README.md
 !/README.zh-CN.md
+packages/rl-agent/checkpoints_v2/
+packages/rl-agent/.text_cache_download_test
+packages/rl-agent/.text_cache_offline_check
+packages/rl-agent/.text_cache_strict_fail
+packages/rl-agent/.tmp_text_cache
+packages/rl-agent/runs_v2
+packages/mcp-server/rl-smoke-logs

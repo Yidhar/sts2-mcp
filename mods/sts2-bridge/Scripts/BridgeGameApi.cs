@@ -30,6 +30,7 @@ using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine;
 using MegaCrit.Sts2.Core.Multiplayer.Game.PeerInput;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Nodes.Cards;
 using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
 using MegaCrit.Sts2.Core.Nodes.Combat;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
@@ -41,6 +42,7 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
 using MegaCrit.Sts2.Core.Nodes.Screens;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
+using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
@@ -90,7 +92,7 @@ internal sealed class BridgeRequestException : Exception
     public object? Details { get; }
 }
 
-internal static class BridgeGameApi
+internal static partial class BridgeGameApi
 {
     private const int NextFrontierWaitTimeoutMs = 5000;
     private const int PassiveFrontierWaitTimeoutMs = 1000;
@@ -652,10 +654,14 @@ internal static class BridgeGameApi
         IReadOnlyList<NCardHolder> cardRewardOptions,
         Node? cardRewardSkipButton)
     {
+        var visible = IsCardRewardSelectionVisible(cardRewardScreen, cardRewardOptions);
+        var ready = IsCardRewardSelectionReady(cardRewardScreen);
         return new
         {
-            visible = cardRewardScreen is not null && IsNodeVisible(cardRewardScreen),
-            skip_visible = cardRewardSkipButton is not null &&
+            visible,
+            ready,
+            skip_visible = ready &&
+                           cardRewardSkipButton is not null &&
                            IsNodeVisible(cardRewardSkipButton) &&
                            IsButtonEnabled(cardRewardSkipButton),
             option_count = cardRewardOptions.Count
@@ -894,10 +900,13 @@ internal static class BridgeGameApi
             GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewConfirmButton") as NConfirmButton);
         var deckUpgradeCloseButton = GetHiddenFieldValue(deckUpgradeScreen, "_closeButton") as NBackButton;
         var cardSelectionConfirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
-        var cardSelectionCancelButton = GetHiddenFieldValue(cardSelectionScreen, "_previewCancelButton") as Node;
+        var cardSelectionCancelButton = ResolveCardSelectionCancelButton(cardSelectionScreen);
         var cardSelectionCloseButton = GetHiddenFieldValue(cardSelectionScreen, "_closeButton") as Node;
         var cardSelectionSkipButton = GetHiddenFieldValue(cardSelectionScreen, "_skipButton") as Node;
         var eventRoom = FindFirstVisibleDescendant<NEventRoom>(game);
+        var gameOverScreen = FindFirstVisibleDescendant<NGameOverScreen>(game);
+        var gameOverContinueButton = GetHiddenFieldValue(gameOverScreen, "_continueButton") as NGameOverContinueButton;
+        var gameOverMainMenuButton = GetHiddenFieldValue(gameOverScreen, "_mainMenuButton") as NReturnToMainMenuButton;
         var crystalSphereScreen = FindFirstVisibleDescendant<NCrystalSphereScreen>(game);
         var crystalSphereCells = crystalSphereScreen is null
             ? new List<NCrystalSphereCell>()
@@ -972,6 +981,7 @@ internal static class BridgeGameApi
                 deckUpgradeScreen,
                 crystalSphereScreen,
                 eventOptionButtons,
+                gameOverScreen,
                 mainMenuRoot,
                 runModeSubmenu,
                 abandonRunConfirmPopup),
@@ -1006,6 +1016,9 @@ internal static class BridgeGameApi
             CharacterButtons = characterButtons,
             EventOptionButtons = eventOptionButtons,
             EventRoom = eventRoom,
+            GameOverScreen = gameOverScreen,
+            GameOverContinueButton = gameOverContinueButton,
+            GameOverMainMenuButton = gameOverMainMenuButton,
             CrystalSphereScreen = crystalSphereScreen,
             CrystalSphereCells = crystalSphereCells,
             CrystalSphereSmallDivinationButton = crystalSphereSmallDivinationButton,
@@ -1191,6 +1204,7 @@ internal static class BridgeGameApi
         AddAutomationActions(actions, context);
         AddRunModeActions(actions, context);
         AddMainMenuActions(actions, context);
+        AddGameOverActions(actions, context);
         AddDeckUpgradeActions(actions, context);
         AddCardSelectionActions(actions, context);
         AddRestSiteActions(actions, context);
@@ -1315,34 +1329,38 @@ internal static class BridgeGameApi
             });
         }
 
-        for (var index = 0; index < context.RewardButtons.Count; index++)
+        if (!IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions))
         {
-            var button = context.RewardButtons[index];
-            if (!IsNodeVisible(button))
+            for (var index = 0; index < context.RewardButtons.Count; index++)
             {
-                continue;
-            }
-
-            var rewardDescription = DescribeReward(button.Reward);
-            var actionId = $"reward:{index}";
-
-            actions.Add(new BridgeResolvedAction
-            {
-                ActionId = actionId,
-                Payload = new
+                var button = context.RewardButtons[index];
+                if (!IsNodeVisible(button))
                 {
-                    action_id = actionId,
-                    kind = "reward",
-                    index,
-                    label = $"Claim reward {index}: {rewardDescription}",
-                    reward = BuildRewardPayload(button.Reward),
-                    screen = context.Screen
-                },
-                Execute = () => InvokeButtonAction(button, "OnRelease")
-            });
+                    continue;
+                }
+
+                var rewardDescription = DescribeReward(button.Reward);
+                var actionId = $"reward:{index}";
+
+                actions.Add(new BridgeResolvedAction
+                {
+                    ActionId = actionId,
+                    Payload = new
+                    {
+                        action_id = actionId,
+                        kind = "reward",
+                        index,
+                        label = $"Claim reward {index}: {rewardDescription}",
+                        reward = BuildRewardPayload(button.Reward),
+                        screen = context.Screen
+                    },
+                    Execute = () => InvokeButtonAction(button, "OnRelease")
+                });
+            }
         }
 
-        if (context.CardRewardScreen is not null)
+        if (context.CardRewardScreen is not null &&
+            IsCardRewardSelectionReady(context.CardRewardScreen))
         {
             for (var index = 0; index < context.CardRewardOptions.Count; index++)
             {
@@ -1649,6 +1667,8 @@ internal static class BridgeGameApi
                     action_id = actionId,
                     kind = "deck_upgrade",
                     upgrade_action = "select_card",
+                    selection_semantics = "upgrade",
+                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
                     index,
                     label = $"Select upgrade card {index}: {cardHolder.CardModel.Title}",
                     card = BuildCardPayload(cardHolder.CardModel),
@@ -1670,6 +1690,8 @@ internal static class BridgeGameApi
                     action_id = "deck_upgrade:confirm",
                     kind = "deck_upgrade",
                     upgrade_action = "confirm",
+                    selection_semantics = "upgrade",
+                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
                     label = "Confirm upgrade selection",
                     screen = context.Screen
                 },
@@ -1692,6 +1714,8 @@ internal static class BridgeGameApi
                     action_id = "deck_upgrade:cancel",
                     kind = "deck_upgrade",
                     upgrade_action = "cancel",
+                    selection_semantics = "upgrade",
+                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
                     label = "Cancel upgrade selection",
                     screen = context.Screen
                 },
@@ -1714,6 +1738,8 @@ internal static class BridgeGameApi
                     action_id = "deck_upgrade:close",
                     kind = "deck_upgrade",
                     upgrade_action = "close",
+                    selection_semantics = "upgrade",
+                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
                     label = "Close upgrade selection",
                     screen = context.Screen
                 },
@@ -1732,36 +1758,79 @@ internal static class BridgeGameApi
             return;
         }
 
-        for (var index = 0; index < context.CardSelectionOptions.Count; index++)
-        {
-            var cardHolder = context.CardSelectionOptions[index];
-            if (!IsNodeVisible(cardHolder))
-            {
-                continue;
-            }
+        var selectionPrompt = TryGetCardSelectionPrompt(context.CardSelectionScreen);
+        var selectionTexts = context.CardSelectionScreen is not null && IsNodeVisible(context.CardSelectionScreen)
+            ? CollectVisibleText(context.CardSelectionScreen, 8).ToArray()
+            : Array.Empty<string>();
+        var selectionSemantics = ResolveCardSelectionSemantics(context.CardSelectionScreen, selectionPrompt, selectionTexts);
 
-            var optionIndex = GetCardSelectionOptionIndex(context.CardSelectionScreen, cardHolder, index);
-            var selectionId = GetCardSelectionOptionSelectionId(context.CardSelectionScreen, cardHolder, optionIndex);
-            var actionId = selectionId is not null
-                ? $"card_selection:select:{selectionId}"
-                : $"card_selection:select:{optionIndex}";
-            actions.Add(new BridgeResolvedAction
+        if (context.CardSelectionScreen is NChooseABundleSelectionScreen)
+        {
+            var bundleOptions = GetCardSelectionBundles(context.CardSelectionScreen);
+            for (var index = 0; index < bundleOptions.Count; index++)
             {
-                ActionId = actionId,
-                Payload = new
+                var bundle = bundleOptions[index];
+                if (!IsNodeVisible(bundle))
                 {
-                    action_id = actionId,
-                    kind = "card_selection",
-                    selection_action = "select",
-                    index = optionIndex,
-                    selection_id = selectionId,
-                    label = $"Select card {optionIndex}: {cardHolder.CardModel?.Title ?? "<missing>"}",
-                    card = BuildCardPayload(cardHolder.CardModel),
-                    screen = context.Screen,
-                    screen_type = context.CardSelectionScreen?.GetType().Name
-                },
-                Execute = () => InvokeCardSelectionOptionAction(context.CardSelectionScreen, cardHolder)
-            });
+                    continue;
+                }
+
+                var actionId = $"card_selection:select:{index}";
+                actions.Add(new BridgeResolvedAction
+                {
+                    ActionId = actionId,
+                    Payload = new
+                    {
+                        action_id = actionId,
+                        kind = "card_selection",
+                        selection_action = "select",
+                        selection_semantics = selectionSemantics,
+                        selection_prompt = selectionPrompt,
+                        index,
+                        label = $"Select bundle {index}",
+                        bundle = bundle.Bundle.Select(card => BuildCardPayload(card)).ToArray(),
+                        screen = context.Screen,
+                        screen_type = context.CardSelectionScreen.GetType().Name
+                    },
+                    Execute = () => InvokeCardSelectionBundleAction(context.CardSelectionScreen, bundle)
+                });
+            }
+        }
+        else
+        {
+            for (var index = 0; index < context.CardSelectionOptions.Count; index++)
+            {
+                var cardHolder = context.CardSelectionOptions[index];
+                if (!IsNodeVisible(cardHolder))
+                {
+                    continue;
+                }
+
+                var optionIndex = GetCardSelectionOptionIndex(context.CardSelectionScreen, cardHolder, index);
+                var selectionId = GetCardSelectionOptionSelectionId(context.CardSelectionScreen, cardHolder, optionIndex);
+                var actionId = selectionId is not null
+                    ? $"card_selection:select:{selectionId}"
+                    : $"card_selection:select:{optionIndex}";
+                actions.Add(new BridgeResolvedAction
+                {
+                    ActionId = actionId,
+                    Payload = new
+                    {
+                        action_id = actionId,
+                        kind = "card_selection",
+                        selection_action = "select",
+                        selection_semantics = selectionSemantics,
+                        selection_prompt = selectionPrompt,
+                        index = optionIndex,
+                        selection_id = selectionId,
+                        label = $"Select card {optionIndex}: {cardHolder.CardModel?.Title ?? "<missing>"}",
+                        card = BuildCardPayload(cardHolder.CardModel),
+                        screen = context.Screen,
+                        screen_type = context.CardSelectionScreen?.GetType().Name
+                    },
+                    Execute = () => InvokeCardSelectionOptionAction(context.CardSelectionScreen, cardHolder)
+                });
+            }
         }
 
         if (context.CardSelectionConfirmButton is not null &&
@@ -1776,6 +1845,8 @@ internal static class BridgeGameApi
                     action_id = "card_selection:confirm",
                     kind = "card_selection",
                     selection_action = "confirm",
+                    selection_semantics = selectionSemantics,
+                    selection_prompt = selectionPrompt,
                     label = "Confirm selected cards",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -1798,6 +1869,8 @@ internal static class BridgeGameApi
                     action_id = "card_selection:cancel",
                     kind = "card_selection",
                     selection_action = "cancel",
+                    selection_semantics = selectionSemantics,
+                    selection_prompt = selectionPrompt,
                     label = "Cancel card selection preview",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -1820,6 +1893,8 @@ internal static class BridgeGameApi
                     action_id = "card_selection:close",
                     kind = "card_selection",
                     selection_action = "close",
+                    selection_semantics = selectionSemantics,
+                    selection_prompt = selectionPrompt,
                     label = "Close card selection",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -1842,6 +1917,8 @@ internal static class BridgeGameApi
                     action_id = "card_selection:skip",
                     kind = "card_selection",
                     selection_action = "skip",
+                    selection_semantics = selectionSemantics,
+                    selection_prompt = selectionPrompt,
                     label = "Skip card selection",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -2099,6 +2176,52 @@ internal static class BridgeGameApi
                     screen = context.Screen
                 },
                 Execute = () => InvokeMenuButtonAction(button)
+            });
+        }
+    }
+
+    private static void AddGameOverActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
+    {
+        if (context.GameOverScreen is null || !IsNodeVisible(context.GameOverScreen))
+        {
+            return;
+        }
+
+        if (context.GameOverContinueButton is not null && IsNodeVisible(context.GameOverContinueButton))
+        {
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = "game_over:continue",
+                Payload = new
+                {
+                    action_id = "game_over:continue",
+                    kind = "game_over",
+                    game_over_action = "continue",
+                    label = "Continue from game-over summary",
+                    screen = context.Screen
+                },
+                Execute = () => InvokeGameOverContinueAction(
+                    context.GameOverScreen,
+                    context.GameOverContinueButton)
+            });
+        }
+
+        if (context.GameOverMainMenuButton is not null && IsNodeVisible(context.GameOverMainMenuButton))
+        {
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = "game_over:return_to_main_menu",
+                Payload = new
+                {
+                    action_id = "game_over:return_to_main_menu",
+                    kind = "game_over",
+                    game_over_action = "return_to_main_menu",
+                    label = "Return to main menu",
+                    screen = context.Screen
+                },
+                Execute = () => InvokeGameOverReturnToMainMenuAction(
+                    context.GameOverScreen,
+                    context.GameOverMainMenuButton)
             });
         }
     }
@@ -2526,6 +2649,26 @@ internal static class BridgeGameApi
 
     private static void ExecuteCardPlay(CardModel card, Creature? target)
     {
+        // Guard: verify target is still alive before executing.
+        // During RL training, rapid action execution can cause the target
+        // to die between action resolution and execution.
+        if (target is not null && !target.IsAlive)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "play_card_target_dead",
+                $"Target '{target.Name}' is no longer alive. Action skipped.");
+        }
+
+        // Guard: verify card is still playable
+        if (!CanPlayCard(card))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "play_card_not_playable",
+                $"Card '{TextOf(card.Title)}' is no longer playable.");
+        }
+
         var executionTargets = BuildCardExecutionTargets(card, target);
         var tryManualPlayMethod = FindMethod(card.GetType(), "TryManualPlay", 1);
         if (tryManualPlayMethod is not null)
@@ -3178,10 +3321,11 @@ internal static class BridgeGameApi
 
     private static int? SafeResolveCardEnergyXValue(CardModel card)
     {
-        var currentEnergy = card.Owner?.PlayerCombatState?.Energy;
+        int? currentEnergy = null;
 
         try
         {
+            currentEnergy = card.Owner?.PlayerCombatState?.Energy;
             var resolvedXValue = card.ResolveEnergyXValue();
             if (currentEnergy.HasValue)
             {
@@ -3759,10 +3903,14 @@ internal static class BridgeGameApi
         IReadOnlyList<NCardHolder> cardRewardOptions,
         Node? cardRewardSkipButton)
     {
+        var visible = IsCardRewardSelectionVisible(cardRewardScreen, cardRewardOptions);
+        var ready = IsCardRewardSelectionReady(cardRewardScreen);
         return new
         {
-            visible = cardRewardScreen is not null && IsNodeVisible(cardRewardScreen),
-            skip_visible = cardRewardSkipButton is not null &&
+            visible,
+            ready,
+            skip_visible = ready &&
+                           cardRewardSkipButton is not null &&
                            IsNodeVisible(cardRewardSkipButton) &&
                            IsButtonEnabled(cardRewardSkipButton),
             options = cardRewardOptions.Select((holder, index) => new
@@ -3784,30 +3932,46 @@ internal static class BridgeGameApi
         var visible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
         var texts = visible ? CollectVisibleText(cardSelectionScreen, 8).ToArray() : Array.Empty<string>();
         var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
+        var prompt = visible ? TryGetCardSelectionPrompt(cardSelectionScreen) : null;
+        var selectedCount = CountSelectedCardSelectionCards(cardSelectionScreen);
+        var minSelect = GetHiddenPropertyValue<int>(prefs, "MinSelect");
+        var maxSelect = GetHiddenPropertyValue<int>(prefs, "MaxSelect");
+        var selectionSemantics = ResolveCardSelectionSemantics(cardSelectionScreen, prompt, texts);
+        var confirmVisible = cardSelectionConfirmButton is not null &&
+                             IsNodeVisible(cardSelectionConfirmButton) &&
+                             IsButtonEnabled(cardSelectionConfirmButton);
+        var skipVisible = cardSelectionSkipButton is not null &&
+                          IsNodeVisible(cardSelectionSkipButton) &&
+                          IsButtonEnabled(cardSelectionSkipButton);
 
         return new
         {
             visible,
             screen_type = visible ? cardSelectionScreen!.GetType().Name : null,
-            prompt = visible ? TryGetCardSelectionPrompt(cardSelectionScreen) : null,
+            prompt,
             texts,
-            selected_count = CountSelectedCardSelectionCards(cardSelectionScreen),
-            min_select = GetHiddenPropertyValue<int>(prefs, "MinSelect"),
-            max_select = GetHiddenPropertyValue<int>(prefs, "MaxSelect"),
+            selection_semantics = selectionSemantics,
+            decision_text = BuildCardSelectionDecisionText(
+                selectionSemantics,
+                prompt,
+                selectedCount,
+                minSelect,
+                maxSelect,
+                confirmVisible,
+                skipVisible),
+            selected_count = selectedCount,
+            min_select = minSelect,
+            max_select = maxSelect,
             requires_manual_confirmation = GetHiddenPropertyValue<bool>(prefs, "RequireManualConfirmation"),
             cancelable = GetHiddenPropertyValue<bool>(prefs, "Cancelable"),
-            confirm_visible = cardSelectionConfirmButton is not null &&
-                              IsNodeVisible(cardSelectionConfirmButton) &&
-                              IsButtonEnabled(cardSelectionConfirmButton),
+            confirm_visible = confirmVisible,
             cancel_visible = cardSelectionCancelButton is not null &&
                              IsNodeVisible(cardSelectionCancelButton) &&
                              IsButtonEnabled(cardSelectionCancelButton),
             close_visible = cardSelectionCloseButton is not null &&
                             IsNodeVisible(cardSelectionCloseButton) &&
                             IsButtonEnabled(cardSelectionCloseButton),
-            skip_visible = cardSelectionSkipButton is not null &&
-                           IsNodeVisible(cardSelectionSkipButton) &&
-                           IsButtonEnabled(cardSelectionSkipButton),
+            skip_visible = skipVisible,
             options = cardSelectionOptions.Select((holder, index) =>
             {
                 var optionIndex = GetCardSelectionOptionIndex(cardSelectionScreen, holder, index);
@@ -4420,14 +4584,24 @@ internal static class BridgeGameApi
         NBackButton? deckUpgradeCancelButton,
         NBackButton? deckUpgradeCloseButton)
     {
+        var visible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen);
+        var prompt = visible ? TryGetDeckUpgradePrompt(deckUpgradeScreen) : null;
+        var texts = visible ? CollectVisibleText(deckUpgradeScreen, 8).ToArray() : Array.Empty<string>();
+        var selectedCount = CountSelectedDeckUpgradeCards(deckUpgradeScreen);
+        var useSingleSelection = GetHiddenPropertyValue<bool>(deckUpgradeScreen, "UseSingleSelection") ?? false;
+        var confirmVisible = deckUpgradeConfirmButton is not null &&
+                             IsNodeVisible(deckUpgradeConfirmButton) &&
+                             IsButtonEnabled(deckUpgradeConfirmButton);
         return new
         {
-            visible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen),
-            use_single_selection = GetHiddenPropertyValue<bool>(deckUpgradeScreen, "UseSingleSelection") ?? false,
-            selected_count = CountSelectedDeckUpgradeCards(deckUpgradeScreen),
-            confirm_visible = deckUpgradeConfirmButton is not null &&
-                              IsNodeVisible(deckUpgradeConfirmButton) &&
-                              IsButtonEnabled(deckUpgradeConfirmButton),
+            visible = visible,
+            use_single_selection = useSingleSelection,
+            selected_count = selectedCount,
+            selection_semantics = "upgrade",
+            prompt,
+            texts,
+            decision_text = BuildDeckUpgradeDecisionText(prompt, useSingleSelection, selectedCount, confirmVisible),
+            confirm_visible = confirmVisible,
             cancel_visible = deckUpgradeCancelButton is not null &&
                              IsNodeVisible(deckUpgradeCancelButton) &&
                              IsButtonEnabled(deckUpgradeCancelButton),
@@ -5096,6 +5270,7 @@ internal static class BridgeGameApi
         NDeckUpgradeSelectScreen? deckUpgradeScreen,
         NCrystalSphereScreen? crystalSphereScreen,
         IReadOnlyList<NEventOptionButton> eventOptionButtons,
+        NGameOverScreen? gameOverScreen,
         Node? mainMenuRoot,
         Node? runModeSubmenu,
         Node? abandonRunConfirmPopup)
@@ -5116,6 +5291,7 @@ internal static class BridgeGameApi
         var isRunModeVisible = runModeSubmenu is not null && IsNodeVisible(runModeSubmenu);
         var isCharacterSelectVisible = characterSelectScreen is not null && IsNodeVisible(characterSelectScreen);
         var isCrystalSphereVisible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
+        var isGameOverVisible = gameOverScreen is not null && IsNodeVisible(gameOverScreen);
         var currentScreen = InvokeParameterless(screenStateTracker, "GetCurrentScreen");
         if (currentScreen is not null)
         {
@@ -5153,6 +5329,11 @@ internal static class BridgeGameApi
             if (isCrystalSphereVisible)
             {
                 return "EVENT_CRYSTAL_SPHERE";
+            }
+
+            if (isGameOverVisible)
+            {
+                return "GAME_OVER";
             }
 
             if (isCharacterSelectVisible)
@@ -5222,6 +5403,11 @@ internal static class BridgeGameApi
         if (mainMenuRoot is not null && IsNodeVisible(mainMenuRoot))
         {
             return "MAIN_MENU";
+        }
+
+        if (isGameOverVisible)
+        {
+            return "GAME_OVER";
         }
 
         if (isCrystalSphereVisible)
@@ -5411,6 +5597,13 @@ internal static class BridgeGameApi
     {
         return (cardRewardScreen is not null && IsNodeVisible(cardRewardScreen)) ||
                cardRewardOptions.Count > 0;
+    }
+
+    private static bool IsCardRewardSelectionReady(NCardRewardSelectionScreen? cardRewardScreen)
+    {
+        return cardRewardScreen is not null &&
+               IsNodeVisible(cardRewardScreen) &&
+               GetHiddenFieldValue(cardRewardScreen, "_completionSource") is not null;
     }
 
     private static bool IsDeckUpgradeSelectionVisible(BridgeWorldContext context)
@@ -5960,6 +6153,25 @@ internal static class BridgeGameApi
             $"Could not resolve a supported card-selection action for {cardSelectionScreen?.GetType().FullName ?? "<missing screen>"}.");
     }
 
+    private static void InvokeCardSelectionBundleAction(Node? cardSelectionScreen, NCardBundle bundle)
+    {
+        if (TryInvokeSingleArgument(cardSelectionScreen, "OnBundleClicked", bundle))
+        {
+            return;
+        }
+
+        if (bundle.Hitbox is not null)
+        {
+            InvokeClickablePressAndRelease(bundle.Hitbox);
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            $"Could not resolve a supported bundle-selection action for {cardSelectionScreen?.GetType().FullName ?? "<missing screen>"}.");
+    }
+
     private static bool ShouldAutoConfirmSingleCardSelection(Node? cardSelectionScreen)
     {
         var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
@@ -6095,7 +6307,8 @@ internal static class BridgeGameApi
 
     private static void InvokeCardRewardSkipAction(NCardRewardSelectionScreen? cardRewardScreen, Node? skipButton)
     {
-        if (TryInvokeSingleArgument(
+        if (IsCardRewardSelectionReady(cardRewardScreen) &&
+            TryInvokeSingleArgument(
                 cardRewardScreen,
                 "OnAlternateRewardSelected",
                 MegaCrit.Sts2.Core.Entities.Rewards.PostAlternateCardRewardAction.DismissScreenAndKeepReward))
@@ -6218,6 +6431,58 @@ internal static class BridgeGameApi
             HttpStatusCode.Conflict,
             "action_target_missing",
             $"Could not invoke {methodName} on {target.GetType().FullName}.");
+    }
+
+    private static void InvokeGameOverContinueAction(
+        NGameOverScreen? gameOverScreen,
+        NGameOverContinueButton? continueButton)
+    {
+        if (gameOverScreen is not null)
+        {
+            if (TryInvokeParameterless(gameOverScreen, "OpenTimeline") ||
+                TryInvokeParameterless(gameOverScreen, "TransitionOutToTimeline"))
+            {
+                return;
+            }
+        }
+
+        if (continueButton is not null)
+        {
+            InvokeClickablePressAndRelease(continueButton);
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            "Could not invoke a supported game-over continue action.");
+    }
+
+    private static void InvokeGameOverReturnToMainMenuAction(
+        NGameOverScreen? gameOverScreen,
+        NReturnToMainMenuButton? mainMenuButton)
+    {
+        if (gameOverScreen is not null)
+        {
+            if (TryInvokeParameterless(gameOverScreen, "ReturnToMainMenu") ||
+                TryInvokeParameterless(gameOverScreen, "TransitionOutToMainMenu") ||
+                (mainMenuButton is not null &&
+                 TryInvokeSingleArgument(gameOverScreen, "OnMainMenuButtonPressed", mainMenuButton)))
+            {
+                return;
+            }
+        }
+
+        if (mainMenuButton is not null)
+        {
+            InvokeClickablePressAndRelease(mainMenuButton);
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            "Could not invoke a supported game-over return-to-main-menu action.");
     }
 
     private static void InvokeSingleArgumentAction(object target, string methodName, object argument)
@@ -6473,6 +6738,24 @@ internal static class BridgeGameApi
         return candidates.FirstOrDefault(IsNodeVisible);
     }
 
+    private static T? ResolveFirstVisibleEnabledNode<T>(params T?[] candidates) where T : Node
+    {
+        return candidates.FirstOrDefault(candidate => IsNodeVisible(candidate) && IsButtonEnabled(candidate));
+    }
+
+    private static bool IsCardSelectionPreviewVisible(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is null)
+        {
+            return false;
+        }
+
+        return ResolveFirstVisibleNode(
+                   GetHiddenFieldValue(cardSelectionScreen, "_previewContainer") as Node,
+                   GetHiddenFieldValue(cardSelectionScreen, "_enchantSinglePreviewContainer") as Node,
+                   GetHiddenFieldValue(cardSelectionScreen, "_enchantMultiPreviewContainer") as Node) is not null;
+    }
+
     private static Node? ResolveCardSelectionConfirmButton(Node? cardSelectionScreen)
     {
         if (cardSelectionScreen is null)
@@ -6480,30 +6763,51 @@ internal static class BridgeGameApi
             return null;
         }
 
-        if (cardSelectionScreen is NDeckCardSelectScreen)
+        if (IsCardSelectionPreviewVisible(cardSelectionScreen))
         {
-            var previewContainer = GetHiddenFieldValue(cardSelectionScreen, "_previewContainer") as Node;
-            if (previewContainer is not null && IsNodeVisible(previewContainer))
+            var previewConfirmButton = ResolveFirstVisibleEnabledNode(
+                GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node,
+                GetHiddenFieldValue(cardSelectionScreen, "_singlePreviewConfirmButton") as Node,
+                GetHiddenFieldValue(cardSelectionScreen, "_multiPreviewConfirmButton") as Node);
+            if (previewConfirmButton is not null)
             {
-                var previewConfirmButton =
-                    GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node;
-                if (previewConfirmButton is not null && IsNodeVisible(previewConfirmButton))
-                {
-                    return previewConfirmButton;
-                }
-            }
-
-            var confirmButton = GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node;
-            if (confirmButton is not null && IsNodeVisible(confirmButton))
-            {
-                return confirmButton;
+                return previewConfirmButton;
             }
         }
 
-        return ResolveFirstVisibleNode(
+        // NConfirmButton.Disable() slides the button off-screen but can remain visible in-tree,
+        // so prefer candidates that are both visible and enabled.
+        return ResolveFirstVisibleEnabledNode(
             GetHiddenFieldValue(cardSelectionScreen, "_confirmButton") as Node,
             GetHiddenFieldValue(cardSelectionScreen, "_previewConfirmButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_singlePreviewConfirmButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_multiPreviewConfirmButton") as Node,
             GetHiddenFieldValue(cardSelectionScreen, "_selectModeConfirmButton") as Node);
+    }
+
+    private static Node? ResolveCardSelectionCancelButton(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is null)
+        {
+            return null;
+        }
+
+        if (IsCardSelectionPreviewVisible(cardSelectionScreen))
+        {
+            var previewCancelButton = ResolveFirstVisibleEnabledNode(
+                GetHiddenFieldValue(cardSelectionScreen, "_previewCancelButton") as Node,
+                GetHiddenFieldValue(cardSelectionScreen, "_singlePreviewCancelButton") as Node,
+                GetHiddenFieldValue(cardSelectionScreen, "_multiPreviewCancelButton") as Node);
+            if (previewCancelButton is not null)
+            {
+                return previewCancelButton;
+            }
+        }
+
+        return ResolveFirstVisibleEnabledNode(
+            GetHiddenFieldValue(cardSelectionScreen, "_previewCancelButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_singlePreviewCancelButton") as Node,
+            GetHiddenFieldValue(cardSelectionScreen, "_multiPreviewCancelButton") as Node);
     }
 
     private static Node? ResolveCombatHandSelectionNode(NPlayerHand? playerHand)
@@ -6556,6 +6860,11 @@ internal static class BridgeGameApi
             return Array.Empty<NCardHolder>();
         }
 
+        if (IsCardSelectionPreviewVisible(cardSelectionScreen))
+        {
+            return Array.Empty<NCardHolder>();
+        }
+
         if (cardSelectionScreen is NPlayerHand playerHand)
         {
             return FindVisibleDescendants<NCardHolder>(playerHand)
@@ -6573,6 +6882,24 @@ internal static class BridgeGameApi
                 FindVisibleDescendants<NCardHolder>(cardSelectionScreen)
                     .Where(static holder => holder.CardModel is not null))
             .DistinctBy(static holder => holder.CardModel, ReferenceEqualityComparer.Instance)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NCardBundle> GetCardSelectionBundles(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is not NChooseABundleSelectionScreen)
+        {
+            return Array.Empty<NCardBundle>();
+        }
+
+        var bundleRow = GetHiddenFieldValue(cardSelectionScreen, "_bundleRow") as Node;
+        var searchRoot = bundleRow is not null && GodotObject.IsInstanceValid(bundleRow)
+            ? bundleRow
+            : cardSelectionScreen;
+
+        return SortByVisualPosition(
+                FindVisibleDescendants<NCardBundle>(searchRoot)
+                    .Where(static bundle => bundle.Bundle.Count > 0))
             .ToArray();
     }
 
@@ -6623,6 +6950,21 @@ internal static class BridgeGameApi
 
     private static bool ShouldSuppressGenericRoomProceed(BridgeWorldContext context)
     {
+        if (IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions) ||
+            IsRewardsScreenVisible(
+                context.RewardsScreen,
+                context.ProceedButton,
+                context.RewardProceedButton,
+                context.MapScreen,
+                context.RewardButtons) ||
+            IsCardSelectionVisible(context) ||
+            IsDeckUpgradeSelectionVisible(context) ||
+            (context.RestSiteRoom is not null && IsNodeVisible(context.RestSiteRoom)) ||
+            (context.CrystalSphereScreen is not null && IsNodeVisible(context.CrystalSphereScreen)))
+        {
+            return true;
+        }
+
         if (context.TreasureRoom is null || !IsNodeVisible(context.TreasureRoom))
         {
             return false;
@@ -6672,11 +7014,38 @@ internal static class BridgeGameApi
         return CollectVisibleText(cardSelectionScreen, 1).FirstOrDefault();
     }
 
+    private static string? TryGetDeckUpgradePrompt(NDeckUpgradeSelectScreen? deckUpgradeScreen)
+    {
+        if (deckUpgradeScreen is null)
+        {
+            return null;
+        }
+
+        var promptNode = ResolveFirstVisibleNode(
+            GetHiddenFieldValue(deckUpgradeScreen, "_selectionHeader") as Node,
+            GetHiddenFieldValue(deckUpgradeScreen, "_infoLabel") as Node,
+            GetHiddenFieldValue(deckUpgradeScreen, "_banner") as Node,
+            GetHiddenFieldValue(deckUpgradeScreen, "_singlePreviewTitleLabel") as Node,
+            GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewTitleLabel") as Node);
+        var prompt = TryGetNodeText(promptNode);
+        if (!string.IsNullOrWhiteSpace(prompt))
+        {
+            return prompt;
+        }
+
+        return CollectVisibleText(deckUpgradeScreen, 1).FirstOrDefault();
+    }
+
     private static int CountSelectedCardSelectionCards(Node? cardSelectionScreen)
     {
         if (cardSelectionScreen is null)
         {
             return 0;
+        }
+
+        if (GetHiddenFieldValue(cardSelectionScreen, "_selectedBundle") is not null)
+        {
+            return 1;
         }
 
         if (GetHiddenFieldValue(cardSelectionScreen, "_selectedCards") is IEnumerable selectedCards)
@@ -8604,6 +8973,12 @@ internal static class BridgeGameApi
         public required IReadOnlyList<NEventOptionButton> EventOptionButtons { get; init; }
 
         public NEventRoom? EventRoom { get; init; }
+
+        public NGameOverScreen? GameOverScreen { get; init; }
+
+        public NGameOverContinueButton? GameOverContinueButton { get; init; }
+
+        public NReturnToMainMenuButton? GameOverMainMenuButton { get; init; }
 
         public NCrystalSphereScreen? CrystalSphereScreen { get; init; }
 

@@ -6,7 +6,9 @@ internal static class BridgeDebugTrace
 
     private static readonly string LogFilePath = Path.Combine(
         BridgeRuntime.SessionDirectoryPath,
-        "bridge-debug.log");
+        BridgeRuntime.IsMultiInstance
+            ? $"bridge-debug-{BridgeRuntime.InstanceId}.log"
+            : "bridge-debug.log");
 
     public static void Write(string message)
     {

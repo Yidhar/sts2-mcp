@@ -1,0 +1,776 @@
+using System.Globalization;
+using System.Net;
+using System.Text.Json.Serialization;
+
+namespace Sts2McpBridge.Scripts;
+
+internal sealed class BridgeEnvResetRequest
+{
+    [JsonPropertyName("character")]
+    public string? Character { get; set; }
+
+    [JsonPropertyName("defensive_buffs")]
+    public bool? DefensiveBuffs { get; set; }
+
+    [JsonPropertyName("timeout_ms")]
+    public int? TimeoutMs { get; set; }
+}
+
+internal sealed class BridgeEnvStepRequest
+{
+    [JsonPropertyName("episode_id")]
+    public string? EpisodeId { get; set; }
+
+    [JsonPropertyName("action_index")]
+    public int? ActionIndex { get; set; }
+
+    [JsonPropertyName("action_id")]
+    public string? ActionId { get; set; }
+
+    [JsonPropertyName("timeout_ms")]
+    public int? TimeoutMs { get; set; }
+}
+
+internal static partial class BridgeGameApi
+{
+    private const int DefaultEnvResetTimeoutMs = 30000;
+    private const int DefaultEnvStepTimeoutMs = 15000;
+    private const int MaxEnvTimeoutMs = 120000;
+    private const int EnvStableSampleTarget = 2;
+    private const int EnvResetTransitionLimit = 24;
+
+    private static readonly object EnvEpisodeSync = new();
+    private static BridgeEnvEpisode? _activeEnvEpisode;
+
+    public static object GetEnvSpecResponse()
+    {
+        return new
+        {
+            ok = true,
+            env_api_version = "bridge-env-v1",
+            single_env = true,
+            direct_bridge = true,
+            model_oriented = true,
+            reset = new
+            {
+                fresh_episode_guarantee = "main_menu_only",
+                supported_run_modes = new[] { "standard" },
+                supports_character = true,
+                supports_defensive_buffs = true,
+                supports_seed = false,
+                supports_ascension = false
+            },
+            observation = new
+            {
+                root_fields = new[] { "phase", "logic_hash", "run", "player", "combat", "decision" },
+                run_fields = new[] { "active", "game_over", "act", "act_id", "act_floor", "floor", "room_type", "room_model", "coord" },
+                player_fields = new[] { "character_id", "character_title", "hp", "max_hp", "block", "gold", "deck", "relics", "potions" },
+                phase_values = new[]
+                {
+                    "startup_main_menu",
+                    "startup_run_mode",
+                    "startup_character_select",
+                    "combat",
+                    "map",
+                    "reward",
+                    "card_reward",
+                    "event",
+                    "event_crystal_sphere",
+                    "rest_site",
+                    "deck_upgrade",
+                    "card_selection",
+                    "shop",
+                    "treasure",
+                    "actions",
+                    "settling",
+                    "terminal",
+                    "unknown"
+                }
+            },
+            action_encoding = new
+            {
+                default_encoding = "legal_action_idx",
+                supported = new[] { "legal_action_idx", "action_id" },
+                legal_action_shape = new[] { "idx", "action_id", "kind" }
+            },
+            reward = new
+            {
+                scalar = "weighted_sum_plus_direct_shaping",
+                linear_channels = new[]
+                {
+                    "hp_loss_normalized",
+                    "hp_gain_normalized",
+                    "room_hp_delta_normalized",
+                    "gold_gain",
+                    "gold_spend",
+                    "floor_delta",
+                    "relic_gain",
+                    "potion_gain",
+                    "card_add_count",
+                    "starter_card_remove_count",
+                    "other_card_remove_count",
+                    "card_upgrade_count",
+                    "combat_win",
+                    "elite_clear",
+                    "boss_clear",
+                    "act_clear",
+                    "death",
+                    "victory"
+                },
+                linear_weights = new
+                {
+                    hp_loss_normalized = -1.5,
+                    hp_gain_normalized = 0.25,
+                    room_hp_delta_normalized = 2.0,
+                    gold_gain = 0.002,
+                    gold_spend = 0.0,
+                    floor_delta = 0.35,
+                    relic_gain = 0.35,
+                    potion_gain = 0.08,
+                    card_add_count = 0.0,
+                    starter_card_remove_count = 0.18,
+                    other_card_remove_count = 0.08,
+                    card_upgrade_count = 0.15,
+                    combat_win = 1.0,
+                    elite_clear = 0.5,
+                    boss_clear = 2.0,
+                    act_clear = 5.0,
+                    death = -6.0,
+                    victory = 10.0
+                },
+                direct_terms = new
+                {
+                    step_penalty = 0.0,
+                    action_error_penalty = -0.10,
+                    truncated_penalty = -1.0,
+                    play_card_bonus = 0.006,
+                    effective_block_weight = 1.5,
+                    wasted_block_weight = -0.1,
+                    weak_intent_reduction_weight = 1.2,
+                    vulnerable_realized_damage_weight = 0.35,
+                    threat_gap_reduction_weight = 1.2,
+                    missed_defense_penalty_weight = -1.25,
+                    end_turn_waste_penalty = -0.01,
+                    no_progress_penalty = -0.01,
+                    skip_bad_cards_bonus = 0.04,
+                    rest_low_hp_bonus = 0.12,
+                    rest_high_hp_mismatch_penalty = -0.08,
+                    smith_healthy_bonus = 0.10,
+                    smith_low_hp_mismatch_penalty = -0.10,
+                    card_heuristic_range = new[] { -0.10, 0.10 }
+                }
+            },
+            done_conditions = new[] { "run_game_over", "step_timeout" }
+        };
+    }
+
+    public static async Task<object> ResetEnvResponseAsync(
+        BridgeEnvResetRequest? request,
+        CancellationToken cancellationToken)
+    {
+        request ??= new BridgeEnvResetRequest();
+        var requestedCharacter = request.Character?.Trim();
+        var defensiveBuffs = request.DefensiveBuffs == true;
+        var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
+        await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
+        var executedActions = new List<object>();
+        var state = await CaptureEnvSnapshotAsync(cancellationToken);
+
+        if (CanReuseFreshEpisode(state, requestedCharacter))
+        {
+            var readyEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
+            state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, cancellationToken);
+            return BuildEnvResetPayload(readyEpisode, state, executedActions);
+        }
+
+        // If there's an active run outside startup, try to navigate to main menu.
+        // This handles mid-game resets (e.g. after truncation, crash recovery, etc.)
+        if (state.RunActive && !IsStartupPhase(state.Phase))
+        {
+            state = await NavigateToMainMenuFromActiveRunAsync(state, timeoutMs, cancellationToken);
+        }
+
+        var resetStartedAt = DateTime.UtcNow;
+        var waitRetries = 0;
+        const int maxWaitRetries = 5;
+
+        for (var transition = 0; transition < EnvResetTransitionLimit; transition++)
+        {
+            // Wall-clock guard for the entire reset loop
+            if ((DateTime.UtcNow - resetStartedAt).TotalMilliseconds > timeoutMs)
+            {
+                break;
+            }
+
+            if (CanReuseFreshEpisode(state, requestedCharacter))
+            {
+                var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
+                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+                return BuildEnvResetPayload(episode, state, executedActions);
+            }
+
+            var nextAction = ResolveEnvResetAction(state, requestedCharacter);
+            if (nextAction is null)
+            {
+                if (ShouldWaitForEnvResetPath(state) && waitRetries < maxWaitRetries)
+                {
+                    state = await WaitForEnvResetPathStateAsync(state, timeoutMs, cancellationToken);
+                    waitRetries++;
+                    transition--;
+                    continue;
+                }
+
+                throw new BridgeRequestException(
+                    HttpStatusCode.Conflict,
+                    "env_reset_no_reset_path",
+                    "Unable to find a reset transition from the current startup state.",
+                    new
+                    {
+                        phase = state.Phase,
+                        screen = state.Screen,
+                        legal_actions = state.LegalActions
+                    });
+            }
+
+            await ExecuteEnvActionAsync(nextAction.Value.Action, cancellationToken);
+            executedActions.Add(new
+            {
+                action_id = nextAction.Value.Action.ActionId,
+                kind = nextAction.Value.Kind,
+                phase_before = state.Phase
+            });
+
+            state = await WaitForResetAdvanceAsync(
+                state,
+                nextAction.Value.Action.ActionId,
+                requestedCharacter,
+                timeoutMs,
+                cancellationToken);
+
+            if (IsEnvFreshEpisodeReady(state))
+            {
+                var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
+                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+                return BuildEnvResetPayload(episode, state, executedActions);
+            }
+        }
+
+        var finalState = await CaptureEnvSnapshotAsync(cancellationToken);
+        if (CanReuseFreshEpisode(finalState, requestedCharacter))
+        {
+            var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
+            finalState = await ApplyEnvEpisodeAdjustmentsAsync(episode, finalState, cancellationToken);
+            return BuildEnvResetPayload(episode, finalState, executedActions);
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "env_reset_transition_limit",
+            $"env/reset exceeded the transition limit of {EnvResetTransitionLimit}.",
+            new
+            {
+                transition_limit = EnvResetTransitionLimit,
+                phase = finalState.Phase,
+                screen = finalState.Screen,
+                actionable = finalState.Actionable,
+                done = finalState.Done,
+                legal_action_count = finalState.LegalActions.Length,
+                executed_actions = executedActions
+            });
+    }
+
+    public static async Task<object> StepEnvResponseAsync(
+        BridgeEnvStepRequest? request,
+        CancellationToken cancellationToken)
+    {
+        request ??= new BridgeEnvStepRequest();
+        var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvStepTimeoutMs);
+        await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
+        var episodeId = request.EpisodeId?.Trim();
+        if (string.IsNullOrWhiteSpace(episodeId))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.BadRequest,
+                "missing_episode_id",
+                "Request body must include a non-empty episode_id.");
+        }
+
+        var episode = RequireActiveEnvEpisode(episodeId);
+        if (episode.Done)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "episode_already_done",
+                $"Episode '{episodeId}' is already done. Call env/reset to start a new episode.");
+        }
+
+        var before = await WaitForStableEnvStateAsync(
+            null,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, cancellationToken);
+
+        if (before.Done)
+        {
+            episode.Done = true;
+            return BuildEnvStepPayload(
+                episode,
+                before,
+                before,
+                selectedAction: null,
+                truncated: false,
+                truncationReason: null);
+        }
+
+        if (!before.Actionable)
+        {
+            episode.Done = true;
+            return BuildEnvStepPayload(
+                episode,
+                before,
+                before,
+                selectedAction: null,
+                truncated: true,
+                truncationReason: "step_timeout_waiting_for_actionable_or_terminal_state");
+        }
+
+        // Resolve and execute the action. All failures are captured as actionError
+        // instead of throwing, so the caller always gets a valid step payload.
+        BridgeResolvedActionSelection? selectedAction = null;
+        string? actionError = null;
+        try
+        {
+            selectedAction = ResolveRequestedEnvAction(before, request);
+            await ExecuteEnvActionAsync(selectedAction.Action, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // Don't swallow cancellation
+        }
+        catch (BridgeRequestException ex)
+        {
+            actionError = ex.ErrorCode;
+        }
+        catch (Exception)
+        {
+            actionError = "action_execution_error";
+        }
+
+        var after = await WaitForStableEnvStateAsync(
+            before.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+        after = await MaybeAutoConfirmSingleDeckUpgradeAsync(
+            selectedAction,
+            after,
+            timeoutMs,
+            cancellationToken);
+        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, cancellationToken);
+
+        episode.StepIndex++;
+        var truncated = !after.Actionable && !after.Done;
+        if (after.Done || truncated)
+        {
+            episode.Done = true;
+        }
+
+        return BuildEnvStepPayload(
+            episode,
+            before,
+            after,
+            selectedAction,
+            truncated,
+            truncated ? "step_timeout_waiting_for_actionable_or_terminal_state" : null,
+            actionError);
+    }
+
+    private static async Task<BridgeEnvSnapshot> MaybeAutoConfirmSingleDeckUpgradeAsync(
+        BridgeResolvedActionSelection? selectedAction,
+        BridgeEnvSnapshot snapshot,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        if (selectedAction is null ||
+            !selectedAction.Action.ActionId.StartsWith("deck_upgrade:select:", StringComparison.Ordinal) ||
+            !string.Equals(snapshot.Phase, "deck_upgrade", StringComparison.Ordinal) ||
+            snapshot.Done)
+        {
+            return snapshot;
+        }
+
+        var deckUpgradeScreen = snapshot.Context.DeckUpgradeScreen;
+        if (deckUpgradeScreen is null || !IsNodeVisible(deckUpgradeScreen))
+        {
+            return snapshot;
+        }
+
+        var useSingleSelection = GetHiddenPropertyValue<bool>(deckUpgradeScreen, "UseSingleSelection") ?? false;
+        if (!useSingleSelection)
+        {
+            return snapshot;
+        }
+
+        if (!snapshot.ActionLookup.TryGetValue("deck_upgrade:confirm", out var confirmAction))
+        {
+            return snapshot;
+        }
+
+        await ExecuteEnvActionAsync(confirmAction, cancellationToken);
+        return await WaitForStableEnvStateAsync(
+            snapshot.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+    }
+
+    private static int NormalizeEnvTimeout(int? requestedTimeoutMs, int defaultTimeoutMs)
+    {
+        return Math.Clamp(requestedTimeoutMs ?? defaultTimeoutMs, 1, MaxEnvTimeoutMs);
+    }
+
+    private static async Task WaitForEnvDispatcherReadyAsync(int timeoutMs, CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (BridgeCoordinator.IsReady)
+            {
+                return;
+            }
+
+            await Task.Delay(50, cancellationToken);
+        }
+
+        EnsureDispatcherReady();
+    }
+
+    private static BridgeEnvEpisode CreateEnvEpisode(string? requestedCharacter, bool defensiveBuffs)
+    {
+        var episode = new BridgeEnvEpisode
+        {
+            Id = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture),
+            StepIndex = 0,
+            Done = false,
+            RequestedCharacter = string.IsNullOrWhiteSpace(requestedCharacter) ? null : requestedCharacter,
+            DefensiveBuffs = defensiveBuffs
+        };
+
+        lock (EnvEpisodeSync)
+        {
+            _activeEnvEpisode = episode;
+        }
+
+        return episode;
+    }
+
+    private static BridgeEnvEpisode RequireActiveEnvEpisode(string episodeId)
+    {
+        lock (EnvEpisodeSync)
+        {
+            if (_activeEnvEpisode is null || !_activeEnvEpisode.Id.Equals(episodeId, StringComparison.Ordinal))
+            {
+                throw new BridgeRequestException(
+                    HttpStatusCode.Conflict,
+                    "unknown_episode_id",
+                    $"Episode '{episodeId}' is not active. Call env/reset to start a new episode.");
+            }
+
+            return _activeEnvEpisode;
+        }
+    }
+
+    private static bool IsEnvFreshEpisodeReady(BridgeEnvSnapshot snapshot)
+    {
+        return snapshot.RunActive && !snapshot.Done && !IsStartupPhase(snapshot.Phase) && snapshot.Actionable;
+    }
+
+    private static bool CanReuseFreshEpisode(BridgeEnvSnapshot snapshot, string? requestedCharacter)
+    {
+        if (!IsEnvFreshEpisodeReady(snapshot))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(requestedCharacter))
+        {
+            return true;
+        }
+
+        var requested = NormalizeComparableText(requestedCharacter);
+        var player = GetPrimaryPlayer(snapshot.Context);
+        var currentId = NormalizeComparableText(player?.Character?.Id.ToString());
+        var currentTitle = NormalizeComparableText(DescribeCharacter(player?.Character));
+        return requested.Equals(currentId, StringComparison.Ordinal) ||
+               requested.Equals(currentTitle, StringComparison.Ordinal);
+    }
+
+    private static bool IsStartupPhase(string phase)
+    {
+        return phase is "startup_main_menu" or "startup_run_mode" or "startup_character_select";
+    }
+
+    private static bool ShouldWaitForEnvResetPath(BridgeEnvSnapshot snapshot)
+    {
+        if (snapshot.Done)
+        {
+            return snapshot.LegalActions.Length == 0;
+        }
+
+        // Settling states should always be waited on, even in active runs.
+        // The game may be mid-transition (combat ending, reward appearing, etc.)
+        if (snapshot.Phase is "settling" or "unknown" || snapshot.Screen == "UNKNOWN")
+        {
+            return true;
+        }
+
+        if (snapshot.RunActive)
+        {
+            return false;
+        }
+
+        return IsStartupPhase(snapshot.Phase) && snapshot.LegalActions.Length == 0;
+    }
+
+    private static async Task ExecuteEnvActionAsync(BridgeResolvedAction action, CancellationToken cancellationToken)
+    {
+        await BridgeCoordinator.RunOnMainThreadAsync(() =>
+        {
+            action.Execute();
+            return true;
+        });
+
+        await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+    }
+
+    private static bool ShouldAutoCloseResidualMapOverlay(BridgeWorldContext context)
+    {
+        return context.RunState?.CurrentRoom is not null &&
+               context.MapScreen is not null &&
+               context.MapScreen.IsOpen &&
+               !context.MapScreen.IsTravelEnabled &&
+               !context.MapScreen.IsTraveling;
+    }
+
+    private static async Task<BridgeEnvSnapshot> MaybeAutoCloseResidualMapOverlayAsync(
+        BridgeEnvSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        if (!ShouldAutoCloseResidualMapOverlay(snapshot.Context))
+        {
+            return snapshot;
+        }
+
+        var closed = await BridgeCoordinator.RunOnMainThreadAsync(() =>
+        {
+            var mapScreen = snapshot.Context.MapScreen;
+            if (mapScreen is null ||
+                !mapScreen.IsOpen ||
+                mapScreen.IsTravelEnabled ||
+                mapScreen.IsTraveling)
+            {
+                return false;
+            }
+
+            mapScreen.Close(false);
+            return true;
+        });
+
+        if (!closed)
+        {
+            return snapshot;
+        }
+
+        await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+        return await CaptureEnvSnapshotAsync(cancellationToken);
+    }
+
+    private static async Task<BridgeEnvSnapshot> WaitForEnvResetPathStateAsync(
+        BridgeEnvSnapshot before,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+        var snapshot = before;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, cancellationToken);
+            if (!ShouldWaitForEnvResetPath(snapshot))
+            {
+                return snapshot;
+            }
+
+            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+        }
+
+        return snapshot;
+    }
+
+    private static async Task<BridgeEnvSnapshot> WaitForStableEnvStateAsync(
+        string? baselineLogicHash,
+        int timeoutMs,
+        bool requireActionableOrDone,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+        var stableHash = string.Empty;
+        var stableCount = 0;
+        BridgeEnvSnapshot? lastSnapshot = null;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, cancellationToken);
+            lastSnapshot = snapshot;
+            var ready = snapshot.Done || !requireActionableOrDone || snapshot.Actionable;
+            var changedFromBaseline = baselineLogicHash is null ||
+                                      !baselineLogicHash.Equals(snapshot.LogicHash, StringComparison.Ordinal);
+
+            if (ready && changedFromBaseline)
+            {
+                if (snapshot.LogicHash.Equals(stableHash, StringComparison.Ordinal))
+                {
+                    stableCount++;
+                }
+                else
+                {
+                    stableHash = snapshot.LogicHash;
+                    stableCount = 1;
+                }
+
+                if (stableCount >= EnvStableSampleTarget)
+                {
+                    return snapshot;
+                }
+            }
+            else
+            {
+                stableHash = string.Empty;
+                stableCount = 0;
+            }
+
+            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+        }
+
+        return lastSnapshot ?? await CaptureEnvSnapshotAsync(cancellationToken);
+    }
+
+    private static async Task<BridgeEnvSnapshot> WaitForResetAdvanceAsync(
+        BridgeEnvSnapshot before,
+        string executedActionId,
+        string? requestedCharacter,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var executedCharacterSelect = executedActionId.StartsWith("character_select:", StringComparison.Ordinal);
+        var executedEmbark = executedActionId.Equals("embark", StringComparison.Ordinal);
+        var snapshot = await WaitForStableEnvStateAsync(
+            before.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+
+        for (var extraWait = 0; extraWait < 4; extraWait++)
+        {
+            if (IsEnvFreshEpisodeReady(snapshot) || !IsStartupPhase(snapshot.Phase))
+            {
+                return snapshot;
+            }
+
+            if (snapshot.Phase == "startup_character_select")
+            {
+                var hasEmbark = snapshot.ActionLookup.ContainsKey("embark");
+                if ((executedCharacterSelect && !hasEmbark) || executedEmbark)
+                {
+                    snapshot = await WaitForStableEnvStateAsync(
+                        snapshot.LogicHash,
+                        timeoutMs,
+                        requireActionableOrDone: true,
+                        cancellationToken);
+                    continue;
+                }
+            }
+
+            var nextAction = ResolveEnvResetAction(snapshot, requestedCharacter);
+            if (nextAction is null ||
+                !nextAction.Value.Action.ActionId.Equals(executedActionId, StringComparison.Ordinal))
+            {
+                return snapshot;
+            }
+
+            snapshot = await WaitForStableEnvStateAsync(
+                snapshot.LogicHash,
+                timeoutMs,
+                requireActionableOrDone: true,
+                cancellationToken);
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Navigate from a non-startup state back to main menu for env/reset.
+    /// Only handles known safe transitions:
+    ///   - terminal/game_over → click return to main menu
+    ///   - wait for settling states to resolve
+    /// Does NOT blindly execute game actions in an active run.
+    /// If the game is in an active non-terminal run, returns the state as-is
+    /// and lets the reset loop handle it (which will error clearly).
+    /// </summary>
+    private static async Task<BridgeEnvSnapshot> NavigateToMainMenuFromActiveRunAsync(
+        BridgeEnvSnapshot state,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if ((DateTime.UtcNow - startedAt).TotalMilliseconds > timeoutMs)
+            {
+                break;
+            }
+
+            // Already at startup — done
+            if (IsStartupPhase(state.Phase) || !state.RunActive)
+            {
+                return state;
+            }
+
+            // Terminal (game over) — navigate to main menu
+            if (state.Done)
+            {
+                var gameOverAction = ResolveEnvResetAction(state, null);
+                if (gameOverAction is not null)
+                {
+                    await ExecuteEnvActionAsync(gameOverAction.Value.Action, cancellationToken);
+                    state = await WaitForStableEnvStateAsync(
+                        state.LogicHash, Math.Min(timeoutMs, 10000),
+                        requireActionableOrDone: true, cancellationToken);
+                    continue;
+                }
+
+                // Wait for game_over screen to appear
+                state = await WaitForStableEnvStateAsync(
+                    state.LogicHash, Math.Min(timeoutMs, 5000),
+                    requireActionableOrDone: true, cancellationToken);
+                continue;
+            }
+
+            // Active run, not terminal — cannot safely navigate.
+            // Return current state; the reset loop will either:
+            //   a) Find an abandon action if we're on main menu with continue
+            //   b) Error out clearly so the caller knows the state
+            break;
+        }
+
+        return await CaptureEnvSnapshotAsync(cancellationToken);
+    }
+}

@@ -1,181 +1,161 @@
-"""Phase 2 attention-based feature extractor for STS2 RL training.
+"""Dual-tower feature encoders for STS2 RL.
 
-Custom SB3 feature extractor that uses:
-- MLP for scalar features (phase, player stats, combat meta)
-- Self-attention + learned pooling for variable-length card sets (hand)
-- Self-attention + learned pooling for variable-length enemy sets
-- Fusion MLP that combines all three streams
+StateEncoder: scalars + hand/enemy attention + cross-attention + relics/potions + context
+ActionEncoder: per-action numeric + text projection
 
-Handles edge cases where hand_mask or enemy_mask is all-False
-(no cards / no enemies) by producing zero vectors for those streams.
+Both output fixed-dim embeddings for the candidate-scoring policy.
 """
 
 import torch
 import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+from .text_encoder import TEXT_DIM
+from .observation_v2 import (
+    SCALAR_DIM, CARD_FEAT_DIM, ENEMY_FEAT_DIM, POWER_DIM,
+    ACTION_FEAT_DIM, MAX_ACTIONS,
+)
 
 
-class STS2AttentionExtractor(BaseFeaturesExtractor):
-    """Attention-based feature extractor for Dict observation spaces.
+class StateEncoder(nn.Module):
+    """Encode game state into a fixed-size vector."""
 
-    Expected observation keys:
-        scalars       (batch, scalar_dim)
-        player_powers (batch, power_dim)
-        hand          (batch, max_hand, card_feat_dim)
-        hand_mask     (batch, max_hand)           -- 1 where card present
-        enemies       (batch, max_enemies, enemy_feat_dim)
-        enemy_mask    (batch, max_enemies)         -- 1 where enemy present
-    """
+    def __init__(self, embed_dim=64, n_heads=2, text_proj_dim=32):
+        super().__init__()
+        self.embed_dim = embed_dim
 
-    def __init__(
-        self,
-        observation_space,
-        features_dim: int = 128,
-        card_embed_dim: int = 32,
-        enemy_embed_dim: int = 32,
-        n_heads: int = 2,
-        scalar_hidden: int = 64,
-    ):
-        super().__init__(observation_space, features_dim=features_dim)
+        # Text projection
+        self.card_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
+        self.enemy_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
+        self.relic_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
+        self.potion_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
+        self.context_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
 
-        # ---- dimensions from observation space ----------------------------
-        scalar_dim = observation_space["scalars"].shape[0]
-        power_dim = observation_space["player_powers"].shape[0]
-        card_feat_dim = observation_space["hand"].shape[1]
-        enemy_feat_dim = observation_space["enemies"].shape[1]
+        # Entity encoders
+        self.card_enc = nn.Sequential(nn.Linear(CARD_FEAT_DIM + text_proj_dim, embed_dim), nn.ReLU())
+        self.enemy_enc = nn.Sequential(nn.Linear(ENEMY_FEAT_DIM + text_proj_dim, embed_dim), nn.ReLU())
 
-        # ---- scalar encoder -----------------------------------------------
+        # Self-attention
+        self.card_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+        self.card_norm = nn.LayerNorm(embed_dim)
+        self.enemy_attn = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+        self.enemy_norm = nn.LayerNorm(embed_dim)
+
+        # Cross-attention (cards → enemies), gated by combat phase
+        self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, kdim=embed_dim, vdim=embed_dim, batch_first=True)
+        self.cross_norm = nn.LayerNorm(embed_dim)
+
+        # Pooling
+        self.card_seed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.enemy_seed = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.card_pool = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+        self.enemy_pool = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
+
+        # Set encoders
+        self.relic_enc = nn.Sequential(nn.Linear(text_proj_dim, 16), nn.ReLU())
+        self.potion_enc = nn.Sequential(nn.Linear(text_proj_dim, 16), nn.ReLU())
+
+        # Scalar
         self.scalar_net = nn.Sequential(
-            nn.Linear(scalar_dim + power_dim, scalar_hidden),
-            nn.ReLU(),
-            nn.Linear(scalar_hidden, scalar_hidden),
-            nn.ReLU(),
+            nn.Linear(SCALAR_DIM + POWER_DIM + text_proj_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
         )
 
-        # ---- card encoder with self-attention + learned pooling -----------
-        self.card_proj = nn.Sequential(
-            nn.Linear(card_feat_dim, card_embed_dim),
-            nn.ReLU(),
+        # Output dim: card(E) + enemy(E) + scalar(64) + relic(16) + potion(16)
+        self.output_dim = embed_dim + embed_dim + 64 + 16 + 16
+
+    def forward(self, obs):
+        # Text projections
+        ct = self.card_text_proj(obs["hand_text"])
+        et = self.enemy_text_proj(obs["enemy_text"])
+        rt = self.relic_text_proj(obs["relics"])
+        pt = self.potion_text_proj(obs["potions"])
+        ctx = self.context_text_proj(obs["context_text"])
+
+        # Cards
+        card_emb = self.card_enc(torch.cat([obs["hand"], ct], dim=-1))
+        hm = obs["hand_mask"].bool()
+        card_emb = self.card_norm(card_emb + _safe_self_attn(self.card_attn, card_emb, hm))
+
+        # Enemies
+        enemy_emb = self.enemy_enc(torch.cat([obs["enemies"], et], dim=-1))
+        em = obs["enemy_mask"].bool()
+        enemy_emb = self.enemy_norm(enemy_emb + _safe_self_attn(self.enemy_attn, enemy_emb, em))
+
+        # Cross-attention: only meaningful in combat (hand_mask has entries)
+        cross = _safe_cross_attn(self.cross_attn, card_emb, enemy_emb, hm, em)
+        card_emb = self.cross_norm(card_emb + cross)
+
+        # Pool
+        card_out = _safe_pool(self.card_pool, self.card_seed, card_emb, hm)
+        enemy_out = _safe_pool(self.enemy_pool, self.enemy_seed, enemy_emb, em)
+
+        # Relics / Potions
+        relic_out = _masked_mean(self.relic_enc(rt), obs["relic_mask"].bool())
+        potion_out = _masked_mean(self.potion_enc(pt), obs["potion_mask"].bool())
+
+        # Scalars + context
+        scalar_in = torch.cat([obs["scalars"], obs["player_powers"], ctx], dim=-1)
+        scalar_out = self.scalar_net(scalar_in)
+
+        return torch.cat([card_out, enemy_out, scalar_out, relic_out, potion_out], dim=-1)
+
+
+class ActionEncoder(nn.Module):
+    """Encode each candidate action into an embedding."""
+
+    def __init__(self, embed_dim=64, text_proj_dim=32):
+        super().__init__()
+        self.action_text_proj = nn.Linear(TEXT_DIM, text_proj_dim)
+        self.action_net = nn.Sequential(
+            nn.Linear(ACTION_FEAT_DIM + text_proj_dim, embed_dim), nn.ReLU(),
         )
-        self.card_attn = nn.MultiheadAttention(
-            card_embed_dim, n_heads, batch_first=True,
-        )
-        self.card_pool = nn.Parameter(
-            torch.randn(1, 1, card_embed_dim) * 0.02,
-        )
-        self.card_pool_attn = nn.MultiheadAttention(
-            card_embed_dim, n_heads, batch_first=True,
-        )
-        self.card_norm = nn.LayerNorm(card_embed_dim)
+        self.output_dim = embed_dim
 
-        # ---- enemy encoder with self-attention + learned pooling ----------
-        self.enemy_proj = nn.Sequential(
-            nn.Linear(enemy_feat_dim, enemy_embed_dim),
-            nn.ReLU(),
-        )
-        self.enemy_attn = nn.MultiheadAttention(
-            enemy_embed_dim, n_heads, batch_first=True,
-        )
-        self.enemy_pool = nn.Parameter(
-            torch.randn(1, 1, enemy_embed_dim) * 0.02,
-        )
-        self.enemy_pool_attn = nn.MultiheadAttention(
-            enemy_embed_dim, n_heads, batch_first=True,
-        )
-        self.enemy_norm = nn.LayerNorm(enemy_embed_dim)
+    def forward(self, obs):
+        at = self.action_text_proj(obs["action_text"])
+        combined = torch.cat([obs["actions"], at], dim=-1)
+        return self.action_net(combined)  # (B, MAX_ACTIONS, embed_dim)
 
-        # ---- fusion -------------------------------------------------------
-        combined_dim = scalar_hidden + card_embed_dim + enemy_embed_dim
-        self.fusion = nn.Sequential(
-            nn.Linear(combined_dim, features_dim),
-            nn.ReLU(),
-        )
 
-    def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
-        scalars = observations["scalars"]
-        powers = observations["player_powers"]
-        hand = observations["hand"]
-        hand_mask = observations["hand_mask"]
-        enemies = observations["enemies"]
-        enemy_mask = observations["enemy_mask"]
+# ---------------------------------------------------------------------------
+# Safe attention helpers
+# ---------------------------------------------------------------------------
 
-        batch_size = scalars.shape[0]
+def _safe_self_attn(attn, x, mask):
+    if not mask.any():
+        return torch.zeros_like(x)
+    empty = ~mask.any(dim=1)
+    safe = mask.clone()
+    safe[empty, 0] = True
+    out, _ = attn(x, x, x, key_padding_mask=~safe)
+    return out * mask.unsqueeze(-1).float()
 
-        # ---- scalar stream ------------------------------------------------
-        s = self.scalar_net(torch.cat([scalars, powers], dim=-1))
+def _safe_cross_attn(attn, q, kv, q_mask, kv_mask):
+    if not q_mask.any() or not kv_mask.any():
+        return torch.zeros_like(q)
+    empty = ~kv_mask.any(dim=1)
+    safe = kv_mask.clone()
+    safe[empty, 0] = True
+    out, _ = attn(q, kv, kv, key_padding_mask=~safe)
+    out = out * q_mask.unsqueeze(-1).float()
+    out[empty] = 0.0
+    return out
 
-        # ---- card stream --------------------------------------------------
-        c_out = self._encode_set(
-            hand, hand_mask,
-            self.card_proj, self.card_attn, self.card_norm,
-            self.card_pool, self.card_pool_attn,
-            batch_size,
-        )
+def _safe_pool(attn, seed, x, mask):
+    b, _, d = x.shape
+    if not mask.any():
+        return torch.zeros(b, d, device=x.device)
+    empty = ~mask.any(dim=1)
+    safe = mask.clone()
+    safe[empty, 0] = True
+    out, _ = attn(seed.expand(b, -1, -1), x, x, key_padding_mask=~safe)
+    result = out.squeeze(1)
+    result[empty] = 0.0
+    return result
 
-        # ---- enemy stream -------------------------------------------------
-        e_out = self._encode_set(
-            enemies, enemy_mask,
-            self.enemy_proj, self.enemy_attn, self.enemy_norm,
-            self.enemy_pool, self.enemy_pool_attn,
-            batch_size,
-        )
-
-        # ---- fuse ---------------------------------------------------------
-        return self.fusion(torch.cat([s, c_out, e_out], dim=-1))
-
-    @staticmethod
-    def _encode_set(
-        items: torch.Tensor,           # (B, N, feat_dim)
-        mask: torch.Tensor,            # (B, N)  -- 1.0 where present
-        proj: nn.Module,
-        self_attn: nn.MultiheadAttention,
-        norm: nn.LayerNorm,
-        pool_token: nn.Parameter,      # (1, 1, embed_dim)
-        pool_attn: nn.MultiheadAttention,
-        batch_size: int,
-    ) -> torch.Tensor:
-        """Project, self-attend, then pool a variable-length set.
-
-        Returns a (batch, embed_dim) tensor.  If the mask is all-False
-        for a sample, the output for that sample is zeros.
-        """
-        embed_dim = pool_token.shape[-1]
-
-        # Check for fully-empty masks (no items at all)
-        # key_padding_mask uses True to MASK (ignore) positions
-        key_pad = ~(mask.bool())  # (B, N) -- True where absent
-
-        # If every sample has at least one item we can run attention normally.
-        # If some samples are fully empty we need to handle them separately
-        # to avoid NaN from softmax over all-masked inputs.
-        any_present = mask.sum(dim=-1) > 0  # (B,) bool
-
-        if not any_present.any():
-            # All samples empty -- return zeros
-            return torch.zeros(batch_size, embed_dim, device=items.device)
-
-        # Project all items
-        x = proj(items)  # (B, N, embed_dim)
-
-        # Self-attention with padding mask
-        # For fully-empty rows, temporarily set one position as unmasked
-        # to prevent NaN, then zero out the result afterward.
-        safe_pad = key_pad.clone()
-        fully_empty = ~any_present  # (B,)
-        if fully_empty.any():
-            # Unmask position 0 for empty rows to prevent all-masked softmax
-            safe_pad[fully_empty, 0] = False
-
-        x_attn, _ = self_attn(x, x, x, key_padding_mask=safe_pad)
-        x = norm(x + x_attn)
-
-        # Learned pooling: cross-attend from a single query token
-        seed = pool_token.expand(batch_size, -1, -1)  # (B, 1, embed_dim)
-        pooled, _ = pool_attn(seed, x, x, key_padding_mask=safe_pad)
-        out = pooled.squeeze(1)  # (B, embed_dim)
-
-        # Zero out results for fully-empty rows
-        if fully_empty.any():
-            out = out * any_present.unsqueeze(-1).float()
-
-        return out
+def _masked_mean(x, mask):
+    b, _, d = x.shape
+    if not mask.any():
+        return torch.zeros(b, d, device=x.device)
+    m = mask.unsqueeze(-1).float()
+    return (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)

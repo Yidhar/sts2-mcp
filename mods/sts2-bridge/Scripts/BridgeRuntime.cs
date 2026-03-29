@@ -11,9 +11,24 @@ internal static class BridgeRuntime
     public const string BridgeName = "STS2 MCP Bridge";
     public const string BridgeVersion = "0.7.12";
     public const string StateSchemaVersion = "2026-03-20.1";
-    public const int PreferredPort = 27100;
-    public const int MaxPort = 27110;
+    public const int BasePreferredPort = 27100;
+    public const int PortsPerInstance = 10;
     public const bool VisibleOnly = true;
+
+    /// <summary>
+    /// Instance ID for parallel training. Set via STS2_BRIDGE_INSTANCE_ID env var.
+    /// Empty string means single-instance mode (default).
+    /// </summary>
+    public static string InstanceId { get; } =
+        Environment.GetEnvironmentVariable("STS2_BRIDGE_INSTANCE_ID") ?? "";
+
+    public static bool IsMultiInstance => InstanceId.Length > 0;
+
+    private static int InstancePortOffset =>
+        int.TryParse(InstanceId, out var id) ? id * PortsPerInstance : 0;
+
+    public static int PreferredPort => BasePreferredPort + InstancePortOffset;
+    public static int MaxPort => PreferredPort + PortsPerInstance - 1;
 
     public static int Port { get; private set; } = PreferredPort;
 
@@ -32,9 +47,12 @@ internal static class BridgeRuntime
         "SlayTheSpire2",
         "bridge");
 
+    private static string SessionFileName =>
+        IsMultiInstance ? $"session_{InstanceId}.json" : "session.json";
+
     public static string SessionFilePath { get; } = Path.Combine(
         SessionDirectoryPath,
-        "session.json");
+        SessionFileName);
 
     public static string GameAssemblyVersion =>
         typeof(Mod).Assembly.GetName().Version?.ToString() ?? "unknown";

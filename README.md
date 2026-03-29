@@ -44,6 +44,9 @@ The server exposes the following tools to any MCP-compliant agent (like Claude D
 | `sts2_pick_option` | Picks indexed reward/event/rest/card-selection options without raw action-id guessing. |
 | `sts2_travel_to_coordinate` | Resolves cleanup, waits for a stable map snapshot, and then travels to a coordinate. |
 | `sts2_resolve_shop_visit` | Buys multiple items and removes a card in a single batch. |
+| `sts2_env_spec` | Describes the compact RL-oriented environment contract exposed by the RL branch, including observation layout, action encoding, and reward shaping. |
+| `sts2_env_reset` | Starts a fresh standard run from the main menu and returns the first actionable RL observation plus legal actions. |
+| `sts2_env_step` | Executes one RL step, waits for the next stable actionable or terminal state, and returns `obs/reward/done/truncated/legal_actions`. |
 
 ---
 

@@ -11,6 +11,7 @@
   "scripts": {
     "start": "node index.js",
     "smoke:test": "node smoke-test.js",
-    "autoslay:run": "node autoslay-runner.js"
+    "autoslay:run": "node autoslay-runner.js",
+    "rl:smoke": "node rl-smoke-runner.js"
   }
 }

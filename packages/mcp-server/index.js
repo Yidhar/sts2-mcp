@@ -38,6 +38,40 @@ const ROOM_EXIT_SETTLE_POLL_INTERVAL_MS = 200;
 const MAP_ROUTE_SETTLE_TIMEOUT_MS = 4000;
 const MAP_ROUTE_SETTLE_POLL_INTERVAL_MS = 200;
 const MAP_ROUTE_STABLE_POLL_TARGET = 2;
+const RL_ENV_API_VERSION = "0.1.0";
+const RL_ENV_ACTION_ENCODING_ENUM = ["legal_action_idx", "action_id"];
+const DEFAULT_RL_RESET_TIMEOUT_MS = 45000;
+const DEFAULT_RL_STEP_TIMEOUT_MS = 20000;
+const RL_ENV_MAX_RESET_TRANSITIONS = 12;
+const RL_ENV_STABILITY_POLL_TIMEOUT_MS = 300;
+const RL_ENV_STABILITY_TARGET = 2;
+const RL_ENV_SURFACE_TYPES = [
+  "combat",
+  "reward",
+  "card_reward",
+  "card_selection",
+  "rest_site",
+  "deck_upgrade",
+  "shop",
+  "event",
+  "event_crystal_sphere",
+  "map",
+  "main_menu",
+  "run_mode_selection",
+  "character_selection",
+  "terminal",
+  "unknown"
+];
+const RL_REWARD_WEIGHTS = Object.freeze({
+  hp_delta_normalized: 1.0,
+  gold_delta: 0.005,
+  floor_delta: 0.25,
+  relic_delta: 0.5,
+  deck_delta: 0.05,
+  combat_win: 0.5,
+  death: -2.0,
+  victory: 3.0
+});
 const KNOWLEDGE_INPUT_TOPIC_ENUM = [
   "route-planning",
   "deck-building",
@@ -487,6 +521,74 @@ const TOOL_DEFINITIONS = [
     }
   },
   {
+    name: "sts2_env_spec",
+    description:
+      "Describe the compact RL-oriented single-environment contract exposed by this branch, including observation layout, legal-action encoding, reward shaping, and reset limitations.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_env_reset",
+    description:
+      "Start a fresh RL episode from the main menu using the standard run flow, optionally selecting a character, then return the first stable actionable observation plus legal actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        character: {
+          type: "string",
+          minLength: 1
+        },
+        defensive_buffs: {
+          type: "boolean",
+          description:
+            "When true, the episode applies RL-only defensive buffs such as full heal plus heavy combat plating/block maintenance."
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_WAIT_TIMEOUT_MS
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "sts2_env_step",
+    description:
+      "Execute one RL environment step against the active episode, automatically waiting until the next stable actionable or terminal state, then return obs, reward, done, truncated, and legal actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        episode_id: {
+          type: "string",
+          minLength: 1
+        },
+        action_encoding: {
+          type: "string",
+          enum: RL_ENV_ACTION_ENCODING_ENUM
+        },
+        action_index: {
+          type: "integer",
+          minimum: 0
+        },
+        action_id: {
+          type: "string",
+          minLength: 1
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 1,
+          maximum: MAX_WAIT_TIMEOUT_MS
+        }
+      },
+      required: ["episode_id"],
+      additionalProperties: false
+    }
+  },
+  {
     name: "sts2_journal_write",
     description:
       "Append a markdown journal entry to the current run's log file. Use this to record combat outcomes, route decisions, card evaluations, and post-mortem notes. Each entry is persisted as a markdown section with floor, tags, and timestamp.",
@@ -865,6 +967,9 @@ const TOOL_PROFILE_TOOL_NAMES = {
     "sts2_get_bridge_status",
     "sts2_get_state",
     "sts2_list_actions",
+    "sts2_env_spec",
+    "sts2_env_reset",
+    "sts2_env_step",
     "sts2_get_map_routes",
     "sts2_get_deck",
     "sts2_perform_action",
@@ -898,6 +1003,8 @@ let processingChain = Promise.resolve();
 let loggedFirstStdinChunk = false;
 let pendingMessageQueue = [];
 let activeBridgeEventClient = null;
+let rlEpisodeCounter = 0;
+let activeRlEpisode = null;
 
 logInfo(
   `process started pid=${process.pid} node=${process.version} cwd=${process.cwd()}`
@@ -1171,6 +1278,12 @@ async function handleToolCall(params) {
       return await waitForChangeTool(args);
     case "sts2_wait_until_actionable":
       return await waitUntilActionableTool(args);
+    case "sts2_env_spec":
+      return await envSpecTool();
+    case "sts2_env_reset":
+      return await envResetTool(args);
+    case "sts2_env_step":
+      return await envStepTool(args);
     case "sts2_journal_write":
       return await journalWriteTool(args);
     case "sts2_journal_read":
@@ -3259,6 +3372,7 @@ function summarizeActionableWaitState(state) {
   const cardSelectionBundle = buildCardSelectionBundle(state);
   const restSiteBundle = buildRestSiteBundle(state);
   const shopBundle = buildShopBundle(state);
+  const transientRoomEntryContinue = isRlTransientRoomEntryContinueState(state);
 
   let surface = null;
   if (rewardBundle.in_reward_flow) {
@@ -3268,9 +3382,7 @@ function summarizeActionableWaitState(state) {
   } else if (restSiteBundle.in_rest_site_flow) {
     surface =
       restSiteBundle.deck_upgrade_selection?.visible === true ? "deck_upgrade" : "rest_site";
-  } else if (shopBundle.in_shop_flow) {
-    surface = "shop";
-  } else if (state?.event_options?.visible === true) {
+  } else if (state?.event_options?.visible === true && !transientRoomEntryContinue) {
     surface = isCrystalSphereScreen(screen) ? "event_crystal_sphere" : "event";
   } else if (isMapReadyState(state)) {
     surface = "map";
@@ -3281,6 +3393,8 @@ function summarizeActionableWaitState(state) {
     state?.combat?.player_actions_disabled !== true
   ) {
     surface = "combat";
+  } else if (shopBundle.in_shop_flow) {
+    surface = "shop";
   } else if (actionIds.length > 0) {
     surface = "actions";
   }
@@ -3317,6 +3431,7 @@ function summarizeActionableWaitState(state) {
   }
 
   const actionable =
+    !transientRoomEntryContinue &&
     actionIds.length > 0 &&
     (typeof surface === "string" && surface.length > 0 || actionIds.length > 0);
 
@@ -3394,6 +3509,982 @@ async function waitUntilActionableTool(args) {
   } catch (error) {
     return asToolResult(toolErrorPayload(error), true);
   }
+}
+
+async function envSpecTool() {
+  try {
+    const session = getLiveSession();
+    const response = await bridgeRequestJson(session, "env/spec", {
+      method: "GET",
+      timeoutMs: DEFAULT_HTTP_TIMEOUT_MS
+    });
+    return asToolResult(response.payload, false);
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function envResetTool(args) {
+  try {
+    const session = getLiveSession();
+    const timeoutMs = clampInteger(
+      args.timeout_ms,
+      DEFAULT_RL_RESET_TIMEOUT_MS,
+      1,
+      MAX_WAIT_TIMEOUT_MS,
+      "timeout_ms"
+    );
+    const response = await bridgeRequestJson(session, "env/reset", {
+      method: "POST",
+      body: {
+        ...(typeof args.character === "string" ? { character: args.character } : {}),
+        ...(typeof args.defensive_buffs === "boolean"
+          ? { defensive_buffs: args.defensive_buffs }
+          : {}),
+        timeout_ms: timeoutMs
+      },
+      timeoutMs: DEFAULT_HTTP_TIMEOUT_MS + timeoutMs
+    });
+    return asToolResult(response.payload, false);
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function envStepTool(args) {
+  try {
+    const timeoutMs = clampInteger(
+      args.timeout_ms,
+      DEFAULT_RL_STEP_TIMEOUT_MS,
+      1,
+      MAX_WAIT_TIMEOUT_MS,
+      "timeout_ms"
+    );
+    const session = getLiveSession();
+    const body = {
+      episode_id: requireNonEmptyString(args.episode_id, "episode_id"),
+      timeout_ms: timeoutMs
+    };
+    if (Number.isInteger(args.action_index)) {
+      body.action_index = args.action_index;
+    }
+    if (typeof args.action_id === "string" && args.action_id.trim()) {
+      body.action_id = args.action_id;
+    }
+    const response = await bridgeRequestJson(session, "env/step", {
+      method: "POST",
+      body,
+      timeoutMs: DEFAULT_HTTP_TIMEOUT_MS + timeoutMs
+    });
+    return asToolResult(response.payload, false);
+  } catch (error) {
+    return asToolResult(toolErrorPayload(error), true);
+  }
+}
+
+async function waitForRlResetState(session, initialState, timeoutMs) {
+  const waitResult = await waitForRlActionableOrTerminalState(session, initialState, timeoutMs);
+  if (waitResult.timed_out === true && !isRlTerminalState(waitResult.state)) {
+    throw new ToolPayloadError(
+      "env_reset_timeout",
+      `sts2_env_reset did not reach a stable actionable state within ${timeoutMs} ms.`,
+      {
+        timeout_ms: timeoutMs,
+        screen: typeof waitResult?.state?.screen === "string" ? waitResult.state.screen : null,
+        surface: getRlSurfaceType(waitResult.state)
+      }
+    );
+  }
+
+  return waitResult.state;
+}
+
+async function waitForRlActionableOrTerminalState(session, initialState, timeoutMs) {
+  let state = isPlainObject(initialState) ? initialState : await getBridgeState(session);
+  const startedAt = Date.now();
+  let analysis = summarizeActionableWaitState(state);
+  let terminal = isRlTerminalState(state);
+  let stableFingerprint =
+    analysis.actionable || terminal ? getRlStableWaitFingerprint(state, analysis, terminal) : null;
+  let stableCount = stableFingerprint ? 1 : 0;
+
+  while (true) {
+    const elapsed = Date.now() - startedAt;
+    const remaining = timeoutMs - elapsed;
+    if (remaining <= 0) {
+      return {
+        state,
+        actionable: analysis.actionable,
+        terminal,
+        timed_out: true,
+        surface: getRlSurfaceType(state)
+      };
+    }
+
+    if ((analysis.actionable || terminal) && stableCount >= RL_ENV_STABILITY_TARGET) {
+      return {
+        state,
+        actionable: analysis.actionable,
+        terminal,
+        timed_out: false,
+        surface: getRlSurfaceType(state)
+      };
+    }
+
+    const sliceTimeout = Math.min(remaining, RL_ENV_STABILITY_POLL_TIMEOUT_MS);
+    try {
+      state = await waitForBridgeStateEvent(session, {
+        timeout_ms: sliceTimeout,
+        after_state_version: getStateVersionValue(state) ?? undefined,
+        predicate: () => true
+      });
+      analysis = summarizeActionableWaitState(state);
+      terminal = isRlTerminalState(state);
+
+      if (analysis.actionable || terminal) {
+        const nextFingerprint = getRlStableWaitFingerprint(state, analysis, terminal);
+        if (nextFingerprint === stableFingerprint) {
+          stableCount += 1;
+        } else {
+          stableFingerprint = nextFingerprint;
+          stableCount = 1;
+        }
+      } else {
+        stableFingerprint = null;
+        stableCount = 0;
+      }
+    } catch (error) {
+      if (!(error instanceof ToolPayloadError) || error.code !== "bridge_event_wait_timeout") {
+        throw error;
+      }
+
+      const lastState =
+        ensureBridgeEventClient(session).getCachedState(Number.POSITIVE_INFINITY) ?? state;
+      state = lastState;
+      analysis = summarizeActionableWaitState(lastState);
+      terminal = isRlTerminalState(lastState);
+      if (analysis.actionable || terminal) {
+        return {
+          state: lastState,
+          actionable: analysis.actionable,
+          terminal,
+          timed_out: false,
+          surface: getRlSurfaceType(lastState)
+        };
+      }
+    }
+  }
+}
+
+function getRlStableWaitFingerprint(state, analysis, terminal) {
+  if (terminal) {
+    return JSON.stringify({
+      terminal: true,
+      outcome: getRlTerminalOutcome(state)
+    });
+  }
+
+  return analysis?.fingerprint ?? null;
+}
+
+function isRlTransientRoomEntryContinueState(state) {
+  if (!isPlainObject(state) || state?.event_options?.visible !== true) {
+    return false;
+  }
+
+  const roomType = getRlCurrentRoomType(state);
+  if (roomType === "Event") {
+    return false;
+  }
+
+  const options = Array.isArray(state.event_options.options)
+    ? state.event_options.options.filter((option) => isPlainObject(option))
+    : [];
+  if (options.length !== 1 || options[0]?.is_proceed !== true) {
+    return false;
+  }
+
+  return true;
+}
+
+function getRlCurrentRoomType(state) {
+  if (typeof state?.run?.current_room?.room_type === "string") {
+    return state.run.current_room.room_type;
+  }
+
+  return typeof state?.run?.room_type === "string" ? state.run.room_type : null;
+}
+
+function buildRlStepPayload(options) {
+  const episode = options.episode;
+  const beforeState = options.beforeState;
+  const afterState = options.afterState;
+  const selectedAction = options.selectedAction ?? null;
+  const truncated = options.truncated === true;
+  const truncationReason =
+    typeof options.truncationReason === "string" ? options.truncationReason : null;
+  const rewardBreakdown =
+    isPlainObject(options.precomputedRewardBreakdown)
+      ? options.precomputedRewardBreakdown
+      : buildRlRewardBreakdown(beforeState, afterState);
+  const done = isRlTerminalState(afterState) || truncated;
+
+  return {
+    ok: true,
+    episode_id: episode.id,
+    step_index: episode.step_index,
+    reward: Number.isFinite(rewardBreakdown.total) ? rewardBreakdown.total : 0,
+    done,
+    truncated,
+    obs: buildRlObservation(afterState),
+    legal_actions: done ? [] : buildRlLegalActions(afterState),
+    info: {
+      action: selectedAction
+        ? {
+          idx: Number.isInteger(selectedAction.idx) ? selectedAction.idx : null,
+          key: typeof selectedAction.key === "string" ? selectedAction.key : null,
+          action_id: selectedAction.action_id,
+          kind: selectedAction.kind ?? null,
+          label: selectedAction.label ?? null
+        }
+        : null,
+      surface_before: getRlSurfaceType(beforeState),
+      surface_after: getRlSurfaceType(afterState),
+      state_version_before: getStateVersionValue(beforeState),
+      state_version_after: getStateVersionValue(afterState),
+      truncation_reason: truncationReason,
+      reward_breakdown: rewardBreakdown,
+      bridge: summarizeRlBridgeActionInfo(options.bridgeActionResult)
+    }
+  };
+}
+
+function buildRlObservation(state) {
+  if (!isPlainObject(state)) {
+    return null;
+  }
+
+  const summary = summarizeStateForAgent(state);
+  const player = isPlainObject(summary?.player) ? summary.player : {};
+  const run = isPlainObject(summary?.run) ? summary.run : {};
+  const combat = isPlainObject(summary?.combat) ? summary.combat : {};
+
+  const observation = {
+    screen: typeof summary?.screen === "string" ? summary.screen : null,
+    state_version: Number.isFinite(summary?.state_version) ? summary.state_version : null,
+    run: {
+      has_run: state?.run?.has_run === true,
+      is_game_over: run.is_game_over === true,
+      act: typeof run.act === "string" ? run.act : null,
+      act_floor: Number.isFinite(run.act_floor) ? run.act_floor : null,
+      total_floor: Number.isFinite(run.total_floor) ? run.total_floor : null,
+      room_type: typeof run.room_type === "string" ? run.room_type : null,
+      room_model: typeof run.room_model === "string" ? run.room_model : null,
+      current_map_coord: isPlainObject(run.current_map_coord) ? run.current_map_coord : null
+    },
+    player: {
+      current_hp: Number.isFinite(player.current_hp) ? player.current_hp : null,
+      max_hp: Number.isFinite(player.max_hp) ? player.max_hp : null,
+      block: Number.isFinite(player.block) ? player.block : 0,
+      gold: Number.isFinite(player.gold) ? player.gold : null,
+      powers: Array.isArray(player.powers) ? player.powers : [],
+      potions: Array.isArray(player.potions) ? player.potions : [],
+      relics: Array.isArray(player.relics) ? player.relics : []
+    },
+    surface: buildRlSurface(state, summary)
+  };
+
+  if (isPlainObject(summary?.combat)) {
+    observation.combat = {
+      in_progress: combat.in_progress === true,
+      round_number: Number.isFinite(combat.round_number) ? combat.round_number : null,
+      current_side: typeof combat.current_side === "string" ? combat.current_side : null,
+      is_play_phase: combat.is_play_phase === true,
+      player_actions_disabled: combat.player_actions_disabled === true,
+      energy: Number.isFinite(combat.energy) ? combat.energy : null,
+      max_energy: Number.isFinite(combat.max_energy) ? combat.max_energy : null,
+      stars: Number.isFinite(combat.stars) ? combat.stars : null,
+      hand: Array.isArray(combat.hand) ? combat.hand : [],
+      draw_pile_count: Number.isFinite(combat.draw_pile_count) ? combat.draw_pile_count : null,
+      discard_pile_count: Number.isFinite(combat.discard_pile_count)
+        ? combat.discard_pile_count
+        : null,
+      exhaust_pile_count: Number.isFinite(combat.exhaust_pile_count)
+        ? combat.exhaust_pile_count
+        : null,
+      summons: Array.isArray(combat.summons) ? combat.summons : [],
+      enemies: Array.isArray(combat.enemies) ? combat.enemies : [],
+      target_index_map: Array.isArray(combat.target_index_map) ? combat.target_index_map : []
+    };
+  }
+
+  return observation;
+}
+
+function buildRlSurface(state, summary = null) {
+  const screen = typeof state?.screen === "string" ? state.screen : null;
+
+  if (state?.run_mode_selection?.visible === true) {
+    return buildRlRunModeSurface(state?.run_mode_selection);
+  }
+
+  if (state?.character_selection?.visible === true) {
+    return buildRlCharacterSelectionSurface(state?.character_selection);
+  }
+
+  if (state?.main_menu?.visible === true || screen === "MAIN_MENU") {
+    return buildRlMainMenuSurface(state?.main_menu);
+  }
+
+  const rewardBundle = buildRewardBundle(state);
+  if (rewardBundle.card_reward_selection.visible) {
+    return {
+      type: "card_reward",
+      options: rewardBundle.card_reward_selection.options
+        .map((option) => summarizeIndexedOptionForAgent("card_reward", option))
+        .filter((option) => option !== null),
+      can_skip: rewardBundle.card_reward_selection.skip_visible === true
+    };
+  }
+
+  if (rewardBundle.in_reward_flow) {
+    return {
+      type: "reward",
+      options: rewardBundle.rewards.entries
+        .map((entry) => summarizeIndexedOptionForAgent("reward", entry))
+        .filter((entry) => entry !== null),
+      has_proceed: rewardBundle.has_proceed === true
+    };
+  }
+
+  const cardSelectionBundle = buildCardSelectionBundle(state);
+  if (cardSelectionBundle.in_card_selection_flow) {
+    return {
+      type: "card_selection",
+      prompt: normalizeAgentText(cardSelectionBundle.card_selection.prompt),
+      selected_count: Number.isInteger(cardSelectionBundle.card_selection.selected_count)
+        ? cardSelectionBundle.card_selection.selected_count
+        : null,
+      min_select: Number.isInteger(cardSelectionBundle.card_selection.min_select)
+        ? cardSelectionBundle.card_selection.min_select
+        : null,
+      max_select: Number.isInteger(cardSelectionBundle.card_selection.max_select)
+        ? cardSelectionBundle.card_selection.max_select
+        : null,
+      options: cardSelectionBundle.card_selection.options
+        .map((option) => summarizeIndexedOptionForAgent("card_selection", option))
+        .filter((option) => option !== null)
+    };
+  }
+
+  const restSiteBundle = buildRestSiteBundle(state);
+  if (restSiteBundle.deck_upgrade_selection.visible) {
+    return {
+      type: "deck_upgrade",
+      options: restSiteBundle.deck_upgrade_selection.options
+        .map((option) => summarizeIndexedOptionForAgent("deck_upgrade", option))
+        .filter((option) => option !== null)
+    };
+  }
+
+  if (restSiteBundle.in_rest_site_flow) {
+    return {
+      type: "rest_site",
+      prompt: normalizeAgentText(restSiteBundle.rest_site.header),
+      options: restSiteBundle.rest_site.options
+        .map((option) => summarizeIndexedOptionForAgent("rest_site", option))
+        .filter((option) => option !== null)
+    };
+  }
+
+  if (isCrystalSphereScreen(screen)) {
+    return {
+      type: "event_crystal_sphere",
+      details: summarizeCrystalSphereForAgent(state?.crystal_sphere, state?.event_options?.options)
+    };
+  }
+
+  if (state?.event_options?.visible === true && !isRlTransientRoomEntryContinueState(state)) {
+    return {
+      type: "event",
+      options: Array.isArray(state.event_options.options)
+        ? state.event_options.options
+          .map(summarizeEventOptionForAgent)
+          .filter((option) => option !== null)
+        : []
+    };
+  }
+
+  if (isMapReadyState(state)) {
+    const map = isPlainObject(summary?.map) ? summary.map : {};
+    return {
+      type: "map",
+      current_coord: isPlainObject(map.current_coord) ? map.current_coord : null,
+      travelable_points: Array.isArray(map.travelable_points) ? map.travelable_points : []
+    };
+  }
+
+  if (
+    state?.combat?.in_progress === true &&
+    state?.combat?.current_side === "Player" &&
+    state?.combat?.is_play_phase === true &&
+    state?.combat?.player_actions_disabled !== true
+  ) {
+    return {
+      type: "combat"
+    };
+  }
+
+  const shopBundle = buildShopBundle(state);
+  if (shopBundle.in_shop_flow) {
+    return {
+      type: "shop",
+      is_open: shopBundle.shop.is_open === true,
+      gold: Number.isFinite(shopBundle.shop.gold) ? shopBundle.shop.gold : null,
+      items: shopBundle.shop.items
+        .map((item) => summarizeShopItemForAgent(item))
+        .filter((item) => item !== null)
+    };
+  }
+
+  if (isRlTerminalState(state)) {
+    return {
+      type: "terminal",
+      outcome: getRlTerminalOutcome(state)
+    };
+  }
+
+  return {
+    type: "unknown"
+  };
+}
+
+function buildRlMainMenuSurface(mainMenu) {
+  const options = [];
+  if (isPlainObject(mainMenu?.continue_button) && mainMenu.continue_button.visible === true) {
+    options.push({
+      semantic_action: "continue",
+      text: normalizeAgentText(mainMenu.continue_button.text)
+    });
+  }
+
+  if (Array.isArray(mainMenu?.buttons)) {
+    for (const button of mainMenu.buttons) {
+      if (!isPlainObject(button) || button.visible !== true) {
+        continue;
+      }
+
+      options.push({
+        semantic_action:
+          typeof button.semantic_action === "string" ? button.semantic_action : null,
+        text: normalizeAgentText(button.text)
+      });
+    }
+  }
+
+  if (mainMenu?.abandon_confirm?.visible === true && Array.isArray(mainMenu.abandon_confirm.buttons)) {
+    for (const button of mainMenu.abandon_confirm.buttons) {
+      if (!isPlainObject(button) || button.visible !== true) {
+        continue;
+      }
+
+      options.push({
+        semantic_action:
+          typeof button.semantic_action === "string" ? button.semantic_action : null,
+        text: normalizeAgentText(button.text)
+      });
+    }
+  }
+
+  return {
+    type: "main_menu",
+    options
+  };
+}
+
+function buildRlRunModeSurface(runModeSelection) {
+  const options = Array.isArray(runModeSelection?.options)
+    ? runModeSelection.options
+      .filter((option) => isPlainObject(option) && option.visible === true)
+      .map((option) => ({
+        semantic_action:
+          typeof option.semantic_action === "string" ? option.semantic_action : null,
+        text: normalizeAgentText(option.text ?? option.label)
+      }))
+    : [];
+
+  if (isPlainObject(runModeSelection?.back_button) && runModeSelection.back_button.visible === true) {
+    options.push({
+      semantic_action:
+        typeof runModeSelection.back_button.semantic_action === "string"
+          ? runModeSelection.back_button.semantic_action
+          : "back",
+      text: normalizeAgentText(runModeSelection.back_button.text ?? runModeSelection.back_button.label)
+    });
+  }
+
+  return {
+    type: "run_mode_selection",
+    options
+  };
+}
+
+function buildRlCharacterSelectionSurface(characterSelection) {
+  const options = Array.isArray(characterSelection?.options)
+    ? characterSelection.options
+      .filter((option) => isPlainObject(option))
+      .map((option) => ({
+        index: Number.isInteger(option.index) ? option.index : null,
+        title: normalizeAgentText(option?.character?.title),
+        id: typeof option?.character?.id === "string" ? option.character.id : null,
+        is_selected: option.is_selected === true,
+        is_locked: option.is_locked === true,
+        is_random: option.is_random === true
+      }))
+    : [];
+
+  return {
+    type: "character_selection",
+    selected_index: Number.isInteger(characterSelection?.selected_index)
+      ? characterSelection.selected_index
+      : null,
+    selected_character: normalizeAgentText(characterSelection?.selected_character?.title),
+    can_embark: characterSelection?.can_embark === true,
+    options
+  };
+}
+
+function buildRlLegalActions(state) {
+  return getNonAutomationActions(state).map((action, idx) => summarizeRlLegalAction(action, idx));
+}
+
+function summarizeRlLegalAction(action, idx) {
+  const summary = {
+    idx,
+    key: typeof action?.action_id === "string" ? action.action_id : String(idx),
+    action_id: typeof action?.action_id === "string" ? action.action_id : null,
+    kind: typeof action?.kind === "string" ? action.kind : null,
+    label: normalizeAgentText(action?.label)
+  };
+
+  if (typeof action?.card?.title === "string" && action.card.title.trim()) {
+    summary.title = normalizeAgentText(action.card.title);
+    if (Number.isInteger(action.card.resolved_energy_cost)) {
+      summary.cost = action.card.resolved_energy_cost;
+    }
+    const starCost = readAgentCardStarCost(action.card);
+    if (starCost !== null) {
+      summary.star_cost = starCost;
+    }
+  } else if (typeof action?.potion?.title === "string" && action.potion.title.trim()) {
+    summary.title = normalizeAgentText(action.potion.title);
+  }
+
+  const targetName =
+    typeof action?.target_name === "string"
+      ? normalizeAgentText(action.target_name)
+      : normalizeAgentText(action?.target?.name);
+  if (targetName) {
+    summary.target = targetName;
+  }
+
+  return summary;
+}
+
+function resolveRlStepAction(state, args) {
+  const legalActions = buildRlLegalActions(state);
+  const actionEncoding = normalizeRlActionEncoding(args);
+  if (actionEncoding === "action_id") {
+    const requestedActionId = requireNonEmptyString(args.action_id, "action_id");
+    const matched = legalActions.find((action) => action.action_id === requestedActionId) ?? null;
+    if (matched) {
+      return matched;
+    }
+
+    throw new ToolPayloadError(
+      "rl_action_not_available",
+      `Action '${requestedActionId}' is not currently legal.`,
+      {
+        action_id: requestedActionId,
+        legal_actions: legalActions
+      }
+    );
+  }
+
+  const requestedIndex = optionalInteger(args.action_index, "action_index");
+  if (!Number.isInteger(requestedIndex)) {
+    throw new ToolPayloadError(
+      "invalid_arguments",
+      "action_index must be provided when action_encoding is legal_action_idx.",
+      {
+        field: "action_index"
+      }
+    );
+  }
+
+  const matched = legalActions.find((action) => action.idx === requestedIndex) ?? null;
+  if (matched) {
+    return matched;
+  }
+
+  throw new ToolPayloadError(
+    "rl_action_not_available",
+    `Action index ${requestedIndex} is out of range for the current legal action set.`,
+    {
+      action_index: requestedIndex,
+      legal_actions: legalActions
+    }
+  );
+}
+
+function normalizeRlActionEncoding(args) {
+  const normalized = optionalString(args?.action_encoding, "action_encoding");
+  if (normalized === undefined || normalized === null || normalized.length <= 0) {
+    return typeof args?.action_id === "string" && args.action_id.trim()
+      ? "action_id"
+      : "legal_action_idx";
+  }
+
+  if (RL_ENV_ACTION_ENCODING_ENUM.includes(normalized)) {
+    return normalized;
+  }
+
+  throw new ToolPayloadError(
+    "invalid_arguments",
+    `action_encoding must be one of ${RL_ENV_ACTION_ENCODING_ENUM.join(", ")}.`,
+    {
+      field: "action_encoding"
+    }
+  );
+}
+
+function requireActiveRlEpisode(episodeId) {
+  if (!isPlainObject(activeRlEpisode)) {
+    throw new ToolPayloadError(
+      "no_active_episode",
+      "No active RL episode is currently registered. Call sts2_env_reset first."
+    );
+  }
+
+  if (activeRlEpisode.id !== episodeId) {
+    throw new ToolPayloadError(
+      "episode_id_mismatch",
+      `Episode '${episodeId}' is not the active RL episode.`,
+      {
+        episode_id: episodeId,
+        active_episode_id: activeRlEpisode.id
+      }
+    );
+  }
+
+  return activeRlEpisode;
+}
+
+function createRlEpisode(config = {}) {
+  rlEpisodeCounter += 1;
+  activeRlEpisode = {
+    id: `rl_ep_${rlEpisodeCounter.toString().padStart(4, "0")}`,
+    step_index: 0,
+    started_at_utc: new Date().toISOString(),
+    done: false,
+    config: {
+      character: typeof config.character === "string" ? config.character : null
+    }
+  };
+  return activeRlEpisode;
+}
+
+function chooseRlResetAction(state, requestedCharacter) {
+  if (!isPlainObject(state)) {
+    return null;
+  }
+
+  const legalActions = getNonAutomationActions(state);
+  if (state?.run_mode_selection?.visible === true) {
+    return findRlResetActionById(legalActions, "run_mode:standard");
+  }
+
+  if (state?.character_selection?.visible === true) {
+    if (typeof requestedCharacter === "string" && requestedCharacter.trim()) {
+      const selectedOption = findRlCharacterOptionMatch(state, requestedCharacter);
+      if (!selectedOption) {
+        throw new ToolPayloadError(
+          "unknown_character",
+          `Character '${requestedCharacter}' is not visible on the current character selection screen.`,
+          {
+            character: requestedCharacter,
+            available_characters: summarizeRlAvailableCharacters(state)
+          }
+        );
+      }
+
+      if (selectedOption.is_selected !== true) {
+        return findRlResetActionById(legalActions, `character_select:${selectedOption.index}`);
+      }
+    }
+
+    return (
+      findRlResetActionById(legalActions, "embark") ??
+      legalActions.find(
+        (action) =>
+          typeof action?.action_id === "string" && action.action_id.startsWith("character_select:")
+      ) ??
+      null
+    );
+  }
+
+  const mainMenuVisible = state?.main_menu?.visible === true || state?.screen === "MAIN_MENU";
+  if (mainMenuVisible) {
+    return (
+      findRlResetActionById(legalActions, "main_menu:abandon_current_game") ??
+      findRlResetActionById(legalActions, "main_menu:confirm_abandon_run") ??
+      findRlResetActionById(legalActions, "main_menu:new_game") ??
+      findRlResetActionById(legalActions, "main_menu:singleplayer")
+    );
+  }
+
+  return null;
+}
+
+function findRlResetActionById(actions, actionId) {
+  if (!Array.isArray(actions) || typeof actionId !== "string") {
+    return null;
+  }
+
+  const matched = actions.find((action) => action?.action_id === actionId) ?? null;
+  if (!matched) {
+    return null;
+  }
+
+  return {
+    action_id: matched.action_id,
+    label: normalizeAgentText(matched.label)
+  };
+}
+
+function findRlCharacterOptionMatch(state, requestedCharacter) {
+  const options = Array.isArray(state?.character_selection?.options)
+    ? state.character_selection.options.filter((option) => isPlainObject(option))
+    : [];
+  if (options.length <= 0) {
+    return null;
+  }
+
+  const normalizedRequested = normalizeRlLooseText(requestedCharacter);
+  return (
+    options.find((option) => {
+      const title = normalizeRlLooseText(option?.character?.title);
+      const id = normalizeRlLooseText(option?.character?.id);
+      return normalizedRequested === title || normalizedRequested === id;
+    }) ?? null
+  );
+}
+
+function summarizeRlAvailableCharacters(state) {
+  return Array.isArray(state?.character_selection?.options)
+    ? state.character_selection.options
+      .filter((option) => isPlainObject(option))
+      .map((option) => ({
+        index: Number.isInteger(option.index) ? option.index : null,
+        title: normalizeAgentText(option?.character?.title),
+        id: typeof option?.character?.id === "string" ? option.character.id : null,
+        is_locked: option.is_locked === true,
+        is_random: option.is_random === true
+      }))
+    : [];
+}
+
+function isRlStartupSurfaceState(state) {
+  return (
+    isPlainObject(state) &&
+    (state?.main_menu?.visible === true ||
+      state?.screen === "MAIN_MENU" ||
+      state?.run_mode_selection?.visible === true ||
+      state?.character_selection?.visible === true)
+  );
+}
+
+function isRlActiveRunState(state) {
+  return state?.run?.has_run === true && state?.run?.is_game_over !== true;
+}
+
+function isRlFreshEpisodeReadyState(state) {
+  return (
+    isRlActiveRunState(state) &&
+    !isRlStartupSurfaceState(state) &&
+    summarizeActionableWaitState(state).actionable
+  );
+}
+
+function isRlTerminalState(state) {
+  return state?.run?.has_run === true && state?.run?.is_game_over === true;
+}
+
+function getRlTerminalOutcome(state) {
+  if (!isRlTerminalState(state)) {
+    return null;
+  }
+
+  const currentHp = Number.isFinite(state?.players?.[0]?.creature?.current_hp)
+    ? state.players[0].creature.current_hp
+    : null;
+  if (currentHp !== null && currentHp <= 0) {
+    return "death";
+  }
+
+  return "victory";
+}
+
+function getRlSurfaceType(state) {
+  const surface = buildRlSurface(state);
+  return typeof surface?.type === "string" ? surface.type : "unknown";
+}
+
+function summarizeRlRunContext(state) {
+  return {
+    has_run: state?.run?.has_run === true,
+    is_game_over: state?.run?.is_game_over === true,
+    total_floor: Number.isInteger(state?.run?.total_floor) ? state.run.total_floor : null,
+    act_floor: Number.isInteger(state?.run?.act_floor) ? state.run.act_floor : null
+  };
+}
+
+function buildRlRewardBreakdown(beforeState, afterState) {
+  const hpBefore = Number.isFinite(beforeState?.players?.[0]?.creature?.current_hp)
+    ? beforeState.players[0].creature.current_hp
+    : null;
+  const hpAfter = Number.isFinite(afterState?.players?.[0]?.creature?.current_hp)
+    ? afterState.players[0].creature.current_hp
+    : null;
+  const maxHp =
+    (Number.isFinite(afterState?.players?.[0]?.creature?.max_hp)
+      ? afterState.players[0].creature.max_hp
+      : null) ??
+    (Number.isFinite(beforeState?.players?.[0]?.creature?.max_hp)
+      ? beforeState.players[0].creature.max_hp
+      : null);
+  const hpDelta =
+    Number.isFinite(hpBefore) && Number.isFinite(hpAfter) ? hpAfter - hpBefore : 0;
+  const hpDeltaNormalized =
+    Number.isFinite(maxHp) && maxHp > 0 ? hpDelta / maxHp : 0;
+  const goldDelta = getRlPlayerGold(afterState) - getRlPlayerGold(beforeState);
+  const floorDelta = getRlTotalFloor(afterState) - getRlTotalFloor(beforeState);
+  const relicDelta = countRlPlayerRelics(afterState) - countRlPlayerRelics(beforeState);
+  const deckDelta = countRlPlayerDeckEntries(afterState) - countRlPlayerDeckEntries(beforeState);
+  const combatWin = didRlCombatWin(beforeState, afterState) ? 1 : 0;
+  const death = getRlTerminalOutcome(afterState) === "death" ? 1 : 0;
+  const victory = getRlTerminalOutcome(afterState) === "victory" ? 1 : 0;
+  const total =
+    hpDeltaNormalized * RL_REWARD_WEIGHTS.hp_delta_normalized +
+    goldDelta * RL_REWARD_WEIGHTS.gold_delta +
+    floorDelta * RL_REWARD_WEIGHTS.floor_delta +
+    relicDelta * RL_REWARD_WEIGHTS.relic_delta +
+    deckDelta * RL_REWARD_WEIGHTS.deck_delta +
+    combatWin * RL_REWARD_WEIGHTS.combat_win +
+    death * RL_REWARD_WEIGHTS.death +
+    victory * RL_REWARD_WEIGHTS.victory;
+
+  return {
+    hp_delta: hpDelta,
+    hp_delta_normalized: roundRlNumber(hpDeltaNormalized),
+    gold_delta: goldDelta,
+    floor_delta: floorDelta,
+    relic_delta: relicDelta,
+    deck_delta: deckDelta,
+    combat_win: combatWin,
+    death,
+    victory,
+    total: roundRlNumber(total)
+  };
+}
+
+function didRlCombatWin(beforeState, afterState) {
+  const beforeCombat = beforeState?.combat?.in_progress === true;
+  const afterCombat = afterState?.combat?.in_progress === true;
+  return (
+    beforeCombat &&
+    !afterCombat &&
+    afterState?.run?.is_game_over !== true &&
+    afterState?.run?.current_room?.is_pre_finished === true
+  );
+}
+
+function getRlPlayerGold(state) {
+  return Number.isFinite(state?.players?.[0]?.gold) ? state.players[0].gold : 0;
+}
+
+function getRlTotalFloor(state) {
+  return Number.isFinite(state?.run?.total_floor) ? state.run.total_floor : 0;
+}
+
+function countRlPlayerRelics(state) {
+  return Array.isArray(state?.players?.[0]?.relics) ? state.players[0].relics.length : 0;
+}
+
+function countRlPlayerDeckEntries(state) {
+  if (Number.isInteger(state?.players?.[0]?.deck?.count)) {
+    return state.players[0].deck.count;
+  }
+
+  return Array.isArray(state?.players?.[0]?.deck?.cards) ? state.players[0].deck.cards.length : 0;
+}
+
+function summarizeRlBridgeActionInfo(result) {
+  if (!isPlainObject(result)) {
+    return null;
+  }
+
+  const info = {
+    screen_after:
+      typeof result.screen_after === "string"
+        ? result.screen_after
+        : typeof result?.state?.screen === "string"
+          ? result.state.screen
+          : null,
+    state_version_after: Number.isInteger(result.state_version_after)
+      ? result.state_version_after
+      : getStateVersionValue(result.state)
+  };
+
+  if (isPlainObject(result.recovered_from_state_version_conflict)) {
+    info.recovered_from_state_version_conflict = result.recovered_from_state_version_conflict;
+  }
+
+  if (result.post_action_settled === true || typeof result.post_action_settle_reason === "string") {
+    info.post_action_settle_reason =
+      typeof result.post_action_settle_reason === "string"
+        ? result.post_action_settle_reason
+        : null;
+  }
+
+  return info;
+}
+
+function normalizeRlLooseText(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.replace(/\s+/g, "").replace(/[^\p{L}\p{N}]+/gu, "").toLowerCase();
+}
+
+function roundRlNumber(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(6)) : 0;
+}
+
+function getRemainingTimeoutMs(startedAt, timeoutMs) {
+  const elapsed = Date.now() - startedAt;
+  if (elapsed >= timeoutMs) {
+    throw new ToolPayloadError(
+      "timeout",
+      `Operation exceeded the timeout budget of ${timeoutMs} ms.`,
+      {
+        timeout_ms: timeoutMs
+      }
+    );
+  }
+
+  return timeoutMs - elapsed;
 }
 
 async function resolveShopVisitTool(args) {
@@ -4287,6 +5378,14 @@ function getScreenTransitionSettlementVerdict(actionId, state, initialScreen, st
       };
     }
 
+    const outOfCombatReason = getOutOfCombatStableStateReason(state);
+    if (outOfCombatReason) {
+      return {
+        settled: true,
+        reason: outOfCombatReason
+      };
+    }
+
     return {
       settled: false,
       reason:
@@ -4429,6 +5528,10 @@ function getRestSiteFlowReadyReason(state) {
 
 function getEventFlowReadyReason(state) {
   if (state?.event_options?.visible !== true) {
+    return null;
+  }
+
+  if (isRlTransientRoomEntryContinueState(state)) {
     return null;
   }
 
@@ -4639,7 +5742,7 @@ function getOutOfCombatStableStateReason(state) {
     return "map_ready";
   }
 
-  if (state?.event_options?.visible === true) {
+  if (state?.event_options?.visible === true && !isRlTransientRoomEntryContinueState(state)) {
     return "event_ready";
   }
 
@@ -9949,9 +11052,21 @@ function compactRewardResolverExecutedActions(actions) {
     return [];
   }
 
-  return actions
+  const compacted = actions
     .map((action) => compactRewardResolverExecutedAction(action))
     .filter((action) => action !== null);
+
+  const deduped = [];
+  for (const action of compacted) {
+    const previous = deduped.length > 0 ? deduped[deduped.length - 1] : null;
+    if (areCompactedActionsEquivalent(previous, action)) {
+      continue;
+    }
+
+    deduped.push(action);
+  }
+
+  return deduped;
 }
 
 function compactRewardResolverExecutedAction(action) {
@@ -9959,7 +11074,12 @@ function compactRewardResolverExecutedAction(action) {
     return null;
   }
 
-  const actionId = typeof action.action_id === "string" ? action.action_id : null;
+  const rawActionId = typeof action.action_id === "string" ? action.action_id : null;
+  if (!rawActionId) {
+    return null;
+  }
+
+  const actionId = getCompactRewardResolverActionId(rawActionId);
   if (!actionId) {
     return null;
   }
@@ -10010,6 +11130,54 @@ function compactRewardResolverExecutedAction(action) {
   }
 
   return summary;
+}
+
+function getCompactRewardResolverActionId(actionId) {
+  if (typeof actionId !== "string" || actionId.length <= 0) {
+    return null;
+  }
+
+  if (actionId.startsWith("reward:")) {
+    return "reward";
+  }
+
+  if (actionId === "card_reward:skip") {
+    return "card_reward:skip";
+  }
+
+  if (actionId.startsWith("card_reward:")) {
+    return "card_reward:pick";
+  }
+
+  return actionId;
+}
+
+function areCompactedActionsEquivalent(left, right) {
+  if (left === null || right === null) {
+    return false;
+  }
+
+  if (typeof left === "string" || typeof right === "string") {
+    return left === right;
+  }
+
+  if (!isPlainObject(left) || !isPlainObject(right)) {
+    return false;
+  }
+
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  for (let index = 0; index < leftKeys.length; index += 1) {
+    if (leftKeys[index] !== rightKeys[index]) {
+      return false;
+    }
+  }
+
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function compactShopLikeExecutedActions(actions) {
