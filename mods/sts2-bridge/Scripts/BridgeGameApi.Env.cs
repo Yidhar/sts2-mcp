@@ -336,7 +336,7 @@ internal static partial class BridgeGameApi
             episode.StepIndex++;
             episode.Done = true;
             return BuildEnvStepPayload(episode, before, after, selectedAction,
-                truncated: false, truncationReason: null, actionError);
+                truncated: false, truncationReason: null, actionError, forceDone: true);
         }
 
         episode.StepIndex++;

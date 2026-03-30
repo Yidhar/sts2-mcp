@@ -488,7 +488,8 @@ internal static partial class BridgeGameApi
         BridgeResolvedActionSelection? selectedAction,
         bool truncated,
         string? truncationReason,
-        string? actionError = null)
+        string? actionError = null,
+        bool forceDone = false)
     {
         var rewardBreakdown = BuildEnvRewardBreakdown(
             episode,
@@ -497,7 +498,7 @@ internal static partial class BridgeGameApi
             selectedAction,
             truncated,
             actionError);
-        var done = after.Done || truncated;
+        var done = forceDone || after.Done || truncated;
         SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
         {
@@ -540,19 +541,84 @@ internal static partial class BridgeGameApi
         BridgeEnvSnapshot snapshot,
         CancellationToken cancellationToken)
     {
-        if (!episode.DefensiveBuffs || !snapshot.RunActive)
+        if (episode.DefensiveBuffs && snapshot.RunActive)
+        {
+            var changed = await BridgeCoordinator.RunOnMainThreadAsync(() => ApplyEnvDefensiveBuffs(CaptureContext()));
+            if (changed)
+            {
+                await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+                snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
+            }
+        }
+
+        if (episode.EpisodeMode == "combat_sandbox")
+        {
+            snapshot = StabilizeCombatSandboxRunSnapshot(snapshot);
+        }
+
+        return snapshot;
+    }
+
+    private static BridgeEnvSnapshot StabilizeCombatSandboxRunSnapshot(BridgeEnvSnapshot snapshot)
+    {
+        var runState = snapshot.Context.RunState;
+        if (runState is null)
         {
             return snapshot;
         }
 
-        var changed = await BridgeCoordinator.RunOnMainThreadAsync(() => ApplyEnvDefensiveBuffs(CaptureContext()));
-        if (!changed)
+        var stableFloor = runState.ActFloor > 0
+            ? runState.ActFloor
+            : snapshot.TotalFloor;
+        if (stableFloor == snapshot.TotalFloor)
         {
             return snapshot;
         }
 
-        await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
-        return await CaptureEnvSnapshotAsync(cancellationToken);
+        if (snapshot.Observation is not Dictionary<string, object?> observation)
+        {
+            return snapshot;
+        }
+
+        var adjustedObservation = CloneDictionary(observation);
+        adjustedObservation["run"] = BuildEnvRunPayload(runState, stableFloor);
+        var adjustedLogicHash = ComputeStateHash(new
+        {
+            phase = snapshot.Phase,
+            observation = adjustedObservation,
+            action_ids = snapshot.ResolvedActions.Select(static action => action.ActionId).ToArray()
+        });
+
+        return new BridgeEnvSnapshot
+        {
+            Context = snapshot.Context,
+            Screen = snapshot.Screen,
+            Phase = snapshot.Phase,
+            Observation = adjustedObservation,
+            RunSummary = BuildEnvRunPayload(runState, stableFloor),
+            LegalActions = snapshot.LegalActions,
+            ActionLookup = snapshot.ActionLookup,
+            ResolvedActions = snapshot.ResolvedActions,
+            LogicHash = adjustedLogicHash,
+            Actionable = snapshot.Actionable,
+            Done = snapshot.Done,
+            CurrentHp = snapshot.CurrentHp,
+            MaxHp = snapshot.MaxHp,
+            PlayerBlock = snapshot.PlayerBlock,
+            CurrentEnergy = snapshot.CurrentEnergy,
+            Gold = snapshot.Gold,
+            ActIndex = snapshot.ActIndex,
+            TotalFloor = stableFloor,
+            RoomType = snapshot.RoomType,
+            RoomModelId = snapshot.RoomModelId,
+            RelicCount = snapshot.RelicCount,
+            PotionCount = snapshot.PotionCount,
+            DeckCount = snapshot.DeckCount,
+            DeckEntries = snapshot.DeckEntries,
+            EnemyStates = snapshot.EnemyStates,
+            CombatInProgress = snapshot.CombatInProgress,
+            RoomPreFinished = snapshot.RoomPreFinished
+        };
     }
 
     private static bool ApplyEnvDefensiveBuffs(BridgeWorldContext context)

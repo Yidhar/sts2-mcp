@@ -2,8 +2,10 @@ using System.Globalization;
 using System.Net;
 using System.Reflection;
 using System.Text.Json.Serialization;
-using MegaCrit.Sts2.Core.Entities.Players;
+using System.ComponentModel;
+using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace Sts2McpBridge.Scripts;
@@ -46,7 +48,7 @@ internal sealed class BridgeEnvCombatResetRequest
 
 internal static partial class BridgeGameApi
 {
-    private const int DefaultCombatResetTimeoutMs = 15000;
+    private const int DefaultCombatResetTimeoutMs = 30000;
 
     // -----------------------------------------------------------------------
     // POST /env/combat_reset
@@ -70,8 +72,14 @@ internal static partial class BridgeGameApi
         }
 
         var diagnostics = new List<string>();
+        var beforeSetup = await EnsureCombatSandboxRunReadyAsync(
+            request,
+            timeoutMs,
+            diagnostics,
+            cancellationToken);
 
-        // Step 1: Resolve encounter and enter combat on the main thread
+        // Step 1: Resolve encounter and enter combat on the main thread.
+        // This now runs only after a real single-player run scene exists.
         var setupResult = await BridgeCoordinator.RunOnMainThreadAsync(() =>
         {
             return SetUpCombatSandbox(request, encounterId, diagnostics);
@@ -86,26 +94,49 @@ internal static partial class BridgeGameApi
                 new { diagnostics, encounter_id = encounterId });
         }
 
+        if (setupResult.PendingTask is not null)
+        {
+            try
+            {
+                await setupResult.PendingTask.WaitAsync(
+                    TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 5000)),
+                    cancellationToken);
+                diagnostics.Add("Combat room entry task completed");
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add($"Combat room entry task await failed: {ex.GetBaseException().Message}");
+            }
+        }
+
         // Step 2: Let Godot settle the scene
         await BridgeCoordinator.WaitForPumpTicksAsync(8, cancellationToken);
 
-        // Step 3: Wait for stable actionable combat state
+        // Step 3: Wait for a stable state that is actually different from the pre-reset baseline.
         var state = await WaitForStableEnvStateAsync(
-            null,
+            beforeSetup.LogicHash,
             timeoutMs,
             requireActionableOrDone: true,
             cancellationToken);
 
-        // Step 4: Verify we landed in combat
-        if (state.Phase != "combat" && !state.CombatInProgress)
+        // Step 4: Retry the debug room entry once more on a later pump if the scene has not flipped
+        // to combat yet. This keeps the fallback tight and avoids rebuilding half-initialized runs.
+        if (!state.CombatInProgress && !state.Done)
         {
-            // Maybe still settling — wait a bit more
-            await BridgeCoordinator.WaitForPumpTicksAsync(5, cancellationToken);
-            state = await WaitForStableEnvStateAsync(
-                null,
-                Math.Min(timeoutMs, 5000),
-                requireActionableOrDone: true,
+            var deferredEnterStarted = await TryDeferredEnterCombatRoomAsync(
+                encounterId,
+                diagnostics,
+                timeoutMs,
                 cancellationToken);
+            if (deferredEnterStarted)
+            {
+                await BridgeCoordinator.WaitForPumpTicksAsync(5, cancellationToken);
+                state = await WaitForStableEnvStateAsync(
+                    state.LogicHash,
+                    Math.Min(timeoutMs, 5000),
+                    requireActionableOrDone: true,
+                    cancellationToken);
+            }
         }
 
         if (!state.CombatInProgress && !state.Done)
@@ -134,12 +165,138 @@ internal static partial class BridgeGameApi
             _activeEnvEpisode = episode;
         }
 
+        state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+
         var executedActions = new List<object>
         {
             new { action = "combat_sandbox_setup", encounter_id = encounterId, diagnostics }
         };
 
         return BuildEnvResetPayload(episode, state, executedActions);
+    }
+
+    private static async Task<BridgeEnvSnapshot> EnsureCombatSandboxRunReadyAsync(
+        BridgeEnvCombatResetRequest request,
+        int timeoutMs,
+        List<string> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        var state = await CaptureEnvSnapshotAsync(cancellationToken);
+        if (HasUsableCombatSandboxRunScene(state))
+        {
+            diagnostics.Add(
+                $"Reusing active run scene (phase={state.Phase}, screen={state.Screen}, current_room={state.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"})");
+            return state;
+        }
+
+        diagnostics.Add(
+            $"No usable run scene for combat sandbox (phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}). Bootstrapping via env/reset.");
+
+        try
+        {
+            await ResetEnvResponseAsync(
+                new BridgeEnvResetRequest
+                {
+                    Character = request.Character?.Trim(),
+                    DefensiveBuffs = false,
+                    TimeoutMs = timeoutMs
+                },
+                cancellationToken);
+        }
+        catch (BridgeRequestException ex)
+        {
+            diagnostics.Add($"env/reset bootstrap failed: {ex.ErrorCode}: {ex.Message}");
+            throw;
+        }
+
+        state = await WaitForStableEnvStateAsync(
+            null,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+
+        diagnostics.Add(
+            $"env/reset bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
+
+        if (!HasUsableCombatSandboxRunScene(state))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "combat_sandbox_run_scene_not_ready",
+                "env/reset completed but did not produce a usable run scene for combat sandbox.",
+                new
+                {
+                    phase = state.Phase,
+                    screen = state.Screen,
+                    run_active = state.RunActive,
+                    has_run_node = state.Context.RunNode is not null,
+                    has_current_room = state.Context.RunState?.CurrentRoom is not null,
+                    diagnostics
+                });
+        }
+
+        return state;
+    }
+
+    private static bool HasUsableCombatSandboxRunScene(BridgeEnvSnapshot state)
+    {
+        return state.RunActive &&
+               !state.Done &&
+               !IsStartupPhase(state.Phase) &&
+               state.Context.RunNode is not null &&
+               state.Context.RunState?.CurrentRoom is not null;
+    }
+
+    private static async Task<bool> TryDeferredEnterCombatRoomAsync(
+        string encounterId,
+        List<string> diagnostics,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var enterTask = await BridgeCoordinator.RunOnMainThreadAsync(() =>
+        {
+            var encounter = ResolveEncounterModel(encounterId, diagnostics);
+            var runManager = RunManager.Instance;
+            if (encounter is null || runManager is null)
+                return null;
+
+            return TryInvokeEnterRoomDebug(runManager, encounter, diagnostics, out var pendingTask)
+                ? pendingTask ?? Task.CompletedTask
+                : null;
+        });
+
+        if (enterTask is null)
+        {
+            diagnostics.Add("Deferred EnterRoomDebug did not start");
+            return false;
+        }
+
+        try
+        {
+            await enterTask.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 5000)), cancellationToken);
+            diagnostics.Add("Deferred EnterRoomDebug task completed");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"Deferred EnterRoomDebug await failed: {ex.GetBaseException().Message}");
+            return false;
+        }
+    }
+
+    private static object? PrepareEncounterForRoomEntry(object? encounter, List<string> diagnostics)
+    {
+        if (encounter is null)
+            return null;
+
+        var mutableEncounter = TryCallToMutable(encounter);
+        if (mutableEncounter is not null)
+        {
+            diagnostics.Add($"Converted encounter {encounter.GetType().Name} -> mutable {mutableEncounter.GetType().Name}");
+            return mutableEncounter;
+        }
+
+        return encounter;
     }
 
     // -----------------------------------------------------------------------
@@ -188,6 +345,16 @@ internal static partial class BridgeGameApi
         public bool Success { get; init; }
         public string? ErrorCode { get; init; }
         public string? ErrorMessage { get; init; }
+        public Task? PendingTask { get; init; }
+    }
+
+    private sealed class EncounterCatalogEntry
+    {
+        public string EncounterId { get; init; } = string.Empty;
+        public string DisplayName { get; init; } = string.Empty;
+        public string TypeName { get; init; } = string.Empty;
+        public string Category { get; init; } = string.Empty;
+        public bool IsMock { get; init; }
     }
 
     private static CombatSandboxSetupResult SetUpCombatSandbox(
@@ -222,12 +389,12 @@ internal static partial class BridgeGameApi
                 };
             }
 
-            // 3. Try to create a test run state and enter combat
-            var entered = TryEnterCombatViaDebugRoom(runManager, encounter, request, diagnostics);
-            if (!entered)
+        // 3. Enter the requested encounter on the active run scene.
+        var entered = TryEnterCombatViaDebugRoom(runManager, encounter, diagnostics, out var pendingTask);
+        if (!entered)
+        {
+            return new CombatSandboxSetupResult
             {
-                return new CombatSandboxSetupResult
-                {
                     Success = false,
                     ErrorCode = "combat_entry_failed",
                     ErrorMessage = "Could not enter combat room. Check diagnostics for reflection probe results."
@@ -241,7 +408,11 @@ internal static partial class BridgeGameApi
                 diagnostics.Add($"Player override warnings: {overrideResult}");
             }
 
-            return new CombatSandboxSetupResult { Success = true };
+            return new CombatSandboxSetupResult
+            {
+                Success = true,
+                PendingTask = pendingTask
+            };
         }
         catch (Exception ex)
         {
@@ -293,9 +464,16 @@ internal static partial class BridgeGameApi
     {
         try
         {
+            var targetType = FindGameType(modelTypeName);
+            if (targetType is null)
+            {
+                diagnostics.Add($"Could not find type '{modelTypeName}' in game assemblies");
+                return null;
+            }
+
             var modelDbType = typeof(ModelDb);
 
-            // Try ModelDb.GetById<T>(string) — it's a generic static method
+            // ModelDb.GetById<T> is generic, but the ID parameter type differs by game build.
             var methods = modelDbType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
             foreach (var method in methods)
             {
@@ -306,18 +484,23 @@ internal static partial class BridgeGameApi
                 if (genericParams.Length != 1)
                     continue;
 
-                // Find the EncounterModel type
-                var targetType = FindGameType(modelTypeName);
-                if (targetType is null)
-                {
-                    diagnostics.Add($"Could not find type '{modelTypeName}' in game assemblies");
+                var parameters = method.GetParameters();
+                if (parameters.Length != 1)
                     continue;
-                }
 
                 try
                 {
                     var genericMethod = method.MakeGenericMethod(targetType);
-                    var result = genericMethod.Invoke(null, new object[] { id });
+                    if (!TryBuildModelDbIdArgument(parameters[0].ParameterType, id, out var idArgument, out var conversionNote))
+                    {
+                        diagnostics.Add($"ModelDb.GetById<{modelTypeName}> skipped unsupported id parameter {parameters[0].ParameterType.FullName}");
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(conversionNote))
+                        diagnostics.Add(conversionNote);
+
+                    var result = genericMethod.Invoke(null, new[] { idArgument });
                     if (result is not null)
                         return result;
                 }
@@ -335,6 +518,111 @@ internal static partial class BridgeGameApi
         return null;
     }
 
+    private static bool TryBuildModelDbIdArgument(
+        Type parameterType,
+        string id,
+        out object? argument,
+        out string? conversionNote)
+    {
+        argument = null;
+        conversionNote = null;
+
+        if (parameterType == typeof(string) || parameterType == typeof(object))
+        {
+            argument = id;
+            return true;
+        }
+
+        if (parameterType == typeof(ModelId))
+        {
+            if (!TrySplitModelId(id, out var category, out var entry))
+                return false;
+
+            argument = new ModelId(category, entry);
+            conversionNote = $"ModelDb id '{id}' converted via ModelId(category='{category}', entry='{entry}')";
+            return true;
+        }
+
+        try
+        {
+            var converter = TypeDescriptor.GetConverter(parameterType);
+            if (converter.CanConvertFrom(typeof(string)))
+            {
+                argument = converter.ConvertFromInvariantString(id);
+                if (argument is not null)
+                {
+                    conversionNote = $"ModelDb id '{id}' converted via TypeConverter -> {parameterType.Name}";
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // fall through
+        }
+
+        foreach (var methodName in new[] { "Parse", "FromString", "From", "Create" })
+        {
+            var factory = parameterType.GetMethod(
+                methodName,
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                new[] { typeof(string) },
+                null);
+            if (factory is null || !parameterType.IsAssignableFrom(factory.ReturnType))
+                continue;
+
+            argument = factory.Invoke(null, new object[] { id });
+            if (argument is not null)
+            {
+                conversionNote = $"ModelDb id '{id}' converted via {parameterType.Name}.{methodName}(string)";
+                return true;
+            }
+        }
+
+        foreach (var methodName in new[] { "op_Implicit", "op_Explicit" })
+        {
+            var castMethod = parameterType.GetMethod(
+                methodName,
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                new[] { typeof(string) },
+                null);
+            if (castMethod is null || !parameterType.IsAssignableFrom(castMethod.ReturnType))
+                continue;
+
+            argument = castMethod.Invoke(null, new object[] { id });
+            if (argument is not null)
+            {
+                conversionNote = $"ModelDb id '{id}' converted via {parameterType.Name}.{methodName}(string)";
+                return true;
+            }
+        }
+
+        var ctor = parameterType.GetConstructor(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            null,
+            new[] { typeof(string) },
+            null);
+        if (ctor is not null)
+        {
+            argument = ctor.Invoke(new object[] { id });
+            conversionNote = $"ModelDb id '{id}' converted via {parameterType.Name}(string)";
+            return true;
+        }
+
+        try
+        {
+            argument = Convert.ChangeType(id, parameterType, CultureInfo.InvariantCulture);
+            conversionNote = $"ModelDb id '{id}' converted via Convert.ChangeType -> {parameterType.Name}";
+            return argument is not null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static object? TryFindEncounterByTypeName(string typeName, List<string> diagnostics)
     {
         try
@@ -346,27 +634,55 @@ internal static partial class BridgeGameApi
                 return null;
             }
 
-            // Try to get a singleton or create an instance
-            // Check for Instance property first
-            var instanceProp = type.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-            if (instanceProp is not null)
+            var encounter = TryResolveEncounterFromType(type, diagnostics);
+            if (encounter is not null)
+                return encounter;
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"Type search failed: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    private static object? TryResolveEncounterFromType(Type type, List<string> diagnostics)
+    {
+        try
+        {
+            foreach (var encounter in GetAllEncounterModels())
             {
-                var instance = instanceProp.GetValue(null);
-                if (instance is not null)
-                    return instance;
+                if (!type.IsInstanceOfType(encounter))
+                    continue;
+
+                diagnostics.Add($"Resolved {type.Name} via ModelDb.AllEncounters");
+                return encounter;
             }
 
-            // Try ModelDb.GetById with the type's Name as ID
-            var modelDbResult = TryModelDbGetById("EncounterModel", type.Name, diagnostics);
-            if (modelDbResult is not null)
-                return modelDbResult;
+            var singleton = TryGetStaticEncounterInstance(type);
+            if (singleton is not null)
+            {
+                diagnostics.Add($"Resolved {type.Name} via static singleton member");
+                return singleton;
+            }
 
-            // Try parameterless constructor
+            foreach (var candidateId in EnumerateEncounterIdCandidates(type))
+            {
+                var byId = TryModelDbGetById("EncounterModel", candidateId, diagnostics);
+                if (byId is not null)
+                {
+                    diagnostics.Add($"Resolved {type.Name} via candidate id '{candidateId}'");
+                    return byId;
+                }
+            }
+
             try
             {
                 var ctor = type.GetConstructor(
                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-                    null, Type.EmptyTypes, null);
+                    null,
+                    Type.EmptyTypes,
+                    null);
                 if (ctor is not null)
                 {
                     var instance = ctor.Invoke(null);
@@ -381,10 +697,209 @@ internal static partial class BridgeGameApi
         }
         catch (Exception ex)
         {
-            diagnostics.Add($"Type search failed: {ex.Message}");
+            diagnostics.Add($"Encounter type resolution failed for {type.Name}: {ex.Message}");
         }
 
         return null;
+    }
+
+    private static bool TrySplitModelId(string rawId, out string category, out string entry)
+    {
+        category = string.Empty;
+        entry = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rawId))
+            return false;
+
+        var trimmed = rawId.Trim();
+        var separatorIndex = trimmed.IndexOf('.');
+        if (separatorIndex <= 0 || separatorIndex >= trimmed.Length - 1)
+            return false;
+
+        category = trimmed[..separatorIndex];
+        entry = trimmed[(separatorIndex + 1)..];
+        return category.Length > 0 && entry.Length > 0;
+    }
+
+    private static IEnumerable<EncounterModel> GetAllEncounterModels()
+    {
+        try
+        {
+            return ModelDb.AllEncounters ?? Enumerable.Empty<EncounterModel>();
+        }
+        catch
+        {
+            return Enumerable.Empty<EncounterModel>();
+        }
+    }
+
+    private static object? TryGetStaticEncounterInstance(Type type)
+    {
+        var flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+        foreach (var propertyName in new[] { "Instance", "Default", "Singleton", "Value" })
+        {
+            var prop = type.GetProperty(propertyName, flags);
+            if (prop is null || prop.GetIndexParameters().Length != 0)
+                continue;
+
+            try
+            {
+                var value = prop.GetValue(null);
+                if (value is not null && type.IsInstanceOfType(value))
+                    return value;
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        foreach (var fieldName in new[] { "Instance", "Default", "Singleton", "Value" })
+        {
+            var field = type.GetField(fieldName, flags);
+            if (field is null)
+                continue;
+
+            try
+            {
+                var value = field.GetValue(null);
+                if (value is not null && type.IsInstanceOfType(value))
+                    return value;
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        foreach (var prop in type.GetProperties(flags))
+        {
+            if (prop.GetIndexParameters().Length != 0 || !type.IsAssignableFrom(prop.PropertyType))
+                continue;
+
+            try
+            {
+                var value = prop.GetValue(null);
+                if (value is not null)
+                    return value;
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        foreach (var field in type.GetFields(flags))
+        {
+            if (!type.IsAssignableFrom(field.FieldType))
+                continue;
+
+            try
+            {
+                var value = field.GetValue(null);
+                if (value is not null)
+                    return value;
+            }
+            catch
+            {
+                // best effort
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateEncounterIdCandidates(Type type)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var candidate in EnumerateEncounterIdCandidatesFromMembers(type))
+        {
+            if (seen.Add(candidate))
+                yield return candidate;
+        }
+
+        var singleton = TryGetStaticEncounterInstance(type);
+        var singletonId = TryGetModelId(singleton);
+        if (!string.IsNullOrWhiteSpace(singletonId) && seen.Add(singletonId))
+            yield return singletonId;
+
+        if (seen.Add(type.Name))
+            yield return type.Name;
+    }
+
+    private static IEnumerable<string> EnumerateEncounterIdCandidatesFromMembers(Type type)
+    {
+        var flags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+        foreach (var property in type.GetProperties(flags))
+        {
+            if (property.GetIndexParameters().Length != 0 || !LooksLikeEncounterIdMember(property.Name))
+                continue;
+
+            object? value;
+            try
+            {
+                value = property.GetValue(null);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (TryNormalizeEncounterIdCandidate(value, out var candidate))
+                yield return candidate;
+        }
+
+        foreach (var field in type.GetFields(flags))
+        {
+            if (!LooksLikeEncounterIdMember(field.Name))
+                continue;
+
+            object? value;
+            try
+            {
+                value = field.GetValue(null);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (TryNormalizeEncounterIdCandidate(value, out var candidate))
+                yield return candidate;
+        }
+    }
+
+    private static bool LooksLikeEncounterIdMember(string memberName)
+    {
+        return memberName.Contains("Id", StringComparison.Ordinal) ||
+               memberName.Contains("ID", StringComparison.Ordinal) ||
+               memberName.Contains("ModelId", StringComparison.Ordinal);
+    }
+
+    private static bool TryNormalizeEncounterIdCandidate(object? value, out string candidate)
+    {
+        candidate = string.Empty;
+
+        if (value is null)
+            return false;
+
+        if (value is string rawString)
+        {
+            candidate = rawString.Trim();
+            return candidate.Length > 0;
+        }
+
+        if (value is ModelId modelId)
+        {
+            candidate = modelId.ToString();
+            return candidate.Length > 0;
+        }
+
+        candidate = value.ToString()?.Trim() ?? string.Empty;
+        return candidate.Length > 0;
     }
 
     private static Type? FindGameType(string typeName)
@@ -443,34 +958,24 @@ internal static partial class BridgeGameApi
     private static bool TryEnterCombatViaDebugRoom(
         RunManager runManager,
         object encounter,
-        BridgeEnvCombatResetRequest request,
-        List<string> diagnostics)
+        List<string> diagnostics,
+        out Task? pendingTask)
     {
-        // Strategy 1: RunManager.EnterRoomDebug(encounter)
-        if (TryCallEnterRoomDebug(runManager, encounter, diagnostics))
+        pendingTask = null;
+        var context = CaptureContext();
+        var hasUsableRunScene = context.RunState is not null &&
+                                context.RunNode is not null &&
+                                context.RunState.CurrentRoom is not null;
+        diagnostics.Add(
+            $"Combat sandbox scene check: run_state={(context.RunState is not null)}, run_node={(context.RunNode is not null)}, current_room={(context.RunState?.CurrentRoom is not null)}");
+
+        if (hasUsableRunScene && TryInvokeEnterRoomDebug(runManager, encounter, diagnostics, out pendingTask))
         {
             diagnostics.Add("Entered combat via RunManager.EnterRoomDebug");
             return true;
         }
 
-        // Strategy 2: RunManager.EnterRoomDebug(encounter, runState)
-        // Try with 2 params
-        var runState = TryGetRunState(runManager);
-        if (runState is not null && TryCallEnterRoomDebugWithState(runManager, encounter, runState, diagnostics))
-        {
-            diagnostics.Add("Entered combat via RunManager.EnterRoomDebug (2-param)");
-            return true;
-        }
-
-        // Strategy 3: Try SetUpNewSinglePlayer first, then EnterRoomDebug
-        if (TrySetUpTestRun(runManager, request, diagnostics))
-        {
-            if (TryCallEnterRoomDebug(runManager, encounter, diagnostics))
-            {
-                diagnostics.Add("Entered combat via test run + EnterRoomDebug");
-                return true;
-            }
-        }
+        diagnostics.Add("Usable run scene not available for EnterRoomDebug");
 
         diagnostics.Add("All combat entry strategies failed");
         return false;
@@ -478,11 +983,28 @@ internal static partial class BridgeGameApi
 
     private static bool TryCallEnterRoomDebug(RunManager runManager, object encounter, List<string> diagnostics)
     {
+        return TryInvokeEnterRoomDebug(runManager, encounter, diagnostics, out _);
+    }
+
+    private static bool TryInvokeEnterRoomDebug(
+        RunManager runManager,
+        object encounter,
+        List<string> diagnostics,
+        out Task? pendingTask)
+    {
+        pendingTask = null;
+        var roomEntryEncounter = PrepareEncounterForRoomEntry(encounter, diagnostics);
+        if (roomEntryEncounter is null)
+        {
+            diagnostics.Add("Encounter could not be prepared for room entry");
+            return false;
+        }
+
         try
         {
             var rmType = runManager.GetType();
-            // Search for EnterRoomDebug with various parameter counts
-            for (var paramCount = 1; paramCount <= 3; paramCount++)
+            // Prefer the current-game 4-param signature, then fall back to older variants.
+            foreach (var paramCount in new[] { 4, 2, 1, 3 })
             {
                 var method = FindStaticOrInstanceMethod(rmType, "EnterRoomDebug", paramCount);
                 if (method is null) continue;
@@ -490,15 +1012,14 @@ internal static partial class BridgeGameApi
                 var parameters = method.GetParameters();
                 diagnostics.Add($"Found EnterRoomDebug({string.Join(", ", parameters.Select(p => p.ParameterType.Name))})");
 
-                var args = new object?[paramCount];
-                args[0] = encounter;
-                // Fill remaining with null/default
-                for (var i = 1; i < paramCount; i++)
+                if (!TryBuildEnterRoomDebugArguments(parameters, roomEntryEncounter, out var args))
                 {
-                    args[i] = parameters[i].HasDefaultValue ? parameters[i].DefaultValue : null;
+                    diagnostics.Add($"Could not build EnterRoomDebug arguments for signature ({string.Join(", ", parameters.Select(p => p.ParameterType.Name))})");
+                    continue;
                 }
 
-                method.Invoke(method.IsStatic ? null : runManager, args);
+                var invokeResult = method.Invoke(method.IsStatic ? null : runManager, args);
+                pendingTask = invokeResult as Task;
                 diagnostics.Add("EnterRoomDebug invoked successfully");
                 return true;
             }
@@ -513,132 +1034,51 @@ internal static partial class BridgeGameApi
         return false;
     }
 
-    private static bool TryCallEnterRoomDebugWithState(
-        RunManager runManager, object encounter, RunState runState, List<string> diagnostics)
+    private static bool TryBuildEnterRoomDebugArguments(
+        ParameterInfo[] parameters,
+        object encounter,
+        out object?[] args)
     {
-        try
+        args = new object?[parameters.Length];
+
+        for (var i = 0; i < parameters.Length; i++)
         {
-            var rmType = runManager.GetType();
-            var method = FindStaticOrInstanceMethod(rmType, "EnterRoomDebug", 2);
-            if (method is null)
+            var parameterType = parameters[i].ParameterType;
+
+            if (parameterType.IsInstanceOfType(encounter) || parameterType.IsAssignableFrom(encounter.GetType()))
             {
-                diagnostics.Add("EnterRoomDebug(2 params) not found");
-                return false;
+                args[i] = encounter;
+                continue;
             }
 
-            method.Invoke(method.IsStatic ? null : runManager, new object[] { encounter, runState });
-            diagnostics.Add("EnterRoomDebug(encounter, runState) invoked successfully");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"EnterRoomDebug(2 params) failed: {ex.InnerException?.Message ?? ex.Message}");
+            if (parameterType == typeof(RoomType))
+            {
+                args[i] = RoomType.Monster;
+                continue;
+            }
+
+            if (parameterType == typeof(MapPointType))
+            {
+                args[i] = MapPointType.Monster;
+                continue;
+            }
+
+            if (parameterType == typeof(bool))
+            {
+                args[i] = false;
+                continue;
+            }
+
+            if (parameters[i].HasDefaultValue)
+            {
+                args[i] = parameters[i].DefaultValue;
+                continue;
+            }
+
             return false;
         }
-    }
 
-    private static bool TrySetUpTestRun(
-        RunManager runManager, BridgeEnvCombatResetRequest request, List<string> diagnostics)
-    {
-        // Strategy A: RunState.CreateForTest(...)
-        try
-        {
-            var rsType = typeof(RunState);
-            for (var paramCount = 0; paramCount <= 4; paramCount++)
-            {
-                var method = rsType.GetMethods(
-                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-                    .FirstOrDefault(m =>
-                        m.Name.Equals("CreateForTest", StringComparison.Ordinal) &&
-                        m.GetParameters().Length == paramCount);
-
-                if (method is null) continue;
-
-                var parameters = method.GetParameters();
-                diagnostics.Add($"Found RunState.CreateForTest({string.Join(", ", parameters.Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
-
-                var args = new object?[paramCount];
-                for (var i = 0; i < paramCount; i++)
-                {
-                    args[i] = parameters[i].HasDefaultValue ? parameters[i].DefaultValue : null;
-                }
-
-                var testRunState = method.Invoke(null, args) as RunState;
-                if (testRunState is not null)
-                {
-                    diagnostics.Add("Created test RunState via CreateForTest");
-                    // Now try to wire it up
-                    return TrySetUpSinglePlayer(runManager, testRunState, diagnostics);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"CreateForTest failed: {ex.InnerException?.Message ?? ex.Message}");
-        }
-
-        // Strategy B: SetUpNewSinglePlayer
-        try
-        {
-            var rmType = runManager.GetType();
-            for (var paramCount = 0; paramCount <= 3; paramCount++)
-            {
-                var method = FindStaticOrInstanceMethod(rmType, "SetUpNewSinglePlayer", paramCount);
-                if (method is null) continue;
-
-                var parameters = method.GetParameters();
-                diagnostics.Add($"Found SetUpNewSinglePlayer({string.Join(", ", parameters.Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
-
-                var args = new object?[paramCount];
-                for (var i = 0; i < paramCount; i++)
-                {
-                    args[i] = parameters[i].HasDefaultValue ? parameters[i].DefaultValue : null;
-                }
-
-                method.Invoke(method.IsStatic ? null : runManager, args);
-                diagnostics.Add("SetUpNewSinglePlayer invoked successfully");
-                return true;
-            }
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"SetUpNewSinglePlayer failed: {ex.InnerException?.Message ?? ex.Message}");
-        }
-
-        diagnostics.Add("Could not set up test run (CreateForTest and SetUpNewSinglePlayer both failed)");
-        return false;
-    }
-
-    private static bool TrySetUpSinglePlayer(RunManager runManager, RunState testRunState, List<string> diagnostics)
-    {
-        try
-        {
-            var rmType = runManager.GetType();
-            var method = FindStaticOrInstanceMethod(rmType, "SetUpNewSinglePlayer", 1);
-            if (method is not null)
-            {
-                method.Invoke(method.IsStatic ? null : runManager, new object[] { testRunState });
-                diagnostics.Add("SetUpNewSinglePlayer(runState) invoked successfully");
-                return true;
-            }
-
-            // Try with 0 args
-            method = FindStaticOrInstanceMethod(rmType, "SetUpNewSinglePlayer", 0);
-            if (method is not null)
-            {
-                method.Invoke(method.IsStatic ? null : runManager, Array.Empty<object>());
-                diagnostics.Add("SetUpNewSinglePlayer() invoked successfully");
-                return true;
-            }
-
-            diagnostics.Add("SetUpNewSinglePlayer not found on RunManager");
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"SetUpNewSinglePlayer failed: {ex.InnerException?.Message ?? ex.Message}");
-        }
-
-        return false;
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -693,34 +1133,43 @@ internal static partial class BridgeGameApi
             }
         }
 
-        if (request.CurrentHp is > 0 && creature is not null)
+        if (creature is not null)
         {
             try
             {
+                var targetHp = request.CurrentHp is > 0
+                    ? request.CurrentHp.Value
+                    : request.MaxHp is > 0
+                        ? request.MaxHp.Value
+                        : creature.MaxHp;
+
                 var currentHpProp = FindProperty(creature.GetType(), "CurrentHp");
                 if (currentHpProp?.GetSetMethod(nonPublic: true) is not null)
                 {
-                    currentHpProp.SetValue(creature, request.CurrentHp.Value);
-                    diagnostics.Add($"Set CurrentHp to {request.CurrentHp.Value}");
+                    currentHpProp.SetValue(creature, targetHp);
+                    diagnostics.Add(request.CurrentHp is > 0
+                        ? $"Set CurrentHp to {targetHp}"
+                        : $"Restored CurrentHp to full ({targetHp})");
                 }
                 else
                 {
-                    // Try healing to target
-                    var targetHp = request.CurrentHp.Value;
                     if (creature.CurrentHp < targetHp)
                     {
                         creature.HealInternal((decimal)(targetHp - creature.CurrentHp));
-                        diagnostics.Add($"Healed to {targetHp}");
+                        diagnostics.Add(request.CurrentHp is > 0
+                            ? $"Healed to {targetHp}"
+                            : $"Healed to full ({targetHp})");
                     }
                     else if (creature.CurrentHp > targetHp)
                     {
-                        // Try DamageInternal or direct field
                         var field = FindField(creature.GetType(), "_currentHp") ??
                                     FindField(creature.GetType(), "currentHp");
                         if (field is not null)
                         {
                             field.SetValue(creature, targetHp);
-                            diagnostics.Add($"Set CurrentHp via field to {targetHp}");
+                            diagnostics.Add(request.CurrentHp is > 0
+                                ? $"Set CurrentHp via field to {targetHp}"
+                                : $"Reset CurrentHp via field to full ({targetHp})");
                         }
                         else
                         {
@@ -947,56 +1396,51 @@ internal static partial class BridgeGameApi
 
     private static object[] ListAvailableCombatEncounters()
     {
-        var results = new List<object>();
+        var results = new List<EncounterCatalogEntry>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
         try
         {
-            // Search all game assemblies for EncounterModel subclasses
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            foreach (var encounter in GetAllEncounterModels())
             {
                 try
                 {
-                    var asmName = asm.GetName().Name ?? "";
-                    if (!asmName.Contains("sts2", StringComparison.OrdinalIgnoreCase) &&
-                        !asmName.Contains("MegaCrit", StringComparison.OrdinalIgnoreCase))
+                    var encounterId = TryGetModelId(encounter);
+                    if (string.IsNullOrWhiteSpace(encounterId) || !seen.Add(encounterId))
                         continue;
 
-                    var encounterModelType = FindGameType("EncounterModel");
-                    if (encounterModelType is null) continue;
+                    var typeName = encounter.GetType().Name;
+                    var category = CategorizeEncounterType(typeName);
+                    var isMock = typeName.Contains("Mock", StringComparison.OrdinalIgnoreCase) ||
+                                 typeName.Contains("Test", StringComparison.OrdinalIgnoreCase) ||
+                                 typeName.Contains("Dummy", StringComparison.OrdinalIgnoreCase);
 
-                    foreach (var type in asm.GetTypes())
+                    results.Add(new EncounterCatalogEntry
                     {
-                        try
-                        {
-                            if (!encounterModelType.IsAssignableFrom(type) || type.IsAbstract || type.IsInterface)
-                                continue;
-
-                            var typeName = type.Name;
-                            if (!seen.Add(typeName)) continue;
-
-                            var category = CategorizeEncounterType(typeName);
-                            var isMock = typeName.Contains("Mock", StringComparison.OrdinalIgnoreCase) ||
-                                         typeName.Contains("Test", StringComparison.OrdinalIgnoreCase) ||
-                                         typeName.Contains("Dummy", StringComparison.OrdinalIgnoreCase);
-
-                            results.Add(new
-                            {
-                                encounter_id = typeName,
-                                display_name = typeName,
-                                category,
-                                is_mock = isMock
-                            });
-                        }
-                        catch { /* skip types that fail reflection */ }
-                    }
+                        EncounterId = encounterId,
+                        DisplayName = encounterId,
+                        TypeName = typeName,
+                        Category = category,
+                        IsMock = isMock
+                    });
                 }
-                catch { /* skip assemblies that fail reflection */ }
+                catch { /* skip entries that fail reflection */ }
             }
         }
         catch { /* best effort */ }
 
-        return results.OrderBy(e => ((dynamic)e).category).ThenBy(e => ((dynamic)e).encounter_id).ToArray();
+        return results
+            .OrderBy(e => e.Category)
+            .ThenBy(e => e.EncounterId)
+            .Select(e => new
+            {
+                encounter_id = e.EncounterId,
+                display_name = e.DisplayName,
+                type_name = e.TypeName,
+                category = e.Category,
+                is_mock = e.IsMock
+            })
+            .ToArray<object>();
     }
 
     private static string CategorizeEncounterType(string typeName)

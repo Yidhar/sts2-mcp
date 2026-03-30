@@ -245,7 +245,7 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static object BuildEnvRunPayload(RunState? runState)
+    private static object BuildEnvRunPayload(RunState? runState, int? floorOverride = null)
     {
         return new
         {
@@ -254,7 +254,7 @@ internal static partial class BridgeGameApi
             act = runState?.Act is null ? null : TryGetTitle(runState.Act),
             act_id = runState?.Act?.Id.ToString(),
             act_floor = runState?.ActFloor,
-            floor = runState?.TotalFloor,
+            floor = floorOverride ?? runState?.TotalFloor,
             room_type = runState?.CurrentRoom?.RoomType.ToString(),
             room_model = runState?.CurrentRoom?.ModelId?.ToString(),
             coord = BuildMapCoord(runState?.CurrentMapCoord)

@@ -35,6 +35,7 @@ class CombatSandboxEnv(gym.Env):
         session_file=None,
         character=None,
         encounter_id=None,
+        encounter_pool=None,
         seed=None,
         current_hp=None,
         max_hp=None,
@@ -54,6 +55,7 @@ class CombatSandboxEnv(gym.Env):
         self.obs_encoder = obs_encoder or DictObservationEncoder(use_text=False)
         self.character = character
         self.encounter_id = encounter_id
+        self.encounter_pool = [eid for eid in (encounter_pool or []) if eid]
         self.seed = seed
         self.current_hp = current_hp
         self.max_hp = max_hp
@@ -72,6 +74,7 @@ class CombatSandboxEnv(gym.Env):
         self._episode_id = None
         self._legal_actions = []
         self._last_obs_raw = None
+        self._current_encounter_id = encounter_id
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -82,8 +85,11 @@ class CombatSandboxEnv(gym.Env):
 
         # Allow per-reset overrides via options dict
         opts = options or {}
-        encounter_id = opts.get("encounter_id", self.encounter_id)
+        encounter_id = opts.get("encounter_id")
+        if encounter_id is None:
+            encounter_id = self._sample_encounter_id()
         reset_seed = opts.get("seed", self.seed)
+        self._current_encounter_id = encounter_id
 
         result = self.bridge.combat_reset(
             character=self.character,
@@ -168,6 +174,12 @@ class CombatSandboxEnv(gym.Env):
     # Internal
     # ------------------------------------------------------------------
 
+    def _sample_encounter_id(self):
+        if self.encounter_pool:
+            idx = int(self.np_random.integers(len(self.encounter_pool)))
+            return self.encounter_pool[idx]
+        return self.encounter_id
+
     def _build_info(self, bridge_info):
         return {
             "episode_id": self._episode_id,
@@ -176,6 +188,7 @@ class CombatSandboxEnv(gym.Env):
             "raw_obs": self._last_obs_raw,
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "combat_sandbox",
-            "encounter_id": self.encounter_id,
+            "encounter_id": self._current_encounter_id,
+            "encounter_pool": self.encounter_pool,
             "bridge_info": bridge_info,
         }
