@@ -1448,6 +1448,7 @@ internal static partial class BridgeGameApi
             context.MapScreen.IsTravelEnabled &&
             !context.MapScreen.IsTraveling)
         {
+            var routePayloadByKey = new Dictionary<string, object?>(StringComparer.Ordinal);
             foreach (var pointNode in context.MapPoints)
             {
                 if (!IsMapPointTravelable(pointNode))
@@ -1457,6 +1458,12 @@ internal static partial class BridgeGameApi
 
                 var coord = pointNode.Point.coord;
                 var actionId = $"map:{coord.col},{coord.row}";
+                var coordKey = ToEnvMapCoordKey(coord);
+                if (!routePayloadByKey.ContainsKey(coordKey))
+                {
+                    routePayloadByKey[coordKey] = BuildEnvMapRoutePayload(context, coord);
+                }
+
                 actions.Add(new BridgeResolvedAction
                 {
                     ActionId = actionId,
@@ -1467,7 +1474,9 @@ internal static partial class BridgeGameApi
                         label = $"Travel to ({coord.col}, {coord.row}) {pointNode.Point.PointType}",
                         coord = BuildMapCoord(coord),
                         point_type = pointNode.Point.PointType.ToString(),
+                        point_type_norm = NormalizeEnvMapPointType(pointNode.Point.PointType.ToString()),
                         state = pointNode.State.ToString(),
+                        route_summary = routePayloadByKey[coordKey],
                         screen = context.Screen
                     },
                     Execute = () => InvokeButtonAction(pointNode, "OnRelease")

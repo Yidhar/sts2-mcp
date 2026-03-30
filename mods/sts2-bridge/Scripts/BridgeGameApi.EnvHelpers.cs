@@ -14,42 +14,42 @@ internal static partial class BridgeGameApi
 {
     private const int EnvDefenseBlockAmount = 999;
     private const int EnvDefensePlatingAmount = 999;
-    private const double EnvRewardHpLossWeight = -1.5d;
-    private const double EnvRewardHpGainWeight = 0.25d;
-    private const double EnvRewardRoomHpDeltaWeight = 2.0d;
-    private const double EnvRewardFloorDeltaWeight = 0.35d;
-    private const double EnvRewardGoldGainWeight = 0.002d;
+    private const double EnvRewardHpLossWeight = -0.15d;
+    private const double EnvRewardHpGainWeight = 0.05d;
+    private const double EnvRewardRoomHpDeltaWeight = 1.00d;
+    private const double EnvRewardFloorDeltaWeight = 0.10d;
+    private const double EnvRewardGoldGainWeight = 0.0d;
     private const double EnvRewardGoldSpendWeight = 0.0d;
-    private const double EnvRewardRelicGainWeight = 0.35d;
-    private const double EnvRewardPotionGainWeight = 0.08d;
+    private const double EnvRewardRelicGainWeight = 0.0d;
+    private const double EnvRewardPotionGainWeight = 0.0d;
     private const double EnvRewardCardAddWeight = 0.0d;
-    private const double EnvRewardStarterRemoveWeight = 0.18d;
-    private const double EnvRewardOtherRemoveWeight = 0.08d;
-    private const double EnvRewardCardUpgradeWeight = 0.15d;
-    private const double EnvRewardCombatWinBonus = 1.00d;
-    private const double EnvRewardEliteClearBonus = 0.50d;
-    private const double EnvRewardBossClearBonus = 2.00d;
-    private const double EnvRewardActClearBonus = 5.00d;
-    private const double EnvRewardDeathPenalty = -6.00d;
+    private const double EnvRewardStarterRemoveWeight = 0.0d;
+    private const double EnvRewardOtherRemoveWeight = 0.0d;
+    private const double EnvRewardCardUpgradeWeight = 0.0d;
+    private const double EnvRewardCombatWinBonus = 0.0d;
+    private const double EnvRewardEliteClearBonus = 0.0d;
+    private const double EnvRewardBossClearBonus = 0.0d;
+    private const double EnvRewardActClearBonus = 0.0d;
+    private const double EnvRewardDeathPenalty = -10.00d;
     private const double EnvRewardVictoryBonus = 10.00d;
     private const double EnvRewardStepPenalty = 0.0d;
     private const double EnvRewardActionErrorPenalty = -0.10d;
     private const double EnvRewardTruncatedPenalty = -1.00d;
-    private const double EnvRewardEndTurnWastePenalty = -0.01d;
-    private const double EnvRewardNoProgressPenalty = -0.01d;
-    private const double EnvRewardPlayCardBonus = 0.006d;
-    private const double EnvRewardEffectiveBlockWeight = 1.50d;
-    private const double EnvRewardWastedBlockWeight = -0.10d;
-    private const double EnvRewardWeakIntentReductionWeight = 1.20d;
-    private const double EnvRewardVulnerableRealizedDamageWeight = 0.35d;
-    private const double EnvRewardThreatGapReductionWeight = 1.20d;
-    private const double EnvRewardMissedDefensePenaltyWeight = -1.25d;
-    private const double EnvRewardSkipBadCardsBonus = 0.04d;
-    private const double EnvRewardRestLowHpBonus = 0.12d;
-    private const double EnvRewardRestHighHpMismatchPenalty = -0.08d;
-    private const double EnvRewardSmithHealthyBonus = 0.10d;
-    private const double EnvRewardSmithLowHpMismatchPenalty = -0.10d;
-    private const double EnvRewardCardHeuristicLimit = 0.10d;
+    private const double EnvRewardEndTurnWastePenalty = 0.0d;
+    private const double EnvRewardNoProgressPenalty = 0.0d;
+    private const double EnvRewardPlayCardBonus = 0.0d;
+    private const double EnvRewardEffectiveBlockWeight = 0.00d;
+    private const double EnvRewardWastedBlockWeight = 0.0d;
+    private const double EnvRewardWeakIntentReductionWeight = 0.0d;
+    private const double EnvRewardVulnerableRealizedDamageWeight = 0.0d;
+    private const double EnvRewardThreatGapReductionWeight = 0.0d;
+    private const double EnvRewardMissedDefensePenaltyWeight = 0.00d;
+    private const double EnvRewardSkipBadCardsBonus = 0.0d;
+    private const double EnvRewardRestLowHpBonus = 0.0d;
+    private const double EnvRewardRestHighHpMismatchPenalty = 0.0d;
+    private const double EnvRewardSmithHealthyBonus = 0.0d;
+    private const double EnvRewardSmithLowHpMismatchPenalty = 0.0d;
+    private const double EnvRewardCardHeuristicLimit = 0.0d;
 
     private static object BuildEnvActionPayload(BridgeResolvedAction action, int index)
     {
@@ -111,6 +111,9 @@ internal static partial class BridgeGameApi
             case "map":
                 entry["coord"] = CompactCoordPayload(TryGetNestedElement(payload, "coord"));
                 entry["point_type"] = TryGetNestedString(payload, "point_type");
+                entry["point_type_norm"] = TryGetNestedString(payload, "point_type_norm");
+                entry["route_summary"] = CompactMapRouteSummaryPayload(TryGetNestedElement(payload, "route_summary"));
+                entry["route_nodes"] = CompactMapRouteNodesPayload(TryGetNestedElement(payload, "route_summary"));
                 break;
 
             case "rest_site":
@@ -471,6 +474,8 @@ internal static partial class BridgeGameApi
                 screen = state.Screen,
                 logic_hash = state.LogicHash,
                 defensive_buffs = episode.DefensiveBuffs,
+                episode_mode = episode.EpisodeMode,
+                encounter_id = episode.EncounterId,
                 reset_actions = resetActions
             }
         };
@@ -521,6 +526,8 @@ internal static partial class BridgeGameApi
                 logic_hash_before = before.LogicHash,
                 logic_hash_after = after.LogicHash,
                 defensive_buffs = episode.DefensiveBuffs,
+                episode_mode = episode.EpisodeMode,
+                encounter_id = episode.EncounterId,
                 truncation_reason = truncationReason,
                 action_error = actionError,
                 reward_breakdown = rewardBreakdown
@@ -642,124 +649,37 @@ internal static partial class BridgeGameApi
         var hpGain = Math.Max(0, after.CurrentHp - before.CurrentHp);
         var hpLossNormalized = maxHp > 0 ? (double)hpLoss / maxHp : 0d;
         var hpGainNormalized = maxHp > 0 ? (double)hpGain / maxHp : 0d;
-        var goldGain = Math.Max(0, after.Gold - before.Gold);
-        var goldSpend = Math.Max(0, before.Gold - after.Gold);
         var floorDelta = Math.Max(0, after.TotalFloor - before.TotalFloor);
-        var relicGain = Math.Max(0, after.RelicCount - before.RelicCount);
-        var potionGain = Math.Max(0, after.PotionCount - before.PotionCount);
         var roomComplete = HasEnvRoomTransition(before, after) ? 1 : 0;
         var roomHpMax = episode.RoomStartMaxHp > 0 ? episode.RoomStartMaxHp : maxHp;
         var roomHpDeltaNormalized = roomComplete == 1 && roomHpMax > 0
             ? (double)(after.CurrentHp - episode.RoomStartHp) / roomHpMax
             : 0d;
-        var combatWin = before.CombatInProgress && !after.CombatInProgress && !after.Done && after.RoomPreFinished ? 1 : 0;
-        var eliteClear = combatWin == 1 && IsEnvEliteRoom(before.RoomType) ? 1 : 0;
-        var bossClear = combatWin == 1 && IsEnvBossRoom(before.RoomType) ? 1 : 0;
-        var actClear = Math.Max(0, after.ActIndex - before.ActIndex);
         var death = after.Done && after.CurrentHp <= 0 ? 1 : 0;
         var victory = after.Done && after.CurrentHp > 0 ? 1 : 0;
-        var deckDiff = DiffEnvDeckEntries(before.DeckEntries, after.DeckEntries);
-        var actionShaping = EvaluateEnvActionShaping(before, after, selectedAction, actionError);
-        var stepPenalty = EnvRewardStepPenalty;
         var actionErrorPenalty = string.IsNullOrWhiteSpace(actionError) ? 0d : EnvRewardActionErrorPenalty;
         var truncatedPenalty = truncated ? EnvRewardTruncatedPenalty : 0d;
-        var noProgressPenalty = actionError is null &&
-                                selectedAction is not null &&
-                                before.LogicHash == after.LogicHash &&
-                                !IsEnvSelectionLikeAction(selectedAction)
-            ? EnvRewardNoProgressPenalty
-            : 0d;
         var total =
             hpLossNormalized * EnvRewardHpLossWeight +
             hpGainNormalized * EnvRewardHpGainWeight +
             roomHpDeltaNormalized * EnvRewardRoomHpDeltaWeight +
             floorDelta * EnvRewardFloorDeltaWeight +
-            goldGain * EnvRewardGoldGainWeight +
-            goldSpend * EnvRewardGoldSpendWeight +
-            relicGain * EnvRewardRelicGainWeight +
-            potionGain * EnvRewardPotionGainWeight +
-            deckDiff.CardAddCount * EnvRewardCardAddWeight +
-            deckDiff.StarterCardRemoveCount * EnvRewardStarterRemoveWeight +
-            deckDiff.OtherCardRemoveCount * EnvRewardOtherRemoveWeight +
-            deckDiff.CardUpgradeCount * EnvRewardCardUpgradeWeight +
-            combatWin * EnvRewardCombatWinBonus +
-            eliteClear * EnvRewardEliteClearBonus +
-            bossClear * EnvRewardBossClearBonus +
-            actClear * EnvRewardActClearBonus +
             death * EnvRewardDeathPenalty +
             victory * EnvRewardVictoryBonus +
-            stepPenalty +
             actionErrorPenalty +
-            truncatedPenalty +
-            actionShaping.PlayCardBonus +
-            actionShaping.CardChoiceBonus +
-            actionShaping.SkipBadCardsBonus +
-            actionShaping.RestBonus +
-            actionShaping.RestMismatchPenalty +
-            actionShaping.SmithBonus +
-            actionShaping.SmithMismatchPenalty +
-            actionShaping.ThreatGapReductionBonus +
-            actionShaping.EffectiveBlockBonus +
-            actionShaping.WastedBlockPenalty +
-            actionShaping.WeakBonus +
-            actionShaping.VulnerableBonus +
-            actionShaping.EndTurnWastePenalty +
-            actionShaping.MissedDefensePenalty +
-            noProgressPenalty;
+            truncatedPenalty;
 
         return new BridgeEnvRewardBreakdown
         {
-            HpLoss = hpLoss,
             HpLossNormalized = RoundEnvNumber(hpLossNormalized),
-            HpGain = hpGain,
             HpGainNormalized = RoundEnvNumber(hpGainNormalized),
             RoomComplete = roomComplete,
             RoomHpDeltaNormalized = RoundEnvNumber(roomHpDeltaNormalized),
-            GoldGain = goldGain,
-            GoldSpend = goldSpend,
             FloorDelta = floorDelta,
-            RelicGain = relicGain,
-            PotionGain = potionGain,
-            CardAddCount = deckDiff.CardAddCount,
-            StarterCardRemoveCount = deckDiff.StarterCardRemoveCount,
-            OtherCardRemoveCount = deckDiff.OtherCardRemoveCount,
-            CardUpgradeCount = deckDiff.CardUpgradeCount,
-            PlayCardBonus = RoundEnvNumber(actionShaping.PlayCardBonus),
-            CardChoiceBonus = RoundEnvNumber(actionShaping.CardChoiceBonus),
-            SkipBadCardsBonus = RoundEnvNumber(actionShaping.SkipBadCardsBonus),
-            RestBonus = RoundEnvNumber(actionShaping.RestBonus),
-            RestMismatchPenalty = RoundEnvNumber(actionShaping.RestMismatchPenalty),
-            SmithBonus = RoundEnvNumber(actionShaping.SmithBonus),
-            SmithMismatchPenalty = RoundEnvNumber(actionShaping.SmithMismatchPenalty),
-            ThreatGapBefore = actionShaping.ThreatGapBefore,
-            ThreatGapAfter = actionShaping.ThreatGapAfter,
-            ThreatGapReduction = actionShaping.ThreatGapReduction,
-            ThreatGapReductionNormalized = RoundEnvNumber(actionShaping.ThreatGapReductionNormalized),
-            ThreatGapReductionBonus = RoundEnvNumber(actionShaping.ThreatGapReductionBonus),
-            EffectiveBlockAdded = actionShaping.EffectiveBlockAdded,
-            EffectiveBlockNormalized = RoundEnvNumber(actionShaping.EffectiveBlockNormalized),
-            EffectiveBlockBonus = RoundEnvNumber(actionShaping.EffectiveBlockBonus),
-            WastedBlockAdded = actionShaping.WastedBlockAdded,
-            WastedBlockNormalized = RoundEnvNumber(actionShaping.WastedBlockNormalized),
-            WastedBlockPenalty = RoundEnvNumber(actionShaping.WastedBlockPenalty),
-            WeakIntentReduction = actionShaping.WeakIntentReduction,
-            WeakIntentReductionNormalized = RoundEnvNumber(actionShaping.WeakIntentReductionNormalized),
-            WeakBonus = RoundEnvNumber(actionShaping.WeakBonus),
-            VulnerableRealizedDamage = actionShaping.VulnerableRealizedDamage,
-            VulnerableRealizedDamageNormalized = RoundEnvNumber(actionShaping.VulnerableRealizedDamageNormalized),
-            VulnerableBonus = RoundEnvNumber(actionShaping.VulnerableBonus),
-            EndTurnWastePenalty = RoundEnvNumber(actionShaping.EndTurnWastePenalty),
-            MissedDefensePenalty = RoundEnvNumber(actionShaping.MissedDefensePenalty),
-            CombatWin = combatWin,
-            EliteClear = eliteClear,
-            BossClear = bossClear,
-            ActClear = actClear,
             Death = death,
             Victory = victory,
-            StepPenalty = RoundEnvNumber(stepPenalty),
             ActionErrorPenalty = RoundEnvNumber(actionErrorPenalty),
             TruncatedPenalty = RoundEnvNumber(truncatedPenalty),
-            NoProgressPenalty = RoundEnvNumber(noProgressPenalty),
             Total = RoundEnvNumber(total)
         };
     }
@@ -1509,6 +1429,8 @@ internal static partial class BridgeGameApi
         public bool Done { get; set; }
         public string? RequestedCharacter { get; init; }
         public bool DefensiveBuffs { get; init; }
+        public string EpisodeMode { get; init; } = "full_run";
+        public string? EncounterId { get; init; }
         public bool RoomAnchorInitialized { get; set; }
         public string RoomKey { get; set; } = string.Empty;
         public int RoomStartHp { get; set; }
@@ -1569,14 +1491,8 @@ internal static partial class BridgeGameApi
 
     private sealed class BridgeEnvRewardBreakdown
     {
-        [JsonPropertyName("hp_loss")]
-        public required int HpLoss { get; init; }
-
         [JsonPropertyName("hp_loss_normalized")]
         public required double HpLossNormalized { get; init; }
-
-        [JsonPropertyName("hp_gain")]
-        public required int HpGain { get; init; }
 
         [JsonPropertyName("hp_gain_normalized")]
         public required double HpGainNormalized { get; init; }
@@ -1587,122 +1503,8 @@ internal static partial class BridgeGameApi
         [JsonPropertyName("room_hp_delta_normalized")]
         public required double RoomHpDeltaNormalized { get; init; }
 
-        [JsonPropertyName("gold_gain")]
-        public required int GoldGain { get; init; }
-
-        [JsonPropertyName("gold_spend")]
-        public required int GoldSpend { get; init; }
-
         [JsonPropertyName("floor_delta")]
         public required int FloorDelta { get; init; }
-
-        [JsonPropertyName("relic_gain")]
-        public required int RelicGain { get; init; }
-
-        [JsonPropertyName("potion_gain")]
-        public required int PotionGain { get; init; }
-
-        [JsonPropertyName("card_add_count")]
-        public required int CardAddCount { get; init; }
-
-        [JsonPropertyName("starter_card_remove_count")]
-        public required int StarterCardRemoveCount { get; init; }
-
-        [JsonPropertyName("other_card_remove_count")]
-        public required int OtherCardRemoveCount { get; init; }
-
-        [JsonPropertyName("card_upgrade_count")]
-        public required int CardUpgradeCount { get; init; }
-
-        [JsonPropertyName("play_card_bonus")]
-        public required double PlayCardBonus { get; init; }
-
-        [JsonPropertyName("card_choice_bonus")]
-        public required double CardChoiceBonus { get; init; }
-
-        [JsonPropertyName("skip_bad_cards_bonus")]
-        public required double SkipBadCardsBonus { get; init; }
-
-        [JsonPropertyName("rest_bonus")]
-        public required double RestBonus { get; init; }
-
-        [JsonPropertyName("rest_mismatch_penalty")]
-        public required double RestMismatchPenalty { get; init; }
-
-        [JsonPropertyName("smith_bonus")]
-        public required double SmithBonus { get; init; }
-
-        [JsonPropertyName("smith_mismatch_penalty")]
-        public required double SmithMismatchPenalty { get; init; }
-
-        [JsonPropertyName("threat_gap_before")]
-        public required int ThreatGapBefore { get; init; }
-
-        [JsonPropertyName("threat_gap_after")]
-        public required int ThreatGapAfter { get; init; }
-
-        [JsonPropertyName("threat_gap_reduction")]
-        public required int ThreatGapReduction { get; init; }
-
-        [JsonPropertyName("threat_gap_reduction_normalized")]
-        public required double ThreatGapReductionNormalized { get; init; }
-
-        [JsonPropertyName("threat_gap_reduction_bonus")]
-        public required double ThreatGapReductionBonus { get; init; }
-
-        [JsonPropertyName("effective_block_added")]
-        public required int EffectiveBlockAdded { get; init; }
-
-        [JsonPropertyName("effective_block_normalized")]
-        public required double EffectiveBlockNormalized { get; init; }
-
-        [JsonPropertyName("effective_block_bonus")]
-        public required double EffectiveBlockBonus { get; init; }
-
-        [JsonPropertyName("wasted_block_added")]
-        public required int WastedBlockAdded { get; init; }
-
-        [JsonPropertyName("wasted_block_normalized")]
-        public required double WastedBlockNormalized { get; init; }
-
-        [JsonPropertyName("wasted_block_penalty")]
-        public required double WastedBlockPenalty { get; init; }
-
-        [JsonPropertyName("weak_intent_reduction")]
-        public required int WeakIntentReduction { get; init; }
-
-        [JsonPropertyName("weak_intent_reduction_normalized")]
-        public required double WeakIntentReductionNormalized { get; init; }
-
-        [JsonPropertyName("weak_bonus")]
-        public required double WeakBonus { get; init; }
-
-        [JsonPropertyName("vulnerable_realized_damage")]
-        public required int VulnerableRealizedDamage { get; init; }
-
-        [JsonPropertyName("vulnerable_realized_damage_normalized")]
-        public required double VulnerableRealizedDamageNormalized { get; init; }
-
-        [JsonPropertyName("vulnerable_bonus")]
-        public required double VulnerableBonus { get; init; }
-
-        [JsonPropertyName("end_turn_waste_penalty")]
-        public required double EndTurnWastePenalty { get; init; }
-
-        [JsonPropertyName("missed_defense_penalty")]
-        public required double MissedDefensePenalty { get; init; }
-
-        [JsonPropertyName("combat_win")]
-        public required int CombatWin { get; init; }
-
-        [JsonPropertyName("elite_clear")]
-        public required int EliteClear { get; init; }
-
-        [JsonPropertyName("boss_clear")]
-        public required int BossClear { get; init; }
-
-        [JsonPropertyName("act_clear")]
-        public required int ActClear { get; init; }
 
         [JsonPropertyName("death")]
         public required int Death { get; init; }
@@ -1710,17 +1512,11 @@ internal static partial class BridgeGameApi
         [JsonPropertyName("victory")]
         public required int Victory { get; init; }
 
-        [JsonPropertyName("step_penalty")]
-        public required double StepPenalty { get; init; }
-
         [JsonPropertyName("action_error_penalty")]
         public required double ActionErrorPenalty { get; init; }
 
         [JsonPropertyName("truncated_penalty")]
         public required double TruncatedPenalty { get; init; }
-
-        [JsonPropertyName("no_progress_penalty")]
-        public required double NoProgressPenalty { get; init; }
 
         [JsonPropertyName("total")]
         public required double Total { get; init; }

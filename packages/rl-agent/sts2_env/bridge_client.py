@@ -208,6 +208,53 @@ class BridgeClient:
 
         return self._request("POST", "env/step", body=body, timeout_ms=timeout_ms)
 
+    def combat_reset(
+        self,
+        *,
+        character: str | None = None,
+        encounter_id: str | None = None,
+        seed: int | None = None,
+        current_hp: int | None = None,
+        max_hp: int | None = None,
+        max_energy: int | None = None,
+        deck: list[str] | None = None,
+        relics: list[str] | None = None,
+        potions: list[str] | None = None,
+        gold: int | None = None,
+        timeout_ms: int = 15_000,
+    ) -> dict[str, Any]:
+        """POST /env/combat_reset -- start a combat sandbox episode.
+
+        Returns dict with keys:
+            ok, episode_id, step_index, done, truncated, obs, legal_actions, info
+        """
+        body: dict[str, Any] = {"timeout_ms": timeout_ms}
+        if character is not None:
+            body["character"] = character
+        if encounter_id is not None:
+            body["encounter_id"] = encounter_id
+        if seed is not None:
+            body["seed"] = seed
+        if current_hp is not None:
+            body["current_hp"] = current_hp
+        if max_hp is not None:
+            body["max_hp"] = max_hp
+        if max_energy is not None:
+            body["max_energy"] = max_energy
+        if deck is not None:
+            body["deck"] = deck
+        if relics is not None:
+            body["relics"] = relics
+        if potions is not None:
+            body["potions"] = potions
+        if gold is not None:
+            body["gold"] = gold
+        return self._request("POST", "env/combat_reset", body=body, timeout_ms=timeout_ms)
+
+    def combat_catalog(self) -> dict[str, Any]:
+        """GET /env/combat_catalog -- list available combat encounters."""
+        return self._request("GET", "env/combat_catalog")
+
     def health(self) -> dict[str, Any]:
         """GET /health -- health check. Updates is_connected."""
         return self._request("GET", "health")

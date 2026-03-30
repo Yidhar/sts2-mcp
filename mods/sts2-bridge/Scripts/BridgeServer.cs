@@ -212,6 +212,31 @@ internal static class BridgeServer
             }
 
             if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/env/combat_reset", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http POST /env/combat_reset authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http POST /env/combat_reset authorized");
+                var request = await ReadJsonAsync<BridgeEnvCombatResetRequest>(context.Request, cancellationToken);
+                var payload = await BridgeGameApi.CombatResetEnvResponseAsync(request, cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http POST /env/combat_reset ok");
+                return;
+            }
+
+            if (method.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/env/combat_catalog", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http GET /env/combat_catalog authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http GET /env/combat_catalog authorized");
+                var payload = await BridgeGameApi.GetCombatCatalogResponseAsync(cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http GET /env/combat_catalog ok");
+                return;
+            }
+
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
                 path.Equals("/env/step", StringComparison.OrdinalIgnoreCase))
             {
                 BridgeDebugTrace.Write("http POST /env/step authorize");

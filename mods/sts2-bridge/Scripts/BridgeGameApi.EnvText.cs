@@ -194,7 +194,7 @@ internal static partial class BridgeGameApi
             }
 
             case "map":
-                return $"动作｜前往｜{TryGetNestedString(payload, "point_type") ?? ""}｜坐标({TryGetNestedInt(payload, "coord", "col")},{TryGetNestedInt(payload, "coord", "row")})";
+                return BuildCanonicalMapRouteActionText(payload);
 
             case "rest_site":
                 return $"动作｜营火｜{NormalizeSemanticText(TryGetNestedString(payload, "option", "label") ?? TryGetNestedString(payload, "option", "semantic_action") ?? "")}";
@@ -276,6 +276,98 @@ internal static partial class BridgeGameApi
         result = Regex.Replace(result, @"\[/?[^\]]+\]", "");
         result = Regex.Replace(result, @"\s+", " ").Trim();
         return result;
+    }
+
+    private static string BuildCanonicalMapRouteActionText(JsonElement payload)
+    {
+        var pointType = TranslateMapPointType(
+            TryGetNestedString(payload, "point_type_norm") ??
+            TryGetNestedString(payload, "point_type"));
+        var col = TryGetNestedInt(payload, "coord", "col");
+        var row = TryGetNestedInt(payload, "coord", "row");
+        var countShop = TryGetNestedInt(payload, "route_summary", "count_shop");
+        var countRest = TryGetNestedInt(payload, "route_summary", "count_rest_site");
+        var countElite = TryGetNestedInt(payload, "route_summary", "count_elite");
+        var countQuestion = TryGetNestedInt(payload, "route_summary", "count_question_mark");
+        var nextShop = TryGetNestedInt(payload, "route_summary", "next_shop_steps");
+        var nextRest = TryGetNestedInt(payload, "route_summary", "next_rest_steps");
+        var nextElite = TryGetNestedInt(payload, "route_summary", "next_elite_steps");
+        var nextQuestion = TryGetNestedInt(payload, "route_summary", "next_question_mark_steps");
+        var forcedSteps = TryGetNestedInt(payload, "route_summary", "forced_path_steps_before_branch");
+
+        var sb = new StringBuilder("动作｜前往｜");
+        sb.Append(pointType);
+        if (col is not null && row is not null)
+        {
+            sb.Append($"｜坐标({col},{row})");
+        }
+
+        if (countShop is > 0 || countRest is > 0 || countElite is > 0 || countQuestion is > 0)
+        {
+            sb.Append("｜未来");
+            if (countShop is > 0)
+            {
+                sb.Append($"｜商店{countShop}");
+            }
+
+            if (countRest is > 0)
+            {
+                sb.Append($"｜营火{countRest}");
+            }
+
+            if (countElite is > 0)
+            {
+                sb.Append($"｜精英{countElite}");
+            }
+
+            if (countQuestion is > 0)
+            {
+                sb.Append($"｜问号{countQuestion}");
+            }
+        }
+
+        if (nextRest is not null)
+        {
+            sb.Append($"｜最近营火{nextRest}步");
+        }
+
+        if (nextShop is not null)
+        {
+            sb.Append($"｜最近商店{nextShop}步");
+        }
+
+        if (nextElite is not null)
+        {
+            sb.Append($"｜最近精英{nextElite}步");
+        }
+
+        if (nextQuestion is not null)
+        {
+            sb.Append($"｜最近问号{nextQuestion}步");
+        }
+
+        if (forcedSteps is > 1)
+        {
+            sb.Append($"｜强制路径{forcedSteps}步");
+        }
+
+        return sb.ToString();
+    }
+
+    private static string TranslateMapPointType(string? pointType)
+    {
+        return NormalizeEnvMapPointType(pointType) switch
+        {
+            "Monster" => "普通战斗",
+            "Elite" => "精英",
+            "Boss" => "Boss",
+            "Event" => "事件",
+            "QuestionMark" => "问号",
+            "RestSite" => "营火",
+            "Shop" => "商店",
+            "Treasure" => "宝箱",
+            _ => NormalizeSemanticText(pointType ?? "")
+        };
     }
 
     private static string DescribeSelectionSemanticsLabel(string? semantics)

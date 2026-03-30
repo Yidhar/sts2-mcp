@@ -62,9 +62,10 @@ internal static partial class BridgeGameApi
             },
             observation = new
             {
-                root_fields = new[] { "phase", "logic_hash", "run", "player", "combat", "decision" },
+                root_fields = new[] { "phase", "decision_domain", "logic_hash", "run", "player", "combat", "decision" },
                 run_fields = new[] { "active", "game_over", "act", "act_id", "act_floor", "floor", "room_type", "room_model", "coord" },
-                player_fields = new[] { "character_id", "character_title", "hp", "max_hp", "block", "gold", "deck", "relics", "potions" },
+                player_fields = new[] { "character_id", "character_title", "hp", "max_hp", "block", "gold", "deck", "deck_cards", "relics", "potions" },
+                decision_domain_values = new[] { "combat", "build", "route" },
                 phase_values = new[]
                 {
                     "startup_main_menu",
@@ -95,69 +96,29 @@ internal static partial class BridgeGameApi
             },
             reward = new
             {
-                scalar = "weighted_sum_plus_direct_shaping",
+                scalar = "terminal_dominant_minimal",
                 linear_channels = new[]
                 {
                     "hp_loss_normalized",
                     "hp_gain_normalized",
                     "room_hp_delta_normalized",
-                    "gold_gain",
-                    "gold_spend",
                     "floor_delta",
-                    "relic_gain",
-                    "potion_gain",
-                    "card_add_count",
-                    "starter_card_remove_count",
-                    "other_card_remove_count",
-                    "card_upgrade_count",
-                    "combat_win",
-                    "elite_clear",
-                    "boss_clear",
-                    "act_clear",
                     "death",
                     "victory"
                 },
                 linear_weights = new
                 {
-                    hp_loss_normalized = -1.5,
-                    hp_gain_normalized = 0.25,
-                    room_hp_delta_normalized = 2.0,
-                    gold_gain = 0.002,
-                    gold_spend = 0.0,
-                    floor_delta = 0.35,
-                    relic_gain = 0.35,
-                    potion_gain = 0.08,
-                    card_add_count = 0.0,
-                    starter_card_remove_count = 0.18,
-                    other_card_remove_count = 0.08,
-                    card_upgrade_count = 0.15,
-                    combat_win = 1.0,
-                    elite_clear = 0.5,
-                    boss_clear = 2.0,
-                    act_clear = 5.0,
-                    death = -6.0,
-                    victory = 10.0
+                    hp_loss_normalized = EnvRewardHpLossWeight,
+                    hp_gain_normalized = EnvRewardHpGainWeight,
+                    room_hp_delta_normalized = EnvRewardRoomHpDeltaWeight,
+                    floor_delta = EnvRewardFloorDeltaWeight,
+                    death = EnvRewardDeathPenalty,
+                    victory = EnvRewardVictoryBonus
                 },
                 direct_terms = new
                 {
-                    step_penalty = 0.0,
-                    action_error_penalty = -0.10,
-                    truncated_penalty = -1.0,
-                    play_card_bonus = 0.006,
-                    effective_block_weight = 1.5,
-                    wasted_block_weight = -0.1,
-                    weak_intent_reduction_weight = 1.2,
-                    vulnerable_realized_damage_weight = 0.35,
-                    threat_gap_reduction_weight = 1.2,
-                    missed_defense_penalty_weight = -1.25,
-                    end_turn_waste_penalty = -0.01,
-                    no_progress_penalty = -0.01,
-                    skip_bad_cards_bonus = 0.04,
-                    rest_low_hp_bonus = 0.12,
-                    rest_high_hp_mismatch_penalty = -0.08,
-                    smith_healthy_bonus = 0.10,
-                    smith_low_hp_mismatch_penalty = -0.10,
-                    card_heuristic_range = new[] { -0.10, 0.10 }
+                    action_error_penalty = EnvRewardActionErrorPenalty,
+                    truncated_penalty = EnvRewardTruncatedPenalty
                 }
             },
             done_conditions = new[] { "run_game_over", "step_timeout" }
@@ -368,6 +329,15 @@ internal static partial class BridgeGameApi
             timeoutMs,
             cancellationToken);
         after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, cancellationToken);
+
+        // Combat sandbox: end episode when combat finishes, skip reward/map screens
+        if (episode.EpisodeMode == "combat_sandbox" && !after.Done && IsCombatSandboxEpisodeDone(after))
+        {
+            episode.StepIndex++;
+            episode.Done = true;
+            return BuildEnvStepPayload(episode, before, after, selectedAction,
+                truncated: false, truncationReason: null, actionError);
+        }
 
         episode.StepIndex++;
         var truncated = !after.Actionable && !after.Done;

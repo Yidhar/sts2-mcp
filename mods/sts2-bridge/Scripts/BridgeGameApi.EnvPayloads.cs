@@ -209,9 +209,11 @@ internal static partial class BridgeGameApi
 
     private static Dictionary<string, object?> BuildEnvObservationCore(BridgeWorldContext context, string phase)
     {
+        var decisionDomain = ResolveEnvDecisionDomain(context, phase);
         var observation = new Dictionary<string, object?>
         {
             ["phase"] = phase,
+            ["decision_domain"] = decisionDomain,
             ["run"] = BuildEnvRunPayload(context.RunState),
             ["player"] = BuildEnvPlayerPayload(context)
         };
@@ -229,6 +231,18 @@ internal static partial class BridgeGameApi
         }
 
         return observation;
+    }
+
+    private static string ResolveEnvDecisionDomain(BridgeWorldContext context, string phase)
+    {
+        return phase switch
+        {
+            "combat" => "combat",
+            "map" => "route",
+            "card_selection" => context.CombatManager?.IsInProgress == true ? "combat" : "build",
+            "settling" => context.CombatManager?.IsInProgress == true ? "combat" : "build",
+            _ => "build"
+        };
     }
 
     private static object BuildEnvRunPayload(RunState? runState)
@@ -293,6 +307,8 @@ internal static partial class BridgeGameApi
             block = creature?.Block,
             gold = player?.Gold,
             deck = player?.Deck?.Cards.Count ?? 0,
+            deck_cards = player?.Deck?.Cards.Select(card => BuildEnvCardPayload(card, GetCardReference(card))).ToArray()
+                ?? Array.Empty<object>(),
             relics,
             potions
         };

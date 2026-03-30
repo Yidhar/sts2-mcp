@@ -25,6 +25,20 @@ def mask_fn(env):
     return env.unwrapped.action_masks()
 
 
+CORE_REWARD_BREAKDOWN_KEYS = (
+    "hp_loss_normalized",
+    "hp_gain_normalized",
+    "room_complete",
+    "room_hp_delta_normalized",
+    "floor_delta",
+    "death",
+    "victory",
+    "action_error_penalty",
+    "truncated_penalty",
+    "total",
+)
+
+
 class RewardBreakdownTensorboardCallback(BaseCallback):
     """Record bridge reward breakdown channels into TensorBoard."""
 
@@ -40,7 +54,8 @@ class RewardBreakdownTensorboardCallback(BaseCallback):
             if not isinstance(reward_breakdown, dict):
                 continue
 
-            for key, value in reward_breakdown.items():
+            for key in CORE_REWARD_BREAKDOWN_KEYS:
+                value = reward_breakdown.get(key)
                 if isinstance(value, (int, float)):
                     self.logger.record_mean(f"reward_breakdown/{key}", float(value))
         return True
@@ -61,10 +76,18 @@ def main():
     parser.add_argument("--checkpoint-freq", type=int, default=1000)
     parser.add_argument("--verbose", type=int, default=1)
     # Network
-    parser.add_argument("--embed-dim", type=int, default=64)
+    parser.add_argument("--combat-embed-dim", type=int, default=64)
+    parser.add_argument("--build-embed-dim", type=int, default=64)
+    parser.add_argument("--route-embed-dim", type=int, default=48)
     parser.add_argument("--n-heads", type=int, default=2)
     parser.add_argument("--text-proj-dim", type=int, default=32)
-    parser.add_argument("--scorer-hidden", type=int, default=64)
+    parser.add_argument("--context-text-dim", type=int, default=48)
+    parser.add_argument("--shared-hidden-dim", type=int, default=96)
+    parser.add_argument("--shared-output-dim", type=int, default=128)
+    parser.add_argument("--combat-scorer-hidden", type=int, default=128)
+    parser.add_argument("--build-scorer-hidden", type=int, default=96)
+    parser.add_argument("--route-scorer-hidden", type=int, default=64)
+    parser.add_argument("--critic-domain-dim", type=int, default=64)
     # Text
     parser.add_argument("--no-text", action="store_true", default=False,
                         help="Disable text embeddings (numeric-only baseline)")
@@ -128,10 +151,18 @@ def main():
             vf_coef=0.5,
             max_grad_norm=0.5,
             policy_kwargs=dict(
-                embed_dim=args.embed_dim,
+                combat_embed_dim=args.combat_embed_dim,
+                build_embed_dim=args.build_embed_dim,
+                route_embed_dim=args.route_embed_dim,
                 n_heads=args.n_heads,
                 text_proj_dim=args.text_proj_dim,
-                scorer_hidden=args.scorer_hidden,
+                context_text_dim=args.context_text_dim,
+                shared_hidden_dim=args.shared_hidden_dim,
+                shared_output_dim=args.shared_output_dim,
+                combat_scorer_hidden=args.combat_scorer_hidden,
+                build_scorer_hidden=args.build_scorer_hidden,
+                route_scorer_hidden=args.route_scorer_hidden,
+                critic_domain_dim=args.critic_domain_dim,
             ),
             verbose=args.verbose,
             tensorboard_log=args.log_dir,

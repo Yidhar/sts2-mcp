@@ -1,12 +1,13 @@
 """Dict observation encoder for STS2 RL training.
 
-Three information streams:
-  - State: scalars + hand/enemy numeric+text + relics/potions text + powers
-  - Actions: per-action numeric+text features
-  - Context: decision_text for current phase
+Observation structure is intentionally split into:
+  - shared global context
+  - combat entities
+  - build/deck entities
+  - candidate actions
 
-Text embeddings use bridge-provided canonical_text (Chinese).
-Python does NOT assemble primary text — bridge is the canonical source.
+The bridge is the canonical source for semantic text. Python only embeds
+bridge-provided canonical_text and compact decision text.
 """
 
 from __future__ import annotations
@@ -19,35 +20,38 @@ from .text_encoder import TEXT_DIM
 # Constants
 # ---------------------------------------------------------------------------
 
-# Phase vocabulary
 PHASES = [
     "combat", "map", "reward", "card_reward", "event", "event_crystal_sphere",
     "rest_site", "deck_upgrade", "card_selection", "shop", "treasure",
     "actions", "settling", "terminal",
     "startup_main_menu", "startup_run_mode", "startup_character_select",
 ]
-PHASE_TO_IDX = {p: i for i, p in enumerate(PHASES)}
-NUM_PHASES = len(PHASES)  # 17
+PHASE_TO_IDX = {phase: index for index, phase in enumerate(PHASES)}
+NUM_PHASES = len(PHASES)
+
+DECISION_DOMAINS = ["combat", "build", "route"]
+DOMAIN_TO_IDX = {domain: index for index, domain in enumerate(DECISION_DOMAINS)}
+NUM_DOMAINS = len(DECISION_DOMAINS)
 
 ROOM_TYPES = ["Monster", "Elite", "Boss", "Event", "Rest", "Merchant", "Treasure"]
-ROOM_TYPE_TO_ORD = {r: i + 1 for i, r in enumerate(ROOM_TYPES)}
+ROOM_TYPE_TO_ORD = {room_type: index + 1 for index, room_type in enumerate(ROOM_TYPES)}
 NUM_ROOM_TYPES = len(ROOM_TYPES) + 1
 
-# Slot limits
 MAX_HAND = 12
+MAX_DECK = 40
 MAX_ENEMIES = 5
 MAX_RELICS = 20
 MAX_POTIONS = 5
 MAX_ACTIONS = 50
+MAX_ROUTE_NODES = 24
 
-# Section dimensions
-SCALAR_DIM = 55         # phase(17) + run(6) + player(8) + combat(8) + decision(10) + summary(6)
-CARD_FEAT_DIM = 10      # numeric per-card
-ENEMY_FEAT_DIM = 10     # numeric per-enemy
-POWER_DIM = 20          # player power slots
-ACTION_FEAT_DIM = 16    # numeric per-action (expanded)
+SCALAR_DIM = 55
+CARD_FEAT_DIM = 10
+DECK_FEAT_DIM = 10
+ENEMY_FEAT_DIM = 10
+POWER_DIM = 20
+ACTION_FEAT_DIM = 20
 
-# Action kind ordinal
 _ACTION_KINDS = [
     "play_card", "use_potion", "discard_potion", "combat",
     "reward", "card_reward", "event_option", "map",
@@ -55,44 +59,43 @@ _ACTION_KINDS = [
     "treasure_relic", "treasure", "character_select",
     "run_mode_selection", "main_menu", "proceed",
 ]
-_KIND_TO_ORD = {k: i + 1 for i, k in enumerate(_ACTION_KINDS)}
+_KIND_TO_ORD = {kind: index + 1 for index, kind in enumerate(_ACTION_KINDS)}
 _NUM_KINDS = len(_ACTION_KINDS) + 1
 
-# Map point type ordinal
-_MAP_POINT_TYPES = ["Monster", "Elite", "Boss", "Event", "Rest", "Merchant", "Treasure"]
-_PT_TO_ORD = {p: i + 1 for i, p in enumerate(_MAP_POINT_TYPES)}
+_MAP_POINT_TYPES = ["Monster", "Elite", "Boss", "Event", "QuestionMark", "RestSite", "Shop", "Treasure"]
+_PT_TO_ORD = {point_type: index + 1 for index, point_type in enumerate(_MAP_POINT_TYPES)}
 _NUM_PT = len(_MAP_POINT_TYPES) + 1
 
-# Known player powers
+_ROUTE_POINT_TYPES = ["Monster", "Elite", "Boss", "Event", "QuestionMark", "RestSite", "Shop", "Treasure"]
+_ROUTE_PT_TO_IDX = {point_type: index for index, point_type in enumerate(_ROUTE_POINT_TYPES)}
+_NUM_ROUTE_PT = len(_ROUTE_POINT_TYPES)
+
+ROUTE_SUMMARY_DIM = 20
+ROUTE_NODE_FEAT_DIM = _NUM_ROUTE_PT + 5
+
 _PLAYER_POWERS = [
     "Strength", "Dexterity", "Weak", "Vulnerable", "Frail",
     "Plating", "Ritual", "Metallicize", "Barricade", "Rage",
     "Vigor", "Intangible", "Thorns", "Regen",
 ]
-_POWER_TO_IDX = {p.lower(): i for i, p in enumerate(_PLAYER_POWERS)}
+_POWER_TO_IDX = {power.lower(): index for index, power in enumerate(_PLAYER_POWERS)}
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _float(val, default=0.0):
-    if val is None: return default
-    try: return float(val)
-    except (TypeError, ValueError): return default
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
 
 def _bool(val):
     return 1.0 if val else 0.0
 
-# ---------------------------------------------------------------------------
-# DictObservationEncoder
-# ---------------------------------------------------------------------------
 
 class DictObservationEncoder:
-    """Encodes bridge observation + legal_actions into gymnasium Dict.
-
-    Args:
-        use_text: Enable text embedding via sentence-transformers.
-    """
+    """Encode bridge observation + legal actions into a gym Dict observation."""
 
     def __init__(self, use_text: bool = True):
         self.use_text = use_text
@@ -101,392 +104,554 @@ class DictObservationEncoder:
     def _get_encoder(self):
         if self._encoder is None and self.use_text:
             from .text_encoder import get_text_encoder
+
             self._encoder = get_text_encoder().ensure_ready()
         return self._encoder
 
     @property
     def obs_space(self):
         from gymnasium import spaces
+
         inf = np.inf
-        return spaces.Dict({
-            "scalars": spaces.Box(0, 1, (SCALAR_DIM,), dtype=np.float32),
-            "hand": spaces.Box(-inf, inf, (MAX_HAND, CARD_FEAT_DIM), dtype=np.float32),
-            "hand_text": spaces.Box(-inf, inf, (MAX_HAND, TEXT_DIM), dtype=np.float32),
-            "hand_mask": spaces.Box(0, 1, (MAX_HAND,), dtype=np.float32),
-            "enemies": spaces.Box(-inf, inf, (MAX_ENEMIES, ENEMY_FEAT_DIM), dtype=np.float32),
-            "enemy_text": spaces.Box(-inf, inf, (MAX_ENEMIES, TEXT_DIM), dtype=np.float32),
-            "enemy_mask": spaces.Box(0, 1, (MAX_ENEMIES,), dtype=np.float32),
-            "player_powers": spaces.Box(0, 1, (POWER_DIM,), dtype=np.float32),
-            "relics": spaces.Box(-inf, inf, (MAX_RELICS, TEXT_DIM), dtype=np.float32),
-            "relic_mask": spaces.Box(0, 1, (MAX_RELICS,), dtype=np.float32),
-            "potions": spaces.Box(-inf, inf, (MAX_POTIONS, TEXT_DIM), dtype=np.float32),
-            "potion_mask": spaces.Box(0, 1, (MAX_POTIONS,), dtype=np.float32),
-            "context_text": spaces.Box(-inf, inf, (TEXT_DIM,), dtype=np.float32),
-            "actions": spaces.Box(-inf, inf, (MAX_ACTIONS, ACTION_FEAT_DIM), dtype=np.float32),
-            "action_text": spaces.Box(-inf, inf, (MAX_ACTIONS, TEXT_DIM), dtype=np.float32),
-            "action_mask": spaces.Box(0, 1, (MAX_ACTIONS,), dtype=np.float32),
-        })
+        return spaces.Dict(
+            {
+                "scalars": spaces.Box(0, 1, (SCALAR_DIM,), dtype=np.float32),
+                "decision_domain": spaces.Box(0, 1, (NUM_DOMAINS,), dtype=np.float32),
+                "hand": spaces.Box(-inf, inf, (MAX_HAND, CARD_FEAT_DIM), dtype=np.float32),
+                "hand_text": spaces.Box(-inf, inf, (MAX_HAND, TEXT_DIM), dtype=np.float32),
+                "hand_mask": spaces.Box(0, 1, (MAX_HAND,), dtype=np.float32),
+                "deck": spaces.Box(-inf, inf, (MAX_DECK, DECK_FEAT_DIM), dtype=np.float32),
+                "deck_text": spaces.Box(-inf, inf, (MAX_DECK, TEXT_DIM), dtype=np.float32),
+                "deck_mask": spaces.Box(0, 1, (MAX_DECK,), dtype=np.float32),
+                "enemies": spaces.Box(-inf, inf, (MAX_ENEMIES, ENEMY_FEAT_DIM), dtype=np.float32),
+                "enemy_text": spaces.Box(-inf, inf, (MAX_ENEMIES, TEXT_DIM), dtype=np.float32),
+                "enemy_mask": spaces.Box(0, 1, (MAX_ENEMIES,), dtype=np.float32),
+                "player_powers": spaces.Box(0, 1, (POWER_DIM,), dtype=np.float32),
+                "relics": spaces.Box(-inf, inf, (MAX_RELICS, TEXT_DIM), dtype=np.float32),
+                "relic_mask": spaces.Box(0, 1, (MAX_RELICS,), dtype=np.float32),
+                "potions": spaces.Box(-inf, inf, (MAX_POTIONS, TEXT_DIM), dtype=np.float32),
+                "potion_mask": spaces.Box(0, 1, (MAX_POTIONS,), dtype=np.float32),
+                "context_text": spaces.Box(-inf, inf, (TEXT_DIM,), dtype=np.float32),
+                "actions": spaces.Box(-inf, inf, (MAX_ACTIONS, ACTION_FEAT_DIM), dtype=np.float32),
+                "action_text": spaces.Box(-inf, inf, (MAX_ACTIONS, TEXT_DIM), dtype=np.float32),
+                "route_summary": spaces.Box(-inf, inf, (MAX_ACTIONS, ROUTE_SUMMARY_DIM), dtype=np.float32),
+                "route_nodes": spaces.Box(-inf, inf, (MAX_ACTIONS, MAX_ROUTE_NODES, ROUTE_NODE_FEAT_DIM), dtype=np.float32),
+                "route_node_mask": spaces.Box(0, 1, (MAX_ACTIONS, MAX_ROUTE_NODES), dtype=np.float32),
+                "action_mask": spaces.Box(0, 1, (MAX_ACTIONS,), dtype=np.float32),
+            }
+        )
 
     def encode(self, obs: dict | None, legal_actions: list | None = None) -> dict[str, np.ndarray]:
-        s = np.zeros(SCALAR_DIM, dtype=np.float32)
-        h = np.zeros((MAX_HAND, CARD_FEAT_DIM), dtype=np.float32)
-        ht = np.zeros((MAX_HAND, TEXT_DIM), dtype=np.float32)
-        hm = np.zeros(MAX_HAND, dtype=np.float32)
-        e = np.zeros((MAX_ENEMIES, ENEMY_FEAT_DIM), dtype=np.float32)
-        et = np.zeros((MAX_ENEMIES, TEXT_DIM), dtype=np.float32)
-        em = np.zeros(MAX_ENEMIES, dtype=np.float32)
-        pp = np.zeros(POWER_DIM, dtype=np.float32)
-        r = np.zeros((MAX_RELICS, TEXT_DIM), dtype=np.float32)
-        rm = np.zeros(MAX_RELICS, dtype=np.float32)
-        p = np.zeros((MAX_POTIONS, TEXT_DIM), dtype=np.float32)
-        pm = np.zeros(MAX_POTIONS, dtype=np.float32)
-        ct = np.zeros(TEXT_DIM, dtype=np.float32)
-        a = np.zeros((MAX_ACTIONS, ACTION_FEAT_DIM), dtype=np.float32)
-        at = np.zeros((MAX_ACTIONS, TEXT_DIM), dtype=np.float32)
-        am = np.zeros(MAX_ACTIONS, dtype=np.float32)
+        scalars = np.zeros(SCALAR_DIM, dtype=np.float32)
+        decision_domain = np.zeros(NUM_DOMAINS, dtype=np.float32)
+        hand = np.zeros((MAX_HAND, CARD_FEAT_DIM), dtype=np.float32)
+        hand_text = np.zeros((MAX_HAND, TEXT_DIM), dtype=np.float32)
+        hand_mask = np.zeros(MAX_HAND, dtype=np.float32)
+        deck = np.zeros((MAX_DECK, DECK_FEAT_DIM), dtype=np.float32)
+        deck_text = np.zeros((MAX_DECK, TEXT_DIM), dtype=np.float32)
+        deck_mask = np.zeros(MAX_DECK, dtype=np.float32)
+        enemies = np.zeros((MAX_ENEMIES, ENEMY_FEAT_DIM), dtype=np.float32)
+        enemy_text = np.zeros((MAX_ENEMIES, TEXT_DIM), dtype=np.float32)
+        enemy_mask = np.zeros(MAX_ENEMIES, dtype=np.float32)
+        player_powers = np.zeros(POWER_DIM, dtype=np.float32)
+        relics = np.zeros((MAX_RELICS, TEXT_DIM), dtype=np.float32)
+        relic_mask = np.zeros(MAX_RELICS, dtype=np.float32)
+        potions = np.zeros((MAX_POTIONS, TEXT_DIM), dtype=np.float32)
+        potion_mask = np.zeros(MAX_POTIONS, dtype=np.float32)
+        context_text = np.zeros(TEXT_DIM, dtype=np.float32)
+        actions = np.zeros((MAX_ACTIONS, ACTION_FEAT_DIM), dtype=np.float32)
+        action_text = np.zeros((MAX_ACTIONS, TEXT_DIM), dtype=np.float32)
+        route_summary = np.zeros((MAX_ACTIONS, ROUTE_SUMMARY_DIM), dtype=np.float32)
+        route_nodes = np.zeros((MAX_ACTIONS, MAX_ROUTE_NODES, ROUTE_NODE_FEAT_DIM), dtype=np.float32)
+        route_node_mask = np.zeros((MAX_ACTIONS, MAX_ROUTE_NODES), dtype=np.float32)
+        action_mask = np.zeros(MAX_ACTIONS, dtype=np.float32)
 
         if obs:
-            self._enc_scalars(s, obs)
-            self._enc_hand(h, ht, hm, obs)
-            self._enc_enemies(e, et, em, obs)
-            self._enc_powers(pp, obs)
-            self._enc_relics(r, rm, obs)
-            self._enc_potions(p, pm, obs)
-            self._enc_context(ct, obs)
+            self._enc_scalars(scalars, obs)
+            self._enc_decision_domain(decision_domain, obs)
+            self._enc_hand(hand, hand_text, hand_mask, obs)
+            self._enc_deck(deck, deck_text, deck_mask, obs)
+            self._enc_enemies(enemies, enemy_text, enemy_mask, obs)
+            self._enc_powers(player_powers, obs)
+            self._enc_relics(relics, relic_mask, obs)
+            self._enc_potions(potions, potion_mask, obs)
+            self._enc_context(context_text, obs)
 
         if legal_actions:
-            self._enc_actions(a, at, am, legal_actions)
+            self._enc_actions(actions, action_text, route_summary, route_nodes, route_node_mask, action_mask, legal_actions)
 
         return {
-            "scalars": s, "hand": h, "hand_text": ht, "hand_mask": hm,
-            "enemies": e, "enemy_text": et, "enemy_mask": em,
-            "player_powers": pp,
-            "relics": r, "relic_mask": rm, "potions": p, "potion_mask": pm,
-            "context_text": ct,
-            "actions": a, "action_text": at, "action_mask": am,
+            "scalars": scalars,
+            "decision_domain": decision_domain,
+            "hand": hand,
+            "hand_text": hand_text,
+            "hand_mask": hand_mask,
+            "deck": deck,
+            "deck_text": deck_text,
+            "deck_mask": deck_mask,
+            "enemies": enemies,
+            "enemy_text": enemy_text,
+            "enemy_mask": enemy_mask,
+            "player_powers": player_powers,
+            "relics": relics,
+            "relic_mask": relic_mask,
+            "potions": potions,
+            "potion_mask": potion_mask,
+            "context_text": context_text,
+            "actions": actions,
+            "action_text": action_text,
+            "route_summary": route_summary,
+            "route_nodes": route_nodes,
+            "route_node_mask": route_node_mask,
+            "action_mask": action_mask,
         }
 
-    # ---- Scalars (55 dims) ------------------------------------------------
+    def _enc_scalars(self, vector: np.ndarray, obs: dict) -> None:
+        offset = 0
 
-    def _enc_scalars(self, v, obs):
-        off = 0
-        # Phase one-hot (17)
         phase = obs.get("phase", "")
-        idx = PHASE_TO_IDX.get(phase, -1)
-        if 0 <= idx < NUM_PHASES:
-            v[off + idx] = 1.0
-        off += NUM_PHASES
+        phase_idx = PHASE_TO_IDX.get(phase, -1)
+        if 0 <= phase_idx < NUM_PHASES:
+            vector[offset + phase_idx] = 1.0
+        offset += NUM_PHASES
 
-        # Run (6)
         run = obs.get("run") or {}
-        v[off] = _bool(run.get("active"))
-        v[off+1] = _bool(run.get("game_over"))
-        v[off+2] = min(self._parse_act(run.get("act_id")) / 4.0, 1.0)
-        v[off+3] = min(_float(run.get("act_floor")) / 20.0, 1.0)
-        v[off+4] = min(_float(run.get("floor")) / 48.0, 1.0)
-        v[off+5] = ROOM_TYPE_TO_ORD.get(run.get("room_type", ""), 0) / NUM_ROOM_TYPES
-        off += 6
+        vector[offset] = _bool(run.get("active"))
+        vector[offset + 1] = _bool(run.get("game_over"))
+        vector[offset + 2] = min(self._parse_act(run.get("act_id")) / 4.0, 1.0)
+        vector[offset + 3] = min(_float(run.get("act_floor")) / 20.0, 1.0)
+        vector[offset + 4] = min(_float(run.get("floor")) / 48.0, 1.0)
+        vector[offset + 5] = ROOM_TYPE_TO_ORD.get(run.get("room_type", ""), 0) / NUM_ROOM_TYPES
+        offset += 6
 
-        # Player (8)
         player = obs.get("player") or {}
         combat = obs.get("combat") or {}
         hp = _float(player.get("hp"))
         max_hp = _float(player.get("max_hp"))
-        v[off] = min(hp / max_hp, 1.0) if max_hp > 0 else 0.0
-        v[off+1] = min(hp / 100.0, 1.0)
-        v[off+2] = min(max_hp / 100.0, 1.0)
-        v[off+3] = min(_float(player.get("block")) / 100.0, 1.0)
-        v[off+4] = min(_float(player.get("gold")) / 500.0, 1.0)
+        vector[offset] = min(hp / max_hp, 1.0) if max_hp > 0 else 0.0
+        vector[offset + 1] = min(hp / 100.0, 1.0)
+        vector[offset + 2] = min(max_hp / 100.0, 1.0)
+        vector[offset + 3] = min(_float(player.get("block")) / 100.0, 1.0)
+        vector[offset + 4] = min(_float(player.get("gold")) / 500.0, 1.0)
         energy = _float(combat.get("energy"))
         max_energy = _float(combat.get("max_energy"))
-        v[off+5] = min(energy / max_energy, 1.0) if max_energy > 0 else 0.0
-        v[off+6] = min(energy / 10.0, 1.0)
-        v[off+7] = min(_float(combat.get("stars")) / 10.0, 1.0)
-        off += 8
+        vector[offset + 5] = min(energy / max_energy, 1.0) if max_energy > 0 else 0.0
+        vector[offset + 6] = min(energy / 10.0, 1.0)
+        vector[offset + 7] = min(_float(combat.get("stars")) / 10.0, 1.0)
+        offset += 8
 
-        # Combat meta (8)
         if combat:
-            v[off] = 1.0
-            v[off+1] = min(_float(combat.get("round")) / 20.0, 1.0)
-            v[off+2] = _bool(combat.get("play_phase"))
-            v[off+3] = _bool(combat.get("can_act"))
+            vector[offset] = 1.0
+            vector[offset + 1] = min(_float(combat.get("round")) / 20.0, 1.0)
+            vector[offset + 2] = _bool(combat.get("play_phase"))
+            vector[offset + 3] = _bool(combat.get("can_act"))
             hand = combat.get("hand") or []
-            v[off+4] = min(len(hand) / 10.0, 1.0)
-            v[off+5] = min(_float(combat.get("draw")) / 40.0, 1.0)
-            v[off+6] = min(_float(combat.get("discard")) / 40.0, 1.0)
-            v[off+7] = min(_float(combat.get("exhaust")) / 20.0, 1.0)
-        off += 8
+            vector[offset + 4] = min(len(hand) / 10.0, 1.0)
+            vector[offset + 5] = min(_float(combat.get("draw")) / 40.0, 1.0)
+            vector[offset + 6] = min(_float(combat.get("discard")) / 40.0, 1.0)
+            vector[offset + 7] = min(_float(combat.get("exhaust")) / 20.0, 1.0)
+        offset += 8
 
-        # Decision (10)
-        dec = obs.get("decision") or {}
-        if isinstance(dec, dict):
-            v[off] = min(_float(dec.get("option_count")) / 10.0, 1.0)
-            v[off+1] = _bool(dec.get("can_skip"))
-            v[off+2] = min(_float(dec.get("selected_count")) / 5.0, 1.0)
-            v[off+3] = min(_float(dec.get("min_select")) / 5.0, 1.0)
-            v[off+4] = min(_float(dec.get("max_select")) / 5.0, 1.0)
-            v[off+5] = _bool(dec.get("is_open"))
-            v[off+6] = min(_float(dec.get("travelable_count")) / 10.0, 1.0)
-            v[off+7] = _bool(dec.get("can_proceed") or dec.get("proceed_only"))
-            v[off+8] = min(_float(dec.get("reward_count")) / 10.0, 1.0)
-            v[off+9] = min(_float(dec.get("item_count")) / 20.0, 1.0)
-        off += 10
+        decision = obs.get("decision") or {}
+        if isinstance(decision, dict):
+            vector[offset] = min(_float(decision.get("option_count")) / 10.0, 1.0)
+            vector[offset + 1] = _bool(decision.get("can_skip"))
+            vector[offset + 2] = min(_float(decision.get("selected_count")) / 5.0, 1.0)
+            vector[offset + 3] = min(_float(decision.get("min_select")) / 5.0, 1.0)
+            vector[offset + 4] = min(_float(decision.get("max_select")) / 5.0, 1.0)
+            vector[offset + 5] = _bool(decision.get("is_open"))
+            vector[offset + 6] = min(_float(decision.get("travelable_count")) / 10.0, 1.0)
+            vector[offset + 7] = _bool(decision.get("can_proceed") or decision.get("proceed_only"))
+            vector[offset + 8] = min(_float(decision.get("reward_count")) / 10.0, 1.0)
+            vector[offset + 9] = min(_float(decision.get("item_count")) / 20.0, 1.0)
+        offset += 10
 
-        # Summary (6)
         relics = player.get("relics") or []
         potions = player.get("potions") or []
         relic_count = len(relics) if isinstance(relics, list) else 0
-        potion_count = sum(1 for p in (potions if isinstance(potions, list) else [])
-                          if isinstance(p, (str, dict)) and (p if isinstance(p, str) else p.get("title", "")) != "[empty]")
-        deck = player.get("deck")
-        deck_size = len(deck) if isinstance(deck, list) else _float(deck)
-        v[off] = min(deck_size / 50.0, 1.0)
-        v[off+1] = min(relic_count / 20.0, 1.0)
-        v[off+2] = min(potion_count / 5.0, 1.0)
-        v[off+3] = min((len(potions) - potion_count) / 5.0, 1.0) if isinstance(potions, list) else 0.0
-        v[off+4] = min(len(potions) / 5.0, 1.0) if isinstance(potions, list) else 0.0  # total potion slots
-        v[off+5] = min(_float(player.get("gold")) / 999.0, 1.0)  # gold ratio (coarser)
-        off += 6
-        assert off == SCALAR_DIM
+        potion_count = sum(
+            1
+            for potion in (potions if isinstance(potions, list) else [])
+            if isinstance(potion, (str, dict))
+            and (potion if isinstance(potion, str) else potion.get("title", "")) != "[empty]"
+        )
+        deck_cards = player.get("deck_cards")
+        deck_size = len(deck_cards) if isinstance(deck_cards, list) else _float(player.get("deck"))
+        vector[offset] = min(deck_size / 50.0, 1.0)
+        vector[offset + 1] = min(relic_count / 20.0, 1.0)
+        vector[offset + 2] = min(potion_count / 5.0, 1.0)
+        vector[offset + 3] = min((len(potions) - potion_count) / 5.0, 1.0) if isinstance(potions, list) else 0.0
+        vector[offset + 4] = min(len(potions) / 5.0, 1.0) if isinstance(potions, list) else 0.0
+        vector[offset + 5] = min(_float(player.get("gold")) / 999.0, 1.0)
+        offset += 6
 
-    # ---- Hand cards -------------------------------------------------------
+        assert offset == SCALAR_DIM
 
-    def _enc_hand(self, h, ht, hm, obs):
+    def _enc_decision_domain(self, vector: np.ndarray, obs: dict) -> None:
+        domain = self._resolve_domain(obs)
+        index = DOMAIN_TO_IDX.get(domain, DOMAIN_TO_IDX["build"])
+        vector[index] = 1.0
+
+    def _enc_hand(self, hand: np.ndarray, hand_text: np.ndarray, hand_mask: np.ndarray, obs: dict) -> None:
         combat = obs.get("combat") or {}
-        hand = combat.get("hand") or []
-        texts = []
-        text_slots = []
-        for i, card in enumerate(hand[:MAX_HAND]):
-            if not isinstance(card, dict): continue
-            hm[i] = 1.0
-            row = h[i]
+        cards = combat.get("hand") or []
+        self._enc_card_collection(cards, hand, hand_text, hand_mask)
+
+    def _enc_deck(self, deck: np.ndarray, deck_text: np.ndarray, deck_mask: np.ndarray, obs: dict) -> None:
+        player = obs.get("player") or {}
+        cards = player.get("deck_cards") or []
+        self._enc_card_collection(cards, deck, deck_text, deck_mask)
+
+    def _enc_card_collection(
+        self,
+        cards: list,
+        numeric: np.ndarray,
+        text: np.ndarray,
+        mask: np.ndarray,
+    ) -> None:
+        max_items = numeric.shape[0]
+        texts: list[str] = []
+        text_slots: list[int] = []
+        for index, card in enumerate(cards[:max_items]):
+            if not isinstance(card, dict):
+                continue
+            mask[index] = 1.0
+            row = numeric[index]
             row[0] = min(_float(card.get("cost")) / 5.0, 1.0)
-            ctype = (card.get("type") or "").capitalize()
-            row[1] = 1.0 if ctype == "Attack" else 0.0
-            row[2] = 1.0 if ctype == "Skill" else 0.0
-            row[3] = 1.0 if ctype == "Power" else 0.0
+            card_type = (card.get("type") or "").capitalize()
+            row[1] = 1.0 if card_type == "Attack" else 0.0
+            row[2] = 1.0 if card_type == "Skill" else 0.0
+            row[3] = 1.0 if card_type == "Power" else 0.0
             row[4] = _bool(card.get("x_cost"))
             row[5] = min(_float(card.get("star")) / 5.0, 1.0) if card.get("star") is not None else 0.0
             row[6] = _bool(card.get("star_x"))
             target = (card.get("target") or "").lower()
             row[7] = 1.0 if "single" in target or "anyenemy" in target else 0.0
             row[8] = 1.0 if "all" in target else 0.0
-            row[9] = 1.0 if "self" in target else 0.0  # only explicit self-target
-            # Text: use bridge canonical_text
-            ct = card.get("canonical_text", "")
-            if ct and self.use_text:
-                texts.append(ct)
-                text_slots.append(i)
+            row[9] = 1.0 if "self" in target else 0.0
+            canonical_text = card.get("canonical_text", "")
+            if canonical_text and self.use_text:
+                texts.append(canonical_text)
+                text_slots.append(index)
+
         if texts:
-            embs = self._get_encoder().encode_batch(texts)
-            for idx, slot in enumerate(text_slots):
-                ht[slot] = embs[idx]
+            embeddings = self._get_encoder().encode_batch(texts)
+            for embedding_index, slot in enumerate(text_slots):
+                text[slot] = embeddings[embedding_index]
 
-    # ---- Enemies ----------------------------------------------------------
-
-    def _enc_enemies(self, e, et, em, obs):
+    def _enc_enemies(self, enemies: np.ndarray, enemy_text: np.ndarray, enemy_mask: np.ndarray, obs: dict) -> None:
         combat = obs.get("combat") or {}
-        enemies = combat.get("enemies") or []
-        texts = []
-        text_slots = []
-        for i, en in enumerate(enemies[:MAX_ENEMIES]):
-            if not isinstance(en, dict): continue
-            em[i] = 1.0
-            row = e[i]
-            hp = _float(en.get("hp"))
-            max_hp = _float(en.get("max_hp"))
+        entries = combat.get("enemies") or []
+        texts: list[str] = []
+        text_slots: list[int] = []
+
+        for index, enemy in enumerate(entries[:MAX_ENEMIES]):
+            if not isinstance(enemy, dict):
+                continue
+            enemy_mask[index] = 1.0
+            row = enemies[index]
+            hp = _float(enemy.get("hp"))
+            max_hp = _float(enemy.get("max_hp"))
             row[0] = min(hp / max_hp, 1.0) if max_hp > 0 else 0.0
             row[1] = min(hp / 1200.0, 1.0)
             row[2] = min(max_hp / 1200.0, 1.0)
-            row[3] = min(_float(en.get("block")) / 200.0, 1.0)
-            intent = en.get("intent") or {}
+            row[3] = min(_float(enemy.get("block")) / 200.0, 1.0)
+            intent = enemy.get("intent") or {}
             row[4] = min(_float(intent.get("total_damage")) / 80.0, 1.0)
             row[5] = min(_float(intent.get("repeats")) / 5.0, 1.0)
-            powers = en.get("powers") or []
+            powers = enemy.get("powers") or []
             row[6] = min(len(powers) / 5.0, 1.0)
-            for p in powers:
-                if not isinstance(p, dict): continue
-                t = (p.get("title") or "").lower()
-                if "vulnerable" in t: row[7] = 1.0
-                elif "weak" in t: row[8] = 1.0
-                elif "strength" in t: row[9] = 1.0
-            # Text: build from name + intent + powers
+            for power in powers:
+                if not isinstance(power, dict):
+                    continue
+                title = (power.get("title") or "").lower()
+                if "vulnerable" in title:
+                    row[7] = 1.0
+                elif "weak" in title:
+                    row[8] = 1.0
+                elif "strength" in title:
+                    row[9] = 1.0
+
             if self.use_text:
-                parts = [en.get("name", "")]
+                parts = [enemy.get("name", "")]
                 if intent.get("total_damage"):
                     parts.append(f"意图:{intent['total_damage']}伤害")
-                for p in powers[:3]:
-                    if isinstance(p, dict):
-                        parts.append(f"{p.get('title','')}:{p.get('amount','')}")
-                text = "｜".join(p for p in parts if p)
-                if text:
-                    texts.append(text)
-                    text_slots.append(i)
+                for power in powers[:3]:
+                    if isinstance(power, dict):
+                        parts.append(f"{power.get('title', '')}:{power.get('amount', '')}")
+                joined = "｜".join(part for part in parts if part)
+                if joined:
+                    texts.append(joined)
+                    text_slots.append(index)
+
         if texts:
-            embs = self._get_encoder().encode_batch(texts)
-            for idx, slot in enumerate(text_slots):
-                et[slot] = embs[idx]
+            embeddings = self._get_encoder().encode_batch(texts)
+            for embedding_index, slot in enumerate(text_slots):
+                enemy_text[slot] = embeddings[embedding_index]
 
-    # ---- Player powers ----------------------------------------------------
-
-    def _enc_powers(self, pp, obs):
+    def _enc_powers(self, vector: np.ndarray, obs: dict) -> None:
         combat = obs.get("combat") or {}
-        # Bridge now provides player_powers directly in the combat payload
         powers = combat.get("player_powers") or []
-
         buff_count = 0
         debuff_count = 0
-        for p in powers:
-            if not isinstance(p, dict): continue
-            title = (p.get("title") or "").lower()
-            amount = _float(p.get("amount"))
-            idx = _POWER_TO_IDX.get(title)
-            if idx is not None and idx < len(_PLAYER_POWERS):
-                pp[idx] = min(abs(amount) / 20.0, 1.0)
+
+        for power in powers:
+            if not isinstance(power, dict):
+                continue
+            title = (power.get("title") or "").lower()
+            amount = _float(power.get("amount"))
+            index = _POWER_TO_IDX.get(title)
+            if index is not None and index < len(_PLAYER_POWERS):
+                vector[index] = min(abs(amount) / 20.0, 1.0)
             if title in ("weak", "vulnerable", "frail"):
                 debuff_count += 1
             else:
                 buff_count += 1
-        # Summary slots at end
+
         if POWER_DIM > len(_PLAYER_POWERS):
-            pp[len(_PLAYER_POWERS)] = min(buff_count / 10.0, 1.0)
-            pp[len(_PLAYER_POWERS)+1] = min(debuff_count / 10.0, 1.0)
+            vector[len(_PLAYER_POWERS)] = min(buff_count / 10.0, 1.0)
+            vector[len(_PLAYER_POWERS) + 1] = min(debuff_count / 10.0, 1.0)
 
-    # ---- Relics -----------------------------------------------------------
-
-    def _enc_relics(self, r, rm, obs):
+    def _enc_relics(self, relics: np.ndarray, relic_mask: np.ndarray, obs: dict) -> None:
         player = obs.get("player") or {}
-        relics = player.get("relics") or []
-        if not isinstance(relics, list) or not self.use_text:
+        entries = player.get("relics") or []
+        if not isinstance(entries, list) or not self.use_text:
             return
-        texts = []
-        text_slots = []
-        for i, relic in enumerate(relics[:MAX_RELICS]):
+
+        texts: list[str] = []
+        slots: list[int] = []
+        for index, relic in enumerate(entries[:MAX_RELICS]):
             if isinstance(relic, dict):
-                ct = relic.get("canonical_text", "")
-                if not ct:
-                    ct = relic.get("title", "")
+                canonical_text = relic.get("canonical_text", "") or relic.get("title", "")
             elif isinstance(relic, str):
-                ct = relic  # fallback: old format (just title)
+                canonical_text = relic
             else:
                 continue
-            if ct and ct != "[empty]":
-                rm[i] = 1.0
-                texts.append(ct)
-                text_slots.append(i)
+            if canonical_text and canonical_text != "[empty]":
+                relic_mask[index] = 1.0
+                texts.append(canonical_text)
+                slots.append(index)
+
         if texts:
-            embs = self._get_encoder().encode_batch(texts)
-            for idx, slot in enumerate(text_slots):
-                r[slot] = embs[idx]
+            embeddings = self._get_encoder().encode_batch(texts)
+            for embedding_index, slot in enumerate(slots):
+                relics[slot] = embeddings[embedding_index]
 
-    # ---- Potions ----------------------------------------------------------
-
-    def _enc_potions(self, p, pm, obs):
+    def _enc_potions(self, potions: np.ndarray, potion_mask: np.ndarray, obs: dict) -> None:
         player = obs.get("player") or {}
-        potions = player.get("potions") or []
-        if not isinstance(potions, list) or not self.use_text:
+        entries = player.get("potions") or []
+        if not isinstance(entries, list) or not self.use_text:
             return
-        texts = []
-        text_slots = []
-        for i, potion in enumerate(potions[:MAX_POTIONS]):
+
+        texts: list[str] = []
+        slots: list[int] = []
+        for index, potion in enumerate(entries[:MAX_POTIONS]):
             if isinstance(potion, dict):
-                ct = potion.get("canonical_text", "")
+                canonical_text = potion.get("canonical_text", "")
                 title = potion.get("title", "")
             elif isinstance(potion, str):
-                ct = ""
+                canonical_text = ""
                 title = potion
             else:
                 continue
-            if title == "[empty]" or not (ct or title):
+            if title == "[empty]" or not (canonical_text or title):
                 continue
-            pm[i] = 1.0
-            texts.append(ct or title)
-            text_slots.append(i)
+            potion_mask[index] = 1.0
+            texts.append(canonical_text or title)
+            slots.append(index)
+
         if texts:
-            embs = self._get_encoder().encode_batch(texts)
-            for idx, slot in enumerate(text_slots):
-                p[slot] = embs[idx]
+            embeddings = self._get_encoder().encode_batch(texts)
+            for embedding_index, slot in enumerate(slots):
+                potions[slot] = embeddings[embedding_index]
 
-    # ---- Context text -----------------------------------------------------
-
-    def _enc_context(self, ct, obs):
+    def _enc_context(self, vector: np.ndarray, obs: dict) -> None:
         if not self.use_text:
             return
-        dec = obs.get("decision") or {}
+        decision = obs.get("decision") or {}
         text = ""
-        if isinstance(dec, dict):
-            text = dec.get("decision_text", "")
+        if isinstance(decision, dict):
+            text = decision.get("decision_text", "")
         if not text:
+            domain = self._resolve_domain(obs)
             phase = obs.get("phase", "")
-            text = f"阶段：{phase}"
-        if text:
-            ct[:] = self._get_encoder().encode(text)
+            text = f"阶段：{phase}｜决策域：{domain}"
+        vector[:] = self._get_encoder().encode(text)
 
-    # ---- Actions ----------------------------------------------------------
+    def _enc_actions(
+        self,
+        actions: np.ndarray,
+        action_text: np.ndarray,
+        route_summary: np.ndarray,
+        route_nodes: np.ndarray,
+        route_node_mask: np.ndarray,
+        action_mask: np.ndarray,
+        legal_actions: list,
+    ) -> None:
+        texts: list[str] = []
+        text_slots: list[int] = []
+        count = min(len(legal_actions), MAX_ACTIONS)
+        for index in range(count):
+            action = legal_actions[index]
+            if not isinstance(action, dict):
+                continue
+            action_mask[index] = 1.0
+            self._enc_action_numeric(actions[index], action)
+            self._enc_route_action(route_summary[index], route_nodes[index], route_node_mask[index], action)
+            canonical_text = action.get("canonical_text", "")
+            if canonical_text and self.use_text:
+                texts.append(canonical_text)
+                text_slots.append(index)
 
-    def _enc_actions(self, a, at, am, legal_actions):
-        texts = []
-        text_slots = []
-        n = min(len(legal_actions), MAX_ACTIONS)
-        for i in range(n):
-            act = legal_actions[i]
-            if not isinstance(act, dict): continue
-            am[i] = 1.0
-            self._enc_action_numeric(a[i], act)
-            ct = act.get("canonical_text", "")
-            if ct and self.use_text:
-                texts.append(ct)
-                text_slots.append(i)
         if texts:
-            embs = self._get_encoder().encode_batch(texts)
-            for idx, slot in enumerate(text_slots):
-                at[slot] = embs[idx]
+            embeddings = self._get_encoder().encode_batch(texts)
+            for embedding_index, slot in enumerate(text_slots):
+                action_text[slot] = embeddings[embedding_index]
 
-    def _enc_action_numeric(self, row, act):
-        """Encode one action into ACTION_FEAT_DIM=16 numeric features."""
-        kind = act.get("kind", "")
+    def _enc_action_numeric(self, row: np.ndarray, action: dict) -> None:
+        kind = action.get("kind", "")
         row[0] = _KIND_TO_ORD.get(kind, 0) / _NUM_KINDS
 
-        card = act.get("card")
+        card = action.get("card")
         if isinstance(card, dict):
-            row[1] = 1.0  # has_card
+            row[1] = 1.0
             row[2] = min(_float(card.get("cost")) / 5.0, 1.0)
             row[3] = min(_float(card.get("star")) / 5.0, 1.0) if card.get("star") is not None else 0.0
-            ctype = (card.get("type") or "").capitalize()
-            row[4] = 1.0 if ctype == "Attack" else 0.0
-            row[5] = 1.0 if ctype == "Skill" else 0.0
-            row[6] = 1.0 if ctype == "Power" else 0.0
+            card_type = (card.get("type") or "").capitalize()
+            row[4] = 1.0 if card_type == "Attack" else 0.0
+            row[5] = 1.0 if card_type == "Skill" else 0.0
+            row[6] = 1.0 if card_type == "Power" else 0.0
 
-        target = act.get("target")
+        target = action.get("target")
         row[7] = 1.0 if isinstance(target, dict) and target.get("name") else 0.0
         row[8] = 1.0 if isinstance(target, dict) and target.get("side") == "Player" else 0.0
-        row[9] = 1.0 if act.get("action_id") == "end_turn" else 0.0
-        row[10] = 1.0 if kind == "proceed" and not act.get("skip") else 0.0
-        row[11] = 1.0 if act.get("skip") or "skip" in (act.get("action_id") or "") else 0.0
+        row[9] = 1.0 if action.get("action_id") == "end_turn" else 0.0
+        row[10] = 1.0 if kind == "proceed" and not action.get("skip") else 0.0
+        row[11] = 1.0 if action.get("skip") or "skip" in (action.get("action_id") or "") else 0.0
 
-        # Shop cost
-        item = act.get("item")
+        item = action.get("item")
         if isinstance(item, dict):
             row[12] = min(_float(item.get("cost")) / 500.0, 1.0)
 
-        # Reward type
-        reward = act.get("reward")
+        reward = action.get("reward")
         if isinstance(reward, dict):
-            rt = reward.get("type", "")
-            row[13] = 1.0 if rt == "gold" else 0.0
-            row[14] = 1.0 if rt == "card" else 0.0
+            reward_type = reward.get("type", "")
+            row[13] = 1.0 if reward_type == "gold" else 0.0
+            row[14] = 1.0 if reward_type == "card" else 0.0
 
-        # Map point type
-        pt = act.get("point_type", "")
-        row[15] = _PT_TO_ORD.get(pt, 0) / _NUM_PT
+        point_type = self._normalize_route_point_type(action.get("point_type_norm") or action.get("point_type", ""))
+        row[15] = _PT_TO_ORD.get(point_type, 0) / _NUM_PT
 
-    # ---- Helpers ----------------------------------------------------------
+        coord = action.get("coord")
+        if isinstance(coord, dict):
+            row[16] = min(_float(coord.get("row")) / 15.0, 1.0)
+            row[17] = min(_float(coord.get("col")) / 7.0, 1.0)
+
+        row[18] = 1.0 if isinstance(action.get("upgrade_preview"), dict) else 0.0
+
+        option_index = action.get("index")
+        if option_index is None:
+            option_index = action.get("hand_index")
+        row[19] = min(_float(option_index) / 20.0, 1.0) if option_index is not None else 0.0
+
+    def _enc_route_action(
+        self,
+        summary_row: np.ndarray,
+        node_rows: np.ndarray,
+        node_mask: np.ndarray,
+        action: dict,
+    ) -> None:
+        route_summary = action.get("route_summary")
+        if not isinstance(route_summary, dict):
+            return
+
+        summary_row[0] = min(_float(route_summary.get("reachable_node_count")) / 30.0, 1.0)
+        summary_row[1] = min(_float(route_summary.get("max_depth")) / 15.0, 1.0)
+        summary_row[2] = min(_float(route_summary.get("direct_child_count")) / 4.0, 1.0)
+        summary_row[3] = min(_float(route_summary.get("forced_path_steps_before_branch")) / 10.0, 1.0)
+        summary_row[4] = min(_float(route_summary.get("count_monster")) / 10.0, 1.0)
+        summary_row[5] = min(_float(route_summary.get("count_elite")) / 5.0, 1.0)
+        summary_row[6] = min(_float(route_summary.get("count_boss")) / 2.0, 1.0)
+        summary_row[7] = min(_float(route_summary.get("count_event")) / 10.0, 1.0)
+        summary_row[8] = min(_float(route_summary.get("count_question_mark")) / 10.0, 1.0)
+        summary_row[9] = min(_float(route_summary.get("count_rest_site")) / 5.0, 1.0)
+        summary_row[10] = min(_float(route_summary.get("count_shop")) / 5.0, 1.0)
+        summary_row[11] = min(_float(route_summary.get("count_treasure")) / 5.0, 1.0)
+        summary_row[12] = self._norm_step(route_summary.get("next_elite_steps"))
+        summary_row[13] = self._norm_step(route_summary.get("next_rest_steps"))
+        summary_row[14] = self._norm_step(route_summary.get("next_shop_steps"))
+        summary_row[15] = self._norm_step(route_summary.get("next_event_steps"))
+        summary_row[16] = self._norm_step(route_summary.get("next_question_mark_steps"))
+        summary_row[17] = self._norm_step(route_summary.get("next_treasure_steps"))
+        summary_row[18] = _bool(route_summary.get("can_reach_rest_site_before_elite"))
+        summary_row[19] = _bool(route_summary.get("can_reach_elite_then_rest_site"))
+
+        nodes = action.get("route_nodes") or []
+        for index, node in enumerate(nodes[:MAX_ROUTE_NODES]):
+            if not isinstance(node, dict):
+                continue
+            node_mask[index] = 1.0
+            self._enc_route_node(node_rows[index], node)
+
+    def _enc_route_node(self, row: np.ndarray, node: dict) -> None:
+        point_type = self._normalize_route_point_type(node.get("point_type"))
+        type_index = _ROUTE_PT_TO_IDX.get(point_type)
+        if type_index is not None:
+            row[type_index] = 1.0
+
+        base = _NUM_ROUTE_PT
+        row[base] = min(_float(node.get("depth")) / 15.0, 1.0)
+        coord = node.get("coord")
+        if isinstance(coord, dict):
+            row[base + 1] = min(_float(coord.get("row")) / 15.0, 1.0)
+            row[base + 2] = min(_float(coord.get("col")) / 7.0, 1.0)
+        row[base + 3] = min(_float(node.get("child_count")) / 4.0, 1.0)
+        row[base + 4] = _bool(node.get("is_leaf"))
+
+    def _resolve_domain(self, obs: dict) -> str:
+        decision_domain = obs.get("decision_domain")
+        if isinstance(decision_domain, str) and decision_domain in DOMAIN_TO_IDX:
+            return decision_domain
+
+        phase = obs.get("phase", "")
+        if phase == "combat":
+            return "combat"
+        if phase == "map":
+            return "route"
+        if phase == "card_selection":
+            combat = obs.get("combat")
+            return "combat" if combat else "build"
+        if phase == "settling":
+            combat = obs.get("combat")
+            return "combat" if combat else "build"
+        return "build"
+
+    @staticmethod
+    def _norm_step(value) -> float:
+        if value is None:
+            return 0.0
+        return min(_float(value) / 10.0, 1.0)
+
+    @staticmethod
+    def _normalize_route_point_type(point_type) -> str:
+        if point_type in ("Merchant", "Shop"):
+            return "Shop"
+        if point_type in ("Rest", "RestSite"):
+            return "RestSite"
+        if point_type in ("Unknown", "QuestionMark"):
+            return "QuestionMark"
+        if point_type in _ROUTE_PT_TO_IDX:
+            return point_type
+        return "Monster"
 
     @staticmethod
     def _parse_act(act_id):
-        if not act_id or not isinstance(act_id, str): return 0.0
-        for ch in reversed(act_id):
-            if ch.isdigit():
-                try: return float(ch)
-                except: pass
+        if not act_id or not isinstance(act_id, str):
+            return 0.0
+        for char in reversed(act_id):
+            if char.isdigit():
+                try:
+                    return float(char)
+                except Exception:
+                    pass
         return 0.0

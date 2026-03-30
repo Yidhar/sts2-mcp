@@ -51,3 +51,4 @@ packages/rl-agent/.text_cache_strict_fail
 packages/rl-agent/.tmp_text_cache
 packages/rl-agent/runs_v2
 packages/mcp-server/rl-smoke-logs
+release-assets/

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 
 namespace Sts2McpBridge.Scripts;
@@ -223,6 +224,64 @@ internal static partial class BridgeGameApi
             col = TryGetNestedInt(element.Value, "col"),
             row = TryGetNestedInt(element.Value, "row")
         };
+    }
+
+    private static object? CompactMapRouteSummaryPayload(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            reachable_node_count = TryGetNestedInt(element.Value, "reachable_node_count"),
+            max_depth = TryGetNestedInt(element.Value, "max_depth"),
+            direct_child_count = TryGetNestedInt(element.Value, "direct_child_count"),
+            forced_path_steps_before_branch = TryGetNestedInt(element.Value, "forced_path_steps_before_branch"),
+            count_monster = TryGetNestedInt(element.Value, "count_monster"),
+            count_elite = TryGetNestedInt(element.Value, "count_elite"),
+            count_boss = TryGetNestedInt(element.Value, "count_boss"),
+            count_event = TryGetNestedInt(element.Value, "count_event"),
+            count_question_mark = TryGetNestedInt(element.Value, "count_question_mark"),
+            count_rest_site = TryGetNestedInt(element.Value, "count_rest_site"),
+            count_shop = TryGetNestedInt(element.Value, "count_shop"),
+            count_treasure = TryGetNestedInt(element.Value, "count_treasure"),
+            next_elite_steps = TryGetNestedInt(element.Value, "next_elite_steps"),
+            next_rest_steps = TryGetNestedInt(element.Value, "next_rest_steps"),
+            next_shop_steps = TryGetNestedInt(element.Value, "next_shop_steps"),
+            next_event_steps = TryGetNestedInt(element.Value, "next_event_steps"),
+            next_question_mark_steps = TryGetNestedInt(element.Value, "next_question_mark_steps"),
+            next_treasure_steps = TryGetNestedInt(element.Value, "next_treasure_steps"),
+            next_boss_steps = TryGetNestedInt(element.Value, "next_boss_steps"),
+            can_reach_rest_site_before_elite = TryGetNestedBool(element.Value, "can_reach_rest_site_before_elite"),
+            can_reach_elite_then_rest_site = TryGetNestedBool(element.Value, "can_reach_elite_then_rest_site")
+        };
+    }
+
+    private static object[] CompactMapRouteNodesPayload(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            return Array.Empty<object>();
+        }
+
+        if (!element.Value.TryGetProperty("nodes", out var nodes) || nodes.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<object>();
+        }
+
+        return nodes
+            .EnumerateArray()
+            .Select(node => (object)new
+            {
+                coord = CompactCoordPayload(TryGetNestedElement(node, "coord")),
+                point_type = TryGetNestedString(node, "point_type"),
+                depth = TryGetNestedInt(node, "depth"),
+                child_count = TryGetNestedInt(node, "child_count"),
+                is_leaf = TryGetNestedBool(node, "is_leaf")
+            })
+            .ToArray();
     }
 
     private static JsonElement? TryGetNestedElement(JsonElement element, params string[] path)
