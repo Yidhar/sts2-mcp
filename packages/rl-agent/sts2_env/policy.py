@@ -10,6 +10,7 @@ from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistrib
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule
 
+from .observation_v2 import ACTION_KIND_TO_ORD, NUM_ACTION_KINDS
 from .network import (
     BuildStateEncoder,
     CandidateScorer,
@@ -19,6 +20,10 @@ from .network import (
     RouteStateEncoder,
     SharedContextEncoder,
 )
+
+_PLAY_CARD_KIND_ORD = ACTION_KIND_TO_ORD["play_card"]
+_USE_POTION_KIND_ORD = ACTION_KIND_TO_ORD["use_potion"]
+_ACTION_INDEX_SCALE = 20.0
 
 
 class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
@@ -161,9 +166,13 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
     def forward(self, obs, deterministic=False, action_masks=None):
         shared_ctx = self._sanitize_tensor(self.shared_encoder(obs))
         logits, critic_state = self._route_domains(obs, shared_ctx)
-        distribution = self._build_distribution(logits, action_masks=action_masks)
+        masked_logits, masks = self._mask_logits(logits, action_masks=action_masks)
+        distribution = self.action_dist.proba_distribution(action_logits=masked_logits)
         values = self._sanitize_tensor(self.value_net(torch.cat([shared_ctx, critic_state], dim=-1)))
-        actions = distribution.get_actions(deterministic=deterministic)
+        if deterministic:
+            actions = self._select_deterministic_actions(masked_logits, obs, masks)
+        else:
+            actions = distribution.get_actions(deterministic=False)
         log_prob = distribution.log_prob(actions)
         return actions, values, log_prob
 
@@ -179,12 +188,21 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
     def get_distribution(self, obs, action_masks=None):
         shared_ctx = self._sanitize_tensor(self.shared_encoder(obs))
         logits, _ = self._route_domains(obs, shared_ctx)
-        return self._build_distribution(logits, action_masks=action_masks)
+        masked_logits, _ = self._mask_logits(logits, action_masks=action_masks)
+        return self.action_dist.proba_distribution(action_logits=masked_logits)
 
     def predict_values(self, obs):
         shared_ctx = self._sanitize_tensor(self.shared_encoder(obs))
         _, critic_state = self._route_domains(obs, shared_ctx)
         return self._sanitize_tensor(self.value_net(torch.cat([shared_ctx, critic_state], dim=-1)))
+
+    def _predict(self, observation, deterministic=False, action_masks=None):
+        shared_ctx = self._sanitize_tensor(self.shared_encoder(observation))
+        logits, _ = self._route_domains(observation, shared_ctx)
+        masked_logits, masks = self._mask_logits(logits, action_masks=action_masks)
+        if deterministic:
+            return self._select_deterministic_actions(masked_logits, observation, masks)
+        return self.action_dist.proba_distribution(action_logits=masked_logits).get_actions(deterministic=False)
 
     def _route_domains(self, obs, shared_ctx):
         batch_size = shared_ctx.shape[0]
@@ -256,6 +274,58 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
             masks = self._normalize_action_masks(action_masks, masked_logits, actions=actions)
             masked_logits = self._apply_action_mask(masked_logits, masks)
         return self.action_dist.proba_distribution(action_logits=masked_logits)
+
+    def _mask_logits(self, logits, action_masks=None, actions=None):
+        masked_logits = self._sanitize_logits(logits)
+        masks = None
+        if action_masks is not None:
+            masks = self._normalize_action_masks(action_masks, masked_logits, actions=actions)
+            masked_logits = self._apply_action_mask(masked_logits, masks)
+        return masked_logits, masks
+
+    def _select_deterministic_actions(self, masked_logits, obs, masks):
+        if masks is None or "actions" not in obs:
+            return masked_logits.argmax(dim=1)
+
+        action_rows = torch.as_tensor(obs["actions"], dtype=torch.float32, device=masked_logits.device)
+        if action_rows.ndim == 2:
+            action_rows = action_rows.unsqueeze(0)
+
+        batch_actions = []
+        kind_scale = float(NUM_ACTION_KINDS)
+        for batch_index in range(masked_logits.shape[0]):
+            row_logits = masked_logits[batch_index]
+            row_mask = masks[batch_index]
+            valid_indices = row_mask.nonzero(as_tuple=False).reshape(-1)
+            if valid_indices.numel() == 0:
+                batch_actions.append(torch.zeros((), dtype=torch.long, device=masked_logits.device))
+                continue
+
+            row_actions = action_rows[batch_index]
+            group_members: dict[tuple[int, int], list[int]] = {}
+            for idx_tensor in valid_indices:
+                candidate_index = int(idx_tensor.item())
+                row = row_actions[candidate_index]
+                kind_ord = int(torch.round(row[0] * kind_scale).item())
+                if kind_ord in (_PLAY_CARD_KIND_ORD, _USE_POTION_KIND_ORD):
+                    logical_index = int(torch.round(row[19] * _ACTION_INDEX_SCALE).item())
+                    group_key = (kind_ord, logical_index)
+                else:
+                    group_key = (-1, candidate_index)
+                group_members.setdefault(group_key, []).append(candidate_index)
+
+            best_action = int(valid_indices[0].item())
+            best_group_score = None
+            for members in group_members.values():
+                member_tensor = torch.as_tensor(members, dtype=torch.long, device=masked_logits.device)
+                group_score = torch.logsumexp(row_logits[member_tensor], dim=0)
+                if best_group_score is None or group_score > best_group_score:
+                    best_group_score = group_score
+                    best_action = int(member_tensor[row_logits[member_tensor].argmax()].item())
+
+            batch_actions.append(torch.tensor(best_action, dtype=torch.long, device=masked_logits.device))
+
+        return torch.stack(batch_actions, dim=0)
 
     @staticmethod
     def _sanitize_tensor(tensor):

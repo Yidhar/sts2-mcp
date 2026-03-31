@@ -3,10 +3,17 @@ using System.Net;
 using System.Reflection;
 using System.Text.Json.Serialization;
 using System.ComponentModel;
+using MegaCrit.Sts2.Core.Assets;
+using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Characters;
+using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
+using MegaCrit.Sts2.Core.Saves;
 
 namespace Sts2McpBridge.Scripts;
 
@@ -181,49 +188,70 @@ internal static partial class BridgeGameApi
         List<string> diagnostics,
         CancellationToken cancellationToken)
     {
-        var state = await CaptureEnvSnapshotAsync(cancellationToken);
-        if (HasUsableCombatSandboxRunScene(state))
+        var priorState = await CaptureEnvSnapshotAsync(cancellationToken);
+        diagnostics.Add(
+            $"Combat sandbox bootstrap starting from phase={priorState.Phase}, screen={priorState.Screen}, run_active={priorState.RunActive}, current_room={priorState.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"}");
+
+        if (HasUsableCombatSandboxRunScene(priorState) && !priorState.CombatInProgress)
         {
             diagnostics.Add(
-                $"Reusing active run scene (phase={state.Phase}, screen={state.Screen}, current_room={state.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"})");
-            return state;
+                $"Reusing existing run scene for combat sandbox reset (phase={priorState.Phase}, screen={priorState.Screen})");
+            return priorState;
         }
 
-        diagnostics.Add(
-            $"No usable run scene for combat sandbox (phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}). Bootstrapping via env/reset.");
+        Task? bootstrapTask;
+        try
+        {
+            bootstrapTask = await BridgeCoordinator.RunOnMainThreadAsync(() =>
+                BeginFreshCombatSandboxRun(request, priorState, diagnostics));
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"Combat sandbox bootstrap scheduling failed: {ex.GetBaseException().Message}");
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "combat_sandbox_bootstrap_failed",
+                "Failed to schedule fresh combat sandbox bootstrap.",
+                new { diagnostics });
+        }
 
         try
         {
-            await ResetEnvResponseAsync(
-                new BridgeEnvResetRequest
-                {
-                    Character = request.Character?.Trim(),
-                    DefensiveBuffs = false,
-                    TimeoutMs = timeoutMs
-                },
-                cancellationToken);
+            if (bootstrapTask is not null)
+            {
+                await bootstrapTask.WaitAsync(
+                    TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 10000)),
+                    cancellationToken);
+            }
+            diagnostics.Add("Combat sandbox fresh run bootstrap task completed");
         }
-        catch (BridgeRequestException ex)
+        catch (Exception ex)
         {
-            diagnostics.Add($"env/reset bootstrap failed: {ex.ErrorCode}: {ex.Message}");
-            throw;
+            diagnostics.Add($"Combat sandbox fresh run bootstrap failed: {ex.GetBaseException().Message}");
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "combat_sandbox_bootstrap_failed",
+                "Failed to start a fresh combat sandbox run.",
+                new { diagnostics });
         }
 
-        state = await WaitForStableEnvStateAsync(
-            null,
+        await BridgeCoordinator.WaitForPumpTicksAsync(6, cancellationToken);
+
+        var state = await WaitForStableEnvStateAsync(
+            priorState.LogicHash,
             timeoutMs,
             requireActionableOrDone: true,
             cancellationToken);
 
         diagnostics.Add(
-            $"env/reset bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
+            $"Combat sandbox bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
 
         if (!HasUsableCombatSandboxRunScene(state))
         {
             throw new BridgeRequestException(
                 HttpStatusCode.Conflict,
                 "combat_sandbox_run_scene_not_ready",
-                "env/reset completed but did not produce a usable run scene for combat sandbox.",
+                "Fresh combat sandbox bootstrap did not produce a usable run scene.",
                 new
                 {
                     phase = state.Phase,
@@ -245,6 +273,256 @@ internal static partial class BridgeGameApi
                !IsStartupPhase(state.Phase) &&
                state.Context.RunNode is not null &&
                state.Context.RunState?.CurrentRoom is not null;
+    }
+
+    private static Task BeginFreshCombatSandboxRun(
+        BridgeEnvCombatResetRequest request,
+        BridgeEnvSnapshot priorState,
+        List<string> diagnostics)
+    {
+        var game = NGame.Instance
+                   ?? throw new InvalidOperationException("NGame.Instance is null.");
+        var runManager = RunManager.Instance;
+        var saveManager = SaveManager.Instance
+                          ?? throw new InvalidOperationException("SaveManager.Instance is null.");
+
+        if (runManager.IsInProgress)
+        {
+            runManager.CleanUp(graceful: false);
+            diagnostics.Add("Cleaned up existing run before combat sandbox bootstrap");
+        }
+
+        var character = ResolveCombatSandboxCharacter(request.Character, priorState, diagnostics);
+        var seed = request.Seed?.ToString(CultureInfo.InvariantCulture) ?? SeedHelper.GetRandomSeed();
+        diagnostics.Add($"Fresh combat sandbox run config: character={character.Id}, seed={seed}");
+
+        var player = Player.CreateForNewRun(
+            character,
+            saveManager.GenerateUnlockStateFromProgress(),
+            1uL);
+
+        ApplyCombatSandboxPlayerOverrides(player, request, diagnostics);
+
+        var runState = RunState.CreateForNewRun(
+            new[] { player },
+            ActModel.GetDefaultList().Select(act => act.ToMutable()).ToList(),
+            Array.Empty<ModifierModel>(),
+            0,
+            seed);
+
+        runManager.SetUpNewSinglePlayer(runState, shouldSave: false);
+        diagnostics.Add("Prepared fresh singleplayer run state for combat sandbox");
+
+        return StartFreshCombatSandboxRunAsync(game, runState, diagnostics);
+    }
+
+    private static async Task StartFreshCombatSandboxRunAsync(
+        NGame game,
+        RunState runState,
+        List<string> diagnostics)
+    {
+        using (new NetLoadingHandle(RunManager.Instance.NetService))
+        {
+            await PreloadManager.LoadRunAssets(runState.Players.Select(player => player.Character));
+            await PreloadManager.LoadActAssets(runState.Acts[0]);
+            await RunManager.Instance.FinalizeStartingRelics();
+            RunManager.Instance.Launch();
+            game.RootSceneContainer.SetCurrentScene(NRun.Create(runState));
+            await RunManager.Instance.EnterAct(0, doTransition: false);
+        }
+
+        diagnostics.Add("Started fresh singleplayer run for combat sandbox");
+    }
+
+    private static CharacterModel ResolveCombatSandboxCharacter(
+        string? requestedCharacter,
+        BridgeEnvSnapshot priorState,
+        List<string> diagnostics)
+    {
+        if (!string.IsNullOrWhiteSpace(requestedCharacter))
+        {
+            var requested = requestedCharacter.Trim();
+            if (TryModelDbGetById("CharacterModel", requested, diagnostics) is CharacterModel requestedById)
+            {
+                diagnostics.Add($"Resolved combat sandbox character by id: {requestedById.Id}");
+                return requestedById;
+            }
+
+            var normalizedRequested = NormalizeComparableText(requested);
+            var requestedByTitle = ModelDb.AllCharacters.FirstOrDefault(character =>
+                NormalizeComparableText(character.Id.ToString()).Equals(normalizedRequested, StringComparison.Ordinal) ||
+                NormalizeComparableText(character.Id.Entry).Equals(normalizedRequested, StringComparison.Ordinal) ||
+                NormalizeComparableText(character.GetType().Name).Equals(normalizedRequested, StringComparison.Ordinal) ||
+                NormalizeComparableText(DescribeCharacter(character)).Equals(normalizedRequested, StringComparison.Ordinal));
+            if (requestedByTitle is not null)
+            {
+                diagnostics.Add($"Resolved combat sandbox character by title: {requestedByTitle.Id}");
+                return requestedByTitle;
+            }
+
+            CharacterModel? requestedByAlias = normalizedRequested switch
+            {
+                "ironclad" => ModelDb.Character<Ironclad>(),
+                "silent" => ModelDb.Character<Silent>(),
+                "defect" => ModelDb.Character<Defect>(),
+                "regent" => ModelDb.Character<Regent>(),
+                "necrobinder" => ModelDb.Character<Necrobinder>(),
+                "deprived" => ModelDb.Character<Deprived>(),
+                _ => null
+            };
+            if (requestedByAlias is not null)
+            {
+                diagnostics.Add($"Resolved combat sandbox character by alias: {requestedByAlias.Id}");
+                return requestedByAlias;
+            }
+
+            throw new InvalidOperationException($"Could not resolve character '{requested}'.");
+        }
+
+        var currentCharacter = GetPrimaryPlayer(priorState.Context)?.Character;
+        if (currentCharacter is not null)
+        {
+            diagnostics.Add($"Falling back to current run character for combat sandbox: {currentCharacter.Id}");
+            return currentCharacter;
+        }
+
+        var defaultCharacter = ModelDb.AllCharacters.FirstOrDefault()
+                               ?? throw new InvalidOperationException("ModelDb.AllCharacters is empty.");
+        diagnostics.Add($"Falling back to default combat sandbox character: {defaultCharacter.Id}");
+        return defaultCharacter;
+    }
+
+    private static void ApplyCombatSandboxPlayerOverrides(
+        Player player,
+        BridgeEnvCombatResetRequest request,
+        List<string> diagnostics)
+    {
+        var creature = player.Creature;
+        if (creature is null)
+        {
+            diagnostics.Add("Combat sandbox bootstrap: player creature is null; skipping overrides");
+            return;
+        }
+
+        if (request.MaxHp is > 0)
+        {
+            creature.SetMaxHpInternal(request.MaxHp.Value);
+            diagnostics.Add($"Set MaxHp to {request.MaxHp.Value}");
+        }
+
+        if (request.CurrentHp is > 0)
+        {
+            creature.SetCurrentHpInternal(request.CurrentHp.Value);
+            diagnostics.Add($"Set CurrentHp to {Math.Min(request.CurrentHp.Value, creature.MaxHp)}");
+        }
+        else if (request.MaxHp is > 0)
+        {
+            creature.SetCurrentHpInternal(creature.MaxHp);
+            diagnostics.Add($"Restored CurrentHp to full ({creature.MaxHp})");
+        }
+
+        if (request.Gold is not null)
+        {
+            player.Gold = request.Gold.Value;
+            diagnostics.Add($"Set Gold to {request.Gold.Value}");
+        }
+
+        if (request.MaxEnergy is > 0)
+        {
+            player.MaxEnergy = request.MaxEnergy.Value;
+            diagnostics.Add($"Set MaxEnergy to {request.MaxEnergy.Value}");
+        }
+
+        if (request.Deck is { Length: > 0 })
+        {
+            player.Deck.Clear(silent: true);
+            var added = 0;
+            foreach (var cardId in request.Deck)
+            {
+                if (TryModelDbGetById("CardModel", cardId, diagnostics) is not CardModel card)
+                {
+                    diagnostics.Add($"Deck override skipped unknown card '{cardId}'");
+                    continue;
+                }
+
+                var mutableCard = card.ToMutable();
+                mutableCard.FloorAddedToDeck = 1;
+                player.Deck.AddInternal(mutableCard, -1, silent: true);
+                added++;
+            }
+
+            diagnostics.Add($"Deck override: added {added}/{request.Deck.Length} cards");
+        }
+
+        if (request.Relics is { Length: > 0 })
+        {
+            foreach (var relic in player.Relics.ToList())
+            {
+                player.RemoveRelicInternal(relic, silent: true);
+            }
+
+            var added = 0;
+            foreach (var relicId in request.Relics)
+            {
+                if (TryModelDbGetById("RelicModel", relicId, diagnostics) is not RelicModel relic)
+                {
+                    diagnostics.Add($"Relic override skipped unknown relic '{relicId}'");
+                    continue;
+                }
+
+                var mutableRelic = relic.ToMutable();
+                mutableRelic.FloorAddedToDeck = 1;
+                SaveManager.Instance?.MarkRelicAsSeen(mutableRelic);
+                player.AddRelicInternal(mutableRelic, -1, silent: true);
+                added++;
+            }
+
+            diagnostics.Add($"Relic override: added {added}/{request.Relics.Length} relics");
+        }
+
+        if (request.Potions is { Length: > 0 })
+        {
+            var targetSlotCount = Math.Max(player.PotionSlots.Count, request.Potions.Length);
+            var setMaxPotionCountInternal = FindMethod(player.GetType(), "SetMaxPotionCountInternal", 1);
+            if (setMaxPotionCountInternal is not null)
+            {
+                setMaxPotionCountInternal.Invoke(player, new object[] { targetSlotCount });
+            }
+            else if (request.Potions.Length > player.PotionSlots.Count)
+            {
+                diagnostics.Add(
+                    $"Potion override could not expand slots from {player.PotionSlots.Count} to {targetSlotCount}");
+            }
+
+            foreach (var potion in player.PotionSlots.ToList())
+            {
+                if (potion is not null)
+                {
+                    player.DiscardPotionInternal(potion, silent: true);
+                }
+            }
+
+            var added = 0;
+            for (var i = 0; i < Math.Min(request.Potions.Length, player.PotionSlots.Count); i++)
+            {
+                var potionId = request.Potions[i];
+                if (string.IsNullOrWhiteSpace(potionId))
+                {
+                    continue;
+                }
+
+                if (TryModelDbGetById("PotionModel", potionId, diagnostics) is not PotionModel potion)
+                {
+                    diagnostics.Add($"Potion override skipped unknown potion '{potionId}'");
+                    continue;
+                }
+
+                player.AddPotionInternal(potion.ToMutable(), i, silent: true);
+                added++;
+            }
+
+            diagnostics.Add($"Potion override: added {added}/{request.Potions.Length} potions");
+        }
     }
 
     private static async Task<bool> TryDeferredEnterCombatRoomAsync(
@@ -389,24 +667,19 @@ internal static partial class BridgeGameApi
                 };
             }
 
-        // 3. Enter the requested encounter on the active run scene.
-        var entered = TryEnterCombatViaDebugRoom(runManager, encounter, diagnostics, out var pendingTask);
-        if (!entered)
-        {
-            return new CombatSandboxSetupResult
+            // 3. Enter the requested encounter on the fresh active run scene.
+            var entered = TryEnterCombatViaDebugRoom(runManager, encounter, diagnostics, out var pendingTask);
+            if (!entered)
             {
+                return new CombatSandboxSetupResult
+                {
                     Success = false,
                     ErrorCode = "combat_entry_failed",
                     ErrorMessage = "Could not enter combat room. Check diagnostics for reflection probe results."
                 };
             }
 
-            // 4. Apply player state overrides if requested
-            var overrideResult = TryApplyPlayerOverrides(request, diagnostics);
-            if (!string.IsNullOrEmpty(overrideResult))
-            {
-                diagnostics.Add($"Player override warnings: {overrideResult}");
-            }
+            ApplyPostCombatSandboxOverrides(request, diagnostics);
 
             return new CombatSandboxSetupResult
             {
@@ -1085,7 +1358,51 @@ internal static partial class BridgeGameApi
     // Player state overrides
     // -----------------------------------------------------------------------
 
-    private static string TryApplyPlayerOverrides(BridgeEnvCombatResetRequest request, List<string> diagnostics)
+    private static void ApplyPostCombatSandboxOverrides(
+        BridgeEnvCombatResetRequest request,
+        List<string> diagnostics)
+    {
+        var context = CaptureContext();
+        var player = GetPrimaryPlayer(context);
+        var creature = player?.Creature;
+        if (player is null || creature is null)
+        {
+            diagnostics.Add("Post-combat overrides skipped: no active player/creature");
+            return;
+        }
+
+        if (request.MaxHp is > 0)
+        {
+            creature.SetMaxHpInternal(request.MaxHp.Value);
+            diagnostics.Add($"Post-combat MaxHp set to {creature.MaxHp}");
+        }
+
+        if (request.CurrentHp is > 0)
+        {
+            creature.SetCurrentHpInternal(request.CurrentHp.Value);
+            diagnostics.Add($"Post-combat CurrentHp set to {creature.CurrentHp}");
+        }
+        else if (request.MaxHp is > 0)
+        {
+            creature.SetCurrentHpInternal(creature.MaxHp);
+            diagnostics.Add($"Post-combat CurrentHp restored to full ({creature.CurrentHp})");
+        }
+
+        if (request.MaxEnergy is > 0)
+        {
+            player.MaxEnergy = request.MaxEnergy.Value;
+            if (player.PlayerCombatState is not null)
+            {
+                player.PlayerCombatState.Energy = request.MaxEnergy.Value;
+                diagnostics.Add($"Post-combat Energy set to {request.MaxEnergy.Value}");
+            }
+        }
+    }
+
+    private static string TryApplyPlayerOverrides(
+        BridgeEnvCombatResetRequest request,
+        List<string> diagnostics,
+        bool includeCombatOnlyOverrides)
     {
         var warnings = new List<string>();
 
@@ -1100,7 +1417,7 @@ internal static partial class BridgeGameApi
         var creature = player.Creature;
 
         // HP overrides
-        if (request.MaxHp is > 0 && creature is not null)
+        if (!includeCombatOnlyOverrides && request.MaxHp is > 0 && creature is not null)
         {
             try
             {
@@ -1133,7 +1450,7 @@ internal static partial class BridgeGameApi
             }
         }
 
-        if (creature is not null)
+        if (!includeCombatOnlyOverrides && creature is not null)
         {
             try
             {
@@ -1185,7 +1502,7 @@ internal static partial class BridgeGameApi
         }
 
         // Gold override
-        if (request.Gold is not null)
+        if (!includeCombatOnlyOverrides && request.Gold is not null)
         {
             try
             {
@@ -1217,7 +1534,7 @@ internal static partial class BridgeGameApi
         }
 
         // Deck override
-        if (request.Deck is { Length: > 0 })
+        if (!includeCombatOnlyOverrides && request.Deck is { Length: > 0 })
         {
             try
             {
@@ -1261,7 +1578,7 @@ internal static partial class BridgeGameApi
         }
 
         // Relic override
-        if (request.Relics is { Length: > 0 })
+        if (!includeCombatOnlyOverrides && request.Relics is { Length: > 0 })
         {
             try
             {
@@ -1299,7 +1616,7 @@ internal static partial class BridgeGameApi
         }
 
         // Potion override
-        if (request.Potions is { Length: > 0 })
+        if (!includeCombatOnlyOverrides && request.Potions is { Length: > 0 })
         {
             try
             {
@@ -1343,7 +1660,7 @@ internal static partial class BridgeGameApi
         }
 
         // Energy override
-        if (request.MaxEnergy is > 0)
+        if (includeCombatOnlyOverrides && request.MaxEnergy is > 0)
         {
             try
             {

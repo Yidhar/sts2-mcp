@@ -61,6 +61,8 @@ _ACTION_KINDS = [
 ]
 _KIND_TO_ORD = {kind: index + 1 for index, kind in enumerate(_ACTION_KINDS)}
 _NUM_KINDS = len(_ACTION_KINDS) + 1
+ACTION_KIND_TO_ORD = dict(_KIND_TO_ORD)
+NUM_ACTION_KINDS = _NUM_KINDS
 
 _MAP_POINT_TYPES = ["Monster", "Elite", "Boss", "Event", "QuestionMark", "RestSite", "Shop", "Treasure"]
 _PT_TO_ORD = {point_type: index + 1 for index, point_type in enumerate(_MAP_POINT_TYPES)}
@@ -374,8 +376,17 @@ class DictObservationEncoder:
 
             if self.use_text:
                 parts = [enemy.get("name", "")]
+                intent_title = intent.get("title")
+                intent_type = intent.get("intent_type")
+                intent_description = intent.get("description")
+                if intent_title:
+                    parts.append(f"意图:{intent_title}")
                 if intent.get("total_damage"):
-                    parts.append(f"意图:{intent['total_damage']}伤害")
+                    parts.append(f"伤害:{intent['total_damage']}")
+                elif intent_type:
+                    parts.append(f"类型:{intent_type}")
+                if intent_description:
+                    parts.append(f"描述:{intent_description}")
                 for power in powers[:3]:
                     if isinstance(power, dict):
                         parts.append(f"{power.get('title', '')}:{power.get('amount', '')}")
@@ -552,6 +563,8 @@ class DictObservationEncoder:
         option_index = action.get("index")
         if option_index is None:
             option_index = action.get("hand_index")
+        if option_index is None:
+            option_index = action.get("slot_index")
         row[19] = min(_float(option_index) / 20.0, 1.0) if option_index is not None else 0.0
 
     def _enc_route_action(

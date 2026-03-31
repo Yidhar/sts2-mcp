@@ -408,7 +408,9 @@ internal static partial class BridgeGameApi
             block = creature.Block,
             intent = new
             {
+                intent_type = TryGetFirstIntentString(intent, "intent_type"),
                 title = TryGetNestedString(intent, "title"),
+                description = TryGetFirstIntentString(intent, "description"),
                 total_damage = TryGetFirstIntentTotalDamage(intent),
                 repeats = TryGetFirstIntentRepeats(intent)
             },

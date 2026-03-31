@@ -368,4 +368,21 @@ internal static partial class BridgeGameApi
         var first = intents.Value[0];
         return TryGetNestedInt(first, "repeats");
     }
+
+    private static string? TryGetFirstIntentString(JsonElement? intentElement, params string[] path)
+    {
+        if (intentElement is null || intentElement.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var intents = TryGetNestedElement(intentElement.Value, "intents");
+        if (intents is null || intents.Value.ValueKind != JsonValueKind.Array || intents.Value.GetArrayLength() <= 0)
+        {
+            return null;
+        }
+
+        var first = intents.Value[0];
+        return TryGetNestedString(first, path);
+    }
 }

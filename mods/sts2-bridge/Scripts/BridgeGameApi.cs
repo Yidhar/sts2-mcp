@@ -2315,6 +2315,7 @@ internal static partial class BridgeGameApi
                         {
                             action_id = actionId,
                             kind = "play_card",
+                            selection_group_key = $"play_card:{playerIndex}:{cardRef}",
                             label = $"Play card {handIndex}: {cardTitle}{targetLabel}",
                             player_index = playerIndex,
                             player_net_id = player.NetId,
@@ -2383,6 +2384,7 @@ internal static partial class BridgeGameApi
                         {
                             action_id = actionId,
                             kind = "use_potion",
+                            selection_group_key = $"use_potion:{playerIndex}:{slotIndex}",
                             label = $"Use potion {slotIndex}: {potionTitle}{targetLabel}",
                             player_index = playerIndex,
                             player_net_id = player.NetId,

@@ -20,6 +20,7 @@ Thumbs.db
 
 # Local research and temporary files
 scratch/
+tmp/
 新建游戏项目/
 release-assets/
 
