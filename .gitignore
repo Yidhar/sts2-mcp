@@ -21,6 +21,7 @@ Thumbs.db
 # Local research and temporary files
 scratch/
 tmp/
+datasets/
 新建游戏项目/
 release-assets/
 
@@ -52,5 +53,4 @@ packages/rl-agent/.text_cache_strict_fail
 packages/rl-agent/.tmp_text_cache
 packages/rl-agent/runs_v2
 packages/mcp-server/rl-smoke-logs
-release-assets/
 packages/rl-agent/tmp/

@@ -2821,7 +2821,7 @@ internal static partial class BridgeGameApi
             return canPlay;
         }
 
-        return GetHiddenPropertyValue<bool>(card, "IsPlayable") ?? false;
+        return SafeGetCardIsPlayable(card);
     }
 
     private static bool CanPlayCardTargeting(CardModel card, Creature target)
@@ -3224,7 +3224,7 @@ internal static partial class BridgeGameApi
             rarity = card.Rarity.ToString(),
             target_type = card.TargetType.ToString(),
             pile = card.Pile?.Type.ToString(),
-            is_playable = GetHiddenPropertyValue<bool>(card, "IsPlayable") ?? false,
+            is_playable = SafeGetCardIsPlayable(card),
             canonical_energy_cost = card.EnergyCost.Canonical,
             resolved_energy_cost = card.EnergyCost.GetResolved(),
             costs_x = card.EnergyCost.CostsX,
@@ -3254,6 +3254,28 @@ internal static partial class BridgeGameApi
             },
             dynamic_vars = BuildDynamicVarPayloads(previewVars)
         };
+    }
+
+    private static bool SafeGetCardIsPlayable(CardModel? card)
+    {
+        if (card is null)
+        {
+            return false;
+        }
+
+        if (card.Pile?.IsCombatPile != true)
+        {
+            return false;
+        }
+
+        try
+        {
+            return GetHiddenPropertyValue<bool>(card, "IsPlayable") ?? false;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static object? BuildCardUpgradePreviewPayload(CardModel? card)

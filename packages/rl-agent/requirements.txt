@@ -8,6 +8,7 @@ sb3-contrib==2.7.1
 numpy==2.4.3
 requests==2.33.0
 tensorboard==2.20.0
+pyarrow==23.0.1
 
 # Text embeddings (Chinese: BAAI/bge-small-zh-v1.5, 512-d)
 sentence-transformers>=3.0

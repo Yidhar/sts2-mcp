@@ -23,8 +23,8 @@ from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule, upda
 
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
+from sts2_env.model import STS2CandidateScoringPolicy
 from sts2_env.observation_v2 import DictObservationEncoder
-from sts2_env.policy import STS2CandidateScoringPolicy
 
 
 def mask_fn(env):

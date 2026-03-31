@@ -3,16 +3,17 @@
 from .bridge_client import BridgeClient
 from .combat_env import CombatSandboxEnv
 from .env_v2 import SlayTheSpire2EnvV2
-from .network import (
+from .model import (
     BuildStateEncoder,
+    CandidateScorer,
     CombatStateEncoder,
     DomainActionEncoder,
     RouteActionEncoder,
     RouteStateEncoder,
     SharedContextEncoder,
+    STS2CandidateScoringPolicy,
 )
 from .observation_v2 import DictObservationEncoder
-from .policy import STS2CandidateScoringPolicy
 
 __all__ = [
     "BridgeClient",
@@ -25,5 +26,6 @@ __all__ = [
     "RouteStateEncoder",
     "DomainActionEncoder",
     "RouteActionEncoder",
+    "CandidateScorer",
     "STS2CandidateScoringPolicy",
 ]
