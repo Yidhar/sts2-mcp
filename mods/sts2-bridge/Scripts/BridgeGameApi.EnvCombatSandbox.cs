@@ -196,62 +196,47 @@ internal static partial class BridgeGameApi
         {
             diagnostics.Add(
                 $"Reusing existing run scene for combat sandbox reset (phase={priorState.Phase}, screen={priorState.Screen})");
-            return priorState;
-        }
-
-        Task? bootstrapTask;
-        try
-        {
-            bootstrapTask = await BridgeCoordinator.RunOnMainThreadAsync(() =>
-                BeginFreshCombatSandboxRun(request, priorState, diagnostics));
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"Combat sandbox bootstrap scheduling failed: {ex.GetBaseException().Message}");
-            throw new BridgeRequestException(
-                HttpStatusCode.Conflict,
-                "combat_sandbox_bootstrap_failed",
-                "Failed to schedule fresh combat sandbox bootstrap.",
-                new { diagnostics });
-        }
-
-        try
-        {
-            if (bootstrapTask is not null)
+            await BridgeCoordinator.RunOnMainThreadAsync(() =>
             {
-                await bootstrapTask.WaitAsync(
-                    TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 10000)),
-                    cancellationToken);
-            }
-            diagnostics.Add("Combat sandbox fresh run bootstrap task completed");
-        }
-        catch (Exception ex)
-        {
-            diagnostics.Add($"Combat sandbox fresh run bootstrap failed: {ex.GetBaseException().Message}");
-            throw new BridgeRequestException(
-                HttpStatusCode.Conflict,
-                "combat_sandbox_bootstrap_failed",
-                "Failed to start a fresh combat sandbox run.",
-                new { diagnostics });
+                ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
+                return true;
+            });
+            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+            return await CaptureEnvSnapshotAsync(cancellationToken);
         }
 
-        await BridgeCoordinator.WaitForPumpTicksAsync(6, cancellationToken);
+        try
+        {
+            await ResetEnvResponseAsync(
+                new BridgeEnvResetRequest
+                {
+                    Character = request.Character?.Trim(),
+                    DefensiveBuffs = false,
+                    TimeoutMs = timeoutMs
+                },
+                cancellationToken);
+        }
+        catch (BridgeRequestException ex)
+        {
+            diagnostics.Add($"env/reset bootstrap failed: {ex.ErrorCode}: {ex.Message}");
+            throw;
+        }
 
         var state = await WaitForStableEnvStateAsync(
-            priorState.LogicHash,
+            null,
             timeoutMs,
             requireActionableOrDone: true,
             cancellationToken);
 
         diagnostics.Add(
-            $"Combat sandbox bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
+            $"env/reset bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
 
         if (!HasUsableCombatSandboxRunScene(state))
         {
             throw new BridgeRequestException(
                 HttpStatusCode.Conflict,
                 "combat_sandbox_run_scene_not_ready",
-                "Fresh combat sandbox bootstrap did not produce a usable run scene.",
+                "env/reset completed but did not produce a usable run scene for combat sandbox.",
                 new
                 {
                     phase = state.Phase,
@@ -392,6 +377,21 @@ internal static partial class BridgeGameApi
         return defaultCharacter;
     }
 
+    private static void ApplyCombatSandboxRunReuseOverrides(
+        BridgeEnvCombatResetRequest request,
+        List<string> diagnostics)
+    {
+        var context = CaptureContext();
+        var player = GetPrimaryPlayer(context);
+        if (player is null)
+        {
+            diagnostics.Add("Combat sandbox reuse overrides skipped: no active player");
+            return;
+        }
+
+        ApplyCombatSandboxPlayerOverrides(player, request, diagnostics);
+    }
+
     private static void ApplyCombatSandboxPlayerOverrides(
         Player player,
         BridgeEnvCombatResetRequest request,
@@ -415,7 +415,7 @@ internal static partial class BridgeGameApi
             creature.SetCurrentHpInternal(request.CurrentHp.Value);
             diagnostics.Add($"Set CurrentHp to {Math.Min(request.CurrentHp.Value, creature.MaxHp)}");
         }
-        else if (request.MaxHp is > 0)
+        else
         {
             creature.SetCurrentHpInternal(creature.MaxHp);
             diagnostics.Add($"Restored CurrentHp to full ({creature.MaxHp})");
@@ -1382,7 +1382,7 @@ internal static partial class BridgeGameApi
             creature.SetCurrentHpInternal(request.CurrentHp.Value);
             diagnostics.Add($"Post-combat CurrentHp set to {creature.CurrentHp}");
         }
-        else if (request.MaxHp is > 0)
+        else
         {
             creature.SetCurrentHpInternal(creature.MaxHp);
             diagnostics.Add($"Post-combat CurrentHp restored to full ({creature.CurrentHp})");
@@ -1391,11 +1391,12 @@ internal static partial class BridgeGameApi
         if (request.MaxEnergy is > 0)
         {
             player.MaxEnergy = request.MaxEnergy.Value;
-            if (player.PlayerCombatState is not null)
-            {
-                player.PlayerCombatState.Energy = request.MaxEnergy.Value;
-                diagnostics.Add($"Post-combat Energy set to {request.MaxEnergy.Value}");
-            }
+        }
+
+        if (player.PlayerCombatState is not null)
+        {
+            player.PlayerCombatState.Energy = player.MaxEnergy;
+            diagnostics.Add($"Post-combat Energy set to {player.MaxEnergy}");
         }
     }
 
