@@ -1,8 +1,8 @@
 """Evaluate a trained STS2 RL agent with text path smoke verification.
 
 Usage:
-    python evaluate.py checkpoints_v2/sts2_v2_final.zip --episodes 5
-    python evaluate.py checkpoints_v2/sts2_v2_final.zip --smoke
+    python evaluate.py checkpoints/final --episodes 5
+    python evaluate.py checkpoints/final --smoke
     python evaluate.py --combat-smoke --encounter-id BattlewornDummyEventEncounter
 """
 
@@ -10,9 +10,9 @@ import argparse
 import json
 import numpy as np
 
-from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 
+from sts2_env.checkpoint import load_online_checkpoint, load_online_checkpoint_metadata
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from sts2_env.observation_v2 import DictObservationEncoder
@@ -218,12 +218,16 @@ def route_smoke_test(session_file=None, character="ironclad", max_steps=40, use_
     raise RuntimeError(f"Map was not reached within {max_steps} steps.")
 
 
-def evaluate(model_path, n_episodes=5, session_file=None, use_text=True, deterministic=True):
+def evaluate(model_path, n_episodes=5, session_file=None, use_text=None, deterministic=True):
     """Load model and run evaluation episodes."""
+    metadata = load_online_checkpoint_metadata(model_path)
+    if use_text is None:
+        use_text = bool(metadata.get("use_text", True))
+
     obs_encoder = DictObservationEncoder(use_text=use_text)
     if use_text:
         from sts2_env.text_encoder import get_text_encoder
-        get_text_encoder().ensure_ready()
+        get_text_encoder(model_name=metadata.get("text_model")).ensure_ready()
     env = SlayTheSpire2EnvV2(
         session_file=session_file,
         obs_encoder=obs_encoder,
@@ -231,7 +235,7 @@ def evaluate(model_path, n_episodes=5, session_file=None, use_text=True, determi
     )
     env = ActionMasker(env, mask_fn)
 
-    model = MaskablePPO.load(model_path, env=env)
+    model, _ = load_online_checkpoint(model_path, env=env)
 
     results = []
     for ep in range(n_episodes):
@@ -403,7 +407,8 @@ def main():
     elif args.smoke:
         smoke_test(session_file=args.session_file, max_steps=args.max_steps, use_text=use_text)
     elif args.model:
-        evaluate(args.model, n_episodes=args.episodes, session_file=args.session_file, use_text=use_text)
+        use_text_override = False if args.no_text else None
+        evaluate(args.model, n_episodes=args.episodes, session_file=args.session_file, use_text=use_text_override)
     else:
         print("Provide a model path, --smoke, or --combat-smoke")
 

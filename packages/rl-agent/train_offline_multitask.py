@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from torch.utils.data import DataLoader
 
 from offline_training_data import (
@@ -324,21 +325,26 @@ def train(config: OfflineMultiTaskConfig) -> dict[str, Any]:
 
         if macro_eval_accuracy > best_macro_accuracy:
             best_macro_accuracy = macro_eval_accuracy
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "tasks": config.tasks,
-                    "state_vocabs": {name: vocab.to_dict() for name, vocab in state_vocabs.items()},
-                    "task_vocabs": {
-                        task: {name: vocab.to_dict() for name, vocab in vocabs.items()}
-                        for task, vocabs in task_vocabs.items()
+            save_file(model.state_dict(), str(run_dir / "model.safetensors"))
+            (run_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "sts2-offline-multitask-v1",
+                        "tasks": config.tasks,
+                        "state_vocabs": {name: vocab.to_dict() for name, vocab in state_vocabs.items()},
+                        "task_vocabs": {
+                            task: {name: vocab.to_dict() for name, vocab in vocabs.items()}
+                            for task, vocabs in task_vocabs.items()
+                        },
+                        "task_meta": task_meta,
+                        "config": asdict(config),
+                        "best_macro_accuracy": best_macro_accuracy,
+                        "epoch": epoch,
                     },
-                    "task_meta": task_meta,
-                    "config": asdict(config),
-                    "best_macro_accuracy": best_macro_accuracy,
-                    "epoch": epoch,
-                },
-                run_dir / "best_model.pt",
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
 
     summary = {

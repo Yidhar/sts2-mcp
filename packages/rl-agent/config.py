@@ -40,8 +40,8 @@ class TrainConfig:
     use_action_text: bool = True
 
     # Logging
-    log_dir: str = "runs_v2"
-    checkpoint_dir: str = "checkpoints_v2"
+    log_dir: str = "runs"
+    checkpoint_dir: str = "checkpoints"
     checkpoint_freq: int = 1000
     tensorboard: bool = True
     verbose: int = 1

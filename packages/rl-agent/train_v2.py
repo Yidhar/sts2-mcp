@@ -3,7 +3,6 @@
 Usage:
     python train_v2.py --total-timesteps 10000
     python train_v2.py --total-timesteps 10000 --no-text   # numeric-only baseline
-    python train_v2.py --resume checkpoints_v2/sts2_ppo_v2_1000_steps.zip
 """
 
 import argparse
@@ -17,10 +16,11 @@ import numpy as np
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule, update_learning_rate
+from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule
 
+from sts2_env.checkpoint import save_online_checkpoint
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from sts2_env.model import STS2CandidateScoringPolicy
@@ -81,22 +81,6 @@ def build_lr_schedule(
         return FloatSchedule(warmup_cosine)
 
     raise ValueError(f"Unsupported --lr-schedule: {schedule_name}")
-
-
-def progress_remaining_from_resume(loaded_timesteps: int, target_total_timesteps: int) -> float:
-    if target_total_timesteps <= 0:
-        return 0.0
-    progress = 1.0 - (float(loaded_timesteps) / float(target_total_timesteps))
-    return min(max(progress, 0.0), 1.0)
-
-
-def apply_lr_schedule_override(model, lr_schedule, progress_remaining: float) -> float:
-    model.learning_rate = lr_schedule
-    model.lr_schedule = FloatSchedule(lr_schedule)
-    model._current_progress_remaining = progress_remaining
-    current_lr = float(model.lr_schedule(progress_remaining))
-    update_learning_rate(model.policy.optimizer, current_lr)
-    return current_lr
 
 
 CORE_REWARD_BREAKDOWN_KEYS = (
@@ -378,6 +362,51 @@ class EncounterStatsCallback(BaseCallback):
         return True
 
 
+class SafeTensorCheckpointCallback(BaseCallback):
+    def __init__(self, *, save_freq: int, checkpoint_dir: str, metadata_builder, verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self.save_freq = max(int(save_freq), 1)
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.metadata_builder = metadata_builder
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps <= 0 or (self.num_timesteps % self.save_freq) != 0:
+            return True
+
+        checkpoint_path = self.checkpoint_dir / f"step_{self.num_timesteps:08d}"
+        metadata = self.metadata_builder(self.model, self.num_timesteps)
+        save_online_checkpoint(self.model, checkpoint_path, metadata=metadata)
+        if self.verbose:
+            print(f"[train] Saved checkpoint {checkpoint_path}")
+        return True
+
+
+def build_online_checkpoint_metadata(args, *, use_text: bool, timesteps: int) -> dict[str, object]:
+    return {
+        "format": "sts2-online-policy-v1",
+        "policy_class": "sts2_env.model.STS2CandidateScoringPolicy",
+        "policy_kwargs": dict(
+            combat_embed_dim=args.combat_embed_dim,
+            build_embed_dim=args.build_embed_dim,
+            route_embed_dim=args.route_embed_dim,
+            n_heads=args.n_heads,
+            text_proj_dim=args.text_proj_dim,
+            context_text_dim=args.context_text_dim,
+            shared_hidden_dim=args.shared_hidden_dim,
+            shared_output_dim=args.shared_output_dim,
+            combat_scorer_hidden=args.combat_scorer_hidden,
+            build_scorer_hidden=args.build_scorer_hidden,
+            route_scorer_hidden=args.route_scorer_hidden,
+            critic_domain_dim=args.critic_domain_dim,
+        ),
+        "use_text": use_text,
+        "text_model": args.text_model if use_text else None,
+        "timesteps": int(timesteps),
+        "mode": "combat_sandbox" if args.combat_sandbox else "full_run",
+        "character": args.character,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train STS2 RL Agent")
     parser.add_argument("--total-timesteps", type=int, default=100_000)
@@ -388,7 +417,7 @@ def main():
         type=str,
         default="constant",
         choices=("constant", "cosine", "warmup_cosine"),
-        help="Learning rate schedule for both fresh training and resume.",
+        help="Learning rate schedule for fresh training.",
     )
     parser.add_argument(
         "--min-learning-rate",
@@ -405,10 +434,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--n-steps", type=int, default=64)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--session-file", type=str, default=None)
-    parser.add_argument("--log-dir", type=str, default="runs_v2")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_v2")
+    parser.add_argument("--log-dir", type=str, default="runs")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint-freq", type=int, default=1000)
     parser.add_argument("--verbose", type=int, default=1)
     parser.add_argument("--combat-sandbox", action="store_true", default=False,
@@ -520,69 +548,48 @@ def main():
     env = ActionMasker(env, mask_fn)
 
     # Model
-    reset_num_timesteps = True
-    effective_total_timesteps = args.total_timesteps
-    if args.resume:
-        print(f"[train] Resuming from {args.resume}")
-        model = MaskablePPO.load(args.resume, env=env, device=args.device)
-        model.tensorboard_log = str(args.log_dir)
-        model.verbose = args.verbose
-        loaded_timesteps = int(getattr(model, "num_timesteps", 0))
-        resume_progress = progress_remaining_from_resume(loaded_timesteps, args.total_timesteps)
-        current_lr = apply_lr_schedule_override(model, lr_schedule, resume_progress)
-        effective_total_timesteps = max(args.total_timesteps - loaded_timesteps, 0)
-        reset_num_timesteps = False
-        print(
-            f"[train] Loaded checkpoint timesteps: {loaded_timesteps} | "
-            f"target total: {args.total_timesteps} | remaining: {effective_total_timesteps}"
-        )
-        print(
-            f"[train] Applied LR schedule override schedule={args.lr_schedule} "
-            f"current_lr={current_lr:.8f} min_lr={args.min_learning_rate:.8f} "
-            f"warmup_fraction={args.warmup_fraction:.4f}"
-        )
-    else:
-        mode = "combat_sandbox" if args.combat_sandbox else "full_run"
-        print(
-            f"[train] Creating new model mode={mode} "
-            f"(text={'on' if use_text else 'off'})"
-        )
-        model = MaskablePPO(
-            STS2CandidateScoringPolicy,
-            env,
-            learning_rate=lr_schedule,
-            n_steps=args.n_steps,
-            batch_size=args.batch_size,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            policy_kwargs=dict(
-                combat_embed_dim=args.combat_embed_dim,
-                build_embed_dim=args.build_embed_dim,
-                route_embed_dim=args.route_embed_dim,
-                n_heads=args.n_heads,
-                text_proj_dim=args.text_proj_dim,
-                context_text_dim=args.context_text_dim,
-                shared_hidden_dim=args.shared_hidden_dim,
-                shared_output_dim=args.shared_output_dim,
-                combat_scorer_hidden=args.combat_scorer_hidden,
-                build_scorer_hidden=args.build_scorer_hidden,
-                route_scorer_hidden=args.route_scorer_hidden,
-                critic_domain_dim=args.critic_domain_dim,
-            ),
-            verbose=args.verbose,
-            tensorboard_log=args.log_dir,
-            device=args.device,
-        )
-        print(
-            f"[train] Using LR schedule schedule={args.lr_schedule} "
-            f"base_lr={args.learning_rate:.8f} min_lr={args.min_learning_rate:.8f} "
-            f"warmup_fraction={args.warmup_fraction:.4f}"
-        )
+    mode = "combat_sandbox" if args.combat_sandbox else "full_run"
+    policy_kwargs = dict(
+        combat_embed_dim=args.combat_embed_dim,
+        build_embed_dim=args.build_embed_dim,
+        route_embed_dim=args.route_embed_dim,
+        n_heads=args.n_heads,
+        text_proj_dim=args.text_proj_dim,
+        context_text_dim=args.context_text_dim,
+        shared_hidden_dim=args.shared_hidden_dim,
+        shared_output_dim=args.shared_output_dim,
+        combat_scorer_hidden=args.combat_scorer_hidden,
+        build_scorer_hidden=args.build_scorer_hidden,
+        route_scorer_hidden=args.route_scorer_hidden,
+        critic_domain_dim=args.critic_domain_dim,
+    )
+    print(
+        f"[train] Creating new model mode={mode} "
+        f"(text={'on' if use_text else 'off'})"
+    )
+    model = MaskablePPO(
+        STS2CandidateScoringPolicy,
+        env,
+        learning_rate=lr_schedule,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        policy_kwargs=policy_kwargs,
+        verbose=args.verbose,
+        tensorboard_log=args.log_dir,
+        device=args.device,
+    )
+    print(
+        f"[train] Using LR schedule schedule={args.lr_schedule} "
+        f"base_lr={args.learning_rate:.8f} min_lr={args.min_learning_rate:.8f} "
+        f"warmup_fraction={args.warmup_fraction:.4f}"
+    )
 
     total = sum(p.numel() for p in model.policy.parameters())
     print(f"[train] Parameters: {total:,}")
@@ -597,15 +604,19 @@ def main():
     # Train
     print(
         f"[train] target_total_timesteps={args.total_timesteps}, "
-        f"effective_learn_timesteps={effective_total_timesteps}, device={args.device}"
+        f"effective_learn_timesteps={args.total_timesteps}, device={args.device}"
     )
     start = time.time()
     callbacks_list = [
-        CheckpointCallback(
+        SafeTensorCheckpointCallback(
             save_freq=args.checkpoint_freq,
-            save_path=args.checkpoint_dir,
-            name_prefix="sts2_v2",
-            verbose=1,
+            checkpoint_dir=args.checkpoint_dir,
+            metadata_builder=lambda model_ref, timesteps: build_online_checkpoint_metadata(
+                args,
+                use_text=use_text,
+                timesteps=timesteps,
+            ),
+            verbose=args.verbose,
         ),
         RewardBreakdownTensorboardCallback(),
         EncounterStatsCallback(),
@@ -629,16 +640,24 @@ def main():
         )
     callbacks = CallbackList(callbacks_list)
     model.learn(
-        total_timesteps=effective_total_timesteps,
+        total_timesteps=args.total_timesteps,
         callback=callbacks,
-        reset_num_timesteps=reset_num_timesteps,
+        reset_num_timesteps=True,
     )
     elapsed = time.time() - start
     print(f"[train] Done in {elapsed:.0f}s")
 
-    final = str(Path(args.checkpoint_dir) / "sts2_v2_final")
-    model.save(final)
-    print(f"[train] Saved {final}.zip")
+    final = Path(args.checkpoint_dir) / "final"
+    save_online_checkpoint(
+        model,
+        final,
+        metadata=build_online_checkpoint_metadata(
+            args,
+            use_text=use_text,
+            timesteps=int(getattr(model, "num_timesteps", args.total_timesteps)),
+        ),
+    )
+    print(f"[train] Saved {final}")
 
     # Save text cache
     if use_text:

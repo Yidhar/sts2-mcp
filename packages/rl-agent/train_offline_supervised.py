@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from torch.utils.data import DataLoader
 
 from offline_training_data import (
@@ -268,18 +269,23 @@ def train(config: OfflineTrainConfig) -> dict[str, Any]:
 
         if eval_metrics["accuracy"] > best_eval_acc:
             best_eval_acc = eval_metrics["accuracy"]
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "task": config.task,
-                    "state_vocabs": {name: vocab.to_dict() for name, vocab in state_vocabs.items()},
-                    "output_vocabs": {name: vocab.to_dict() for name, vocab in output_vocabs.items()},
-                    "task_meta": task_meta,
-                    "config": asdict(config),
-                    "best_eval_accuracy": best_eval_acc,
-                    "epoch": epoch,
-                },
-                run_dir / "best_model.pt",
+            save_file(model.state_dict(), str(run_dir / "model.safetensors"))
+            (run_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "format": "sts2-offline-task-v1",
+                        "task": config.task,
+                        "state_vocabs": {name: vocab.to_dict() for name, vocab in state_vocabs.items()},
+                        "output_vocabs": {name: vocab.to_dict() for name, vocab in output_vocabs.items()},
+                        "task_meta": task_meta,
+                        "config": asdict(config),
+                        "best_eval_accuracy": best_eval_acc,
+                        "epoch": epoch,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
 
     summary = {

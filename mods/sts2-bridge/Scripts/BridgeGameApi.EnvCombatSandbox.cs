@@ -128,7 +128,9 @@ internal static partial class BridgeGameApi
 
         // Step 4: Retry the debug room entry once more on a later pump if the scene has not flipped
         // to combat yet. This keeps the fallback tight and avoids rebuilding half-initialized runs.
-        if (!state.CombatInProgress && !state.Done)
+        if (!state.CombatInProgress &&
+            !state.Done &&
+            HasUsableCombatSandboxRunScene(state))
         {
             var deferredEnterStarted = await TryDeferredEnterCombatRoomAsync(
                 encounterId,
@@ -190,7 +192,25 @@ internal static partial class BridgeGameApi
     {
         var priorState = await CaptureEnvSnapshotAsync(cancellationToken);
         diagnostics.Add(
-            $"Combat sandbox bootstrap starting from phase={priorState.Phase}, screen={priorState.Screen}, run_active={priorState.RunActive}, current_room={priorState.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"}");
+            $"Combat sandbox bootstrap starting from phase={priorState.Phase}, screen={priorState.Screen}, run_active={priorState.RunActive}, combat_in_progress={priorState.CombatInProgress}, current_room={priorState.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"}");
+
+        if (HasUsableCombatSandboxRunScene(priorState) &&
+            (priorState.CombatInProgress || string.Equals(priorState.Phase, "settling", StringComparison.Ordinal)))
+        {
+            diagnostics.Add(
+                $"Waiting for existing run scene to settle before combat sandbox reset (phase={priorState.Phase}, combat_in_progress={priorState.CombatInProgress})");
+
+            var settledState = await WaitForStableEnvStateAsync(
+                priorState.LogicHash,
+                Math.Min(timeoutMs, 5000),
+                requireActionableOrDone: true,
+                cancellationToken);
+
+            diagnostics.Add(
+                $"Combat sandbox pre-reset settle observed phase={settledState.Phase}, screen={settledState.Screen}, run_active={settledState.RunActive}, combat_in_progress={settledState.CombatInProgress}, current_room={settledState.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"}");
+
+            priorState = settledState;
+        }
 
         if (HasUsableCombatSandboxRunScene(priorState) && !priorState.CombatInProgress)
         {
