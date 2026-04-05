@@ -103,6 +103,52 @@ Combat usage note:
 
 ---
 
+## 🤖 Unified RL Pipeline
+
+The RL branch now uses one checkpoint lineage across all training stages:
+
+1. combat sandbox PPO
+2. offline build/route pretraining
+3. full-run PPO
+
+The entry point is [packages/rl-agent/train_pipeline.py](./packages/rl-agent/train_pipeline.py). It passes the output checkpoint of each stage directly into the next one.
+
+Example:
+
+```powershell
+python .\packages\rl-agent\train_pipeline.py `
+  --dataset-root .\datasets\parquet `
+  --character ironclad `
+  --session-file "$env:APPDATA\SlayTheSpire2\bridge\session.json" `
+  --stage2-partition-kind build_family `
+  --stage2-partition-value v0.98_to_v0.99.1
+```
+
+If you do not pass `--stage1-encounter-pool`, stage 1 now defaults to a starter-deck-friendly early Act 1 weak pool derived from exported run history:
+
+- `ENCOUNTER.SLIMES_WEAK`
+- `ENCOUNTER.SHRINKER_BEETLE_WEAK`
+- `ENCOUNTER.FUZZY_WURM_CRAWLER_WEAK`
+- `ENCOUNTER.NIBBITS_WEAK`
+
+The fixed eval holdout pool also defaults to unseen early Act 1 weak encounters:
+
+- `ENCOUNTER.CORPSE_SLUGS_WEAK`
+- `ENCOUNTER.SLUDGE_SPINNER_WEAK`
+- `ENCOUNTER.SEAPUNK_WEAK`
+- `ENCOUNTER.TOADPOLES_WEAK`
+
+If you already have a sandbox checkpoint and want to skip stage 1:
+
+```powershell
+python .\packages\rl-agent\train_pipeline.py `
+  --dataset-root .\datasets\parquet `
+  --start-checkpoint .\pipeline_runs\some_run\stage1_sandbox\checkpoints\final `
+  --stop-after offline
+```
+
+---
+
 ## ⚖️ Disclaimer & License
 
 **Disclaimer**: This is an unofficial community project. It is not affiliated with, endorsed by, or associated with Mega Crit or the developers of Slay the Spire 2. Use at your own risk.

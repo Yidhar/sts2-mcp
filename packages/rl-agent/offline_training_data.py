@@ -12,12 +12,42 @@ from torch.utils.data import Dataset
 from offline_dataset_loader import load_dataset
 
 
-CANDIDATE_TASKS = {"card_choice", "ancient_choice", "relic_choice", "potion_choice"}
+LEGACY_CANDIDATE_TASKS = {"card_choice", "ancient_choice", "relic_choice", "potion_choice"}
+BUILD_V2_CANDIDATE_TASKS = {
+    "regular_card_reward",
+    "event_card_bundle",
+    "ancient_choice",
+    "relic_choice_step",
+    "potion_choice_step",
+    "smith_target",
+    "remove_card_step",
+    "transform_card_step",
+    "shop_relic_pick_step",
+    "shop_potion_pick_step",
+    "shop_remove_target_step",
+}
 ROUTE_TASKS = {"route_room_type", "route_point_type"}
 ACTION_ONLY_CARD_TASKS = {"upgrade", "card_remove", "card_transform"}
 ACTION_ONLY_CLASS_TASKS = {"rest_site"}
-CLASSIFICATION_TASKS = ROUTE_TASKS | ACTION_ONLY_CLASS_TASKS
-SUPERVISED_TASKS = CANDIDATE_TASKS | ROUTE_TASKS | ACTION_ONLY_CARD_TASKS | ACTION_ONLY_CLASS_TASKS
+BUILD_V2_CLASS_TASKS = {"rest_action", "shop_remove_binary"}
+AUXILIARY_TASKS = {"shop_bundle_aux"}
+SHOP_BUNDLE_AUX_FIELDS = (
+    "did_buy_any_card",
+    "did_buy_any_relic",
+    "did_buy_any_potion",
+    "did_remove_card",
+    "leave_only",
+)
+CANDIDATE_TASKS = LEGACY_CANDIDATE_TASKS | BUILD_V2_CANDIDATE_TASKS
+CLASSIFICATION_TASKS = ROUTE_TASKS | ACTION_ONLY_CLASS_TASKS | BUILD_V2_CLASS_TASKS
+SUPERVISED_TASKS = (
+    CANDIDATE_TASKS
+    | ROUTE_TASKS
+    | ACTION_ONLY_CARD_TASKS
+    | ACTION_ONLY_CLASS_TASKS
+    | BUILD_V2_CLASS_TASKS
+    | AUXILIARY_TASKS
+)
 
 
 @dataclass
@@ -87,12 +117,18 @@ def load_task_rows(
     if split is not None:
         rows = [row for row in rows if row.get("split") == split]
 
-    if task in CANDIDATE_TASKS:
+    if task in BUILD_V2_CANDIDATE_TASKS:
+        samples = [_normalize_v2_candidate_row(row, task) for row in rows]
+    elif task in LEGACY_CANDIDATE_TASKS:
         samples = [_normalize_candidate_row(row, task) for row in rows]
     elif task in ROUTE_TASKS:
         samples = [_normalize_route_row(row, task) for row in rows]
     elif task in ACTION_ONLY_CARD_TASKS:
         samples = [_normalize_action_card_row(row, task) for row in rows]
+    elif task in BUILD_V2_CLASS_TASKS:
+        samples = [_normalize_v2_class_row(row, task) for row in rows]
+    elif task in AUXILIARY_TASKS:
+        samples = [_normalize_aux_row(row, task) for row in rows]
     elif task in ACTION_ONLY_CLASS_TASKS:
         samples = [_normalize_action_class_row(row, task) for row in rows]
     else:
@@ -141,9 +177,11 @@ def build_output_vocabs(rows: list[dict[str, Any]], task: str) -> dict[str, Stri
     if task in ROUTE_TASKS:
         labels = [row["label"] for row in rows]
         return {"label": StringVocab.build(labels, add_unknown=False, add_pad=False)}
-    if task in ACTION_ONLY_CLASS_TASKS:
+    if task in ACTION_ONLY_CLASS_TASKS | BUILD_V2_CLASS_TASKS:
         labels = [row["label"] for row in rows]
         return {"label": StringVocab.build(labels, add_unknown=False, add_pad=False)}
+    if task in AUXILIARY_TASKS:
+        return {}
     if task in ACTION_ONLY_CARD_TASKS:
         return {}
     raise ValueError(f"Unsupported task: {task}")
@@ -166,6 +204,9 @@ def build_task_metadata(rows: list[dict[str, Any]], task: str) -> dict[str, Any]
     if task in ACTION_ONLY_CARD_TASKS:
         meta["slot_count"] = max((len(row["selected_slot_ids"]) for row in rows), default=1)
         meta["max_candidates"] = max((len(row["deck_ids"]) for row in rows), default=1)
+    if task in AUXILIARY_TASKS:
+        meta["aux_label_count"] = len(SHOP_BUNDLE_AUX_FIELDS)
+        meta["max_candidates"] = len(SHOP_BUNDLE_AUX_FIELDS)
     return meta
 
 
@@ -185,12 +226,16 @@ def make_collate_fn(task: str, vocabs: dict[str, StringVocab], meta: dict[str, A
         return lambda batch: _collate_candidate_batch(batch, task, vocabs)
     if task in CLASSIFICATION_TASKS:
         return lambda batch: _collate_classification_batch(batch, task, vocabs)
+    if task in AUXILIARY_TASKS:
+        return lambda batch: _collate_aux_batch(batch, task, vocabs, meta)
     if task in ACTION_ONLY_CARD_TASKS:
         return lambda batch: _collate_action_card_batch(batch, task, vocabs, meta)
     raise ValueError(f"Unsupported task: {task}")
 
 
 def _dataset_name_for_task(task: str) -> str:
+    if task in BUILD_V2_CANDIDATE_TASKS | BUILD_V2_CLASS_TASKS | AUXILIARY_TASKS:
+        return f"{task}_samples"
     if task == "card_choice":
         return "card_choice_samples"
     if task in {"ancient_choice", "relic_choice", "potion_choice"}:
@@ -213,11 +258,71 @@ def _task_family(task: str) -> str:
         return "candidate"
     if task in ROUTE_TASKS:
         return "route"
-    if task in ACTION_ONLY_CLASS_TASKS:
+    if task in AUXILIARY_TASKS:
+        return "auxiliary"
+    if task in ACTION_ONLY_CLASS_TASKS | BUILD_V2_CLASS_TASKS:
         return "classification"
     if task in ACTION_ONLY_CARD_TASKS:
         return "cardset"
     raise ValueError(f"Unsupported task: {task}")
+
+
+def _normalize_v2_candidate_row(row: dict[str, Any], task: str) -> dict[str, Any] | None:
+    state = _extract_common_state(row, deck_key="deck_before", relic_key="relic_ids_before")
+    candidate_ids = [str(value) for value in row.get("option_ids") or [] if value]
+    candidate_counts_map = row.get("option_counts") or {}
+    candidate_counts = [float(candidate_counts_map.get(candidate_id, 1) or 1.0) for candidate_id in candidate_ids]
+
+    label_id = str(row.get("label_id") or "")
+    candidate_upgrade_levels: list[float] = []
+    option_upgrade_levels: dict[str, float] = {}
+    for item in row.get("options") or []:
+        if not isinstance(item, dict):
+            continue
+        card = item.get("card") or {}
+        card_id = card.get("id")
+        if not card_id:
+            continue
+        option_upgrade_levels[str(card_id)] = max(
+            option_upgrade_levels.get(str(card_id), 0.0),
+            float(card.get("current_upgrade_level") or 0.0),
+        )
+    for candidate_id in candidate_ids:
+        candidate_upgrade_levels.append(float(option_upgrade_levels.get(candidate_id, 0.0)))
+
+    if row.get("skip_available"):
+        candidate_ids.append("<skip>")
+        candidate_counts.append(0.0)
+        candidate_upgrade_levels.append(0.0)
+
+    if label_id == "<skip>":
+        label_index = len(candidate_ids) - 1 if candidate_ids and candidate_ids[-1] == "<skip>" else None
+    else:
+        try:
+            label_index = candidate_ids.index(label_id)
+        except ValueError:
+            return None
+
+    if label_index is None or not candidate_ids:
+        return None
+
+    return {
+        **state,
+        "sample_id": row["sample_id"],
+        "task": task,
+        "candidate_ids": candidate_ids,
+        "candidate_counts": candidate_counts,
+        "candidate_upgrade_levels": candidate_upgrade_levels,
+        "label_index": int(label_index),
+        "character": str(row.get("character") or "unknown"),
+        "choice_group_id": str(row.get("choice_group_id") or row["sample_id"]),
+        "selection_step_index": int(row.get("selection_step_index") or 0),
+        "selection_steps_total": int(row.get("selection_steps_total") or 1),
+        "selected_prefix_ids": [str(value) for value in row.get("selected_prefix_ids") or [] if value],
+        "skip_available": bool(row.get("skip_available")),
+        "label_id": label_id,
+        "option_kind": str(row.get("option_kind") or "unknown"),
+    }
 
 
 def _normalize_candidate_row(row: dict[str, Any], task: str) -> dict[str, Any] | None:
@@ -281,13 +386,60 @@ def _normalize_candidate_row(row: dict[str, Any], task: str) -> dict[str, Any] |
 def _normalize_route_row(row: dict[str, Any], task: str) -> dict[str, Any] | None:
     state = _extract_common_state(row, deck_key="deck_after", relic_key="relic_ids_after")
     label = row.get("next_room_type") if task == "route_room_type" else row.get("next_map_point_type")
+    route_candidates = _extract_route_candidates(row)
+    label_index = _resolve_route_label_index(row, route_candidates, task=task) if route_candidates else None
+    if not label and label_index is None:
+        return None
+    sample = {
+        **state,
+        "sample_id": row["sample_id"],
+        "task": task,
+        "supervision_type": str(row.get("supervision_type") or "unknown"),
+    }
+    if label:
+        sample["label"] = str(label)
+    if route_candidates:
+        sample["route_candidates"] = route_candidates
+    if label_index is not None:
+        sample["label_index"] = int(label_index)
+    return sample
+
+
+def _normalize_v2_class_row(row: dict[str, Any], task: str) -> dict[str, Any] | None:
+    state = _extract_common_state(row, deck_key="deck_before", relic_key="relic_ids_before")
+    label = str(row.get("label_id") or row.get("label") or "")
     if not label:
         return None
     return {
         **state,
         "sample_id": row["sample_id"],
         "task": task,
-        "label": str(label),
+        "label": label,
+        "character": str(row.get("character") or "unknown"),
+        "choice_group_id": str(row.get("choice_group_id") or row["sample_id"]),
+    }
+
+
+def _normalize_aux_row(row: dict[str, Any], task: str) -> dict[str, Any] | None:
+    if task != "shop_bundle_aux":
+        raise ValueError(f"Unsupported auxiliary task: {task}")
+    state = _extract_common_state(row, deck_key="deck_before", relic_key="relic_ids_before")
+    label_multi_hot = [1.0 if row.get(field) else 0.0 for field in SHOP_BUNDLE_AUX_FIELDS]
+    return {
+        **state,
+        "sample_id": row["sample_id"],
+        "task": task,
+        "character": str(row.get("character") or "unknown"),
+        "choice_group_id": str(row.get("choice_group_id") or row["sample_id"]),
+        "available_card_ids": [str(value) for value in row.get("available_card_ids") or [] if value],
+        "available_relic_ids": [str(value) for value in row.get("available_relic_ids") or [] if value],
+        "available_potion_ids": [str(value) for value in row.get("available_potion_ids") or [] if value],
+        "bought_card_ids": [str(value) for value in row.get("bought_card_ids") or [] if value],
+        "picked_relic_ids": [str(value) for value in row.get("picked_relic_ids") or [] if value],
+        "picked_potion_ids": [str(value) for value in row.get("picked_potion_ids") or [] if value],
+        "removed_card_ids": [str(value) for value in row.get("removed_card_ids") or [] if value],
+        "label_multi_hot": label_multi_hot,
+        "shop_card_purchase_unsupported": bool(row.get("shop_card_purchase_unsupported")),
     }
 
 
@@ -341,6 +493,9 @@ def _extract_common_state(row: dict[str, Any], *, deck_key: str, relic_key: str)
     current_hp = float(row.get("current_hp") or 0.0)
     gold_before = float(row.get("gold_before") or 0.0)
     current_gold = float(row.get("current_gold") or 0.0)
+    selection_step_index = float(row.get("selection_step_index") or 0.0)
+    selection_steps_total = float(row.get("selection_steps_total") or 0.0)
+    selected_prefix_count = float(len(row.get("selected_prefix_ids") or []))
 
     scalars = [
         float(row.get("floor_number") or 0.0),
@@ -361,15 +516,19 @@ def _extract_common_state(row: dict[str, Any], *, deck_key: str, relic_key: str)
         float(len(relic_ids)),
         1.0 if quality.get("initial_floor_sample") else 0.0,
         1.0 if quality.get("relic_ids_before_approximate") else 0.0,
+        selection_step_index,
+        selection_steps_total,
+        selected_prefix_count,
     ]
 
     return {
         "split": str(row.get("split") or "train"),
         "build_id": str(row.get("build_id") or "unknown"),
         "run_id": str(row.get("run_id") or "unknown"),
-        "room_type": str(row.get("room_type") or "unknown"),
-        "map_point_type": str(row.get("map_point_type") or "unknown"),
-        "room_model_id": str(row.get("room_model_id") or "unknown"),
+        "character": str(row.get("character") or "unknown"),
+        "room_type": str(row.get("room_type") or row.get("current_room_type") or "unknown"),
+        "map_point_type": str(row.get("map_point_type") or row.get("current_map_point_type") or "unknown"),
+        "room_model_id": str(row.get("room_model_id") or row.get("current_room_model_id") or "unknown"),
         "deck_ids": deck_ids,
         "deck_counts": deck_counts,
         "deck_upgraded_counts": deck_upgraded_counts,
@@ -378,6 +537,162 @@ def _extract_common_state(row: dict[str, Any], *, deck_key: str, relic_key: str)
         "monster_ids": monster_ids,
         "scalars": scalars,
     }
+
+
+def _extract_route_candidates(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_candidates = row.get("route_candidates")
+    if not isinstance(raw_candidates, list):
+        raw_candidates = row.get("candidate_routes")
+    if not isinstance(raw_candidates, list):
+        raw_candidates = row.get("candidate_actions")
+    if not isinstance(raw_candidates, list):
+        possible_choices = row.get("choices")
+        if isinstance(possible_choices, list) and any(_looks_like_route_candidate(item) for item in possible_choices):
+            raw_candidates = possible_choices
+        else:
+            raw_candidates = []
+
+    normalized: list[dict[str, Any]] = []
+    for index, candidate in enumerate(raw_candidates):
+        if not isinstance(candidate, dict):
+            continue
+        point_type = str(
+            candidate.get("point_type_norm")
+            or candidate.get("point_type")
+            or candidate.get("next_map_point_type")
+            or ""
+        )
+        route_summary = candidate.get("route_summary")
+        if not isinstance(route_summary, dict):
+            route_summary = candidate.get("summary") if isinstance(candidate.get("summary"), dict) else None
+        route_nodes = candidate.get("route_nodes")
+        if not isinstance(route_nodes, list):
+            route_nodes = candidate.get("nodes") if isinstance(candidate.get("nodes"), list) else None
+        coord = candidate.get("coord") if isinstance(candidate.get("coord"), dict) else None
+        normalized.append(
+            {
+                "index": index,
+                "action_id": str(candidate.get("action_id") or f"map:{index}"),
+                "point_type": point_type or "Unknown",
+                "point_type_norm": point_type or "Unknown",
+                "coord": coord,
+                "canonical_text": str(candidate.get("canonical_text") or candidate.get("label") or ""),
+                "route_summary": route_summary,
+                "route_nodes": route_nodes,
+                "_was_chosen": bool(
+                    candidate.get("was_chosen")
+                    or candidate.get("is_selected")
+                    or candidate.get("selected")
+                    or candidate.get("is_chosen")
+                ),
+            }
+        )
+    return normalized
+
+
+def _looks_like_route_candidate(candidate: Any) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    return any(
+        key in candidate
+        for key in ("point_type", "point_type_norm", "coord", "route_summary", "route_nodes", "action_id")
+    )
+
+
+def _resolve_route_label_index(
+    row: dict[str, Any],
+    route_candidates: list[dict[str, Any]],
+    *,
+    task: str,
+) -> int | None:
+    if not route_candidates:
+        return None
+
+    for key in ("label_index", "selected_index", "selected_route_index"):
+        value = row.get(key)
+        if isinstance(value, int) and 0 <= value < len(route_candidates):
+            return int(value)
+
+    chosen_indices = [index for index, candidate in enumerate(route_candidates) if candidate.get("_was_chosen")]
+    if len(chosen_indices) == 1:
+        return chosen_indices[0]
+
+    selected_action_id = row.get("selected_action_id")
+    if selected_action_id:
+        for index, candidate in enumerate(route_candidates):
+            if candidate.get("action_id") == str(selected_action_id):
+                return index
+
+    selected_coord = row.get("selected_coord")
+    if isinstance(selected_coord, dict):
+        for index, candidate in enumerate(route_candidates):
+            if _coords_equal(candidate.get("coord"), selected_coord):
+                return index
+
+    normalized_label = _normalize_route_training_label(
+        row.get("next_room_type") if task == "route_room_type" else row.get("next_map_point_type"),
+        task=task,
+    )
+    if normalized_label:
+        matching = [
+            index
+            for index, candidate in enumerate(route_candidates)
+            if _normalize_route_point_type(candidate.get("point_type_norm") or candidate.get("point_type")) == normalized_label
+        ]
+        if len(matching) == 1:
+            return matching[0]
+
+    if len(route_candidates) == 1:
+        return 0
+    return None
+
+
+def _coords_equal(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return left.get("row") == right.get("row") and left.get("col") == right.get("col")
+
+
+def _normalize_route_training_label(value: Any, *, task: str) -> str | None:
+    if value is None:
+        return None
+    if task == "route_room_type":
+        mapped = {
+            "Monster": "Monster",
+            "Elite": "Elite",
+            "Boss": "Boss",
+            "Event": "Event",
+            "Rest": "RestSite",
+            "RestSite": "RestSite",
+            "Merchant": "Shop",
+            "Shop": "Shop",
+            "Treasure": "Treasure",
+        }.get(str(value))
+        if mapped is not None:
+            return mapped
+    return _normalize_route_point_type(value)
+
+
+def _normalize_route_point_type(value: Any) -> str:
+    lookup = {
+        "monster": "Monster",
+        "normal": "Monster",
+        "elite": "Elite",
+        "boss": "Boss",
+        "event": "Event",
+        "question": "QuestionMark",
+        "questionmark": "QuestionMark",
+        "question_mark": "QuestionMark",
+        "rest": "RestSite",
+        "restsite": "RestSite",
+        "rest_site": "RestSite",
+        "merchant": "Shop",
+        "shop": "Shop",
+        "treasure": "Treasure",
+        "ancient": "Event",
+        "unknown": "Unknown",
+    }
+    return lookup.get(str(value or "").strip().lower(), str(value or "Unknown"))
 
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
@@ -462,6 +777,23 @@ def _collate_action_card_batch(
             "candidate_mask": _pad_mask([len(row["deck_ids"]) for row in batch]),
             "labels": torch.tensor(label_rows, dtype=torch.long),
             "selection_count": torch.tensor([int(row["selected_count"]) for row in batch], dtype=torch.long),
+            "sample_ids": [row["sample_id"] for row in batch],
+        }
+    )
+    return payload
+
+
+def _collate_aux_batch(
+    batch: list[dict[str, Any]],
+    task: str,
+    vocabs: dict[str, StringVocab],
+    meta: dict[str, Any],
+) -> dict[str, torch.Tensor | list[str] | str]:
+    payload = _collate_state(batch, vocabs)
+    payload.update(
+        {
+            "task": task,
+            "labels": torch.tensor([row["label_multi_hot"] for row in batch], dtype=torch.float32),
             "sample_ids": [row["sample_id"] for row in batch],
         }
     )

@@ -10,10 +10,68 @@ namespace Sts2McpBridge.Scripts;
 internal static class BridgeCoordinator
 {
     private static readonly object Sync = new();
-    private static readonly ConcurrentQueue<Action> Queue = new();
+    private static readonly ConcurrentQueue<IMainThreadWorkItem> Queue = new();
     private static readonly List<PumpTickWaiter> PumpTickWaiters = new();
     private static bool _isAttached;
     private static long _pumpTick;
+    private static long _lastPumpAtMs = System.Environment.TickCount64;
+
+    private interface IMainThreadWorkItem
+    {
+        void TryExecute();
+    }
+
+    private sealed class MainThreadWorkItem<T> : IMainThreadWorkItem
+    {
+        private readonly Func<T> _action;
+        private readonly TaskCompletionSource<T> _completionSource;
+        private CancellationTokenRegistration _cancellationRegistration;
+        private int _completionState;
+
+        public MainThreadWorkItem(
+            Func<T> action,
+            TaskCompletionSource<T> completionSource,
+            CancellationToken cancellationToken)
+        {
+            _action = action;
+            _completionSource = completionSource;
+            if (cancellationToken.CanBeCanceled)
+            {
+                _cancellationRegistration = cancellationToken.Register(() =>
+                {
+                    if (Interlocked.Exchange(ref _completionState, 1) != 0)
+                    {
+                        return;
+                    }
+
+                    _cancellationRegistration.Dispose();
+                    _completionSource.TrySetCanceled(cancellationToken);
+                });
+            }
+        }
+
+        public void TryExecute()
+        {
+            if (Interlocked.Exchange(ref _completionState, 1) != 0)
+            {
+                _cancellationRegistration.Dispose();
+                return;
+            }
+
+            try
+            {
+                _completionSource.TrySetResult(_action());
+            }
+            catch (Exception ex)
+            {
+                _completionSource.TrySetException(ex);
+            }
+            finally
+            {
+                _cancellationRegistration.Dispose();
+            }
+        }
+    }
 
     private sealed class PumpTickWaiter
     {
@@ -46,6 +104,25 @@ internal static class BridgeCoordinator
                        NGame.Instance is not null &&
                        GodotObject.IsInstanceValid(NGame.Instance);
             }
+        }
+    }
+
+    public static object GetDiagnosticsSnapshot()
+    {
+        lock (Sync)
+        {
+            var nowMs = System.Environment.TickCount64;
+            return new
+            {
+                attached = _isAttached,
+                ready = _isAttached &&
+                        NGame.Instance is not null &&
+                        GodotObject.IsInstanceValid(NGame.Instance),
+                pump_tick = _pumpTick,
+                ms_since_last_pump = Math.Max(0, nowMs - _lastPumpAtMs),
+                queued_main_thread_work = Queue.Count,
+                waiting_for_pump_tick = PumpTickWaiters.Count
+            };
         }
     }
 
@@ -105,7 +182,7 @@ internal static class BridgeCoordinator
         }
     }
 
-    public static Task<T> RunOnMainThreadAsync<T>(Func<T> action)
+    public static Task<T> RunOnMainThreadAsync<T>(Func<T> action, CancellationToken cancellationToken = default)
     {
         if (NGame.Instance is not null &&
             GodotObject.IsInstanceValid(NGame.Instance) &&
@@ -125,17 +202,7 @@ internal static class BridgeCoordinator
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         BridgeDebugTrace.Write("coordinator enqueue");
 
-        Queue.Enqueue(() =>
-        {
-            try
-            {
-                tcs.TrySetResult(action());
-            }
-            catch (Exception ex)
-            {
-                tcs.TrySetException(ex);
-            }
-        });
+        Queue.Enqueue(new MainThreadWorkItem<T>(action, tcs, cancellationToken));
 
         return tcs.Task;
     }
@@ -185,15 +252,16 @@ internal static class BridgeCoordinator
         var processedAny = false;
         List<PumpTickWaiter>? readyWaiters = null;
 
-        while (Queue.TryDequeue(out var action))
+        while (Queue.TryDequeue(out var workItem))
         {
             processedAny = true;
-            action();
+            workItem.TryExecute();
         }
 
         lock (Sync)
         {
             _pumpTick++;
+            _lastPumpAtMs = System.Environment.TickCount64;
 
             if (PumpTickWaiters.Count > 0)
             {

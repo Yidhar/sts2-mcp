@@ -96,11 +96,16 @@ internal static partial class BridgeGameApi
 {
     private const int NextFrontierWaitTimeoutMs = 5000;
     private const int PassiveFrontierWaitTimeoutMs = 1000;
+    private const int MaxShopOpenActionsPerRoom = 2;
+    private const int DefaultMainThreadTaskTimeoutMs = 3000;
+    private const int DefaultPumpWaitTimeoutMs = 2000;
+    private const int MaxMainThreadGuardTimeoutMs = 5000;
 
     private static readonly JsonSerializerOptions HashJsonOptions = new()
     {
         WriteIndented = false
     };
+    private static readonly object ShopOpenLimiterSync = new();
     private static readonly HashSet<string> SemanticStateExcludedPropertyNames = new(StringComparer.Ordinal)
     {
         "automation",
@@ -117,6 +122,8 @@ internal static partial class BridgeGameApi
         "selection_screen_prompt",
         "watchdog_dump"
     };
+    private static string? _shopOpenLimiterRoomKey;
+    private static int _shopOpenLimiterCount;
 
     public static async Task<object> GetStateResponseAsync(CancellationToken cancellationToken = default)
     {
@@ -125,7 +132,7 @@ internal static partial class BridgeGameApi
 
         var frontier = await ObserveFrontierAsync(cancellationToken);
         BridgeDebugTrace.Write($"get_state completed state_version={frontier.Sequence}");
-        return frontier.StatePayload;
+        return frontier.GetOrCreateStatePayload();
     }
 
     public static void NotifyFrontierPumpTick()
@@ -241,7 +248,11 @@ internal static partial class BridgeGameApi
     private static async Task<ObservedFrontier> ObserveFrontierAsync(CancellationToken cancellationToken)
     {
         BridgeDebugTrace.Write("observe_frontier executing on main thread");
-        var snapshot = await BridgeCoordinator.RunOnMainThreadAsync(CaptureSnapshot);
+        var snapshot = await RunOnMainThreadGuardedAsync(
+            CaptureSnapshot,
+            "observe_frontier.capture_snapshot",
+            DefaultMainThreadTaskTimeoutMs,
+            cancellationToken);
         var frontier = PublishFrontier(snapshot);
         BridgeDebugTrace.Write($"observe_frontier completed version={frontier.Sequence}");
         return frontier;
@@ -259,12 +270,16 @@ internal static partial class BridgeGameApi
         int waitAfterMs,
         CancellationToken cancellationToken)
     {
-        await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            BridgeDebugTrace.Write($"perform_action executing action={actionId}");
-            action.Execute();
-            return true;
-        });
+        await RunOnMainThreadGuardedAsync(
+            () =>
+            {
+                BridgeDebugTrace.Write($"perform_action executing action={actionId}");
+                action.Execute();
+                return true;
+            },
+            $"perform_action.execute:{actionId}",
+            DefaultMainThreadTaskTimeoutMs,
+            cancellationToken);
 
         if (waitAfterMs > 0)
         {
@@ -294,6 +309,92 @@ internal static partial class BridgeGameApi
         BridgeDebugTrace.Write(
             $"perform_action frontier_wait_timeout action={actionId} after_version={before.Sequence}");
         return await ObserveFrontierAsync(cancellationToken);
+    }
+
+    private static int NormalizeMainThreadGuardTimeout(int timeoutMs, int fallbackMs)
+    {
+        var normalized = timeoutMs <= 0 ? fallbackMs : timeoutMs;
+        return Math.Clamp(Math.Min(normalized, MaxMainThreadGuardTimeoutMs), 250, MaxMainThreadGuardTimeoutMs);
+    }
+
+    private static async Task<T> RunOnMainThreadGuardedAsync<T>(
+        Func<T> action,
+        string operationName,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var guardTimeoutMs = NormalizeMainThreadGuardTimeout(timeoutMs, DefaultMainThreadTaskTimeoutMs);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var mainThreadTask = BridgeCoordinator.RunOnMainThreadAsync(action, linkedCts.Token);
+
+        try
+        {
+            var completedTask = await Task.WhenAny(
+                mainThreadTask,
+                Task.Delay(guardTimeoutMs, cancellationToken));
+            if (completedTask == mainThreadTask)
+            {
+                return await mainThreadTask;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw BuildMainThreadTimeoutException(
+                "main_thread_stalled",
+                operationName,
+                guardTimeoutMs);
+        }
+
+        linkedCts.Cancel();
+        throw BuildMainThreadTimeoutException(
+            "main_thread_stalled",
+            operationName,
+            guardTimeoutMs);
+    }
+
+    private static async Task WaitForPumpTicksGuardedAsync(
+        int tickCount,
+        string operationName,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var guardTimeoutMs = NormalizeMainThreadGuardTimeout(timeoutMs, DefaultPumpWaitTimeoutMs);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linkedCts.CancelAfter(guardTimeoutMs);
+
+        try
+        {
+            await BridgeCoordinator.WaitForPumpTicksAsync(tickCount, linkedCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested &&
+                                                 linkedCts.IsCancellationRequested)
+        {
+            throw BuildMainThreadTimeoutException(
+                "pump_stalled",
+                operationName,
+                guardTimeoutMs);
+        }
+    }
+
+    private static BridgeRequestException BuildMainThreadTimeoutException(
+        string errorCode,
+        string operationName,
+        int timeoutMs)
+    {
+        return new BridgeRequestException(
+            HttpStatusCode.ServiceUnavailable,
+            errorCode,
+            $"Timed out waiting for bridge operation '{operationName}'.",
+            new
+            {
+                operation = operationName,
+                timeout_ms = timeoutMs,
+                coordinator = BridgeCoordinator.GetDiagnosticsSnapshot()
+            });
     }
 
     private static async Task<ObservedFrontier> WaitForNextObservedFrontierAsync(
@@ -407,6 +508,29 @@ internal static partial class BridgeGameApi
         }
     }
 
+    private static bool? ReadPayloadBooleanProperty(object? payload, string propertyName)
+    {
+        var value = ReadPayloadPropertyValue(payload, propertyName);
+        if (value is bool boolValue)
+        {
+            return boolValue;
+        }
+
+        if (value is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static object? ReadPayloadPropertyValue(object? payload, string propertyName)
     {
         if (payload is null || string.IsNullOrWhiteSpace(propertyName))
@@ -439,7 +563,7 @@ internal static partial class BridgeGameApi
         BridgeDebugTrace.Write($"capture_frontier_candidate context screen={context.Screen}");
         var actions = BuildResolvedActions(context);
         BridgeDebugTrace.Write($"capture_frontier_candidate actions={actions.Count}");
-        var frontierHash = ComputeFrontierHash(BuildFrontierProbePayload(context, actions));
+        var frontierHash = ComputeFrontierHash(BuildFrontierFingerprint(context, actions));
         BridgeDebugTrace.Write($"capture_frontier_candidate complete hash={frontierHash}");
 
         return new BridgeFrontierCandidate
@@ -455,19 +579,12 @@ internal static partial class BridgeGameApi
         BridgeDebugTrace.Write($"hydrate_snapshot start frontier_hash={candidate.FrontierHash}");
         var actionPayloads = candidate.Actions.Select(static action => action.Payload).ToArray();
         var fields = BuildStateFields(candidate.Context, actionPayloads);
-        var corePayload = CreateSemanticStateCore(fields);
-        var semanticStateHash = ComputeStateHash(corePayload);
-        var statePayload = CreateStatePayload(fields, 0, candidate.FrontierHash, semanticStateHash);
-        BridgeDebugTrace.Write(
-            $"hydrate_snapshot complete frontier_hash={candidate.FrontierHash} semantic_hash={semanticStateHash}");
+        BridgeDebugTrace.Write($"hydrate_snapshot complete frontier_hash={candidate.FrontierHash}");
 
         return new BridgeSnapshot
         {
             Fields = fields,
             FrontierHash = candidate.FrontierHash,
-            StateHash = semanticStateHash,
-            StatePayload = statePayload,
-            StateVersion = 0,
             Actions = candidate.Actions,
             ActionPayloads = actionPayloads,
             ActionLookup = candidate.Actions.ToDictionary(static action => action.ActionId, StringComparer.Ordinal)
@@ -518,6 +635,397 @@ internal static partial class BridgeGameApi
                 context.MerchantProceedButton,
                 context.MerchantBackButton)
         };
+    }
+
+    private static string BuildFrontierFingerprint(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        var builder = new StringBuilder(2048);
+
+        builder.Append("screen=").Append(context.Screen);
+        AppendRunStateFingerprint(builder, context.RunState);
+        AppendMapStateFingerprint(builder, context);
+        AppendCombatStateFingerprint(builder, context);
+        AppendCardSelectionStateFingerprint(builder, context);
+        AppendDeckUpgradeStateFingerprint(builder, context);
+        AppendCrystalSphereStateFingerprint(builder, context);
+        AppendActionSetFingerprint(builder, actions);
+
+        return builder.ToString();
+    }
+
+    private static void AppendRunStateFingerprint(StringBuilder builder, RunState? runState)
+    {
+        builder.Append("|run=");
+        if (runState is null)
+        {
+            builder.Append("none");
+            return;
+        }
+
+        builder.Append(runState.Act?.Id.ToString() ?? string.Empty)
+            .Append(';').Append(runState.ActFloor)
+            .Append(';').Append(runState.TotalFloor)
+            .Append(';').Append(runState.CurrentRoom?.RoomType.ToString() ?? string.Empty)
+            .Append(';').Append(runState.CurrentRoom?.ModelId?.ToString() ?? string.Empty)
+            .Append(';').Append(runState.CurrentRoom?.IsPreFinished == true ? '1' : '0');
+
+        if (runState.CurrentMapCoord.HasValue)
+        {
+            builder.Append(';');
+            AppendMapCoordFingerprint(builder, runState.CurrentMapCoord.Value);
+        }
+    }
+
+    private static void AppendMapStateFingerprint(StringBuilder builder, BridgeWorldContext context)
+    {
+        var mapScreen = context.MapScreen;
+        builder.Append("|map=");
+        if (mapScreen is null)
+        {
+            builder.Append("none");
+            return;
+        }
+
+        builder.Append(mapScreen.IsOpen ? '1' : '0')
+            .Append(';').Append(mapScreen.IsTravelEnabled ? '1' : '0')
+            .Append(';').Append(mapScreen.IsTraveling ? '1' : '0');
+
+        if (mapScreen.IsOpen && mapScreen.IsTravelEnabled && !mapScreen.IsTraveling)
+        {
+            foreach (var pointNode in context.MapPoints)
+            {
+                if (!IsMapPointTravelable(pointNode))
+                {
+                    continue;
+                }
+
+                builder.Append('|').Append("travel:");
+                AppendMapCoordFingerprint(builder, pointNode.Point.coord);
+                builder.Append(':').Append(pointNode.Point.PointType);
+                builder.Append(':').Append(pointNode.State);
+            }
+        }
+    }
+
+    private static void AppendCombatStateFingerprint(StringBuilder builder, BridgeWorldContext context)
+    {
+        var combatManager = context.CombatManager;
+        var combatState = context.CombatState;
+        builder.Append("|combat=");
+        if (combatManager is null || combatState is null || !combatManager.IsInProgress)
+        {
+            builder.Append("none");
+            return;
+        }
+
+        builder.Append(combatManager.IsPlayPhase ? '1' : '0')
+            .Append(';').Append(combatManager.PlayerActionsDisabled ? '1' : '0')
+            .Append(';').Append(combatState.RoundNumber)
+            .Append(';').Append(combatState.CurrentSide);
+
+        foreach (var player in combatState.Players)
+        {
+            var playerCreatureCombatId = player.Creature is null
+                ? -1
+                : Convert.ToInt32(player.Creature.CombatId, CultureInfo.InvariantCulture);
+            builder.Append("|p:")
+                .Append(player.NetId)
+                .Append(':').Append(playerCreatureCombatId)
+                .Append(':').Append(player.Creature?.CurrentHp ?? -1)
+                .Append('/').Append(player.Creature?.MaxHp ?? -1)
+                .Append(':').Append(player.Creature?.Block ?? -1)
+                .Append(':').Append(player.PlayerCombatState?.Energy ?? -1)
+                .Append('/').Append(player.PlayerCombatState?.MaxEnergy ?? -1)
+                .Append(':').Append(player.PlayerCombatState?.Stars ?? -1);
+
+            if (player.Creature is not null)
+            {
+                AppendPowerSetFingerprint(builder, player.Creature.Powers);
+            }
+
+            var handCards = player.PlayerCombatState?.Hand?.Cards;
+            builder.Append(":hand=").Append(handCards?.Count ?? 0);
+            if (handCards is not null)
+            {
+                foreach (var card in handCards)
+                {
+                    AppendCardFingerprint(builder, card);
+                }
+            }
+
+            builder.Append(":draw=").Append(player.PlayerCombatState?.DrawPile?.Cards.Count ?? 0)
+                .Append(":discard=").Append(player.PlayerCombatState?.DiscardPile?.Cards.Count ?? 0)
+                .Append(":exhaust=").Append(player.PlayerCombatState?.ExhaustPile?.Cards.Count ?? 0);
+        }
+
+        foreach (var creature in combatState.Creatures.Where(static creature => creature.IsEnemy))
+        {
+            builder.Append("|e:")
+                .Append(creature.ModelId)
+                .Append(':').Append(creature.CombatId)
+                .Append(':').Append(creature.CurrentHp)
+                .Append('/').Append(creature.MaxHp)
+                .Append(':').Append(creature.Block)
+                .Append(':').Append(creature.IsAlive ? '1' : '0');
+
+            AppendPowerSetFingerprint(builder, creature.Powers);
+            AppendEnemyIntentFingerprint(builder, creature);
+        }
+    }
+
+    private static void AppendCardSelectionStateFingerprint(StringBuilder builder, BridgeWorldContext context)
+    {
+        var screen = context.CardSelectionScreen;
+        var visible = screen is not null && IsNodeVisible(screen);
+        builder.Append("|cardsel=").Append(visible ? '1' : '0');
+        if (!visible)
+        {
+            return;
+        }
+
+        var prefs = GetHiddenFieldValue(screen, "_prefs");
+        builder.Append(';').Append(screen!.GetType().Name)
+            .Append(';').Append(CountSelectedCardSelectionCards(screen))
+            .Append('/').Append(GetHiddenPropertyValue<int>(prefs, "MinSelect"))
+            .Append('/').Append(GetHiddenPropertyValue<int>(prefs, "MaxSelect"))
+            .Append(';').Append(IsNodeVisible(context.CardSelectionConfirmButton) && IsButtonEnabled(context.CardSelectionConfirmButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CardSelectionCancelButton) && IsButtonEnabled(context.CardSelectionCancelButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CardSelectionCloseButton) && IsButtonEnabled(context.CardSelectionCloseButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CardSelectionSkipButton) && IsButtonEnabled(context.CardSelectionSkipButton) ? '1' : '0');
+
+        for (var index = 0; index < context.CardSelectionOptions.Count; index++)
+        {
+            var holder = context.CardSelectionOptions[index];
+            if (!IsNodeVisible(holder))
+            {
+                continue;
+            }
+
+            var optionIndex = GetCardSelectionOptionIndex(screen, holder, index);
+            var selectionId = GetCardSelectionOptionSelectionId(screen, holder, optionIndex) ??
+                              optionIndex.ToString(CultureInfo.InvariantCulture);
+            builder.Append("|csopt:")
+                .Append(selectionId)
+                .Append(':').Append(IsCardSelectionCardSelected(screen, holder.CardModel) ? '1' : '0');
+            AppendCardFingerprint(builder, holder.CardModel);
+        }
+    }
+
+    private static void AppendDeckUpgradeStateFingerprint(StringBuilder builder, BridgeWorldContext context)
+    {
+        var screen = context.DeckUpgradeScreen;
+        var visible = screen is not null && IsNodeVisible(screen);
+        builder.Append("|upgrade=").Append(visible ? '1' : '0');
+        if (!visible)
+        {
+            return;
+        }
+
+        builder.Append(';').Append(CountSelectedDeckUpgradeCards(screen))
+            .Append(';').Append(IsNodeVisible(context.DeckUpgradeConfirmButton) && IsButtonEnabled(context.DeckUpgradeConfirmButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.DeckUpgradeCancelButton) && IsButtonEnabled(context.DeckUpgradeCancelButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.DeckUpgradeCloseButton) && IsButtonEnabled(context.DeckUpgradeCloseButton) ? '1' : '0');
+
+        foreach (var holder in context.DeckUpgradeOptions)
+        {
+            if (!IsNodeVisible(holder))
+            {
+                continue;
+            }
+
+            builder.Append("|upopt:")
+                .Append(IsDeckUpgradeCardSelected(screen, holder.CardModel) ? '1' : '0');
+            AppendCardFingerprint(builder, holder.CardModel);
+        }
+    }
+
+    private static void AppendCrystalSphereStateFingerprint(StringBuilder builder, BridgeWorldContext context)
+    {
+        var screen = context.CrystalSphereScreen;
+        var visible = screen is not null && IsNodeVisible(screen);
+        builder.Append("|sphere=").Append(visible ? '1' : '0');
+        if (!visible)
+        {
+            return;
+        }
+
+        var minigame = GetCrystalSphereMinigame(screen);
+        builder.Append(';').Append(GetCrystalSphereDivinationCount(minigame))
+            .Append(';').Append(GetCrystalSphereToolName(minigame))
+            .Append(';').Append(GetCrystalSphereIsFinished(minigame) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CrystalSphereSmallDivinationButton) && IsButtonEnabled(context.CrystalSphereSmallDivinationButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CrystalSphereBigDivinationButton) && IsButtonEnabled(context.CrystalSphereBigDivinationButton) ? '1' : '0')
+            .Append(';').Append(IsNodeVisible(context.CrystalSphereProceedButton) && IsButtonEnabled(context.CrystalSphereProceedButton) ? '1' : '0');
+
+        foreach (var cell in context.CrystalSphereCells)
+        {
+            builder.Append("|cell:")
+                .Append(cell.Entity?.X ?? -1)
+                .Append(',').Append(cell.Entity?.Y ?? -1)
+                .Append(':').Append(cell.Entity?.IsHidden ?? true ? '1' : '0')
+                .Append(':').Append(cell.Entity?.IsHighlighted ?? false ? '1' : '0');
+        }
+    }
+
+    private static void AppendActionSetFingerprint(StringBuilder builder, IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        builder.Append("|actions=").Append(actions.Count);
+        foreach (var action in actions)
+        {
+            builder.Append("|a:").Append(action.ActionId);
+            AppendActionPayloadFingerprint(builder, action.Payload);
+        }
+    }
+
+    private static void AppendActionPayloadFingerprint(StringBuilder builder, object? payload)
+    {
+        builder.Append(':').Append(ReadPayloadStringProperty(payload, "kind") ?? string.Empty);
+
+        var rewardPayload = ReadPayloadPropertyValue(payload, "reward");
+        if (rewardPayload is not null)
+        {
+            builder.Append(":rw=")
+                .Append(ReadPayloadStringProperty(rewardPayload, "reward_type")
+                        ?? ReadPayloadStringProperty(rewardPayload, "type")
+                        ?? string.Empty)
+                .Append(':').Append(ReadPayloadIntegerProperty(rewardPayload, "amount") ?? -1)
+                .Append(':').Append(NormalizeComparableText(ReadPayloadStringProperty(rewardPayload, "description")));
+        }
+
+        var cardPayload = ReadPayloadPropertyValue(payload, "card");
+        if (cardPayload is not null)
+        {
+            builder.Append(":card=")
+                .Append(ReadPayloadStringProperty(cardPayload, "id") ?? string.Empty)
+                .Append(':').Append(ReadPayloadIntegerProperty(cardPayload, "resolved_energy_cost") ?? -1)
+                .Append(':').Append(ReadPayloadIntegerProperty(cardPayload, "current_star_cost") ?? -1);
+        }
+
+        var optionPayload = ReadPayloadPropertyValue(payload, "option");
+        if (optionPayload is not null)
+        {
+            builder.Append(":opt=")
+                .Append(ReadPayloadStringProperty(optionPayload, "option_id") ?? string.Empty)
+                .Append(':').Append(NormalizeComparableText(ReadPayloadStringProperty(optionPayload, "title")))
+                .Append(':').Append(ReadPayloadBooleanProperty(optionPayload, "is_enabled") == true ? '1' : '0');
+        }
+
+        var itemPayload = ReadPayloadPropertyValue(payload, "item");
+        if (itemPayload is not null)
+        {
+            builder.Append(":item=")
+                .Append(ReadPayloadStringProperty(itemPayload, "item_kind") ?? string.Empty)
+                .Append(':').Append(NormalizeComparableText(ReadPayloadStringProperty(itemPayload, "title")))
+                .Append(':').Append(ReadPayloadIntegerProperty(itemPayload, "cost") ?? -1)
+                .Append(':').Append(ReadPayloadBooleanProperty(itemPayload, "is_affordable") == true ? '1' : '0');
+        }
+
+        var relicPayload = ReadPayloadPropertyValue(payload, "relic");
+        if (relicPayload is not null)
+        {
+            builder.Append(":relic=")
+                .Append(ReadPayloadStringProperty(relicPayload, "id") ?? string.Empty)
+                .Append(':').Append(NormalizeComparableText(ReadPayloadStringProperty(relicPayload, "title")));
+        }
+
+        var coordPayload = ReadPayloadPropertyValue(payload, "coord");
+        if (coordPayload is not null)
+        {
+            builder.Append(":coord=")
+                .Append(ReadPayloadIntegerProperty(coordPayload, "col") ?? -1)
+                .Append(',').Append(ReadPayloadIntegerProperty(coordPayload, "row") ?? -1);
+        }
+
+        var pointType = ReadPayloadStringProperty(payload, "point_type");
+        if (!string.IsNullOrWhiteSpace(pointType))
+        {
+            builder.Append(":pt=").Append(pointType);
+        }
+
+        var selectionPrompt = ReadPayloadStringProperty(payload, "selection_prompt");
+        if (!string.IsNullOrWhiteSpace(selectionPrompt))
+        {
+            builder.Append(":prompt=").Append(NormalizeComparableText(selectionPrompt));
+        }
+
+        var buttonText = ReadPayloadStringProperty(payload, "button_text");
+        if (!string.IsNullOrWhiteSpace(buttonText))
+        {
+            builder.Append(":btn=").Append(NormalizeComparableText(buttonText));
+        }
+    }
+
+    private static void AppendMapCoordFingerprint(StringBuilder builder, MapCoord coord)
+    {
+        builder.Append(coord.col).Append(',').Append(coord.row);
+    }
+
+    private static void AppendCardFingerprint(StringBuilder builder, CardModel? card)
+    {
+        if (card is null)
+        {
+            builder.Append(":card=<missing>");
+            return;
+        }
+
+        builder.Append(":card=")
+            .Append(card.Id.ToString())
+            .Append('/').Append(card.EnergyCost.GetResolved())
+            .Append('/').Append(card.CurrentStarCost)
+            .Append('/').Append(card.EnergyCost.CostsX ? '1' : '0')
+            .Append('/').Append(SafeGetCardIsPlayable(card) ? '1' : '0');
+    }
+
+    private static void AppendPowerSetFingerprint(StringBuilder builder, IEnumerable<PowerModel> powers)
+    {
+        foreach (var power in powers)
+        {
+            builder.Append(":pow=")
+                .Append(NormalizeComparableText(TextOf(power.Title)))
+                .Append('/').Append(power.Amount)
+                .Append('/').Append(power.DisplayAmount);
+        }
+    }
+
+    private static void AppendEnemyIntentFingerprint(StringBuilder builder, Creature creature)
+    {
+        var monster = creature.Monster;
+        if (monster?.NextMove is null)
+        {
+            builder.Append(":intent=none");
+            return;
+        }
+
+        var nextMove = monster.NextMove;
+        builder.Append(":intent=")
+            .Append(nextMove.StateId ?? string.Empty)
+            .Append('/').Append(nextMove.FollowUpStateId ?? string.Empty)
+            .Append('/').Append(nextMove.IsMove ? '1' : '0');
+
+        var targets = ResolveMonsterIntentTargets(creature);
+        foreach (var intent in SafeGetMonsterIntents(monster, nextMove))
+        {
+            var repeats = intent switch
+            {
+                SingleAttackIntent singleAttackIntent => singleAttackIntent.Repeats,
+                MultiAttackIntent multiAttackIntent => multiAttackIntent.Repeats,
+                _ => 1
+            };
+
+            var totalDamage = intent switch
+            {
+                SingleAttackIntent singleAttackIntent => SafeGetIntentTotalDamage(singleAttackIntent, targets, creature),
+                MultiAttackIntent multiAttackIntent => SafeGetIntentTotalDamage(multiAttackIntent, targets, creature),
+                _ => null
+            };
+
+            builder.Append(":i=")
+                .Append(intent.IntentType)
+                .Append('/').Append(repeats)
+                .Append('/').Append(totalDamage ?? -1);
+        }
     }
 
     private static object BuildCombatFrontierPayload(CombatManager? combatManager, CombatState? combatState)
@@ -1948,8 +2456,10 @@ internal static partial class BridgeGameApi
         }
 
         var inventoryIsOpen = context.MerchantInventory?.IsOpen == true;
+        var shopOpenAvailable = CanExposeShopOpenAction(context);
 
         if (!inventoryIsOpen &&
+            shopOpenAvailable &&
             context.MerchantButton is not null &&
             IsNodeVisible(context.MerchantButton) &&
             IsButtonEnabled(context.MerchantButton))
@@ -1965,7 +2475,11 @@ internal static partial class BridgeGameApi
                     label = "Open merchant inventory",
                     screen = context.Screen
                 },
-                Execute = () => InvokeButtonAction(context.MerchantButton, "OnRelease", "OnPress")
+                Execute = () =>
+                {
+                    InvokeButtonAction(context.MerchantButton, "OnRelease", "OnPress");
+                    RecordShopOpenAction(context);
+                }
             });
         }
 
@@ -2997,7 +3511,7 @@ internal static partial class BridgeGameApi
         {
             has_run = true,
             is_game_over = runState.IsGameOver,
-            current_location = TextOf(runState.CurrentLocation),
+            current_location = BuildCurrentLocationText(runState),
             current_act_index = runState.CurrentActIndex,
             ascension_level = runState.AscensionLevel,
             act_floor = runState.ActFloor,
@@ -3016,6 +3530,18 @@ internal static partial class BridgeGameApi
             current_room = BuildRoomPayload(runState.CurrentRoom),
             player_count = runState.Players.Count
         };
+    }
+
+    private static string BuildCurrentLocationText(RunState runState)
+    {
+        var actPart = $"act {runState.CurrentActIndex}";
+        if (!runState.CurrentMapCoord.HasValue)
+        {
+            return actPart;
+        }
+
+        var coord = runState.CurrentMapCoord.Value;
+        return $"{actPart} coord ({coord.col}, {coord.row})";
     }
 
     private static object BuildCombatPayload(CombatManager? combatManager, CombatState? combatState)
@@ -3216,6 +3742,8 @@ internal static partial class BridgeGameApi
         return new
         {
             id = card.Id.ToString(),
+            current_upgrade_level = card.CurrentUpgradeLevel,
+            max_upgrade_level = card.MaxUpgradeLevel,
             title = string.IsNullOrWhiteSpace(card.Title)
                 ? DescribeText(card.TitleLocString, card)
                 : DescribeText(card.Title, card),
@@ -3276,6 +3804,89 @@ internal static partial class BridgeGameApi
         {
             return false;
         }
+    }
+
+    private static bool CanExposeShopOpenAction(BridgeWorldContext context)
+    {
+        var roomKey = BuildShopOpenLimiterRoomKey(context);
+        if (string.IsNullOrWhiteSpace(roomKey))
+        {
+            ResetShopOpenLimiter();
+            return true;
+        }
+
+        lock (ShopOpenLimiterSync)
+        {
+            if (!string.Equals(_shopOpenLimiterRoomKey, roomKey, StringComparison.Ordinal))
+            {
+                _shopOpenLimiterRoomKey = roomKey;
+                _shopOpenLimiterCount = 0;
+            }
+
+            return _shopOpenLimiterCount < MaxShopOpenActionsPerRoom;
+        }
+    }
+
+    private static void RecordShopOpenAction(BridgeWorldContext context)
+    {
+        var roomKey = BuildShopOpenLimiterRoomKey(context);
+        if (string.IsNullOrWhiteSpace(roomKey))
+        {
+            return;
+        }
+
+        lock (ShopOpenLimiterSync)
+        {
+            if (!string.Equals(_shopOpenLimiterRoomKey, roomKey, StringComparison.Ordinal))
+            {
+                _shopOpenLimiterRoomKey = roomKey;
+                _shopOpenLimiterCount = 0;
+            }
+
+            if (_shopOpenLimiterCount < int.MaxValue)
+            {
+                _shopOpenLimiterCount++;
+            }
+        }
+    }
+
+    private static void ResetShopOpenLimiter()
+    {
+        lock (ShopOpenLimiterSync)
+        {
+            _shopOpenLimiterRoomKey = null;
+            _shopOpenLimiterCount = 0;
+        }
+    }
+
+    private static string? BuildShopOpenLimiterRoomKey(BridgeWorldContext context)
+    {
+        if (context.MerchantRoom is null &&
+            context.MerchantInventory is null)
+        {
+            return null;
+        }
+
+        var runState = context.RunState;
+        if (runState is null)
+        {
+            return "shop:no-run";
+        }
+
+        var coordPart = runState.CurrentMapCoord.HasValue
+            ? $"{runState.CurrentMapCoord.Value.col},{runState.CurrentMapCoord.Value.row}"
+            : "?,?";
+        var roomTypePart = runState.CurrentRoom?.RoomType.ToString() ?? "Unknown";
+        var roomModelPart = runState.CurrentRoom?.ModelId?.ToString() ?? string.Empty;
+
+        return string.Concat(
+            runState.TotalFloor.ToString(CultureInfo.InvariantCulture),
+            "|",
+            coordPart,
+            "|",
+            roomTypePart,
+            "|",
+            roomModelPart);
     }
 
     private static object? BuildCardUpgradePreviewPayload(CardModel? card)
@@ -6676,13 +7287,15 @@ internal static partial class BridgeGameApi
             return null;
         }
 
-        var property = FindProperty(target.GetType(), propertyName);
+        var (property, staticTarget) = target is Type staticType
+            ? (FindProperty(staticType, propertyName, includeStatic: true), (object?)null)
+            : (FindProperty(target.GetType(), propertyName), target);
         if (property is null)
         {
             return null;
         }
 
-        var value = property.GetValue(target);
+        var value = property.GetValue(staticTarget);
         return value is T typed ? typed : null;
     }
 
@@ -6693,8 +7306,10 @@ internal static partial class BridgeGameApi
             return null;
         }
 
-        var property = FindProperty(target.GetType(), propertyName);
-        return property?.GetValue(target);
+        var (property, staticTarget) = target is Type staticType
+            ? (FindProperty(staticType, propertyName, includeStatic: true), (object?)null)
+            : (FindProperty(target.GetType(), propertyName), target);
+        return property?.GetValue(staticTarget);
     }
 
     private static object? GetHiddenFieldValue(object? target, string fieldName)
@@ -6704,8 +7319,10 @@ internal static partial class BridgeGameApi
             return null;
         }
 
-        var field = FindField(target.GetType(), fieldName);
-        return field?.GetValue(target);
+        var (field, staticTarget) = target is Type staticType
+            ? (FindField(staticType, fieldName, includeStatic: true), (object?)null)
+            : (FindField(target.GetType(), fieldName), target);
+        return field?.GetValue(staticTarget);
     }
 
     private static int CountSelectedDeckUpgradeCards(NDeckUpgradeSelectScreen? deckUpgradeScreen)
@@ -7221,13 +7838,16 @@ internal static partial class BridgeGameApi
         }
     }
 
-    private static PropertyInfo? FindProperty(Type? type, string propertyName)
+    private static PropertyInfo? FindProperty(Type? type, string propertyName, bool includeStatic = false)
     {
         while (type is not null)
         {
             var property = type.GetProperty(
                 propertyName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                (includeStatic ? BindingFlags.Static : BindingFlags.Instance) |
+                BindingFlags.Public |
+                BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly);
 
             if (property is not null)
             {
@@ -7240,13 +7860,16 @@ internal static partial class BridgeGameApi
         return null;
     }
 
-    private static FieldInfo? FindField(Type? type, string fieldName)
+    private static FieldInfo? FindField(Type? type, string fieldName, bool includeStatic = false)
     {
         while (type is not null)
         {
             var field = type.GetField(
                 fieldName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                (includeStatic ? BindingFlags.Static : BindingFlags.Instance) |
+                BindingFlags.Public |
+                BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly);
 
             if (field is not null)
             {
@@ -8903,16 +9526,19 @@ internal static partial class BridgeGameApi
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
-    private static string ComputeFrontierHash(object payload)
+    private static string ComputeFrontierHash(string fingerprint)
     {
-        return ComputeStateHash(payload);
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(fingerprint));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     private static object BuildFrontierStatePayload(
         BridgeSnapshot snapshot,
         long sequence)
     {
-        return CreateStatePayload(snapshot.Fields, sequence, snapshot.FrontierHash, snapshot.StateHash);
+        var semanticCore = CreateSemanticStateCore(snapshot.Fields);
+        var semanticStateHash = ComputeStateHash(semanticCore);
+        return CreateStatePayload(snapshot.Fields, sequence, snapshot.FrontierHash, semanticStateHash);
     }
 
     private sealed class BridgeWorldContext
@@ -9073,7 +9699,22 @@ internal static partial class BridgeGameApi
 
         public required BridgeSnapshot Snapshot { get; init; }
 
-        public required object StatePayload { get; init; }
+        private readonly object _statePayloadSync = new();
+        private object? _statePayload;
+
+        public object GetOrCreateStatePayload()
+        {
+            if (_statePayload is not null)
+            {
+                return _statePayload;
+            }
+
+            lock (_statePayloadSync)
+            {
+                _statePayload ??= BuildFrontierStatePayload(Snapshot, Sequence);
+                return _statePayload;
+            }
+        }
     }
 
     private sealed class BridgeFrontierCandidate
@@ -9098,6 +9739,8 @@ internal static partial class BridgeGameApi
     {
         private const int StreamStableTickTarget = 1;
         private const int StreamHeartbeatIntervalMs = 15000;
+        private const int WaiterSampleIntervalMs = 40;
+        private const int SubscriberSampleIntervalMs = 120;
 
         private static readonly object Sync = new();
         private static readonly Dictionary<Guid, Channel<ObservedFrontier>> Subscribers = new();
@@ -9107,6 +9750,7 @@ internal static partial class BridgeGameApi
         private static BridgeFrontierCandidate? _candidate;
         private static int _candidateStableTicks;
         private static long _nextSequence = 1;
+        private static long _nextPumpSampleAtMs;
 
         public static void Reset()
         {
@@ -9125,6 +9769,7 @@ internal static partial class BridgeGameApi
                 _candidate = null;
                 _candidateStableTicks = 0;
                 _nextSequence = 1;
+                _nextPumpSampleAtMs = 0;
             }
 
             foreach (var channel in subscriberChannels)
@@ -9229,15 +9874,26 @@ internal static partial class BridgeGameApi
 
         public static void OnPumpTick()
         {
-            bool shouldSample;
+            bool hasSubscribers;
+            bool hasWaiters;
             lock (Sync)
             {
-                shouldSample = Subscribers.Count > 0 || Waiters.Count > 0;
-            }
+                hasSubscribers = Subscribers.Count > 0;
+                hasWaiters = Waiters.Count > 0;
 
-            if (!shouldSample)
-            {
-                return;
+                if (!hasSubscribers && !hasWaiters)
+                {
+                    return;
+                }
+
+                var nowMs = System.Environment.TickCount64;
+                if (nowMs < _nextPumpSampleAtMs)
+                {
+                    return;
+                }
+
+                var intervalMs = hasWaiters ? WaiterSampleIntervalMs : SubscriberSampleIntervalMs;
+                _nextPumpSampleAtMs = nowMs + intervalMs;
             }
 
             try
@@ -9420,13 +10076,11 @@ internal static partial class BridgeGameApi
             }
 
             var sequence = _nextSequence++;
-            var payload = BuildFrontierStatePayload(snapshot, sequence);
             _current = new ObservedFrontier
             {
                 Sequence = sequence,
                 FrontierHash = frontierHash,
-                Snapshot = snapshot,
-                StatePayload = payload
+                Snapshot = snapshot
             };
             return _current;
         }
@@ -9477,7 +10131,7 @@ internal static partial class BridgeGameApi
             {
                 ok = true,
                 event_type = "frontier",
-                state = frontier.StatePayload
+                state = frontier.GetOrCreateStatePayload()
             }, HashJsonOptions);
             await WriteSseEventAsync(response, "frontier", payload, cancellationToken);
         }
@@ -9606,15 +10260,9 @@ internal static partial class BridgeGameApi
 
     private sealed class BridgeSnapshot
     {
-        public required long StateVersion { get; init; }
-
         public required string FrontierHash { get; init; }
 
-        public required string StateHash { get; init; }
-
         public required BridgeStateFields Fields { get; init; }
-
-        public required object StatePayload { get; init; }
 
         public required IReadOnlyList<BridgeResolvedAction> Actions { get; init; }
 

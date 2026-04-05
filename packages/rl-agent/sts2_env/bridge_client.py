@@ -51,6 +51,7 @@ class BridgeClient:
         self._base_url: str = ""
         self._token: str = ""
         self._is_connected: bool = False
+        self._session = requests.Session()
         self._load_session()
 
     def _load_session(self) -> None:
@@ -72,6 +73,7 @@ class BridgeClient:
 
         self._base_url = data["base_url"].rstrip("/")
         self._token = data["token"]
+        self._session.headers.update({"Authorization": f"Bearer {self._token}"})
 
     @property
     def base_url(self) -> str:
@@ -105,7 +107,6 @@ class BridgeClient:
             BridgeError: On non-retryable HTTP errors or after retries exhausted.
         """
         url = f"{self._base_url}/{endpoint.lstrip('/')}"
-        headers = {"Authorization": f"Bearer {self._token}"}
         http_timeout_s = (
             (timeout_ms + self.HTTP_TIMEOUT_GRACE_MS) / 1000.0
             if timeout_ms is not None
@@ -115,10 +116,9 @@ class BridgeClient:
         last_exc: Exception | None = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                resp = requests.request(
+                resp = self._session.request(
                     method,
                     url,
-                    headers=headers,
                     json=body if body is not None else None,
                     timeout=http_timeout_s,
                 )
@@ -258,6 +258,22 @@ class BridgeClient:
     def health(self) -> dict[str, Any]:
         """GET /health -- health check. Updates is_connected."""
         return self._request("GET", "health")
+
+    def export_static(
+        self,
+        *,
+        output_dir: str | None = None,
+        timeout_ms: int = 60_000,
+    ) -> dict[str, Any]:
+        """POST /static/export -- dump static game metadata to disk.
+
+        Returns dict with keys like:
+            ok, output_dir, items_path, manifest_path, counts
+        """
+        body: dict[str, Any] = {"timeout_ms": timeout_ms}
+        if output_dir is not None:
+            body["output_dir"] = output_dir
+        return self._request("POST", "static/export", body=body, timeout_ms=timeout_ms)
 
     def get_state(self) -> dict[str, Any]:
         """GET /state -- full game state."""

@@ -96,24 +96,45 @@ internal static partial class BridgeGameApi
             },
             reward = new
             {
-                scalar = "terminal_dominant_minimal",
-                linear_channels = new[]
+                scalar = "room_settlement_milestone_v2",
+                optimized_components = new[]
+                {
+                    "combat_room_complete_bonus",
+                    "combat_room_quality_bonus",
+                    "floor_progress_bonus",
+                    "elite_clear_bonus",
+                    "boss_clear_bonus",
+                    "act_clear_bonus",
+                    "relic_gain_bonus",
+                    "max_hp_gain_bonus",
+                    "run_victory_bonus"
+                },
+                component_scales = new
+                {
+                    combat_room_complete = EnvRewardCombatWinBonus,
+                    room_hp_delta_normalized = EnvRewardRoomHpDeltaWeight,
+                    floor_delta = EnvRewardFloorDeltaWeight,
+                    elite_clear = EnvRewardEliteClearBonus,
+                    boss_clear = EnvRewardBossClearBonus,
+                    act_clear = EnvRewardActClearBonus,
+                    relic_gain_count = EnvRewardRelicGainWeight,
+                    max_hp_gain_normalized = EnvRewardMaxHpGainWeight,
+                    death = EnvRewardDeathPenalty,
+                    victory = EnvRewardVictoryBonus
+                },
+                diagnostic_channels = new[]
                 {
                     "hp_loss_normalized",
                     "hp_gain_normalized",
+                    "room_complete",
+                    "combat_room_complete",
                     "room_hp_delta_normalized",
                     "floor_delta",
+                    "act_clear",
+                    "relic_gain_count",
+                    "max_hp_gain_normalized",
                     "death",
                     "victory"
-                },
-                linear_weights = new
-                {
-                    hp_loss_normalized = EnvRewardHpLossWeight,
-                    hp_gain_normalized = EnvRewardHpGainWeight,
-                    room_hp_delta_normalized = EnvRewardRoomHpDeltaWeight,
-                    floor_delta = EnvRewardFloorDeltaWeight,
-                    death = EnvRewardDeathPenalty,
-                    victory = EnvRewardVictoryBonus
                 },
                 direct_terms = new
                 {
@@ -135,12 +156,15 @@ internal static partial class BridgeGameApi
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
         await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
         var executedActions = new List<object>();
-        var state = await CaptureEnvSnapshotAsync(cancellationToken);
+        var state = await CaptureEnvSnapshotAsync(
+            timeoutMs,
+            cancellationToken,
+            "env.reset.initial_snapshot");
 
         if (CanReuseFreshEpisode(state, requestedCharacter))
         {
             var readyEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
-            state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, cancellationToken);
+            state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, timeoutMs, cancellationToken);
             return BuildEnvResetPayload(readyEpisode, state, executedActions);
         }
 
@@ -166,7 +190,7 @@ internal static partial class BridgeGameApi
             if (CanReuseFreshEpisode(state, requestedCharacter))
             {
                 var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
-                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, timeoutMs, cancellationToken);
                 return BuildEnvResetPayload(episode, state, executedActions);
             }
 
@@ -193,7 +217,11 @@ internal static partial class BridgeGameApi
                     });
             }
 
-            await ExecuteEnvActionAsync(nextAction.Value.Action, cancellationToken);
+            await ExecuteEnvActionAsync(
+                nextAction.Value.Action,
+                timeoutMs,
+                cancellationToken,
+                $"env.reset.execute:{nextAction.Value.Action.ActionId}");
             executedActions.Add(new
             {
                 action_id = nextAction.Value.Action.ActionId,
@@ -211,16 +239,19 @@ internal static partial class BridgeGameApi
             if (IsEnvFreshEpisodeReady(state))
             {
                 var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
-                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+                state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, timeoutMs, cancellationToken);
                 return BuildEnvResetPayload(episode, state, executedActions);
             }
         }
 
-        var finalState = await CaptureEnvSnapshotAsync(cancellationToken);
+        var finalState = await CaptureEnvSnapshotAsync(
+            timeoutMs,
+            cancellationToken,
+            "env.reset.final_snapshot");
         if (CanReuseFreshEpisode(finalState, requestedCharacter))
         {
             var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
-            finalState = await ApplyEnvEpisodeAdjustmentsAsync(episode, finalState, cancellationToken);
+            finalState = await ApplyEnvEpisodeAdjustmentsAsync(episode, finalState, timeoutMs, cancellationToken);
             return BuildEnvResetPayload(episode, finalState, executedActions);
         }
 
@@ -270,7 +301,7 @@ internal static partial class BridgeGameApi
             timeoutMs,
             requireActionableOrDone: true,
             cancellationToken);
-        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, cancellationToken);
+        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, timeoutMs, cancellationToken);
 
         if (before.Done)
         {
@@ -303,7 +334,11 @@ internal static partial class BridgeGameApi
         try
         {
             selectedAction = ResolveRequestedEnvAction(before, request);
-            await ExecuteEnvActionAsync(selectedAction.Action, cancellationToken);
+            await ExecuteEnvActionAsync(
+                selectedAction.Action,
+                timeoutMs,
+                cancellationToken,
+                $"env.step.execute:{selectedAction.Action.ActionId}");
         }
         catch (OperationCanceledException)
         {
@@ -328,7 +363,7 @@ internal static partial class BridgeGameApi
             after,
             timeoutMs,
             cancellationToken);
-        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, cancellationToken);
+        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, timeoutMs, cancellationToken);
 
         // Combat sandbox: end episode when combat finishes, skip reward/map screens
         if (episode.EpisodeMode == "combat_sandbox" && !after.Done && IsCombatSandboxEpisodeDone(after))
@@ -387,7 +422,11 @@ internal static partial class BridgeGameApi
             return snapshot;
         }
 
-        await ExecuteEnvActionAsync(confirmAction, cancellationToken);
+        await ExecuteEnvActionAsync(
+            confirmAction,
+            timeoutMs,
+            cancellationToken,
+            "env.step.deck_upgrade_confirm");
         return await WaitForStableEnvStateAsync(
             snapshot.LogicHash,
             timeoutMs,
@@ -504,15 +543,28 @@ internal static partial class BridgeGameApi
         return IsStartupPhase(snapshot.Phase) && snapshot.LegalActions.Length == 0;
     }
 
-    private static async Task ExecuteEnvActionAsync(BridgeResolvedAction action, CancellationToken cancellationToken)
+    private static async Task ExecuteEnvActionAsync(
+        BridgeResolvedAction action,
+        int timeoutMs,
+        CancellationToken cancellationToken,
+        string? operationName = null)
     {
-        await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            action.Execute();
-            return true;
-        });
+        var normalizedOperation = operationName ?? $"env.execute:{action.ActionId}";
+        await RunOnMainThreadGuardedAsync(
+            () =>
+            {
+                action.Execute();
+                return true;
+            },
+            normalizedOperation,
+            timeoutMs,
+            cancellationToken);
 
-        await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+        await WaitForPumpTicksGuardedAsync(
+            1,
+            $"{normalizedOperation}.post_pump",
+            timeoutMs,
+            cancellationToken);
     }
 
     private static bool ShouldAutoCloseResidualMapOverlay(BridgeWorldContext context)
@@ -526,6 +578,7 @@ internal static partial class BridgeGameApi
 
     private static async Task<BridgeEnvSnapshot> MaybeAutoCloseResidualMapOverlayAsync(
         BridgeEnvSnapshot snapshot,
+        int timeoutMs,
         CancellationToken cancellationToken)
     {
         if (!ShouldAutoCloseResidualMapOverlay(snapshot.Context))
@@ -533,28 +586,32 @@ internal static partial class BridgeGameApi
             return snapshot;
         }
 
-        var closed = await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            var mapScreen = snapshot.Context.MapScreen;
-            if (mapScreen is null ||
-                !mapScreen.IsOpen ||
-                mapScreen.IsTravelEnabled ||
-                mapScreen.IsTraveling)
+        var closed = await RunOnMainThreadGuardedAsync(
+            () =>
             {
-                return false;
-            }
+                var mapScreen = snapshot.Context.MapScreen;
+                if (mapScreen is null ||
+                    !mapScreen.IsOpen ||
+                    mapScreen.IsTravelEnabled ||
+                    mapScreen.IsTraveling)
+                {
+                    return false;
+                }
 
-            mapScreen.Close(false);
-            return true;
-        });
+                mapScreen.Close(false);
+                return true;
+            },
+            "env.close_residual_map_overlay",
+            timeoutMs,
+            cancellationToken);
 
         if (!closed)
         {
             return snapshot;
         }
 
-        await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
-        return await CaptureEnvSnapshotAsync(cancellationToken);
+        await WaitForPumpTicksGuardedAsync(1, "env.close_residual_map_overlay.post_pump", timeoutMs, cancellationToken);
+        return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.close_residual_map_overlay.snapshot");
     }
 
     private static async Task<BridgeEnvSnapshot> WaitForEnvResetPathStateAsync(
@@ -568,14 +625,14 @@ internal static partial class BridgeGameApi
         while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
-            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, cancellationToken);
+            snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.reset_path.snapshot");
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken);
             if (!ShouldWaitForEnvResetPath(snapshot))
             {
                 return snapshot;
             }
 
-            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+            await WaitForPumpTicksGuardedAsync(1, "env.reset_path.wait_pump", timeoutMs, cancellationToken);
         }
 
         return snapshot;
@@ -595,8 +652,8 @@ internal static partial class BridgeGameApi
         while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
-            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, cancellationToken);
+            var snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.snapshot");
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken);
             lastSnapshot = snapshot;
             var ready = snapshot.Done || !requireActionableOrDone || snapshot.Actionable;
             var changedFromBaseline = baselineLogicHash is null ||
@@ -625,10 +682,10 @@ internal static partial class BridgeGameApi
                 stableCount = 0;
             }
 
-            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
+            await WaitForPumpTicksGuardedAsync(1, "env.wait_stable.wait_pump", timeoutMs, cancellationToken);
         }
 
-        return lastSnapshot ?? await CaptureEnvSnapshotAsync(cancellationToken);
+        return lastSnapshot ?? await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.final_snapshot");
     }
 
     private static async Task<BridgeEnvSnapshot> WaitForResetAdvanceAsync(
@@ -720,7 +777,11 @@ internal static partial class BridgeGameApi
                 var gameOverAction = ResolveEnvResetAction(state, null);
                 if (gameOverAction is not null)
                 {
-                    await ExecuteEnvActionAsync(gameOverAction.Value.Action, cancellationToken);
+                    await ExecuteEnvActionAsync(
+                        gameOverAction.Value.Action,
+                        timeoutMs,
+                        cancellationToken,
+                        $"env.navigate_main_menu.execute:{gameOverAction.Value.Action.ActionId}");
                     state = await WaitForStableEnvStateAsync(
                         state.LogicHash, Math.Min(timeoutMs, 10000),
                         requireActionableOrDone: true, cancellationToken);
@@ -741,6 +802,6 @@ internal static partial class BridgeGameApi
             break;
         }
 
-        return await CaptureEnvSnapshotAsync(cancellationToken);
+        return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.navigate_main_menu.final_snapshot");
     }
 }

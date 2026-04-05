@@ -35,6 +35,26 @@ def load_online_checkpoint_metadata(checkpoint_dir: str | Path) -> dict[str, Any
     return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
+def load_online_policy_state_dict(
+    model_or_policy,
+    checkpoint_dir: str | Path,
+    *,
+    device: str = "cpu",
+    strict: bool = True,
+) -> dict[str, Any]:
+    checkpoint_path = Path(checkpoint_dir)
+    metadata = load_online_checkpoint_metadata(checkpoint_path)
+    state_dict = load_file(str(checkpoint_path / "model.safetensors"), device=device)
+
+    policy = getattr(model_or_policy, "policy", model_or_policy)
+    policy.load_state_dict(state_dict, strict=strict)
+
+    if hasattr(model_or_policy, "policy") and hasattr(model_or_policy, "num_timesteps"):
+        model_or_policy.num_timesteps = int(metadata.get("timesteps", 0))
+
+    return metadata
+
+
 def load_online_checkpoint(
     checkpoint_dir: str | Path,
     env,
@@ -62,7 +82,5 @@ def load_online_checkpoint(
         verbose=0,
         device=device,
     )
-    state_dict = load_file(str(checkpoint_path / "model.safetensors"), device=device)
-    model.policy.load_state_dict(state_dict, strict=True)
-    model.num_timesteps = int(metadata.get("timesteps", 0))
+    load_online_policy_state_dict(model, checkpoint_path, device=device, strict=True)
     return model, metadata

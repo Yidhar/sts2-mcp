@@ -249,6 +249,19 @@ internal static class BridgeServer
                 return;
             }
 
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                path.Equals("/static/export", StringComparison.OrdinalIgnoreCase))
+            {
+                BridgeDebugTrace.Write("http POST /static/export authorize");
+                EnsureAuthorized(context.Request);
+                BridgeDebugTrace.Write("http POST /static/export authorized");
+                var request = await ReadJsonAsync<BridgeStaticExportRequest>(context.Request, cancellationToken);
+                var payload = await BridgeGameApi.ExportStaticDataResponseAsync(request, cancellationToken);
+                await WriteJsonAsync(context.Response, HttpStatusCode.OK, payload, cancellationToken);
+                BridgeDebugTrace.Write("http POST /static/export ok");
+                return;
+            }
+
             var notFound = new
             {
                 ok = false,

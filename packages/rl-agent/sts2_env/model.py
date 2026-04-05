@@ -257,6 +257,72 @@ class CandidateScorer(nn.Module):
         return self.scorer(scorer_input).squeeze(-1)
 
 
+class CombatTurnPolicyHead(nn.Module):
+    """Hierarchical combat gate: continue-vs-end_turn, then conditional action choice."""
+
+    def __init__(self, *, state_dim: int, action_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(state_dim + action_dim + 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+        base_logits: torch.Tensor,
+        valid_mask: torch.Tensor,
+        end_turn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        continue_mask = valid_mask & ~end_turn_mask
+        continue_summary = _masked_mean(actions, continue_mask)
+        flags = torch.stack(
+            [
+                continue_mask.any(dim=1).float(),
+                end_turn_mask.any(dim=1).float(),
+            ],
+            dim=-1,
+        )
+        gate_logits = self.gate(torch.cat([state, continue_summary, flags], dim=-1))
+        continue_count = continue_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+        end_count = end_turn_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+        gate_prior = torch.cat([continue_count.log(), end_count.log()], dim=-1)
+        gate_logits = gate_logits + gate_prior
+        continue_gate = gate_logits[:, 0:1]
+        end_gate = gate_logits[:, 1:2]
+
+        final_logits = torch.full_like(base_logits, -50.0)
+
+        if continue_mask.any():
+            normalized_continue = _masked_log_softmax(base_logits, continue_mask)
+            final_logits = torch.where(continue_mask, continue_gate + normalized_continue, final_logits)
+
+        if end_turn_mask.any():
+            end_count = end_turn_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+            end_logits = end_gate - end_count.log()
+            final_logits = torch.where(end_turn_mask, end_logits, final_logits)
+
+        rows_without_end = ~end_turn_mask.any(dim=1)
+        if rows_without_end.any():
+            final_logits[rows_without_end] = torch.where(
+                continue_mask[rows_without_end],
+                continue_gate[rows_without_end] + _masked_log_softmax(base_logits[rows_without_end], continue_mask[rows_without_end]),
+                final_logits[rows_without_end],
+            )
+
+        rows_without_continue = ~continue_mask.any(dim=1)
+        if rows_without_continue.any():
+            final_logits[rows_without_continue] = torch.where(
+                end_turn_mask[rows_without_continue],
+                end_gate[rows_without_continue],
+                final_logits[rows_without_continue],
+            )
+
+        return final_logits
+
+
 class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
     """Policy with hard-routed combat/build/route experts."""
 
@@ -279,6 +345,7 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
         combat_scorer_hidden: int = 128,
         build_scorer_hidden: int = 96,
         route_scorer_hidden: int = 64,
+        combat_continue_hidden: int = 64,
         critic_domain_dim: int = 64,
         **kwargs,
     ):
@@ -306,6 +373,7 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
         self._combat_scorer_hidden = combat_scorer_hidden
         self._build_scorer_hidden = build_scorer_hidden
         self._route_scorer_hidden = route_scorer_hidden
+        self._combat_continue_hidden = combat_continue_hidden
         self._critic_domain_dim = critic_domain_dim
         self._features_dim_value = shared_output_dim + critic_domain_dim
 
@@ -358,6 +426,11 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
             state_dim=self._shared_output_dim + self.combat_state_encoder.output_dim,
             action_dim=self.combat_action_encoder.output_dim,
             hidden_dim=self._combat_scorer_hidden,
+        )
+        self.combat_turn_head = CombatTurnPolicyHead(
+            state_dim=self._shared_output_dim + self.combat_state_encoder.output_dim,
+            action_dim=self.combat_action_encoder.output_dim,
+            hidden_dim=self._combat_continue_hidden,
         )
         self.build_scorer = CandidateScorer(
             state_dim=self._shared_output_dim + self.build_state_encoder.output_dim,
@@ -429,6 +502,12 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
         masked_logits, _ = self._mask_logits(logits, action_masks=action_masks)
         return self.action_dist.proba_distribution(action_logits=masked_logits)
 
+    def score_action_logits(self, obs, action_masks=None):
+        shared_ctx = self._sanitize_tensor(self.shared_encoder(obs))
+        logits, _ = self._route_domains(obs, shared_ctx)
+        masked_logits, _ = self._mask_logits(logits, action_masks=action_masks)
+        return masked_logits
+
     def predict_values(self, obs):
         shared_ctx = self._sanitize_tensor(self.shared_encoder(obs))
         _, critic_state = self._route_domains(obs, shared_ctx)
@@ -456,7 +535,21 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
             combat_state = self._sanitize_tensor(self.combat_state_encoder(sub_obs))
             combat_actions = self._sanitize_tensor(self.combat_action_encoder(sub_obs))
             combat_input = torch.cat([shared_sub, combat_state], dim=-1)
-            logits[combat_mask] = self._sanitize_logits(self.combat_scorer(combat_input, combat_actions))
+            combat_base_logits = self._sanitize_logits(self.combat_scorer(combat_input, combat_actions))
+            combat_valid_mask = torch.as_tensor(
+                sub_obs.get("action_mask", torch.ones_like(combat_base_logits)),
+                dtype=torch.bool,
+                device=shared_ctx.device,
+            ).reshape(combat_base_logits.shape)
+            combat_end_turn_mask = combat_valid_mask & (sub_obs["actions"][..., 9] > 0.5)
+            combat_logits = self.combat_turn_head(
+                combat_input,
+                combat_actions,
+                combat_base_logits,
+                combat_valid_mask,
+                combat_end_turn_mask,
+            )
+            logits[combat_mask] = self._sanitize_logits(combat_logits)
             critic_state[combat_mask] = self._sanitize_tensor(self.combat_critic_proj(combat_state))
 
         if build_mask.any():
@@ -609,6 +702,7 @@ class STS2CandidateScoringPolicy(MaskableActorCriticPolicy):
             combat_scorer_hidden=self._combat_scorer_hidden,
             build_scorer_hidden=self._build_scorer_hidden,
             route_scorer_hidden=self._route_scorer_hidden,
+            combat_continue_hidden=self._combat_continue_hidden,
             critic_domain_dim=self._critic_domain_dim,
         )
         data.pop("features_extractor_class", None)
@@ -687,3 +781,16 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return torch.zeros(batch_size, dim, device=x.device)
     weights = mask.unsqueeze(-1).float()
     return (x * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+
+
+def _masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if not mask.any():
+        return torch.full_like(logits, -50.0)
+
+    masked_logits = logits.masked_fill(~mask, -1e9)
+    log_norm = torch.logsumexp(masked_logits, dim=1, keepdim=True)
+    normalized = masked_logits - log_norm
+    normalized = torch.where(mask, normalized, torch.full_like(normalized, -50.0))
+    no_valid = ~mask.any(dim=1, keepdim=True)
+    normalized = torch.where(no_valid, torch.full_like(normalized, -50.0), normalized)
+    return torch.nan_to_num(normalized, nan=-50.0, posinf=0.0, neginf=-50.0)

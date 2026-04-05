@@ -54,3 +54,5 @@ packages/rl-agent/.tmp_text_cache
 packages/rl-agent/runs_v2
 packages/mcp-server/rl-smoke-logs
 packages/rl-agent/tmp/
+packages/rl-agent/train_logs/
+packages/rl-agent/offline_runs/

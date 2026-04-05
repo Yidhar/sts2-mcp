@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from content_registry import build_live_card_semantic_text
+
 from .text_encoder import TEXT_DIM
 
 # ---------------------------------------------------------------------------
@@ -42,15 +44,17 @@ MAX_DECK = 40
 MAX_ENEMIES = 5
 MAX_RELICS = 20
 MAX_POTIONS = 5
-MAX_ACTIONS = 50
+# Single-source action cap for both env wrappers and the policy head.
+# 80 is large enough for dense combat turns without exploding tensor size.
+MAX_ACTIONS = 80
 MAX_ROUTE_NODES = 24
 
-SCALAR_DIM = 55
-CARD_FEAT_DIM = 10
-DECK_FEAT_DIM = 10
+SCALAR_DIM = 61
+CARD_FEAT_DIM = 20
+DECK_FEAT_DIM = 20
 ENEMY_FEAT_DIM = 10
 POWER_DIM = 20
-ACTION_FEAT_DIM = 20
+ACTION_FEAT_DIM = 32
 
 _ACTION_KINDS = [
     "play_card", "use_potion", "discard_potion", "combat",
@@ -94,6 +98,12 @@ def _float(val, default=0.0):
 
 def _bool(val):
     return 1.0 if val else 0.0
+
+
+def _metric(source, key, default=0.0):
+    if not isinstance(source, dict):
+        return default
+    return _float(source.get(key), default)
 
 
 class DictObservationEncoder:
@@ -169,7 +179,7 @@ class DictObservationEncoder:
         action_mask = np.zeros(MAX_ACTIONS, dtype=np.float32)
 
         if obs:
-            self._enc_scalars(scalars, obs)
+            self._enc_scalars(scalars, obs, legal_actions or [])
             self._enc_decision_domain(decision_domain, obs)
             self._enc_hand(hand, hand_text, hand_mask, obs)
             self._enc_deck(deck, deck_text, deck_mask, obs)
@@ -208,7 +218,7 @@ class DictObservationEncoder:
             "action_mask": action_mask,
         }
 
-    def _enc_scalars(self, vector: np.ndarray, obs: dict) -> None:
+    def _enc_scalars(self, vector: np.ndarray, obs: dict, legal_actions: list) -> None:
         offset = 0
 
         phase = obs.get("phase", "")
@@ -287,6 +297,54 @@ class DictObservationEncoder:
         vector[offset + 5] = min(_float(player.get("gold")) / 999.0, 1.0)
         offset += 6
 
+        total_actions = 0
+        combat_continue_actions = 0
+        play_card_actions = 0
+        zero_cost_play_actions = 0
+        positive_preview_actions = 0
+        has_end_turn = False
+
+        for action in legal_actions:
+            if not isinstance(action, dict):
+                continue
+            total_actions += 1
+            action_id = action.get("action_id") or ""
+            if action_id == "end_turn":
+                has_end_turn = True
+                continue
+
+            kind = action.get("kind") or ""
+            if kind not in ("play_card", "use_potion"):
+                continue
+
+            combat_continue_actions += 1
+            source = action.get("card") if kind == "play_card" else action.get("potion")
+            if kind == "play_card":
+                play_card_actions += 1
+                if isinstance(source, dict) and _float(source.get("cost")) == 0:
+                    zero_cost_play_actions += 1
+
+            if isinstance(source, dict) and (
+                _metric(source, "damage") > 0
+                or _metric(source, "block") > 0
+                or _metric(source, "draw") > 0
+                or _metric(source, "weak") > 0
+                or _metric(source, "vulnerable") > 0
+                or _metric(source, "heal") > 0
+                or _metric(source, "strength") > 0
+                or _metric(source, "dexterity") > 0
+                or _metric(source, "summon") > 0
+            ):
+                positive_preview_actions += 1
+
+        vector[offset] = min(total_actions / 50.0, 1.0)
+        vector[offset + 1] = min(combat_continue_actions / 20.0, 1.0)
+        vector[offset + 2] = min(play_card_actions / 20.0, 1.0)
+        vector[offset + 3] = min(zero_cost_play_actions / 10.0, 1.0)
+        vector[offset + 4] = min(positive_preview_actions / 10.0, 1.0)
+        vector[offset + 5] = _bool(has_end_turn)
+        offset += 6
+
         assert offset == SCALAR_DIM
 
     def _enc_decision_domain(self, vector: np.ndarray, obs: dict) -> None:
@@ -331,9 +389,31 @@ class DictObservationEncoder:
             row[7] = 1.0 if "single" in target or "anyenemy" in target else 0.0
             row[8] = 1.0 if "all" in target else 0.0
             row[9] = 1.0 if "self" in target else 0.0
-            canonical_text = card.get("canonical_text", "")
-            if canonical_text and self.use_text:
-                texts.append(canonical_text)
+            row[10] = 1.0 if card_type == "Status" else 0.0
+            row[11] = 1.0 if card_type == "Curse" else 0.0
+            row[12] = min(_metric(card, "damage") / 50.0, 1.0)
+            row[13] = min(_metric(card, "block") / 50.0, 1.0)
+            row[14] = min(_metric(card, "draw") / 5.0, 1.0)
+            row[15] = min(_metric(card, "weak") / 5.0, 1.0)
+            row[16] = min(_metric(card, "vulnerable") / 5.0, 1.0)
+            row[17] = min(_metric(card, "heal") / 30.0, 1.0)
+            row[18] = min(_metric(card, "hp_loss") / 30.0, 1.0)
+            row[19] = min(_metric(card, "summon") / 5.0, 1.0)
+            build_aux = card.get("build_aux")
+            if isinstance(build_aux, dict):
+                option_total = max(_float(build_aux.get("option_total")), 1.0)
+                deck_after_size = max(_float(build_aux.get("deck_after_size")), 1.0)
+                row[12] = min(_float(build_aux.get("remove_rank")) / option_total, 1.0)
+                row[13] = min(_float(build_aux.get("keep_rank")) / option_total, 1.0)
+                row[14] = min(_float(build_aux.get("count_before")) / 5.0, 1.0)
+                row[15] = min(_float(build_aux.get("count_after")) / 5.0, 1.0)
+                row[16] = min(_float(build_aux.get("junk_after")) / deck_after_size, 1.0)
+                row[17] = min(_float(build_aux.get("starter_attack_after")) / 10.0, 1.0)
+                row[18] = min(_float(build_aux.get("starter_defend_after")) / 10.0, 1.0)
+                row[19] = min(_float(build_aux.get("starter_gap_after")) / 10.0, 1.0)
+            text_value = self._build_live_card_text(card)
+            if text_value and self.use_text:
+                texts.append(text_value)
                 text_slots.append(index)
 
         if texts:
@@ -509,15 +589,78 @@ class DictObservationEncoder:
             action_mask[index] = 1.0
             self._enc_action_numeric(actions[index], action)
             self._enc_route_action(route_summary[index], route_nodes[index], route_node_mask[index], action)
-            canonical_text = action.get("canonical_text", "")
-            if canonical_text and self.use_text:
-                texts.append(canonical_text)
+            text_value = self._build_action_text(action)
+            if text_value and self.use_text:
+                texts.append(text_value)
                 text_slots.append(index)
 
         if texts:
             embeddings = self._get_encoder().encode_batch(texts)
             for embedding_index, slot in enumerate(text_slots):
                 action_text[slot] = embeddings[embedding_index]
+
+    def _build_live_card_text(self, card: dict | None) -> str:
+        if not isinstance(card, dict):
+            return ""
+        semantic_text = build_live_card_semantic_text(card)
+        if semantic_text:
+            return semantic_text
+        return str(card.get("canonical_text") or card.get("title") or "").strip()
+
+    def _build_action_text(self, action: dict | None) -> str:
+        if not isinstance(action, dict):
+            return ""
+
+        kind = str(action.get("kind") or "").strip()
+        canonical_text = str(action.get("canonical_text") or "").strip()
+
+        card = action.get("card")
+        if isinstance(card, dict):
+            card_text = self._build_live_card_text(card)
+            if kind == "play_card":
+                target = action.get("target") if isinstance(action.get("target"), dict) else {}
+                target_name = str((target or {}).get("name") or "").strip()
+                parts = ["play", card_text]
+                if target_name:
+                    parts.append(f"tgt {target_name}")
+                return " | ".join(part for part in parts if part)
+            if kind == "card_reward":
+                selection = str(action.get("selection") or "").strip().lower()
+                if "skip" in selection:
+                    return canonical_text or "skip card reward"
+                return " | ".join(part for part in ("pick", card_text) if part)
+            if kind == "deck_upgrade":
+                selection = str(action.get("selection") or "").strip().lower()
+                if any(token in selection for token in ("confirm", "cancel", "close")):
+                    return canonical_text
+                preview = action.get("upgrade_preview")
+                preview_text = self._build_live_card_text(preview) if isinstance(preview, dict) else ""
+                parts = ["upgrade", card_text]
+                if preview_text:
+                    parts.append(f"to {preview_text}")
+                return " | ".join(part for part in parts if part)
+            if kind == "card_selection":
+                selection = str(action.get("selection") or "").strip().lower()
+                if any(token in selection for token in ("confirm", "cancel", "close", "skip")):
+                    return canonical_text
+                semantics = str(action.get("selection_semantics") or "").strip()
+                prefix = f"select {semantics}".strip() if semantics else "select"
+                return " | ".join(part for part in (prefix, card_text) if part)
+
+        if kind == "shop":
+            item = action.get("item")
+            if isinstance(item, dict):
+                shop_action = str(action.get("shop_action") or "").strip().lower()
+                item_cost = item.get("cost")
+                cost_text = f"cost {_float(item_cost):.0f}" if item_cost is not None else ""
+                item_card = item.get("card")
+                if isinstance(item_card, dict):
+                    item_text = self._build_live_card_text(item_card)
+                    if item_text:
+                        prefix = "leave shop" if any(token in shop_action for token in ("leave", "back")) else "buy"
+                        return " | ".join(part for part in (prefix, item_text, cost_text) if part)
+
+        return canonical_text
 
     def _enc_action_numeric(self, row: np.ndarray, action: dict) -> None:
         kind = action.get("kind", "")
@@ -532,6 +675,8 @@ class DictObservationEncoder:
             row[4] = 1.0 if card_type == "Attack" else 0.0
             row[5] = 1.0 if card_type == "Skill" else 0.0
             row[6] = 1.0 if card_type == "Power" else 0.0
+            row[20] = 1.0 if card_type == "Status" else 0.0
+            row[21] = 1.0 if card_type == "Curse" else 0.0
 
         target = action.get("target")
         row[7] = 1.0 if isinstance(target, dict) and target.get("name") else 0.0
@@ -566,6 +711,66 @@ class DictObservationEncoder:
         if option_index is None:
             option_index = action.get("slot_index")
         row[19] = min(_float(option_index) / 20.0, 1.0) if option_index is not None else 0.0
+
+        source = None
+        if isinstance(card, dict):
+            source = card
+        else:
+            potion = action.get("potion")
+            if isinstance(potion, dict):
+                source = potion
+
+        if isinstance(source, dict):
+            row[22] = min(_metric(source, "damage") / 50.0, 1.0)
+            row[23] = min(_metric(source, "block") / 50.0, 1.0)
+            row[24] = min(_metric(source, "draw") / 5.0, 1.0)
+            row[25] = min(_metric(source, "weak") / 5.0, 1.0)
+            row[26] = min(_metric(source, "vulnerable") / 5.0, 1.0)
+            row[27] = min(_metric(source, "heal") / 30.0, 1.0)
+            row[28] = min(_metric(source, "hp_loss") / 30.0, 1.0)
+            row[29] = min(_metric(source, "summon") / 5.0, 1.0)
+            row[30] = 1.0 if (
+                _metric(source, "damage") > 0
+                or _metric(source, "block") > 0
+                or _metric(source, "draw") > 0
+                or _metric(source, "weak") > 0
+                or _metric(source, "vulnerable") > 0
+                or _metric(source, "heal") > 0
+                or _metric(source, "strength") > 0
+                or _metric(source, "dexterity") > 0
+                or _metric(source, "summon") > 0
+            ) else 0.0
+            row[31] = 1.0 if isinstance(card, dict) and _float(card.get("cost")) == 0 else 0.0
+
+        build_aux = action.get("build_aux")
+        if isinstance(build_aux, dict):
+            option_total = max(_float(build_aux.get("option_total")), 1.0)
+            deck_after_size = max(_float(build_aux.get("deck_after_size")), 1.0)
+            row[7] = _float(build_aux.get("is_starter_attack"))
+            row[8] = _float(build_aux.get("is_starter_defend"))
+            row[9] = _float(build_aux.get("is_curse_or_status"))
+            row[10] = min(_float(build_aux.get("shop_remove_rate")), 1.0)
+            row[11] = _float(build_aux.get("gap_improves"))
+            row[12] = min(_float(build_aux.get("remove_any_rate")), 1.0)
+            row[13] = min(_float(build_aux.get("reward_rate")), 1.0)
+            row[14] = min(_float(build_aux.get("smith_rate")), 1.0)
+            row[15] = min(_float(build_aux.get("transform_rate")), 1.0)
+            row[16] = min(_float(build_aux.get("primary_rate")), 1.0)
+            row[17] = _float(build_aux.get("balanced_after"))
+            row[18] = 1.0 if _float(build_aux.get("remove_rank")) <= 1 else 0.0
+            row[19] = min(_float(build_aux.get("rate_rank")) / option_total, 1.0)
+            row[20] = _float(build_aux.get("is_largest_stack"))
+            row[21] = min(_float(build_aux.get("count_share")), 1.0)
+            row[22] = min(_float(build_aux.get("remove_rank")) / option_total, 1.0)
+            row[23] = min(_float(build_aux.get("keep_rank")) / option_total, 1.0)
+            row[24] = min(max(_float(build_aux.get("primary_score")), 0.0) / 2.0, 1.0)
+            row[25] = min(_float(build_aux.get("keep_score")), 1.0)
+            row[26] = min(_float(build_aux.get("count_before")) / 5.0, 1.0)
+            row[27] = min(_float(build_aux.get("count_after")) / 5.0, 1.0)
+            row[28] = min(_float(build_aux.get("junk_after")) / deck_after_size, 1.0)
+            row[29] = min(_float(build_aux.get("starter_attack_after")) / 10.0, 1.0)
+            row[30] = min(_float(build_aux.get("starter_defend_after")) / 10.0, 1.0)
+            row[31] = min((_float(build_aux.get("starter_gap_delta")) + 5.0) / 10.0, 1.0)
 
     def _enc_route_action(
         self,

@@ -22,6 +22,19 @@ def mask_fn(env):
     return env.unwrapped.action_masks()
 
 
+def _has_semantic_markers(text: str) -> bool:
+    value = str(text or "").strip()
+    return "sig " in value or "tag " in value
+
+
+def _append_example(bucket: list[str], text: str, *, limit: int = 6) -> None:
+    value = str(text or "").strip()
+    if not value or value in bucket:
+        return
+    if len(bucket) < limit:
+        bucket.append(value)
+
+
 def smoke_test(session_file=None, max_steps=200, use_text=True):
     """Run random legal actions and verify text path coverage."""
     obs_encoder = DictObservationEncoder(use_text=use_text)
@@ -29,6 +42,7 @@ def smoke_test(session_file=None, max_steps=200, use_text=True):
         session_file=session_file,
         obs_encoder=obs_encoder,
         render_mode="human",
+        include_debug_info=True,
     )
 
     print(f"[smoke] use_text={use_text}")
@@ -36,6 +50,22 @@ def smoke_test(session_file=None, max_steps=200, use_text=True):
 
     phase_counts = {}
     text_hits = {"action_text": 0, "decision_text": 0, "canonical_text": 0}
+    semantic_counts = {
+        "hand_card_total": 0,
+        "hand_card_semantic": 0,
+        "deck_card_total": 0,
+        "deck_card_semantic": 0,
+        "card_action_total": 0,
+        "card_action_semantic": 0,
+        "build_card_action_total": 0,
+        "build_card_action_semantic": 0,
+    }
+    semantic_examples = {
+        "hand_cards": [],
+        "deck_cards": [],
+        "card_actions": [],
+        "build_card_actions": [],
+    }
     total_actions = 0
     cache_before = 0
 
@@ -59,9 +89,58 @@ def smoke_test(session_file=None, max_steps=200, use_text=True):
 
         raw_obs = info.get("raw_obs", {})
         if isinstance(raw_obs, dict):
+            combat = raw_obs.get("combat", {})
+            if isinstance(combat, dict):
+                for card in combat.get("hand", []) or []:
+                    if not isinstance(card, dict):
+                        continue
+                    semantic_counts["hand_card_total"] += 1
+                    live_text = obs_encoder._build_live_card_text(card)
+                    if _has_semantic_markers(live_text):
+                        semantic_counts["hand_card_semantic"] += 1
+                        _append_example(semantic_examples["hand_cards"], live_text)
+
+            player = raw_obs.get("player", {})
+            if isinstance(player, dict):
+                for card in player.get("deck_cards", []) or []:
+                    if not isinstance(card, dict):
+                        continue
+                    semantic_counts["deck_card_total"] += 1
+                    live_text = obs_encoder._build_live_card_text(card)
+                    if _has_semantic_markers(live_text):
+                        semantic_counts["deck_card_semantic"] += 1
+                        _append_example(semantic_examples["deck_cards"], live_text)
+
+        if isinstance(raw_obs, dict):
             decision = raw_obs.get("decision", {})
             if isinstance(decision, dict) and decision.get("decision_text"):
                 text_hits["decision_text"] += 1
+
+        for a in legal:
+            if not isinstance(a, dict):
+                continue
+            action_text = obs_encoder._build_action_text(a)
+            if action_text:
+                text_hits["action_text"] += 1
+
+            kind = str(a.get("kind") or "").strip()
+            has_card_payload = isinstance(a.get("card"), dict)
+            is_shop_card = (
+                kind == "shop"
+                and isinstance(a.get("item"), dict)
+                and isinstance((a.get("item") or {}).get("card"), dict)
+            )
+            if has_card_payload or is_shop_card:
+                semantic_counts["card_action_total"] += 1
+                if _has_semantic_markers(action_text):
+                    semantic_counts["card_action_semantic"] += 1
+                    _append_example(semantic_examples["card_actions"], action_text)
+
+            if kind in ("card_reward", "deck_upgrade", "card_selection") or is_shop_card:
+                semantic_counts["build_card_action_total"] += 1
+                if _has_semantic_markers(action_text):
+                    semantic_counts["build_card_action_semantic"] += 1
+                    _append_example(semantic_examples["build_card_actions"], action_text)
 
         # Random action
         action = np.random.randint(len(legal))
@@ -77,6 +156,24 @@ def smoke_test(session_file=None, max_steps=200, use_text=True):
     print(f"\n[smoke] Results ({total_actions} actions):")
     print(f"  Phases: {phase_counts}")
     print(f"  Text hits: {text_hits}")
+    print("  Semantic coverage:")
+    for total_key, hit_key in (
+        ("hand_card_total", "hand_card_semantic"),
+        ("deck_card_total", "deck_card_semantic"),
+        ("card_action_total", "card_action_semantic"),
+        ("build_card_action_total", "build_card_action_semantic"),
+    ):
+        total = semantic_counts[total_key]
+        hits = semantic_counts[hit_key]
+        ratio = (hits / total) if total else 0.0
+        print(f"    {hit_key}: {hits}/{total} ({ratio:.1%})")
+    if any(semantic_examples.values()):
+        print("  Semantic examples:")
+        for bucket_name, samples in semantic_examples.items():
+            if samples:
+                print(f"    {bucket_name}:")
+                for sample in samples:
+                    print(f"      - {sample}")
 
     if use_text:
         enc = get_text_encoder()
@@ -232,6 +329,7 @@ def evaluate(model_path, n_episodes=5, session_file=None, use_text=None, determi
         session_file=session_file,
         obs_encoder=obs_encoder,
         render_mode="human",
+        include_debug_info=True,
     )
     env = ActionMasker(env, mask_fn)
 
@@ -295,6 +393,7 @@ def combat_smoke_test(
         encounter_id=encounter_id,
         obs_encoder=obs_encoder,
         render_mode="human",
+        include_debug_info=True,
     )
 
     print(f"[combat-smoke] encounter={encounter_id} episodes={n_episodes} use_text={use_text}")

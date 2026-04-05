@@ -100,6 +100,52 @@ MCP 服务会自动寻找桥接会话文件。你可以通过环境变量手动�
 
 ---
 
+## 🤖 统一 RL 流水线
+
+RL 分支现在使用同一条 checkpoint 链路贯穿三个阶段：
+
+1. 战斗沙盒 PPO
+2. 离线构筑 / 路线预训练
+3. 全流程 PPO
+
+正式入口是 [packages/rl-agent/train_pipeline.py](./packages/rl-agent/train_pipeline.py)。它会把每一阶段产出的 checkpoint 自动传给下一阶段。
+
+示例：
+
+```powershell
+python .\packages\rl-agent\train_pipeline.py `
+  --dataset-root .\datasets\parquet `
+  --character ironclad `
+  --session-file "$env:APPDATA\SlayTheSpire2\bridge\session.json" `
+  --stage2-partition-kind build_family `
+  --stage2-partition-value v0.98_to_v0.99.1
+```
+
+如果不传 `--stage1-encounter-pool`，第一阶段现在会默认使用一组更贴近初始牌组难度的一幕前几层弱怪池。这个集合是根据已导出的 run 历史统计出来的：
+
+- `ENCOUNTER.SLIMES_WEAK`
+- `ENCOUNTER.SHRINKER_BEETLE_WEAK`
+- `ENCOUNTER.FUZZY_WURM_CRAWLER_WEAK`
+- `ENCOUNTER.NIBBITS_WEAK`
+
+固定评估的 holdout 池也默认切到未参与训练的一幕前几层弱怪：
+
+- `ENCOUNTER.CORPSE_SLUGS_WEAK`
+- `ENCOUNTER.SLUDGE_SPINNER_WEAK`
+- `ENCOUNTER.SEAPUNK_WEAK`
+- `ENCOUNTER.TOADPOLES_WEAK`
+
+如果你已经有战斗沙盒 checkpoint，想直接跳过第一阶段：
+
+```powershell
+python .\packages\rl-agent\train_pipeline.py `
+  --dataset-root .\datasets\parquet `
+  --start-checkpoint .\pipeline_runs\some_run\stage1_sandbox\checkpoints\final `
+  --stop-after offline
+```
+
+---
+
 ## ⚖️ 免责声明与许可证
 
 **免责声明**: 这是一个非官方的社区项目。它与 Mega Crit 或《杀戮尖塔 2》的开发者没有隶属关系、背书或关联。使用风险自负。

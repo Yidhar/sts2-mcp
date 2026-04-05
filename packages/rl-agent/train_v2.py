@@ -20,11 +20,24 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule
 
-from sts2_env.checkpoint import save_online_checkpoint
+from sts2_env.checkpoint import load_online_checkpoint_metadata, load_online_policy_state_dict, save_online_checkpoint
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from sts2_env.model import STS2CandidateScoringPolicy
 from sts2_env.observation_v2 import DictObservationEncoder
+
+DEFAULT_COMBAT_SANDBOX_TRAIN_POOL = ",".join([
+    "ENCOUNTER.SLIMES_WEAK",
+    "ENCOUNTER.SHRINKER_BEETLE_WEAK",
+    "ENCOUNTER.FUZZY_WURM_CRAWLER_WEAK",
+    "ENCOUNTER.NIBBITS_WEAK",
+])
+DEFAULT_COMBAT_SANDBOX_HOLDOUT_POOL = ",".join([
+    "ENCOUNTER.CORPSE_SLUGS_WEAK",
+    "ENCOUNTER.SLUDGE_SPINNER_WEAK",
+    "ENCOUNTER.SEAPUNK_WEAK",
+    "ENCOUNTER.TOADPOLES_WEAK",
+])
 
 
 def mask_fn(env):
@@ -87,13 +100,38 @@ CORE_REWARD_BREAKDOWN_KEYS = (
     "hp_loss_normalized",
     "hp_gain_normalized",
     "room_complete",
+    "combat_room_complete",
     "room_hp_delta_normalized",
+    "combat_room_complete_bonus",
+    "combat_room_quality_bonus",
     "floor_delta",
+    "floor_progress_bonus",
+    "act_clear",
+    "act_clear_bonus",
+    "elite_clear_bonus",
+    "boss_clear_bonus",
+    "relic_gain_count",
+    "relic_gain_bonus",
+    "max_hp_gain_normalized",
+    "max_hp_gain_bonus",
     "death",
     "victory",
+    "run_victory_bonus",
     "action_error_penalty",
     "truncated_penalty",
     "total",
+)
+
+CORE_ACTION_DIAGNOSTIC_KEYS = (
+    "end_turn_selected",
+    "end_turn_wasted",
+    "non_end_action_count",
+    "play_card_action_count",
+    "zero_cost_play_card_count",
+    "positive_preview_action_count",
+    "self_hp_loss_action_count",
+    "invalid_action_selected",
+    "legal_action_overflow",
 )
 
 
@@ -110,12 +148,21 @@ class RewardBreakdownTensorboardCallback(BaseCallback):
                 continue
             reward_breakdown = bridge_info.get("reward_breakdown", {})
             if not isinstance(reward_breakdown, dict):
-                continue
+                reward_breakdown = {}
 
             for key in CORE_REWARD_BREAKDOWN_KEYS:
                 value = reward_breakdown.get(key)
                 if isinstance(value, (int, float)):
                     self.logger.record_mean(f"reward_breakdown/{key}", float(value))
+
+            action_diagnostics = bridge_info.get("action_diagnostics", {})
+            if not isinstance(action_diagnostics, dict):
+                action_diagnostics = {}
+
+            for key in CORE_ACTION_DIAGNOSTIC_KEYS:
+                value = action_diagnostics.get(key)
+                if isinstance(value, (int, float, bool)):
+                    self.logger.record_mean(f"action_diagnostics/{key}", float(value))
         return True
 
 
@@ -165,6 +212,7 @@ class CombatFixedEvalCallback(BaseCallback):
             reset_timeout_ms=self.reset_timeout_ms,
             step_timeout_ms=self.step_timeout_ms,
             obs_encoder=obs_encoder,
+            include_debug_info=True,
         )
 
     def _on_step(self) -> bool:
@@ -381,30 +429,42 @@ class SafeTensorCheckpointCallback(BaseCallback):
         return True
 
 
-def build_online_checkpoint_metadata(args, *, use_text: bool, timesteps: int) -> dict[str, object]:
+def build_online_checkpoint_metadata(
+    args,
+    *,
+    use_text: bool,
+    timesteps: int,
+    policy_kwargs: dict[str, object] | None = None,
+    text_model_name: str | None = None,
+) -> dict[str, object]:
+    resolved_policy_kwargs = policy_kwargs or build_policy_kwargs_from_args(args)
     return {
         "format": "sts2-online-policy-v1",
         "policy_class": "sts2_env.model.STS2CandidateScoringPolicy",
-        "policy_kwargs": dict(
-            combat_embed_dim=args.combat_embed_dim,
-            build_embed_dim=args.build_embed_dim,
-            route_embed_dim=args.route_embed_dim,
-            n_heads=args.n_heads,
-            text_proj_dim=args.text_proj_dim,
-            context_text_dim=args.context_text_dim,
-            shared_hidden_dim=args.shared_hidden_dim,
-            shared_output_dim=args.shared_output_dim,
-            combat_scorer_hidden=args.combat_scorer_hidden,
-            build_scorer_hidden=args.build_scorer_hidden,
-            route_scorer_hidden=args.route_scorer_hidden,
-            critic_domain_dim=args.critic_domain_dim,
-        ),
+        "policy_kwargs": resolved_policy_kwargs,
         "use_text": use_text,
-        "text_model": args.text_model if use_text else None,
+        "text_model": (text_model_name or args.text_model) if use_text else None,
         "timesteps": int(timesteps),
         "mode": "combat_sandbox" if args.combat_sandbox else "full_run",
         "character": args.character,
     }
+
+
+def build_policy_kwargs_from_args(args) -> dict[str, object]:
+    return dict(
+        combat_embed_dim=args.combat_embed_dim,
+        build_embed_dim=args.build_embed_dim,
+        route_embed_dim=args.route_embed_dim,
+        n_heads=args.n_heads,
+        text_proj_dim=args.text_proj_dim,
+        context_text_dim=args.context_text_dim,
+        shared_hidden_dim=args.shared_hidden_dim,
+        shared_output_dim=args.shared_output_dim,
+        combat_scorer_hidden=args.combat_scorer_hidden,
+        build_scorer_hidden=args.build_scorer_hidden,
+        route_scorer_hidden=args.route_scorer_hidden,
+        critic_domain_dim=args.critic_domain_dim,
+    )
 
 
 def main():
@@ -438,13 +498,22 @@ def main():
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint-freq", type=int, default=1000)
+    parser.add_argument("--init-checkpoint", type=str, default=None,
+                        help="Initialize weights from an existing online checkpoint directory")
     parser.add_argument("--verbose", type=int, default=1)
     parser.add_argument("--combat-sandbox", action="store_true", default=False,
                         help="Train in combat sandbox mode via /env/combat_reset")
     parser.add_argument("--encounter-id", type=str, default=None,
                         help="Encounter ID for combat sandbox training")
-    parser.add_argument("--encounter-pool", type=str, default=None,
-                        help="Comma-separated encounter IDs sampled uniformly on each combat reset")
+    parser.add_argument(
+        "--encounter-pool",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated encounter IDs sampled uniformly on each combat reset. "
+            "If omitted in --combat-sandbox mode, defaults to starter-deck-friendly early Act 1 weak encounters."
+        ),
+    )
     parser.add_argument("--reset-timeout-ms", type=int, default=None,
                         help="Override env reset timeout in milliseconds")
     parser.add_argument("--step-timeout-ms", type=int, default=None,
@@ -472,8 +541,11 @@ def main():
     parser.add_argument(
         "--eval-freq",
         type=int,
-        default=512,
-        help="Run fixed combat eval every N env steps at rollout boundaries. Only used in --combat-sandbox mode.",
+        default=0,
+        help=(
+            "Run fixed combat eval every N env steps at rollout boundaries. "
+            "Default is 0 because single-instance live combat sandbox training cannot safely reset into a separate eval episode."
+        ),
     )
     parser.add_argument(
         "--eval-episodes-per-encounter",
@@ -485,7 +557,10 @@ def main():
         "--eval-holdout-pool",
         type=str,
         default=None,
-        help="Comma-separated holdout encounter IDs for fixed eval.",
+        help=(
+            "Comma-separated holdout encounter IDs for fixed eval. "
+            "If omitted in --combat-sandbox mode, defaults to unseen early Act 1 weak encounters."
+        ),
     )
     parser.add_argument(
         "--eval-stochastic",
@@ -504,7 +579,14 @@ def main():
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-    use_text = not args.no_text
+    init_metadata = load_online_checkpoint_metadata(args.init_checkpoint) if args.init_checkpoint else None
+    use_text = False if args.no_text else bool((init_metadata or {}).get("use_text", True))
+    text_model_name = (init_metadata or {}).get("text_model") or args.text_model
+    if args.combat_sandbox and not args.encounter_id and not args.encounter_pool:
+        args.encounter_pool = DEFAULT_COMBAT_SANDBOX_TRAIN_POOL
+    if args.combat_sandbox and not args.eval_holdout_pool:
+        args.eval_holdout_pool = DEFAULT_COMBAT_SANDBOX_HOLDOUT_POOL
+
     encounter_pool = parse_encounter_pool(args.encounter_pool)
     eval_holdout_pool = parse_encounter_pool(args.eval_holdout_pool)
     lr_schedule = build_lr_schedule(
@@ -518,7 +600,7 @@ def main():
     if use_text:
         from sts2_env.text_encoder import get_text_encoder
         get_text_encoder(
-            model_name=args.text_model,
+            model_name=text_model_name,
             cache_dir=args.text_cache_dir,
         ).ensure_ready()
 
@@ -549,20 +631,7 @@ def main():
 
     # Model
     mode = "combat_sandbox" if args.combat_sandbox else "full_run"
-    policy_kwargs = dict(
-        combat_embed_dim=args.combat_embed_dim,
-        build_embed_dim=args.build_embed_dim,
-        route_embed_dim=args.route_embed_dim,
-        n_heads=args.n_heads,
-        text_proj_dim=args.text_proj_dim,
-        context_text_dim=args.context_text_dim,
-        shared_hidden_dim=args.shared_hidden_dim,
-        shared_output_dim=args.shared_output_dim,
-        combat_scorer_hidden=args.combat_scorer_hidden,
-        build_scorer_hidden=args.build_scorer_hidden,
-        route_scorer_hidden=args.route_scorer_hidden,
-        critic_domain_dim=args.critic_domain_dim,
-    )
+    policy_kwargs = (init_metadata or {}).get("policy_kwargs") or build_policy_kwargs_from_args(args)
     print(
         f"[train] Creating new model mode={mode} "
         f"(text={'on' if use_text else 'off'})"
@@ -585,6 +654,12 @@ def main():
         tensorboard_log=args.log_dir,
         device=args.device,
     )
+    if args.init_checkpoint:
+        loaded_metadata = load_online_policy_state_dict(model, args.init_checkpoint, device=args.device, strict=True)
+        print(
+            f"[train] Initialized weights from {args.init_checkpoint} "
+            f"(source_timesteps={loaded_metadata.get('timesteps', 0)})"
+        )
     print(
         f"[train] Using LR schedule schedule={args.lr_schedule} "
         f"base_lr={args.learning_rate:.8f} min_lr={args.min_learning_rate:.8f} "
@@ -615,6 +690,8 @@ def main():
                 args,
                 use_text=use_text,
                 timesteps=timesteps,
+                policy_kwargs=policy_kwargs,
+                text_model_name=text_model_name,
             ),
             verbose=args.verbose,
         ),
@@ -642,7 +719,7 @@ def main():
     model.learn(
         total_timesteps=args.total_timesteps,
         callback=callbacks,
-        reset_num_timesteps=True,
+        reset_num_timesteps=not bool(args.init_checkpoint),
     )
     elapsed = time.time() - start
     print(f"[train] Done in {elapsed:.0f}s")
@@ -655,6 +732,8 @@ def main():
             args,
             use_text=use_text,
             timesteps=int(getattr(model, "num_timesteps", args.total_timesteps)),
+            policy_kwargs=policy_kwargs,
+            text_model_name=text_model_name,
         ),
     )
     print(f"[train] Saved {final}")

@@ -11,9 +11,16 @@ namespace Sts2McpBridge.Scripts;
 
 internal static partial class BridgeGameApi
 {
-    private static async Task<BridgeEnvSnapshot> CaptureEnvSnapshotAsync(CancellationToken cancellationToken)
+    private static async Task<BridgeEnvSnapshot> CaptureEnvSnapshotAsync(
+        int timeoutMs,
+        CancellationToken cancellationToken,
+        string operationName = "env.capture_snapshot")
     {
-        return await BridgeCoordinator.RunOnMainThreadAsync(CaptureEnvSnapshot);
+        return await RunOnMainThreadGuardedAsync(
+            CaptureEnvSnapshot,
+            operationName,
+            timeoutMs,
+            cancellationToken);
     }
 
     private static BridgeEnvSnapshot CaptureEnvSnapshot()

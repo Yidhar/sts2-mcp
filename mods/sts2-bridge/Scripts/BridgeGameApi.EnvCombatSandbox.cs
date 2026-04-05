@@ -87,10 +87,11 @@ internal static partial class BridgeGameApi
 
         // Step 1: Resolve encounter and enter combat on the main thread.
         // This now runs only after a real single-player run scene exists.
-        var setupResult = await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            return SetUpCombatSandbox(request, encounterId, diagnostics);
-        });
+        var setupResult = await RunOnMainThreadGuardedAsync(
+            () => SetUpCombatSandbox(request, encounterId, diagnostics),
+            "combat_sandbox.setup",
+            timeoutMs,
+            cancellationToken);
 
         if (!setupResult.Success)
         {
@@ -117,7 +118,7 @@ internal static partial class BridgeGameApi
         }
 
         // Step 2: Let Godot settle the scene
-        await BridgeCoordinator.WaitForPumpTicksAsync(8, cancellationToken);
+        await WaitForPumpTicksGuardedAsync(8, "combat_sandbox.settle_scene", timeoutMs, cancellationToken);
 
         // Step 3: Wait for a stable state that is actually different from the pre-reset baseline.
         var state = await WaitForStableEnvStateAsync(
@@ -139,7 +140,7 @@ internal static partial class BridgeGameApi
                 cancellationToken);
             if (deferredEnterStarted)
             {
-                await BridgeCoordinator.WaitForPumpTicksAsync(5, cancellationToken);
+                await WaitForPumpTicksGuardedAsync(5, "combat_sandbox.deferred_enter_wait", timeoutMs, cancellationToken);
                 state = await WaitForStableEnvStateAsync(
                     state.LogicHash,
                     Math.Min(timeoutMs, 5000),
@@ -174,7 +175,7 @@ internal static partial class BridgeGameApi
             _activeEnvEpisode = episode;
         }
 
-        state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, cancellationToken);
+        state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, timeoutMs, cancellationToken);
 
         var executedActions = new List<object>
         {
@@ -190,7 +191,7 @@ internal static partial class BridgeGameApi
         List<string> diagnostics,
         CancellationToken cancellationToken)
     {
-        var priorState = await CaptureEnvSnapshotAsync(cancellationToken);
+        var priorState = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.prior_snapshot");
         diagnostics.Add(
             $"Combat sandbox bootstrap starting from phase={priorState.Phase}, screen={priorState.Screen}, run_active={priorState.RunActive}, combat_in_progress={priorState.CombatInProgress}, current_room={priorState.Context.RunState?.CurrentRoom?.GetType().Name ?? "null"}");
 
@@ -216,13 +217,17 @@ internal static partial class BridgeGameApi
         {
             diagnostics.Add(
                 $"Reusing existing run scene for combat sandbox reset (phase={priorState.Phase}, screen={priorState.Screen})");
-            await BridgeCoordinator.RunOnMainThreadAsync(() =>
-            {
-                ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
-                return true;
-            });
-            await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
-            return await CaptureEnvSnapshotAsync(cancellationToken);
+            await RunOnMainThreadGuardedAsync(
+                () =>
+                {
+                    ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
+                    return true;
+                },
+                "combat_sandbox.reuse_overrides",
+                timeoutMs,
+                cancellationToken);
+            await WaitForPumpTicksGuardedAsync(1, "combat_sandbox.reuse_overrides.post_pump", timeoutMs, cancellationToken);
+            return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.reuse_snapshot");
         }
 
         try
@@ -312,6 +317,7 @@ internal static partial class BridgeGameApi
             new[] { player },
             ActModel.GetDefaultList().Select(act => act.ToMutable()).ToList(),
             Array.Empty<ModifierModel>(),
+            GameMode.Standard,
             0,
             seed);
 
@@ -551,17 +557,21 @@ internal static partial class BridgeGameApi
         int timeoutMs,
         CancellationToken cancellationToken)
     {
-        var enterTask = await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            var encounter = ResolveEncounterModel(encounterId, diagnostics);
-            var runManager = RunManager.Instance;
-            if (encounter is null || runManager is null)
-                return null;
+        var enterTask = await RunOnMainThreadGuardedAsync(
+            () =>
+            {
+                var encounter = ResolveEncounterModel(encounterId, diagnostics);
+                var runManager = RunManager.Instance;
+                if (encounter is null || runManager is null)
+                    return null;
 
-            return TryInvokeEnterRoomDebug(runManager, encounter, diagnostics, out var pendingTask)
-                ? pendingTask ?? Task.CompletedTask
-                : null;
-        });
+                return TryInvokeEnterRoomDebug(runManager, encounter, diagnostics, out var pendingTask)
+                    ? pendingTask ?? Task.CompletedTask
+                    : null;
+            },
+            "combat_sandbox.deferred_enter",
+            timeoutMs,
+            cancellationToken);
 
         if (enterTask is null)
         {
@@ -605,10 +615,11 @@ internal static partial class BridgeGameApi
     {
         await WaitForEnvDispatcherReadyAsync(5000, cancellationToken);
 
-        var encounters = await BridgeCoordinator.RunOnMainThreadAsync(() =>
-        {
-            return ListAvailableCombatEncounters();
-        });
+        var encounters = await RunOnMainThreadGuardedAsync(
+            ListAvailableCombatEncounters,
+            "combat_sandbox.list_catalog",
+            5000,
+            cancellationToken);
 
         return new
         {

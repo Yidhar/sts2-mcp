@@ -25,7 +25,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from run_history_parser import build_offline_training_samples, extract_run_history_bytes
+from run_history_parser import (
+    build_offline_build_v2_samples,
+    build_offline_training_samples,
+    extract_run_history_bytes,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -38,6 +42,19 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def _sanitize_path_component(value: str) -> str:
     sanitized = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(value))
     return sanitized or "unknown"
+
+
+def _merge_numeric_audit(
+    target: Counter[str],
+    audit: dict[str, Any] | None,
+) -> None:
+    if not audit:
+        return
+    for key, value in audit.items():
+        if isinstance(value, bool):
+            target[key] += int(value)
+        elif isinstance(value, int):
+            target[key] += value
 
 
 def _bucket_rows_by_build_id(
@@ -72,6 +89,8 @@ def _build_manifest(
     card_choice_samples: list[dict[str, Any]],
     build_samples: list[dict[str, Any]],
     build_samples_by_type: dict[str, list[dict[str, Any]]],
+    build_v2_task_rows: dict[str, list[dict[str, Any]]] | None = None,
+    build_v2_audit: dict[str, Any] | None = None,
     extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     build_ids: Counter[str] = Counter()
@@ -116,6 +135,14 @@ def _build_manifest(
         "splits": dict(sorted(splits.items())),
         "wins": dict(sorted(wins.items())),
     }
+    if build_v2_task_rows is not None:
+        manifest["dataset_counts"]["build_v2_total"] = sum(len(rows) for rows in build_v2_task_rows.values())
+        manifest["build_v2_dataset_counts_by_task"] = {
+            task: len(rows)
+            for task, rows in sorted(build_v2_task_rows.items())
+        }
+    if build_v2_audit:
+        manifest["build_v2_audit"] = build_v2_audit
     if extra_fields:
         manifest.update(extra_fields)
     return manifest
@@ -131,6 +158,7 @@ def _write_dataset_bundle(
     route_samples: list[dict[str, Any]],
     card_choice_samples: list[dict[str, Any]],
     build_samples: list[dict[str, Any]],
+    build_v2_task_rows: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_jsonl(output_dir / "runs_summary.jsonl", runs_summary)
@@ -146,6 +174,10 @@ def _write_dataset_bundle(
         build_samples_by_type.setdefault(decision_type, []).append(sample)
     for decision_type, rows in sorted(build_samples_by_type.items()):
         _write_jsonl(output_dir / f"{decision_type}_samples.jsonl", rows)
+
+    if build_v2_task_rows:
+        for task_name, rows in sorted(build_v2_task_rows.items()):
+            _write_jsonl(output_dir / f"{task_name}_samples.jsonl", rows)
 
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -259,6 +291,7 @@ def _quality_filter_bundle(
     bundle: dict[str, Any],
     samples: dict[str, list[dict[str, Any]]],
     *,
+    build_v2: dict[str, Any] | None,
     quality_profile: str,
     min_loss_path_points: int,
 ) -> tuple[bool, str | None]:
@@ -268,11 +301,12 @@ def _quality_filter_bundle(
     summary = bundle["summary"]
 
     if quality_profile == "offline_training_v1":
+        build_v2_total = sum(len(rows) for rows in ((build_v2 or {}).get("task_rows") or {}).values())
         if summary.get("was_abandoned"):
             return False, "abandoned_run"
         if not summary.get("win") and (summary.get("path_point_count") or 0) < min_loss_path_points:
             return False, "short_loss"
-        if not summary.get("win") and not samples["card_choice_samples"] and not samples["build_samples"]:
+        if not summary.get("win") and not samples["card_choice_samples"] and not samples["build_samples"] and build_v2_total <= 0:
             return False, "uninformative_loss"
         return True, None
 
@@ -308,8 +342,8 @@ def main() -> None:
     parser.add_argument(
         "--min-loss-path-points",
         type=int,
-        default=8,
-        help="For quality profiles that keep some losses, require at least this many path points. Default: 8.",
+        default=12,
+        help="For quality profiles that keep some losses, require at least this many path points. Default: 12.",
     )
     parser.add_argument(
         "--materialize-run-payloads",
@@ -333,6 +367,8 @@ def main() -> None:
     card_choice_samples: list[dict[str, Any]] = []
     build_samples: list[dict[str, Any]] = []
     build_samples_by_type: dict[str, list[dict[str, Any]]] = {}
+    build_v2_task_rows: dict[str, list[dict[str, Any]]] = {}
+    build_v2_audit_totals: Counter[str] = Counter()
 
     skip_reasons: Counter[str] = Counter()
     source_kinds: Counter[str] = Counter()
@@ -404,10 +440,12 @@ def main() -> None:
             continue
 
         samples = build_offline_training_samples(bundle)
+        build_v2 = build_offline_build_v2_samples(bundle)
         basic_accepted += 1
         keep, reason = _quality_filter_bundle(
             bundle,
             samples,
+            build_v2=build_v2,
             quality_profile=args.quality_profile,
             min_loss_path_points=args.min_loss_path_points,
         )
@@ -427,14 +465,18 @@ def main() -> None:
         route_samples.extend(samples["route_samples"])
         card_choice_samples.extend(samples["card_choice_samples"])
         build_samples.extend(samples["build_samples"])
+        _merge_numeric_audit(build_v2_audit_totals, build_v2.get("audit"))
         for sample in samples["build_samples"]:
             decision_type = str(sample.get("decision_type") or "unknown")
             build_samples_by_type.setdefault(decision_type, []).append(sample)
+        for task_name, rows in (build_v2.get("task_rows") or {}).items():
+            build_v2_task_rows.setdefault(task_name, []).extend(rows)
 
         if accepted % 100 == 0:
             print(
                 f"[progress] accepted={accepted} processed={processed} "
-                f"route={len(route_samples)} card={len(card_choice_samples)} build={len(build_samples)}"
+                f"route={len(route_samples)} card={len(card_choice_samples)} "
+                f"build={len(build_samples)} build_v2={sum(len(rows) for rows in build_v2_task_rows.values())}"
             )
 
     filters = {
@@ -459,6 +501,8 @@ def main() -> None:
         card_choice_samples=card_choice_samples,
         build_samples=build_samples,
         build_samples_by_type=build_samples_by_type,
+        build_v2_task_rows=build_v2_task_rows,
+        build_v2_audit=dict(sorted(build_v2_audit_totals.items())),
         extra_fields={
             "source_counts": dict(sorted(source_kinds.items())),
             "archive_member_counts": dict(sorted(archive_members.items())),
@@ -474,6 +518,7 @@ def main() -> None:
         route_samples=route_samples,
         card_choice_samples=card_choice_samples,
         build_samples=build_samples,
+        build_v2_task_rows=build_v2_task_rows,
     )
     if raw_payload_index:
         _write_jsonl(output_dir / "raw_run_payloads_index.jsonl", raw_payload_index)
@@ -490,6 +535,10 @@ def main() -> None:
     route_by_build = _bucket_rows_by_build_id(route_samples, run_to_build_id=run_to_build_id)
     card_by_build = _bucket_rows_by_build_id(card_choice_samples, run_to_build_id=run_to_build_id)
     build_by_build = _bucket_rows_by_build_id(build_samples, run_to_build_id=run_to_build_id)
+    build_v2_by_build = {
+        task_name: _bucket_rows_by_build_id(rows, run_to_build_id=run_to_build_id)
+        for task_name, rows in build_v2_task_rows.items()
+    }
 
     partition_index: dict[str, dict[str, Any]] = {}
     for build_id, partition_runs in sorted(runs_by_build.items()):
@@ -516,6 +565,10 @@ def main() -> None:
             card_choice_samples=card_by_build.get(build_id, []),
             build_samples=partition_build_samples,
             build_samples_by_type=partition_build_samples_by_type,
+            build_v2_task_rows={
+                task_name: buckets.get(build_id, [])
+                for task_name, buckets in build_v2_by_build.items()
+            },
             extra_fields={
                 "partition_key": "build_id",
                 "partition_value": build_id,
@@ -531,6 +584,10 @@ def main() -> None:
             route_samples=route_by_build.get(build_id, []),
             card_choice_samples=card_by_build.get(build_id, []),
             build_samples=partition_build_samples,
+            build_v2_task_rows={
+                task_name: buckets.get(build_id, [])
+                for task_name, buckets in build_v2_by_build.items()
+            },
         )
         partition_index[build_id] = {
             "dir_name": safe_name,
@@ -539,6 +596,7 @@ def main() -> None:
             "route_samples": len(route_by_build.get(build_id, [])),
             "card_choice_samples": len(card_by_build.get(build_id, [])),
             "build_samples": len(partition_build_samples),
+            "build_v2_total": sum(len(buckets.get(build_id, [])) for buckets in build_v2_by_build.values()),
         }
 
     manifest["by_build_id_root"] = str(by_build_dir)
@@ -556,6 +614,10 @@ def main() -> None:
     route_by_family = _bucket_rows_by_build_id(route_samples, run_to_build_id=run_to_build_family)
     card_by_family = _bucket_rows_by_build_id(card_choice_samples, run_to_build_id=run_to_build_family)
     build_by_family = _bucket_rows_by_build_id(build_samples, run_to_build_id=run_to_build_family)
+    build_v2_by_family = {
+        task_name: _bucket_rows_by_build_id(rows, run_to_build_id=run_to_build_family)
+        for task_name, rows in build_v2_task_rows.items()
+    }
 
     family_index: dict[str, dict[str, Any]] = {}
     for family_name, partition_runs in sorted(runs_by_family.items()):
@@ -582,6 +644,10 @@ def main() -> None:
             card_choice_samples=card_by_family.get(family_name, []),
             build_samples=partition_build_samples,
             build_samples_by_type=partition_build_samples_by_type,
+            build_v2_task_rows={
+                task_name: buckets.get(family_name, [])
+                for task_name, buckets in build_v2_by_family.items()
+            },
             extra_fields={
                 "partition_key": "build_family",
                 "partition_value": family_name,
@@ -597,6 +663,10 @@ def main() -> None:
             route_samples=route_by_family.get(family_name, []),
             card_choice_samples=card_by_family.get(family_name, []),
             build_samples=partition_build_samples,
+            build_v2_task_rows={
+                task_name: buckets.get(family_name, [])
+                for task_name, buckets in build_v2_by_family.items()
+            },
         )
         family_index[family_name] = {
             "dir_name": safe_name,
@@ -605,6 +675,7 @@ def main() -> None:
             "route_samples": len(route_by_family.get(family_name, [])),
             "card_choice_samples": len(card_by_family.get(family_name, [])),
             "build_samples": len(partition_build_samples),
+            "build_v2_total": sum(len(buckets.get(family_name, [])) for buckets in build_v2_by_family.values()),
         }
 
     if args.materialize_run_payloads:
@@ -621,6 +692,7 @@ def main() -> None:
     print(
         f"[done] accepted={accepted}/{processed} "
         f"route={len(route_samples)} card={len(card_choice_samples)} build={len(build_samples)} "
+        f"build_v2={sum(len(rows) for rows in build_v2_task_rows.values())} "
         f"out={output_dir}"
     )
 

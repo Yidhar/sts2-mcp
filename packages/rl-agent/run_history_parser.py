@@ -90,12 +90,88 @@ def write_extracted_run_history(bundle: dict[str, Any], output_dir: str | Path) 
 
 
 def build_offline_training_samples(bundle: dict[str, Any], player_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
-    floors = bundle.get("floors") or []
-    if not floors:
+    summary, floor_views = _build_player_floor_views(bundle, player_id=player_id)
+    if not floor_views:
         return {"route_samples": [], "card_choice_samples": [], "build_samples": []}
 
-    summary = bundle["summary"]
-    final_build = bundle["final_build"]
+    route_samples = _build_route_samples(summary, floor_views)
+    card_choice_samples = _build_card_choice_samples(summary, floor_views)
+    build_samples = _build_build_samples(summary, floor_views)
+    return {
+        "route_samples": route_samples,
+        "card_choice_samples": card_choice_samples,
+        "build_samples": build_samples,
+    }
+
+
+def build_offline_build_v2_samples(
+    bundle: dict[str, Any],
+    player_id: int | None = None,
+) -> dict[str, Any]:
+    summary, floor_views = _build_player_floor_views(bundle, player_id=player_id)
+    task_rows = _empty_build_v2_task_rows()
+    if not floor_views:
+        return {
+            "task_rows": task_rows,
+            "audit": {},
+        }
+
+    task_rows["regular_card_reward"] = _build_regular_card_reward_v2_samples(summary, floor_views)
+    task_rows["event_card_bundle"] = _build_event_card_bundle_v2_samples(summary, floor_views)
+    task_rows["ancient_choice"] = _build_ancient_choice_v2_samples(summary, floor_views)
+    task_rows["relic_choice_step"] = _build_relic_choice_step_v2_samples(summary, floor_views)
+    task_rows["potion_choice_step"] = _build_potion_choice_step_v2_samples(summary, floor_views)
+    task_rows["rest_action"] = _build_rest_action_v2_samples(summary, floor_views)
+    task_rows["smith_target"] = _build_smith_target_v2_samples(summary, floor_views)
+    task_rows["remove_card_step"] = _build_remove_card_step_v2_samples(summary, floor_views)
+    task_rows["transform_card_step"] = _build_transform_card_step_v2_samples(summary, floor_views)
+    task_rows["shop_relic_pick_step"] = _build_shop_relic_pick_step_v2_samples(summary, floor_views)
+    task_rows["shop_potion_pick_step"] = _build_shop_potion_pick_step_v2_samples(summary, floor_views)
+    task_rows["shop_remove_binary"] = _build_shop_remove_binary_v2_samples(summary, floor_views)
+    task_rows["shop_remove_target_step"] = _build_shop_remove_target_step_v2_samples(summary, floor_views)
+    task_rows["shop_bundle_aux"] = _build_shop_bundle_aux_v2_samples(summary, floor_views)
+    return {
+        "task_rows": task_rows,
+        "audit": _build_build_v2_audit(summary, floor_views, task_rows),
+    }
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False))
+            handle.write("\n")
+
+
+def _empty_build_v2_task_rows() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "regular_card_reward": [],
+        "event_card_bundle": [],
+        "ancient_choice": [],
+        "relic_choice_step": [],
+        "potion_choice_step": [],
+        "rest_action": [],
+        "smith_target": [],
+        "remove_card_step": [],
+        "transform_card_step": [],
+        "shop_relic_pick_step": [],
+        "shop_potion_pick_step": [],
+        "shop_remove_binary": [],
+        "shop_remove_target_step": [],
+        "shop_bundle_aux": [],
+    }
+
+
+def _build_player_floor_views(
+    bundle: dict[str, Any],
+    player_id: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    floors = bundle.get("floors") or []
+    summary = bundle.get("summary") or {}
+    if not floors or not summary:
+        return summary, []
+
+    final_build = bundle.get("final_build") or {}
     player_records = final_build.get("players") or []
 
     if player_id is None:
@@ -103,7 +179,7 @@ def build_offline_training_samples(bundle: dict[str, Any], player_id: int | None
 
     player_floors = [floor for floor in floors if floor.get("player_id") == player_id]
     if not player_floors:
-        return {"route_samples": [], "card_choice_samples": [], "build_samples": []}
+        return summary, []
 
     player_build = next(
         (player for player in player_records if player.get("player_id") == player_id),
@@ -141,22 +217,639 @@ def build_offline_training_samples(bundle: dict[str, Any], player_id: int | None
                 "relic_ids_after": relics_after,
             }
         )
+    return summary, floor_views
 
-    route_samples = _build_route_samples(summary, floor_views)
-    card_choice_samples = _build_card_choice_samples(summary, floor_views)
-    build_samples = _build_build_samples(summary, floor_views)
+
+def _build_v2_common_row(summary: dict[str, Any], floor: dict[str, Any]) -> dict[str, Any]:
     return {
-        "route_samples": route_samples,
-        "card_choice_samples": card_choice_samples,
-        "build_samples": build_samples,
+        "run_id": summary["run_id"],
+        "split": summary["split"],
+        "build_id": summary.get("build_id"),
+        "character": floor.get("character"),
+        "ascension": summary.get("ascension"),
+        "floor_number": floor.get("floor_number"),
+        "act_index": floor.get("act_index"),
+        "path_index": floor.get("path_index"),
+        "map_point_type": floor.get("map_point_type"),
+        "room_type": floor.get("room_type"),
+        "room_model_id": floor.get("room_model_id"),
+        "monster_ids": list(floor.get("monster_ids") or []),
+        "turns_taken": floor.get("turns_taken"),
+        "hp_before": floor.get("hp_before"),
+        "current_hp": floor.get("current_hp"),
+        "max_hp": floor.get("max_hp"),
+        "gold_before": floor.get("gold_before"),
+        "current_gold": floor.get("current_gold"),
+        "gold_spent": floor.get("gold_spent"),
+        "gold_gained": floor.get("gold_gained"),
+        "deck_before": floor.get("deck_before"),
+        "deck_after": floor.get("deck_after"),
+        "relic_ids_before": floor.get("relic_ids_before"),
+        "relic_ids_after": floor.get("relic_ids_after"),
+        "quality_flags": floor.get("quality_flags"),
     }
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False))
-            handle.write("\n")
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        key = str(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
+
+
+def _remaining_candidate_counts(
+    option_ids: list[str],
+    selected_prefix_ids: list[str],
+) -> Counter[str]:
+    counts = Counter(str(value) for value in option_ids if value)
+    for selected_id in selected_prefix_ids:
+        key = str(selected_id)
+        if counts.get(key, 0) > 0:
+            counts[key] -= 1
+    return counts
+
+
+def _expand_deck_card_id_multiset(deck_summary: dict[str, Any] | None) -> list[str]:
+    cards = (deck_summary or {}).get("cards") or []
+    expanded: list[str] = []
+    for card in cards:
+        card_id = str(card.get("id") or "")
+        count = int(card.get("count") or 0)
+        if not card_id or count <= 0:
+            continue
+        expanded.extend([card_id] * count)
+    return expanded
+
+
+def _build_candidate_step_rows(
+    *,
+    summary: dict[str, Any],
+    floor: dict[str, Any],
+    task: str,
+    choice_group_id: str,
+    option_ids: list[str],
+    selected_ids: list[str],
+    option_kind: str,
+    supervision_type: str,
+    allow_skip: bool,
+    extra_fields: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    option_ids = [str(value) for value in option_ids if value]
+    selected_ids = [str(value) for value in selected_ids if value]
+    option_order = _ordered_unique(option_ids)
+    rows: list[dict[str, Any]] = []
+    common = _build_v2_common_row(summary, floor)
+    extra = extra_fields or {}
+
+    if not option_order and not selected_ids:
+        return []
+
+    if not selected_ids:
+        if not allow_skip:
+            return []
+        rows.append(
+            {
+                **common,
+                **extra,
+                "sample_id": f"{choice_group_id}:step:1",
+                "choice_group_id": choice_group_id,
+                "task": task,
+                "decision_type": task,
+                "option_kind": option_kind,
+                "supervision_type": supervision_type,
+                "option_ids": option_order,
+                "option_counts": {key: int(value) for key, value in _remaining_candidate_counts(option_ids, []).items() if value > 0},
+                "label_id": "<skip>",
+                "skip_available": True,
+                "selection_step_index": 0,
+                "selection_steps_total": 1,
+                "selected_prefix_ids": [],
+                "selected_ids_full": [],
+            }
+        )
+        return rows
+
+    selected_prefix_ids: list[str] = []
+    total_steps = len(selected_ids)
+    for step_index, label_id in enumerate(selected_ids):
+        remaining_counts = _remaining_candidate_counts(option_ids, selected_prefix_ids)
+        candidate_ids = [candidate_id for candidate_id in option_order if remaining_counts.get(candidate_id, 0) > 0]
+        if label_id not in candidate_ids:
+            return []
+
+        rows.append(
+            {
+                **common,
+                **extra,
+                "sample_id": f"{choice_group_id}:step:{step_index + 1}",
+                "choice_group_id": choice_group_id,
+                "task": task,
+                "decision_type": task,
+                "option_kind": option_kind,
+                "supervision_type": supervision_type,
+                "option_ids": candidate_ids,
+                "option_counts": {key: int(remaining_counts[key]) for key in candidate_ids},
+                "label_id": label_id,
+                "skip_available": False,
+                "selection_step_index": step_index,
+                "selection_steps_total": total_steps,
+                "selected_prefix_ids": list(selected_prefix_ids),
+                "selected_ids_full": list(selected_ids),
+            }
+        )
+        selected_prefix_ids.append(label_id)
+
+    return rows
+
+
+def _build_regular_card_reward_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") not in {"monster", "elite", "boss"}:
+            continue
+        options = floor.get("card_choices") or []
+        if not options:
+            continue
+        option_ids = [item["card"]["id"] for item in options if item.get("card") and item["card"].get("id")]
+        picked_ids = [item["card"]["id"] for item in options if item.get("was_picked") and item.get("card") and item["card"].get("id")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="regular_card_reward",
+                choice_group_id=f"{summary['run_id']}:regular_card_reward:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=picked_ids,
+                option_kind="card",
+                supervision_type="single_pick_or_skip",
+                allow_skip=True,
+                extra_fields={
+                    "options": options,
+                    "picked_card_ids": picked_ids,
+                },
+            )
+        )
+    return rows
+
+
+def _build_event_card_bundle_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "event":
+            continue
+        options = floor.get("card_choices") or []
+        if not options:
+            continue
+        option_ids = [item["card"]["id"] for item in options if item.get("card") and item["card"].get("id")]
+        picked_ids = [item["card"]["id"] for item in options if item.get("was_picked") and item.get("card") and item["card"].get("id")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="event_card_bundle",
+                choice_group_id=f"{summary['run_id']}:event_card_bundle:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=picked_ids,
+                option_kind="card",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=True,
+                extra_fields={
+                    "options": options,
+                    "picked_card_ids": picked_ids,
+                },
+            )
+        )
+    return rows
+
+
+def _build_ancient_choice_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        choices = floor.get("ancient_choices") or []
+        if not choices:
+            continue
+        option_ids = [item["text_key"] for item in choices if item.get("text_key")]
+        selected_ids = [item["text_key"] for item in choices if item.get("was_chosen") and item.get("text_key")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="ancient_choice",
+                choice_group_id=f"{summary['run_id']}:ancient_choice:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="ancient",
+                supervision_type="single_pick",
+                allow_skip=False,
+                extra_fields={"choices": choices},
+            )
+        )
+    return rows
+
+
+def _build_relic_choice_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") == "shop" or floor.get("ancient_choices"):
+            continue
+        choices = floor.get("relic_choices") or []
+        if not choices:
+            continue
+        option_ids = [item["choice"] for item in choices if item.get("choice")]
+        selected_ids = [item["choice"] for item in choices if item.get("was_picked") and item.get("choice")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="relic_choice_step",
+                choice_group_id=f"{summary['run_id']}:relic_choice_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="relic",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=True,
+                extra_fields={"choices": choices},
+            )
+        )
+    return rows
+
+
+def _build_potion_choice_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") == "shop":
+            continue
+        choices = floor.get("potion_choices") or []
+        if not choices:
+            continue
+        option_ids = [item["choice"] for item in choices if item.get("choice")]
+        selected_ids = [item["choice"] for item in choices if item.get("was_picked") and item.get("choice")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="potion_choice_step",
+                choice_group_id=f"{summary['run_id']}:potion_choice_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="potion",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=True,
+                extra_fields={"choices": choices},
+            )
+        )
+    return rows
+
+
+def _build_rest_action_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        selected_actions = [str(value) for value in floor.get("rest_site_choices") or [] if value]
+        if len(selected_actions) != 1:
+            continue
+        row = {
+            **_build_v2_common_row(summary, floor),
+            "sample_id": f"{summary['run_id']}:rest_action:{floor['floor_number']}",
+            "choice_group_id": f"{summary['run_id']}:rest_action:{floor['floor_number']}",
+            "task": "rest_action",
+            "decision_type": "rest_action",
+            "option_kind": "rest_action",
+            "supervision_type": "classification",
+            "label_id": selected_actions[0],
+            "skip_available": False,
+            "selected_prefix_ids": [],
+            "selected_ids_full": list(selected_actions),
+            "rest_site_choices": list(floor.get("rest_site_choices") or []),
+        }
+        rows.append(row)
+    return rows
+
+
+def _build_smith_target_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        selected_ids = [str(value) for value in floor.get("upgraded_cards") or [] if value]
+        if len(selected_ids) != 1 or not floor.get("upgrade_label_reliable"):
+            continue
+        option_ids: list[str] = []
+        for card in (floor.get("deck_before") or {}).get("cards") or []:
+            card_id = str(card.get("id") or "")
+            count = int(card.get("count") or 0)
+            upgraded_count = int(card.get("upgraded_count") or 0)
+            if not card_id or count <= 0:
+                continue
+            if count > upgraded_count:
+                option_ids.append(card_id)
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="smith_target",
+                choice_group_id=f"{summary['run_id']}:smith_target:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="card",
+                supervision_type="single_pick",
+                allow_skip=False,
+                extra_fields={"raw_upgraded_cards": list(floor.get("raw_upgraded_cards") or [])},
+            )
+        )
+    return rows
+
+
+def _build_remove_card_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        selected_ids = [item["id"] for item in floor.get("cards_removed") or [] if item and item.get("id")]
+        if not selected_ids:
+            continue
+        option_ids = _expand_deck_card_id_multiset(floor.get("deck_before"))
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="remove_card_step",
+                choice_group_id=f"{summary['run_id']}:remove_card_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="card",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=False,
+                extra_fields={"removed_cards": floor.get("cards_removed") or []},
+            )
+        )
+    return rows
+
+
+def _build_transform_card_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        transforms = floor.get("cards_transformed") or []
+        selected_ids = [
+            item["original_card"]["id"]
+            for item in transforms
+            if item.get("original_card") and item["original_card"].get("id")
+        ]
+        if not selected_ids:
+            continue
+        option_ids = _expand_deck_card_id_multiset(floor.get("deck_before"))
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="transform_card_step",
+                choice_group_id=f"{summary['run_id']}:transform_card_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="card",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=False,
+                extra_fields={"transforms": transforms},
+            )
+        )
+    return rows
+
+
+def _build_shop_relic_pick_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "shop":
+            continue
+        choices = floor.get("relic_choices") or []
+        if not choices:
+            continue
+        option_ids = [item["choice"] for item in choices if item.get("choice")]
+        selected_ids = [item["choice"] for item in choices if item.get("was_picked") and item.get("choice")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="shop_relic_pick_step",
+                choice_group_id=f"{summary['run_id']}:shop_relic_pick_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="relic",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=True,
+                extra_fields={"choices": choices},
+            )
+        )
+    return rows
+
+
+def _build_shop_potion_pick_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "shop":
+            continue
+        choices = floor.get("potion_choices") or []
+        if not choices:
+            continue
+        option_ids = [item["choice"] for item in choices if item.get("choice")]
+        selected_ids = [item["choice"] for item in choices if item.get("was_picked") and item.get("choice")]
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="shop_potion_pick_step",
+                choice_group_id=f"{summary['run_id']}:shop_potion_pick_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="potion",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=True,
+                extra_fields={"choices": choices},
+            )
+        )
+    return rows
+
+
+def _build_shop_remove_binary_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "shop":
+            continue
+        removed_ids = [item["id"] for item in floor.get("cards_removed") or [] if item and item.get("id")]
+        row = {
+            **_build_v2_common_row(summary, floor),
+            "sample_id": f"{summary['run_id']}:shop_remove_binary:{floor['floor_number']}",
+            "choice_group_id": f"{summary['run_id']}:shop_remove_binary:{floor['floor_number']}",
+            "task": "shop_remove_binary",
+            "decision_type": "shop_remove_binary",
+            "option_kind": "shop_remove",
+            "supervision_type": "binary_choice",
+            "label_id": "remove_card" if removed_ids else "skip_remove",
+            "skip_available": False,
+            "selected_prefix_ids": [],
+            "selected_ids_full": removed_ids,
+            "shown_card_options": floor.get("card_choices") or [],
+            "shown_relic_options": floor.get("relic_choices") or [],
+            "shown_potion_options": floor.get("potion_choices") or [],
+        }
+        rows.append(row)
+    return rows
+
+
+def _build_shop_remove_target_step_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "shop":
+            continue
+        selected_ids = [item["id"] for item in floor.get("cards_removed") or [] if item and item.get("id")]
+        if not selected_ids:
+            continue
+        option_ids = _expand_deck_card_id_multiset(floor.get("deck_before"))
+        rows.extend(
+            _build_candidate_step_rows(
+                summary=summary,
+                floor=floor,
+                task="shop_remove_target_step",
+                choice_group_id=f"{summary['run_id']}:shop_remove_target_step:{floor['floor_number']}",
+                option_ids=option_ids,
+                selected_ids=selected_ids,
+                option_kind="card",
+                supervision_type="autoregressive_multiselect",
+                allow_skip=False,
+                extra_fields={"removed_cards": floor.get("cards_removed") or []},
+            )
+        )
+    return rows
+
+
+def _build_shop_bundle_aux_v2_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for floor in floor_views:
+        if floor.get("room_type") != "shop":
+            continue
+        shown_cards = floor.get("card_choices") or []
+        shown_relics = floor.get("relic_choices") or []
+        shown_potions = floor.get("potion_choices") or []
+        bought_card_ids = [item["id"] for item in floor.get("cards_gained") or [] if item and item.get("id")]
+        picked_relic_ids = [item["choice"] for item in shown_relics if item.get("was_picked") and item.get("choice")]
+        picked_potion_ids = [item["choice"] for item in shown_potions if item.get("was_picked") and item.get("choice")]
+        removed_card_ids = [item["id"] for item in floor.get("cards_removed") or [] if item and item.get("id")]
+        available_card_ids = [item["card"]["id"] for item in shown_cards if item.get("card") and item["card"].get("id")]
+
+        did_buy_card = bool(bought_card_ids)
+        did_buy_relic = bool(picked_relic_ids)
+        did_buy_potion = bool(picked_potion_ids)
+        did_remove = bool(removed_card_ids)
+
+        rows.append(
+            {
+                **_build_v2_common_row(summary, floor),
+                "sample_id": f"{summary['run_id']}:shop_bundle_aux:{floor['floor_number']}",
+                "choice_group_id": f"{summary['run_id']}:shop_bundle_aux:{floor['floor_number']}",
+                "task": "shop_bundle_aux",
+                "decision_type": "shop_bundle_aux",
+                "supervision_type": "multi_binary_aux",
+                "available_card_ids": available_card_ids,
+                "available_relic_ids": [item["choice"] for item in shown_relics if item.get("choice")],
+                "available_potion_ids": [item["choice"] for item in shown_potions if item.get("choice")],
+                "bought_card_ids": bought_card_ids,
+                "picked_relic_ids": picked_relic_ids,
+                "picked_potion_ids": picked_potion_ids,
+                "removed_card_ids": removed_card_ids,
+                "did_buy_any_card": did_buy_card,
+                "did_buy_any_relic": did_buy_relic,
+                "did_buy_any_potion": did_buy_potion,
+                "did_remove_card": did_remove,
+                "leave_only": not (did_buy_card or did_buy_relic or did_buy_potion or did_remove),
+                "shop_card_purchase_unsupported": bool(bought_card_ids) and not set(bought_card_ids).issubset(set(available_card_ids)),
+            }
+        )
+    return rows
+
+
+def _build_build_v2_audit(
+    summary: dict[str, Any],
+    floor_views: list[dict[str, Any]],
+    task_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    audit: dict[str, Any] = {
+        "run_id": summary.get("run_id"),
+        "character": (summary.get("characters") or [None])[0],
+        "regular_card_reward_rows": len(task_rows.get("regular_card_reward") or []),
+        "event_card_bundle_rows": len(task_rows.get("event_card_bundle") or []),
+        "rest_action_rows": len(task_rows.get("rest_action") or []),
+        "smith_target_rows": len(task_rows.get("smith_target") or []),
+        "remove_card_step_rows": len(task_rows.get("remove_card_step") or []),
+        "transform_card_step_rows": len(task_rows.get("transform_card_step") or []),
+        "shop_remove_binary_rows": len(task_rows.get("shop_remove_binary") or []),
+        "shop_remove_target_step_rows": len(task_rows.get("shop_remove_target_step") or []),
+        "shop_bundle_aux_rows": len(task_rows.get("shop_bundle_aux") or []),
+    }
+
+    regular_choice_groups = 0
+    regular_invalid_multi_pick_groups = 0
+    event_multi_pick_groups = 0
+    rest_multi_action_anomalies = 0
+    unsupported_shop_card_purchase_rows = 0
+    duplicate_remove_groups = 0
+    duplicate_transform_groups = 0
+    shop_rows = 0
+
+    for floor in floor_views:
+        room_type = str(floor.get("room_type") or "")
+        card_choices = floor.get("card_choices") or []
+        if room_type in {"monster", "elite", "boss"} and card_choices:
+            regular_choice_groups += 1
+            regular_pick_count = sum(1 for item in card_choices if item.get("was_picked") and item.get("card"))
+            if regular_pick_count > 1:
+                regular_invalid_multi_pick_groups += 1
+        if room_type == "event" and card_choices:
+            event_pick_count = sum(1 for item in card_choices if item.get("was_picked") and item.get("card"))
+            if event_pick_count > 1:
+                event_multi_pick_groups += 1
+
+        if len([value for value in floor.get("rest_site_choices") or [] if value]) > 1:
+            rest_multi_action_anomalies += 1
+
+        if room_type == "shop":
+            shop_rows += 1
+            shown_card_ids = {
+                item["card"]["id"]
+                for item in card_choices
+                if item.get("card") and item["card"].get("id")
+            }
+            bought_card_ids = {
+                item["id"]
+                for item in floor.get("cards_gained") or []
+                if item and item.get("id")
+            }
+            if bought_card_ids and not bought_card_ids.issubset(shown_card_ids):
+                unsupported_shop_card_purchase_rows += 1
+
+        removed_ids = [item["id"] for item in floor.get("cards_removed") or [] if item and item.get("id")]
+        if len(removed_ids) != len(set(removed_ids)):
+            duplicate_remove_groups += 1
+
+        transformed_ids = [
+            item["original_card"]["id"]
+            for item in floor.get("cards_transformed") or []
+            if item.get("original_card") and item["original_card"].get("id")
+        ]
+        if len(transformed_ids) != len(set(transformed_ids)):
+            duplicate_transform_groups += 1
+
+    audit.update(
+        {
+            "regular_card_reward_groups": regular_choice_groups,
+            "regular_invalid_multi_pick_groups": regular_invalid_multi_pick_groups,
+            "event_multi_pick_groups": event_multi_pick_groups,
+            "rest_multi_action_anomalies": rest_multi_action_anomalies,
+            "shop_rows": shop_rows,
+            "unsupported_shop_card_purchase_rows": unsupported_shop_card_purchase_rows,
+            "duplicate_remove_groups": duplicate_remove_groups,
+            "duplicate_transform_groups": duplicate_transform_groups,
+        }
+    )
+    return audit
 
 
 def _extract_summary(run: dict[str, Any], source_path: Path) -> dict[str, Any]:

@@ -30,6 +30,18 @@ internal static partial class BridgeGameApi
             payload["ref"] = cardRef;
         }
 
+        var cardId = TryGetNestedString(element.Value, "id");
+        if (!string.IsNullOrWhiteSpace(cardId))
+        {
+            payload["id"] = cardId;
+        }
+
+        var upgradeLevel = TryGetNestedInt(element.Value, "current_upgrade_level");
+        if (upgradeLevel.HasValue)
+        {
+            payload["upgrade_level"] = upgradeLevel.Value;
+        }
+
         var title = TryGetNestedString(element.Value, "title");
         if (!string.IsNullOrWhiteSpace(title))
         {
@@ -100,6 +112,8 @@ internal static partial class BridgeGameApi
             payload["canonical_text"] = ct.ToString();
         }
 
+        AppendCompactPreviewFields(payload, element.Value);
+
         return payload;
     }
 
@@ -127,17 +141,38 @@ internal static partial class BridgeGameApi
             return null;
         }
 
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
         var title = TryGetNestedString(element.Value, "title");
         var rarity = TryGetNestedString(element.Value, "rarity");
         var target = TryGetNestedString(element.Value, "target_type");
         var desc = TryGetNestedString(element.Value, "description");
-        return new
+        if (!string.IsNullOrWhiteSpace(title))
         {
-            title,
-            rarity,
-            target,
-            canonical_text = BuildCanonicalPotionText(title, rarity, target, desc)
-        };
+            payload["title"] = title;
+        }
+
+        if (!string.IsNullOrWhiteSpace(rarity))
+        {
+            payload["rarity"] = rarity;
+        }
+
+        if (!string.IsNullOrWhiteSpace(target))
+        {
+            payload["target"] = target;
+        }
+
+        AppendCompactPreviewValue(payload, "damage", TryExtractEnvMetric(element.Value, "damage"));
+        AppendCompactPreviewValue(payload, "block", TryExtractEnvMetric(element.Value, "block"));
+        AppendCompactPreviewValue(payload, "draw", TryExtractEnvMetric(element.Value, "draw"));
+        AppendCompactPreviewValue(payload, "weak", TryExtractEnvMetric(element.Value, "weak"));
+        AppendCompactPreviewValue(payload, "vulnerable", TryExtractEnvMetric(element.Value, "vulnerable"));
+        AppendCompactPreviewValue(payload, "heal", TryExtractEnvMetric(element.Value, "heal"));
+        AppendCompactPreviewValue(payload, "hp_loss", TryExtractEnvMetric(element.Value, "hp_loss"));
+        AppendCompactPreviewValue(payload, "strength", TryExtractEnvMetric(element.Value, "strength"));
+        AppendCompactPreviewValue(payload, "dexterity", TryExtractEnvMetric(element.Value, "dexterity"));
+        AppendCompactPreviewValue(payload, "summon", TryExtractEnvMetric(element.Value, "summon"));
+        payload["canonical_text"] = BuildCanonicalPotionText(title, rarity, target, desc);
+        return payload;
     }
 
     private static object? CompactRelicPayload(JsonElement? element)
@@ -384,5 +419,27 @@ internal static partial class BridgeGameApi
 
         var first = intents.Value[0];
         return TryGetNestedString(first, path);
+    }
+
+    private static void AppendCompactPreviewFields(Dictionary<string, object?> payload, JsonElement element)
+    {
+        AppendCompactPreviewValue(payload, "damage", TryGetNestedInt(element, "effect_preview", "total_damage") ?? TryExtractEnvMetric(element, "damage"));
+        AppendCompactPreviewValue(payload, "block", TryGetNestedInt(element, "effect_preview", "total_block") ?? TryExtractEnvMetric(element, "block"));
+        AppendCompactPreviewValue(payload, "draw", TryGetNestedInt(element, "effect_preview", "draw") ?? TryExtractEnvMetric(element, "draw"));
+        AppendCompactPreviewValue(payload, "weak", TryGetNestedInt(element, "effect_preview", "weak") ?? TryExtractEnvMetric(element, "weak"));
+        AppendCompactPreviewValue(payload, "vulnerable", TryGetNestedInt(element, "effect_preview", "vulnerable") ?? TryExtractEnvMetric(element, "vulnerable"));
+        AppendCompactPreviewValue(payload, "heal", TryGetNestedInt(element, "effect_preview", "heal") ?? TryExtractEnvMetric(element, "heal"));
+        AppendCompactPreviewValue(payload, "hp_loss", TryGetNestedInt(element, "effect_preview", "hp_loss") ?? TryExtractEnvMetric(element, "hp_loss"));
+        AppendCompactPreviewValue(payload, "strength", TryGetNestedInt(element, "effect_preview", "strength") ?? TryExtractEnvMetric(element, "strength"));
+        AppendCompactPreviewValue(payload, "dexterity", TryGetNestedInt(element, "effect_preview", "dexterity") ?? TryExtractEnvMetric(element, "dexterity"));
+        AppendCompactPreviewValue(payload, "summon", TryGetNestedInt(element, "effect_preview", "summon") ?? TryExtractEnvMetric(element, "summon"));
+    }
+
+    private static void AppendCompactPreviewValue(Dictionary<string, object?> payload, string key, int value)
+    {
+        if (value != 0)
+        {
+            payload[key] = value;
+        }
     }
 }

@@ -14,24 +14,25 @@ internal static partial class BridgeGameApi
 {
     private const int EnvDefenseBlockAmount = 999;
     private const int EnvDefensePlatingAmount = 999;
-    private const double EnvRewardHpLossWeight = -0.15d;
-    private const double EnvRewardHpGainWeight = 0.05d;
-    private const double EnvRewardRoomHpDeltaWeight = 1.00d;
-    private const double EnvRewardFloorDeltaWeight = 0.10d;
-    private const double EnvRewardGoldGainWeight = 0.0d;
-    private const double EnvRewardGoldSpendWeight = 0.0d;
-    private const double EnvRewardRelicGainWeight = 0.0d;
+    private const double EnvRewardHpLossWeight = 0.0d;
+    private const double EnvRewardHpGainWeight = 0.0d;
+    private const double EnvRewardRoomHpDeltaWeight = 1.50d;
+    private const double EnvRewardFloorDeltaWeight = 0.25d;
+    private const double EnvRewardGoldGainWeight = 0.01d;
+    private const double EnvRewardGoldSpendWeight = 0.01d;
+    private const double EnvRewardRelicGainWeight = 1.00d;
+    private const double EnvRewardMaxHpGainWeight = 0.25d;
     private const double EnvRewardPotionGainWeight = 0.0d;
     private const double EnvRewardCardAddWeight = 0.0d;
     private const double EnvRewardStarterRemoveWeight = 0.0d;
     private const double EnvRewardOtherRemoveWeight = 0.0d;
     private const double EnvRewardCardUpgradeWeight = 0.0d;
-    private const double EnvRewardCombatWinBonus = 0.0d;
-    private const double EnvRewardEliteClearBonus = 0.0d;
-    private const double EnvRewardBossClearBonus = 0.0d;
-    private const double EnvRewardActClearBonus = 0.0d;
-    private const double EnvRewardDeathPenalty = -10.00d;
-    private const double EnvRewardVictoryBonus = 10.00d;
+    private const double EnvRewardCombatWinBonus = 1.00d;
+    private const double EnvRewardEliteClearBonus = 0.75d;
+    private const double EnvRewardBossClearBonus = 1.50d;
+    private const double EnvRewardActClearBonus = 2.00d;
+    private const double EnvRewardDeathPenalty = -2.00d;
+    private const double EnvRewardVictoryBonus = 5.00d;
     private const double EnvRewardStepPenalty = 0.0d;
     private const double EnvRewardActionErrorPenalty = -0.10d;
     private const double EnvRewardTruncatedPenalty = -1.00d;
@@ -498,6 +499,7 @@ internal static partial class BridgeGameApi
             selectedAction,
             truncated,
             actionError);
+        var actionDiagnostics = BuildEnvActionDiagnostics(before, selectedAction, actionError);
         var done = forceDone || after.Done || truncated;
         SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
@@ -531,6 +533,7 @@ internal static partial class BridgeGameApi
                 encounter_id = episode.EncounterId,
                 truncation_reason = truncationReason,
                 action_error = actionError,
+                action_diagnostics = actionDiagnostics,
                 reward_breakdown = rewardBreakdown
             }
         };
@@ -539,15 +542,20 @@ internal static partial class BridgeGameApi
     private static async Task<BridgeEnvSnapshot> ApplyEnvEpisodeAdjustmentsAsync(
         BridgeEnvEpisode episode,
         BridgeEnvSnapshot snapshot,
+        int timeoutMs,
         CancellationToken cancellationToken)
     {
         if (episode.DefensiveBuffs && snapshot.RunActive)
         {
-            var changed = await BridgeCoordinator.RunOnMainThreadAsync(() => ApplyEnvDefensiveBuffs(CaptureContext()));
+            var changed = await RunOnMainThreadGuardedAsync(
+                () => ApplyEnvDefensiveBuffs(CaptureContext()),
+                "env.apply_defensive_buffs",
+                timeoutMs,
+                cancellationToken);
             if (changed)
             {
-                await BridgeCoordinator.WaitForPumpTicksAsync(1, cancellationToken);
-                snapshot = await CaptureEnvSnapshotAsync(cancellationToken);
+                await WaitForPumpTicksGuardedAsync(1, "env.apply_defensive_buffs.post_pump", timeoutMs, cancellationToken);
+                snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.apply_defensive_buffs.snapshot");
             }
         }
 
@@ -663,14 +671,16 @@ internal static partial class BridgeGameApi
             var changed = false;
             if (existing.Amount < amount)
             {
-                existing.Amount = amount;
-                changed = true;
+                changed |=
+                    TrySetHiddenPropertyValue(existing, nameof(PowerModel.Amount), amount) ||
+                    TrySetHiddenFieldValue(existing, "_amount", amount);
             }
 
             if (existing.AmountOnTurnStart < amount)
             {
-                existing.AmountOnTurnStart = amount;
-                changed = true;
+                changed |=
+                    TrySetHiddenPropertyValue(existing, nameof(PowerModel.AmountOnTurnStart), amount) ||
+                    TrySetHiddenFieldValue(existing, "_amountOnTurnStart", amount);
             }
 
             return changed;
@@ -680,7 +690,8 @@ internal static partial class BridgeGameApi
         power.Applier = creature;
         power.Target = creature;
         power.ApplyInternal(creature, amount, silent: true);
-        power.AmountOnTurnStart = amount;
+        TrySetHiddenPropertyValue(power, nameof(PowerModel.AmountOnTurnStart), amount);
+        TrySetHiddenFieldValue(power, "_amountOnTurnStart", amount);
         return true;
     }
 
@@ -702,6 +713,23 @@ internal static partial class BridgeGameApi
         return true;
     }
 
+    private static bool TrySetHiddenFieldValue(object? target, string fieldName, object? value)
+    {
+        if (target is null)
+        {
+            return false;
+        }
+
+        var field = FindField(target.GetType(), fieldName);
+        if (field is null)
+        {
+            return false;
+        }
+
+        field.SetValue(target, value);
+        return true;
+    }
+
     private static BridgeEnvRewardBreakdown BuildEnvRewardBreakdown(
         BridgeEnvEpisode episode,
         BridgeEnvSnapshot before,
@@ -717,21 +745,52 @@ internal static partial class BridgeGameApi
         var hpGainNormalized = maxHp > 0 ? (double)hpGain / maxHp : 0d;
         var floorDelta = Math.Max(0, after.TotalFloor - before.TotalFloor);
         var roomComplete = HasEnvRoomTransition(before, after) ? 1 : 0;
+        var combatRoom = IsEnvCombatRewardRoom(before.RoomType);
+        var combatRoomComplete = roomComplete == 1 && combatRoom ? 1 : 0;
         var roomHpMax = episode.RoomStartMaxHp > 0 ? episode.RoomStartMaxHp : maxHp;
-        var roomHpDeltaNormalized = roomComplete == 1 && roomHpMax > 0
+        var death = after.Done && after.CurrentHp <= 0 ? 1 : 0;
+        var combatRoomSettled = combatRoom && (combatRoomComplete == 1 || death == 1);
+        var roomHpDeltaNormalized = combatRoomSettled && roomHpMax > 0
             ? (double)(after.CurrentHp - episode.RoomStartHp) / roomHpMax
             : 0d;
-        var death = after.Done && after.CurrentHp <= 0 ? 1 : 0;
+        var actClear = Math.Max(0, after.ActIndex - before.ActIndex);
         var victory = after.Done && after.CurrentHp > 0 ? 1 : 0;
+        var relicGainCount = Math.Max(0, after.RelicCount - before.RelicCount);
+        var goldGain = Math.Max(0, after.Gold - before.Gold);
+        var goldSpend = Math.Max(0, before.Gold - after.Gold);
+        var maxHpGain = Math.Max(0, after.MaxHp - before.MaxHp);
+        var maxHpGainNormalized = maxHp > 0 ? (double)maxHpGain / maxHp : 0d;
+
+        var combatRoomCompleteBonus = combatRoomComplete * EnvRewardCombatWinBonus;
+        var combatRoomQualityBonus = roomHpDeltaNormalized * EnvRewardRoomHpDeltaWeight;
+        var floorProgressBonus = floorDelta * EnvRewardFloorDeltaWeight;
+        var eliteClearBonus = combatRoomComplete == 1 && IsEnvEliteRoom(before.RoomType)
+            ? EnvRewardEliteClearBonus
+            : 0d;
+        var bossClearBonus = combatRoomComplete == 1 && IsEnvBossRoom(before.RoomType)
+            ? EnvRewardBossClearBonus
+            : 0d;
+        var actClearBonus = actClear * EnvRewardActClearBonus;
+        var relicGainBonus = relicGainCount * EnvRewardRelicGainWeight;
+        var goldGainBonus = goldGain * EnvRewardGoldGainWeight;
+        var goldSpendBonus = goldSpend * EnvRewardGoldSpendWeight;
+        var maxHpGainBonus = maxHpGainNormalized * EnvRewardMaxHpGainWeight;
+        var runVictoryBonus = victory * EnvRewardVictoryBonus;
         var actionErrorPenalty = string.IsNullOrWhiteSpace(actionError) ? 0d : EnvRewardActionErrorPenalty;
         var truncatedPenalty = truncated ? EnvRewardTruncatedPenalty : 0d;
         var total =
-            hpLossNormalized * EnvRewardHpLossWeight +
-            hpGainNormalized * EnvRewardHpGainWeight +
-            roomHpDeltaNormalized * EnvRewardRoomHpDeltaWeight +
-            floorDelta * EnvRewardFloorDeltaWeight +
+            combatRoomCompleteBonus +
+            combatRoomQualityBonus +
+            floorProgressBonus +
+            eliteClearBonus +
+            bossClearBonus +
+            actClearBonus +
+            relicGainBonus +
+            goldGainBonus +
+            goldSpendBonus +
+            maxHpGainBonus +
+            runVictoryBonus +
             death * EnvRewardDeathPenalty +
-            victory * EnvRewardVictoryBonus +
             actionErrorPenalty +
             truncatedPenalty;
 
@@ -740,10 +799,23 @@ internal static partial class BridgeGameApi
             HpLossNormalized = RoundEnvNumber(hpLossNormalized),
             HpGainNormalized = RoundEnvNumber(hpGainNormalized),
             RoomComplete = roomComplete,
+            CombatRoomComplete = combatRoomComplete,
             RoomHpDeltaNormalized = RoundEnvNumber(roomHpDeltaNormalized),
+            CombatRoomCompleteBonus = RoundEnvNumber(combatRoomCompleteBonus),
+            CombatRoomQualityBonus = RoundEnvNumber(combatRoomQualityBonus),
             FloorDelta = floorDelta,
+            FloorProgressBonus = RoundEnvNumber(floorProgressBonus),
+            ActClear = actClear,
+            ActClearBonus = RoundEnvNumber(actClearBonus),
+            EliteClearBonus = RoundEnvNumber(eliteClearBonus),
+            BossClearBonus = RoundEnvNumber(bossClearBonus),
+            RelicGainCount = relicGainCount,
+            RelicGainBonus = RoundEnvNumber(relicGainBonus),
+            MaxHpGainNormalized = RoundEnvNumber(maxHpGainNormalized),
+            MaxHpGainBonus = RoundEnvNumber(maxHpGainBonus),
             Death = death,
             Victory = victory,
+            RunVictoryBonus = RoundEnvNumber(runVictoryBonus),
             ActionErrorPenalty = RoundEnvNumber(actionErrorPenalty),
             TruncatedPenalty = RoundEnvNumber(truncatedPenalty),
             Total = RoundEnvNumber(total)
@@ -785,6 +857,18 @@ internal static partial class BridgeGameApi
     private static bool IsEnvBossRoom(string? roomType)
     {
         return roomType?.Contains("Boss", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static bool IsEnvCombatRewardRoom(string? roomType)
+    {
+        if (string.IsNullOrWhiteSpace(roomType))
+        {
+            return false;
+        }
+
+        return roomType.Contains("Monster", StringComparison.OrdinalIgnoreCase) ||
+               IsEnvEliteRoom(roomType) ||
+               IsEnvBossRoom(roomType);
     }
 
     private static int GetPrimaryPlayerCurrentEnergy(BridgeWorldContext context) => GetPrimaryPlayer(context)?.PlayerCombatState?.Energy ?? 0;
@@ -1246,6 +1330,94 @@ internal static partial class BridgeGameApi
              action.ActionId.StartsWith("use_potion:", StringComparison.Ordinal)));
     }
 
+    private static object? BuildEnvActionDiagnostics(
+        BridgeEnvSnapshot before,
+        BridgeResolvedActionSelection? selectedAction,
+        string? actionError)
+    {
+        if (selectedAction is null || !string.IsNullOrWhiteSpace(actionError))
+        {
+            return null;
+        }
+
+        var endTurnSelected =
+            string.Equals(selectedAction.Kind, "combat", StringComparison.Ordinal) &&
+            string.Equals(selectedAction.Action.ActionId, "end_turn", StringComparison.Ordinal);
+
+        if (!before.CombatInProgress)
+        {
+            return new
+            {
+                end_turn_selected = endTurnSelected
+            };
+        }
+
+        var nonEndActionCount = 0;
+        var playCardActionCount = 0;
+        var zeroCostPlayCardCount = 0;
+        var positivePreviewActionCount = 0;
+        var selfHpLossActionCount = 0;
+
+        foreach (var action in before.ResolvedActions)
+        {
+            if (string.Equals(action.ActionId, "end_turn", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var payload = JsonSerializer.SerializeToElement(action.Payload);
+            var kind = TryGetNestedString(payload, "kind") ?? InferEnvActionKind(action.ActionId);
+            if (!string.Equals(kind, "play_card", StringComparison.Ordinal) &&
+                !string.Equals(kind, "use_potion", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            nonEndActionCount += 1;
+            if (string.Equals(kind, "play_card", StringComparison.Ordinal))
+            {
+                playCardActionCount += 1;
+            }
+
+            var source = string.Equals(kind, "play_card", StringComparison.Ordinal)
+                ? TryGetNestedElement(payload, "card")
+                : TryGetNestedElement(payload, "potion");
+            if (source is null || source.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                continue;
+            }
+
+            var energyCost = TryGetNestedInt(source.Value, "resolved_energy_cost") ??
+                             TryGetNestedInt(source.Value, "cost") ??
+                             0;
+            if (string.Equals(kind, "play_card", StringComparison.Ordinal) && energyCost == 0)
+            {
+                zeroCostPlayCardCount += 1;
+            }
+
+            if (HasPositivePreview(source.Value))
+            {
+                positivePreviewActionCount += 1;
+            }
+
+            if (GetPreviewMetric(source.Value, "hp_loss") > 0)
+            {
+                selfHpLossActionCount += 1;
+            }
+        }
+
+        return new
+        {
+            end_turn_selected = endTurnSelected,
+            end_turn_wasted = endTurnSelected && HasEnvWastedEndTurn(before),
+            non_end_action_count = nonEndActionCount,
+            play_card_action_count = playCardActionCount,
+            zero_cost_play_card_count = zeroCostPlayCardCount,
+            positive_preview_action_count = positivePreviewActionCount,
+            self_hp_loss_action_count = selfHpLossActionCount
+        };
+    }
+
     private static bool ShouldRewardSkippingBadCardReward(BridgeEnvSnapshot snapshot)
     {
         var candidateScores = snapshot.ResolvedActions
@@ -1437,9 +1609,44 @@ internal static partial class BridgeGameApi
             "draw" => TryExtractEnvMetricWithPatterns(lower, text, @"draw\s*(\d+)", @"抽(\d+)张牌"),
             "weak" => TryExtractEnvMetricWithPatterns(lower, text, @"(\d+)\s*weak", @"给予(\d+)层虚弱"),
             "vulnerable" => TryExtractEnvMetricWithPatterns(lower, text, @"(\d+)\s*vulnerable", @"给予(\d+)层易伤"),
+            "heal" => TryExtractEnvMetricWithPatterns(lower, text, @"heal\s*(\d+)", @"(?:回复|恢复)(\d+)点生命"),
+            "hp_loss" => TryExtractEnvMetricWithPatterns(lower, text, @"lose\s*(\d+)\s*hp", @"失去(\d+)点生命"),
+            "strength" => TryExtractEnvMetricWithPatterns(lower, text, @"(\d+)\s*strength", @"(?:获得|给予)(\d+)点力量"),
+            "dexterity" => TryExtractEnvMetricWithPatterns(lower, text, @"(\d+)\s*dexterity", @"(?:获得|给予)(\d+)点敏捷"),
             "summon" => TryExtractEnvMetricWithPatterns(lower, text, @"summon\s*(\d+)", @"召唤(\d+)"),
             _ => 0
         };
+    }
+
+    private static int GetPreviewMetric(JsonElement element, string metric)
+    {
+        return metric switch
+        {
+            "damage" => TryGetNestedInt(element, "effect_preview", "total_damage") ?? TryGetNestedInt(element, "damage") ?? TryExtractEnvMetric(element, "damage"),
+            "block" => TryGetNestedInt(element, "effect_preview", "total_block") ?? TryGetNestedInt(element, "block") ?? TryExtractEnvMetric(element, "block"),
+            "draw" => TryGetNestedInt(element, "effect_preview", "draw") ?? TryGetNestedInt(element, "draw") ?? TryExtractEnvMetric(element, "draw"),
+            "weak" => TryGetNestedInt(element, "effect_preview", "weak") ?? TryGetNestedInt(element, "weak") ?? TryExtractEnvMetric(element, "weak"),
+            "vulnerable" => TryGetNestedInt(element, "effect_preview", "vulnerable") ?? TryGetNestedInt(element, "vulnerable") ?? TryExtractEnvMetric(element, "vulnerable"),
+            "heal" => TryGetNestedInt(element, "effect_preview", "heal") ?? TryGetNestedInt(element, "heal") ?? TryExtractEnvMetric(element, "heal"),
+            "hp_loss" => TryGetNestedInt(element, "effect_preview", "hp_loss") ?? TryGetNestedInt(element, "hp_loss") ?? TryExtractEnvMetric(element, "hp_loss"),
+            "strength" => TryGetNestedInt(element, "effect_preview", "strength") ?? TryGetNestedInt(element, "strength") ?? TryExtractEnvMetric(element, "strength"),
+            "dexterity" => TryGetNestedInt(element, "effect_preview", "dexterity") ?? TryGetNestedInt(element, "dexterity") ?? TryExtractEnvMetric(element, "dexterity"),
+            "summon" => TryGetNestedInt(element, "effect_preview", "summon") ?? TryGetNestedInt(element, "summon") ?? TryExtractEnvMetric(element, "summon"),
+            _ => 0
+        };
+    }
+
+    private static bool HasPositivePreview(JsonElement element)
+    {
+        return GetPreviewMetric(element, "damage") > 0 ||
+               GetPreviewMetric(element, "block") > 0 ||
+               GetPreviewMetric(element, "draw") > 0 ||
+               GetPreviewMetric(element, "weak") > 0 ||
+               GetPreviewMetric(element, "vulnerable") > 0 ||
+               GetPreviewMetric(element, "heal") > 0 ||
+               GetPreviewMetric(element, "strength") > 0 ||
+               GetPreviewMetric(element, "dexterity") > 0 ||
+               GetPreviewMetric(element, "summon") > 0;
     }
 
     private static int TryExtractEnvMetricWithPatterns(string normalized, string original, string englishPattern, string chinesePattern)
@@ -1566,17 +1773,56 @@ internal static partial class BridgeGameApi
         [JsonPropertyName("room_complete")]
         public required int RoomComplete { get; init; }
 
+        [JsonPropertyName("combat_room_complete")]
+        public required int CombatRoomComplete { get; init; }
+
         [JsonPropertyName("room_hp_delta_normalized")]
         public required double RoomHpDeltaNormalized { get; init; }
 
+        [JsonPropertyName("combat_room_complete_bonus")]
+        public required double CombatRoomCompleteBonus { get; init; }
+
+        [JsonPropertyName("combat_room_quality_bonus")]
+        public required double CombatRoomQualityBonus { get; init; }
+
         [JsonPropertyName("floor_delta")]
         public required int FloorDelta { get; init; }
+
+        [JsonPropertyName("floor_progress_bonus")]
+        public required double FloorProgressBonus { get; init; }
+
+        [JsonPropertyName("act_clear")]
+        public required int ActClear { get; init; }
+
+        [JsonPropertyName("act_clear_bonus")]
+        public required double ActClearBonus { get; init; }
+
+        [JsonPropertyName("elite_clear_bonus")]
+        public required double EliteClearBonus { get; init; }
+
+        [JsonPropertyName("boss_clear_bonus")]
+        public required double BossClearBonus { get; init; }
+
+        [JsonPropertyName("relic_gain_count")]
+        public required int RelicGainCount { get; init; }
+
+        [JsonPropertyName("relic_gain_bonus")]
+        public required double RelicGainBonus { get; init; }
+
+        [JsonPropertyName("max_hp_gain_normalized")]
+        public required double MaxHpGainNormalized { get; init; }
+
+        [JsonPropertyName("max_hp_gain_bonus")]
+        public required double MaxHpGainBonus { get; init; }
 
         [JsonPropertyName("death")]
         public required int Death { get; init; }
 
         [JsonPropertyName("victory")]
         public required int Victory { get; init; }
+
+        [JsonPropertyName("run_victory_bonus")]
+        public required double RunVictoryBonus { get; init; }
 
         [JsonPropertyName("action_error_penalty")]
         public required double ActionErrorPenalty { get; init; }

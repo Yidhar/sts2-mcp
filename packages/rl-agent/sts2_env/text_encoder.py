@@ -15,6 +15,8 @@ from typing import Iterable
 
 import numpy as np
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 # bge-small-zh-v1.5 output dimension
 TEXT_DIM: int = 512
 
@@ -159,8 +161,9 @@ class TextEncoder:
             return np.zeros((0, self.embed_dim), dtype=np.float32)
 
         results = np.zeros((len(texts), self.embed_dim), dtype=np.float32)
-        uncached_indices = []
-        uncached_texts = []
+        uncached_keys_in_order: list[str] = []
+        uncached_texts_by_key: dict[str, str] = {}
+        pending_indices_by_key: dict[str, list[int]] = {}
 
         with self._lock:
             for i, text in enumerate(texts):
@@ -170,16 +173,19 @@ class TextEncoder:
                 if key in self._mem_cache:
                     results[i] = self._mem_cache[key]
                 else:
-                    uncached_indices.append(i)
-                    uncached_texts.append(text)
+                    if key not in uncached_texts_by_key:
+                        uncached_keys_in_order.append(key)
+                        uncached_texts_by_key[key] = text
+                    pending_indices_by_key.setdefault(key, []).append(i)
 
-        if uncached_texts:
+        if uncached_keys_in_order:
+            uncached_texts = [uncached_texts_by_key[key] for key in uncached_keys_in_order]
             embeddings = self._compute(uncached_texts)
             with self._lock:
-                for idx, text, emb in zip(uncached_indices, uncached_texts, embeddings):
-                    key = self._cache_key(text)
+                for key, emb in zip(uncached_keys_in_order, embeddings):
                     self._mem_cache[key] = emb
-                    results[idx] = emb
+                    for idx in pending_indices_by_key.get(key, ()):
+                        results[idx] = emb
 
         return results
 
@@ -276,10 +282,7 @@ class TextEncoder:
             texts, convert_to_numpy=True, normalize_embeddings=self._normalize,
             show_progress_bar=False,
         )
-        result = embeddings.astype(np.float32)
-        if len(self._mem_cache) % 100 == 0:
-            self.save_cache()
-        return result
+        return embeddings.astype(np.float32)
 
     @staticmethod
     def _cache_key(text: str) -> str:
