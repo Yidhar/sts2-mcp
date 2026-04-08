@@ -30,7 +30,7 @@ internal static partial class BridgeGameApi
         var phase = ResolveEnvPhase(context, actions);
         var runSummary = BuildEnvRunPayload(context.RunState);
         var observationCore = BuildEnvObservationCore(context, phase);
-        var legalActions = BuildEnvLegalActions(actions);
+        var legalActions = BuildEnvLegalActions(context, actions);
         var logicHash = ComputeStateHash(new
         {
             phase,
@@ -116,22 +116,37 @@ internal static partial class BridgeGameApi
         BridgeWorldContext context,
         IReadOnlyList<BridgeResolvedAction> actions)
     {
+        var hasActiveRunContext = context.RunState is not null && context.RunState.IsGameOver != true;
+        var hasRunActions = actions.Any(static action =>
+            !action.ActionId.StartsWith("main_menu:", StringComparison.Ordinal) &&
+            !action.ActionId.StartsWith("run_mode:", StringComparison.Ordinal) &&
+            !action.ActionId.StartsWith("character_select:", StringComparison.Ordinal) &&
+            !action.ActionId.StartsWith("game_over:", StringComparison.Ordinal) &&
+            !action.ActionId.StartsWith("automation:", StringComparison.Ordinal) &&
+            !action.ActionId.Equals("embark", StringComparison.Ordinal));
+        var allowStartupSurface = !hasActiveRunContext && !hasRunActions;
+
         if (context.RunState?.IsGameOver == true)
         {
             return "terminal";
         }
 
-        if (IsRunModeSelectionVisible(context))
+        if (allowStartupSurface &&
+            IsRunModeSelectionVisible(context))
         {
             return "startup_run_mode";
         }
 
-        if (context.CharacterSelectScreen is not null && IsNodeVisible(context.CharacterSelectScreen))
+        if (context.CharacterSelectScreen is not null &&
+            IsNodeVisible(context.CharacterSelectScreen) &&
+            allowStartupSurface)
         {
             return "startup_character_select";
         }
 
-        if (context.MainMenuRoot is not null && IsNodeVisible(context.MainMenuRoot))
+        if (context.MainMenuRoot is not null &&
+            IsNodeVisible(context.MainMenuRoot) &&
+            allowStartupSurface)
         {
             return "startup_main_menu";
         }
@@ -161,16 +176,26 @@ internal static partial class BridgeGameApi
             return "reward";
         }
 
-        if (context.MapScreen?.IsOpen == true &&
-            context.MapScreen.IsTravelEnabled &&
-            !context.MapScreen.IsTraveling)
-        {
-            return "map";
-        }
-
         if (context.CrystalSphereScreen is not null && IsNodeVisible(context.CrystalSphereScreen))
         {
             return "event_crystal_sphere";
+        }
+
+        if (context.CombatManager?.IsInProgress == true)
+        {
+            return context.CombatManager.IsPlayPhase &&
+                   !context.CombatManager.PlayerActionsDisabled &&
+                   context.CardSelectionScreen is null
+                ? "combat"
+                : "settling";
+        }
+
+        if (context.MapScreen?.IsOpen == true &&
+            context.MapScreen.IsTravelEnabled &&
+            !context.MapScreen.IsTraveling &&
+            !HasBlockingMapOverlaySurface(context, actions))
+        {
+            return "map";
         }
 
         if ((context.EventRoom is not null && IsNodeVisible(context.EventRoom) && context.MapScreen?.IsOpen != true) ||
@@ -195,15 +220,6 @@ internal static partial class BridgeGameApi
         if (context.TreasureRoom is not null && IsNodeVisible(context.TreasureRoom))
         {
             return "treasure";
-        }
-
-        if (context.CombatManager?.IsInProgress == true)
-        {
-            return context.CombatManager.IsPlayPhase &&
-                   !context.CombatManager.PlayerActionsDisabled &&
-                   context.CardSelectionScreen is null
-                ? "combat"
-                : "settling";
         }
 
         if (actions.Count > 0)
@@ -277,12 +293,15 @@ internal static partial class BridgeGameApi
         var relics = (player?.Relics ?? Enumerable.Empty<RelicModel>())
             .Select(relic =>
             {
+                var relicId = relic.Id.ToString();
                 var title = TryGetTitle(relic);
                 var desc = SafeGetRelicDescription(relic);
                 var rarity = relic.Rarity.ToString();
                 return new
                 {
+                    id = relicId,
                     title,
+                    rarity,
                     canonical_text = BuildCanonicalRelicText(title, rarity, desc)
                 };
             })
@@ -292,14 +311,18 @@ internal static partial class BridgeGameApi
         var potions = (player?.PotionSlots ?? Enumerable.Empty<PotionModel?>())
             .Select(slot =>
             {
-                if (slot is null) return new { title = "[empty]", canonical_text = "" };
+                if (slot is null) return new { id = (string?)null, title = "[empty]", rarity = (string?)null, target = (string?)null, canonical_text = "" };
+                var potionId = slot.Id.ToString();
                 var title = TryGetTitle(slot);
                 var desc = SafeGetPotionDescription(slot);
                 var target = slot.TargetType.ToString();
                 var rarity = slot.Rarity.ToString();
                 return new
                 {
+                    id = (string?)potionId,
                     title,
+                    rarity = (string?)rarity,
+                    target = (string?)target,
                     canonical_text = BuildCanonicalPotionText(title, rarity, target, desc)
                 };
             })
@@ -723,19 +746,34 @@ internal static partial class BridgeGameApi
         return null;
     }
 
-    private static IReadOnlyList<BridgeResolvedAction> BuildEnvLegalActions(IReadOnlyList<BridgeResolvedAction> actions)
+    private static bool HasBlockingMapOverlaySurface(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
     {
-        // Filter out map travel actions when non-map actions are also present.
-        // This handles the map overlay bug where MAP screen shows over a room,
-        // exposing both map travel and room actions simultaneously.
-        var hasMapActions = actions.Any(static a => a.ActionId.StartsWith("map:", StringComparison.Ordinal));
-        // Any action that is NOT a map travel action counts as non-map
-        var hasNonMapActions = actions.Any(static a =>
-            !a.ActionId.StartsWith("map:", StringComparison.Ordinal));
+        return context.CombatManager?.IsInProgress == true ||
+               (context.DeckUpgradeScreen is not null && IsNodeVisible(context.DeckUpgradeScreen)) ||
+               (context.CardSelectionScreen is not null && IsNodeVisible(context.CardSelectionScreen)) ||
+               IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions) ||
+               IsRewardsScreenVisible(
+                   context.RewardsScreen,
+                   context.ProceedButton,
+                   context.RewardProceedButton,
+                   context.MapScreen,
+                   context.RewardButtons) ||
+               (context.CrystalSphereScreen is not null && IsNodeVisible(context.CrystalSphereScreen)) ||
+               context.MerchantInventory?.IsOpen == true ||
+               actions.Any(static action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal));
+    }
 
-        if (hasMapActions && hasNonMapActions)
+    private static IReadOnlyList<BridgeResolvedAction> BuildEnvLegalActions(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        var hasMapActions = actions.Any(static a => a.ActionId.StartsWith("map:", StringComparison.Ordinal));
+        var suppressMapActions = hasMapActions && HasBlockingMapOverlaySurface(context, actions);
+
+        if (suppressMapActions)
         {
-            // Map overlay detected — filter out map actions, keep room actions
             return actions
                 .Where(static a => !a.ActionId.StartsWith("map:", StringComparison.Ordinal))
                 .ToList();

@@ -128,6 +128,15 @@ class BridgeClient:
                         resp_body = resp.json()
                     except Exception:
                         resp_body = resp.text
+                    if (
+                        resp.status_code == 401
+                        and isinstance(resp_body, dict)
+                        and str(resp_body.get("error") or "").strip() == "missing_or_invalid_token"
+                        and attempt < self.MAX_RETRIES
+                    ):
+                        self._load_session()
+                        time.sleep(self.RETRY_DELAY_S)
+                        continue
                     raise BridgeError(
                         f"Bridge returned HTTP {resp.status_code} for {method} /{endpoint}: "
                         f"{resp_body}",
@@ -165,6 +174,7 @@ class BridgeClient:
     def reset(
         self,
         character: str | None = None,
+        force_fresh: bool = False,
         defensive_buffs: bool = False,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
@@ -176,6 +186,8 @@ class BridgeClient:
         body: dict[str, Any] = {"timeout_ms": timeout_ms}
         if character is not None:
             body["character"] = character
+        if force_fresh:
+            body["force_fresh"] = True
         if defensive_buffs:
             body["defensive_buffs"] = True
         return self._request("POST", "env/reset", body=body, timeout_ms=timeout_ms)

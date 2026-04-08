@@ -1708,10 +1708,14 @@ internal static partial class BridgeGameApi
     private static List<BridgeResolvedAction> BuildResolvedActions(BridgeWorldContext context)
     {
         var actions = new List<BridgeResolvedAction>();
+        var hasActiveRunContext = context.RunState is not null && context.RunState.IsGameOver != true;
 
         AddAutomationActions(actions, context);
-        AddRunModeActions(actions, context);
-        AddMainMenuActions(actions, context);
+        if (!hasActiveRunContext)
+        {
+            AddRunModeActions(actions, context);
+            AddMainMenuActions(actions, context);
+        }
         AddGameOverActions(actions, context);
         AddDeckUpgradeActions(actions, context);
         AddCardSelectionActions(actions, context);
@@ -1719,33 +1723,37 @@ internal static partial class BridgeGameApi
         AddShopActions(actions, context);
         AddTreasureRoomActions(actions, context);
 
-        for (var index = 0; index < context.CharacterButtons.Count; index++)
+        if (!hasActiveRunContext)
         {
-            var button = context.CharacterButtons[index];
-            if (!IsNodeVisible(button) || button.IsLocked || ReferenceEquals(button, context.SelectedCharacterButton))
+            for (var index = 0; index < context.CharacterButtons.Count; index++)
             {
-                continue;
-            }
-
-            var actionId = $"character_select:{index}";
-            actions.Add(new BridgeResolvedAction
-            {
-                ActionId = actionId,
-                Payload = new
+                var button = context.CharacterButtons[index];
+                if (!IsNodeVisible(button) || button.IsLocked || ReferenceEquals(button, context.SelectedCharacterButton))
                 {
-                    action_id = actionId,
-                    kind = "character_select",
-                    index,
-                    label = $"Select character {index}: {DescribeCharacter(button.Character)}",
-                    character = BuildCharacterPayload(button.Character),
-                    is_random = button.IsRandom,
-                    screen = context.Screen
-                },
-                Execute = () => InvokeButtonAction(button, "Select", "OnPress")
-            });
+                    continue;
+                }
+
+                var actionId = $"character_select:{index}";
+                actions.Add(new BridgeResolvedAction
+                {
+                    ActionId = actionId,
+                    Payload = new
+                    {
+                        action_id = actionId,
+                        kind = "character_select",
+                        index,
+                        label = $"Select character {index}: {DescribeCharacter(button.Character)}",
+                        character = BuildCharacterPayload(button.Character),
+                        is_random = button.IsRandom,
+                        screen = context.Screen
+                    },
+                    Execute = () => InvokeButtonAction(button, "Select", "OnPress")
+                });
+            }
         }
 
-        if (context.EmbarkButton is not null &&
+        if (!hasActiveRunContext &&
+            context.EmbarkButton is not null &&
             IsNodeVisible(context.EmbarkButton) &&
             IsButtonEnabled(context.EmbarkButton))
         {
@@ -2598,6 +2606,8 @@ internal static partial class BridgeGameApi
             return;
         }
 
+        var initialActionCount = actions.Count;
+
         if (context.AbandonRunConfirmPopup is not null && IsNodeVisible(context.AbandonRunConfirmPopup))
         {
             for (var index = 0; index < context.AbandonRunConfirmButtons.Count; index++)
@@ -2698,9 +2708,67 @@ internal static partial class BridgeGameApi
                     label,
                     screen = context.Screen
                 },
-                Execute = () => InvokeMenuButtonAction(button)
+                Execute = () =>
+                {
+                    if (semanticAction == "abandon_current_game" &&
+                        context.MainMenuRoot is not null &&
+                        IsNodeVisible(context.MainMenuRoot))
+                    {
+                        InvokeButtonAction(context.MainMenuRoot, "AbandonRun");
+                        return;
+                    }
+
+                    if (semanticAction == "singleplayer" &&
+                        context.MainMenuRoot is not null &&
+                        IsNodeVisible(context.MainMenuRoot))
+                    {
+                        InvokeButtonAction(context.MainMenuRoot, "OpenSingleplayerSubmenu");
+                        return;
+                    }
+
+                    InvokeMenuButtonAction(button);
+                }
             });
         }
+
+        if (actions.Count > initialActionCount ||
+            context.MainMenuRoot is null ||
+            !IsNodeVisible(context.MainMenuRoot))
+        {
+            return;
+        }
+
+        if (context.ContinueRunInfo is not null && IsNodeVisible(context.ContinueRunInfo))
+        {
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = "main_menu:abandon_current_game",
+                Payload = new
+                {
+                    action_id = "main_menu:abandon_current_game",
+                    kind = "main_menu",
+                    menu_action = "abandon_current_game",
+                    label = "Abandon current game",
+                    screen = context.Screen
+                },
+                Execute = () => InvokeButtonAction(context.MainMenuRoot, "AbandonRun")
+            });
+            return;
+        }
+
+        actions.Add(new BridgeResolvedAction
+        {
+            ActionId = "main_menu:singleplayer",
+            Payload = new
+            {
+                action_id = "main_menu:singleplayer",
+                kind = "main_menu",
+                menu_action = "singleplayer",
+                label = "Open singleplayer submenu",
+                screen = context.Screen
+            },
+            Execute = () => InvokeButtonAction(context.MainMenuRoot, "OpenSingleplayerSubmenu")
+        });
     }
 
     private static void AddGameOverActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
@@ -6695,7 +6763,10 @@ internal static partial class BridgeGameApi
 
     private static void InvokeMerchantLeaveAction(NMerchantRoom? merchantRoom, NProceedButton button)
     {
-        if (TryInvokeSingleArgument(merchantRoom, "HideScreen", button))
+        if (TryInvokeSingleArgument(merchantRoom, "OnProceedButtonReleased", button) ||
+            TryInvokeSingleArgument(merchantRoom, "OnProceedButtonPressed", button) ||
+            TryInvokeParameterless(button, "ForceClick") ||
+            TryInvokeSingleArgument(merchantRoom, "HideScreen", button))
         {
             return;
         }

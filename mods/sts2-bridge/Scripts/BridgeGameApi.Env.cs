@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Text.Json.Serialization;
+using MegaCrit.Sts2.Core.Nodes;
 
 namespace Sts2McpBridge.Scripts;
 
@@ -8,6 +9,9 @@ internal sealed class BridgeEnvResetRequest
 {
     [JsonPropertyName("character")]
     public string? Character { get; set; }
+
+    [JsonPropertyName("force_fresh")]
+    public bool? ForceFresh { get; set; }
 
     [JsonPropertyName("defensive_buffs")]
     public bool? DefensiveBuffs { get; set; }
@@ -152,6 +156,7 @@ internal static partial class BridgeGameApi
     {
         request ??= new BridgeEnvResetRequest();
         var requestedCharacter = request.Character?.Trim();
+        var forceFresh = request.ForceFresh == true;
         var defensiveBuffs = request.DefensiveBuffs == true;
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
         await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
@@ -161,7 +166,7 @@ internal static partial class BridgeGameApi
             cancellationToken,
             "env.reset.initial_snapshot");
 
-        if (CanReuseFreshEpisode(state, requestedCharacter))
+        if (!forceFresh && CanReuseFreshEpisode(state, requestedCharacter))
         {
             var readyEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
             state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, timeoutMs, cancellationToken);
@@ -177,6 +182,7 @@ internal static partial class BridgeGameApi
 
         var resetStartedAt = DateTime.UtcNow;
         var waitRetries = 0;
+        var forcedMainMenuRecoveryUsed = false;
         const int maxWaitRetries = 5;
 
         for (var transition = 0; transition < EnvResetTransitionLimit; transition++)
@@ -205,6 +211,23 @@ internal static partial class BridgeGameApi
                     continue;
                 }
 
+                if (!forcedMainMenuRecoveryUsed &&
+                    state.RunActive &&
+                    !IsStartupPhase(state.Phase))
+                {
+                    var phaseBeforeRecovery = state.Phase;
+                    state = await ForceReturnToMainMenuFromActiveRunAsync(state, timeoutMs, cancellationToken);
+                    executedActions.Add(new
+                    {
+                        action_id = "automation:force_return_to_main_menu",
+                        kind = "automation",
+                        phase_before = phaseBeforeRecovery
+                    });
+                    forcedMainMenuRecoveryUsed = true;
+                    transition--;
+                    continue;
+                }
+
                 throw new BridgeRequestException(
                     HttpStatusCode.Conflict,
                     "env_reset_no_reset_path",
@@ -217,17 +240,39 @@ internal static partial class BridgeGameApi
                     });
             }
 
-            await ExecuteEnvActionAsync(
-                nextAction.Value.Action,
-                timeoutMs,
-                cancellationToken,
-                $"env.reset.execute:{nextAction.Value.Action.ActionId}");
-            executedActions.Add(new
+            try
             {
-                action_id = nextAction.Value.Action.ActionId,
-                kind = nextAction.Value.Kind,
-                phase_before = state.Phase
-            });
+                await ExecuteEnvActionAsync(
+                    nextAction.Value.Action,
+                    timeoutMs,
+                    cancellationToken,
+                    $"env.reset.execute:{nextAction.Value.Action.ActionId}");
+                executedActions.Add(new
+                {
+                    action_id = nextAction.Value.Action.ActionId,
+                    kind = nextAction.Value.Kind,
+                    phase_before = state.Phase
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                executedActions.Add(new
+                {
+                    action_id = nextAction.Value.Action.ActionId,
+                    kind = nextAction.Value.Kind,
+                    phase_before = state.Phase,
+                    execution_error = ex is BridgeRequestException bridgeEx ? bridgeEx.ErrorCode : ex.GetType().Name
+                });
+                state = await CaptureEnvSnapshotAsync(
+                    timeoutMs,
+                    cancellationToken,
+                    "env.reset.retry_after_action_error");
+                continue;
+            }
 
             state = await WaitForResetAdvanceAsync(
                 state,
@@ -567,13 +612,14 @@ internal static partial class BridgeGameApi
             cancellationToken);
     }
 
-    private static bool ShouldAutoCloseResidualMapOverlay(BridgeWorldContext context)
+    private static bool ShouldAutoCloseResidualMapOverlay(BridgeEnvSnapshot snapshot)
     {
+        var context = snapshot.Context;
         return context.RunState?.CurrentRoom is not null &&
                context.MapScreen is not null &&
                context.MapScreen.IsOpen &&
-               !context.MapScreen.IsTravelEnabled &&
-               !context.MapScreen.IsTraveling;
+               !context.MapScreen.IsTraveling &&
+               HasBlockingMapOverlaySurface(context, snapshot.ResolvedActions);
     }
 
     private static async Task<BridgeEnvSnapshot> MaybeAutoCloseResidualMapOverlayAsync(
@@ -581,7 +627,7 @@ internal static partial class BridgeGameApi
         int timeoutMs,
         CancellationToken cancellationToken)
     {
-        if (!ShouldAutoCloseResidualMapOverlay(snapshot.Context))
+        if (!ShouldAutoCloseResidualMapOverlay(snapshot))
         {
             return snapshot;
         }
@@ -592,7 +638,6 @@ internal static partial class BridgeGameApi
                 var mapScreen = snapshot.Context.MapScreen;
                 if (mapScreen is null ||
                     !mapScreen.IsOpen ||
-                    mapScreen.IsTravelEnabled ||
                     mapScreen.IsTraveling)
                 {
                     return false;
@@ -756,6 +801,7 @@ internal static partial class BridgeGameApi
         CancellationToken cancellationToken)
     {
         var startedAt = DateTime.UtcNow;
+        var settlingWaitBudgetMs = Math.Min(timeoutMs, 1500);
 
         for (var attempt = 0; attempt < 20; attempt++)
         {
@@ -771,37 +817,75 @@ internal static partial class BridgeGameApi
                 return state;
             }
 
-            // Terminal (game over) — navigate to main menu
-            if (state.Done)
+            // If the game is in a transient settling state, give it a short chance to
+            // resolve before forcing the scene back to the main menu.
+            if (ShouldWaitForEnvResetPath(state))
             {
-                var gameOverAction = ResolveEnvResetAction(state, null);
-                if (gameOverAction is not null)
-                {
-                    await ExecuteEnvActionAsync(
-                        gameOverAction.Value.Action,
-                        timeoutMs,
-                        cancellationToken,
-                        $"env.navigate_main_menu.execute:{gameOverAction.Value.Action.ActionId}");
-                    state = await WaitForStableEnvStateAsync(
-                        state.LogicHash, Math.Min(timeoutMs, 10000),
-                        requireActionableOrDone: true, cancellationToken);
-                    continue;
-                }
+                state = await WaitForEnvResetPathStateAsync(
+                    state,
+                    settlingWaitBudgetMs,
+                    cancellationToken);
 
-                // Wait for game_over screen to appear
-                state = await WaitForStableEnvStateAsync(
-                    state.LogicHash, Math.Min(timeoutMs, 5000),
-                    requireActionableOrDone: true, cancellationToken);
-                continue;
+                if (IsStartupPhase(state.Phase) || !state.RunActive)
+                {
+                    return state;
+                }
             }
 
-            // Active run, not terminal — cannot safely navigate.
-            // Return current state; the reset loop will either:
-            //   a) Find an abandon action if we're on main menu with continue
-            //   b) Error out clearly so the caller knows the state
-            break;
+            state = await ForceReturnToMainMenuFromActiveRunAsync(
+                state,
+                Math.Min(timeoutMs, 10000),
+                cancellationToken);
+
+            if (IsStartupPhase(state.Phase) || !state.RunActive)
+            {
+                return state;
+            }
         }
 
         return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.navigate_main_menu.final_snapshot");
+    }
+
+    private static async Task<BridgeEnvSnapshot> ForceReturnToMainMenuFromActiveRunAsync(
+        BridgeEnvSnapshot state,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var returnTask = await RunOnMainThreadGuardedAsync(
+            () =>
+            {
+                var game = NGame.Instance;
+                return game?.ReturnToMainMenuAfterRun();
+            },
+            "env.force_return_to_main_menu.start",
+            timeoutMs,
+            cancellationToken);
+
+        if (returnTask is not null)
+        {
+            try
+            {
+                await returnTask.WaitAsync(
+                    TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 8000)),
+                    cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                // The return task can legitimately outlive the scheduling call because
+                // it performs fade/preload work on the main loop. Fall through to
+                // snapshot polling below.
+            }
+        }
+
+        var snapshot = await WaitForStableEnvStateAsync(
+            state.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: false,
+            cancellationToken);
+
+        return await WaitForEnvResetPathStateAsync(
+            snapshot,
+            timeoutMs,
+            cancellationToken);
     }
 }
