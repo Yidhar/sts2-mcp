@@ -10,6 +10,9 @@ internal sealed class BridgeEnvResetRequest
     [JsonPropertyName("character")]
     public string? Character { get; set; }
 
+    [JsonPropertyName("rebind_active_run")]
+    public bool? RebindActiveRun { get; set; }
+
     [JsonPropertyName("force_fresh")]
     public bool? ForceFresh { get; set; }
 
@@ -156,6 +159,7 @@ internal static partial class BridgeGameApi
     {
         request ??= new BridgeEnvResetRequest();
         var requestedCharacter = request.Character?.Trim();
+        var rebindActiveRun = request.RebindActiveRun == true;
         var forceFresh = request.ForceFresh == true;
         var defensiveBuffs = request.DefensiveBuffs == true;
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
@@ -166,11 +170,41 @@ internal static partial class BridgeGameApi
             cancellationToken,
             "env.reset.initial_snapshot");
 
-        if (!forceFresh && CanReuseFreshEpisode(state, requestedCharacter))
+        var reuseCharacterConstraint = rebindActiveRun ? null : requestedCharacter;
+        if (!forceFresh && CanReuseFreshEpisode(state, reuseCharacterConstraint))
         {
             var readyEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
             state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, timeoutMs, cancellationToken);
             return BuildEnvResetPayload(readyEpisode, state, executedActions);
+        }
+
+        if (rebindActiveRun &&
+            state.RunActive &&
+            !IsStartupPhase(state.Phase))
+        {
+            var rebound = await TryRebindActiveRunAsync(
+                state,
+                requestedCharacter,
+                defensiveBuffs,
+                timeoutMs,
+                cancellationToken);
+            if (rebound is not null)
+            {
+                return rebound;
+            }
+
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "env_reset_rebind_not_ready",
+                "Current run is still transitioning and cannot be rebound yet.",
+                new
+                {
+                    phase = state.Phase,
+                    screen = state.Screen,
+                    actionable = state.Actionable,
+                    done = state.Done,
+                    legal_action_count = state.LegalActions.Length
+                });
         }
 
         // If there's an active run outside startup, try to navigate to main menu.
@@ -731,6 +765,56 @@ internal static partial class BridgeGameApi
         }
 
         return lastSnapshot ?? await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.final_snapshot");
+    }
+
+    private static async Task<object?> TryRebindActiveRunAsync(
+        BridgeEnvSnapshot state,
+        string? requestedCharacter,
+        bool defensiveBuffs,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = state;
+        var startedAt = DateTime.UtcNow;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            snapshot = await WaitForStableEnvStateAsync(
+                snapshot.LogicHash,
+                timeoutMs,
+                requireActionableOrDone: true,
+                cancellationToken);
+
+            if (!snapshot.RunActive || IsStartupPhase(snapshot.Phase))
+            {
+                return null;
+            }
+
+            if (CanReuseFreshEpisode(snapshot, null))
+            {
+                var reboundEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
+                snapshot = await ApplyEnvEpisodeAdjustmentsAsync(reboundEpisode, snapshot, timeoutMs, cancellationToken);
+                return BuildEnvResetPayload(reboundEpisode, snapshot, Array.Empty<object>());
+            }
+
+            if (snapshot.Done)
+            {
+                return null;
+            }
+
+            if (ShouldWaitForEnvResetPath(snapshot))
+            {
+                snapshot = await WaitForEnvResetPathStateAsync(snapshot, timeoutMs, cancellationToken);
+                continue;
+            }
+
+            await WaitForPumpTicksGuardedAsync(1, "env.rebind_active_run.wait_pump", timeoutMs, cancellationToken);
+            snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.rebind_active_run.snapshot");
+        }
+
+        return null;
     }
 
     private static async Task<BridgeEnvSnapshot> WaitForResetAdvanceAsync(

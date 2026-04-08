@@ -142,10 +142,16 @@ internal static partial class BridgeGameApi
         }
 
         var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
+        var potionId = TryGetNestedString(element.Value, "id");
         var title = TryGetNestedString(element.Value, "title");
         var rarity = TryGetNestedString(element.Value, "rarity");
         var target = TryGetNestedString(element.Value, "target_type");
         var desc = TryGetNestedString(element.Value, "description");
+        if (!string.IsNullOrWhiteSpace(potionId))
+        {
+            payload["id"] = potionId;
+        }
+
         if (!string.IsNullOrWhiteSpace(title))
         {
             payload["title"] = title;
@@ -182,15 +188,28 @@ internal static partial class BridgeGameApi
             return null;
         }
 
+        var relicId = TryGetNestedString(element.Value, "id");
         var title = TryGetNestedString(element.Value, "title");
         var rarity = TryGetNestedString(element.Value, "rarity");
         var desc = TryGetNestedString(element.Value, "description");
-        return new
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(relicId))
         {
-            title,
-            rarity,
-            canonical_text = BuildCanonicalRelicText(title, rarity, desc)
-        };
+            payload["id"] = relicId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            payload["title"] = title;
+        }
+
+        if (!string.IsNullOrWhiteSpace(rarity))
+        {
+            payload["rarity"] = rarity;
+        }
+
+        payload["canonical_text"] = BuildCanonicalRelicText(title, rarity, desc);
+        return payload;
     }
 
     private static object? CompactCharacterPayload(JsonElement? element)

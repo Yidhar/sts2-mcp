@@ -12,6 +12,7 @@ Later layers win when both files define the same id.
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,7 @@ _CARD_SIGNAL_ALIASES = {
     "starGain": "star+",
     "strengthGain": "str+",
     "dexterityGain": "dex+",
+    "vigorGain": "vigor+",
     "focusGain": "focus+",
     "thornsGain": "thorn+",
     "intangibleGain": "intang+",
@@ -69,6 +71,51 @@ _CARD_SIGNAL_ALIASES = {
     "potionGain": "pot+",
     "orbGeneration": "orb+",
     "cardsToHand": "hand+",
+}
+_ENTITY_SIGNAL_ALIASES = {
+    "damage": "dmg",
+    "hits": "hits",
+    "block": "blk",
+    "draw": "draw",
+    "discard": "disc",
+    "energyGain": "eng+",
+    "starGain": "star+",
+    "strengthGain": "str+",
+    "dexterityGain": "dex+",
+    "vigorGain": "vigor+",
+    "focusGain": "focus+",
+    "thornsGain": "thorn+",
+    "intangibleGain": "intang+",
+    "heal": "heal",
+    "hpLoss": "hp-",
+    "weak": "weak",
+    "vulnerable": "vuln",
+    "poison": "pois",
+    "calamity": "calam",
+    "summon": "summon",
+    "forge": "forge",
+    "scry": "scry",
+    "potionGain": "pot+",
+    "orbGeneration": "orb+",
+    "cardsToHand": "hand+",
+}
+_INTENT_TYPE_TAGS = {
+    "attack": ("attack",),
+    "singleattackintent": ("attack",),
+    "multiattackintent": ("attack", "multi_hit"),
+    "attackdebuff": ("attack", "debuff"),
+    "attackbuff": ("attack", "buff"),
+    "attackdefend": ("attack", "block"),
+    "block": ("block",),
+    "defend": ("block",),
+    "buff": ("buff",),
+    "debuff": ("debuff",),
+    "statuscard": ("status_card",),
+    "status": ("status_card",),
+    "summon": ("summon",),
+    "sleep": ("sleep",),
+    "escape": ("escape",),
+    "stun": ("stun",),
 }
 
 
@@ -139,11 +186,16 @@ def get_potion_metadata(potion_id: str | None) -> dict[str, Any] | None:
     return _get_metadata("potions", potion_id)
 
 
+def get_enemy_metadata(enemy_id: str | None) -> dict[str, Any] | None:
+    return _get_metadata("enemies", enemy_id)
+
+
 def _entity_title(kind: str, entity_id: str | None) -> str:
     metadata = {
         "card": get_card_metadata,
         "relic": get_relic_metadata,
         "potion": get_potion_metadata,
+        "enemy": get_enemy_metadata,
     }.get(kind, lambda _value: None)(entity_id)
     if metadata:
         title = str(metadata.get("title") or "").strip()
@@ -190,6 +242,66 @@ def _normalize_compact_text(value: Any) -> str:
     if not text:
         return ""
     return " ".join(text.split())
+
+
+def _extract_semantic_hints_from_text(text: Any) -> tuple[dict[str, Any], list[str]]:
+    normalized = _normalize_compact_text(text)
+    if not normalized:
+        return {}, []
+
+    signals: dict[str, Any] = {}
+    tags: list[str] = []
+
+    def add_tag(tag: str) -> None:
+        tag_value = str(tag).strip()
+        if tag_value and tag_value not in tags:
+            tags.append(tag_value)
+
+    def add_signal(key: str, value: Any) -> None:
+        if value in (None, "", False):
+            return
+        signals[key] = value
+
+    numeric_rules = (
+        (r"造成(\d+)点伤害", "damage", "damage"),
+        (r"获得(\d+)点格挡", "block", "block"),
+        (r"抽(\d+)张牌", "draw", "draw"),
+        (r"回复(\d+)点生命", "heal", "heal"),
+        (r"失去(\d+)点生命", "hpLoss", "hp_loss"),
+        (r"获得(\d+)点力量", "strengthGain", "gain_strength"),
+        (r"获得(\d+)点敏捷", "dexterityGain", "gain_dexterity"),
+        (r"获得(\d+)点活力", "vigorGain", "gain_vigor"),
+        (r"给予(\d+)层虚弱", "weak", "apply_weak"),
+        (r"给予(\d+)层易伤", "vulnerable", "apply_vulnerable"),
+        (r"给予(\d+)层中毒", "poison", "apply_poison"),
+    )
+    for pattern, signal_key, tag in numeric_rules:
+        match = re.search(pattern, normalized)
+        if match:
+            add_signal(signal_key, int(match.group(1)))
+            add_tag(tag)
+
+    phrase_tags = (
+        ("拾起时", "on_pickup"),
+        ("每场战斗开始时", "combat_start"),
+        ("在战斗结束时", "combat_end"),
+        ("每回合", "per_turn"),
+        ("免费打出", "cost_zero"),
+        ("状态牌", "status_card"),
+        ("变化", "transform_card"),
+        ("升级", "upgrade"),
+        ("药水栏位", "potion_slots"),
+        ("药水", "potion"),
+        ("随机", "random"),
+        ("消耗", "exhaust"),
+        ("从3张随机", "discover"),
+        ("加入你的手牌", "add_to_hand"),
+    )
+    for needle, tag in phrase_tags:
+        if needle in normalized:
+            add_tag(tag)
+
+    return signals, tags
 
 
 def _resolve_card_variant_metadata(
@@ -252,44 +364,73 @@ def _infer_upgrade_level_from_card_payload(card_payload: dict[str, Any] | None) 
     return title.count("+")
 
 
-def _compact_card_semantic_signals(metadata: dict[str, Any] | None) -> str:
+def _compact_semantic_signals(
+    metadata: dict[str, Any] | None,
+    *,
+    signal_order: tuple[str, ...] | None = None,
+    signal_aliases: dict[str, str] | None = None,
+) -> str:
     if not metadata:
         return ""
     raw = metadata.get("semantic_signals")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not raw:
+        summary_text = metadata.get("summary") or metadata.get("effect") or metadata.get("description")
+        fallback_signals, _ = _extract_semantic_hints_from_text(summary_text)
+        raw = fallback_signals
+    if not isinstance(raw, dict) or not raw:
         return ""
+
+    ordered_keys = tuple(signal_order or ())
+    aliases = signal_aliases or _ENTITY_SIGNAL_ALIASES
 
     parts: list[str] = []
     seen_keys: set[str] = set()
-    for key in _CARD_SIGNAL_ORDER:
+    for key in ordered_keys:
         value = raw.get(key)
         if value in (None, "", False):
             continue
         seen_keys.add(key)
-        alias = _CARD_SIGNAL_ALIASES.get(key, key)
+        alias = aliases.get(key, key)
         parts.append(f"{alias}={_format_compact_number(value)}")
 
     for key in sorted(str(name) for name in raw.keys() if str(name) not in seen_keys):
         value = raw.get(key)
         if value in (None, "", False):
             continue
-        parts.append(f"{key}={_format_compact_number(value)}")
+        alias = aliases.get(key, key)
+        parts.append(f"{alias}={_format_compact_number(value)}")
 
     if not parts:
         return ""
     return "sig " + " ".join(parts)
 
 
-def _compact_card_semantic_tags(metadata: dict[str, Any] | None) -> str:
+def _compact_semantic_tags(metadata: dict[str, Any] | None) -> str:
     if not metadata:
         return ""
     raw = metadata.get("semantic_tags")
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not raw:
+        summary_text = metadata.get("summary") or metadata.get("effect") or metadata.get("description")
+        _, fallback_tags = _extract_semantic_hints_from_text(summary_text)
+        raw = fallback_tags
+    if not isinstance(raw, list) or not raw:
         return ""
     tags = [str(tag).strip() for tag in raw if str(tag).strip()]
     if not tags:
         return ""
     return "tag " + " ".join(tags)
+
+
+def _compact_card_semantic_signals(metadata: dict[str, Any] | None) -> str:
+    return _compact_semantic_signals(
+        metadata,
+        signal_order=_CARD_SIGNAL_ORDER,
+        signal_aliases=_CARD_SIGNAL_ALIASES,
+    )
+
+
+def _compact_card_semantic_tags(metadata: dict[str, Any] | None) -> str:
+    return _compact_semantic_tags(metadata)
 
 
 def _compact_runtime_card_summary(card_payload: dict[str, Any] | None) -> str:
@@ -326,6 +467,94 @@ def _compact_runtime_card_summary(card_payload: dict[str, Any] | None) -> str:
     if effect:
         parts.append(effect)
     return " | ".join(parts)
+
+
+def _compact_runtime_potion_summary(potion_payload: dict[str, Any] | None) -> str:
+    if not isinstance(potion_payload, dict):
+        return ""
+
+    tokens: list[str] = []
+    rarity = _normalize_compact_text(potion_payload.get("rarity"))
+    if rarity:
+        tokens.append(rarity)
+
+    target = _normalize_compact_text(potion_payload.get("target"))
+    if target:
+        tokens.append(target)
+
+    preview_parts: list[str] = []
+    preview_aliases = (
+        ("damage", "dmg"),
+        ("block", "blk"),
+        ("draw", "draw"),
+        ("weak", "weak"),
+        ("vulnerable", "vuln"),
+        ("heal", "heal"),
+        ("hp_loss", "hp-"),
+        ("strength", "str+"),
+        ("dexterity", "dex+"),
+        ("summon", "summon"),
+    )
+    for key, alias in preview_aliases:
+        value = potion_payload.get(key)
+        if value in (None, "", False):
+            continue
+        preview_parts.append(f"{alias}={_format_compact_number(value)}")
+
+    effect = _normalize_compact_text(potion_payload.get("description"))
+    canonical_text = _normalize_compact_text(potion_payload.get("canonical_text"))
+
+    parts: list[str] = []
+    if tokens:
+        parts.append(" ".join(tokens))
+    if preview_parts:
+        parts.append("sig " + " ".join(preview_parts))
+    if effect:
+        parts.append(effect)
+    elif canonical_text:
+        parts.append(canonical_text)
+    return " | ".join(parts)
+
+
+def _compact_entity_static_summary(kind: str, metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+
+    parts: list[str] = []
+    rarity = _normalize_compact_text(metadata.get("rarity"))
+    if rarity:
+        parts.append(rarity)
+
+    semantic_signals = _compact_semantic_signals(metadata)
+    if semantic_signals:
+        parts.append(semantic_signals)
+
+    semantic_tags = _compact_semantic_tags(metadata)
+    if semantic_tags:
+        parts.append(semantic_tags)
+
+    summary = _normalize_compact_text(
+        metadata.get("summary")
+        or metadata.get("effect")
+        or metadata.get("description")
+    )
+    if summary:
+        parts.append(summary)
+
+    if kind == "relic":
+        pools = metadata.get("pools")
+        if isinstance(pools, list):
+            pool_names = []
+            for pool in pools[:2]:
+                if not isinstance(pool, dict):
+                    continue
+                pool_name = _normalize_compact_text(pool.get("name") or pool.get("id"))
+                if pool_name:
+                    pool_names.append(pool_name)
+            if pool_names:
+                parts.append("pool " + ",".join(pool_names))
+
+    return " | ".join(part for part in parts if part)
 
 
 def _compact_card_static_summary(
@@ -470,6 +699,131 @@ def build_live_card_semantic_text(card_payload: dict[str, Any] | None) -> str:
         parts.append(semantic_signals)
     if semantic_tags:
         parts.append(semantic_tags)
+    return " | ".join(part for part in parts if part)
+
+
+def build_live_relic_semantic_text(relic_payload: dict[str, Any] | None) -> str:
+    if not isinstance(relic_payload, dict):
+        return ""
+
+    relic_id = str(relic_payload.get("id") or "").strip()
+    metadata = get_relic_metadata(relic_id)
+
+    title = _normalize_compact_text(relic_payload.get("title"))
+    if not title and relic_id:
+        title = _entity_title("relic", relic_id)
+    elif not title:
+        title = "[unknown relic]"
+
+    runtime_rarity = _normalize_compact_text(relic_payload.get("rarity"))
+    static_summary = _compact_entity_static_summary("relic", metadata)
+    canonical_text = _normalize_compact_text(relic_payload.get("canonical_text"))
+
+    parts = [title]
+    if runtime_rarity and not static_summary.startswith(runtime_rarity):
+        parts.append(runtime_rarity)
+    if static_summary:
+        parts.append(static_summary)
+    elif canonical_text:
+        parts.append(canonical_text)
+    return " | ".join(part for part in parts if part)
+
+
+def build_live_potion_semantic_text(potion_payload: dict[str, Any] | None) -> str:
+    if not isinstance(potion_payload, dict):
+        return ""
+
+    potion_id = str(potion_payload.get("id") or "").strip()
+    metadata = get_potion_metadata(potion_id)
+
+    title = _normalize_compact_text(potion_payload.get("title"))
+    if not title and potion_id:
+        title = _entity_title("potion", potion_id)
+    elif not title:
+        title = "[unknown potion]"
+
+    runtime_summary = _compact_runtime_potion_summary(potion_payload)
+    static_summary = _compact_entity_static_summary("potion", metadata)
+
+    parts = [title]
+    if runtime_summary:
+        parts.append(runtime_summary)
+    if static_summary and static_summary != runtime_summary:
+        parts.append(static_summary)
+    return " | ".join(part for part in parts if part)
+
+
+def _normalize_intent_type(intent_type: Any) -> str:
+    raw = _normalize_compact_text(intent_type)
+    if not raw:
+        return ""
+    return raw.replace("Intent", "")
+
+
+def build_enemy_intent_semantic_text(intent_payload: dict[str, Any] | None) -> str:
+    if not isinstance(intent_payload, dict):
+        return ""
+
+    title = _normalize_compact_text(intent_payload.get("title"))
+    intent_type_raw = _normalize_compact_text(intent_payload.get("intent_type"))
+    intent_type = _normalize_intent_type(intent_type_raw)
+    description = _normalize_compact_text(intent_payload.get("description"))
+
+    signal_parts: list[str] = []
+    total_damage = intent_payload.get("total_damage")
+    if total_damage not in (None, "", False):
+        signal_parts.append(f"dmg={_format_compact_number(total_damage)}")
+    repeats = intent_payload.get("repeats")
+    if repeats not in (None, "", False) and int(float(repeats)) > 1:
+        signal_parts.append(f"hits={_format_compact_number(repeats)}")
+
+    tag_parts: list[str] = []
+    normalized_lookup = intent_type_raw.lower().replace(" ", "")
+    for key, tags in _INTENT_TYPE_TAGS.items():
+        if key in normalized_lookup:
+            for tag in tags:
+                if tag not in tag_parts:
+                    tag_parts.append(tag)
+
+    parts: list[str] = []
+    if title:
+        parts.append(title)
+    if intent_type:
+        parts.append(f"type {intent_type}")
+    if signal_parts:
+        parts.append("sig " + " ".join(signal_parts))
+    if tag_parts:
+        parts.append("tag " + " ".join(tag_parts))
+    if description:
+        parts.append(description)
+    return " | ".join(part for part in parts if part)
+
+
+def build_live_enemy_semantic_text(enemy_payload: dict[str, Any] | None) -> str:
+    if not isinstance(enemy_payload, dict):
+        return ""
+
+    name = _normalize_compact_text(enemy_payload.get("name")) or "[unknown enemy]"
+    intent_text = build_enemy_intent_semantic_text(enemy_payload.get("intent"))
+
+    power_parts: list[str] = []
+    for power in (enemy_payload.get("powers") or [])[:3]:
+        if not isinstance(power, dict):
+            continue
+        power_title = _normalize_compact_text(power.get("title"))
+        amount = power.get("amount")
+        if not power_title:
+            continue
+        if amount in (None, "", False):
+            power_parts.append(power_title)
+        else:
+            power_parts.append(f"{power_title}:{_format_compact_number(amount)}")
+
+    parts = [name]
+    if intent_text:
+        parts.append(intent_text)
+    if power_parts:
+        parts.append("pow " + " ".join(power_parts))
     return " | ".join(part for part in parts if part)
 
 

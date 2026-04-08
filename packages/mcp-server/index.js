@@ -4436,10 +4436,10 @@ function summarizeRlBridgeActionInfo(result) {
 
   const info = {
     screen_after:
-      typeof result.screen_after === "string"
-        ? result.screen_after
-        : typeof result?.state?.screen === "string"
-          ? result.state.screen
+      typeof result?.state?.screen === "string"
+        ? result.state.screen
+        : typeof result.screen_after === "string"
+          ? result.screen_after
           : null,
     state_version_after: Number.isInteger(result.state_version_after)
       ? result.state_version_after
@@ -4943,10 +4943,7 @@ async function performBridgeAction(
       if (!Number.isInteger(settledResult?.state_version_after)) {
         settledResult.state_version_after = getStateVersionValue(settledResult.state);
       }
-      if (
-        typeof settledResult?.screen_after !== "string" &&
-        typeof settledResult?.state?.screen === "string"
-      ) {
+      if (typeof settledResult?.state?.screen === "string") {
         settledResult.screen_after = settledResult.state.screen;
       }
 
@@ -5078,6 +5075,10 @@ async function maybeSettleAfterAction(session, actionId, result) {
   return {
     ...result,
     state: settled.state,
+    screen_after:
+      typeof settled?.state?.screen === "string"
+        ? settled.state.screen
+        : result?.screen_after ?? null,
     state_version_after:
       settled?.state?.state_version ?? result?.state_version_after ?? null,
     state_hash_after:

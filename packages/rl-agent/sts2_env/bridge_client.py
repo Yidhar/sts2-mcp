@@ -174,6 +174,7 @@ class BridgeClient:
     def reset(
         self,
         character: str | None = None,
+        rebind_active_run: bool = False,
         force_fresh: bool = False,
         defensive_buffs: bool = False,
         timeout_ms: int = 45_000,
@@ -186,6 +187,8 @@ class BridgeClient:
         body: dict[str, Any] = {"timeout_ms": timeout_ms}
         if character is not None:
             body["character"] = character
+        if rebind_active_run:
+            body["rebind_active_run"] = True
         if force_fresh:
             body["force_fresh"] = True
         if defensive_buffs:

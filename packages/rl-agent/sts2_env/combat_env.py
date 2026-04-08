@@ -13,11 +13,13 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
+from combat_snapshot_dataset import snapshot_row_to_reset_kwargs
 from .bridge_client import BridgeClient
 from .observation_v2 import DictObservationEncoder, MAX_ACTIONS
 
 INVALID_ACTION_REWARD = -1.0
 INVALID_ACTION_REASON = "invalid_action_index"
+BLOCKED_ACTION_KINDS = {"discard_potion"}
 
 
 class CombatSandboxEnv(gym.Env):
@@ -43,6 +45,7 @@ class CombatSandboxEnv(gym.Env):
         relics: list[str] | None = None,
         potions: list[str] | None = None,
         gold: int | None = None,
+        snapshot_pool = None,
         reset_timeout_ms: int = 15000,
         step_timeout_ms: int = 20000,
         render_mode: str | None = None,
@@ -64,6 +67,7 @@ class CombatSandboxEnv(gym.Env):
         self.relics = relics
         self.potions = potions
         self.gold = gold
+        self.snapshot_pool = snapshot_pool
         self.reset_timeout_ms = reset_timeout_ms
         self.step_timeout_ms = step_timeout_ms
         self.render_mode = render_mode
@@ -77,6 +81,7 @@ class CombatSandboxEnv(gym.Env):
         self._last_obs_raw: dict[str, Any] | None = None
         self._current_encounter_id: str | None = encounter_id
         self._last_action_overflow: int = 0
+        self._current_snapshot: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -87,23 +92,43 @@ class CombatSandboxEnv(gym.Env):
 
         # Allow per-reset overrides via options dict
         opts = options or {}
-        encounter_id = opts.get("encounter_id")
+        snapshot = opts.get("snapshot")
+        if snapshot is None and self.snapshot_pool is not None:
+            snapshot = self.snapshot_pool.sample(self.np_random)
+        snapshot_kwargs = snapshot_row_to_reset_kwargs(snapshot) if isinstance(snapshot, dict) else {}
+
+        encounter_id = opts.get("encounter_id", snapshot_kwargs.get("encounter_id"))
         if encounter_id is None:
             encounter_id = self._sample_encounter_id()
         reset_seed = opts.get("seed", self.seed)
         self._current_encounter_id = encounter_id
+        self._current_snapshot = snapshot if isinstance(snapshot, dict) else None
+
+        character = opts.get("character", snapshot_kwargs.get("character", self.character))
+        current_hp = opts.get("current_hp", snapshot_kwargs.get("current_hp", self.current_hp))
+        max_hp = opts.get("max_hp", snapshot_kwargs.get("max_hp", self.max_hp))
+        max_energy = opts.get("max_energy", snapshot_kwargs.get("max_energy", self.max_energy))
+        deck = opts.get("deck", snapshot_kwargs.get("deck", self.deck))
+        relics = opts.get("relics", snapshot_kwargs.get("relics", self.relics))
+        gold = opts.get("gold", snapshot_kwargs.get("gold", self.gold))
+        if "potions" in opts:
+            potions = opts.get("potions")
+        elif snapshot_kwargs.get("potions") is not None:
+            potions = snapshot_kwargs.get("potions")
+        else:
+            potions = self.potions
 
         result = self.bridge.combat_reset(
-            character=self.character,
+            character=character,
             encounter_id=encounter_id,
             seed=reset_seed,
-            current_hp=self.current_hp,
-            max_hp=self.max_hp,
-            max_energy=self.max_energy,
-            deck=self.deck,
-            relics=self.relics,
-            potions=self.potions,
-            gold=self.gold,
+            current_hp=current_hp,
+            max_hp=max_hp,
+            max_energy=max_energy,
+            deck=deck,
+            relics=relics,
+            potions=potions,
+            gold=gold,
             timeout_ms=self.reset_timeout_ms,
         )
 
@@ -192,7 +217,16 @@ class CombatSandboxEnv(gym.Env):
 
     def _update_live_state(self, result: dict[str, Any]) -> None:
         legal_actions = result.get("legal_actions", [])
-        self._legal_actions = legal_actions if isinstance(legal_actions, list) else []
+        if isinstance(legal_actions, list):
+            self._legal_actions = [
+                action for action in legal_actions
+                if not (
+                    isinstance(action, dict) and
+                    str(action.get("kind") or "").strip() in BLOCKED_ACTION_KINDS
+                )
+            ]
+        else:
+            self._legal_actions = []
         obs = result.get("obs", {})
         self._last_obs_raw = obs if isinstance(obs, dict) else {}
         self._last_action_overflow = max(len(self._legal_actions) - MAX_ACTIONS, 0)
@@ -206,6 +240,7 @@ class CombatSandboxEnv(gym.Env):
         return info
 
     def _build_info(self, bridge_info: Any, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        current_snapshot = self._current_snapshot or {}
         info: dict[str, Any] = {
             "episode_id": self._episode_id,
             "action_mask": self.action_masks(),
@@ -215,6 +250,10 @@ class CombatSandboxEnv(gym.Env):
             "episode_mode": "combat_sandbox",
             "encounter_id": self._current_encounter_id,
             "encounter_pool": self.encounter_pool,
+            "snapshot_sample_id": current_snapshot.get("sample_id"),
+            "snapshot_run_id": current_snapshot.get("run_id"),
+            "snapshot_floor_number": current_snapshot.get("floor_number"),
+            "snapshot_build_id": current_snapshot.get("build_id"),
             "bridge_info": self._decorate_bridge_info(bridge_info),
         }
         if extra:
@@ -222,6 +261,8 @@ class CombatSandboxEnv(gym.Env):
         if self.include_debug_info:
             info["legal_actions"] = self._legal_actions
             info["raw_obs"] = self._last_obs_raw
+            if current_snapshot:
+                info["combat_snapshot"] = current_snapshot
         return info
 
     def _make_invalid_action_response(self, attempted_action: Any):

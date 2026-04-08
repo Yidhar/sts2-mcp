@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from content_registry import build_live_card_semantic_text
+from content_registry import (
+    build_enemy_intent_semantic_text,
+    build_live_card_semantic_text,
+    build_live_enemy_semantic_text,
+    build_live_potion_semantic_text,
+    build_live_relic_semantic_text,
+)
 
 from .text_encoder import TEXT_DIM
 
@@ -455,24 +461,9 @@ class DictObservationEncoder:
                     row[9] = 1.0
 
             if self.use_text:
-                parts = [enemy.get("name", "")]
-                intent_title = intent.get("title")
-                intent_type = intent.get("intent_type")
-                intent_description = intent.get("description")
-                if intent_title:
-                    parts.append(f"意图:{intent_title}")
-                if intent.get("total_damage"):
-                    parts.append(f"伤害:{intent['total_damage']}")
-                elif intent_type:
-                    parts.append(f"类型:{intent_type}")
-                if intent_description:
-                    parts.append(f"描述:{intent_description}")
-                for power in powers[:3]:
-                    if isinstance(power, dict):
-                        parts.append(f"{power.get('title', '')}:{power.get('amount', '')}")
-                joined = "｜".join(part for part in parts if part)
-                if joined:
-                    texts.append(joined)
+                text_value = build_live_enemy_semantic_text(enemy)
+                if text_value:
+                    texts.append(text_value)
                     text_slots.append(index)
 
         if texts:
@@ -513,7 +504,9 @@ class DictObservationEncoder:
         slots: list[int] = []
         for index, relic in enumerate(entries[:MAX_RELICS]):
             if isinstance(relic, dict):
-                canonical_text = relic.get("canonical_text", "") or relic.get("title", "")
+                canonical_text = build_live_relic_semantic_text(relic)
+                if not canonical_text:
+                    canonical_text = relic.get("canonical_text", "") or relic.get("title", "")
             elif isinstance(relic, str):
                 canonical_text = relic
             else:
@@ -538,7 +531,9 @@ class DictObservationEncoder:
         slots: list[int] = []
         for index, potion in enumerate(entries[:MAX_POTIONS]):
             if isinstance(potion, dict):
-                canonical_text = potion.get("canonical_text", "")
+                canonical_text = build_live_potion_semantic_text(potion)
+                if not canonical_text:
+                    canonical_text = potion.get("canonical_text", "")
                 title = potion.get("title", "")
             elif isinstance(potion, str):
                 canonical_text = ""
@@ -566,7 +561,18 @@ class DictObservationEncoder:
         if not text:
             domain = self._resolve_domain(obs)
             phase = obs.get("phase", "")
-            text = f"阶段：{phase}｜决策域：{domain}"
+            combat = obs.get("combat") or {}
+            enemy_intents: list[str] = []
+            for enemy in (combat.get("enemies") or [])[:3]:
+                if not isinstance(enemy, dict):
+                    continue
+                intent_text = build_enemy_intent_semantic_text(enemy.get("intent"))
+                if intent_text:
+                    enemy_intents.append(intent_text)
+            if enemy_intents:
+                text = f"阶段：{phase}｜决策域：{domain}｜敌人意图：{' || '.join(enemy_intents)}"
+            else:
+                text = f"阶段：{phase}｜决策域：{domain}"
         vector[:] = self._get_encoder().encode(text)
 
     def _enc_actions(
@@ -613,13 +619,13 @@ class DictObservationEncoder:
 
         kind = str(action.get("kind") or "").strip()
         canonical_text = str(action.get("canonical_text") or "").strip()
+        target = action.get("target") if isinstance(action.get("target"), dict) else {}
+        target_name = str((target or {}).get("name") or "").strip()
 
         card = action.get("card")
         if isinstance(card, dict):
             card_text = self._build_live_card_text(card)
             if kind == "play_card":
-                target = action.get("target") if isinstance(action.get("target"), dict) else {}
-                target_name = str((target or {}).get("name") or "").strip()
                 parts = ["play", card_text]
                 if target_name:
                     parts.append(f"tgt {target_name}")
@@ -647,6 +653,33 @@ class DictObservationEncoder:
                 prefix = f"select {semantics}".strip() if semantics else "select"
                 return " | ".join(part for part in (prefix, card_text) if part)
 
+        potion = action.get("potion")
+        if isinstance(potion, dict):
+            potion_text = build_live_potion_semantic_text(potion)
+            if kind == "use_potion":
+                parts = ["use potion", potion_text]
+                if target_name:
+                    parts.append(f"tgt {target_name}")
+                return " | ".join(part for part in parts if part)
+            if kind == "discard_potion":
+                return " | ".join(part for part in ("discard potion", potion_text) if part)
+
+        reward = action.get("reward")
+        if isinstance(reward, dict):
+            reward_relic = reward.get("relic")
+            if isinstance(reward_relic, dict):
+                relic_text = build_live_relic_semantic_text(reward_relic)
+                if relic_text:
+                    prefix = "take relic" if kind in ("reward", "treasure_relic") else (kind or "relic")
+                    return " | ".join(part for part in (prefix, relic_text) if part)
+
+            reward_potion = reward.get("potion")
+            if isinstance(reward_potion, dict):
+                potion_text = build_live_potion_semantic_text(reward_potion)
+                if potion_text:
+                    prefix = "take potion" if kind == "reward" else (kind or "potion")
+                    return " | ".join(part for part in (prefix, potion_text) if part)
+
         if kind == "shop":
             item = action.get("item")
             if isinstance(item, dict):
@@ -659,6 +692,26 @@ class DictObservationEncoder:
                     if item_text:
                         prefix = "leave shop" if any(token in shop_action for token in ("leave", "back")) else "buy"
                         return " | ".join(part for part in (prefix, item_text, cost_text) if part)
+                item_relic = item.get("relic")
+                if isinstance(item_relic, dict):
+                    item_text = build_live_relic_semantic_text(item_relic)
+                    if item_text:
+                        prefix = "leave shop" if any(token in shop_action for token in ("leave", "back")) else "buy relic"
+                        return " | ".join(part for part in (prefix, item_text, cost_text) if part)
+                item_potion = item.get("potion")
+                if isinstance(item_potion, dict):
+                    item_text = build_live_potion_semantic_text(item_potion)
+                    if item_text:
+                        prefix = "leave shop" if any(token in shop_action for token in ("leave", "back")) else "buy potion"
+                        return " | ".join(part for part in (prefix, item_text, cost_text) if part)
+
+        relic = action.get("relic")
+        if isinstance(relic, dict):
+            relic_text = build_live_relic_semantic_text(relic)
+            if kind == "treasure_relic":
+                return " | ".join(part for part in ("take relic", relic_text) if part)
+            if relic_text:
+                return " | ".join(part for part in (kind or "relic", relic_text) if part)
 
         return canonical_text
 

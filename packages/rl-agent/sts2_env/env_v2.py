@@ -28,6 +28,7 @@ INVALID_ACTION_REASON = "invalid_action_index"
 BLOCKED_ACTION_KINDS = {"discard_potion"}
 RECOVERY_POLL_INTERVAL_S = 0.10
 RECOVERY_MAX_WAIT_MS = 15_000
+TRANSITION_RECOVERY_MAX_WAIT_MS = 60_000
 RESET_READY_POLL_INTERVAL_S = 0.50
 RESET_READY_MAX_WAIT_MS = 90_000
 STEP_RECOVERY_TRUNCATION_REASON = "bridge_episode_lost"
@@ -89,7 +90,7 @@ class SlayTheSpire2EnvV2(gym.Env):
     def step(self, action: int):
         if not self._legal_actions:
             recovered = self._recover_filtered_action_window(
-                timeout_ms=min(self.step_timeout_ms, RECOVERY_MAX_WAIT_MS)
+                timeout_ms=self._transition_recovery_timeout_ms()
             )
             if not recovered:
                 return self._make_terminal()
@@ -108,18 +109,51 @@ class SlayTheSpire2EnvV2(gym.Env):
             )
         except Exception as exc:
             if self._is_episode_lost_error(exc):
+                recovered = self._soft_rebind_into_current_run(
+                    timeout_ms=self._transition_recovery_timeout_ms()
+                )
+                if recovered is not None:
+                    self._episode_id = recovered.get("episode_id", self._episode_id)
+                    self._update_live_state(recovered)
+                    obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions)
+                    info = self._build_info(
+                        {},
+                        extra={
+                            "bridge_episode_lost": True,
+                            "bridge_episode_rebound": True,
+                            "bridge_exception": str(exc),
+                            "step_recovery": "soft_rebind_current_run",
+                        },
+                    )
+                    return obs, 0.0, False, False, info
                 return self._make_step_recovery_response(exc)
             raise
 
         self._update_live_state(result)
+        reward = float(result.get("reward", 0.0))
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
+        bridge_info = result.get("info", {})
+
+        if truncated and not terminated:
+            recovered = self._soft_rebind_into_current_run(
+                timeout_ms=self._transition_recovery_timeout_ms()
+            )
+            if recovered is not None:
+                self._episode_id = recovered.get("episode_id", self._episode_id)
+                self._update_live_state(recovered)
+                terminated = False
+                truncated = False
+                bridge_info = self._decorate_recovery_bridge_info(
+                    bridge_info,
+                    recovery_reason="soft_rebind_after_truncated_step",
+                )
+
         if not terminated and not truncated:
-            self._recover_filtered_action_window(timeout_ms=min(self.step_timeout_ms, RECOVERY_MAX_WAIT_MS))
+            self._recover_filtered_action_window(timeout_ms=self._transition_recovery_timeout_ms())
 
         obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions)
-        reward = float(result.get("reward", 0.0))
-        info = self._build_info(result.get("info", {}))
+        info = self._build_info(bridge_info)
 
         if self.render_mode == "human":
             self.render()
@@ -342,11 +376,88 @@ class SlayTheSpire2EnvV2(gym.Env):
             return None
         return state if isinstance(state, dict) else None
 
+    def _transition_recovery_timeout_ms(self) -> int:
+        return max(
+            RECOVERY_MAX_WAIT_MS,
+            min(self.reset_timeout_ms, TRANSITION_RECOVERY_MAX_WAIT_MS),
+        )
+
+    def _soft_rebind_into_current_run(self, timeout_ms: int) -> dict[str, Any] | None:
+        if timeout_ms <= 0:
+            return None
+
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
+        rebind_timeout_ms = max(1_000, min(timeout_ms, self.reset_timeout_ms))
+
+        while time.monotonic() < deadline:
+            state = self._safe_get_state()
+            if not self._state_allows_soft_rebind(state):
+                return None
+
+            if not self._state_has_unblocked_actions(state):
+                time.sleep(RECOVERY_POLL_INTERVAL_S)
+                continue
+
+            try:
+                result = self.bridge.reset(
+                    rebind_active_run=True,
+                    defensive_buffs=self.defensive_buffs,
+                    timeout_ms=rebind_timeout_ms,
+                )
+            except Exception as exc:
+                if not self._is_transient_reset_error(exc):
+                    return None
+                time.sleep(RECOVERY_POLL_INTERVAL_S)
+                continue
+
+            if not isinstance(result, dict):
+                time.sleep(RECOVERY_POLL_INTERVAL_S)
+                continue
+
+            phase = self._extract_phase(result)
+            filtered_actions = self._filter_legal_actions(result.get("legal_actions", []), phase=phase)
+            if filtered_actions:
+                return result
+
+            time.sleep(RECOVERY_POLL_INTERVAL_S)
+
+        return None
+
+    def _state_allows_soft_rebind(self, state: dict[str, Any] | None) -> bool:
+        if not isinstance(state, dict):
+            return False
+
+        phase = str(state.get("phase") or "").strip()
+        if phase.startswith("startup_") or phase == "terminal":
+            return False
+
+        screen = str(state.get("screen") or "").strip().upper()
+        if screen in {"MAIN_MENU", "TITLE_SCREEN"}:
+            return False
+
+        run = state.get("run")
+        if isinstance(run, dict):
+            if run.get("game_over") is True or run.get("is_game_over") is True:
+                return False
+
+            active = run.get("active")
+            if active is not None:
+                return bool(active)
+
+        return True
+
+    def _decorate_recovery_bridge_info(self, bridge_info: Any, *, recovery_reason: str) -> dict[str, Any]:
+        info = dict(bridge_info) if isinstance(bridge_info, dict) else {}
+        diagnostics = info.get("action_diagnostics")
+        diagnostics = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+        diagnostics["soft_rebind_recovery"] = 1.0
+        info["action_diagnostics"] = diagnostics
+        info["step_recovery"] = recovery_reason
+        return info
+
     def _safe_reset_into_current_run(self, timeout_ms: int) -> dict[str, Any] | None:
         try:
-            result = self._reset_with_ready_gate(
-                timeout_ms=max(1_000, min(timeout_ms, self.reset_timeout_ms))
-            )
+            result = self._soft_rebind_into_current_run(timeout_ms)
         except Exception:
             return None
         return result if isinstance(result, dict) else None

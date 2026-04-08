@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Text.Json.Serialization;
 using System.ComponentModel;
 using MegaCrit.Sts2.Core.Assets;
+using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Map;
@@ -114,6 +115,7 @@ internal static partial class BridgeGameApi
             catch (Exception ex)
             {
                 diagnostics.Add($"Combat room entry task await failed: {ex.GetBaseException().Message}");
+                diagnostics.Add($"Combat room entry exception detail: {ex}");
             }
         }
 
@@ -121,15 +123,16 @@ internal static partial class BridgeGameApi
         await WaitForPumpTicksGuardedAsync(8, "combat_sandbox.settle_scene", timeoutMs, cancellationToken);
 
         // Step 3: Wait for a stable state that is actually different from the pre-reset baseline.
-        var state = await WaitForStableEnvStateAsync(
+        var state = await WaitForCombatSandboxReadyStateAsync(
             beforeSetup.LogicHash,
             timeoutMs,
-            requireActionableOrDone: true,
+            diagnostics,
             cancellationToken);
 
         // Step 4: Retry the debug room entry once more on a later pump if the scene has not flipped
-        // to combat yet. This keeps the fallback tight and avoids rebuilding half-initialized runs.
-        if (!state.CombatInProgress &&
+        // to an actionable combat-facing state yet. This keeps the fallback tight and avoids
+        // rebuilding half-initialized runs.
+        if (!IsCombatSandboxResetReady(state) &&
             !state.Done &&
             HasUsableCombatSandboxRunScene(state))
         {
@@ -141,21 +144,30 @@ internal static partial class BridgeGameApi
             if (deferredEnterStarted)
             {
                 await WaitForPumpTicksGuardedAsync(5, "combat_sandbox.deferred_enter_wait", timeoutMs, cancellationToken);
-                state = await WaitForStableEnvStateAsync(
+                state = await WaitForCombatSandboxReadyStateAsync(
                     state.LogicHash,
                     Math.Min(timeoutMs, 5000),
-                    requireActionableOrDone: true,
+                    diagnostics,
                     cancellationToken);
             }
         }
 
-        if (!state.CombatInProgress && !state.Done)
+        if (!IsCombatSandboxResetReady(state) && !state.Done)
         {
             throw new BridgeRequestException(
                 HttpStatusCode.Conflict,
                 "combat_sandbox_not_in_combat",
                 $"Combat sandbox setup completed but the game is not in combat. Phase: {state.Phase}",
-                new { phase = state.Phase, actionable = state.Actionable, diagnostics });
+                new
+                {
+                    phase = state.Phase,
+                    screen = state.Screen,
+                    actionable = state.Actionable,
+                    combat_in_progress = state.CombatInProgress,
+                    room_type = state.RoomType,
+                    room_model_id = state.RoomModelId,
+                    diagnostics
+                });
         }
 
         // Step 5: Create the sandbox episode
@@ -213,39 +225,56 @@ internal static partial class BridgeGameApi
             priorState = settledState;
         }
 
-        if (HasUsableCombatSandboxRunScene(priorState) && !priorState.CombatInProgress)
+        priorState = await TryPrepareCombatSandboxFastResetStateAsync(
+            priorState,
+            timeoutMs,
+            diagnostics,
+            cancellationToken);
+
+        if (CanReuseCombatSandboxRunScene(priorState))
         {
             diagnostics.Add(
                 $"Reusing existing run scene for combat sandbox reset (phase={priorState.Phase}, screen={priorState.Screen})");
-            await RunOnMainThreadGuardedAsync(
-                () =>
-                {
-                    ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
-                    return true;
-                },
-                "combat_sandbox.reuse_overrides",
-                timeoutMs,
-                cancellationToken);
-            await WaitForPumpTicksGuardedAsync(1, "combat_sandbox.reuse_overrides.post_pump", timeoutMs, cancellationToken);
             return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.reuse_snapshot");
         }
 
+        if (HasUsableCombatSandboxRunScene(priorState) && !priorState.CombatInProgress)
+        {
+            diagnostics.Add(
+                $"Active run scene is not safe to reuse for combat sandbox reset (phase={priorState.Phase}, screen={priorState.Screen}); bootstrapping via env/reset instead");
+        }
+
+        Task? freshRunTask;
         try
         {
-            await ResetEnvResponseAsync(
-                new BridgeEnvResetRequest
-                {
-                    Character = request.Character?.Trim(),
-                    DefensiveBuffs = false,
-                    TimeoutMs = timeoutMs
-                },
+            freshRunTask = await RunOnMainThreadGuardedAsync(
+                () => BeginFreshCombatSandboxRun(request, priorState, diagnostics),
+                "combat_sandbox.begin_fresh_run",
+                timeoutMs,
                 cancellationToken);
         }
         catch (BridgeRequestException ex)
         {
-            diagnostics.Add($"env/reset bootstrap failed: {ex.ErrorCode}: {ex.Message}");
+            diagnostics.Add($"fresh combat sandbox bootstrap failed: {ex.ErrorCode}: {ex.Message}");
             throw;
         }
+
+        if (freshRunTask is not null)
+        {
+            try
+            {
+                await freshRunTask.WaitAsync(
+                    TimeSpan.FromMilliseconds(Math.Min(timeoutMs, 10000)),
+                    cancellationToken);
+                diagnostics.Add("Fresh combat sandbox run task completed");
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add($"Fresh combat sandbox run task await failed: {ex.GetBaseException().Message}");
+            }
+        }
+
+        await WaitForPumpTicksGuardedAsync(3, "combat_sandbox.begin_fresh_run.post_pump", timeoutMs, cancellationToken);
 
         var state = await WaitForStableEnvStateAsync(
             null,
@@ -254,7 +283,7 @@ internal static partial class BridgeGameApi
             cancellationToken);
 
         diagnostics.Add(
-            $"env/reset bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
+            $"fresh combat sandbox bootstrap settled at phase={state.Phase}, screen={state.Screen}, run_active={state.RunActive}, run_node={(state.Context.RunNode is not null)}, current_room={(state.Context.RunState?.CurrentRoom is not null)}");
 
         if (!HasUsableCombatSandboxRunScene(state))
         {
@@ -285,6 +314,85 @@ internal static partial class BridgeGameApi
                state.Context.RunState?.CurrentRoom is not null;
     }
 
+    private static bool CanReuseCombatSandboxRunScene(BridgeEnvSnapshot state)
+    {
+        // Reusing an existing run scene is measurably less stable than bootstrapping
+        // a fresh single-player run for sandbox resets. Hidden room/UI residue can
+        // leave the game in a half-entered COMBAT/settling state and crash reset.
+        // For training stability, disable scene reuse entirely.
+        return false;
+    }
+
+    private static async Task<BridgeEnvSnapshot> TryPrepareCombatSandboxFastResetStateAsync(
+        BridgeEnvSnapshot state,
+        int timeoutMs,
+        List<string> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = state;
+
+        // Terminal / game-over states are much cheaper to recover by walking back to
+        // startup first, then launching a fresh sandbox run from there.
+        if (snapshot.Done && !IsStartupPhase(snapshot.Phase))
+        {
+            diagnostics.Add(
+                $"Combat sandbox fast-reset: navigating terminal state back to startup (phase={snapshot.Phase}, screen={snapshot.Screen})");
+            snapshot = await NavigateToMainMenuFromActiveRunAsync(
+                snapshot,
+                Math.Min(timeoutMs, 10000),
+                cancellationToken);
+            diagnostics.Add(
+                $"Combat sandbox fast-reset terminal navigation settled at phase={snapshot.Phase}, screen={snapshot.Screen}, run_active={snapshot.RunActive}, done={snapshot.Done}");
+        }
+
+        // Victory/reward flows can usually be recycled by skipping rewards and
+        // returning to the map instead of rebuilding a whole run scene.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            if (CanReuseCombatSandboxRunScene(snapshot) ||
+                snapshot.Done ||
+                !snapshot.RunActive ||
+                snapshot.CombatInProgress)
+            {
+                return snapshot;
+            }
+
+            var rewardPhase =
+                string.Equals(snapshot.Phase, "reward", StringComparison.Ordinal) ||
+                string.Equals(snapshot.Phase, "card_reward", StringComparison.Ordinal) ||
+                string.Equals(snapshot.Screen, "REWARDS", StringComparison.OrdinalIgnoreCase);
+            if (!rewardPhase)
+            {
+                return snapshot;
+            }
+
+            if (!snapshot.ActionLookup.TryGetValue("proceed", out var proceedAction))
+            {
+                diagnostics.Add(
+                    $"Combat sandbox fast-reset: reward-like state had no proceed action (phase={snapshot.Phase}, screen={snapshot.Screen})");
+                return snapshot;
+            }
+
+            diagnostics.Add(
+                $"Combat sandbox fast-reset: skipping reward flow via proceed from phase={snapshot.Phase}, screen={snapshot.Screen}");
+            await ExecuteEnvActionAsync(
+                proceedAction,
+                timeoutMs,
+                cancellationToken,
+                "combat_sandbox.fast_reset.proceed");
+
+            snapshot = await WaitForStableEnvStateAsync(
+                snapshot.LogicHash,
+                Math.Min(timeoutMs, 5000),
+                requireActionableOrDone: true,
+                cancellationToken);
+            diagnostics.Add(
+                $"Combat sandbox fast-reset: reward proceed settled at phase={snapshot.Phase}, screen={snapshot.Screen}, run_active={snapshot.RunActive}, combat_in_progress={snapshot.CombatInProgress}");
+        }
+
+        return snapshot;
+    }
+
     private static Task BeginFreshCombatSandboxRun(
         BridgeEnvCombatResetRequest request,
         BridgeEnvSnapshot priorState,
@@ -311,8 +419,6 @@ internal static partial class BridgeGameApi
             saveManager.GenerateUnlockStateFromProgress(),
             1uL);
 
-        ApplyCombatSandboxPlayerOverrides(player, request, diagnostics);
-
         var runState = RunState.CreateForNewRun(
             new[] { player },
             ActModel.GetDefaultList().Select(act => act.ToMutable()).ToList(),
@@ -322,14 +428,16 @@ internal static partial class BridgeGameApi
             seed);
 
         runManager.SetUpNewSinglePlayer(runState, shouldSave: false);
+        ForceCombatSandboxNoNeowStartup(runState, diagnostics);
         diagnostics.Add("Prepared fresh singleplayer run state for combat sandbox");
 
-        return StartFreshCombatSandboxRunAsync(game, runState, diagnostics);
+        return StartFreshCombatSandboxRunAsync(game, runState, request, diagnostics);
     }
 
     private static async Task StartFreshCombatSandboxRunAsync(
         NGame game,
         RunState runState,
+        BridgeEnvCombatResetRequest request,
         List<string> diagnostics)
     {
         using (new NetLoadingHandle(RunManager.Instance.NetService))
@@ -339,10 +447,36 @@ internal static partial class BridgeGameApi
             await RunManager.Instance.FinalizeStartingRelics();
             RunManager.Instance.Launch();
             game.RootSceneContainer.SetCurrentScene(NRun.Create(runState));
+            ForceCombatSandboxNoNeowStartup(runState, diagnostics);
             await RunManager.Instance.EnterAct(0, doTransition: false);
         }
 
+        var context = CaptureContext();
+        var player = GetPrimaryPlayer(context);
+        if (player is not null)
+        {
+            ApplyCombatSandboxPlayerOverrides(player, request, diagnostics);
+        }
+        else
+        {
+            diagnostics.Add("Fresh combat sandbox run started but active player was not found for overrides");
+        }
+
         diagnostics.Add("Started fresh singleplayer run for combat sandbox");
+    }
+
+    private static void ForceCombatSandboxNoNeowStartup(
+        RunState? runState,
+        List<string> diagnostics)
+    {
+        if (runState?.ExtraFields is null)
+        {
+            diagnostics.Add("Combat sandbox bootstrap could not force StartedWithNeow=false because run state extra fields were unavailable");
+            return;
+        }
+
+        runState.ExtraFields.StartedWithNeow = false;
+        diagnostics.Add("Forced StartedWithNeow=false for combat sandbox bootstrap");
     }
 
     private static CharacterModel ResolveCombatSandboxCharacter(
@@ -461,7 +595,21 @@ internal static partial class BridgeGameApi
 
         if (request.Deck is { Length: > 0 })
         {
-            player.Deck.Clear(silent: true);
+            var liveRunState = player.RunState as RunState;
+            if (liveRunState is null)
+            {
+                diagnostics.Add("Deck override warning: player.RunState was not a live RunState; deck cards will be attached without run-state registration");
+            }
+
+            foreach (var existingCard in player.Deck.Cards.ToList())
+            {
+                player.Deck.RemoveInternal(existingCard, silent: true);
+                if (liveRunState is not null)
+                {
+                    liveRunState.RemoveCard(existingCard);
+                }
+            }
+
             var added = 0;
             foreach (var cardId in request.Deck)
             {
@@ -474,6 +622,16 @@ internal static partial class BridgeGameApi
                 var mutableCard = card.ToMutable();
                 mutableCard.FloorAddedToDeck = 1;
                 player.Deck.AddInternal(mutableCard, -1, silent: true);
+                if (liveRunState is not null)
+                {
+                    liveRunState.AddCard(mutableCard, player);
+                }
+                else
+                {
+                    mutableCard.Owner = player;
+                }
+
+                mutableCard.AfterCreated();
                 added++;
             }
 
@@ -588,8 +746,92 @@ internal static partial class BridgeGameApi
         catch (Exception ex)
         {
             diagnostics.Add($"Deferred EnterRoomDebug await failed: {ex.GetBaseException().Message}");
+            diagnostics.Add($"Deferred EnterRoomDebug exception detail: {ex}");
             return false;
         }
+    }
+
+    private static async Task<BridgeEnvSnapshot> WaitForCombatSandboxReadyStateAsync(
+        string? baselineLogicHash,
+        int timeoutMs,
+        List<string> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTime.UtcNow;
+        var stableHash = string.Empty;
+        var stableCount = 0;
+        BridgeEnvSnapshot? lastSnapshot = null;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.wait_ready.snapshot");
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken);
+            lastSnapshot = snapshot;
+
+            var changedFromBaseline = baselineLogicHash is null ||
+                                      !baselineLogicHash.Equals(snapshot.LogicHash, StringComparison.Ordinal);
+            var ready = snapshot.Done || IsCombatSandboxResetReady(snapshot);
+
+            if (ready && changedFromBaseline)
+            {
+                if (snapshot.LogicHash.Equals(stableHash, StringComparison.Ordinal))
+                {
+                    stableCount++;
+                }
+                else
+                {
+                    stableHash = snapshot.LogicHash;
+                    stableCount = 1;
+                }
+
+                if (stableCount >= EnvStableSampleTarget)
+                {
+                    diagnostics.Add(
+                        $"Combat sandbox ready: phase={snapshot.Phase}, screen={snapshot.Screen}, actionable={snapshot.Actionable}, combat_in_progress={snapshot.CombatInProgress}, room_type={snapshot.RoomType}, room_model_id={snapshot.RoomModelId}");
+                    return snapshot;
+                }
+            }
+            else
+            {
+                stableHash = string.Empty;
+                stableCount = 0;
+            }
+
+            await WaitForPumpTicksGuardedAsync(1, "combat_sandbox.wait_ready.wait_pump", timeoutMs, cancellationToken);
+        }
+
+        if (lastSnapshot is not null)
+        {
+            diagnostics.Add(
+                $"Combat sandbox ready wait timed out at phase={lastSnapshot.Phase}, screen={lastSnapshot.Screen}, actionable={lastSnapshot.Actionable}, combat_in_progress={lastSnapshot.CombatInProgress}, room_type={lastSnapshot.RoomType}, room_model_id={lastSnapshot.RoomModelId}");
+            return lastSnapshot;
+        }
+
+        var finalSnapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.wait_ready.final_snapshot");
+        diagnostics.Add(
+            $"Combat sandbox ready wait ended with fallback snapshot phase={finalSnapshot.Phase}, screen={finalSnapshot.Screen}, actionable={finalSnapshot.Actionable}, combat_in_progress={finalSnapshot.CombatInProgress}, room_type={finalSnapshot.RoomType}, room_model_id={finalSnapshot.RoomModelId}");
+        return finalSnapshot;
+    }
+
+    private static bool IsCombatSandboxResetReady(BridgeEnvSnapshot snapshot)
+    {
+        if (!snapshot.RunActive || !snapshot.CombatInProgress || !snapshot.Actionable)
+        {
+            return false;
+        }
+
+        if (string.Equals(snapshot.Phase, "combat", StringComparison.Ordinal) &&
+            string.Equals(snapshot.Screen, "COMBAT", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Some relics can legitimately open a combat-start selection surface before the first
+        // playable combat frame (for example Gambling Chip mulligan). That is still a valid
+        // combat sandbox start state and should not hard-fail reset.
+        return string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) &&
+               string.Equals(snapshot.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase);
     }
 
     private static object? PrepareEncounterForRoomEntry(object? encounter, List<string> diagnostics)
@@ -698,6 +940,9 @@ internal static partial class BridgeGameApi
                 };
             }
 
+            ResetCombatManagerForSandboxEntry(diagnostics);
+            ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
+
             // 3. Enter the requested encounter on the fresh active run scene.
             var entered = TryEnterCombatViaDebugRoom(runManager, encounter, diagnostics, out var pendingTask);
             if (!entered)
@@ -728,6 +973,19 @@ internal static partial class BridgeGameApi
                 ErrorMessage = ex.Message
             };
         }
+    }
+
+    private static void ResetCombatManagerForSandboxEntry(List<string> diagnostics)
+    {
+        var combatManager = CombatManager.Instance;
+        if (combatManager is null)
+        {
+            diagnostics.Add("Combat sandbox setup: CombatManager.Instance was null; skipping combat reset");
+            return;
+        }
+
+        combatManager.Reset(graceful: true);
+        diagnostics.Add("Combat sandbox setup: reset CombatManager before entering new encounter");
     }
 
     // -----------------------------------------------------------------------
@@ -1344,6 +1602,7 @@ internal static partial class BridgeGameApi
         out object?[] args)
     {
         args = new object?[parameters.Length];
+        var roomType = TryResolveEncounterRoomType(encounter) ?? RoomType.Monster;
 
         for (var i = 0; i < parameters.Length; i++)
         {
@@ -1357,13 +1616,13 @@ internal static partial class BridgeGameApi
 
             if (parameterType == typeof(RoomType))
             {
-                args[i] = RoomType.Monster;
+                args[i] = roomType;
                 continue;
             }
 
             if (parameterType == typeof(MapPointType))
             {
-                args[i] = MapPointType.Monster;
+                args[i] = MapPointType.Unassigned;
                 continue;
             }
 
@@ -1383,6 +1642,38 @@ internal static partial class BridgeGameApi
         }
 
         return true;
+    }
+
+    private static RoomType? TryResolveEncounterRoomType(object encounter)
+    {
+        if (encounter is EncounterModel typedEncounter)
+        {
+            return typedEncounter.RoomType;
+        }
+
+        try
+        {
+            var roomTypeProperty = encounter.GetType().GetProperty(
+                "RoomType",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var value = roomTypeProperty?.GetValue(encounter);
+            if (value is RoomType typedRoomType)
+            {
+                return typedRoomType;
+            }
+
+            if (value is not null &&
+                Enum.TryParse<RoomType>(value.ToString(), ignoreCase: true, out var parsedRoomType))
+            {
+                return parsedRoomType;
+            }
+        }
+        catch
+        {
+            // Best-effort only; the caller falls back to Monster.
+        }
+
+        return null;
     }
 
     // -----------------------------------------------------------------------

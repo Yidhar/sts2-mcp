@@ -92,16 +92,33 @@ def write_extracted_run_history(bundle: dict[str, Any], output_dir: str | Path) 
 def build_offline_training_samples(bundle: dict[str, Any], player_id: int | None = None) -> dict[str, list[dict[str, Any]]]:
     summary, floor_views = _build_player_floor_views(bundle, player_id=player_id)
     if not floor_views:
-        return {"route_samples": [], "card_choice_samples": [], "build_samples": []}
+        return {
+            "route_samples": [],
+            "card_choice_samples": [],
+            "build_samples": [],
+            "combat_snapshot_samples": [],
+        }
 
     route_samples = _build_route_samples(summary, floor_views)
     card_choice_samples = _build_card_choice_samples(summary, floor_views)
     build_samples = _build_build_samples(summary, floor_views)
+    combat_snapshot_samples = _build_combat_snapshot_samples(summary, floor_views)
     return {
         "route_samples": route_samples,
         "card_choice_samples": card_choice_samples,
         "build_samples": build_samples,
+        "combat_snapshot_samples": combat_snapshot_samples,
     }
+
+
+def build_offline_combat_snapshot_samples(
+    bundle: dict[str, Any],
+    player_id: int | None = None,
+) -> list[dict[str, Any]]:
+    summary, floor_views = _build_player_floor_views(bundle, player_id=player_id)
+    if not floor_views:
+        return []
+    return _build_combat_snapshot_samples(summary, floor_views)
 
 
 def build_offline_build_v2_samples(
@@ -1342,6 +1359,124 @@ def _summarize_deck_instances(deck_state: list[dict[str, Any]]) -> dict[str, Any
         "upgraded_card_count": sum(1 for card in deck_state if int(card.get("current_upgrade_level", 0) or 0) > 0),
         "cards": cards,
     }
+
+
+def _expand_deck_card_id_multiset(deck_summary: dict[str, Any] | None) -> list[str]:
+    if not isinstance(deck_summary, dict):
+        return []
+
+    card_ids: list[str] = []
+    for card in deck_summary.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        card_id = card.get("id")
+        count = int(card.get("count", 0) or 0)
+        if not card_id or count <= 0:
+            continue
+        card_ids.extend([str(card_id)] * count)
+    return card_ids
+
+
+def _expand_deck_entry_multiset(deck_summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(deck_summary, dict):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for card in deck_summary.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        card_id = card.get("id")
+        count = int(card.get("count", 0) or 0)
+        upgraded_count = int(card.get("upgraded_count", 0) or 0)
+        max_upgrade_level = int(card.get("max_upgrade_level", 0) or 0)
+        if not card_id or count <= 0:
+            continue
+
+        base_count = max(0, count - upgraded_count)
+        entries.extend(
+            {
+                "id": str(card_id),
+                "upgrade_level": 0,
+            }
+            for _ in range(base_count)
+        )
+        entries.extend(
+            {
+                "id": str(card_id),
+                "upgrade_level": max_upgrade_level,
+            }
+            for _ in range(max(0, upgraded_count))
+        )
+    return entries
+
+
+def _build_combat_snapshot_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+
+    for floor in floor_views:
+        room_type = str(floor.get("room_type") or "").lower()
+        encounter_id = floor.get("room_model_id")
+        if room_type not in {"monster", "elite", "boss"}:
+            continue
+        if not encounter_id:
+            continue
+
+        max_hp = floor.get("max_hp")
+        hp_before = floor.get("hp_before")
+        snapshot_current_hp = hp_before if isinstance(hp_before, int) and hp_before > 0 else floor.get("current_hp")
+        if not isinstance(snapshot_current_hp, int) or snapshot_current_hp <= 0:
+            continue
+        if not isinstance(max_hp, int) or max_hp <= 0:
+            continue
+
+        deck_before = floor.get("deck_before")
+        deck_card_ids = _expand_deck_card_id_multiset(deck_before)
+        deck_entries = _expand_deck_entry_multiset(deck_before)
+        if not deck_card_ids:
+            continue
+
+        relic_ids_before = list(floor.get("relic_ids_before") or [])
+
+        samples.append(
+            {
+                "sample_id": f"{summary['run_id']}:combat_snapshot:{floor['floor_number']}",
+                "run_id": summary["run_id"],
+                "split": summary["split"],
+                "build_id": summary.get("build_id"),
+                "character": floor.get("character"),
+                "ascension": summary.get("ascension"),
+                "source_run_win": summary.get("win"),
+                "source_run_path_point_count": summary.get("path_point_count"),
+                "source_run_time_seconds": summary.get("run_time_seconds"),
+                "source_killed_by_encounter": summary.get("killed_by_encounter"),
+                "floor_number": floor.get("floor_number"),
+                "act_index": floor.get("act_index"),
+                "path_index": floor.get("path_index"),
+                "map_point_type": floor.get("map_point_type"),
+                "room_type": floor.get("room_type"),
+                "encounter_id": encounter_id,
+                "room_model_id": encounter_id,
+                "monster_ids": list(floor.get("monster_ids") or []),
+                "turns_taken": floor.get("turns_taken"),
+                "snapshot_current_hp": snapshot_current_hp,
+                "snapshot_max_hp": max_hp,
+                "snapshot_hp_ratio": (
+                    max(0.0, min(snapshot_current_hp / max_hp, 2.0))
+                    if max_hp > 0 else None
+                ),
+                "snapshot_gold": floor.get("gold_before"),
+                "snapshot_max_energy": 3,
+                "deck_before": deck_before,
+                "deck_card_ids": deck_card_ids,
+                "deck_entries": deck_entries,
+                "relic_ids_before": relic_ids_before,
+                "potion_ids_before": None,
+                "potion_state_known": False,
+                "quality_flags": floor.get("quality_flags"),
+            }
+        )
+
+    return samples
 
 
 def _build_route_samples(summary: dict[str, Any], floor_views: list[dict[str, Any]]) -> list[dict[str, Any]]:

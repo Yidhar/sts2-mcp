@@ -11,6 +11,7 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -19,7 +20,10 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
+from combat_snapshot_dataset import CombatSnapshotPool
+from launcher import get_session_files as get_default_multi_session_files
 from sts2_env.checkpoint import load_online_checkpoint_metadata, load_online_policy_state_dict, save_online_checkpoint
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
@@ -48,6 +52,81 @@ def parse_encounter_pool(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def parse_session_files(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def resolve_training_session_files(
+    *,
+    n_envs: int,
+    session_file: str | None,
+    session_files: list[str],
+) -> list[str | None]:
+    if n_envs < 1:
+        raise ValueError("--n-envs must be >= 1")
+
+    if session_file and session_files:
+        raise ValueError("Use either --session-file or --session-files, not both.")
+
+    if session_files:
+        if len(session_files) != n_envs:
+            raise ValueError(
+                f"--session-files count ({len(session_files)}) must match --n-envs ({n_envs})."
+            )
+        return session_files
+
+    if n_envs == 1:
+        return [session_file]
+
+    return get_default_multi_session_files(n_envs)
+
+
+def build_train_env_factory(
+    *,
+    env_index: int,
+    session_file: str | None,
+    use_text: bool,
+    log_dir: str,
+    combat_sandbox: bool,
+    character: str | None,
+    encounter_id: str | None,
+    encounter_pool: list[str],
+    snapshot_pool: CombatSnapshotPool | None,
+    reset_timeout_ms: int,
+    step_timeout_ms: int,
+) -> Callable[[], object]:
+    def _factory():
+        obs_encoder = DictObservationEncoder(use_text=use_text)
+        if combat_sandbox:
+            env = CombatSandboxEnv(
+                session_file=session_file,
+                character=character,
+                encounter_id=encounter_id,
+                encounter_pool=encounter_pool,
+                snapshot_pool=snapshot_pool,
+                reset_timeout_ms=reset_timeout_ms,
+                step_timeout_ms=step_timeout_ms,
+                obs_encoder=obs_encoder,
+            )
+        else:
+            env = SlayTheSpire2EnvV2(
+                session_file=session_file,
+                character=character,
+                reset_timeout_ms=reset_timeout_ms,
+                step_timeout_ms=step_timeout_ms,
+                obs_encoder=obs_encoder,
+            )
+
+        monitor_name = "monitor" if env_index == 0 else f"monitor_{env_index}"
+        env = Monitor(env, filename=str(Path(log_dir) / monitor_name))
+        env = ActionMasker(env, mask_fn)
+        return env
+
+    return _factory
 
 
 def sanitize_metric_key(value: str) -> str:
@@ -447,6 +526,9 @@ def build_online_checkpoint_metadata(
         "timesteps": int(timesteps),
         "mode": "combat_sandbox" if args.combat_sandbox else "full_run",
         "character": args.character,
+        "combat_snapshot_dataset": args.combat_snapshot_dataset,
+        "combat_snapshot_split": args.combat_snapshot_split or None,
+        "combat_snapshot_sample_mode": args.combat_snapshot_sample_mode if args.combat_snapshot_dataset else None,
     }
 
 
@@ -467,11 +549,23 @@ def build_policy_kwargs_from_args(args) -> dict[str, object]:
     )
 
 
+def _get_live_supported_encounter_ids(session_file=None):
+    from sts2_env.bridge_client import BridgeClient
+
+    client = BridgeClient(session_path=session_file)
+    catalog = client.combat_catalog()
+    return [
+        entry.get("encounter_id")
+        for entry in (catalog.get("encounters") or [])
+        if entry.get("encounter_id")
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train STS2 RL Agent")
     parser.add_argument("--total-timesteps", type=int, default=100_000)
     parser.add_argument("--character", type=str, default=None)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument(
         "--lr-schedule",
         type=str,
@@ -491,10 +585,30 @@ def main():
         default=0.0,
         help="Warmup fraction for --lr-schedule warmup_cosine.",
     )
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--n-steps", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--n-steps", type=int, default=256)
+    parser.add_argument("--n-epochs", type=int, default=4)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--vf-coef", type=float, default=0.25)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--session-file", type=str, default=None)
+    parser.add_argument(
+        "--session-files",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated bridge session file paths for multi-instance training. "
+            "When omitted and --n-envs > 1, defaults to session_0..session_{n-1}.json under APPDATA/SlayTheSpire2/bridge."
+        ),
+    )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="Number of parallel training environments / bridge instances.",
+    )
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint-freq", type=int, default=1000)
@@ -513,6 +627,58 @@ def main():
             "Comma-separated encounter IDs sampled uniformly on each combat reset. "
             "If omitted in --combat-sandbox mode, defaults to starter-deck-friendly early Act 1 weak encounters."
         ),
+    )
+    parser.add_argument(
+        "--combat-snapshot-dataset",
+        type=str,
+        default=None,
+        help=(
+            "Path to combat_snapshot_samples.{jsonl,parquet} or a dataset root/partition dir. "
+            "When set in --combat-sandbox mode, each episode samples a historical pre-combat build snapshot."
+        ),
+    )
+    parser.add_argument(
+        "--combat-snapshot-split",
+        type=str,
+        default="train",
+        help="Split filter for --combat-snapshot-dataset. Use '' to disable. Default: train.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-character",
+        type=str,
+        default=None,
+        help="Optional character filter for --combat-snapshot-dataset. Defaults to --character when set.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-build-id",
+        type=str,
+        default=None,
+        help="Optional build_id filter for --combat-snapshot-dataset.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-max-rows",
+        type=int,
+        default=None,
+        help="Optional cap on loaded combat snapshot rows.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-min-floor",
+        type=int,
+        default=None,
+        help="Optional minimum floor filter for combat snapshots.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-max-floor",
+        type=int,
+        default=None,
+        help="Optional maximum floor filter for combat snapshots.",
+    )
+    parser.add_argument(
+        "--combat-snapshot-sample-mode",
+        type=str,
+        default="encounter_balanced",
+        choices=("row_uniform", "encounter_balanced"),
+        help="Sampling mode for combat snapshot episodes. Default: encounter_balanced.",
     )
     parser.add_argument("--reset-timeout-ms", type=int, default=None,
                         help="Override env reset timeout in milliseconds")
@@ -582,13 +748,55 @@ def main():
     init_metadata = load_online_checkpoint_metadata(args.init_checkpoint) if args.init_checkpoint else None
     use_text = False if args.no_text else bool((init_metadata or {}).get("use_text", True))
     text_model_name = (init_metadata or {}).get("text_model") or args.text_model
-    if args.combat_sandbox and not args.encounter_id and not args.encounter_pool:
+    if args.combat_sandbox and not args.encounter_id and not args.encounter_pool and not args.combat_snapshot_dataset:
         args.encounter_pool = DEFAULT_COMBAT_SANDBOX_TRAIN_POOL
     if args.combat_sandbox and not args.eval_holdout_pool:
         args.eval_holdout_pool = DEFAULT_COMBAT_SANDBOX_HOLDOUT_POOL
 
     encounter_pool = parse_encounter_pool(args.encounter_pool)
     eval_holdout_pool = parse_encounter_pool(args.eval_holdout_pool)
+    session_files = parse_session_files(args.session_files)
+    try:
+        resolved_session_files = resolve_training_session_files(
+            n_envs=args.n_envs,
+            session_file=args.session_file,
+            session_files=session_files,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    primary_session_file = resolved_session_files[0]
+    if args.eval_freq > 0 and len(resolved_session_files) > 1:
+        parser.error("--eval-freq with --n-envs > 1 is not supported yet.")
+
+    snapshot_split = args.combat_snapshot_split or None
+    snapshot_pool = None
+    if args.combat_snapshot_dataset:
+        snapshot_character = args.combat_snapshot_character or args.character
+        supported_encounter_ids = _get_live_supported_encounter_ids(session_file=primary_session_file)
+        snapshot_pool = CombatSnapshotPool.from_path(
+            args.combat_snapshot_dataset,
+            split=snapshot_split,
+            character=snapshot_character,
+            build_id=args.combat_snapshot_build_id,
+            encounter_ids=supported_encounter_ids,
+            min_floor=args.combat_snapshot_min_floor,
+            max_floor=args.combat_snapshot_max_floor,
+            max_rows=args.combat_snapshot_max_rows,
+            sample_mode=args.combat_snapshot_sample_mode,
+        )
+        snapshot_summary = snapshot_pool.summary()
+        print(
+            "[train] Loaded combat snapshot pool "
+            f"rows={snapshot_summary['row_count']} "
+            f"encounters={snapshot_summary['encounter_count']} "
+            f"floors={snapshot_summary['min_floor']}..{snapshot_summary['max_floor']} "
+            f"characters={snapshot_summary['characters']} "
+            f"build_ids={snapshot_summary['build_ids']} "
+            f"sample_mode={snapshot_summary['sample_mode']}"
+        )
+        if snapshot_summary["top_encounters"]:
+            print(f"[train] Combat snapshot top_encounters={snapshot_summary['top_encounters']}")
     lr_schedule = build_lr_schedule(
         args.lr_schedule,
         args.learning_rate,
@@ -605,49 +813,67 @@ def main():
         ).ensure_ready()
 
     # Environment
-    obs_encoder = DictObservationEncoder(use_text=use_text)
-    if args.combat_sandbox:
-        if not args.encounter_id and not encounter_pool:
-            parser.error("--combat-sandbox requires --encounter-id or --encounter-pool")
-        env = CombatSandboxEnv(
-            session_file=args.session_file,
+    if args.combat_sandbox and not args.encounter_id and not encounter_pool and snapshot_pool is None:
+        parser.error("--combat-sandbox requires --encounter-id, --encounter-pool, or --combat-snapshot-dataset")
+
+    env_fns = [
+        build_train_env_factory(
+            env_index=env_index,
+            session_file=session_file,
+            use_text=use_text,
+            log_dir=args.log_dir,
+            combat_sandbox=args.combat_sandbox,
             character=args.character,
             encounter_id=args.encounter_id,
             encounter_pool=encounter_pool,
-            reset_timeout_ms=args.reset_timeout_ms or 30000,
+            snapshot_pool=snapshot_pool,
+            reset_timeout_ms=args.reset_timeout_ms or (30000 if args.combat_sandbox else 60000),
             step_timeout_ms=args.step_timeout_ms or 20000,
-            obs_encoder=obs_encoder,
         )
+        for env_index, session_file in enumerate(resolved_session_files)
+    ]
+
+    if len(env_fns) == 1:
+        env = env_fns[0]()
     else:
-        env = SlayTheSpire2EnvV2(
-            session_file=args.session_file,
-            character=args.character,
-            reset_timeout_ms=args.reset_timeout_ms or 60000,
-            step_timeout_ms=args.step_timeout_ms or 20000,
-            obs_encoder=obs_encoder,
+        env = SubprocVecEnv(
+            env_fns,
+            start_method="spawn",
         )
-    env = Monitor(env, filename=str(Path(args.log_dir) / "monitor"))
-    env = ActionMasker(env, mask_fn)
+
+    rollout_size = int(args.n_steps) * max(len(resolved_session_files), 1)
+    if args.batch_size > rollout_size:
+        parser.error(
+            f"--batch-size ({args.batch_size}) cannot exceed rollout size "
+            f"(--n-steps * --n-envs = {rollout_size})."
+        )
+    if rollout_size % args.batch_size != 0:
+        print(
+            f"[train] Warning: rollout_size={rollout_size} is not divisible by batch_size={args.batch_size}; "
+            "the final minibatch of each epoch will be truncated."
+        )
 
     # Model
     mode = "combat_sandbox" if args.combat_sandbox else "full_run"
     policy_kwargs = (init_metadata or {}).get("policy_kwargs") or build_policy_kwargs_from_args(args)
     print(
         f"[train] Creating new model mode={mode} "
-        f"(text={'on' if use_text else 'off'})"
+        f"(text={'on' if use_text else 'off'}, n_envs={len(resolved_session_files)})"
     )
+    if len(resolved_session_files) > 1:
+        print(f"[train] Session files: {resolved_session_files}")
     model = MaskablePPO(
         STS2CandidateScoringPolicy,
         env,
         learning_rate=lr_schedule,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         verbose=args.verbose,
@@ -665,10 +891,18 @@ def main():
         f"base_lr={args.learning_rate:.8f} min_lr={args.min_learning_rate:.8f} "
         f"warmup_fraction={args.warmup_fraction:.4f}"
     )
+    print(
+        f"[train] PPO geometry n_envs={len(resolved_session_files)} "
+        f"n_steps={args.n_steps} rollout_size={rollout_size} batch_size={args.batch_size} "
+        f"n_epochs={args.n_epochs} gamma={args.gamma:.4f} gae_lambda={args.gae_lambda:.4f} "
+        f"ent_coef={args.ent_coef:.4f} vf_coef={args.vf_coef:.4f}"
+    )
 
     total = sum(p.numel() for p in model.policy.parameters())
     print(f"[train] Parameters: {total:,}")
     if args.combat_sandbox:
+        if snapshot_pool is not None:
+            print(f"[train] Combat sandbox snapshot_dataset={args.combat_snapshot_dataset}")
         if encounter_pool:
             print(f"[train] Combat sandbox encounter_pool={encounter_pool}")
         else:
@@ -716,39 +950,60 @@ def main():
             )
         )
     callbacks = CallbackList(callbacks_list)
-    model.learn(
-        total_timesteps=args.total_timesteps,
-        callback=callbacks,
-        reset_num_timesteps=not bool(args.init_checkpoint),
-    )
-    elapsed = time.time() - start
-    print(f"[train] Done in {elapsed:.0f}s")
+    try:
+        model.learn(
+            total_timesteps=args.total_timesteps,
+            callback=callbacks,
+            reset_num_timesteps=not bool(args.init_checkpoint),
+        )
+        elapsed = time.time() - start
+        print(f"[train] Done in {elapsed:.0f}s")
 
-    final = Path(args.checkpoint_dir) / "final"
-    save_online_checkpoint(
-        model,
-        final,
-        metadata=build_online_checkpoint_metadata(
-            args,
-            use_text=use_text,
-            timesteps=int(getattr(model, "num_timesteps", args.total_timesteps)),
-            policy_kwargs=policy_kwargs,
-            text_model_name=text_model_name,
-        ),
-    )
-    print(f"[train] Saved {final}")
-
-    # Save text cache
-    if use_text:
+        final = Path(args.checkpoint_dir) / "final"
+        save_online_checkpoint(
+            model,
+            final,
+            metadata=build_online_checkpoint_metadata(
+                args,
+                use_text=use_text,
+                timesteps=int(getattr(model, "num_timesteps", args.total_timesteps)),
+                policy_kwargs=policy_kwargs,
+                text_model_name=text_model_name,
+            ),
+        )
+        print(f"[train] Saved {final}")
+    except Exception:
+        crash_timesteps = int(getattr(model, "num_timesteps", 0))
+        crash_name = f"crash_{crash_timesteps:08d}_{time.strftime('%Y%m%d-%H%M%S')}"
+        crash_dir = Path(args.checkpoint_dir) / crash_name
         try:
-            from sts2_env.text_encoder import get_text_encoder
-            enc = get_text_encoder()
-            enc.save_cache()
-            print(f"[train] Text cache saved ({enc.cache_size} entries)")
-        except Exception:
-            pass
+            save_online_checkpoint(
+                model,
+                crash_dir,
+                metadata=build_online_checkpoint_metadata(
+                    args,
+                    use_text=use_text,
+                    timesteps=crash_timesteps,
+                    policy_kwargs=policy_kwargs,
+                    text_model_name=text_model_name,
+                ),
+            )
+            print(f"[train] Saved crash checkpoint {crash_dir}")
+        except Exception as save_exc:
+            print(f"[train] Failed to save crash checkpoint: {save_exc}")
+        raise
+    finally:
+        # Save text cache
+        if use_text:
+            try:
+                from sts2_env.text_encoder import get_text_encoder
+                enc = get_text_encoder()
+                enc.save_cache()
+                print(f"[train] Text cache saved ({enc.cache_size} entries)")
+            except Exception:
+                pass
 
-    env.close()
+        env.close()
 
 
 if __name__ == "__main__":

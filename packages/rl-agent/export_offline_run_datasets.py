@@ -25,6 +25,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from combat_snapshot_dataset import clean_combat_snapshot_rows
 from run_history_parser import (
     build_offline_build_v2_samples,
     build_offline_training_samples,
@@ -88,6 +89,7 @@ def _build_manifest(
     route_samples: list[dict[str, Any]],
     card_choice_samples: list[dict[str, Any]],
     build_samples: list[dict[str, Any]],
+    combat_snapshot_samples: list[dict[str, Any]],
     build_samples_by_type: dict[str, list[dict[str, Any]]],
     build_v2_task_rows: dict[str, list[dict[str, Any]]] | None = None,
     build_v2_audit: dict[str, Any] | None = None,
@@ -125,6 +127,7 @@ def _build_manifest(
             "route_samples": len(route_samples),
             "card_choice_samples": len(card_choice_samples),
             "build_samples": len(build_samples),
+            "combat_snapshot_samples": len(combat_snapshot_samples),
         },
         "build_dataset_counts_by_type": {
             decision_type: len(rows)
@@ -158,6 +161,7 @@ def _write_dataset_bundle(
     route_samples: list[dict[str, Any]],
     card_choice_samples: list[dict[str, Any]],
     build_samples: list[dict[str, Any]],
+    combat_snapshot_samples: list[dict[str, Any]],
     build_v2_task_rows: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +171,7 @@ def _write_dataset_bundle(
     _write_jsonl(output_dir / "route_samples.jsonl", route_samples)
     _write_jsonl(output_dir / "card_choice_samples.jsonl", card_choice_samples)
     _write_jsonl(output_dir / "build_samples.jsonl", build_samples)
+    _write_jsonl(output_dir / "combat_snapshot_samples.jsonl", combat_snapshot_samples)
 
     build_samples_by_type: dict[str, list[dict[str, Any]]] = {}
     for sample in build_samples:
@@ -366,9 +371,14 @@ def main() -> None:
     route_samples: list[dict[str, Any]] = []
     card_choice_samples: list[dict[str, Any]] = []
     build_samples: list[dict[str, Any]] = []
+    combat_snapshot_samples: list[dict[str, Any]] = []
+    combat_snapshot_clean_reasons: Counter[str] = Counter()
+    combat_snapshot_input_rows = 0
+    combat_snapshot_dropped_rows = 0
     build_samples_by_type: dict[str, list[dict[str, Any]]] = {}
     build_v2_task_rows: dict[str, list[dict[str, Any]]] = {}
     build_v2_audit_totals: Counter[str] = Counter()
+    run_to_build_family_basic: dict[str, str] = {}
 
     skip_reasons: Counter[str] = Counter()
     source_kinds: Counter[str] = Counter()
@@ -442,6 +452,23 @@ def main() -> None:
         samples = build_offline_training_samples(bundle)
         build_v2 = build_offline_build_v2_samples(bundle)
         basic_accepted += 1
+        run_to_build_family_basic[str(summary.get("run_id"))] = _resolve_build_family(summary.get("build_id"))
+        combat_rows = samples.get("combat_snapshot_samples") or []
+        combat_snapshot_input_rows += len(combat_rows)
+        if combat_rows:
+            cleaned_combat_rows, clean_report = clean_combat_snapshot_rows(combat_rows)
+            combat_snapshot_samples.extend(cleaned_combat_rows)
+            combat_snapshot_dropped_rows += int(clean_report.get("dropped_rows", 0) or 0)
+            for reason, count in (clean_report.get("reject_reasons") or {}).items():
+                if isinstance(count, int):
+                    combat_snapshot_clean_reasons[str(reason)] += count
+            raw_payload_index[-1]["combat_snapshot_included"] = True
+            raw_payload_index[-1]["combat_snapshot_count"] = len(cleaned_combat_rows)
+            raw_payload_index[-1]["combat_snapshot_raw_count"] = len(combat_rows)
+        else:
+            raw_payload_index[-1]["combat_snapshot_included"] = False
+            raw_payload_index[-1]["combat_snapshot_count"] = 0
+            raw_payload_index[-1]["combat_snapshot_raw_count"] = 0
         keep, reason = _quality_filter_bundle(
             bundle,
             samples,
@@ -476,7 +503,8 @@ def main() -> None:
             print(
                 f"[progress] accepted={accepted} processed={processed} "
                 f"route={len(route_samples)} card={len(card_choice_samples)} "
-                f"build={len(build_samples)} build_v2={sum(len(rows) for rows in build_v2_task_rows.values())}"
+                f"build={len(build_samples)} combat={len(combat_snapshot_samples)} "
+                f"build_v2={sum(len(rows) for rows in build_v2_task_rows.values())}"
             )
 
     filters = {
@@ -500,6 +528,7 @@ def main() -> None:
         route_samples=route_samples,
         card_choice_samples=card_choice_samples,
         build_samples=build_samples,
+        combat_snapshot_samples=combat_snapshot_samples,
         build_samples_by_type=build_samples_by_type,
         build_v2_task_rows=build_v2_task_rows,
         build_v2_audit=dict(sorted(build_v2_audit_totals.items())),
@@ -507,6 +536,14 @@ def main() -> None:
             "source_counts": dict(sorted(source_kinds.items())),
             "archive_member_counts": dict(sorted(archive_members.items())),
             "unique_payloads": len(seen_payload_digests),
+            "combat_snapshot_filter_scope": "basic_filters_plus_strict_playable_rows",
+            "combat_snapshot_source_runs": len({str(row.get("run_id")) for row in combat_snapshot_samples}),
+            "combat_snapshot_cleaning": {
+                "input_rows": combat_snapshot_input_rows,
+                "kept_rows": len(combat_snapshot_samples),
+                "dropped_rows": combat_snapshot_dropped_rows,
+                "reject_reasons": dict(sorted(combat_snapshot_clean_reasons.items())),
+            },
         },
     )
     _write_dataset_bundle(
@@ -518,6 +555,7 @@ def main() -> None:
         route_samples=route_samples,
         card_choice_samples=card_choice_samples,
         build_samples=build_samples,
+        combat_snapshot_samples=combat_snapshot_samples,
         build_v2_task_rows=build_v2_task_rows,
     )
     if raw_payload_index:
@@ -535,6 +573,7 @@ def main() -> None:
     route_by_build = _bucket_rows_by_build_id(route_samples, run_to_build_id=run_to_build_id)
     card_by_build = _bucket_rows_by_build_id(card_choice_samples, run_to_build_id=run_to_build_id)
     build_by_build = _bucket_rows_by_build_id(build_samples, run_to_build_id=run_to_build_id)
+    combat_by_build = _bucket_rows_by_build_id(combat_snapshot_samples, run_to_build_id=run_to_build_id)
     build_v2_by_build = {
         task_name: _bucket_rows_by_build_id(rows, run_to_build_id=run_to_build_id)
         for task_name, rows in build_v2_task_rows.items()
@@ -564,6 +603,7 @@ def main() -> None:
             route_samples=route_by_build.get(build_id, []),
             card_choice_samples=card_by_build.get(build_id, []),
             build_samples=partition_build_samples,
+            combat_snapshot_samples=combat_by_build.get(build_id, []),
             build_samples_by_type=partition_build_samples_by_type,
             build_v2_task_rows={
                 task_name: buckets.get(build_id, [])
@@ -573,6 +613,8 @@ def main() -> None:
                 "partition_key": "build_id",
                 "partition_value": build_id,
                 "partition_dir": str(partition_dir),
+                "combat_snapshot_filter_scope": "basic_filters_plus_strict_playable_rows",
+                "combat_snapshot_source_runs": len({str(row.get("run_id")) for row in combat_by_build.get(build_id, [])}),
             },
         )
         _write_dataset_bundle(
@@ -584,6 +626,7 @@ def main() -> None:
             route_samples=route_by_build.get(build_id, []),
             card_choice_samples=card_by_build.get(build_id, []),
             build_samples=partition_build_samples,
+            combat_snapshot_samples=combat_by_build.get(build_id, []),
             build_v2_task_rows={
                 task_name: buckets.get(build_id, [])
                 for task_name, buckets in build_v2_by_build.items()
@@ -596,6 +639,7 @@ def main() -> None:
             "route_samples": len(route_by_build.get(build_id, [])),
             "card_choice_samples": len(card_by_build.get(build_id, [])),
             "build_samples": len(partition_build_samples),
+            "combat_snapshot_samples": len(combat_by_build.get(build_id, [])),
             "build_v2_total": sum(len(buckets.get(build_id, [])) for buckets in build_v2_by_build.values()),
         }
 
@@ -604,16 +648,14 @@ def main() -> None:
 
     by_build_family_dir = output_dir / "by_build_family"
     by_build_family_dir.mkdir(parents=True, exist_ok=True)
-    run_to_build_family = {
-        str(summary["run_id"]): _resolve_build_family(summary.get("build_id"))
-        for summary in runs_summary
-    }
+    run_to_build_family = dict(run_to_build_family_basic)
     runs_by_family = _bucket_rows_by_build_id(runs_summary, run_to_build_id=run_to_build_family)
     floors_by_family = _bucket_rows_by_build_id(floor_records, run_to_build_id=run_to_build_family)
     decisions_by_family = _bucket_rows_by_build_id(decision_records, run_to_build_id=run_to_build_family)
     route_by_family = _bucket_rows_by_build_id(route_samples, run_to_build_id=run_to_build_family)
     card_by_family = _bucket_rows_by_build_id(card_choice_samples, run_to_build_id=run_to_build_family)
     build_by_family = _bucket_rows_by_build_id(build_samples, run_to_build_id=run_to_build_family)
+    combat_by_family = _bucket_rows_by_build_id(combat_snapshot_samples, run_to_build_id=run_to_build_family)
     build_v2_by_family = {
         task_name: _bucket_rows_by_build_id(rows, run_to_build_id=run_to_build_family)
         for task_name, rows in build_v2_task_rows.items()
@@ -643,6 +685,7 @@ def main() -> None:
             route_samples=route_by_family.get(family_name, []),
             card_choice_samples=card_by_family.get(family_name, []),
             build_samples=partition_build_samples,
+            combat_snapshot_samples=combat_by_family.get(family_name, []),
             build_samples_by_type=partition_build_samples_by_type,
             build_v2_task_rows={
                 task_name: buckets.get(family_name, [])
@@ -652,6 +695,8 @@ def main() -> None:
                 "partition_key": "build_family",
                 "partition_value": family_name,
                 "partition_dir": str(partition_dir),
+                "combat_snapshot_filter_scope": "basic_filters_plus_strict_playable_rows",
+                "combat_snapshot_source_runs": len({str(row.get("run_id")) for row in combat_by_family.get(family_name, [])}),
             },
         )
         _write_dataset_bundle(
@@ -663,6 +708,7 @@ def main() -> None:
             route_samples=route_by_family.get(family_name, []),
             card_choice_samples=card_by_family.get(family_name, []),
             build_samples=partition_build_samples,
+            combat_snapshot_samples=combat_by_family.get(family_name, []),
             build_v2_task_rows={
                 task_name: buckets.get(family_name, [])
                 for task_name, buckets in build_v2_by_family.items()
@@ -675,6 +721,7 @@ def main() -> None:
             "route_samples": len(route_by_family.get(family_name, [])),
             "card_choice_samples": len(card_by_family.get(family_name, [])),
             "build_samples": len(partition_build_samples),
+            "combat_snapshot_samples": len(combat_by_family.get(family_name, [])),
             "build_v2_total": sum(len(buckets.get(family_name, [])) for buckets in build_v2_by_family.values()),
         }
 
