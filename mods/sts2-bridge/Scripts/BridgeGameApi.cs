@@ -1256,13 +1256,33 @@ internal static partial class BridgeGameApi
         };
     }
 
+    private static bool IsInteractiveMapSurface(NMapScreen? mapScreen)
+    {
+        return mapScreen is not null &&
+               mapScreen.IsOpen &&
+               mapScreen.IsTravelEnabled &&
+               !mapScreen.IsTraveling;
+    }
+
+    private static bool IsInteractiveMapSurface(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction>? actions = null)
+    {
+        if (!IsInteractiveMapSurface(context.MapScreen))
+        {
+            return false;
+        }
+
+        return !HasBlockingMapOverlaySurface(context, actions ?? Array.Empty<BridgeResolvedAction>());
+    }
+
     private static object BuildRestSiteFrontierPayload(
         NMapScreen? mapScreen,
         NRestSiteRoom? restSiteRoom,
         IReadOnlyList<NRestSiteButton> restSiteButtons,
         NProceedButton? restSiteProceedButton)
     {
-        var visible = mapScreen?.IsOpen != true &&
+        var visible = !IsInteractiveMapSurface(mapScreen) &&
                       restSiteRoom is not null &&
                       IsNodeVisible(restSiteRoom);
         return new
@@ -1822,7 +1842,7 @@ internal static partial class BridgeGameApi
                     context.RewardProceedButton)
             });
         }
-        else if (context.MapScreen?.IsOpen != true &&
+        else if (!IsInteractiveMapSurface(context, actions) &&
                  context.ProceedButton is not null &&
                  IsNodeVisible(context.ProceedButton) &&
                  IsButtonEnabled(context.ProceedButton) &&
@@ -1925,7 +1945,7 @@ internal static partial class BridgeGameApi
             }
         }
 
-        if (context.MapScreen is null || !context.MapScreen.IsOpen)
+        if (!IsInteractiveMapSurface(context, actions))
         {
             for (var index = 0; index < context.EventOptionButtons.Count; index++)
             {
@@ -1952,17 +1972,14 @@ internal static partial class BridgeGameApi
                             GetHiddenFieldValue(context.EventRoom, "_event") as EventModel),
                         screen = context.Screen
                     },
-                    Execute = () => InvokeButtonAction(button, "OnRelease")
+                    Execute = () => InvokeEventOptionAction(context.EventRoom, button, index)
                 });
             }
 
             AddCrystalSphereEventActions(actions, context, context.EventOptionButtons.Count);
         }
 
-        if (context.MapScreen is not null &&
-            context.MapScreen.IsOpen &&
-            context.MapScreen.IsTravelEnabled &&
-            !context.MapScreen.IsTraveling)
+        if (IsInteractiveMapSurface(context, actions))
         {
             var routePayloadByKey = new Dictionary<string, object?>(StringComparer.Ordinal);
             foreach (var pointNode in context.MapPoints)
@@ -2110,7 +2127,7 @@ internal static partial class BridgeGameApi
             return;
         }
 
-        if (context.MapScreen?.IsOpen == true)
+        if (IsInteractiveMapSurface(context.MapScreen))
         {
             return;
         }
@@ -4796,7 +4813,7 @@ internal static partial class BridgeGameApi
         NDivinationButton? crystalSphereBigDivinationButton,
         NProceedButton? crystalSphereProceedButton)
     {
-        if (mapScreen is not null && mapScreen.IsOpen)
+        if (IsInteractiveMapSurface(mapScreen))
         {
             return new
             {
@@ -5659,7 +5676,7 @@ internal static partial class BridgeGameApi
         IReadOnlyList<NRestSiteButton> restSiteButtons,
         NProceedButton? restSiteProceedButton)
     {
-        var visible = mapScreen?.IsOpen != true &&
+        var visible = !IsInteractiveMapSurface(mapScreen) &&
                       restSiteRoom is not null &&
                       IsNodeVisible(restSiteRoom);
         var options = visible
@@ -5990,7 +6007,7 @@ internal static partial class BridgeGameApi
         var isRestSiteVisible = restSiteRoom is not null && IsNodeVisible(restSiteRoom);
         var isMerchantVisible = (merchantRoom is not null && IsNodeVisible(merchantRoom)) ||
                                 merchantInventory?.IsOpen == true;
-        var isMapOpen = mapScreen is not null && mapScreen.IsOpen;
+        var isInteractiveMapOpen = IsInteractiveMapSurface(mapScreen);
         var isRewardsVisible = IsRewardsScreenVisible(
             rewardsScreen,
             roomProceedButton,
@@ -6033,9 +6050,9 @@ internal static partial class BridgeGameApi
                 return "REWARDS";
             }
 
-            if (isMapOpen)
+            if (combatManager?.IsInProgress == true)
             {
-                return "MAP";
+                return "COMBAT";
             }
 
             if (isCrystalSphereVisible)
@@ -6051,6 +6068,26 @@ internal static partial class BridgeGameApi
             if (isCharacterSelectVisible)
             {
                 return "CHARACTER_SELECT";
+            }
+
+            if (!isInteractiveMapOpen && eventOptionButtons.Count > 0)
+            {
+                return "EVENT";
+            }
+
+            if (!isInteractiveMapOpen && isRestSiteVisible)
+            {
+                return "REST_SITE";
+            }
+
+            if (!isInteractiveMapOpen && isMerchantVisible)
+            {
+                return "SHOP";
+            }
+
+            if (isInteractiveMapOpen)
+            {
+                return "MAP";
             }
 
             if (combatManager?.IsInProgress == true &&
@@ -6127,9 +6164,14 @@ internal static partial class BridgeGameApi
             return "EVENT_CRYSTAL_SPHERE";
         }
 
-        if (isMapOpen)
+        if (isCardRewardVisible)
         {
-            return "MAP";
+            return "CARD_REWARD_SELECTION";
+        }
+
+        if (isRewardsVisible)
+        {
+            return "REWARDS";
         }
 
         if (restSiteRoom is not null && IsNodeVisible(restSiteRoom))
@@ -6142,17 +6184,7 @@ internal static partial class BridgeGameApi
             return "SHOP";
         }
 
-        if (isCardRewardVisible)
-        {
-            return "CARD_REWARD_SELECTION";
-        }
-
-        if (isRewardsVisible)
-        {
-            return "REWARDS";
-        }
-
-        if (isMapOpen)
+        if (isInteractiveMapOpen)
         {
             return "MAP";
         }
@@ -6286,7 +6318,7 @@ internal static partial class BridgeGameApi
         NMapScreen? mapScreen,
         IReadOnlyList<NRewardButton> rewardButtons)
     {
-        if (mapScreen?.IsOpen == true && rewardButtons.Count == 0)
+        if (IsInteractiveMapSurface(mapScreen) && rewardButtons.Count == 0)
         {
             return false;
         }
@@ -6339,7 +6371,7 @@ internal static partial class BridgeGameApi
                context.RewardProceedButton is not null &&
                IsNodeVisible(context.RewardProceedButton) &&
                context.RewardButtons.Count == 0 &&
-               context.MapScreen?.IsOpen != true &&
+               !IsInteractiveMapSurface(context.MapScreen) &&
                !IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions);
     }
 
@@ -6670,6 +6702,26 @@ internal static partial class BridgeGameApi
     {
         InvokeClickablePressAndRelease(button);
     }
+
+    private static void InvokeEventOptionAction(
+        NEventRoom? eventRoom,
+        NEventOptionButton button,
+        int index)
+    {
+        if (button.Option?.IsProceed == true &&
+            eventRoom is not null &&
+            button.Option is not null)
+        {
+            TryInvokeSingleArgument(eventRoom, "BeforeOptionChosen", button.Option);
+            if (TryInvokeTwoArguments(eventRoom, "OptionButtonClicked", button.Option, index))
+            {
+                return;
+            }
+        }
+
+        InvokeButtonAction(button, "OnRelease");
+    }
+
 
     private static void InvokeCrystalSphereDivinationAction(
         NCrystalSphereScreen? crystalSphereScreen,
@@ -7329,6 +7381,24 @@ internal static partial class BridgeGameApi
         method.Invoke(target, new[] { argument });
         return true;
     }
+
+    private static bool TryInvokeTwoArguments(object? target, string methodName, object firstArgument, object secondArgument)
+    {
+        if (target is null)
+        {
+            return false;
+        }
+
+        var method = FindMethod(target.GetType(), methodName, 2);
+        if (method is null)
+        {
+            return false;
+        }
+
+        method.Invoke(target, new[] { firstArgument, secondArgument });
+        return true;
+    }
+
 
     private static MethodInfo? FindMethod(Type? type, string methodName, int parameterCount)
     {

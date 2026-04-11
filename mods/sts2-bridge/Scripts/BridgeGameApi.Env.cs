@@ -444,6 +444,17 @@ internal static partial class BridgeGameApi
             cancellationToken);
         after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, timeoutMs, cancellationToken);
 
+        var noStateChangeAfterAction =
+            selectedAction is not null &&
+            string.IsNullOrWhiteSpace(actionError) &&
+            !after.Done &&
+            before.LogicHash.Equals(after.LogicHash, StringComparison.Ordinal);
+
+        if (noStateChangeAfterAction)
+        {
+            actionError = "action_no_state_change";
+        }
+
         // Combat sandbox: end episode when combat finishes, skip reward/map screens
         if (episode.EpisodeMode == "combat_sandbox" && !after.Done && IsCombatSandboxEpisodeDone(after))
         {
@@ -454,7 +465,7 @@ internal static partial class BridgeGameApi
         }
 
         episode.StepIndex++;
-        var truncated = !after.Actionable && !after.Done;
+        var truncated = (!after.Actionable && !after.Done) || noStateChangeAfterAction;
         if (after.Done || truncated)
         {
             episode.Done = true;
@@ -466,7 +477,11 @@ internal static partial class BridgeGameApi
             after,
             selectedAction,
             truncated,
-            truncated ? "step_timeout_waiting_for_actionable_or_terminal_state" : null,
+            truncated
+                ? (noStateChangeAfterAction
+                    ? "step_action_no_state_change"
+                    : "step_timeout_waiting_for_actionable_or_terminal_state")
+                : null,
             actionError);
     }
 
@@ -653,6 +668,7 @@ internal static partial class BridgeGameApi
                context.MapScreen is not null &&
                context.MapScreen.IsOpen &&
                !context.MapScreen.IsTraveling &&
+               !IsInteractiveMapSurface(context, snapshot.ResolvedActions) &&
                HasBlockingMapOverlaySurface(context, snapshot.ResolvedActions);
     }
 

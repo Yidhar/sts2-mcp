@@ -443,6 +443,8 @@ internal static partial class BridgeGameApi
     private static void AppendCompactPreviewFields(Dictionary<string, object?> payload, JsonElement element)
     {
         AppendCompactPreviewValue(payload, "damage", TryGetNestedInt(element, "effect_preview", "total_damage") ?? TryExtractEnvMetric(element, "damage"));
+        AppendCompactPreviewValue(payload, "damage_per_hit", TryGetNestedInt(element, "effect_preview", "damage_per_hit"));
+        AppendCompactPreviewValue(payload, "hits", TryGetNestedInt(element, "effect_preview", "hits"));
         AppendCompactPreviewValue(payload, "block", TryGetNestedInt(element, "effect_preview", "total_block") ?? TryExtractEnvMetric(element, "block"));
         AppendCompactPreviewValue(payload, "draw", TryGetNestedInt(element, "effect_preview", "draw") ?? TryExtractEnvMetric(element, "draw"));
         AppendCompactPreviewValue(payload, "weak", TryGetNestedInt(element, "effect_preview", "weak") ?? TryExtractEnvMetric(element, "weak"));
@@ -452,6 +454,13 @@ internal static partial class BridgeGameApi
         AppendCompactPreviewValue(payload, "strength", TryGetNestedInt(element, "effect_preview", "strength") ?? TryExtractEnvMetric(element, "strength"));
         AppendCompactPreviewValue(payload, "dexterity", TryGetNestedInt(element, "effect_preview", "dexterity") ?? TryExtractEnvMetric(element, "dexterity"));
         AppendCompactPreviewValue(payload, "summon", TryGetNestedInt(element, "effect_preview", "summon") ?? TryExtractEnvMetric(element, "summon"));
+        AppendCompactPreviewValue(payload, "x_cost_value", TryGetNestedInt(element, "effect_preview", "x_cost_value"));
+
+        var xCostSemantics = TryGetNestedString(element, "effect_preview", "x_cost_semantics");
+        if (!string.IsNullOrWhiteSpace(xCostSemantics))
+        {
+            payload["x_cost_semantics"] = xCostSemantics;
+        }
     }
 
     private static void AppendCompactPreviewValue(Dictionary<string, object?> payload, string key, int value)
@@ -459,6 +468,14 @@ internal static partial class BridgeGameApi
         if (value != 0)
         {
             payload[key] = value;
+        }
+    }
+
+    private static void AppendCompactPreviewValue(Dictionary<string, object?> payload, string key, int? value)
+    {
+        if (value.HasValue)
+        {
+            AppendCompactPreviewValue(payload, key, value.Value);
         }
     }
 }

@@ -500,7 +500,7 @@ internal static partial class BridgeGameApi
             truncated,
             actionError);
         var actionDiagnostics = BuildEnvActionDiagnostics(before, selectedAction, actionError);
-        var done = forceDone || after.Done || truncated;
+        var done = forceDone || after.Done;
         SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
         {

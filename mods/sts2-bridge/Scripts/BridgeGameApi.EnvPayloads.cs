@@ -190,15 +190,12 @@ internal static partial class BridgeGameApi
                 : "settling";
         }
 
-        if (context.MapScreen?.IsOpen == true &&
-            context.MapScreen.IsTravelEnabled &&
-            !context.MapScreen.IsTraveling &&
-            !HasBlockingMapOverlaySurface(context, actions))
+        if (IsInteractiveMapSurface(context, actions))
         {
             return "map";
         }
 
-        if ((context.EventRoom is not null && IsNodeVisible(context.EventRoom) && context.MapScreen?.IsOpen != true) ||
+        if ((context.EventRoom is not null && IsNodeVisible(context.EventRoom) && !IsInteractiveMapSurface(context.MapScreen)) ||
             (actions.Count > 0 && actions.All(static action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal))))
         {
             return "event";
@@ -211,7 +208,7 @@ internal static partial class BridgeGameApi
         }
 
         if (context.RestSiteRoom is not null &&
-            context.MapScreen?.IsOpen != true &&
+            !IsInteractiveMapSurface(context.MapScreen) &&
             IsNodeVisible(context.RestSiteRoom))
         {
             return "rest_site";
@@ -746,11 +743,66 @@ internal static partial class BridgeGameApi
         return null;
     }
 
+    private static bool HasOnlyProceedEventActions(IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        var eventActions = actions
+            .Where(static action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal))
+            .ToList();
+        if (eventActions.Count == 0)
+        {
+            return false;
+        }
+
+        return eventActions.All(static action =>
+        {
+            var payload = JsonSerializer.SerializeToElement(action.Payload);
+            return TryGetNestedBool(payload, "option", "is_proceed") == true;
+        });
+    }
+
+    private static bool ShouldIgnoreResidualEventOverlayOnInteractiveMap(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        if (!IsInteractiveMapSurface(context.MapScreen))
+        {
+            return false;
+        }
+
+        if (context.RunState?.CurrentRoom?.RoomType.ToString() != "Event")
+        {
+            return false;
+        }
+
+        if (context.RunState.CurrentRoom.IsPreFinished == true)
+        {
+            return true;
+        }
+
+        return HasOnlyProceedEventActions(actions);
+    }
+
     private static bool HasBlockingMapOverlaySurface(
         BridgeWorldContext context,
         IReadOnlyList<BridgeResolvedAction> actions)
     {
-        return context.CombatManager?.IsInProgress == true ||
+        var hasCombatSurface = context.CombatManager?.IsInProgress == true ||
+                               (context.CombatRoom is not null && IsNodeVisible(context.CombatRoom));
+        var hasRestSiteSurface = context.RestSiteRoom is not null && IsNodeVisible(context.RestSiteRoom);
+        var hasMerchantSurface = (context.MerchantRoom is not null && IsNodeVisible(context.MerchantRoom)) ||
+                                 context.MerchantInventory?.IsOpen == true;
+        var hasTreasureSurface = context.TreasureRoom is not null && IsNodeVisible(context.TreasureRoom);
+        var ignoreResidualEventOverlay = ShouldIgnoreResidualEventOverlayOnInteractiveMap(context, actions);
+        var hasEventSurface = !ignoreResidualEventOverlay &&
+                              ((context.EventRoom is not null && IsNodeVisible(context.EventRoom)) ||
+                               actions.Any(static action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal)));
+        var hasGenericProceedSurface = !ignoreResidualEventOverlay &&
+                                       context.ProceedButton is not null &&
+                                       IsNodeVisible(context.ProceedButton) &&
+                                       IsButtonEnabled(context.ProceedButton) &&
+                                       !ShouldSuppressGenericRoomProceed(context);
+
+        return hasCombatSurface ||
                (context.DeckUpgradeScreen is not null && IsNodeVisible(context.DeckUpgradeScreen)) ||
                (context.CardSelectionScreen is not null && IsNodeVisible(context.CardSelectionScreen)) ||
                IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions) ||
@@ -761,8 +813,11 @@ internal static partial class BridgeGameApi
                    context.MapScreen,
                    context.RewardButtons) ||
                (context.CrystalSphereScreen is not null && IsNodeVisible(context.CrystalSphereScreen)) ||
-               context.MerchantInventory?.IsOpen == true ||
-               actions.Any(static action => action.ActionId.StartsWith("event_option:", StringComparison.Ordinal));
+               hasMerchantSurface ||
+               hasRestSiteSurface ||
+               hasTreasureSurface ||
+               hasGenericProceedSurface ||
+               hasEventSurface;
     }
 
     private static IReadOnlyList<BridgeResolvedAction> BuildEnvLegalActions(
