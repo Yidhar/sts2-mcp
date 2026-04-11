@@ -1878,7 +1878,8 @@ internal static partial class BridgeGameApi
                     continue;
                 }
 
-                var rewardDescription = DescribeReward(button.Reward);
+                var rewardSummary = BuildRewardButtonPayload(button);
+                var rewardDescription = DescribeReward(ResolveRewardFromControlForLivePayload(button));
                 var actionId = $"reward:{index}";
 
                 actions.Add(new BridgeResolvedAction
@@ -1890,7 +1891,7 @@ internal static partial class BridgeGameApi
                         kind = "reward",
                         index,
                         label = $"Claim reward {index}: {rewardDescription}",
-                        reward = BuildRewardPayload(button.Reward),
+                        reward = rewardSummary,
                         screen = context.Screen
                     },
                     Execute = () => InvokeButtonAction(button, "OnRelease")
@@ -3962,7 +3963,7 @@ internal static partial class BridgeGameApi
         {
             var (rewardControl, potionReward) = skippablePotionRewards[index];
             var actionId = $"reward:skip_potion:{index}";
-            var potionTitle = TextOf(potionReward.Potion?.Title);
+            var rewardPayload = BuildRewardPayload(potionReward);
             actions.Add(new BridgeResolvedAction
             {
                 ActionId = actionId,
@@ -3972,8 +3973,8 @@ internal static partial class BridgeGameApi
                     kind = "reward",
                     selection_action = "skip_potion",
                     index,
-                    label = $"Skip potion reward {index}: {potionTitle}",
-                    reward = BuildRewardPayload(potionReward),
+                    label = $"Skip potion reward {index}",
+                    reward = rewardPayload,
                     screen = context.Screen
                 },
                 Execute = () => InvokeRewardSkipAction(context.RewardsScreen, rewardControl)
@@ -4603,8 +4604,70 @@ internal static partial class BridgeGameApi
             rewards = rewardButtons.Select((button, index) => new
             {
                 index,
-                reward = BuildRewardPayload(button.Reward)
+                reward = BuildRewardButtonPayload(button)
             }).ToArray()
+        };
+    }
+
+    private static object BuildRewardButtonPayload(NRewardButton button)
+    {
+        var reward = ResolveRewardFromControlForLivePayload(button);
+        var visibleTexts = CollectVisibleText(button, 4)
+            .Where(static text => !string.IsNullOrWhiteSpace(text))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var primaryText = visibleTexts.FirstOrDefault();
+
+        return reward switch
+        {
+            CardReward cardReward => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = "card",
+                reward_type = "card",
+                can_skip = cardReward.CanSkip,
+                can_reroll = cardReward.CanReroll,
+                option_count = SafeCount(cardReward.Cards)
+            },
+            GoldReward goldReward => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = "gold",
+                reward_type = "gold",
+                amount = goldReward.Amount
+            },
+            RelicReward relicReward => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = "relic",
+                reward_type = "relic",
+                rarity = relicReward.Rarity.ToString()
+            },
+            PotionReward => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = "potion",
+                reward_type = "potion"
+            },
+            null => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = "unknown",
+                reward_type = "unknown",
+                missing = true
+            },
+            _ => new
+            {
+                text = primaryText,
+                texts = visibleTexts,
+                type = reward.GetType().Name,
+                reward_type = reward.GetType().Name
+            }
         };
     }
 
@@ -4614,6 +4677,7 @@ internal static partial class BridgeGameApi
         {
             return new
             {
+                type = "unknown",
                 reward_type = "unknown",
                 missing = true
             };
@@ -4623,35 +4687,33 @@ internal static partial class BridgeGameApi
         {
             CardReward cardReward => new
             {
+                type = "card",
                 reward_type = "card",
-                description = DescribeText(cardReward.Description, cardReward),
                 can_skip = cardReward.CanSkip,
                 can_reroll = cardReward.CanReroll,
-                cards = cardReward.Cards.Select(card => BuildCardPayload(card)).ToArray()
+                option_count = SafeCount(cardReward.Cards)
             },
             GoldReward goldReward => new
             {
+                type = "gold",
                 reward_type = "gold",
-                description = DescribeText(goldReward.Description, goldReward),
                 amount = goldReward.Amount
             },
             RelicReward relicReward => new
             {
+                type = "relic",
                 reward_type = "relic",
-                description = DescribeText(relicReward.Description, relicReward),
-                rarity = relicReward.Rarity.ToString(),
-                relic = BuildRelicPayload(relicReward.ClaimedRelic)
+                rarity = relicReward.Rarity.ToString()
             },
             PotionReward potionReward => new
             {
-                reward_type = "potion",
-                description = DescribeText(potionReward.Description, potionReward),
-                potion = BuildPotionPayload(potionReward.Potion)
+                type = "potion",
+                reward_type = "potion"
             },
             _ => new
             {
-                reward_type = reward.GetType().Name,
-                description = DescribeText(reward.Description, reward)
+                type = reward.GetType().Name,
+                reward_type = reward.GetType().Name
             }
         };
     }
@@ -4665,12 +4727,33 @@ internal static partial class BridgeGameApi
 
         return reward switch
         {
-            CardReward cardReward => $"Card reward ({cardReward.Cards.Count()} options)",
+            CardReward cardReward => $"Card reward ({SafeCount(cardReward.Cards)} options)",
             GoldReward goldReward => $"{goldReward.Amount} gold",
-            RelicReward relicReward => $"Relic {TextOf(relicReward.ClaimedRelic?.Title)}",
-            PotionReward potionReward => $"Potion {TextOf(potionReward.Potion?.Title)}",
-            _ => DescribeText(reward.Description, reward)
+            RelicReward => "Relic reward",
+            PotionReward => "Potion reward",
+            _ => reward.GetType().Name
         };
+    }
+
+    private static int SafeCount(IEnumerable? values)
+    {
+        if (values is null)
+        {
+            return 0;
+        }
+
+        if (values is ICollection collection)
+        {
+            return collection.Count;
+        }
+
+        var count = 0;
+        foreach (var _ in values)
+        {
+            count++;
+        }
+
+        return count;
     }
 
     private static object BuildCardRewardSelectionPayload(
@@ -7268,13 +7351,13 @@ internal static partial class BridgeGameApi
 
     private static Reward? ResolveRewardFromControl(Control rewardControl)
     {
-        if (rewardControl is NRewardButton rewardButton)
-        {
-            return rewardButton.Reward;
-        }
+        return ResolveRewardFromControlForLivePayload(rewardControl) ??
+               GetHiddenPropertyObjectValue(rewardControl, "Reward") as Reward;
+    }
 
-        return GetHiddenPropertyObjectValue(rewardControl, "Reward") as Reward ??
-               GetHiddenFieldValue(rewardControl, "<Reward>k__BackingField") as Reward ??
+    private static Reward? ResolveRewardFromControlForLivePayload(Control rewardControl)
+    {
+        return GetHiddenFieldValue(rewardControl, "<Reward>k__BackingField") as Reward ??
                GetHiddenFieldValue(rewardControl, "_reward") as Reward;
     }
 
