@@ -40,6 +40,8 @@ def evaluate_full_run(
     num_simulations: int,
     temperature: float,
     device: str,
+    disable_root_bias: bool,
+    disable_semantic_rollout: bool,
 ) -> None:
     obs_encoder = DictObservationEncoder(use_text=False)
     env = SlayTheSpire2EnvV2(
@@ -53,6 +55,9 @@ def evaluate_full_run(
 
     network = load_muzero_network(checkpoint_dir, device=device)
     mcts = MCTS(num_simulations=num_simulations)
+    mcts.set_training_step(mcts.root_bias_decay_steps)
+    mcts.set_root_bias_enabled(not disable_root_bias)
+    mcts.set_semantic_rollout_enabled(not disable_semantic_rollout)
 
     obs, info = env.reset()
     total_reward = 0.0
@@ -67,6 +72,8 @@ def evaluate_full_run(
                 "temperature": temperature,
                 "max_steps": max_steps,
                 "device": device,
+                "disable_root_bias": disable_root_bias,
+                "disable_semantic_rollout": disable_semantic_rollout,
             },
             ensure_ascii=False,
         ),
@@ -165,6 +172,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-simulations", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--disable-root-bias", action="store_true")
+    parser.add_argument("--disable-semantic-rollout", action="store_true")
     return parser.parse_args()
 
 
@@ -179,6 +188,8 @@ def main() -> None:
         num_simulations=args.num_simulations,
         temperature=args.temperature,
         device=args.device,
+        disable_root_bias=args.disable_root_bias,
+        disable_semantic_rollout=args.disable_semantic_rollout,
     )
 
 

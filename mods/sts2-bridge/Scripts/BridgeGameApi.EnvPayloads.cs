@@ -358,13 +358,13 @@ internal static partial class BridgeGameApi
 
     private static string SafeGetRelicDescription(RelicModel relic)
     {
-        try { return DescribeText(relic.Description, relic) ?? ""; }
+        try { return DescribeRelicModelSafely(relic); }
         catch { return ""; }
     }
 
     private static string SafeGetPotionDescription(PotionModel potion)
     {
-        try { return DescribeText(potion.Description, potion) ?? ""; }
+        try { return DescribePotionModelSafely(potion); }
         catch { return ""; }
     }
 
@@ -786,12 +786,21 @@ internal static partial class BridgeGameApi
         BridgeWorldContext context,
         IReadOnlyList<BridgeResolvedAction> actions)
     {
+        var interactiveMapOpen = IsInteractiveMapSurface(context.MapScreen);
         var hasCombatSurface = context.CombatManager?.IsInProgress == true ||
-                               (context.CombatRoom is not null && IsNodeVisible(context.CombatRoom));
-        var hasRestSiteSurface = context.RestSiteRoom is not null && IsNodeVisible(context.RestSiteRoom);
-        var hasMerchantSurface = (context.MerchantRoom is not null && IsNodeVisible(context.MerchantRoom)) ||
-                                 context.MerchantInventory?.IsOpen == true;
-        var hasTreasureSurface = context.TreasureRoom is not null && IsNodeVisible(context.TreasureRoom);
+                               (!interactiveMapOpen &&
+                                context.CombatRoom is not null &&
+                                IsNodeVisible(context.CombatRoom));
+        var hasRestSiteSurface = !interactiveMapOpen &&
+                                 context.RestSiteRoom is not null &&
+                                 IsNodeVisible(context.RestSiteRoom);
+        var hasMerchantSurface = context.MerchantInventory?.IsOpen == true ||
+                                 (!interactiveMapOpen &&
+                                  context.MerchantRoom is not null &&
+                                  IsNodeVisible(context.MerchantRoom));
+        var hasTreasureSurface = !interactiveMapOpen &&
+                                 context.TreasureRoom is not null &&
+                                 IsNodeVisible(context.TreasureRoom);
         var ignoreResidualEventOverlay = ShouldIgnoreResidualEventOverlayOnInteractiveMap(context, actions);
         var hasEventSurface = !ignoreResidualEventOverlay &&
                               ((context.EventRoom is not null && IsNodeVisible(context.EventRoom)) ||

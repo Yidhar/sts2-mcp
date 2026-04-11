@@ -22,7 +22,11 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import ConstantSchedule, FloatSchedule
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from combat_snapshot_dataset import CombatSnapshotPool
+from combat_snapshot_dataset import (
+    CombatSnapshotPool,
+    DEFAULT_CURATED_COMBINED_SUBSET,
+    VALID_CURATED_COMBINED_SUBSETS,
+)
 from launcher import get_session_files as get_default_multi_session_files
 from sts2_env.checkpoint import load_online_checkpoint_metadata, load_online_policy_state_dict, save_online_checkpoint
 from sts2_env.combat_env import CombatSandboxEnv
@@ -638,6 +642,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--combat-curated-subset",
+        type=str,
+        default=DEFAULT_CURATED_COMBINED_SUBSET,
+        choices=sorted(VALID_CURATED_COMBINED_SUBSETS),
+        help=(
+            "When --combat-snapshot-dataset points at a curated combat root/combined dir, "
+            "resolve this subset. Default keeps all human rows plus only local runs that cleared Act 1."
+        ),
+    )
+    parser.add_argument(
         "--combat-snapshot-split",
         type=str,
         default="train",
@@ -776,6 +790,7 @@ def main():
         supported_encounter_ids = _get_live_supported_encounter_ids(session_file=primary_session_file)
         snapshot_pool = CombatSnapshotPool.from_path(
             args.combat_snapshot_dataset,
+            curated_subset=args.combat_curated_subset,
             split=snapshot_split,
             character=snapshot_character,
             build_id=args.combat_snapshot_build_id,

@@ -44,6 +44,7 @@ using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
+using MegaCrit.Sts2.Core.Nodes.Screens.Overlays;
 using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Nodes.TreasureRooms;
@@ -696,7 +697,8 @@ internal static partial class BridgeGameApi
         {
             foreach (var pointNode in context.MapPoints)
             {
-                if (!IsMapPointTravelable(pointNode))
+                if (!IsMapPointTravelable(pointNode) ||
+                    IsCurrentMapCoord(context.RunState, pointNode.Point.coord))
                 {
                     continue;
                 }
@@ -1454,6 +1456,7 @@ internal static partial class BridgeGameApi
         var eventOptionButtons = SortByVisualPosition(FindVisibleDescendants<NEventOptionButton>(game))
             .Where(static button => button.Option is not null)
             .ToList();
+        RefreshInteractiveMapTravelability(mapScreen);
         var mapPoints = FindVisibleDescendants<NMapPoint>(mapScreen)
             .OrderBy(static point => point.Point.coord.row)
             .ThenBy(static point => point.Point.coord.col)
@@ -1990,6 +1993,11 @@ internal static partial class BridgeGameApi
                 }
 
                 var coord = pointNode.Point.coord;
+                if (IsCurrentMapCoord(context.RunState, coord))
+                {
+                    continue;
+                }
+
                 var actionId = $"map:{coord.col},{coord.row}";
                 var coordKey = ToEnvMapCoordKey(coord);
                 if (!routePayloadByKey.ContainsKey(coordKey))
@@ -2012,7 +2020,7 @@ internal static partial class BridgeGameApi
                         route_summary = routePayloadByKey[coordKey],
                         screen = context.Screen
                     },
-                    Execute = () => InvokeButtonAction(pointNode, "OnRelease")
+                    Execute = () => InvokeMapTravelAction(context.RunManager, context.MapScreen, pointNode)
                 });
             }
         }
@@ -3018,6 +3026,18 @@ internal static partial class BridgeGameApi
             return;
         }
 
+        if (context.CombatManager?.IsInProgress != true &&
+            IsRewardsScreenVisible(
+                context.RewardsScreen,
+                context.ProceedButton,
+                context.RewardProceedButton,
+                context.MapScreen,
+                context.RewardButtons))
+        {
+            AddPotionRewardSkipActions(actions, context);
+            return;
+        }
+
         var players = context.RunState?.Players ?? context.CombatState?.Players ?? Array.Empty<Player>();
         for (var playerIndex = 0; playerIndex < players.Count; playerIndex++)
         {
@@ -3932,6 +3952,32 @@ internal static partial class BridgeGameApi
             {
                 _shopOpenLimiterCount++;
             }
+        }
+    }
+
+    private static void AddPotionRewardSkipActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
+    {
+        var skippablePotionRewards = ResolveSkippablePotionRewardControls(context.RewardsScreen);
+        for (var index = 0; index < skippablePotionRewards.Count; index++)
+        {
+            var (rewardControl, potionReward) = skippablePotionRewards[index];
+            var actionId = $"reward:skip_potion:{index}";
+            var potionTitle = TextOf(potionReward.Potion?.Title);
+            actions.Add(new BridgeResolvedAction
+            {
+                ActionId = actionId,
+                Payload = new
+                {
+                    action_id = actionId,
+                    kind = "reward",
+                    selection_action = "skip_potion",
+                    index,
+                    label = $"Skip potion reward {index}: {potionTitle}",
+                    reward = BuildRewardPayload(potionReward),
+                    screen = context.Screen
+                },
+                Execute = () => InvokeRewardSkipAction(context.RewardsScreen, rewardControl)
+            });
         }
     }
 
@@ -5410,12 +5456,18 @@ internal static partial class BridgeGameApi
         EventModel? eventModel)
     {
         var option = button.Option;
-        var glossary = BuildHoverTipPayloads(option?.HoverTips);
         object? optionTextContext = option is null
             ? eventModel
             : eventModel is null
                 ? option
                 : new object?[] { option, eventModel };
+
+        // Live event-option introspection has proven unsafe for some reward-
+        // backed options (notably Neow / BaseLib interaction probes). Accessing
+        // option hover tips / embedded relic payloads can materialize reward
+        // previews with real game-side effects. Keep the live bridge payload on
+        // the visible text-only path here; static export keeps the richer data.
+        var glossary = Array.Empty<object>();
 
         return new
         {
@@ -5424,7 +5476,7 @@ internal static partial class BridgeGameApi
             description = option is null ? string.Empty : DescribeText(option.Description, optionTextContext),
             is_locked = option?.IsLocked ?? true,
             is_proceed = option?.IsProceed ?? false,
-            relic = option?.Relic is null ? null : BuildRelicPayload(option.Relic),
+            relic = (object?)null,
             glossary
         };
     }
@@ -6294,6 +6346,27 @@ internal static partial class BridgeGameApi
         return GetHiddenPropertyValue<bool>(pointNode, "IsTravelable") ?? false;
     }
 
+    private static void RefreshInteractiveMapTravelability(NMapScreen? mapScreen)
+    {
+        if (mapScreen is null || !mapScreen.IsOpen || mapScreen.IsTraveling)
+        {
+            return;
+        }
+
+        TryInvokeParameterless(mapScreen, "RecalculateTravelability");
+        TryInvokeParameterless(mapScreen, "RefreshAllPointVisuals");
+    }
+
+    private static bool IsCurrentMapCoord(RunState? runState, MapCoord coord)
+    {
+        if (runState?.CurrentMapCoord is not MapCoord currentCoord)
+        {
+            return false;
+        }
+
+        return currentCoord.col == coord.col && currentCoord.row == coord.row;
+    }
+
     private static bool HasVisibleEnabledRestSiteOptions(IReadOnlyList<NRestSiteButton> restSiteButtons)
     {
         return restSiteButtons.Any(static button =>
@@ -6318,6 +6391,11 @@ internal static partial class BridgeGameApi
         NMapScreen? mapScreen,
         IReadOnlyList<NRewardButton> rewardButtons)
     {
+        if (rewardsScreen is not null && IsNodeVisible(rewardsScreen))
+        {
+            return true;
+        }
+
         if (IsInteractiveMapSurface(mapScreen) && rewardButtons.Count == 0)
         {
             return false;
@@ -6331,8 +6409,7 @@ internal static partial class BridgeGameApi
             return false;
         }
 
-        return (rewardsScreen is not null && IsNodeVisible(rewardsScreen)) ||
-               (rewardProceedButton is not null && IsNodeVisible(rewardProceedButton));
+        return rewardProceedButton is not null && IsNodeVisible(rewardProceedButton);
     }
 
     private static bool IsCardRewardSelectionVisible(
@@ -6722,6 +6799,34 @@ internal static partial class BridgeGameApi
         InvokeButtonAction(button, "OnRelease");
     }
 
+    private static void InvokeMapTravelAction(
+        RunManager? runManager,
+        NMapScreen? mapScreen,
+        NMapPoint pointNode)
+    {
+        var coord = pointNode.Point.coord;
+
+        if (runManager is not null &&
+            TryInvokeSingleArgument(runManager, "EnterMapCoord", coord))
+        {
+            return;
+        }
+
+        if (mapScreen is not null &&
+            TryInvokeSingleArgument(mapScreen, "TravelToMapCoord", coord))
+        {
+            return;
+        }
+
+        if (mapScreen is not null &&
+            TryInvokeSingleArgument(mapScreen, "OnMapPointSelectedLocally", pointNode))
+        {
+            return;
+        }
+
+        InvokeButtonAction(pointNode, "OnRelease");
+    }
+
 
     private static void InvokeCrystalSphereDivinationAction(
         NCrystalSphereScreen? crystalSphereScreen,
@@ -7109,6 +7214,11 @@ internal static partial class BridgeGameApi
 
     private static bool IsRewardButtonSkipped(NRewardsScreen? rewardsScreen, NRewardButton button)
     {
+        return IsRewardControlSkipped(rewardsScreen, button);
+    }
+
+    private static bool IsRewardControlSkipped(NRewardsScreen? rewardsScreen, Control rewardControl)
+    {
         if (GetHiddenFieldValue(rewardsScreen, "_skippedRewardButtons") is not IEnumerable skippedRewardButtons)
         {
             return false;
@@ -7117,7 +7227,7 @@ internal static partial class BridgeGameApi
         foreach (var skippedRewardButton in skippedRewardButtons)
         {
             if (skippedRewardButton is Node skippedNode &&
-                IsSameNodeInstance(skippedNode, button))
+                IsSameNodeInstance(skippedNode, rewardControl))
             {
                 return true;
             }
@@ -7126,33 +7236,124 @@ internal static partial class BridgeGameApi
         return false;
     }
 
+    private static List<(Control RewardControl, PotionReward PotionReward)> ResolveSkippablePotionRewardControls(
+        NRewardsScreen? rewardsScreen)
+    {
+        var results = new List<(Control RewardControl, PotionReward PotionReward)>();
+        if (rewardsScreen is null ||
+            GetHiddenFieldValue(rewardsScreen, "_rewardButtons") is not IEnumerable rewardButtons)
+        {
+            return results;
+        }
+
+        foreach (var rewardButton in rewardButtons)
+        {
+            if (rewardButton is not Control rewardControl ||
+                !GodotObject.IsInstanceValid(rewardControl) ||
+                IsRewardControlSkipped(rewardsScreen, rewardControl))
+            {
+                continue;
+            }
+
+            if (ResolveRewardFromControl(rewardControl) is not PotionReward potionReward)
+            {
+                continue;
+            }
+
+            results.Add((rewardControl, potionReward));
+        }
+
+        return results;
+    }
+
+    private static Reward? ResolveRewardFromControl(Control rewardControl)
+    {
+        if (rewardControl is NRewardButton rewardButton)
+        {
+            return rewardButton.Reward;
+        }
+
+        return GetHiddenPropertyObjectValue(rewardControl, "Reward") as Reward ??
+               GetHiddenFieldValue(rewardControl, "<Reward>k__BackingField") as Reward ??
+               GetHiddenFieldValue(rewardControl, "_reward") as Reward;
+    }
+
+    private static void InvokeRewardSkipAction(NRewardsScreen? rewardsScreen, Control rewardControl)
+    {
+        if (TryInvokeSingleArgument(rewardsScreen, "RewardSkippedFrom", rewardControl))
+        {
+            return;
+        }
+
+        if (rewardControl is NRewardButton rewardButton &&
+            TryInvokeSingleArgument(rewardButton, "EmitSignalRewardSkipped", rewardButton))
+        {
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            "Could not skip the current reward.");
+    }
+
     private static void InvokeTerminalRewardsProceed(
         RunManager? runManager,
         NRewardsScreen? rewardsScreen,
         NProceedButton? rewardProceedButton)
     {
-        // Prefer the real rewards-screen handler so boss-room reward exits
-        // follow the same path as a manual click.
+        // Prefer the run-manager path first. In practice this is the most
+        // reliable way to leave terminal reward states back into the normal
+        // run flow after room-end rewards finish resolving.
+        if (TryInvokeParameterless(runManager, "ProceedFromTerminalRewardsScreen") ||
+            TryInvokeParameterless(rewardsScreen, "ProceedFromTerminalRewardsScreen"))
+        {
+            FinalizeTerminalRewardsOverlayClose(rewardsScreen);
+            return;
+        }
+
         if (rewardProceedButton is not null &&
             TryInvokeSingleArgument(rewardsScreen, "OnProceedButtonPressed", rewardProceedButton))
         {
+            FinalizeTerminalRewardsOverlayClose(rewardsScreen);
             return;
         }
 
         if (rewardProceedButton is not null && IsNodeVisible(rewardProceedButton))
         {
             InvokeProceedButtonAction(rewardProceedButton);
+            FinalizeTerminalRewardsOverlayClose(rewardsScreen);
             return;
         }
-
-        if (TryInvokeParameterless(runManager, "ProceedFromTerminalRewardsScreen") ||
-            TryInvokeParameterless(rewardsScreen, "ProceedFromTerminalRewardsScreen"))
-            return;
 
         throw new BridgeRequestException(
             HttpStatusCode.Conflict,
             "action_target_missing",
             "Could not find a terminal rewards proceed target.");
+    }
+
+    private static void FinalizeTerminalRewardsOverlayClose(NRewardsScreen? rewardsScreen)
+    {
+        if (rewardsScreen is null || !GodotObject.IsInstanceValid(rewardsScreen))
+        {
+            return;
+        }
+
+        try
+        {
+            if (NOverlayStack.Instance is not null)
+            {
+                NOverlayStack.Instance.Remove(rewardsScreen);
+                return;
+            }
+        }
+        catch
+        {
+            // Fall back to the legacy direct-close path below if the overlay
+            // stack is unavailable or rejects the remove call.
+        }
+
+        TryInvokeParameterless(rewardsScreen, "AfterOverlayClosed");
     }
 
     private static void InvokeRunModeSelectionAction(Node? submenu, Node? button, string methodName)
@@ -8058,12 +8259,40 @@ internal static partial class BridgeGameApi
 
     private static string TryGetDescription(object model)
     {
+        // Some runtime models (notably relic/potion models reachable from live
+        // event / Neow option payloads) expose dynamic description accessors
+        // that are not side-effect free. Probing the broader preferred-description
+        // surface can accidentally instantiate reward visuals or even trigger
+        // obtain-side logic while we're only trying to serialize text.
+        //
+        // Keep relic / potion descriptions on the narrow, previously-stable
+        // direct Description path for live bridge payloads.
+        if (model is RelicModel relic)
+        {
+            return DescribeRelicModelSafely(relic);
+        }
+
+        if (model is PotionModel potion)
+        {
+            return DescribePotionModelSafely(potion);
+        }
+
         if (model is CharacterModel character)
         {
             return DescribeCharacterDescription(character);
         }
 
         return DescribeText(TryGetPreferredDescriptionValue(model), model);
+    }
+
+    private static string DescribeRelicModelSafely(RelicModel relic)
+    {
+        return DescribeText(GetHiddenPropertyObjectValue(relic, "DynamicDescription"), relic);
+    }
+
+    private static string DescribePotionModelSafely(PotionModel potion)
+    {
+        return DescribeText(GetHiddenPropertyObjectValue(potion, "DynamicDescription"), potion);
     }
 
     private static string TextOf(object? value)

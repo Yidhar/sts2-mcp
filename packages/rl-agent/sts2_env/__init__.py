@@ -15,6 +15,10 @@ from .model import (
     STS2CandidateScoringPolicy,
 )
 from .observation_v2 import DictObservationEncoder
+from .action_binder import bind_semantic_action
+from .objective_heads import compute_transition_objective_rewards
+from .run_memory import RunMemoryTracker
+from .semantic_action import semantic_action_signature
 
 __all__ = [
     "BridgeClient",
@@ -32,4 +36,8 @@ __all__ = [
     "RouteActionEncoder",
     "CandidateScorer",
     "STS2CandidateScoringPolicy",
+    "semantic_action_signature",
+    "bind_semantic_action",
+    "compute_transition_objective_rewards",
+    "RunMemoryTracker",
 ]

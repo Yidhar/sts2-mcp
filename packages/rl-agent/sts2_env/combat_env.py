@@ -14,12 +14,29 @@ import numpy as np
 from gymnasium import spaces
 
 from combat_snapshot_dataset import snapshot_row_to_reset_kwargs
+from .action_compact import compact_legal_actions
 from .bridge_client import BridgeClient
 from .observation_v2 import DictObservationEncoder, MAX_ACTIONS
+from .run_memory import RunMemoryTracker
 
 INVALID_ACTION_REWARD = -1.0
 INVALID_ACTION_REASON = "invalid_action_index"
 BLOCKED_ACTION_KINDS = {"discard_potion"}
+ENEMY_HP_DELTA_REWARD_SCALE = 0.01
+PLAYER_HP_LOSS_REWARD_SCALE = 0.03
+END_TURN_WASTE_BASE_PENALTY = -0.03
+END_TURN_WASTE_ENERGY_PENALTY = -0.01
+END_TURN_WASTE_ZERO_COST_BONUS_PENALTY = -0.02
+END_TURN_WASTE_EXTRA_ACTION_PENALTY = -0.01
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class CombatSandboxEnv(gym.Env):
@@ -82,6 +99,7 @@ class CombatSandboxEnv(gym.Env):
         self._current_encounter_id: str | None = encounter_id
         self._last_action_overflow: int = 0
         self._current_snapshot: dict[str, Any] | None = None
+        self._run_memory = RunMemoryTracker(episode_mode="combat_sandbox")
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -134,8 +152,9 @@ class CombatSandboxEnv(gym.Env):
 
         self._episode_id = result["episode_id"]
         self._update_live_state(result)
+        self._run_memory.reset(self._last_obs_raw, self._legal_actions, episode_mode="combat_sandbox")
 
-        obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions)
+        obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, self._planner_context())
         info = self._build_info(result.get("info", {}))
         return obs, info
 
@@ -148,6 +167,8 @@ class CombatSandboxEnv(gym.Env):
             return self._make_invalid_action_response(action)
 
         legal_action = self._legal_actions[normalized_action]
+        prev_obs = self._last_obs_raw or {}
+        end_turn_penalty = self._end_turn_waste_penalty(prev_obs, self._legal_actions, legal_action)
 
         result = self.bridge.step(
             episode_id=self._episode_id,
@@ -156,9 +177,13 @@ class CombatSandboxEnv(gym.Env):
         )
 
         self._update_live_state(result)
+        self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
 
-        obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions)
+        obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, self._planner_context())
         reward = float(result.get("reward", 0.0))
+        reward += self._enemy_hp_delta_reward(prev_obs, self._last_obs_raw)
+        reward += self._player_hp_delta_reward(prev_obs, self._last_obs_raw)
+        reward += end_turn_penalty
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
         info = self._build_info(result.get("info", {}))
@@ -175,7 +200,7 @@ class CombatSandboxEnv(gym.Env):
         return mask
 
     def _make_terminal(self):
-        obs = self.obs_encoder.encode(self._last_obs_raw or {}, [])
+        obs = self.obs_encoder.encode(self._last_obs_raw or {}, [], self._planner_context())
         info = self._build_info({})
         return obs, 0.0, True, False, info
 
@@ -195,6 +220,9 @@ class CombatSandboxEnv(gym.Env):
 
     def close(self) -> None:
         pass
+
+    def get_compact_legal_actions(self) -> list[dict[str, Any]]:
+        return compact_legal_actions(self._legal_actions)
 
     # ------------------------------------------------------------------
     # Internal
@@ -231,6 +259,116 @@ class CombatSandboxEnv(gym.Env):
         self._last_obs_raw = obs if isinstance(obs, dict) else {}
         self._last_action_overflow = max(len(self._legal_actions) - MAX_ACTIONS, 0)
 
+    def _combat_enemy_total_hp(self, obs: dict[str, Any] | None) -> float:
+        if not isinstance(obs, dict):
+            return 0.0
+        combat = obs.get("combat")
+        if not isinstance(combat, dict):
+            return 0.0
+        enemies = combat.get("enemies")
+        if not isinstance(enemies, list):
+            return 0.0
+
+        total = 0.0
+        for enemy in enemies:
+            if not isinstance(enemy, dict):
+                continue
+            hp = enemy.get("hp", enemy.get("current_hp"))
+            total += float(hp or 0.0)
+        return total
+
+    def _enemy_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
+        before_total = self._combat_enemy_total_hp(before_obs)
+        after_total = self._combat_enemy_total_hp(after_obs)
+        if before_total <= 0.0 and after_total <= 0.0:
+            return 0.0
+        return (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+
+    def _player_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
+        before_player = before_obs.get("player") if isinstance(before_obs, dict) else {}
+        after_player = after_obs.get("player") if isinstance(after_obs, dict) else {}
+        before_hp = _float((before_player or {}).get("hp"))
+        after_hp = _float((after_player or {}).get("hp"))
+        if before_hp <= 0.0 and after_hp <= 0.0:
+            return 0.0
+        return -max(before_hp - after_hp, 0.0) * PLAYER_HP_LOSS_REWARD_SCALE
+
+    @staticmethod
+    def _source_preview_metric(source: dict[str, Any] | None, key: str) -> float:
+        if not isinstance(source, dict):
+            return 0.0
+        effect_preview = source.get("effect_preview")
+        if isinstance(effect_preview, dict) and effect_preview.get(key) is not None:
+            try:
+                return float(effect_preview.get(key) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        try:
+            return float(source.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _is_positive_progress_action(self, action: dict[str, Any]) -> bool:
+        kind = str(action.get("kind") or "").strip()
+        if kind not in ("play_card", "use_potion"):
+            return False
+
+        source = action.get("card") if kind == "play_card" else action.get("potion")
+        if not isinstance(source, dict):
+            return False
+
+        if kind == "play_card" and str(source.get("type") or "").strip().lower() == "power":
+            return True
+
+        for key in ("damage", "block", "draw", "weak", "vulnerable", "heal", "strength", "dexterity", "summon"):
+            if self._source_preview_metric(source, key) > 0.0:
+                return True
+        return False
+
+    def _end_turn_waste_penalty(
+        self,
+        obs: dict[str, Any] | None,
+        legal_actions: list[dict[str, Any]],
+        chosen_action: dict[str, Any],
+    ) -> float:
+        if str(chosen_action.get("action_id") or "") != "end_turn":
+            return 0.0
+
+        combat = obs.get("combat") if isinstance(obs, dict) else None
+        if not isinstance(combat, dict):
+            return 0.0
+        energy = float(combat.get("energy") or 0.0)
+        if energy <= 0.0:
+            return 0.0
+
+        positive_actions = 0
+        has_zero_cost_positive = False
+        for action in legal_actions:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("action_id") or "") == "end_turn":
+                continue
+            if not self._is_positive_progress_action(action):
+                continue
+            positive_actions += 1
+            card = action.get("card")
+            if isinstance(card, dict):
+                try:
+                    if float(card.get("cost") or 0.0) <= 0.0:
+                        has_zero_cost_positive = True
+                except (TypeError, ValueError):
+                    pass
+
+        if positive_actions <= 0:
+            return 0.0
+
+        penalty = END_TURN_WASTE_BASE_PENALTY
+        penalty += END_TURN_WASTE_ENERGY_PENALTY * min(energy, 3.0)
+        if has_zero_cost_positive:
+            penalty += END_TURN_WASTE_ZERO_COST_BONUS_PENALTY
+        penalty += END_TURN_WASTE_EXTRA_ACTION_PENALTY * min(max(positive_actions - 1, 0), 2)
+        return float(penalty)
+
     def _decorate_bridge_info(self, bridge_info: Any) -> dict[str, Any]:
         info = dict(bridge_info) if isinstance(bridge_info, dict) else {}
         diagnostics = info.get("action_diagnostics")
@@ -239,12 +377,61 @@ class CombatSandboxEnv(gym.Env):
         info["action_diagnostics"] = diagnostics
         return info
 
+    def _transition_state(self) -> dict[str, Any]:
+        obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else {}
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+        run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+
+        potions = player.get("potions") if isinstance(player.get("potions"), list) else []
+        relics = player.get("relics") if isinstance(player.get("relics"), list) else []
+        enemies_out: list[dict[str, Any]] = []
+        for enemy in combat.get("enemies") if isinstance(combat.get("enemies"), list) else []:
+            if not isinstance(enemy, dict):
+                continue
+            intent = enemy.get("intent") if isinstance(enemy.get("intent"), dict) else {}
+            enemies_out.append(
+                {
+                    "hp": _float(enemy.get("hp", enemy.get("current_hp"))),
+                    "block": _float(enemy.get("block")),
+                    "intent": {
+                        "total_damage": _float(intent.get("total_damage")),
+                        "damage_per_hit": _float(intent.get("damage_per_hit")),
+                        "repeats": _float(intent.get("repeats")),
+                    },
+                }
+            )
+
+        return {
+            "phase": obs.get("phase"),
+            "player": {
+                "hp": _float(player.get("hp")),
+                "max_hp": _float(player.get("max_hp")),
+                "gold": _float(player.get("gold")),
+                "potions": list(potions),
+                "relics": list(relics),
+            },
+            "run": {
+                "floor": _float(run.get("floor")),
+                "act_id": _float(run.get("act_id")),
+                "room_type": run.get("room_type"),
+            },
+            "combat": {
+                "block": _float(combat.get("block")),
+                "energy": _float(combat.get("energy")),
+                "round": _float(combat.get("round")),
+                "enemies": enemies_out,
+            } if combat else {},
+        }
+
     def _build_info(self, bridge_info: Any, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         current_snapshot = self._current_snapshot or {}
+        planner_context = self._planner_context()
         info: dict[str, Any] = {
             "episode_id": self._episode_id,
             "action_mask": self.action_masks(),
             "legal_action_count": len(self._legal_actions),
+            "legal_actions_compact": self.get_compact_legal_actions(),
             "action_overflow": self._last_action_overflow,
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "combat_sandbox",
@@ -254,6 +441,8 @@ class CombatSandboxEnv(gym.Env):
             "snapshot_run_id": current_snapshot.get("run_id"),
             "snapshot_floor_number": current_snapshot.get("floor_number"),
             "snapshot_build_id": current_snapshot.get("build_id"),
+            "planner_context": planner_context,
+            "transition_state": self._transition_state(),
             "bridge_info": self._decorate_bridge_info(bridge_info),
         }
         if extra:
@@ -266,7 +455,7 @@ class CombatSandboxEnv(gym.Env):
         return info
 
     def _make_invalid_action_response(self, attempted_action: Any):
-        obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions)
+        obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions, self._planner_context())
         bridge_info = {
             "action_error": INVALID_ACTION_REASON,
             "truncation_reason": INVALID_ACTION_REASON,
@@ -282,3 +471,6 @@ class CombatSandboxEnv(gym.Env):
             },
         )
         return obs, INVALID_ACTION_REWARD, False, True, info
+
+    def _planner_context(self) -> dict[str, Any]:
+        return self._run_memory.build_context(self._last_obs_raw, self._legal_actions)

@@ -748,7 +748,6 @@ internal static partial class BridgeGameApi
         {
             cancellationToken.ThrowIfCancellationRequested();
             var snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.snapshot");
-            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken);
             lastSnapshot = snapshot;
             var ready = snapshot.Done || !requireActionableOrDone || snapshot.Actionable;
             var changedFromBaseline = baselineLogicHash is null ||

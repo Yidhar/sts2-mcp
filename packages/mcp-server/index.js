@@ -4059,16 +4059,37 @@ function buildRlLegalActions(state) {
 }
 
 function summarizeRlLegalAction(action, idx) {
+  const baseSummary = summarizeActionForAgent(action) ?? {};
   const summary = {
     idx,
     key: typeof action?.action_id === "string" ? action.action_id : String(idx),
     action_id: typeof action?.action_id === "string" ? action.action_id : null,
     kind: typeof action?.kind === "string" ? action.kind : null,
-    label: normalizeAgentText(action?.label)
+    label: normalizeAgentText(action?.label),
+    ...baseSummary
   };
 
-  if (typeof action?.card?.title === "string" && action.card.title.trim()) {
-    summary.title = normalizeAgentText(action.card.title);
+  if (Number.isInteger(action?.hand_index)) {
+    summary.hand_index = action.hand_index;
+  }
+
+  if (Number.isInteger(action?.index)) {
+    summary.index = action.index;
+  }
+
+  if (Number.isInteger(action?.slot_index)) {
+    summary.slot_index = action.slot_index;
+  }
+
+  if (action?.skip === true) {
+    summary.skip = true;
+  }
+
+  if (isPlainObject(action?.card)) {
+    summary.card = summarizeCardForAgent(action.card);
+    if (typeof action.card.title === "string" && action.card.title.trim()) {
+      summary.title = normalizeAgentText(action.card.title);
+    }
     if (Number.isInteger(action.card.resolved_energy_cost)) {
       summary.cost = action.card.resolved_energy_cost;
     }
@@ -4076,16 +4097,11 @@ function summarizeRlLegalAction(action, idx) {
     if (starCost !== null) {
       summary.star_cost = starCost;
     }
-  } else if (typeof action?.potion?.title === "string" && action.potion.title.trim()) {
-    summary.title = normalizeAgentText(action.potion.title);
-  }
-
-  const targetName =
-    typeof action?.target_name === "string"
-      ? normalizeAgentText(action.target_name)
-      : normalizeAgentText(action?.target?.name);
-  if (targetName) {
-    summary.target = targetName;
+  } else if (isPlainObject(action?.potion)) {
+    summary.potion = summarizePotionForAgent(action.potion);
+    if (typeof action.potion.title === "string" && action.potion.title.trim()) {
+      summary.title = normalizeAgentText(action.potion.title);
+    }
   }
 
   return summary;
@@ -8327,6 +8343,47 @@ function summarizeActionForAgent(action) {
   return summary;
 }
 
+function summarizeCardEffectPreviewForAgent(card) {
+  if (!isPlainObject(card)) {
+    return null;
+  }
+
+  const effectPreview = isPlainObject(card.effect_preview) ? card.effect_preview : {};
+  const summary = {};
+  const numericMappings = [
+    ["damage", ["damage", "total_damage"]],
+    ["damage_per_hit", ["damage_per_hit"]],
+    ["hits", ["hits"]],
+    ["block", ["block", "total_block"]],
+    ["draw", ["draw"]],
+    ["heal", ["heal"]],
+    ["hp_loss", ["hp_loss"]],
+    ["weak", ["weak"]],
+    ["vulnerable", ["vulnerable"]],
+    ["poison", ["poison"]],
+    ["strength", ["strength"]],
+    ["dexterity", ["dexterity"]],
+    ["summon", ["summon"]],
+    ["extra_damage", ["extra_damage"]],
+    ["x_cost_value", ["x_cost_value"]]
+  ];
+
+  for (const [targetKey, sourceKeys] of numericMappings) {
+    for (const sourceKey of sourceKeys) {
+      if (Number.isFinite(effectPreview[sourceKey])) {
+        summary[targetKey] = effectPreview[sourceKey];
+        break;
+      }
+    }
+  }
+
+  if (typeof effectPreview.x_cost_semantics === "string" && effectPreview.x_cost_semantics.trim()) {
+    summary.x_cost_semantics = effectPreview.x_cost_semantics;
+  }
+
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
 function filterNonAutomationActions(actions) {
   if (!Array.isArray(actions)) {
     return [];
@@ -8403,13 +8460,20 @@ function summarizeCardForAgent(card) {
   }
 
   const summary = {
+    id: typeof card.id === "string" && card.id.trim() ? card.id : null,
     title: normalizeAgentText(card.title),
-    cost: Number.isInteger(card.resolved_energy_cost) ? card.resolved_energy_cost : null
+    cost: Number.isInteger(card.resolved_energy_cost)
+      ? card.resolved_energy_cost
+      : Number.isInteger(card.cost)
+        ? card.cost
+        : null
   };
   const starCost = readAgentCardStarCost(card);
 
   const effect = typeof card?.effect_preview?.summary === "string"
     ? normalizeAgentText(card.effect_preview.summary)
+    : typeof card?.effect === "string" && card.effect.trim()
+      ? normalizeAgentText(card.effect)
     : null;
   const description = typeof card.description === "string" && card.description.trim()
     ? normalizeAgentText(card.description)
@@ -8419,8 +8483,34 @@ function summarizeCardForAgent(card) {
     summary.type = card.type;
   }
 
+  if (typeof card.rarity === "string" && card.rarity.trim()) {
+    summary.rarity = card.rarity;
+  }
+
   if (typeof card.target_type === "string" && card.target_type.trim()) {
     summary.target = card.target_type;
+  } else if (typeof card.target === "string" && card.target.trim()) {
+    summary.target = card.target;
+  }
+
+  if (Number.isInteger(card.current_upgrade_level) && card.current_upgrade_level >= 0) {
+    summary.upgrade_level = card.current_upgrade_level;
+  } else if (Number.isInteger(card.upgrade_level) && card.upgrade_level >= 0) {
+    summary.upgrade_level = card.upgrade_level;
+  }
+
+  if (card.costs_x === true || card.x_cost === true) {
+    summary.x_cost = true;
+  }
+
+  if (Number.isInteger(card.current_star_cost) && card.current_star_cost >= 0) {
+    summary.star = card.current_star_cost;
+  } else if (Number.isInteger(card.star) && card.star >= 0) {
+    summary.star = card.star;
+  }
+
+  if (card.has_star_cost_x === true || card.star_x === true) {
+    summary.star_x = true;
   }
 
   if (starCost !== null) {
@@ -8435,6 +8525,11 @@ function summarizeCardForAgent(card) {
     summary.description = description;
   }
 
+  const effectPreview = summarizeCardEffectPreviewForAgent(card);
+  if (effectPreview !== null) {
+    summary.effect_preview = effectPreview;
+  }
+
   return summary;
 }
 
@@ -8443,12 +8538,20 @@ function readAgentCardStarCost(card) {
     return null;
   }
 
-  if (card.has_star_cost_x === true) {
+  if (card.has_star_cost_x === true || card.star_x === true || card.star_cost === "X") {
     return "X";
   }
 
   if (Number.isInteger(card.current_star_cost) && card.current_star_cost >= 0) {
     return card.current_star_cost;
+  }
+
+  if (Number.isInteger(card.star) && card.star >= 0) {
+    return card.star;
+  }
+
+  if (Number.isInteger(card.star_cost) && card.star_cost >= 0) {
+    return card.star_cost;
   }
 
   return null;
@@ -8480,6 +8583,56 @@ function summarizePotionForAgent(potion) {
   }
 
   return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeIntentCandidateForAgent(intent) {
+  if (!isPlainObject(intent)) {
+    return null;
+  }
+
+  const totalDamage = Number.isFinite(intent.total_damage) ? intent.total_damage : null;
+  const repeats = Number.isFinite(intent.repeats) ? intent.repeats : null;
+  const damagePerHit = Number.isFinite(intent.damage_per_hit)
+    ? intent.damage_per_hit
+    : (
+      totalDamage !== null &&
+      repeats !== null &&
+      repeats > 0 &&
+      Number.isInteger(totalDamage) &&
+      Number.isInteger(repeats) &&
+      totalDamage % repeats === 0
+    )
+      ? totalDamage / repeats
+      : null;
+  const description = typeof intent.description === "string" && intent.description.trim()
+    ? normalizeAgentText(intent.description)
+    : typeof intent.text === "string" && intent.text.trim()
+      ? normalizeAgentText(intent.text)
+      : null;
+
+  const summary = {
+    intent_type: typeof intent.intent_type === "string" ? intent.intent_type : null,
+    intent_class: typeof intent.intent_class === "string" ? intent.intent_class : null,
+    title: typeof intent.title === "string" && intent.title.trim()
+      ? normalizeAgentText(intent.title)
+      : null,
+    label: typeof intent.label === "string" && intent.label.trim()
+      ? normalizeAgentText(intent.label)
+      : null,
+    description
+  };
+
+  if (totalDamage !== null) {
+    summary.total_damage = totalDamage;
+  }
+  if (repeats !== null) {
+    summary.repeats = repeats;
+  }
+  if (damagePerHit !== null) {
+    summary.damage_per_hit = damagePerHit;
+  }
+
+  return summary;
 }
 
 function summarizeRelicForAgent(relic) {
@@ -8536,6 +8689,10 @@ function summarizeIntentForAgent(intent) {
     ? rawCandidates.filter((entry) => entry.title === title)
     : rawCandidates;
   const candidates = filteredCandidates.length > 0 ? filteredCandidates : rawCandidates;
+  const summarizedCandidates = candidates
+    .map(summarizeIntentCandidateForAgent)
+    .filter((entry) => entry !== null);
+  const primaryCandidate = summarizedCandidates[0] ?? null;
 
   const labels = compactStringArray(
     candidates
@@ -8543,14 +8700,23 @@ function summarizeIntentForAgent(intent) {
       .filter((label) => typeof label === "string" && !label.includes("LocString"))
   );
   const texts = compactStringArray(
-    candidates.map((entry) => normalizeAgentText(entry.description))
+    candidates.map((entry) => normalizeAgentText(entry.description ?? entry.text))
   );
   const totalDamages = compactNumberArray(candidates.map((entry) => entry.total_damage));
+  const repeats = compactNumberArray(candidates.map((entry) => entry.repeats));
+  const damagePerHits = compactNumberArray(candidates.map((entry) => entry.damage_per_hit));
 
   const summary = {
     state_id: typeof intent.state_id === "string" ? intent.state_id : null,
     title
   };
+
+  if (primaryCandidate?.intent_type) {
+    summary.intent_type = primaryCandidate.intent_type;
+  }
+  if (primaryCandidate?.intent_class) {
+    summary.intent_class = primaryCandidate.intent_class;
+  }
 
   if (labels.length > 0) {
     summary.label = labels[0];
@@ -8561,9 +8727,13 @@ function summarizeIntentForAgent(intent) {
 
   if (texts.length > 0) {
     summary.text = texts[0];
+    summary.description = texts[0];
     if (texts.length > 1) {
       summary.alt_text_count = texts.length - 1;
     }
+  } else if (primaryCandidate?.description) {
+    summary.text = primaryCandidate.description;
+    summary.description = primaryCandidate.description;
   }
 
   if (totalDamages.length > 0) {
@@ -8571,6 +8741,31 @@ function summarizeIntentForAgent(intent) {
     if (totalDamages.length > 1) {
       summary.alt_total_damage_count = totalDamages.length - 1;
     }
+  } else if (primaryCandidate?.total_damage !== undefined) {
+    summary.total_damage = primaryCandidate.total_damage;
+  }
+
+  if (repeats.length > 0) {
+    summary.repeats = repeats[0];
+    if (repeats.length > 1) {
+      summary.alt_repeats_count = repeats.length - 1;
+    }
+  } else if (primaryCandidate?.repeats !== undefined) {
+    summary.repeats = primaryCandidate.repeats;
+  }
+
+  if (damagePerHits.length > 0) {
+    summary.damage_per_hit = damagePerHits[0];
+    if (damagePerHits.length > 1) {
+      summary.alt_damage_per_hit_count = damagePerHits.length - 1;
+    }
+  } else if (primaryCandidate?.damage_per_hit !== undefined) {
+    summary.damage_per_hit = primaryCandidate.damage_per_hit;
+  }
+
+  if (summarizedCandidates.length > 0) {
+    summary.candidate_count = summarizedCandidates.length;
+    summary.intents = summarizedCandidates.slice(0, 3);
   }
 
   return summary;

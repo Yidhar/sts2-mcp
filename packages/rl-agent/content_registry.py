@@ -440,16 +440,16 @@ def _compact_runtime_card_summary(card_payload: dict[str, Any] | None) -> str:
     tokens: list[str] = []
 
     cost = card_payload.get("cost")
-    if isinstance(cost, (int, float)):
-        tokens.append(f"{_format_compact_number(cost)}e")
-    elif card_payload.get("x_cost"):
+    if card_payload.get("x_cost"):
         tokens.append("Xe")
+    elif isinstance(cost, (int, float)):
+        tokens.append(f"{_format_compact_number(cost)}e")
 
     star = card_payload.get("star")
-    if isinstance(star, (int, float)) and float(star) > 0:
-        tokens.append(f"{_format_compact_number(star)}s")
-    elif card_payload.get("star_x"):
+    if card_payload.get("star_x"):
         tokens.append("Xs")
+    elif isinstance(star, (int, float)) and float(star) > 0:
+        tokens.append(f"{_format_compact_number(star)}s")
 
     card_type = _normalize_compact_text(card_payload.get("type"))
     if card_type:
@@ -767,7 +767,7 @@ def build_enemy_intent_semantic_text(intent_payload: dict[str, Any] | None) -> s
     title = _normalize_compact_text(intent_payload.get("title"))
     intent_type_raw = _normalize_compact_text(intent_payload.get("intent_type"))
     intent_type = _normalize_intent_type(intent_type_raw)
-    description = _normalize_compact_text(intent_payload.get("description"))
+    description = _normalize_compact_text(intent_payload.get("description") or intent_payload.get("text"))
 
     signal_parts: list[str] = []
     total_damage = intent_payload.get("total_damage")
@@ -776,6 +776,12 @@ def build_enemy_intent_semantic_text(intent_payload: dict[str, Any] | None) -> s
     repeats = intent_payload.get("repeats")
     if repeats not in (None, "", False) and int(float(repeats)) > 1:
         signal_parts.append(f"hits={_format_compact_number(repeats)}")
+    damage_per_hit = intent_payload.get("damage_per_hit")
+    if damage_per_hit not in (None, "", False):
+        signal_parts.append(f"dph={_format_compact_number(damage_per_hit)}")
+    candidate_count = intent_payload.get("candidate_count")
+    if candidate_count not in (None, "", False) and int(float(candidate_count)) > 1:
+        signal_parts.append(f"cand={_format_compact_number(candidate_count)}")
 
     tag_parts: list[str] = []
     normalized_lookup = intent_type_raw.lower().replace(" ", "")

@@ -18,8 +18,56 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 
-def resolve_combat_snapshot_dataset_path(path: str | Path) -> Path:
+VALID_ENCOUNTER_TIERS = {"weak", "normal", "elite", "boss"}
+VALID_CURATED_COMBINED_SUBSETS = {
+    "human_only",
+    "human_only_weak_normal",
+    "local_act1clear_only",
+    "bootstrap_human_plus_local_act1clear",
+    "bootstrap_human_plus_local_act1clear_weak_normal",
+}
+DEFAULT_CURATED_COMBINED_SUBSET = "bootstrap_human_plus_local_act1clear"
+
+
+def infer_encounter_tier(
+    encounter_id: str | None = None,
+    *,
+    room_type: str | None = None,
+) -> str:
+    """Infer a coarse encounter tier for curriculum filtering."""
+    normalized_room_type = str(room_type or "").strip().lower()
+    if normalized_room_type == "boss":
+        return "boss"
+    if normalized_room_type == "elite":
+        return "elite"
+
+    enc = str(encounter_id or "").strip().upper()
+    if enc.endswith("_WEAK"):
+        return "weak"
+    if enc.endswith("_ELITE"):
+        return "elite"
+    if enc.endswith("_BOSS"):
+        return "boss"
+    if enc.endswith("_NORMAL") or enc.endswith("_NORMAL_ALT"):
+        return "normal"
+
+    return "normal"
+
+
+def infer_encounter_tier_from_row(row: dict[str, Any]) -> str:
+    return infer_encounter_tier(
+        row.get("encounter_id"),
+        room_type=row.get("room_type"),
+    )
+
+
+def resolve_combat_snapshot_dataset_path(
+    path: str | Path,
+    *,
+    curated_subset: str | None = None,
+) -> Path:
     """Resolve a user-provided path to a concrete combat snapshot dataset file.
 
     Accepted inputs:
@@ -27,6 +75,7 @@ def resolve_combat_snapshot_dataset_path(path: str | Path) -> Path:
     - dataset root containing ``combat_snapshot_samples.jsonl``
     - dataset root containing ``parquet/combat_snapshot_samples.parquet``
     - partition dir such as ``.../by_build_family/v0.99.1``
+    - curated combat root / combined dir containing bootstrap subsets
     """
 
     input_path = Path(path)
@@ -36,11 +85,45 @@ def resolve_combat_snapshot_dataset_path(path: str | Path) -> Path:
     if not input_path.exists():
         raise FileNotFoundError(f"Combat snapshot dataset path does not exist: {input_path}")
 
+    preferred_subset = str(curated_subset or "").strip()
+    if preferred_subset:
+        if preferred_subset not in VALID_CURATED_COMBINED_SUBSETS:
+            raise ValueError(
+                f"Unsupported curated combat subset {preferred_subset!r}; "
+                f"expected one of {sorted(VALID_CURATED_COMBINED_SUBSETS)}"
+            )
+
+    curated_candidates: list[Path] = []
+    subsets_to_try: list[str] = []
+    if preferred_subset:
+        subsets_to_try.append(preferred_subset)
+    if (input_path / "combined").exists() or (input_path / "curated_runs_summary.jsonl").exists():
+        if DEFAULT_CURATED_COMBINED_SUBSET not in subsets_to_try:
+            subsets_to_try.append(DEFAULT_CURATED_COMBINED_SUBSET)
+
+    for subset in subsets_to_try:
+        curated_candidates.extend(
+            [
+                input_path / "combined" / f"{subset}.parquet",
+                input_path / "combined" / f"{subset}.jsonl",
+                input_path / f"{subset}.parquet",
+                input_path / f"{subset}.jsonl",
+            ]
+        )
+
+    for candidate in curated_candidates:
+        if candidate.exists():
+            return candidate
+
     candidates = [
         input_path / "combat_snapshot_samples.parquet",
         input_path / "combat_snapshot_samples.jsonl",
+        input_path / "combat_snapshot_samples_all.parquet",
+        input_path / "combat_snapshot_samples_all.jsonl",
         input_path / "parquet" / "combat_snapshot_samples.parquet",
         input_path / "parquet" / "combat_snapshot_samples.jsonl",
+        input_path / "parquet" / "combat_snapshot_samples_all.parquet",
+        input_path / "parquet" / "combat_snapshot_samples_all.jsonl",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -236,17 +319,19 @@ def clean_combat_snapshot_rows(
 def load_combat_snapshot_rows(
     path: str | Path,
     *,
+    curated_subset: str | None = None,
     split: str | None = None,
     character: str | None = None,
     build_id: str | None = None,
     encounter_ids: list[str] | None = None,
+    encounter_tiers: list[str] | None = None,
     min_floor: int | None = None,
     max_floor: int | None = None,
     max_rows: int | None = None,
     strict_playable_only: bool = True,
     supported_encounter_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    dataset_path = resolve_combat_snapshot_dataset_path(path)
+    dataset_path = resolve_combat_snapshot_dataset_path(path, curated_subset=curated_subset)
     suffix = dataset_path.suffix.lower()
     if suffix == ".jsonl":
         rows = _load_jsonl_rows(dataset_path)
@@ -256,6 +341,10 @@ def load_combat_snapshot_rows(
         raise ValueError(f"Unsupported combat snapshot dataset format: {dataset_path}")
 
     encounter_filter = {str(value) for value in (encounter_ids or []) if value}
+    encounter_tier_filter = {str(value).strip().lower() for value in (encounter_tiers or []) if value}
+    invalid_tiers = sorted(encounter_tier_filter.difference(VALID_ENCOUNTER_TIERS))
+    if invalid_tiers:
+        raise ValueError(f"Unsupported encounter tiers: {invalid_tiers}")
     filtered: list[dict[str, Any]] = []
     for row in rows:
         if split and str(row.get("split") or "") != split:
@@ -265,6 +354,8 @@ def load_combat_snapshot_rows(
         if build_id and str(row.get("build_id") or "") != build_id:
             continue
         if encounter_filter and str(row.get("encounter_id") or "") not in encounter_filter:
+            continue
+        if encounter_tier_filter and infer_encounter_tier_from_row(row) not in encounter_tier_filter:
             continue
 
         floor_number = row.get("floor_number")
@@ -296,49 +387,82 @@ class CombatSnapshotPool:
         rows: list[dict[str, Any]],
         *,
         sample_mode: str = "encounter_balanced",
+        tier_weights: dict[str, float] | None = None,
+        encounter_weights: dict[str, float] | None = None,
     ) -> None:
         if not rows:
             raise ValueError("CombatSnapshotPool requires at least one row")
-        if sample_mode not in {"row_uniform", "encounter_balanced"}:
+        if sample_mode not in {"row_uniform", "encounter_balanced", "tier_weighted_encounter_balanced"}:
             raise ValueError(f"Unsupported sample_mode: {sample_mode}")
 
         self.rows = rows
         self.sample_mode = sample_mode
+        self.tier_weights = {
+            str(tier).strip().lower(): float(weight)
+            for tier, weight in (tier_weights or {}).items()
+            if float(weight) > 0.0
+        }
+        self.encounter_weights = {
+            str(encounter_id).strip(): float(weight)
+            for encounter_id, weight in (encounter_weights or {}).items()
+            if float(weight) > 0.0
+        }
         self._rows_by_encounter: dict[str, list[dict[str, Any]]] = {}
+        self._rows_by_tier_encounter: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for row in rows:
             encounter_id = str(row.get("encounter_id") or "")
             if not encounter_id:
                 continue
             self._rows_by_encounter.setdefault(encounter_id, []).append(row)
+            tier = infer_encounter_tier_from_row(row)
+            self._rows_by_tier_encounter.setdefault(tier, {}).setdefault(encounter_id, []).append(row)
         self._encounter_ids = sorted(self._rows_by_encounter.keys())
+        self._tier_ids = sorted(self._rows_by_tier_encounter.keys())
         if not self._encounter_ids:
             raise ValueError("CombatSnapshotPool found no usable encounter_id rows")
+        if sample_mode == "tier_weighted_encounter_balanced" and not self._tier_ids:
+            raise ValueError("CombatSnapshotPool found no encounter tiers for weighted sampling")
+
+        self._normalized_tier_weights = self._build_normalized_tier_weights()
 
     @classmethod
     def from_path(
         cls,
         path: str | Path,
         *,
+        curated_subset: str | None = None,
         split: str | None = None,
         character: str | None = None,
         build_id: str | None = None,
         encounter_ids: list[str] | None = None,
+        encounter_tiers: list[str] | None = None,
         min_floor: int | None = None,
         max_floor: int | None = None,
         max_rows: int | None = None,
         sample_mode: str = "encounter_balanced",
+        tier_weights: dict[str, float] | None = None,
+        encounter_weights: dict[str, float] | None = None,
+        supported_encounter_ids: set[str] | None = None,
     ) -> "CombatSnapshotPool":
         rows = load_combat_snapshot_rows(
             path,
+            curated_subset=curated_subset,
             split=split,
             character=character,
             build_id=build_id,
             encounter_ids=encounter_ids,
+            encounter_tiers=encounter_tiers,
             min_floor=min_floor,
             max_floor=max_floor,
             max_rows=max_rows,
+            supported_encounter_ids=supported_encounter_ids,
         )
-        return cls(rows, sample_mode=sample_mode)
+        return cls(
+            rows,
+            sample_mode=sample_mode,
+            tier_weights=tier_weights,
+            encounter_weights=encounter_weights,
+        )
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -352,6 +476,7 @@ class CombatSnapshotPool:
         characters = sorted({str(row.get("character") or "unknown") for row in self.rows})
         build_ids = sorted({str(row.get("build_id") or "unknown") for row in self.rows})
         floors = [int(row.get("floor_number")) for row in self.rows if isinstance(row.get("floor_number"), int)]
+        tier_counts = Counter(infer_encounter_tier_from_row(row) for row in self.rows)
         encounter_sizes = {encounter_id: len(rows) for encounter_id, rows in self._rows_by_encounter.items()}
         top_encounters = sorted(
             encounter_sizes.items(),
@@ -365,6 +490,9 @@ class CombatSnapshotPool:
             "min_floor": min(floors) if floors else None,
             "max_floor": max(floors) if floors else None,
             "sample_mode": self.sample_mode,
+            "tier_counts": dict(sorted(tier_counts.items())),
+            "tier_sampling_weights": dict(sorted(self._normalized_tier_weights.items())),
+            "encounter_weight_overrides": dict(sorted(self.encounter_weights.items())[:10]),
             "top_encounters": top_encounters,
         }
 
@@ -373,11 +501,62 @@ class CombatSnapshotPool:
             index = int(rng.integers(len(self.rows)))
             return self.rows[index]
 
-        encounter_index = int(rng.integers(len(self._encounter_ids)))
+        if self.sample_mode == "tier_weighted_encounter_balanced":
+            tier_probs = np.asarray([self._normalized_tier_weights[tier] for tier in self._tier_ids], dtype=np.float64)
+            tier_index = int(rng.choice(len(self._tier_ids), p=tier_probs))
+            tier_id = self._tier_ids[tier_index]
+            encounter_ids = sorted(self._rows_by_tier_encounter[tier_id].keys())
+            encounter_probs = self._encounter_probabilities(encounter_ids)
+            encounter_index = int(rng.choice(len(encounter_ids), p=encounter_probs))
+            encounter_id = encounter_ids[encounter_index]
+            encounter_rows = self._rows_by_tier_encounter[tier_id][encounter_id]
+            row_index = int(rng.integers(len(encounter_rows)))
+            return encounter_rows[row_index]
+
+        encounter_probs = self._encounter_probabilities(self._encounter_ids)
+        encounter_index = int(rng.choice(len(self._encounter_ids), p=encounter_probs))
         encounter_id = self._encounter_ids[encounter_index]
         encounter_rows = self._rows_by_encounter[encounter_id]
         row_index = int(rng.integers(len(encounter_rows)))
         return encounter_rows[row_index]
+
+    def _build_normalized_tier_weights(self) -> dict[str, float]:
+        if not self._tier_ids:
+            return {}
+
+        if not self.tier_weights:
+            uniform = 1.0 / float(len(self._tier_ids))
+            return {tier: uniform for tier in self._tier_ids}
+
+        weights: dict[str, float] = {}
+        total = 0.0
+        for tier in self._tier_ids:
+            weight = float(self.tier_weights.get(tier, 0.0))
+            if weight > 0.0:
+                weights[tier] = weight
+                total += weight
+        if total <= 0.0:
+            raise ValueError(
+                "CombatSnapshotPool tier_weighted_encounter_balanced needs at least one positive tier weight "
+                f"among available tiers {self._tier_ids!r}."
+            )
+        return {tier: weight / total for tier, weight in weights.items()}
+
+    def _encounter_probabilities(self, encounter_ids: list[str]) -> np.ndarray:
+        if not encounter_ids:
+            raise ValueError("CombatSnapshotPool cannot sample from an empty encounter id list")
+
+        if not self.encounter_weights:
+            return np.full(len(encounter_ids), 1.0 / float(len(encounter_ids)), dtype=np.float64)
+
+        weights = np.asarray(
+            [max(float(self.encounter_weights.get(encounter_id, 1.0)), 0.0) for encounter_id in encounter_ids],
+            dtype=np.float64,
+        )
+        total = float(weights.sum())
+        if total <= 0.0:
+            return np.full(len(encounter_ids), 1.0 / float(len(encounter_ids)), dtype=np.float64)
+        return weights / total
 
 
 def snapshot_row_to_reset_kwargs(row: dict[str, Any]) -> dict[str, Any]:

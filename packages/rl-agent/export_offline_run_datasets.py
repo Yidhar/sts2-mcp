@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import tarfile
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -209,6 +210,11 @@ def _collect_run_sources(input_path: Path) -> list[dict[str, Any]]:
     raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
 
+def _is_tar_archive_path(input_path: Path) -> bool:
+    name = input_path.name.lower()
+    return name.endswith(".tar.gz") or name.endswith(".tgz") or name.endswith(".tar")
+
+
 def _expand_single_input(input_path: Path) -> list[dict[str, Any]]:
     suffix = input_path.suffix.lower()
     if suffix == ".run":
@@ -221,6 +227,8 @@ def _expand_single_input(input_path: Path) -> list[dict[str, Any]]:
         ]
     if suffix == ".zip":
         return _expand_zip_input(input_path)
+    if _is_tar_archive_path(input_path):
+        return _expand_tar_input(input_path)
     raise FileNotFoundError(f"Unsupported input file type: {input_path}")
 
 
@@ -244,6 +252,26 @@ def _expand_zip_input(archive_path: Path) -> list[dict[str, Any]]:
     return sources
 
 
+def _expand_tar_input(archive_path: Path) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        run_names = sorted(
+            member.name
+            for member in archive.getmembers()
+            if member.isfile() and member.name.lower().endswith(".run")
+        )
+    for member_name in run_names:
+        sources.append(
+            {
+                "kind": "tar_member",
+                "display_path": f"{archive_path}!{member_name}",
+                "archive_path": archive_path,
+                "member_name": member_name,
+            }
+        )
+    return sources
+
+
 def _load_source_payload(source: dict[str, Any]) -> bytes:
     kind = source["kind"]
     if kind == "file":
@@ -251,6 +279,15 @@ def _load_source_payload(source: dict[str, Any]) -> bytes:
     if kind == "zip_member":
         with zipfile.ZipFile(source["archive_path"]) as archive:
             return archive.read(source["member_name"])
+    if kind == "tar_member":
+        with tarfile.open(source["archive_path"], mode="r:*") as archive:
+            member = archive.getmember(source["member_name"])
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise FileNotFoundError(
+                    f"Could not extract tar member {source['member_name']} from {source['archive_path']}"
+                )
+            return extracted.read()
     raise ValueError(f"Unsupported source kind: {kind}")
 
 
@@ -454,10 +491,11 @@ def main() -> None:
         basic_accepted += 1
         run_to_build_family_basic[str(summary.get("run_id"))] = _resolve_build_family(summary.get("build_id"))
         combat_rows = samples.get("combat_snapshot_samples") or []
+        pending_cleaned_combat_rows: list[dict[str, Any]] = []
         combat_snapshot_input_rows += len(combat_rows)
         if combat_rows:
             cleaned_combat_rows, clean_report = clean_combat_snapshot_rows(combat_rows)
-            combat_snapshot_samples.extend(cleaned_combat_rows)
+            pending_cleaned_combat_rows = cleaned_combat_rows
             combat_snapshot_dropped_rows += int(clean_report.get("dropped_rows", 0) or 0)
             for reason, count in (clean_report.get("reject_reasons") or {}).items():
                 if isinstance(count, int):
@@ -492,6 +530,7 @@ def main() -> None:
         route_samples.extend(samples["route_samples"])
         card_choice_samples.extend(samples["card_choice_samples"])
         build_samples.extend(samples["build_samples"])
+        combat_snapshot_samples.extend(pending_cleaned_combat_rows)
         _merge_numeric_audit(build_v2_audit_totals, build_v2.get("audit"))
         for sample in samples["build_samples"]:
             decision_type = str(sample.get("decision_type") or "unknown")
