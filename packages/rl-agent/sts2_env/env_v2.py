@@ -455,14 +455,17 @@ class SlayTheSpire2EnvV2(gym.Env):
     def _reset_with_ready_gate(self, *, timeout_ms: int) -> dict[str, Any]:
         deadline = time.monotonic() + (max(timeout_ms, RESET_READY_MAX_WAIT_MS) / 1000.0)
         last_exc: Exception | None = None
+        force_fresh_next = False
 
         while time.monotonic() < deadline:
             try:
                 result = self.bridge.reset(
                     character=self.character,
+                    force_fresh=force_fresh_next,
                     defensive_buffs=self.defensive_buffs,
                     timeout_ms=timeout_ms,
                 )
+                force_fresh_next = False
             except Exception as exc:
                 if not self._is_transient_reset_error(exc):
                     raise
@@ -471,16 +474,20 @@ class SlayTheSpire2EnvV2(gym.Env):
                 continue
 
             phase = self._extract_phase(result)
-            filtered_actions = self._filter_legal_actions(result.get("legal_actions", []), phase=phase)
+            raw_actions = result.get("legal_actions", [])
+            filtered_actions = self._filter_legal_actions(raw_actions, phase=phase)
             if filtered_actions:
                 return result
+
+            raw_action_count = len(raw_actions) if isinstance(raw_actions, list) else 0
+            blocked_only = raw_action_count > 0 and not filtered_actions
 
             episode_id = result.get("episode_id") if isinstance(result, dict) else None
             if episode_id:
                 self._episode_id = str(episode_id)
                 self._update_live_state(result)
                 recovered = self._recover_filtered_action_window(
-                    timeout_ms=min(timeout_ms, RECOVERY_MAX_WAIT_MS),
+                    timeout_ms=self._transition_recovery_timeout_ms(),
                 )
                 if recovered and self._legal_actions:
                     recovered_result = dict(result)
@@ -490,7 +497,13 @@ class SlayTheSpire2EnvV2(gym.Env):
                         recovered_result["obs"] = dict(self._last_obs_raw)
                     return recovered_result
 
-            last_exc = RuntimeError(f"reset returned no usable legal actions at phase={phase}")
+            if blocked_only:
+                force_fresh_next = True
+                last_exc = RuntimeError(
+                    f"reset returned only blocked legal actions at phase={phase}; forcing fresh reset retry"
+                )
+            else:
+                last_exc = RuntimeError(f"reset returned no usable legal actions at phase={phase}")
             time.sleep(RESET_READY_POLL_INTERVAL_S)
 
         if last_exc is not None:
@@ -507,19 +520,20 @@ class SlayTheSpire2EnvV2(gym.Env):
         deadline = time.monotonic() + (timeout_ms / 1000.0)
         while time.monotonic() < deadline:
             state = self._safe_get_state()
+            remaining_ms = max(int((deadline - time.monotonic()) * 1000.0), 0)
+            attempt_timeout_ms = max(1_000, min(remaining_ms, self._transition_recovery_timeout_ms()))
+
+            if self._state_allows_soft_rebind(state):
+                refreshed = self._safe_reset_into_current_run(attempt_timeout_ms)
+                if refreshed is not None:
+                    self._episode_id = refreshed.get("episode_id", self._episode_id)
+                    self._update_live_state(refreshed)
+                    if self._legal_actions:
+                        return True
+
             if not self._state_has_unblocked_actions(state):
                 time.sleep(RECOVERY_POLL_INTERVAL_S)
                 continue
-
-            refreshed = self._safe_reset_into_current_run(timeout_ms)
-            if refreshed is None:
-                time.sleep(RECOVERY_POLL_INTERVAL_S)
-                continue
-
-            self._episode_id = refreshed.get("episode_id", self._episode_id)
-            self._update_live_state(refreshed)
-            if self._legal_actions:
-                return True
 
             time.sleep(RECOVERY_POLL_INTERVAL_S)
 
@@ -549,10 +563,6 @@ class SlayTheSpire2EnvV2(gym.Env):
             state = self._safe_get_state()
             if not self._state_allows_soft_rebind(state):
                 return None
-
-            if not self._state_has_unblocked_actions(state):
-                time.sleep(RECOVERY_POLL_INTERVAL_S)
-                continue
 
             try:
                 result = self.bridge.reset(

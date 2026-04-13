@@ -43,8 +43,10 @@ using MegaCrit.Sts2.Core.Nodes.Screens;
 using MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect;
 using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.GameOverScreen;
+using MegaCrit.Sts2.Core.Nodes.Screens.MainMenu;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Nodes.Screens.Overlays;
+using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 using MegaCrit.Sts2.Core.Nodes.Screens.Shops;
 using MegaCrit.Sts2.Core.Nodes.Screens.TreasureRoomRelic;
 using MegaCrit.Sts2.Core.Nodes.TreasureRooms;
@@ -562,8 +564,9 @@ internal static partial class BridgeGameApi
         BridgeDebugTrace.Write("capture_frontier_candidate start");
         var context = CaptureContext();
         BridgeDebugTrace.Write($"capture_frontier_candidate context screen={context.Screen}");
-        var actions = BuildResolvedActions(context);
-        BridgeDebugTrace.Write($"capture_frontier_candidate actions={actions.Count}");
+        var rawActions = BuildResolvedActions(context);
+        var actions = FilterActionsForStableSurface(context, rawActions);
+        BridgeDebugTrace.Write($"capture_frontier_candidate actions={actions.Count} raw_actions={rawActions.Count}");
         var frontierHash = ComputeFrontierHash(BuildFrontierFingerprint(context, actions));
         BridgeDebugTrace.Write($"capture_frontier_candidate complete hash={frontierHash}");
 
@@ -616,7 +619,7 @@ internal static partial class BridgeGameApi
             crystal_sphere = BuildCrystalSphereFrontierPayload(
                 context.CrystalSphereScreen,
                 context.CrystalSphereCells),
-            map = BuildMapFrontierPayload(context.RunState, context.MapScreen),
+            map = BuildMapFrontierPayload(context.RunState, context.MapScreen, context.Screen, context.CombatManager),
             rest_site = BuildRestSiteFrontierPayload(
                 context.MapScreen,
                 context.RestSiteRoom,
@@ -1247,18 +1250,31 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static object BuildMapFrontierPayload(RunState? runState, NMapScreen? mapScreen)
+    private static object BuildMapFrontierPayload(
+        RunState? runState,
+        NMapScreen? mapScreen,
+        string currentScreen,
+        CombatManager? combatManager)
     {
+        var rawIsOpen = mapScreen?.IsOpen ?? false;
+        var rawIsTravelEnabled = mapScreen?.IsTravelEnabled ?? false;
+        var rawIsTraveling = mapScreen?.IsTraveling ?? false;
+        var interactiveSurface = string.Equals(currentScreen, "MAP", StringComparison.Ordinal) &&
+                                 IsInteractiveMapSurface(mapScreen, combatManager);
+
         return new
         {
-            is_open = mapScreen?.IsOpen ?? false,
-            is_travel_enabled = mapScreen?.IsTravelEnabled ?? false,
-            is_traveling = mapScreen?.IsTraveling ?? false,
+            is_open = interactiveSurface,
+            is_travel_enabled = interactiveSurface && rawIsTravelEnabled,
+            is_traveling = rawIsTraveling,
+            is_open_raw = rawIsOpen,
+            is_travel_enabled_raw = rawIsTravelEnabled,
+            is_interactive_surface = interactiveSurface,
             current_coord = BuildMapCoord(runState?.CurrentMapCoord)
         };
     }
 
-    private static bool IsInteractiveMapSurface(NMapScreen? mapScreen)
+    private static bool HasRawInteractiveMapSurface(NMapScreen? mapScreen)
     {
         return mapScreen is not null &&
                mapScreen.IsOpen &&
@@ -1267,15 +1283,28 @@ internal static partial class BridgeGameApi
     }
 
     private static bool IsInteractiveMapSurface(
-        BridgeWorldContext context,
-        IReadOnlyList<BridgeResolvedAction>? actions = null)
+        NMapScreen? mapScreen,
+        CombatManager? combatManager = null)
     {
-        if (!IsInteractiveMapSurface(context.MapScreen))
+        if (!HasRawInteractiveMapSurface(mapScreen))
         {
             return false;
         }
 
-        return !HasBlockingMapOverlaySurface(context, actions ?? Array.Empty<BridgeResolvedAction>());
+        combatManager ??= CombatManager.Instance;
+        return combatManager?.IsInProgress != true;
+    }
+
+    private static bool IsInteractiveMapSurface(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction>? actions = null)
+    {
+        if (!IsInteractiveMapSurface(context.MapScreen, context.CombatManager))
+        {
+            return false;
+        }
+
+        return string.Equals(context.Screen, "MAP", StringComparison.Ordinal);
     }
 
     private static object BuildRestSiteFrontierPayload(
@@ -1364,26 +1393,31 @@ internal static partial class BridgeGameApi
         var combatUi = combatRoom?.Ui;
         var playerHand = combatUi?.Hand;
         var endTurnButton = combatUi?.EndTurnButton;
+        var activeScreen = ActiveScreenContext.Instance.GetCurrentScreen();
+        var activeScreenNode = activeScreen as Node;
+        var overlayStack = NOverlayStack.Instance;
+        var overlayRoot = overlayStack as Node;
         var mapScreen = NMapScreen.Instance;
+        var mainMenuRoot = game.MainMenu;
+        var mainMenuSubmenu = ResolveMainMenuSubmenu(activeScreen, mainMenuRoot);
         var restSiteRoom = NRestSiteRoom.Instance;
         var restSiteProceedButton = restSiteRoom?.ProceedButton;
         var merchantRoom = NMerchantRoom.Instance;
         var merchantInventory = merchantRoom?.Inventory;
         var merchantButton = merchantRoom?.MerchantButton;
         var merchantProceedButton = merchantRoom?.ProceedButton;
-        var merchantBackButton = GetHiddenFieldValue(merchantInventory, "_backButton") as NBackButton;
-        var treasureRoom = FindFirstVisibleDescendant<NTreasureRoom>(game);
-        var treasureChestButton = ResolveFirstVisibleNode(
-            GetHiddenFieldValue(treasureRoom, "_chestButton") as NTreasureButton,
-            FindFirstVisibleDescendant<NTreasureButton>(treasureRoom));
-        var treasureRelicCollection = ResolveFirstVisibleNode(
-            GetHiddenFieldValue(treasureRoom, "_relicCollection") as NTreasureRoomRelicCollection,
-            FindFirstVisibleDescendant<NTreasureRoomRelicCollection>(treasureRoom));
-        var treasureRelicOptions = treasureRelicCollection is null
-            ? new List<NTreasureRoomRelicHolder>()
-            : SortByVisualPosition(FindVisibleDescendants<NTreasureRoomRelicHolder>(treasureRelicCollection));
-        var proceedButton = ResolveVisibleProceedButton(
-            game,
+        var merchantBackButton = merchantInventory?.GetNodeOrNull<NBackButton>("%BackButton") ??
+                                 GetHiddenFieldValue(merchantInventory, "_backButton") as NBackButton;
+        var treasureRoom = runNode?.TreasureRoom;
+        var treasureChestButton = ResolveTreasureChestButton(treasureRoom);
+        var treasureRelicCollection = ResolveTreasureRelicCollection(treasureRoom);
+        var treasureRelicOptions = ResolveTreasureRelicOptions(treasureRelicCollection);
+        var rewardsScreen = ResolveOverlayScreen<NRewardsScreen>(activeScreen, overlayStack);
+        var rewardProceedButton = rewardsScreen?.GetNodeOrNull<NProceedButton>("ProceedButton") ??
+                                  GetHiddenFieldValue(rewardsScreen, "_proceedButton") as NProceedButton;
+        var proceedButton = ResolveStableProceedButton(
+            activeScreen,
+            activeScreenNode ?? overlayRoot ?? game,
             combatRoom?.ProceedButton,
             treasureRoom?.ProceedButton,
             restSiteProceedButton,
@@ -1391,100 +1425,82 @@ internal static partial class BridgeGameApi
         var merchantSlots = merchantInventory is null
             ? new List<NMerchantSlot>()
             : SortByVisualPosition(merchantInventory.GetAllSlots().Where(IsNodeVisible));
-        var rewardsScreen = FindFirstVisibleDescendant<NRewardsScreen>(game);
-        var rewardProceedButton = ResolveFirstVisibleNode(
-            GetHiddenPropertyObjectValue(rewardsScreen, "ProceedButton") as NProceedButton,
-            GetHiddenFieldValue(rewardsScreen, "_proceedButton") as NProceedButton);
-        var cardRewardScreen = FindFirstVisibleDescendant<NCardRewardSelectionScreen>(game);
-        var characterSelectScreen = FindFirstVisibleDescendant<NCharacterSelectScreen>(game);
-        var deckUpgradeScreen = FindFirstVisibleDescendant<NDeckUpgradeSelectScreen>(game);
-        Node cardSelectionSearchRoot = game.GetTree()?.Root is Node sceneRoot
-            ? sceneRoot
-            : game;
+        var cardRewardScreen = ResolveOverlayScreen<NCardRewardSelectionScreen>(activeScreen, overlayStack);
+        var characterSelectScreen = activeScreen as NCharacterSelectScreen ??
+                                    mainMenuSubmenu as NCharacterSelectScreen;
+        var deckUpgradeScreen = ResolveOverlayScreen<NDeckUpgradeSelectScreen>(activeScreen, overlayStack);
         var cardRewardSkipButton = ResolveCardRewardSkipButton(cardRewardScreen);
-        var cardSelectionScreen = ResolveVisibleCardSelectionScreen(
-            cardSelectionSearchRoot,
+        var cardSelectionScreen = ResolveStableCardSelectionScreen(
+            activeScreen,
+            overlayStack,
             cardRewardScreen,
-            deckUpgradeScreen) ?? ResolveCombatHandSelectionNode(playerHand);
-        var restSiteButtons = SortByVisualPosition(FindVisibleDescendants<NRestSiteButton>(restSiteRoom));
-        var characterButtons = SortByVisualPosition(FindVisibleDescendants<NCharacterSelectButton>(characterSelectScreen));
+            deckUpgradeScreen,
+            playerHand);
+        var restSiteButtons = ResolveRestSiteButtons(restSiteRoom);
+        var characterButtons = ResolveCharacterButtons(characterSelectScreen);
         var selectedCharacterButton = GetHiddenFieldValue(characterSelectScreen, "_selectedButton") as NCharacterSelectButton;
-        var embarkButton = GetHiddenFieldValue(characterSelectScreen, "_embarkButton") as NConfirmButton;
-        var rewardButtons = rewardsScreen is null
-            ? new List<NRewardButton>()
-            : SortByVisualPosition(
-                FindVisibleDescendants<NRewardButton>(rewardsScreen)
-                    .Where(button => !IsRewardButtonSkipped(rewardsScreen, button)));
-        var cardRewardOptions = SortByVisualPosition(FindVisibleDescendants<NCardHolder>(cardRewardScreen));
-        var deckUpgradeOptions = deckUpgradeScreen is null
-            ? new List<NCardHolder>()
-            : SortByVisualPosition(
-                FindVisibleDescendants<NCardHolder>(deckUpgradeScreen)
-                    .Where(holder => !IsDeckUpgradePreviewHolder(deckUpgradeScreen, holder)));
+        var embarkButton = characterSelectScreen?.GetNodeOrNull<NConfirmButton>("%EmbarkButton") ??
+                           GetHiddenFieldValue(characterSelectScreen, "_embarkButton") as NConfirmButton;
+        var rewardButtons = ResolveRewardButtons(rewardsScreen);
+        var cardRewardOptions = ResolveCardRewardOptions(cardRewardScreen);
+        var deckUpgradeOptions = ResolveDeckUpgradeOptions(deckUpgradeScreen);
         var cardSelectionOptions = GetCardSelectionOptions(cardSelectionScreen);
         var deckUpgradeCancelButton = ResolveFirstVisibleNode(
+            deckUpgradeScreen?.GetNodeOrNull<NBackButton>("%UpgradeSinglePreviewContainer/Cancel"),
+            deckUpgradeScreen?.GetNodeOrNull<NBackButton>("%UpgradeMultiPreviewContainer/Cancel"),
             GetHiddenFieldValue(deckUpgradeScreen, "_singlePreviewCancelButton") as NBackButton,
             GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewCancelButton") as NBackButton);
         var deckUpgradeConfirmButton = ResolveFirstVisibleNode(
+            deckUpgradeScreen?.GetNodeOrNull<NConfirmButton>("%UpgradeSinglePreviewContainer/Confirm"),
+            deckUpgradeScreen?.GetNodeOrNull<NConfirmButton>("%UpgradeMultiPreviewContainer/Confirm"),
             GetHiddenFieldValue(deckUpgradeScreen, "_singlePreviewConfirmButton") as NConfirmButton,
             GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewConfirmButton") as NConfirmButton);
-        var deckUpgradeCloseButton = GetHiddenFieldValue(deckUpgradeScreen, "_closeButton") as NBackButton;
+        var deckUpgradeCloseButton = deckUpgradeScreen?.GetNodeOrNull<NBackButton>("%Close") ??
+                                     GetHiddenFieldValue(deckUpgradeScreen, "_closeButton") as NBackButton;
         var cardSelectionConfirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
         var cardSelectionCancelButton = ResolveCardSelectionCancelButton(cardSelectionScreen);
         var cardSelectionCloseButton = GetHiddenFieldValue(cardSelectionScreen, "_closeButton") as Node;
         var cardSelectionSkipButton = GetHiddenFieldValue(cardSelectionScreen, "_skipButton") as Node;
-        var eventRoom = FindFirstVisibleDescendant<NEventRoom>(game);
-        var gameOverScreen = FindFirstVisibleDescendant<NGameOverScreen>(game);
+        var eventRoom = runNode?.EventRoom;
+        var gameOverScreen = activeScreen as NGameOverScreen ??
+                             (activeScreen is null ? overlayStack?.Peek() as NGameOverScreen : null);
         var gameOverContinueButton = GetHiddenFieldValue(gameOverScreen, "_continueButton") as NGameOverContinueButton;
         var gameOverMainMenuButton = GetHiddenFieldValue(gameOverScreen, "_mainMenuButton") as NReturnToMainMenuButton;
-        var crystalSphereScreen = FindFirstVisibleDescendant<NCrystalSphereScreen>(game);
-        var crystalSphereCells = crystalSphereScreen is null
-            ? new List<NCrystalSphereCell>()
-            : FindVisibleDescendants<NCrystalSphereCell>(crystalSphereScreen)
-                .OrderBy(static cell => cell.Entity?.Y ?? int.MaxValue)
-                .ThenBy(static cell => cell.Entity?.X ?? int.MaxValue)
-                .ToList();
+        var crystalSphereScreen = ResolveOverlayScreen<NCrystalSphereScreen>(activeScreen, overlayStack);
+        var crystalSphereCells = ResolveCrystalSphereCells(crystalSphereScreen);
         var crystalSphereSmallDivinationButton =
+            crystalSphereScreen?.GetNodeOrNull<NDivinationButton>("%SmallDivinationButton") ??
             GetHiddenFieldValue(crystalSphereScreen, "_smallDivinationButton") as NDivinationButton;
         var crystalSphereBigDivinationButton =
+            crystalSphereScreen?.GetNodeOrNull<NDivinationButton>("%BigDivinationButton") ??
             GetHiddenFieldValue(crystalSphereScreen, "_bigDivinationButton") as NDivinationButton;
         var crystalSphereProceedButton =
+            crystalSphereScreen?.GetNodeOrNull<NProceedButton>("%ProceedButton") ??
             GetHiddenFieldValue(crystalSphereScreen, "_proceedButton") as NProceedButton;
-        var hoverTipSet = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.HoverTips.NHoverTipSet"));
-        var eventOptionButtons = SortByVisualPosition(FindVisibleDescendants<NEventOptionButton>(game))
+        var hoverTipSet = ResolveVisibleHoverTipSet(game);
+        var eventOptionSearchRoot = ResolveEventOptionSearchRoot(activeScreen, eventRoom);
+        var eventOptionButtons = (eventOptionSearchRoot is null
+            ? new List<NEventOptionButton>()
+            : SortByVisualPosition(FindVisibleDescendants<NEventOptionButton>(eventOptionSearchRoot)))
             .Where(static button => button.Option is not null)
             .ToList();
         RefreshInteractiveMapTravelability(mapScreen);
-        var mapPoints = FindVisibleDescendants<NMapPoint>(mapScreen)
-            .OrderBy(static point => point.Point.coord.row)
-            .ThenBy(static point => point.Point.coord.col)
-            .ToList();
-        var mainMenuRoot = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenu"));
-        var mainMenuContinueButton = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenuContinueButton"));
-        var mainMenuTextButtons = SortByVisualPosition(
-            FindVisibleDescendants(
-                game,
-                static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenuTextButton")));
-        var runModeSubmenu = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NSingleplayerSubmenu"));
-        var runModeStandardButton = GetHiddenFieldValue(runModeSubmenu, "_standardButton") as Node;
-        var runModeDailyButton = GetHiddenFieldValue(runModeSubmenu, "_dailyButton") as Node;
-        var runModeCustomButton = GetHiddenFieldValue(runModeSubmenu, "_customButton") as Node;
-        var runModeBackButton = GetHiddenFieldValue(runModeSubmenu, "_backButton") as NBackButton;
-        var continueRunInfo = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NContinueRunInfo"));
-        var abandonRunConfirmPopup = FindFirstVisibleDescendant(
-            game,
-            static node => IsTypeFullName(node, "MegaCrit.Sts2.Core.Nodes.CommonUi.NAbandonRunConfirmPopup"));
-        var abandonRunConfirmButtons = SortByVisualPosition(FindVisibleDescendants<NPopupYesNoButton>(abandonRunConfirmPopup));
+        var mapPoints = ResolveMapPoints(mapScreen);
+        var mainMenuContinueButton = GetHiddenFieldValue(mainMenuRoot, "_continueButton") as Node;
+        var mainMenuTextButtons = ResolveMainMenuTextButtons(mainMenuRoot);
+        var runModeSubmenu = mainMenuSubmenu as NSingleplayerSubmenu;
+        var runModeStandardButton = runModeSubmenu?.GetNodeOrNull<Node>("StandardButton") ??
+                                    GetHiddenFieldValue(runModeSubmenu, "_standardButton") as Node;
+        var runModeDailyButton = runModeSubmenu?.GetNodeOrNull<Node>("DailyButton") ??
+                                 GetHiddenFieldValue(runModeSubmenu, "_dailyButton") as Node;
+        var runModeCustomButton = runModeSubmenu?.GetNodeOrNull<Node>("CustomRunButton") ??
+                                  GetHiddenFieldValue(runModeSubmenu, "_customButton") as Node;
+        var runModeBackButton = runModeSubmenu?.GetNodeOrNull<NBackButton>("BackButton") ??
+                                GetHiddenFieldValue(runModeSubmenu, "_backButton") as NBackButton;
+        var continueRunInfo = mainMenuRoot?.ContinueRunInfo;
+        var abandonRunConfirmPopup = activeScreen as NAbandonRunConfirmPopup ??
+                                     NModalContainer.Instance?.OpenModal as NAbandonRunConfirmPopup;
+        var abandonRunConfirmButtons = ResolveAbandonRunConfirmButtons(abandonRunConfirmPopup);
 
         return new BridgeWorldContext
         {
@@ -1495,24 +1511,10 @@ internal static partial class BridgeGameApi
             RunState = runState,
             CombatState = combatState,
             Screen = ResolveCurrentScreen(
-                runNode?.ScreenStateTracker,
+                activeScreen,
                 combatManager,
                 mapScreen,
-                restSiteRoom,
-                merchantRoom,
-                merchantInventory,
-                rewardsScreen,
-                proceedButton,
-                rewardProceedButton,
-                rewardButtons,
-                cardRewardScreen,
-                cardRewardOptions,
-                cardSelectionScreen,
                 characterSelectScreen,
-                deckUpgradeScreen,
-                crystalSphereScreen,
-                eventOptionButtons,
-                gameOverScreen,
                 mainMenuRoot,
                 runModeSubmenu,
                 abandonRunConfirmPopup),
@@ -1634,7 +1636,7 @@ internal static partial class BridgeGameApi
                 context.CrystalSphereSmallDivinationButton,
                 context.CrystalSphereBigDivinationButton,
                 context.CrystalSphereProceedButton),
-            Map = BuildMapPayload(context.RunState, context.MapScreen, context.MapPoints),
+            Map = BuildMapPayload(context.RunState, context.MapScreen, context.MapPoints, context.CombatManager, context.Screen),
             RestSite = BuildRestSitePayload(
                 context.MapScreen,
                 context.RestSiteRoom,
@@ -1770,7 +1772,7 @@ internal static partial class BridgeGameApi
                         is_random = button.IsRandom,
                         screen = context.Screen
                     },
-                    Execute = () => InvokeButtonAction(button, "Select", "OnPress")
+                    Execute = () => InvokeCharacterSelectAction(context.CharacterSelectScreen, button)
                 });
             }
         }
@@ -1791,7 +1793,7 @@ internal static partial class BridgeGameApi
                     selected_character = BuildCharacterPayload(context.SelectedCharacterButton?.Character),
                     screen = context.Screen
                 },
-                Execute = () => InvokeButtonAction(context.EmbarkButton, "ForceClick", "OnRelease")
+                Execute = () => InvokeEmbarkAction(context.CharacterSelectScreen, context.EmbarkButton)
             });
         }
 
@@ -2121,7 +2123,7 @@ internal static partial class BridgeGameApi
                 action_id = "run_mode:back",
                 kind = "run_mode_selection",
                 run_mode_action = "back",
-                button_text = TryGetNodeText(context.RunModeBackButton),
+                button_text = TryGetLocalNodeText(context.RunModeBackButton),
                 label = "Back",
                 screen = context.Screen
             },
@@ -2310,9 +2312,13 @@ internal static partial class BridgeGameApi
         }
 
         var selectionPrompt = TryGetCardSelectionPrompt(context.CardSelectionScreen);
-        var selectionTexts = context.CardSelectionScreen is not null && IsNodeVisible(context.CardSelectionScreen)
-            ? CollectVisibleText(context.CardSelectionScreen, 8).ToArray()
-            : Array.Empty<string>();
+        var selectionTexts = CollectCardSelectionSurfaceTexts(
+            context.CardSelectionScreen,
+            selectionPrompt,
+            context.CardSelectionConfirmButton,
+            context.CardSelectionCancelButton,
+            context.CardSelectionCloseButton,
+            context.CardSelectionSkipButton);
         var selectionSemantics = ResolveCardSelectionSemantics(context.CardSelectionScreen, selectionPrompt, selectionTexts);
 
         if (context.CardSelectionScreen is NChooseABundleSelectionScreen)
@@ -2644,7 +2650,7 @@ internal static partial class BridgeGameApi
                     continue;
                 }
 
-                var buttonText = TryGetNodeText(button);
+                var buttonText = TryGetLocalNodeText(button);
                 var semanticAction = TryGetAbandonConfirmSemanticAction(buttonText);
                 var actionId = semanticAction switch
                 {
@@ -2673,7 +2679,19 @@ internal static partial class BridgeGameApi
                         label,
                         screen = context.Screen
                     },
-                    Execute = () => InvokeMenuButtonAction(button)
+                    Execute = () =>
+                    {
+                        if (semanticAction == "confirm" || semanticAction == "cancel")
+                        {
+                            InvokeAbandonRunConfirmAction(
+                                context.AbandonRunConfirmPopup,
+                                button,
+                                confirm: semanticAction == "confirm");
+                            return;
+                        }
+
+                        InvokeMenuButtonAction(button);
+                    }
                 });
             }
 
@@ -2682,7 +2700,7 @@ internal static partial class BridgeGameApi
 
         if (context.MainMenuContinueButton is not null && IsNodeVisible(context.MainMenuContinueButton))
         {
-            var buttonText = TryGetNodeText(context.MainMenuContinueButton);
+            var buttonText = TryGetLocalNodeText(context.MainMenuContinueButton);
             actions.Add(new BridgeResolvedAction
             {
                 ActionId = "main_menu:continue",
@@ -2695,7 +2713,7 @@ internal static partial class BridgeGameApi
                     label = !string.IsNullOrWhiteSpace(buttonText) ? buttonText : "Continue Game",
                     screen = context.Screen
                 },
-                Execute = () => InvokeMenuButtonAction(context.MainMenuContinueButton)
+                Execute = () => InvokeMainMenuContinueAction(context.MainMenuRoot, context.MainMenuContinueButton)
             });
         }
 
@@ -2707,7 +2725,7 @@ internal static partial class BridgeGameApi
                 continue;
             }
 
-            var buttonText = TryGetNodeText(button);
+            var buttonText = TryGetLocalNodeText(button);
             var semanticAction = TryGetMainMenuSemanticAction(buttonText);
             var actionId = semanticAction is not null
                 ? $"main_menu:{semanticAction}"
@@ -2856,7 +2874,7 @@ internal static partial class BridgeGameApi
             return;
         }
 
-        var texts = CollectVisibleText(button, 4).ToArray();
+        var texts = CollectButtonPayloadTexts(button, 4);
         var buttonText = texts.FirstOrDefault(static text => !string.IsNullOrWhiteSpace(text)) ?? fallbackLabel;
         var actionId = $"run_mode:{actionSuffix}";
 
@@ -4612,7 +4630,7 @@ internal static partial class BridgeGameApi
     private static object BuildRewardButtonPayload(NRewardButton button)
     {
         var reward = ResolveRewardFromControlForLivePayload(button);
-        var visibleTexts = CollectVisibleText(button, 4)
+        var visibleTexts = CollectButtonPayloadTexts(button, 4)
             .Where(static text => !string.IsNullOrWhiteSpace(text))
             .Distinct(StringComparer.Ordinal)
             .ToArray();
@@ -4788,9 +4806,15 @@ internal static partial class BridgeGameApi
         Node? cardSelectionSkipButton)
     {
         var visible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
-        var texts = visible ? CollectVisibleText(cardSelectionScreen, 8).ToArray() : Array.Empty<string>();
         var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
         var prompt = visible ? TryGetCardSelectionPrompt(cardSelectionScreen) : null;
+        var texts = CollectCardSelectionSurfaceTexts(
+            cardSelectionScreen,
+            prompt,
+            cardSelectionConfirmButton,
+            cardSelectionCancelButton,
+            cardSelectionCloseButton,
+            cardSelectionSkipButton);
         var selectedCount = CountSelectedCardSelectionCards(cardSelectionScreen);
         var minSelect = GetHiddenPropertyValue<int>(prefs, "MinSelect");
         var maxSelect = GetHiddenPropertyValue<int>(prefs, "MaxSelect");
@@ -4917,7 +4941,7 @@ internal static partial class BridgeGameApi
             };
         }
 
-        var texts = CollectVisibleText(button, 4).ToArray();
+        var texts = CollectButtonPayloadTexts(button, 4);
         var text = texts.FirstOrDefault(static candidate => !string.IsNullOrWhiteSpace(candidate)) ?? fallbackLabel;
 
         return new
@@ -4954,7 +4978,7 @@ internal static partial class BridgeGameApi
             };
         }
 
-        var (glossarySource, glossaryTexts) = CollectVisibleEventGlossaryTexts(
+        var (glossarySource, glossaryTexts, glossaryEntries) = CollectVisibleEventGlossaryTexts(
             eventOptionButtons,
             eventRoom,
             hoverTipSet);
@@ -4976,7 +5000,7 @@ internal static partial class BridgeGameApi
             visible = eventOptionButtons.Count > 0 || options.Count > 0 || isCrystalSphereVisible || glossaryTexts.Count > 0,
             visible_glossary_source = glossarySource,
             visible_glossary_texts = glossaryTexts.ToArray(),
-            visible_glossary = BuildVisibleGlossaryPayload(glossaryTexts),
+            visible_glossary = BuildVisibleGlossaryPayload(glossaryEntries),
             options = options.ToArray()
         };
     }
@@ -5008,11 +5032,11 @@ internal static partial class BridgeGameApi
             !string.IsNullOrWhiteSpace(currentTool) &&
             !string.Equals(currentTool, "none", StringComparison.OrdinalIgnoreCase);
         var divinationsLeftLabel =
-            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_divinationsLeftLabel") as Node);
+            TryGetLocalNodeText(GetHiddenFieldValue(crystalSphereScreen, "_divinationsLeftLabel") as Node);
         var instructionsTitle =
-            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsTitleLabel") as Node);
+            TryGetLocalNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsTitleLabel") as Node);
         var instructionsDescription =
-            TryGetNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsDescriptionLabel") as Node);
+            TryGetLocalNodeText(GetHiddenFieldValue(crystalSphereScreen, "_instructionsDescriptionLabel") as Node);
 
         return new
         {
@@ -5431,7 +5455,7 @@ internal static partial class BridgeGameApi
 
     private static string GetCrystalSphereControlLabel(Node? button, string fallbackLabel)
     {
-        var label = TryGetNodeText(button);
+        var label = TryGetLocalNodeText(button);
         return string.IsNullOrWhiteSpace(label) ? fallbackLabel : label;
     }
 
@@ -5444,7 +5468,12 @@ internal static partial class BridgeGameApi
     {
         var visible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen);
         var prompt = visible ? TryGetDeckUpgradePrompt(deckUpgradeScreen) : null;
-        var texts = visible ? CollectVisibleText(deckUpgradeScreen, 8).ToArray() : Array.Empty<string>();
+        var texts = CollectDeckUpgradeSurfaceTexts(
+            deckUpgradeScreen,
+            prompt,
+            deckUpgradeConfirmButton,
+            deckUpgradeCancelButton,
+            deckUpgradeCloseButton);
         var selectedCount = CountSelectedDeckUpgradeCards(deckUpgradeScreen);
         var useSingleSelection = GetHiddenPropertyValue<bool>(deckUpgradeScreen, "UseSingleSelection") ?? false;
         var confirmVisible = deckUpgradeConfirmButton is not null &&
@@ -5488,13 +5517,9 @@ internal static partial class BridgeGameApi
         {
             visible = mainMenuRoot is not null && IsNodeVisible(mainMenuRoot),
             continue_button = BuildMainMenuButtonPayload(mainMenuContinueButton, null, "continue"),
-            continue_run_info = new
-            {
-                visible = continueRunInfo is not null && IsNodeVisible(continueRunInfo),
-                texts = CollectVisibleText(continueRunInfo, 8).ToArray()
-            },
+            continue_run_info = BuildContinueRunInfoPayload(continueRunInfo),
             buttons = mainMenuTextButtons
-                .Select((button, index) => BuildMainMenuButtonPayload(button, index, TryGetMainMenuSemanticAction(TryGetNodeText(button))))
+                .Select((button, index) => BuildMainMenuButtonPayload(button, index, TryGetMainMenuSemanticAction(TryGetLocalNodeText(button))))
                 .ToArray(),
             abandon_confirm = new
             {
@@ -5503,7 +5528,7 @@ internal static partial class BridgeGameApi
                     .Select((button, index) => BuildMainMenuButtonPayload(
                         button,
                         index,
-                        TryGetAbandonConfirmSemanticAction(TryGetNodeText(button))))
+                        TryGetAbandonConfirmSemanticAction(TryGetLocalNodeText(button))))
                     .ToArray()
             }
         };
@@ -5521,7 +5546,7 @@ internal static partial class BridgeGameApi
             };
         }
 
-        var text = TryGetNodeText(button);
+        var text = TryGetLocalNodeText(button);
 
         return new
         {
@@ -5530,6 +5555,57 @@ internal static partial class BridgeGameApi
             semantic_action = semanticAction,
             text,
             node_type = button.GetType().FullName
+        };
+    }
+
+    private static object BuildContinueRunInfoPayload(Node? continueRunInfo)
+    {
+        var visible = continueRunInfo is not null && IsNodeVisible(continueRunInfo);
+        if (!visible)
+        {
+            return new
+            {
+                visible = false,
+                has_result = false,
+                texts = Array.Empty<string>()
+            };
+        }
+
+        var visibleInfo = continueRunInfo!;
+        var hasResult = GetHiddenPropertyValue<bool>(visibleInfo, "HasResult") ??
+                        (GetHiddenFieldValue(visibleInfo, "<HasResult>k__BackingField") is bool fieldHasResult
+                            ? fieldHasResult
+                            : (bool?)null) ??
+                        false;
+        var texts = CollectPromptAndNodeTexts(
+            prompt: null,
+            maxCount: 8,
+            visibleInfo.GetNodeOrNull<Node>("%DateLabel") ??
+            GetHiddenFieldValue(visibleInfo, "_dateLabel") as Node,
+            visibleInfo.GetNodeOrNull<Node>("%AscensionLabel") ??
+            GetHiddenFieldValue(visibleInfo, "_ascensionLabel") as Node,
+            visibleInfo.GetNodeOrNull<Node>("%ProgressLabel") ??
+            GetHiddenFieldValue(visibleInfo, "_progressLabel") as Node,
+            visibleInfo.GetNodeOrNull<Node>("%HealthLabel") ??
+            GetHiddenFieldValue(visibleInfo, "_healthLabel") as Node,
+            visibleInfo.GetNodeOrNull<Node>("%GoldLabel") ??
+            GetHiddenFieldValue(visibleInfo, "_goldLabel") as Node);
+
+        if (texts.Length == 0)
+        {
+            texts = CollectLocalVisibleText(
+                    visibleInfo.GetNodeOrNull<Node>("%ErrorContainer") ??
+                    GetHiddenFieldValue(visibleInfo, "_errorContainer") as Node,
+                    4,
+                    maxDepth: 1)
+                .ToArray();
+        }
+
+        return new
+        {
+            visible = true,
+            has_result = hasResult,
+            texts
         };
     }
 
@@ -5564,31 +5640,196 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static (string? Source, IReadOnlyList<string> Texts) CollectVisibleEventGlossaryTexts(
+    private static (
+        string? Source,
+        IReadOnlyList<string> Texts,
+        IReadOnlyList<(string Title, string? Description, string[] Texts)> Entries) CollectVisibleEventGlossaryTexts(
         IReadOnlyList<NEventOptionButton> eventOptionButtons,
         NEventRoom? eventRoom,
         Node? hoverTipSet)
     {
         var excludedTexts = new HashSet<string>(
             eventOptionButtons
-                .SelectMany(static button => CollectVisibleText(button, 6))
+                .SelectMany(static button => CollectButtonPayloadTexts(button, 4))
                 .Select(NormalizeComparableText)
                 .Where(static text => !string.IsNullOrWhiteSpace(text)),
             StringComparer.Ordinal);
 
-        var hoverTipTexts = FilterGlossaryCandidateTexts(CollectVisibleText(hoverTipSet, 24), excludedTexts);
-        if (hoverTipTexts.Count > 0)
+        var hoverTipEntries = FilterGlossaryEntries(
+            ExtractVisibleHoverTipEntries(hoverTipSet),
+            excludedTexts);
+        if (hoverTipEntries.Count > 0)
         {
-            return ("hover_tip_set", hoverTipTexts);
+            return (
+                "hover_tip_set",
+                FlattenGlossaryTexts(hoverTipEntries),
+                hoverTipEntries);
         }
 
-        var eventRoomTexts = FilterGlossaryCandidateTexts(CollectVisibleText(eventRoom, 48), excludedTexts);
+        var eventRoomTexts = FilterGlossaryCandidateTexts(
+            CollectLocalVisibleText(eventRoom, 24, maxDepth: 3),
+            excludedTexts);
         if (eventRoomTexts.Count > 0)
         {
-            return ("event_room_fallback", eventRoomTexts);
+            return (
+                "event_room_fallback",
+                eventRoomTexts,
+                BuildGlossaryEntriesFromTexts(eventRoomTexts));
         }
 
-        return (null, Array.Empty<string>());
+        return (
+            null,
+            Array.Empty<string>(),
+            Array.Empty<(string Title, string? Description, string[] Texts)>());
+    }
+
+    private static IReadOnlyList<(string Title, string? Description, string[] Texts)> ExtractVisibleHoverTipEntries(
+        Node? hoverTipSet)
+    {
+        if (hoverTipSet is null || !IsNodeVisible(hoverTipSet))
+        {
+            return Array.Empty<(string Title, string? Description, string[] Texts)>();
+        }
+
+        var textHoverTipContainer = GetHiddenFieldValue(hoverTipSet, "_textHoverTipContainer") as Node ??
+                                    GetHiddenPropertyObjectValue(hoverTipSet, "TextHoverTipContainer") as Node ??
+                                    hoverTipSet.GetNodeOrNull<Node>("textHoverTipContainer") ??
+                                    FindVisibleImmediateChildByName(hoverTipSet, "textHoverTipContainer");
+        if (textHoverTipContainer is null || !IsNodeVisible(textHoverTipContainer))
+        {
+            return Array.Empty<(string Title, string? Description, string[] Texts)>();
+        }
+
+        var entries = new List<(string Title, string? Description, string[] Texts)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var hoverTip in SortByVisualPosition(
+                     textHoverTipContainer
+                         .GetChildren()
+                         .OfType<Node>()
+                         .Where(IsNodeVisible)))
+        {
+            var titleNode = hoverTip.GetNodeOrNull<Node>("%Title") ??
+                            FindVisibleImmediateChildByName(hoverTip, "Title");
+            var descriptionNode = hoverTip.GetNodeOrNull<Node>("%Description") ??
+                                  FindVisibleImmediateChildByName(hoverTip, "Description");
+            var title = TryGetLocalNodeText(titleNode);
+            var description = TryGetLocalNodeText(descriptionNode);
+            var texts = new[] { title, description }
+                .Where(static text => !string.IsNullOrWhiteSpace(text))
+                .Select(static text => text.ReplaceLineEndings("\n").Trim())
+                .ToArray();
+            if (texts.Length == 0)
+            {
+                continue;
+            }
+
+            var dedupeKey = string.Join(
+                "|",
+                texts.Select(NormalizeComparableText));
+            if (!seen.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            entries.Add((
+                string.IsNullOrWhiteSpace(title) ? texts[0] : title.ReplaceLineEndings("\n").Trim(),
+                string.IsNullOrWhiteSpace(description) ? null : description.ReplaceLineEndings("\n").Trim(),
+                texts));
+        }
+
+        return entries;
+    }
+
+    private static IReadOnlyList<(string Title, string? Description, string[] Texts)> FilterGlossaryEntries(
+        IReadOnlyList<(string Title, string? Description, string[] Texts)> entries,
+        IReadOnlySet<string> excludedTexts)
+    {
+        if (entries.Count == 0)
+        {
+            return Array.Empty<(string Title, string? Description, string[] Texts)>();
+        }
+
+        var filtered = new List<(string Title, string? Description, string[] Texts)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var entry in entries)
+        {
+            var comparableTexts = entry.Texts
+                .Select(NormalizeComparableText)
+                .Where(static text => !string.IsNullOrWhiteSpace(text))
+                .ToArray();
+            if (comparableTexts.Length == 0 || comparableTexts.All(excludedTexts.Contains))
+            {
+                continue;
+            }
+
+            var dedupeKey = string.Join("|", comparableTexts);
+            if (!seen.Add(dedupeKey))
+            {
+                continue;
+            }
+
+            filtered.Add(entry);
+        }
+
+        return filtered;
+    }
+
+    private static IReadOnlyList<string> FlattenGlossaryTexts(
+        IReadOnlyList<(string Title, string? Description, string[] Texts)> entries)
+    {
+        if (entries.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var texts = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in entries)
+        {
+            foreach (var text in entry.Texts)
+            {
+                var normalized = text.ReplaceLineEndings("\n").Trim();
+                if (!string.IsNullOrWhiteSpace(normalized) && seen.Add(normalized))
+                {
+                    texts.Add(normalized);
+                }
+            }
+        }
+
+        return texts;
+    }
+
+    private static IReadOnlyList<(string Title, string? Description, string[] Texts)> BuildGlossaryEntriesFromTexts(
+        IReadOnlyList<string> glossaryTexts)
+    {
+        if (glossaryTexts.Count == 0)
+        {
+            return Array.Empty<(string Title, string? Description, string[] Texts)>();
+        }
+
+        var entries = new List<(string Title, string? Description, string[] Texts)>();
+
+        for (var index = 0; index < glossaryTexts.Count; index++)
+        {
+            var title = glossaryTexts[index];
+            string? description = null;
+
+            if (index + 1 < glossaryTexts.Count &&
+                LooksLikeGlossaryTitle(title) &&
+                LooksLikeGlossaryDescription(glossaryTexts[index + 1], title))
+            {
+                description = glossaryTexts[index + 1];
+                index++;
+            }
+
+            entries.Add((
+                title,
+                description,
+                description is null ? new[] { title } : new[] { title, description }));
+        }
+
+        return entries;
     }
 
     private static IReadOnlyList<string> FilterGlossaryCandidateTexts(
@@ -5614,37 +5855,22 @@ internal static partial class BridgeGameApi
         return filtered;
     }
 
-    private static object[] BuildVisibleGlossaryPayload(IReadOnlyList<string> glossaryTexts)
+    private static object[] BuildVisibleGlossaryPayload(
+        IReadOnlyList<(string Title, string? Description, string[] Texts)> glossaryEntries)
     {
-        if (glossaryTexts.Count == 0)
+        if (glossaryEntries.Count == 0)
         {
             return Array.Empty<object>();
         }
 
-        var entries = new List<object>();
-
-        for (var index = 0; index < glossaryTexts.Count; index++)
-        {
-            var title = glossaryTexts[index];
-            string? description = null;
-
-            if (index + 1 < glossaryTexts.Count &&
-                LooksLikeGlossaryTitle(title) &&
-                LooksLikeGlossaryDescription(glossaryTexts[index + 1], title))
+        return glossaryEntries
+            .Select(static entry => new
             {
-                description = glossaryTexts[index + 1];
-                index++;
-            }
-
-            entries.Add(new
-            {
-                title,
-                description,
-                texts = description is null ? new[] { title } : new[] { title, description }
-            });
-        }
-
-        return entries.ToArray();
+                title = entry.Title,
+                description = entry.Description,
+                texts = entry.Texts
+            })
+            .ToArray();
     }
 
     private static object[] BuildHoverTipPayloads(IEnumerable? hoverTips)
@@ -5702,6 +5928,7 @@ internal static partial class BridgeGameApi
     private static string ResolveHoverTipTitle(object hoverTip, AbstractModel? canonicalModel, string fallbackId)
     {
         return FirstNonEmptyText(
+            hoverTip is Node hoverTipNode ? TryGetHoverTipNodeNamedText(hoverTipNode, "Title") : string.Empty,
             TryGetNamedValueText(hoverTip, "HoverTipTitle"),
             TryGetNamedValueText(hoverTip, "Title"),
             TryGetNamedValueText(hoverTip, "Name"),
@@ -5714,6 +5941,7 @@ internal static partial class BridgeGameApi
     private static string ResolveHoverTipDescription(object hoverTip, AbstractModel? canonicalModel)
     {
         return FirstNonEmptyText(
+            hoverTip is Node hoverTipNode ? TryGetHoverTipNodeNamedText(hoverTipNode, "Description") : string.Empty,
             TryGetNamedValueText(hoverTip, "HoverTipDesc"),
             TryGetNamedValueText(hoverTip, "Description"),
             TryGetNamedValueText(hoverTip, "Text"),
@@ -5722,12 +5950,25 @@ internal static partial class BridgeGameApi
             canonicalModel is null ? string.Empty : TryGetDescription(canonicalModel));
     }
 
+    private static string TryGetHoverTipNodeNamedText(Node? hoverTipNode, string nodeName)
+    {
+        if (hoverTipNode is null || !IsNodeVisible(hoverTipNode))
+        {
+            return string.Empty;
+        }
+
+        var textNode = hoverTipNode.GetNodeOrNull<Node>($"%{nodeName}") ??
+                       FindVisibleImmediateChildByName(hoverTipNode, nodeName);
+        return TryGetLocalNodeText(textNode);
+    }
+
     private static string TryGetNamedValueText(object target, string memberName)
     {
-        return DescribeText(
-            GetHiddenPropertyObjectValue(target, memberName) ??
-            GetHiddenFieldValue(target, memberName),
-            target);
+        var value = GetHiddenPropertyObjectValue(target, memberName) ??
+                    GetHiddenFieldValue(target, memberName);
+        return value is Node node
+            ? TryGetLocalNodeText(node)
+            : DescribeText(value, target);
     }
 
     private static string FirstNonEmptyText(params string[] candidates)
@@ -5784,15 +6025,30 @@ internal static partial class BridgeGameApi
     private static object BuildMapPayload(
         RunState? runState,
         NMapScreen? mapScreen,
-        IReadOnlyList<NMapPoint> mapPoints)
+        IReadOnlyList<NMapPoint> mapPoints,
+        CombatManager? combatManager,
+        string currentScreen)
     {
         var map = runState?.Map;
+        var rawIsOpen = mapScreen?.IsOpen ?? false;
+        var rawIsTravelEnabled = mapScreen?.IsTravelEnabled ?? false;
+        var rawIsTraveling = mapScreen?.IsTraveling ?? false;
+        var interactiveSurface = string.Equals(currentScreen, "MAP", StringComparison.Ordinal) &&
+                                 IsInteractiveMapSurface(mapScreen, combatManager);
 
         return new
         {
-            is_open = mapScreen?.IsOpen ?? false,
-            is_travel_enabled = mapScreen?.IsTravelEnabled ?? false,
-            is_traveling = mapScreen?.IsTraveling ?? false,
+            is_open = interactiveSurface,
+            is_travel_enabled = interactiveSurface && rawIsTravelEnabled,
+            is_traveling = rawIsTraveling,
+            is_open_raw = rawIsOpen,
+            is_travel_enabled_raw = rawIsTravelEnabled,
+            is_interactive_surface = interactiveSurface,
+            is_blocked_by_combat = !interactiveSurface &&
+                                   rawIsOpen &&
+                                   rawIsTravelEnabled &&
+                                   !rawIsTraveling &&
+                                   combatManager?.IsInProgress == true,
             current_coord = BuildMapCoord(runState?.CurrentMapCoord),
             dimensions = map is null
                 ? null
@@ -5825,10 +6081,10 @@ internal static partial class BridgeGameApi
         {
             visible,
             header = visible
-                ? TryGetNodeText(GetHiddenFieldValue(restSiteRoom, "<Header>k__BackingField") as Node)
+                ? TryGetLocalNodeText(GetHiddenFieldValue(restSiteRoom, "<Header>k__BackingField") as Node)
                 : null,
             description = visible
-                ? TryGetNodeText(GetHiddenFieldValue(restSiteRoom, "<Description>k__BackingField") as Node)
+                ? TryGetLocalNodeText(GetHiddenFieldValue(restSiteRoom, "<Description>k__BackingField") as Node)
                 : null,
             proceed_visible = visible &&
                               !HasVisibleEnabledRestSiteOptions(restSiteButtons) &&
@@ -6117,72 +6373,83 @@ internal static partial class BridgeGameApi
     }
 
     private static string ResolveCurrentScreen(
-        ScreenStateTracker? screenStateTracker,
+        IScreenContext? activeScreen,
         CombatManager? combatManager,
         NMapScreen? mapScreen,
-        NRestSiteRoom? restSiteRoom,
-        NMerchantRoom? merchantRoom,
-        NMerchantInventory? merchantInventory,
-        NRewardsScreen? rewardsScreen,
-        NProceedButton? roomProceedButton,
-        NProceedButton? rewardProceedButton,
-        IReadOnlyList<NRewardButton> rewardButtons,
-        NCardRewardSelectionScreen? cardRewardScreen,
-        IReadOnlyList<NCardHolder> cardRewardOptions,
-        Node? cardSelectionScreen,
         NCharacterSelectScreen? characterSelectScreen,
-        NDeckUpgradeSelectScreen? deckUpgradeScreen,
-        NCrystalSphereScreen? crystalSphereScreen,
-        IReadOnlyList<NEventOptionButton> eventOptionButtons,
-        NGameOverScreen? gameOverScreen,
         Node? mainMenuRoot,
         Node? runModeSubmenu,
         Node? abandonRunConfirmPopup)
     {
-        var isRestSiteVisible = restSiteRoom is not null && IsNodeVisible(restSiteRoom);
-        var isMerchantVisible = (merchantRoom is not null && IsNodeVisible(merchantRoom)) ||
-                                merchantInventory?.IsOpen == true;
-        var isInteractiveMapOpen = IsInteractiveMapSurface(mapScreen);
-        var isRewardsVisible = IsRewardsScreenVisible(
-            rewardsScreen,
-            roomProceedButton,
-            rewardProceedButton,
-            mapScreen,
-            rewardButtons);
-        var isCardRewardVisible = IsCardRewardSelectionVisible(cardRewardScreen, cardRewardOptions);
-        var isCardSelectionVisible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
-        var isDeckUpgradeVisible = deckUpgradeScreen is not null && IsNodeVisible(deckUpgradeScreen);
-        var isRunModeVisible = runModeSubmenu is not null && IsNodeVisible(runModeSubmenu);
-        var isCharacterSelectVisible = characterSelectScreen is not null && IsNodeVisible(characterSelectScreen);
-        var isCrystalSphereVisible = crystalSphereScreen is not null && IsNodeVisible(crystalSphereScreen);
-        var isGameOverVisible = gameOverScreen is not null && IsNodeVisible(gameOverScreen);
-        var currentScreen = InvokeParameterless(screenStateTracker, "GetCurrentScreen");
-        if (currentScreen is not null)
+        if (abandonRunConfirmPopup is not null && IsNodeVisible(abandonRunConfirmPopup))
         {
-            var currentScreenText = currentScreen.ToString() ?? "UNKNOWN";
-            if (abandonRunConfirmPopup is not null && IsNodeVisible(abandonRunConfirmPopup))
+            return "ABANDON_RUN_CONFIRM";
+        }
+
+        if (activeScreen is not null)
+        {
+            switch (activeScreen)
             {
-                return "ABANDON_RUN_CONFIRM";
+                case NAbandonRunConfirmPopup:
+                    return "ABANDON_RUN_CONFIRM";
+                case NCombatRoom:
+                    return combatManager?.IsInProgress == true ? "COMBAT" : "ROOM";
+                case NMapScreen when combatManager?.IsInProgress == true:
+                    return "COMBAT";
+                case NMapScreen when IsInteractiveMapSurface(mapScreen, combatManager):
+                    return "MAP";
+                case NRewardsScreen:
+                    return "REWARDS";
+                case NCardRewardSelectionScreen:
+                    return "CARD_REWARD_SELECTION";
+                case NDeckUpgradeSelectScreen:
+                    return "DECK_UPGRADE_SELECTION";
+                case NRestSiteRoom:
+                    return "REST_SITE";
+                case NMerchantInventory:
+                case NMerchantRoom:
+                    return "SHOP";
+                case NTreasureRoom:
+                    return "TREASURE";
+                case NCrystalSphereScreen:
+                    return "EVENT_CRYSTAL_SPHERE";
+                case NEventRoom:
+                    return "EVENT";
+                case NGameOverScreen:
+                    return "GAME_OVER";
+                case NCharacterSelectScreen:
+                    return "CHARACTER_SELECT";
+                case NSingleplayerSubmenu:
+                    return "RUN_MODE_SELECTION";
+                case NMainMenu:
+                    return "MAIN_MENU";
             }
 
-            if (isDeckUpgradeVisible)
-            {
-                return "DECK_UPGRADE_SELECTION";
-            }
-
-            if (isCardSelectionVisible)
+            var fullName = activeScreen.GetType().FullName ?? activeScreen.GetType().Name;
+            if (fullName.StartsWith("MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.", StringComparison.Ordinal))
             {
                 return "CARD_SELECTION";
             }
 
-            if (isCardRewardVisible)
+            if (fullName.Contains("CrystalSphere", StringComparison.Ordinal))
             {
-                return "CARD_REWARD_SELECTION";
+                return "EVENT_CRYSTAL_SPHERE";
             }
 
-            if (isRewardsVisible)
+            if (fullName.Contains("SingleplayerSubmenu", StringComparison.Ordinal))
             {
-                return "REWARDS";
+                return "RUN_MODE_SELECTION";
+            }
+
+            if (fullName.Contains("MainMenu", StringComparison.Ordinal))
+            {
+                return "MAIN_MENU";
+            }
+
+            if (fullName.Contains(".Events.", StringComparison.Ordinal) ||
+                fullName.Contains("Event", StringComparison.Ordinal))
+            {
+                return "EVENT";
             }
 
             if (combatManager?.IsInProgress == true)
@@ -6190,98 +6457,17 @@ internal static partial class BridgeGameApi
                 return "COMBAT";
             }
 
-            if (isCrystalSphereVisible)
-            {
-                return "EVENT_CRYSTAL_SPHERE";
-            }
-
-            if (isGameOverVisible)
-            {
-                return "GAME_OVER";
-            }
-
-            if (isCharacterSelectVisible)
-            {
-                return "CHARACTER_SELECT";
-            }
-
-            if (!isInteractiveMapOpen && eventOptionButtons.Count > 0)
-            {
-                return "EVENT";
-            }
-
-            if (!isInteractiveMapOpen && isRestSiteVisible)
-            {
-                return "REST_SITE";
-            }
-
-            if (!isInteractiveMapOpen && isMerchantVisible)
-            {
-                return "SHOP";
-            }
-
-            if (isInteractiveMapOpen)
-            {
-                return "MAP";
-            }
-
-            if (combatManager?.IsInProgress == true &&
-                currentScreenText.Equals("Room", StringComparison.OrdinalIgnoreCase))
-            {
-                return "COMBAT";
-            }
-
-            if (currentScreenText.Equals("Room", StringComparison.OrdinalIgnoreCase))
-            {
-                if (isRestSiteVisible)
-                {
-                    return "REST_SITE";
-                }
-
-                if (isMerchantVisible)
-                {
-                    return "SHOP";
-                }
-            }
-
-            if (isRunModeVisible)
-            {
-                return "RUN_MODE_SELECTION";
-            }
-
-            if (isMerchantVisible &&
-                (currentScreenText.Contains("merchant", StringComparison.OrdinalIgnoreCase) ||
-                 currentScreenText.Contains("shop", StringComparison.OrdinalIgnoreCase)))
-            {
-                return "SHOP";
-            }
-
-            return currentScreenText;
+            return fullName;
         }
 
-        if (abandonRunConfirmPopup is not null && IsNodeVisible(abandonRunConfirmPopup))
-        {
-            return "ABANDON_RUN_CONFIRM";
-        }
-
-        if (isRunModeVisible)
+        if (runModeSubmenu is not null && IsNodeVisible(runModeSubmenu))
         {
             return "RUN_MODE_SELECTION";
         }
 
-        if (isCharacterSelectVisible)
+        if (characterSelectScreen is not null && IsNodeVisible(characterSelectScreen))
         {
             return "CHARACTER_SELECT";
-        }
-
-        if (isDeckUpgradeVisible)
-        {
-            return "DECK_UPGRADE_SELECTION";
-        }
-
-        if (isCardSelectionVisible)
-        {
-            return "CARD_SELECTION";
         }
 
         if (mainMenuRoot is not null && IsNodeVisible(mainMenuRoot))
@@ -6289,49 +6475,14 @@ internal static partial class BridgeGameApi
             return "MAIN_MENU";
         }
 
-        if (isGameOverVisible)
-        {
-            return "GAME_OVER";
-        }
-
-        if (isCrystalSphereVisible)
-        {
-            return "EVENT_CRYSTAL_SPHERE";
-        }
-
-        if (isCardRewardVisible)
-        {
-            return "CARD_REWARD_SELECTION";
-        }
-
-        if (isRewardsVisible)
-        {
-            return "REWARDS";
-        }
-
-        if (restSiteRoom is not null && IsNodeVisible(restSiteRoom))
-        {
-            return "REST_SITE";
-        }
-
-        if (isMerchantVisible)
-        {
-            return "SHOP";
-        }
-
-        if (isInteractiveMapOpen)
-        {
-            return "MAP";
-        }
-
-        if (eventOptionButtons.Count > 0)
-        {
-            return "EVENT";
-        }
-
         if (combatManager?.IsInProgress == true)
         {
             return "COMBAT";
+        }
+
+        if (IsInteractiveMapSurface(mapScreen, combatManager))
+        {
+            return "MAP";
         }
 
         return "UNKNOWN";
@@ -6415,6 +6566,24 @@ internal static partial class BridgeGameApi
         }
 
         return left.NativeInstance == right.NativeInstance;
+    }
+
+    private static bool IsNodeSameOrDescendantOf(Node? candidate, Node? ancestor)
+    {
+        if (candidate is null || ancestor is null)
+        {
+            return false;
+        }
+
+        for (Node? current = candidate; current is not null; current = current.GetParent())
+        {
+            if (IsSameNodeInstance(current, ancestor))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsTypeFullName(Node? node, string fullTypeName)
@@ -6798,16 +6967,6 @@ internal static partial class BridgeGameApi
         return result;
     }
 
-    private static T? FindFirstVisibleDescendant<T>(Node? root) where T : Node
-    {
-        return FindVisibleDescendants<T>(root).FirstOrDefault();
-    }
-
-    private static Node? FindFirstVisibleDescendant(Node? root, Func<Node, bool> predicate)
-    {
-        return FindVisibleDescendants(root, predicate).FirstOrDefault();
-    }
-
     private static List<T> SortByVisualPosition<T>(IEnumerable<T> nodes) where T : Node
     {
         return nodes
@@ -6831,6 +6990,93 @@ internal static partial class BridgeGameApi
             HttpStatusCode.Conflict,
             "action_target_missing",
             $"Could not invoke a supported main-menu action on {button.GetType().FullName}.");
+    }
+
+    private static void InvokeCharacterSelectAction(
+        NCharacterSelectScreen? characterSelectScreen,
+        NCharacterSelectButton button)
+    {
+        if (characterSelectScreen is not null &&
+            button.Character is not null &&
+            TryInvokeTwoArguments(characterSelectScreen, "SelectCharacter", button, button.Character))
+        {
+            return;
+        }
+
+        if (TryInvokeParameterless(button, "Select") ||
+            TryInvokeParameterless(button, "OnPress"))
+        {
+            return;
+        }
+
+        InvokeButtonAction(button, "Select", "OnPress");
+    }
+
+    private static void InvokeEmbarkAction(
+        NCharacterSelectScreen? characterSelectScreen,
+        NConfirmButton embarkButton)
+    {
+        if (characterSelectScreen is not null &&
+            TryInvokeSingleArgument(characterSelectScreen, "OnEmbarkPressed", embarkButton))
+        {
+            return;
+        }
+
+        if (TryInvokeParameterless(embarkButton, "ForceClick") ||
+            TryInvokeParameterless(embarkButton, "OnRelease"))
+        {
+            return;
+        }
+
+        InvokeButtonAction(embarkButton, "ForceClick", "OnRelease");
+    }
+
+    private static void InvokeMainMenuContinueAction(
+        Node? mainMenuRoot,
+        Node? continueButton)
+    {
+        if (mainMenuRoot is not null &&
+            continueButton is not null &&
+            TryInvokeSingleArgument(mainMenuRoot, "OnContinueButtonPressed", continueButton))
+        {
+            return;
+        }
+
+        if (continueButton is not null)
+        {
+            InvokeMenuButtonAction(continueButton);
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            "Could not invoke the main-menu continue action.");
+    }
+
+    private static void InvokeAbandonRunConfirmAction(
+        Node? abandonRunConfirmPopup,
+        NPopupYesNoButton? button,
+        bool confirm)
+    {
+        var methodName = confirm ? "OnYesButtonPressed" : "OnNoButtonPressed";
+        if (abandonRunConfirmPopup is not null &&
+            button is not null &&
+            TryInvokeSingleArgument(abandonRunConfirmPopup, methodName, button))
+        {
+            return;
+        }
+
+        if (button is not null)
+        {
+            InvokeMenuButtonAction(button);
+            return;
+        }
+
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "action_target_missing",
+            $"Could not invoke abandon-run confirmation action '{methodName}'.");
     }
 
     private static void InvokeClickablePressAndRelease(object target)
@@ -7250,13 +7496,17 @@ internal static partial class BridgeGameApi
 
     private static Node? ResolveCardRewardSkipButton(NCardRewardSelectionScreen? cardRewardScreen)
     {
-        const string alternativeButtonTypeName = "MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.NCardRewardAlternativeButton";
-        var alternativesRoot = GetHiddenFieldValue(cardRewardScreen, "_rewardAlternativesContainer") as Node
-                               ?? cardRewardScreen;
+        var alternativesContainer = cardRewardScreen?.GetNodeOrNull<Control>("UI/RewardAlternatives") ??
+                                    GetHiddenFieldValue(cardRewardScreen, "_rewardAlternativesContainer") as Control;
+        if (alternativesContainer is null || !GodotObject.IsInstanceValid(alternativesContainer))
+        {
+            return null;
+        }
 
-        return FindVisibleDescendants(
-                alternativesRoot,
-                static node => IsTypeFullName(node, alternativeButtonTypeName))
+        return alternativesContainer
+            .GetChildren()
+            .OfType<Node>()
+            .Where(IsNodeVisible)
             .FirstOrDefault(IsCardRewardSkipAlternativeButton);
     }
 
@@ -7292,7 +7542,7 @@ internal static partial class BridgeGameApi
         }
 
         return IsSkipText(GetHiddenFieldValue(button, "_optionName") as string) ||
-               IsSkipText(TryGetNodeText(button));
+               IsSkipText(TryGetLocalNodeText(button));
     }
 
     private static bool IsRewardButtonSkipped(NRewardsScreen? rewardsScreen, NRewardButton button)
@@ -7808,6 +8058,31 @@ internal static partial class BridgeGameApi
         return false;
     }
 
+    private static Node? ResolveVisibleHoverTipSet(NGame? game)
+    {
+        var hoverTipsContainer = game?.HoverTipsContainer ??
+                                 GetHiddenPropertyObjectValue(game, "HoverTipsContainer") as Node ??
+                                 GetHiddenFieldValue(game, "HoverTipsContainer") as Node;
+        if (hoverTipsContainer is null || !GodotObject.IsInstanceValid(hoverTipsContainer))
+        {
+            return null;
+        }
+
+        var visibleImmediateSets = SortByVisualPosition(
+            hoverTipsContainer
+                .GetChildren()
+                .OfType<Node>()
+                .Where(static child =>
+                    IsNodeVisible(child) &&
+                    IsTypeFullName(child, "MegaCrit.Sts2.Core.Nodes.HoverTips.NHoverTipSet")));
+        if (visibleImmediateSets.Count > 0)
+        {
+            return visibleImmediateSets.Last();
+        }
+
+        return null;
+    }
+
     private static T? ResolveFirstVisibleNode<T>(params T?[] candidates) where T : Node
     {
         return candidates.FirstOrDefault(IsNodeVisible);
@@ -7816,6 +8091,110 @@ internal static partial class BridgeGameApi
     private static T? ResolveFirstVisibleEnabledNode<T>(params T?[] candidates) where T : Node
     {
         return candidates.FirstOrDefault(candidate => IsNodeVisible(candidate) && IsButtonEnabled(candidate));
+    }
+
+    private static string[] CollectButtonPayloadTexts(Node? button, int maxCount = 4)
+    {
+        return CollectLocalVisibleText(button, maxCount, maxDepth: 1).ToArray();
+    }
+
+    private static string[] CollectCardSelectionSurfaceTexts(
+        Node? cardSelectionScreen,
+        string? prompt,
+        Node? cardSelectionConfirmButton,
+        Node? cardSelectionCancelButton,
+        Node? cardSelectionCloseButton,
+        Node? cardSelectionSkipButton)
+    {
+        if (cardSelectionScreen is null || !IsNodeVisible(cardSelectionScreen))
+        {
+            return string.IsNullOrWhiteSpace(prompt)
+                ? Array.Empty<string>()
+                : new[] { prompt.ReplaceLineEndings("\n").Trim() };
+        }
+
+        return CollectPromptAndNodeTexts(
+            prompt,
+            8,
+            cardSelectionConfirmButton,
+            cardSelectionCancelButton,
+            cardSelectionCloseButton,
+            cardSelectionSkipButton);
+    }
+
+    private static string[] CollectDeckUpgradeSurfaceTexts(
+        NDeckUpgradeSelectScreen? deckUpgradeScreen,
+        string? prompt,
+        Node? deckUpgradeConfirmButton,
+        Node? deckUpgradeCancelButton,
+        Node? deckUpgradeCloseButton)
+    {
+        if (deckUpgradeScreen is null || !IsNodeVisible(deckUpgradeScreen))
+        {
+            return string.IsNullOrWhiteSpace(prompt)
+                ? Array.Empty<string>()
+                : new[] { prompt.ReplaceLineEndings("\n").Trim() };
+        }
+
+        return CollectPromptAndNodeTexts(
+            prompt,
+            8,
+            deckUpgradeConfirmButton,
+            deckUpgradeCancelButton,
+            deckUpgradeCloseButton);
+    }
+
+    private static string[] CollectPromptAndNodeTexts(string? prompt, int maxCount, params Node?[] nodes)
+    {
+        if (maxCount <= 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var texts = new List<string>(maxCount);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddText(string? text)
+        {
+            var normalized = text?.ReplaceLineEndings("\n").Trim();
+            if (string.IsNullOrWhiteSpace(normalized) || !seen.Add(normalized))
+            {
+                return;
+            }
+
+            texts.Add(normalized);
+        }
+
+        AddText(prompt);
+
+        foreach (var node in nodes)
+        {
+            foreach (var text in CollectLocalVisibleText(node, Math.Max(0, maxCount - texts.Count), maxDepth: 1))
+            {
+                AddText(text);
+                if (texts.Count >= maxCount)
+                {
+                    return texts.ToArray();
+                }
+            }
+        }
+
+        return texts.ToArray();
+    }
+
+    private static Node? FindVisibleImmediateChildByName(Node? root, string childName)
+    {
+        if (root is null || string.IsNullOrWhiteSpace(childName))
+        {
+            return null;
+        }
+
+        return root
+            .GetChildren()
+            .OfType<Node>()
+            .FirstOrDefault(child =>
+                IsNodeVisible(child) &&
+                string.Equals(child.Name.ToString(), childName, StringComparison.Ordinal));
     }
 
     private static bool IsCardSelectionPreviewVisible(Node? cardSelectionScreen)
@@ -7898,34 +8277,321 @@ internal static partial class BridgeGameApi
             : null;
     }
 
-    private static Node? ResolveVisibleCardSelectionScreen(Node? root, params Node?[] excludedScreens)
+    private static bool IsCardSelectionRootCandidate(Node node)
     {
-        if (root is null)
+        if (node is NPlayerHand)
+        {
+            return true;
+        }
+
+        var fullName = node.GetType().FullName;
+        return fullName is not null &&
+               fullName.StartsWith("MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.", StringComparison.Ordinal);
+    }
+
+    private static T? ResolveOverlayScreen<T>(IScreenContext? activeScreen, NOverlayStack? overlayStack)
+        where T : Node, IScreenContext
+    {
+        if (activeScreen is T typedScreen)
+        {
+            return typedScreen;
+        }
+
+        return activeScreen is null
+            ? overlayStack?.Peek() as T
+            : null;
+    }
+
+    private static Node? ResolveStableCardSelectionScreen(
+        IScreenContext? activeScreen,
+        NOverlayStack? overlayStack,
+        Node? cardRewardScreen,
+        Node? deckUpgradeScreen,
+        NPlayerHand? playerHand)
+    {
+        if (activeScreen is Node activeNode &&
+            IsCardSelectionRootCandidate(activeNode) &&
+            !IsSameNodeInstance(activeNode, cardRewardScreen) &&
+            !IsSameNodeInstance(activeNode, deckUpgradeScreen))
+        {
+            return activeNode;
+        }
+
+        if (overlayStack?.Peek() is Node overlayNode &&
+            IsCardSelectionRootCandidate(overlayNode) &&
+            !IsSameNodeInstance(overlayNode, cardRewardScreen) &&
+            !IsSameNodeInstance(overlayNode, deckUpgradeScreen))
+        {
+            return overlayNode;
+        }
+
+        return ResolveCombatHandSelectionNode(playerHand);
+    }
+
+    private static IReadOnlyList<NTreasureRoomRelicHolder> ResolveTreasureRelicOptions(
+        NTreasureRoomRelicCollection? treasureRelicCollection)
+    {
+        if (treasureRelicCollection is null)
+        {
+            return Array.Empty<NTreasureRoomRelicHolder>();
+        }
+
+        return SortByVisualPosition(
+                treasureRelicCollection
+                    .GetChildren()
+                    .OfType<NTreasureRoomRelicHolder>()
+                    .Where(IsNodeVisible))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NRestSiteButton> ResolveRestSiteButtons(NRestSiteRoom? restSiteRoom)
+    {
+        var choicesContainer = restSiteRoom?.GetNodeOrNull<Control>("%ChoicesContainer") ??
+                               GetHiddenFieldValue(restSiteRoom, "_choicesContainer") as Control;
+        if (choicesContainer is null)
+        {
+            return Array.Empty<NRestSiteButton>();
+        }
+
+        return SortByVisualPosition(
+                choicesContainer
+                    .GetChildren()
+                    .OfType<NRestSiteButton>()
+                    .Where(IsNodeVisible))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NCharacterSelectButton> ResolveCharacterButtons(
+        NCharacterSelectScreen? characterSelectScreen)
+    {
+        var buttonContainer = characterSelectScreen?.GetNodeOrNull<Control>("CharSelectButtons/ButtonContainer") ??
+                              GetHiddenFieldValue(characterSelectScreen, "_charButtonContainer") as Control;
+        if (buttonContainer is null)
+        {
+            return Array.Empty<NCharacterSelectButton>();
+        }
+
+        return SortByVisualPosition(
+                buttonContainer
+                    .GetChildren()
+                    .OfType<NCharacterSelectButton>()
+                    .Where(IsNodeVisible))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NRewardButton> ResolveRewardButtons(NRewardsScreen? rewardsScreen)
+    {
+        if (rewardsScreen is null)
+        {
+            return Array.Empty<NRewardButton>();
+        }
+
+        if (GetHiddenFieldValue(rewardsScreen, "_rewardButtons") is IEnumerable rewardControls)
+        {
+            var buttons = rewardControls
+                .Cast<object?>()
+                .OfType<Control>()
+                .Where(static control => GodotObject.IsInstanceValid(control))
+                .Where(control => !IsRewardControlSkipped(rewardsScreen, control))
+                .SelectMany(ExpandRewardButtonsFromControl)
+                .Where(IsNodeVisible)
+                .DistinctBy(static button => button.NativeInstance);
+
+            return SortByVisualPosition(buttons).ToArray();
+        }
+
+        return SortByVisualPosition(
+                FindVisibleDescendants<NRewardButton>(rewardsScreen)
+                    .Where(button => !IsRewardButtonSkipped(rewardsScreen, button)))
+            .ToArray();
+    }
+
+    private static IEnumerable<NRewardButton> ExpandRewardButtonsFromControl(Control control)
+    {
+        if (control is NRewardButton rewardButton)
+        {
+            yield return rewardButton;
+            yield break;
+        }
+
+        foreach (var nestedRewardButton in FindVisibleDescendants<NRewardButton>(control))
+        {
+            yield return nestedRewardButton;
+        }
+    }
+
+    private static IReadOnlyList<NCardHolder> ResolveCardRewardOptions(
+        NCardRewardSelectionScreen? cardRewardScreen)
+    {
+        var cardRow = cardRewardScreen?.GetNodeOrNull<Control>("UI/CardRow") ??
+                      GetHiddenFieldValue(cardRewardScreen, "_cardRow") as Control;
+        if (cardRow is null)
+        {
+            return Array.Empty<NCardHolder>();
+        }
+
+        return SortByVisualPosition(
+                cardRow
+                    .GetChildren()
+                    .OfType<NCardHolder>()
+                    .Where(static holder => holder.CardModel is not null)
+                    .Where(IsNodeVisible))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NCardHolder> ResolveDeckUpgradeOptions(
+        NDeckUpgradeSelectScreen? deckUpgradeScreen)
+    {
+        if (deckUpgradeScreen is null)
+        {
+            return Array.Empty<NCardHolder>();
+        }
+
+        var grid = ResolveCardGrid(deckUpgradeScreen);
+        if (grid is null)
+        {
+            return Array.Empty<NCardHolder>();
+        }
+
+        return SortByVisualPosition(
+                grid.CurrentlyDisplayedCardHolders
+                    .Where(static holder => holder.CardModel is not null)
+                    .Where(IsNodeVisible)
+                    .Where(holder => !IsDeckUpgradePreviewHolder(deckUpgradeScreen, holder)))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NCrystalSphereCell> ResolveCrystalSphereCells(
+        NCrystalSphereScreen? crystalSphereScreen)
+    {
+        var cellContainer = crystalSphereScreen?.GetNodeOrNull<Control>("%Cells") ??
+                            GetHiddenFieldValue(crystalSphereScreen, "_cellContainer") as Control;
+        if (cellContainer is null)
+        {
+            return Array.Empty<NCrystalSphereCell>();
+        }
+
+        return cellContainer
+            .GetChildren()
+            .OfType<NCrystalSphereCell>()
+            .Where(IsNodeVisible)
+            .OrderBy(static cell => cell.Entity?.Y ?? int.MaxValue)
+            .ThenBy(static cell => cell.Entity?.X ?? int.MaxValue)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NMapPoint> ResolveMapPoints(NMapScreen? mapScreen)
+    {
+        var pointsContainer = mapScreen?.GetNodeOrNull<Control>("TheMap/Points") ??
+                              GetHiddenFieldValue(mapScreen, "_points") as Control;
+        if (pointsContainer is null)
+        {
+            return Array.Empty<NMapPoint>();
+        }
+
+        return pointsContainer
+            .GetChildren()
+            .OfType<NMapPoint>()
+            .Where(IsNodeVisible)
+            .OrderBy(static point => point.Point.coord.row)
+            .ThenBy(static point => point.Point.coord.col)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<Node> ResolveMainMenuTextButtons(NMainMenu? mainMenuRoot)
+    {
+        if (mainMenuRoot is null)
+        {
+            return Array.Empty<Node>();
+        }
+
+        return SortByVisualPosition(
+                new Node?[]
+                {
+                    GetHiddenFieldValue(mainMenuRoot, "_abandonRunButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_singleplayerButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_multiplayerButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_timelineButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_settingsButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_compendiumButton") as Node,
+                    GetHiddenFieldValue(mainMenuRoot, "_quitButton") as Node
+                }
+                .Where(static button => button is not null && GodotObject.IsInstanceValid(button))
+                .Cast<Node>()
+                .Where(IsNodeVisible)
+                .DistinctBy(static button => button.NativeInstance))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<NPopupYesNoButton> ResolveAbandonRunConfirmButtons(Node? abandonRunConfirmPopup)
+    {
+        var verticalPopup = GetHiddenFieldValue(abandonRunConfirmPopup, "_verticalPopup");
+        var yesButton = GetHiddenPropertyObjectValue(verticalPopup, "YesButton") as NPopupYesNoButton ??
+                        GetHiddenFieldValue(verticalPopup, "_yesButton") as NPopupYesNoButton;
+        var noButton = GetHiddenPropertyObjectValue(verticalPopup, "NoButton") as NPopupYesNoButton ??
+                       GetHiddenFieldValue(verticalPopup, "_noButton") as NPopupYesNoButton;
+
+        return SortByVisualPosition(
+                new[] { yesButton, noButton }
+                    .Where(static button => button is not null && GodotObject.IsInstanceValid(button))
+                    .Cast<NPopupYesNoButton>()
+                    .Where(IsNodeVisible))
+            .ToArray();
+    }
+
+    private static NTreasureButton? ResolveTreasureChestButton(NTreasureRoom? treasureRoom)
+    {
+        if (treasureRoom is null)
         {
             return null;
         }
 
-        var excludedInstances = excludedScreens
-            .Where(screen => screen is not null && GodotObject.IsInstanceValid(screen))
-            .Select(screen => screen!.NativeInstance)
-            .ToHashSet();
+        return treasureRoom.GetNodeOrNull<NTreasureButton>("%Chest") ??
+               GetHiddenFieldValue(treasureRoom, "_chestButton") as NTreasureButton;
+    }
 
-        return FindVisibleDescendants(
-                root,
-                node =>
-                {
-                    if (excludedInstances.Contains(node.NativeInstance))
-                    {
-                        return false;
-                    }
+    private static NTreasureRoomRelicCollection? ResolveTreasureRelicCollection(NTreasureRoom? treasureRoom)
+    {
+        if (treasureRoom is null)
+        {
+            return null;
+        }
 
-                    var fullName = node.GetType().FullName;
-                    return fullName is not null &&
-                           fullName.StartsWith("MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.", StringComparison.Ordinal) &&
-                           fullName.EndsWith("Screen", StringComparison.Ordinal);
-                })
-            .OrderByDescending(node => node is Control control ? control.Size.X * control.Size.Y : 0f)
-            .FirstOrDefault();
+        return treasureRoom.GetNodeOrNull<NTreasureRoomRelicCollection>("%RelicCollection") ??
+               GetHiddenFieldValue(treasureRoom, "_relicCollection") as NTreasureRoomRelicCollection;
+    }
+
+    private static NSubmenu? ResolveMainMenuSubmenu(IScreenContext? activeScreen, NMainMenu? mainMenu)
+    {
+        if (activeScreen is NSubmenu submenu)
+        {
+            return submenu;
+        }
+
+        return activeScreen is null
+            ? mainMenu?.SubmenuStack?.Peek() as NSubmenu
+            : null;
+    }
+
+    private static Node? ResolveEventOptionSearchRoot(IScreenContext? activeScreen, NEventRoom? eventRoom)
+    {
+        if (activeScreen is Node activeNode &&
+            (eventRoom is null || IsNodeSameOrDescendantOf(activeNode, eventRoom)))
+        {
+            return activeNode;
+        }
+
+        if (eventRoom?.CustomEventNode?.CurrentScreenContext is Node customEventScreen)
+        {
+            return customEventScreen;
+        }
+
+        if (eventRoom?.Layout is Node layoutNode)
+        {
+            return layoutNode;
+        }
+
+        return eventRoom;
     }
 
     private static IReadOnlyList<NCardHolder> GetCardSelectionOptions(Node? cardSelectionScreen)
@@ -7953,6 +8619,36 @@ internal static partial class BridgeGameApi
                 .ToArray();
         }
 
+        if (ResolveCardGrid(cardSelectionScreen) is { } cardGrid)
+        {
+            return SortByVisualPosition(
+                    cardGrid.CurrentlyDisplayedCardHolders
+                        .Where(static holder => holder.CardModel is not null)
+                        .Where(IsNodeVisible))
+                .DistinctBy(static holder => holder.CardModel, ReferenceEqualityComparer.Instance)
+                .ToArray();
+        }
+
+        if (string.Equals(
+                cardSelectionScreen.GetType().FullName,
+                "MegaCrit.Sts2.Core.Nodes.Screens.CardSelection.NChooseACardSelectionScreen",
+                StringComparison.Ordinal))
+        {
+            var cardRow = cardSelectionScreen.GetNodeOrNull<Control>("CardRow") ??
+                          GetHiddenFieldValue(cardSelectionScreen, "_cardRow") as Control;
+            if (cardRow is not null && GodotObject.IsInstanceValid(cardRow))
+            {
+                return SortByVisualPosition(
+                        cardRow
+                            .GetChildren()
+                            .OfType<NCardHolder>()
+                            .Where(static holder => holder.CardModel is not null)
+                            .Where(IsNodeVisible))
+                    .DistinctBy(static holder => holder.CardModel, ReferenceEqualityComparer.Instance)
+                    .ToArray();
+            }
+        }
+
         return SortByVisualPosition(
                 FindVisibleDescendants<NCardHolder>(cardSelectionScreen)
                     .Where(static holder => holder.CardModel is not null))
@@ -7972,10 +8668,27 @@ internal static partial class BridgeGameApi
             ? bundleRow
             : cardSelectionScreen;
 
+        if (searchRoot is Control bundleContainer)
+        {
+            return SortByVisualPosition(
+                    bundleContainer
+                        .GetChildren()
+                        .OfType<NCardBundle>()
+                        .Where(static bundle => bundle.Bundle.Count > 0)
+                        .Where(IsNodeVisible))
+                .ToArray();
+        }
+
         return SortByVisualPosition(
                 FindVisibleDescendants<NCardBundle>(searchRoot)
                     .Where(static bundle => bundle.Bundle.Count > 0))
             .ToArray();
+    }
+
+    private static NCardGrid? ResolveCardGrid(Node? cardSelectionScreen)
+    {
+        return cardSelectionScreen?.GetNodeOrNull<NCardGrid>("%CardGrid") ??
+               GetHiddenFieldValue(cardSelectionScreen, "_grid") as NCardGrid;
     }
 
     private static NProceedButton? ResolveVisibleProceedButton(
@@ -8021,6 +8734,59 @@ internal static partial class BridgeGameApi
                         !excludedButtons.Contains(button.NativeInstance) &&
                         IsButtonEnabled(button)))
             .LastOrDefault();
+    }
+
+    private static NProceedButton? ResolveStableProceedButton(
+        IScreenContext? activeScreen,
+        Node? root,
+        NProceedButton? combatProceedButton,
+        NProceedButton? treasureProceedButton,
+        NProceedButton? restSiteProceedButton,
+        NProceedButton? merchantProceedButton)
+    {
+        if (activeScreen is NCombatRoom &&
+            combatProceedButton is not null &&
+            IsNodeVisible(combatProceedButton) &&
+            IsButtonEnabled(combatProceedButton))
+        {
+            return combatProceedButton;
+        }
+
+        if (activeScreen is NTreasureRoom &&
+            treasureProceedButton is not null &&
+            IsNodeVisible(treasureProceedButton) &&
+            IsButtonEnabled(treasureProceedButton))
+        {
+            return treasureProceedButton;
+        }
+
+        if (activeScreen is NRestSiteRoom &&
+            restSiteProceedButton is not null &&
+            IsNodeVisible(restSiteProceedButton) &&
+            IsButtonEnabled(restSiteProceedButton))
+        {
+            return restSiteProceedButton;
+        }
+
+        if (activeScreen is NMerchantRoom &&
+            merchantProceedButton is not null &&
+            IsNodeVisible(merchantProceedButton) &&
+            IsButtonEnabled(merchantProceedButton))
+        {
+            return merchantProceedButton;
+        }
+
+        if (activeScreen is NRewardsScreen)
+        {
+            return null;
+        }
+
+        return ResolveVisibleProceedButton(
+            root,
+            combatProceedButton,
+            treasureProceedButton,
+            restSiteProceedButton,
+            merchantProceedButton);
     }
 
     private static bool ShouldSuppressGenericRoomProceed(BridgeWorldContext context)
@@ -8076,17 +8842,38 @@ internal static partial class BridgeGameApi
             return null;
         }
 
+        if (cardSelectionScreen is NPlayerHand)
+        {
+            var handPrompt = TryGetLocalNodeText(ResolveFirstVisibleNode(
+                cardSelectionScreen.GetNodeOrNull<Node>("%SelectionHeader"),
+                GetHiddenFieldValue(cardSelectionScreen, "_selectionHeader") as Node));
+            if (!string.IsNullOrWhiteSpace(handPrompt))
+            {
+                return handPrompt;
+            }
+        }
+
+        if (string.Equals(cardSelectionScreen.GetType().Name, "NSimpleCardSelectScreen", StringComparison.Ordinal))
+        {
+            var simplePrompt = TryGetLocalNodeText(ResolveFirstVisibleNode(
+                cardSelectionScreen.GetNodeOrNull<Node>("%BottomText/%BottomLabel"),
+                cardSelectionScreen.GetNodeOrNull<Node>("%BottomLabel"),
+                GetHiddenFieldValue(cardSelectionScreen, "_infoLabel") as Node));
+            if (!string.IsNullOrWhiteSpace(simplePrompt))
+            {
+                return simplePrompt;
+            }
+        }
+
         var promptNode = ResolveFirstVisibleNode(
+            cardSelectionScreen.GetNodeOrNull<Node>("%SelectionHeader"),
+            cardSelectionScreen.GetNodeOrNull<Node>("%BottomText/%BottomLabel"),
+            cardSelectionScreen.GetNodeOrNull<Node>("%BottomLabel"),
             GetHiddenFieldValue(cardSelectionScreen, "_selectionHeader") as Node,
             GetHiddenFieldValue(cardSelectionScreen, "_infoLabel") as Node,
             GetHiddenFieldValue(cardSelectionScreen, "_banner") as Node);
-        var prompt = TryGetNodeText(promptNode);
-        if (!string.IsNullOrWhiteSpace(prompt))
-        {
-            return prompt;
-        }
-
-        return CollectVisibleText(cardSelectionScreen, 1).FirstOrDefault();
+        var prompt = TryGetLocalNodeText(promptNode);
+        return string.IsNullOrWhiteSpace(prompt) ? null : prompt;
     }
 
     private static string? TryGetDeckUpgradePrompt(NDeckUpgradeSelectScreen? deckUpgradeScreen)
@@ -8097,18 +8884,15 @@ internal static partial class BridgeGameApi
         }
 
         var promptNode = ResolveFirstVisibleNode(
+            deckUpgradeScreen.GetNodeOrNull<Node>("%BottomText/%BottomLabel"),
+            deckUpgradeScreen.GetNodeOrNull<Node>("%BottomLabel"),
             GetHiddenFieldValue(deckUpgradeScreen, "_selectionHeader") as Node,
             GetHiddenFieldValue(deckUpgradeScreen, "_infoLabel") as Node,
             GetHiddenFieldValue(deckUpgradeScreen, "_banner") as Node,
             GetHiddenFieldValue(deckUpgradeScreen, "_singlePreviewTitleLabel") as Node,
             GetHiddenFieldValue(deckUpgradeScreen, "_multiPreviewTitleLabel") as Node);
-        var prompt = TryGetNodeText(promptNode);
-        if (!string.IsNullOrWhiteSpace(prompt))
-        {
-            return prompt;
-        }
-
-        return CollectVisibleText(deckUpgradeScreen, 1).FirstOrDefault();
+        var prompt = TryGetLocalNodeText(promptNode);
+        return string.IsNullOrWhiteSpace(prompt) ? null : prompt;
     }
 
     private static int CountSelectedCardSelectionCards(Node? cardSelectionScreen)
@@ -9664,9 +10448,9 @@ internal static partial class BridgeGameApi
         }
     }
 
-    private static IReadOnlyList<string> CollectVisibleText(Node? root, int maxCount)
+    private static IReadOnlyList<string> CollectLocalVisibleText(Node? root, int maxCount, int maxDepth = 1)
     {
-        if (root is null || maxCount <= 0)
+        if (root is null || maxCount <= 0 || maxDepth < 0)
         {
             return Array.Empty<string>();
         }
@@ -9674,9 +10458,12 @@ internal static partial class BridgeGameApi
         var texts = new List<string>(maxCount);
         var seenTexts = new HashSet<string>(StringComparer.Ordinal);
 
-        void Visit(Node node)
+        void Visit(Node node, int depth)
         {
-            if (texts.Count >= maxCount || !GodotObject.IsInstanceValid(node) || !IsNodeVisible(node))
+            if (texts.Count >= maxCount ||
+                depth > maxDepth ||
+                !GodotObject.IsInstanceValid(node) ||
+                !IsNodeVisible(node))
             {
                 return;
             }
@@ -9691,9 +10478,14 @@ internal static partial class BridgeGameApi
                 }
             }
 
+            if (depth >= maxDepth)
+            {
+                return;
+            }
+
             foreach (Node child in node.GetChildren())
             {
-                Visit(child);
+                Visit(child, depth + 1);
                 if (texts.Count >= maxCount)
                 {
                     return;
@@ -9701,13 +10493,13 @@ internal static partial class BridgeGameApi
             }
         }
 
-        Visit(root);
+        Visit(root, 0);
         return texts;
     }
 
-    private static string TryGetNodeText(Node? node)
+    private static string TryGetLocalNodeText(Node? node)
     {
-        return CollectVisibleText(node, 1).FirstOrDefault() ?? string.Empty;
+        return CollectLocalVisibleText(node, 1, maxDepth: 1).FirstOrDefault() ?? string.Empty;
     }
 
     private static string TryGetOwnNodeText(Node node)
@@ -9770,7 +10562,7 @@ internal static partial class BridgeGameApi
         {
             null => string.Empty,
             string text => DescribeText(text),
-            Node node => TryGetNodeText(node),
+            Node node => TryGetLocalNodeText(node),
             _ when value is System.Collections.IEnumerable => string.Empty,
             _ => DescribeText(value)
         };

@@ -84,6 +84,8 @@ internal static partial class BridgeGameApi
             .Where(static action => !action.ActionId.StartsWith("automation:", StringComparison.Ordinal))
             .ToList();
 
+        filtered = FilterActionsForStableSurface(context, filtered);
+
         if (!ShouldSuppressTransientEventContinue(context, filtered))
         {
             return filtered;
@@ -92,6 +94,114 @@ internal static partial class BridgeGameApi
         return filtered
             .Where(static action => !action.ActionId.StartsWith("event_option:", StringComparison.Ordinal))
             .ToList();
+    }
+
+    private static List<BridgeResolvedAction> FilterActionsForStableSurface(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> actions)
+    {
+        var cardSelectionVisible = IsCardSelectionVisible(context);
+        var deckUpgradeVisible = IsDeckUpgradeSelectionVisible(context);
+        var cardRewardVisible = IsCardRewardSelectionVisible(context.CardRewardScreen, context.CardRewardOptions);
+        var rewardsVisible = IsRewardsScreenVisible(
+            context.RewardsScreen,
+            context.ProceedButton,
+            context.RewardProceedButton,
+            context.MapScreen,
+            context.RewardButtons);
+        var crystalSphereVisible = context.CrystalSphereScreen is not null && IsNodeVisible(context.CrystalSphereScreen);
+        var mapVisible = IsInteractiveMapSurface(context);
+        var merchantVisible = context.MerchantRoom is not null &&
+                              (IsNodeVisible(context.MerchantRoom) || context.MerchantInventory?.IsOpen == true);
+        var restSiteVisible = context.RestSiteRoom is not null &&
+                              !mapVisible &&
+                              IsNodeVisible(context.RestSiteRoom);
+        var treasureVisible = context.TreasureRoom is not null && IsNodeVisible(context.TreasureRoom);
+        var eventVisible = context.EventRoom is not null &&
+                           IsNodeVisible(context.EventRoom) &&
+                           !mapVisible;
+
+        bool IsAllowed(BridgeResolvedAction action)
+        {
+            var actionId = action.ActionId;
+            if (cardSelectionVisible)
+            {
+                return actionId.StartsWith("card_selection:", StringComparison.Ordinal);
+            }
+
+            if (deckUpgradeVisible)
+            {
+                return actionId.StartsWith("deck_upgrade:", StringComparison.Ordinal);
+            }
+
+            if (cardRewardVisible)
+            {
+                return actionId.StartsWith("card_reward:", StringComparison.Ordinal);
+            }
+
+            if (rewardsVisible)
+            {
+                return actionId.StartsWith("reward:", StringComparison.Ordinal) ||
+                       actionId.Equals("proceed", StringComparison.Ordinal);
+            }
+
+            if (crystalSphereVisible)
+            {
+                return actionId.StartsWith("crystal_sphere:", StringComparison.Ordinal);
+            }
+
+            if (context.CombatManager?.IsInProgress == true &&
+                !cardSelectionVisible)
+            {
+                return actionId.StartsWith("play_card:", StringComparison.Ordinal) ||
+                       actionId.StartsWith("use_potion:", StringComparison.Ordinal) ||
+                       actionId.StartsWith("discard_potion:", StringComparison.Ordinal) ||
+                       actionId.Equals("end_turn", StringComparison.Ordinal);
+            }
+
+            if (mapVisible)
+            {
+                return actionId.StartsWith("map:", StringComparison.Ordinal);
+            }
+
+            if (eventVisible)
+            {
+                return actionId.StartsWith("event_option:", StringComparison.Ordinal);
+            }
+
+            if (merchantVisible)
+            {
+                return actionId.StartsWith("shop:", StringComparison.Ordinal);
+            }
+
+            if (restSiteVisible)
+            {
+                return actionId.StartsWith("rest_site:", StringComparison.Ordinal);
+            }
+
+            if (treasureVisible)
+            {
+                return actionId.StartsWith("treasure:", StringComparison.Ordinal) ||
+                       actionId.StartsWith("treasure_relic:", StringComparison.Ordinal) ||
+                       actionId.Equals("proceed", StringComparison.Ordinal);
+            }
+
+            return context.Screen switch
+            {
+                "RUN_MODE_SELECTION" => actionId.StartsWith("run_mode:", StringComparison.Ordinal),
+                "CHARACTER_SELECT" => actionId.StartsWith("character_select:", StringComparison.Ordinal) ||
+                                      actionId.Equals("embark", StringComparison.Ordinal),
+                "MAIN_MENU" => actionId.StartsWith("main_menu:", StringComparison.Ordinal),
+                "ABANDON_RUN_CONFIRM" => actionId.StartsWith("main_menu:confirm_abandon_run", StringComparison.Ordinal) ||
+                                         actionId.StartsWith("main_menu:cancel_abandon_run", StringComparison.Ordinal) ||
+                                         actionId.StartsWith("main_menu:abandon_confirm:", StringComparison.Ordinal),
+                "GAME_OVER" => actionId.StartsWith("game_over:", StringComparison.Ordinal),
+                _ => true
+            };
+        }
+
+        var filtered = actions.Where(IsAllowed).ToList();
+        return filtered.Count > 0 ? filtered : actions.ToList();
     }
 
     private static bool ShouldSuppressTransientEventContinue(
@@ -183,9 +293,17 @@ internal static partial class BridgeGameApi
 
         if (context.CombatManager?.IsInProgress == true)
         {
+            var blockedByResidualMapOverlay =
+                context.MapScreen is not null &&
+                context.MapScreen.IsOpen &&
+                !context.MapScreen.IsTraveling &&
+                HasBlockingMapOverlaySurface(context, actions);
+
             return context.CombatManager.IsPlayPhase &&
+                   !context.CombatManager.IsPaused &&
                    !context.CombatManager.PlayerActionsDisabled &&
-                   context.CardSelectionScreen is null
+                   context.CardSelectionScreen is null &&
+                   !blockedByResidualMapOverlay
                 ? "combat"
                 : "settling";
         }
@@ -537,9 +655,12 @@ internal static partial class BridgeGameApi
                            IsNodeVisible(context.DeckUpgradeConfirmButton) &&
                            IsButtonEnabled(context.DeckUpgradeConfirmButton);
         var prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen);
-        var texts = context.DeckUpgradeScreen is not null && IsNodeVisible(context.DeckUpgradeScreen)
-            ? CollectVisibleText(context.DeckUpgradeScreen, 8).ToArray()
-            : Array.Empty<string>();
+        var texts = CollectDeckUpgradeSurfaceTexts(
+            context.DeckUpgradeScreen,
+            prompt,
+            context.DeckUpgradeConfirmButton,
+            context.DeckUpgradeCancelButton,
+            context.DeckUpgradeCloseButton);
         for (var index = 0; index < context.DeckUpgradeOptions.Count; index++)
         {
             var holder = context.DeckUpgradeOptions[index];
@@ -577,9 +698,13 @@ internal static partial class BridgeGameApi
         var screen = context.CardSelectionScreen;
         var prefs = GetHiddenFieldValue(screen, "_prefs");
         var prompt = TryGetCardSelectionPrompt(screen);
-        var texts = screen is not null && IsNodeVisible(screen)
-            ? CollectVisibleText(screen, 8).ToArray()
-            : Array.Empty<string>();
+        var texts = CollectCardSelectionSurfaceTexts(
+            screen,
+            prompt,
+            context.CardSelectionConfirmButton,
+            context.CardSelectionCancelButton,
+            context.CardSelectionCloseButton,
+            context.CardSelectionSkipButton);
         var selectedCount = CountSelectedCardSelectionCards(screen);
         var minSelect = GetHiddenPropertyValue<int>(prefs, "MinSelect");
         var maxSelect = GetHiddenPropertyValue<int>(prefs, "MaxSelect");
@@ -833,16 +958,6 @@ internal static partial class BridgeGameApi
         BridgeWorldContext context,
         IReadOnlyList<BridgeResolvedAction> actions)
     {
-        var hasMapActions = actions.Any(static a => a.ActionId.StartsWith("map:", StringComparison.Ordinal));
-        var suppressMapActions = hasMapActions && HasBlockingMapOverlaySurface(context, actions);
-
-        if (suppressMapActions)
-        {
-            return actions
-                .Where(static a => !a.ActionId.StartsWith("map:", StringComparison.Ordinal))
-                .ToList();
-        }
-
-        return actions;
+        return FilterActionsForStableSurface(context, actions);
     }
 }

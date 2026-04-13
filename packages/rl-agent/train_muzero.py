@@ -14,6 +14,7 @@ from collections import defaultdict
 import json
 import math
 import pickle
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -370,6 +371,7 @@ class MuZeroTrainer:
         surface_phase_weight: float = 0.1,
         log_dir: str = "runs",
         checkpoint_dir: str = "checkpoints",
+        checkpoint_keep_last: int = 3,
     ):
         """Initialize trainer.
 
@@ -415,6 +417,7 @@ class MuZeroTrainer:
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         self.log_dir = log_dir
         self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_keep_last = max(int(checkpoint_keep_last), 0)
 
         self.writer = SummaryWriter(log_dir=log_dir)
         self.total_steps = 0
@@ -480,12 +483,9 @@ class MuZeroTrainer:
     def _obs_list_to_torch(self, obs_list: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Convert a list of dict observations into a batched torch dict."""
         obs_torch_batch: dict[str, torch.Tensor] = {}
-        for key in obs_list[0].keys():
-            values = [obs[key] for obs in obs_list]
-            if isinstance(values[0], np.ndarray):
-                obs_torch_batch[key] = torch.from_numpy(np.stack(values, axis=0)).to(self.device)
-            else:
-                obs_torch_batch[key] = torch.as_tensor(values, device=self.device)
+        obs_numpy_batch = MuZeroReplayBuffer.batch_observations(obs_list)
+        for key, value in obs_numpy_batch.items():
+            obs_torch_batch[key] = torch.from_numpy(value).to(self.device)
         return obs_torch_batch
 
     def compute_temperature(self, step: int, total_steps: int) -> float:
@@ -883,15 +883,14 @@ class MuZeroTrainer:
 
         batch_size_actual = int(action_batch.shape[0])
 
-        # Convert observation sequence to torch batches.
-        # obs_sequence_batch[b][k] = observation at position pos+k (or zero obs past terminal)
-        obs_torch_sequence = [
-            self._obs_list_to_torch([sequence[k] for sequence in obs_sequence_batch])
-            for k in range(unroll_steps + 1)
-        ]
+        # Materialize only the current/next observation batches on demand to keep
+        # peak host memory lower during training.
+        current_obs_torch = self._obs_list_to_torch(
+            [sequence[0] for sequence in obs_sequence_batch]
+        )
 
         # Initial inference
-        initial = self.network.initial_inference(obs_torch_sequence[0])
+        initial = self.network.initial_inference(current_obs_torch)
         hidden_state = initial.hidden_state
         policy_logits = initial.policy_logits
         value_logits = initial.value_logits
@@ -949,7 +948,7 @@ class MuZeroTrainer:
         if semantic_training_active:
             semantic_root = self.network.semantic_prediction(
                 self.network.project_to_semantic_latent(hidden_state),
-                obs=obs_torch_sequence[0],
+                obs=current_obs_torch,
             )
             semantic_policy_loss = self._semantic_policy_loss(
                 semantic_root.semantic_policy_logits,
@@ -1008,8 +1007,9 @@ class MuZeroTrainer:
 
         # Unrolled steps
         for step_k in range(unroll_steps):
-            current_obs_torch = obs_torch_sequence[step_k]
-            next_obs_torch = obs_torch_sequence[step_k + 1]
+            next_obs_torch = self._obs_list_to_torch(
+                [sequence[step_k + 1] for sequence in obs_sequence_batch]
+            )
             action_embeddings = self.network.encode_actions(current_obs_torch)  # [B, 80, 64]
 
             # Select action embeddings
@@ -1183,6 +1183,7 @@ class MuZeroTrainer:
             surface_phase_acc_sum += surface_metrics["phase_acc"]
 
             hidden_state = recurrent.next_hidden_state
+            current_obs_torch = next_obs_torch
 
         # Backward pass
         self.optimizer.zero_grad()
@@ -1522,6 +1523,7 @@ class MuZeroTrainer:
             "surface_count_weight": float(self.surface_count_weight),
             "surface_domain_weight": float(self.surface_domain_weight),
             "surface_phase_weight": float(self.surface_phase_weight),
+            "checkpoint_keep_last": int(self.checkpoint_keep_last),
             "mcts": {
                 "num_simulations": int(self.mcts.num_simulations),
                 "max_sampled_actions": int(self.mcts.max_sampled_actions),
@@ -1547,6 +1549,50 @@ class MuZeroTrainer:
         }
         (checkpoint_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
         print(f"[checkpoint] Saved to {checkpoint_path}")
+        self._prune_old_step_checkpoints(checkpoint_dir)
+
+    def _prune_old_step_checkpoints(self, checkpoint_dir: Path) -> None:
+        keep_last = int(self.checkpoint_keep_last)
+        if keep_last <= 0:
+            return
+
+        step_dirs = sorted(
+            (
+                path
+                for path in checkpoint_dir.iterdir()
+                if path.is_dir() and path.name.startswith("muzero_step_")
+            ),
+            key=lambda path: path.name,
+        )
+        if len(step_dirs) <= keep_last:
+            return
+
+        prune_targets = step_dirs[:-keep_last]
+        freed_bytes = 0
+        pruned_names: list[str] = []
+
+        for target in prune_targets:
+            try:
+                freed_bytes += sum(
+                    file_path.stat().st_size
+                    for file_path in target.rglob("*")
+                    if file_path.is_file()
+                )
+            except FileNotFoundError:
+                continue
+
+            shutil.rmtree(target, ignore_errors=False)
+            pruned_names.append(target.name)
+
+        if pruned_names:
+            freed_gb = freed_bytes / (1024 ** 3)
+            preview = ", ".join(pruned_names[:4])
+            suffix = " ..." if len(pruned_names) > 4 else ""
+            print(
+                "[checkpoint] Pruned "
+                f"{len(pruned_names)} old step checkpoint(s), freed ~{freed_gb:.2f} GB "
+                f"(keep_last={keep_last}): {preview}{suffix}"
+            )
 
 
 def main():
@@ -1597,6 +1643,8 @@ def main():
     parser.add_argument("--updates-per-train", type=int, default=3,
                         help="Gradient updates per training call")
     parser.add_argument("--checkpoint-freq", type=int, default=2048)
+    parser.add_argument("--checkpoint-keep-last", type=int, default=3,
+                        help="Auto-prune old muzero_step_* checkpoints in the current run directory after each save; 0 disables pruning.")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Resume MuZero training from a checkpoint directory")
     parser.add_argument("--resume-without-buffer", action="store_true", default=False,
@@ -1818,6 +1866,7 @@ def main():
         surface_phase_weight=args.surface_phase_weight,
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,
+        checkpoint_keep_last=args.checkpoint_keep_last,
     )
 
     if args.resume_from:
@@ -1868,6 +1917,14 @@ def main():
         f"end_turn_bias={args.end_turn_prior_bias:.2f}, "
         f"min_scale={args.root_bias_min_scale:.2f}, "
         f"decay_steps={args.root_bias_decay_steps})"
+    )
+    print(
+        "[setup] Checkpoint retention: "
+        + (
+            "disabled"
+            if args.checkpoint_keep_last <= 0
+            else f"keep last {args.checkpoint_keep_last} muzero_step_* checkpoint(s) per run"
+        )
     )
     if encounter_tiers:
         print(f"[setup] Encounter tiers: {encounter_tiers}")

@@ -17,7 +17,195 @@ from .objective_heads import (
     NUM_OBJECTIVE_HEADS,
     scalarize_objective_components_np,
 )
+from .observation_v2 import (
+    ACTION_FEAT_DIM,
+    CARD_FEAT_DIM,
+    DECK_FEAT_DIM,
+    ENEMY_FEAT_DIM,
+    MAX_ACTIONS,
+    MAX_DECK,
+    MAX_ENEMIES,
+    MAX_HAND,
+    MAX_POTIONS,
+    MAX_RELICS,
+    MAX_ROUTE_NODES,
+    NUM_DOMAINS,
+    OBJECTIVE_DIM,
+    POWER_DIM,
+    RELIC_SIGNAL_DIM,
+    ROUTE_NODE_FEAT_DIM,
+    ROUTE_SUMMARY_DIM,
+    RUN_MEMORY_DIM,
+    SCALAR_DIM,
+    SEM_ACTION_FEAT_DIM,
+)
 from .semantic_rollout import SEMANTIC_ROLLOUT_SIZE, aggregate_concrete_policy_to_semantic
+from .text_encoder import TEXT_DIM
+
+
+_PACKED_OBS_MARKER = "__packed_obs_v1__"
+
+_OBS_FIXED_SHAPES: dict[str, tuple[int, ...]] = {
+    "scalars": (SCALAR_DIM,),
+    "decision_domain": (NUM_DOMAINS,),
+    "hand": (MAX_HAND, CARD_FEAT_DIM),
+    "hand_text": (MAX_HAND, TEXT_DIM),
+    "hand_mask": (MAX_HAND,),
+    "deck": (MAX_DECK, DECK_FEAT_DIM),
+    "deck_text": (MAX_DECK, TEXT_DIM),
+    "deck_mask": (MAX_DECK,),
+    "enemies": (MAX_ENEMIES, ENEMY_FEAT_DIM),
+    "enemy_text": (MAX_ENEMIES, TEXT_DIM),
+    "enemy_mask": (MAX_ENEMIES,),
+    "player_powers": (POWER_DIM,),
+    "relic_signals": (RELIC_SIGNAL_DIM,),
+    "run_memory": (RUN_MEMORY_DIM,),
+    "objective_context": (OBJECTIVE_DIM,),
+    "relics": (MAX_RELICS, TEXT_DIM),
+    "relic_mask": (MAX_RELICS,),
+    "potions": (MAX_POTIONS, TEXT_DIM),
+    "potion_mask": (MAX_POTIONS,),
+    "context_text": (TEXT_DIM,),
+    "actions": (MAX_ACTIONS, ACTION_FEAT_DIM),
+    "action_text": (MAX_ACTIONS, TEXT_DIM),
+    "semantic_actions": (MAX_ACTIONS, SEM_ACTION_FEAT_DIM),
+    "semantic_action_text": (MAX_ACTIONS, TEXT_DIM),
+    "route_summary": (MAX_ACTIONS, ROUTE_SUMMARY_DIM),
+    "route_nodes": (MAX_ACTIONS, MAX_ROUTE_NODES, ROUTE_NODE_FEAT_DIM),
+    "route_node_mask": (MAX_ACTIONS, MAX_ROUTE_NODES),
+    "action_mask": (MAX_ACTIONS,),
+}
+
+_OBS_BINARY_KEYS = {
+    "decision_domain",
+    "hand_mask",
+    "deck_mask",
+    "enemy_mask",
+    "relic_mask",
+    "potion_mask",
+    "route_node_mask",
+    "action_mask",
+}
+
+_OBS_ROW_TRIM_MASKS = {
+    "hand": "hand_mask",
+    "hand_text": "hand_mask",
+    "deck": "deck_mask",
+    "deck_text": "deck_mask",
+    "enemies": "enemy_mask",
+    "enemy_text": "enemy_mask",
+    "relics": "relic_mask",
+    "potions": "potion_mask",
+    "actions": "action_mask",
+    "action_text": "action_mask",
+    "semantic_actions": "action_mask",
+    "semantic_action_text": "action_mask",
+    "route_summary": "action_mask",
+    "route_nodes": "action_mask",
+    "route_node_mask": "action_mask",
+}
+
+
+def _is_packed_observation(obs: Dict[str, Any] | None) -> bool:
+    return isinstance(obs, dict) and bool(obs.get(_PACKED_OBS_MARKER))
+
+
+def _count_active_rows(mask_value: Any, max_rows: int) -> int:
+    if mask_value is None:
+        return max_rows
+    mask_arr = np.asarray(mask_value)
+    if mask_arr.size == 0:
+        return 0
+    return max(0, min(int(np.count_nonzero(mask_arr > 0.5)), max_rows))
+
+
+def _pack_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+    packed: Dict[str, Any] = {_PACKED_OBS_MARKER: True}
+    for key, shape in _OBS_FIXED_SHAPES.items():
+        value = obs.get(key)
+        if value is None:
+            continue
+
+        arr = np.asarray(value)
+        if arr.shape != shape:
+            try:
+                arr = np.asarray(value, dtype=np.float32).reshape(shape)
+            except Exception:
+                arr = np.zeros(shape, dtype=np.float32)
+
+        if key in _OBS_ROW_TRIM_MASKS:
+            row_mask_key = _OBS_ROW_TRIM_MASKS[key]
+            row_count = _count_active_rows(obs.get(row_mask_key), shape[0])
+            arr = arr[:row_count]
+
+        if key in _OBS_BINARY_KEYS:
+            packed[key] = np.asarray(arr > 0.5, dtype=np.uint8)
+        else:
+            packed[key] = np.asarray(arr, dtype=np.float16)
+
+    return packed
+
+
+def _batched_observations_to_numpy(obs_list: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    if not obs_list:
+        return {}
+
+    batch_size = len(obs_list)
+    batched = {
+        key: np.zeros((batch_size, *shape), dtype=np.float32)
+        for key, shape in _OBS_FIXED_SHAPES.items()
+    }
+
+    for batch_idx, obs in enumerate(obs_list):
+        if _is_packed_observation(obs):
+            for key, shape in _OBS_FIXED_SHAPES.items():
+                stored = obs.get(key)
+                if stored is None:
+                    continue
+                if key in _OBS_BINARY_KEYS:
+                    data = np.asarray(stored, dtype=np.uint8)
+                else:
+                    data = np.asarray(stored, dtype=np.float32)
+
+                if key in _OBS_ROW_TRIM_MASKS:
+                    rows = min(int(data.shape[0]) if data.ndim >= 1 else 0, shape[0])
+                    if rows > 0:
+                        batched[key][batch_idx, :rows] = data[:rows].astype(np.float32, copy=False)
+                else:
+                    if data.shape != shape:
+                        try:
+                            data = data.reshape(shape)
+                        except Exception:
+                            continue
+                    batched[key][batch_idx] = data.astype(np.float32, copy=False)
+            continue
+
+        for key, shape in _OBS_FIXED_SHAPES.items():
+            value = obs.get(key) if isinstance(obs, dict) else None
+            if value is None:
+                continue
+            data = np.asarray(value, dtype=np.float32)
+            if data.shape != shape:
+                try:
+                    data = data.reshape(shape)
+                except Exception:
+                    continue
+            batched[key][batch_idx] = data
+
+    return batched
+
+
+_ZERO_PACKED_OBSERVATION: Dict[str, Any] = {
+    _PACKED_OBS_MARKER: True,
+    **{
+        key: (
+            np.zeros((0, *shape[1:]), dtype=np.uint8 if key in _OBS_BINARY_KEYS else np.float16)
+            if key in _OBS_ROW_TRIM_MASKS
+            else np.zeros(shape, dtype=np.uint8 if key in _OBS_BINARY_KEYS else np.float16)
+        )
+        for key, shape in _OBS_FIXED_SHAPES.items()
+    },
+}
 
 
 @dataclass
@@ -101,7 +289,7 @@ class GameTrajectory:
             if semantic_policy_arr.shape[0] != SEMANTIC_ROLLOUT_SIZE:
                 semantic_policy_arr = np.resize(semantic_policy_arr, SEMANTIC_ROLLOUT_SIZE).astype(np.float32, copy=False)
         self.steps.append({
-            "obs": obs,
+            "obs": _pack_observation(obs),
             "action": int(action),
             "reward": float(reward),
             "reward_components": reward_components_arr.astype(np.float32, copy=False),
@@ -263,6 +451,8 @@ class MuZeroReplayBuffer:
     @staticmethod
     def _zero_obs_like(obs: Dict[str, Any]) -> Dict[str, Any]:
         """Create a zero observation with the same schema/shapes as `obs`."""
+        if _is_packed_observation(obs):
+            return _ZERO_PACKED_OBSERVATION
         zero_obs: Dict[str, Any] = {}
         for key, value in obs.items():
             if isinstance(value, np.ndarray):
@@ -272,6 +462,11 @@ class MuZeroReplayBuffer:
             else:
                 zero_obs[key] = 0
         return zero_obs
+
+    @staticmethod
+    def batch_observations(obs_list: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+        """Materialize a batch of observations into dense numpy arrays."""
+        return _batched_observations_to_numpy(obs_list)
 
     def sample_batch(
         self,
@@ -318,7 +513,6 @@ class MuZeroReplayBuffer:
         priorities_array = np.array(self.priorities, dtype=np.float32)
         priorities_array /= priorities_array.sum()
 
-        batch_obs = []
         batch_obs_sequence = []
         batch_actions = []
         batch_semantic_actions = []
@@ -340,9 +534,7 @@ class MuZeroReplayBuffer:
             # Sample random position in trajectory
             pos = int(rng.integers(len(trajectory)))
 
-            # Collect observation at position
-            batch_obs.append(trajectory.steps[pos]["obs"])
-            zero_obs = self._zero_obs_like(trajectory.steps[-1]["obs"])
+            zero_obs = _ZERO_PACKED_OBSERVATION
             obs_sequence = []
             for k in range(unroll_steps + 1):
                 step_idx = pos + k
@@ -454,7 +646,6 @@ class MuZeroReplayBuffer:
         mask_batch = torch.from_numpy(np.asarray(batch_masks, dtype=np.float32))  # [B, K+1, 80]
 
         return {
-            "obs_batch": batch_obs,
             "obs_sequence_batch": batch_obs_sequence,
             "action_batch": action_batch,
             "semantic_action_batch": semantic_action_batch,
@@ -505,6 +696,11 @@ class MuZeroReplayBuffer:
             if not hasattr(trajectory, "metadata") or trajectory.metadata is None:
                 trajectory.metadata = {}
             for step in getattr(trajectory, "steps", []):
+                obs = step.get("obs")
+                if isinstance(obs, dict) and not _is_packed_observation(obs):
+                    step["obs"] = _pack_observation(obs)
+                elif obs is None:
+                    step["obs"] = _ZERO_PACKED_OBSERVATION
                 if "reward_components" not in step or step["reward_components"] is None:
                     step["reward_components"] = np.zeros(NUM_OBJECTIVE_HEADS, dtype=np.float32)
                 if "root_value_components" not in step or step["root_value_components"] is None:
