@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 from safetensors.torch import load_file, save_file
 from sb3_contrib import MaskablePPO
 
-from .model import STS2CandidateScoringPolicy
+from .aux_maskable_ppo import AuxMaskablePPO
+from .omni_attention_policy import DEFAULT_POLICY_CLASS_PATH, STS2OmniAttentionPolicy
+
+REQUIRED_OBSERVATION_API_VERSION = "attention_obs_v2"
+REQUIRED_COLLECTOR_MODE = "async"
+REQUIRED_CANDIDATE_LOCAL_TOKENS = 24
+
+# Only these policy classes may be loaded from checkpoint metadata.
+_ALLOWED_POLICY_CLASSES = {
+    "sts2_env.omni_attention_policy.STS2OmniAttentionPolicy",
+}
+_ALLOWED_ALGORITHM_CLASSES = {
+    "sts2_env.aux_maskable_ppo.AuxMaskablePPO",
+}
 
 
 def save_online_checkpoint(
@@ -27,12 +42,132 @@ def save_online_checkpoint(
     return output_path
 
 
+def _parse_periodic_checkpoint_step(checkpoint_path: str | Path) -> int | None:
+    path = Path(checkpoint_path)
+    if not path.is_dir():
+        return None
+    name = path.name
+    if not name.startswith("step_"):
+        return None
+    suffix = name[len("step_") :]
+    if not suffix.isdigit():
+        return None
+    try:
+        return int(suffix)
+    except ValueError:
+        return None
+
+
+def prune_periodic_online_checkpoints(
+    checkpoint_root: str | Path,
+    *,
+    keep_last: int = 3,
+) -> list[Path]:
+    root = Path(checkpoint_root)
+    if keep_last < 0:
+        keep_last = 0
+    periodic_dirs = [
+        path
+        for path in root.iterdir()
+        if _parse_periodic_checkpoint_step(path) is not None
+    ] if root.exists() else []
+    periodic_dirs.sort(
+        key=lambda path: (_parse_periodic_checkpoint_step(path) or -1, path.name),
+        reverse=True,
+    )
+    removed: list[Path] = []
+    for stale_path in periodic_dirs[keep_last:]:
+        shutil.rmtree(stale_path, ignore_errors=False)
+        removed.append(stale_path)
+    return removed
+
+
+def save_rotating_online_checkpoint(
+    model: MaskablePPO,
+    checkpoint_root: str | Path,
+    *,
+    timesteps: int,
+    metadata: dict[str, Any],
+    keep_last: int = 3,
+) -> Path:
+    root = Path(checkpoint_root)
+    checkpoint_path = root / f"step_{int(timesteps):09d}"
+    saved_path = save_online_checkpoint(model, checkpoint_path, metadata=metadata)
+    prune_periodic_online_checkpoints(root, keep_last=keep_last)
+    return saved_path
+
+
 def load_online_checkpoint_metadata(checkpoint_dir: str | Path) -> dict[str, Any]:
     checkpoint_path = Path(checkpoint_dir)
     metadata_path = checkpoint_path / "metadata.json"
     if not metadata_path.exists():
         raise FileNotFoundError(f"Missing metadata.json in checkpoint directory: {checkpoint_path}")
-    return json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    validate_attention_checkpoint_metadata(metadata, checkpoint_path=checkpoint_path)
+    return metadata
+
+
+def validate_attention_checkpoint_metadata(
+    metadata: dict[str, Any],
+    *,
+    checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    observation_api_version = str(metadata.get("observation_api_version") or "").strip()
+    collector_mode = str(metadata.get("collector_mode") or "").strip().lower()
+    try:
+        candidate_local_tokens = int(metadata.get("candidate_local_tokens"))
+    except (TypeError, ValueError):
+        candidate_local_tokens = -1
+
+    mismatches: list[str] = []
+    if observation_api_version != REQUIRED_OBSERVATION_API_VERSION:
+        mismatches.append(
+            f"observation_api_version={observation_api_version or '<missing>'} (expected {REQUIRED_OBSERVATION_API_VERSION})"
+        )
+    if collector_mode != REQUIRED_COLLECTOR_MODE:
+        mismatches.append(f"collector_mode={collector_mode or '<missing>'} (expected {REQUIRED_COLLECTOR_MODE})")
+    if candidate_local_tokens != REQUIRED_CANDIDATE_LOCAL_TOKENS:
+        mismatches.append(
+            f"candidate_local_tokens={candidate_local_tokens if candidate_local_tokens >= 0 else '<missing>'} "
+            f"(expected {REQUIRED_CANDIDATE_LOCAL_TOKENS})"
+        )
+
+    if mismatches:
+        location = f" in checkpoint '{Path(checkpoint_path)}'" if checkpoint_path is not None else ""
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(
+            "Incompatible attention checkpoint metadata"
+            f"{location}: {mismatch_text}. "
+            f"This runtime requires {REQUIRED_OBSERVATION_API_VERSION}."
+        )
+
+    return metadata
+
+
+_FORWARD_COMPATIBLE_MISSING_PREFIXES = (
+    "candidate_selection_head.",
+    "world_bank_relation_bias.",
+    "world_bank_cross_blocks.",
+    "world_bank_poolers.",
+    "world_bank_router_q.",
+    "world_bank_router_k.",
+    "world_bank_router_bias",
+)
+
+
+def _can_relax_for_forward_compatible_missing_keys(policy, state_dict: dict[str, Any]) -> bool:
+    policy_state_keys = set(policy.state_dict().keys())
+    forward_compatible_keys = {
+        key
+        for key in policy_state_keys
+        if key == "world_bank_router_bias" or any(key.startswith(prefix) for prefix in _FORWARD_COMPATIBLE_MISSING_PREFIXES if prefix.endswith("."))
+    }
+    if not forward_compatible_keys:
+        return False
+    checkpoint_keys = set(state_dict.keys())
+    missing_keys = policy_state_keys - checkpoint_keys
+    unexpected_keys = checkpoint_keys - policy_state_keys
+    return bool(missing_keys) and missing_keys.issubset(forward_compatible_keys) and not unexpected_keys
 
 
 def load_online_policy_state_dict(
@@ -47,7 +182,13 @@ def load_online_policy_state_dict(
     state_dict = load_file(str(checkpoint_path / "model.safetensors"), device=device)
 
     policy = getattr(model_or_policy, "policy", model_or_policy)
-    policy.load_state_dict(state_dict, strict=strict)
+    try:
+        policy.load_state_dict(state_dict, strict=strict)
+    except RuntimeError:
+        if strict and _can_relax_for_forward_compatible_missing_keys(policy, state_dict):
+            policy.load_state_dict(state_dict, strict=False)
+        else:
+            raise
 
     if hasattr(model_or_policy, "policy") and hasattr(model_or_policy, "num_timesteps"):
         model_or_policy.num_timesteps = int(metadata.get("timesteps", 0))
@@ -64,10 +205,29 @@ def load_online_checkpoint(
     checkpoint_path = Path(checkpoint_dir)
     metadata = load_online_checkpoint_metadata(checkpoint_path)
     policy_kwargs = metadata.get("policy_kwargs") or {}
+    policy_class_path = str(metadata.get("policy_class") or DEFAULT_POLICY_CLASS_PATH).strip()
 
-    model = MaskablePPO(
-        STS2CandidateScoringPolicy,
-        env,
+    if policy_class_path == DEFAULT_POLICY_CLASS_PATH:
+        policy_class = STS2OmniAttentionPolicy
+    elif policy_class_path in _ALLOWED_POLICY_CLASSES:
+        module_name, _, class_name = policy_class_path.rpartition(".")
+        module = importlib.import_module(module_name)
+        policy_class = getattr(module, class_name)
+    else:
+        raise ValueError(
+            f"Untrusted policy_class in checkpoint metadata: {policy_class_path!r}. "
+            f"Allowed: {_ALLOWED_POLICY_CLASSES}"
+        )
+
+    algorithm_class_path = str(metadata.get("algorithm_class") or "").strip()
+    if algorithm_class_path and algorithm_class_path not in _ALLOWED_ALGORITHM_CLASSES:
+        raise ValueError(
+            f"Untrusted algorithm_class in checkpoint metadata: {algorithm_class_path!r}. "
+            f"Allowed: {_ALLOWED_ALGORITHM_CLASSES}"
+        )
+    algorithm_class = AuxMaskablePPO if algorithm_class_path == "sts2_env.aux_maskable_ppo.AuxMaskablePPO" else MaskablePPO
+
+    common_kwargs = dict(
         learning_rate=3e-4,
         n_steps=64,
         batch_size=64,
@@ -81,6 +241,21 @@ def load_online_checkpoint(
         policy_kwargs=policy_kwargs,
         verbose=0,
         device=device,
+    )
+    if algorithm_class is AuxMaskablePPO:
+        common_kwargs.update(
+            aux_objective_coef=float(metadata.get("aux_objective_coef", 0.25)),
+            aux_transition_coef=float(metadata.get("aux_transition_coef", 0.10)),
+            aux_trait_coef=float(metadata.get("aux_trait_coef", 0.10)),
+            aux_build_coef=float(metadata.get("aux_build_coef", 0.10)),
+            aux_selection_coef=float(metadata.get("aux_selection_coef", 0.10)),
+            aux_route_coef=float(metadata.get("aux_route_coef", 0.10)),
+        )
+
+    model = algorithm_class(
+        policy_class,
+        env,
+        **common_kwargs,
     )
     load_online_policy_state_dict(model, checkpoint_path, device=device, strict=True)
     return model, metadata

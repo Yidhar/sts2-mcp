@@ -21,11 +21,22 @@ import numpy as np
 from gymnasium import spaces
 
 from .action_compact import compact_legal_actions
+from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
-from .observation_v2 import DictObservationEncoder, MAX_ACTIONS
+from .observation_common import DenseObservationEncoder, MAX_ACTIONS
+from .observation_v3 import WorldTokenObservationEncoder
 from .run_memory import RunMemoryTracker
 
-INVALID_ACTION_REWARD = -1.0
+from .reward_constants import (
+    ENEMY_HP_DELTA_REWARD_SCALE,
+    FULL_RUN_WASTE_BASE as END_TURN_WASTE_BASE_PENALTY,
+    FULL_RUN_WASTE_ENERGY as END_TURN_WASTE_ENERGY_PENALTY,
+    FULL_RUN_WASTE_EXTRA_ACTION as END_TURN_WASTE_EXTRA_ACTION_PENALTY,
+    FULL_RUN_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
+    INVALID_ACTION_REWARD,
+    PLAYER_HP_LOSS_REWARD_SCALE,
+)
+
 INVALID_ACTION_REASON = "invalid_action_index"
 BLOCKED_ACTION_KINDS = {"discard_potion"}
 RECOVERY_POLL_INTERVAL_S = 0.10
@@ -35,12 +46,6 @@ RESET_READY_POLL_INTERVAL_S = 0.50
 RESET_READY_MAX_WAIT_MS = 90_000
 STEP_RECOVERY_TRUNCATION_REASON = "bridge_episode_lost"
 STARTUP_ACTION_PREFIXES = ("main_menu:", "run_mode:", "character_select:")
-ENEMY_HP_DELTA_REWARD_SCALE = 0.01
-PLAYER_HP_LOSS_REWARD_SCALE = 0.03
-END_TURN_WASTE_BASE_PENALTY = -0.08
-END_TURN_WASTE_ENERGY_PENALTY = -0.04
-END_TURN_WASTE_ZERO_COST_BONUS_PENALTY = -0.08
-END_TURN_WASTE_EXTRA_ACTION_PENALTY = -0.03
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -65,13 +70,13 @@ class SlayTheSpire2EnvV2(gym.Env):
         reset_timeout_ms: int = 60000,
         step_timeout_ms: int = 20000,
         render_mode: str | None = None,
-        obs_encoder: DictObservationEncoder | None = None,
+        obs_encoder: DenseObservationEncoder | None = None,
         include_debug_info: bool = False,
     ) -> None:
         super().__init__()
 
         self.bridge = BridgeClient(session_path=session_file)
-        self.obs_encoder = obs_encoder or DictObservationEncoder(use_text=False)
+        self.obs_encoder = obs_encoder or WorldTokenObservationEncoder(use_text=False)
         self.character = character
         self.defensive_buffs = defensive_buffs
         self.reset_timeout_ms = reset_timeout_ms
@@ -86,7 +91,10 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._legal_actions: list[dict[str, Any]] = []
         self._last_obs_raw: dict[str, Any] | None = None
         self._last_action_overflow: int = 0
-        self._run_memory = RunMemoryTracker(episode_mode="full_run")
+        self._run_memory = RunMemoryTracker(
+            episode_mode="full_run",
+            potion_mechanics_available=True,
+        )
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -94,17 +102,44 @@ class SlayTheSpire2EnvV2(gym.Env):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
+        started = time.perf_counter()
 
+        bridge_started = time.perf_counter()
         result = self._reset_with_ready_gate(timeout_ms=self.reset_timeout_ms)
+        bridge_elapsed_ms = (time.perf_counter() - bridge_started) * 1000.0
 
         self._episode_id = result["episode_id"]
         self._update_live_state(result)
         self._recover_filtered_action_window(timeout_ms=min(self.reset_timeout_ms, RECOVERY_MAX_WAIT_MS))
-        self._run_memory.reset(self._last_obs_raw, self._legal_actions, episode_mode="full_run")
+        run_memory_started = time.perf_counter()
+        self._run_memory.reset(
+            self._last_obs_raw,
+            self._legal_actions,
+            episode_mode="full_run",
+            potion_mechanics_available=True,
+        )
+        run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
 
         planner_context = self._planner_context()
+        obs_encode_started = time.perf_counter()
         obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, planner_context)
-        info = self._build_info(result.get("info", {}))
+        obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
+        info_started = time.perf_counter()
+        info = self._build_info(
+            result.get("info", {}),
+            extra={
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=bridge_elapsed_ms,
+                    run_memory_update=run_memory_elapsed_ms,
+                    obs_encode=obs_encode_elapsed_ms,
+                    aux_targets=0.0,
+                    info_build=0.0,
+                    total=(time.perf_counter() - started) * 1000.0,
+                )
+            },
+        )
+        info["python_timing_ms"]["info_build"] = (time.perf_counter() - info_started) * 1000.0
+        info["python_timing_ms"]["total"] = (time.perf_counter() - started) * 1000.0
         return obs, info
 
     def step(self, action: int):
@@ -114,21 +149,26 @@ class SlayTheSpire2EnvV2(gym.Env):
             )
             if not recovered:
                 return self._make_terminal()
+        started = time.perf_counter()
 
         normalized_action = self._normalize_action(action)
         if normalized_action is None or normalized_action >= len(self._legal_actions):
             return self._make_invalid_action_response(action)
 
         legal_action = self._legal_actions[normalized_action]
+        legal_actions_before = list(self._legal_actions)
         prev_obs = self._last_obs_raw or {}
+        prev_planner_context = self._planner_context()
         end_turn_penalty = self._end_turn_waste_penalty(prev_obs, self._legal_actions, legal_action)
 
         try:
+            bridge_started = time.perf_counter()
             result = self.bridge.step(
                 episode_id=self._episode_id,
                 action_id=legal_action.get("action_id"),
                 timeout_ms=self.step_timeout_ms,
             )
+            bridge_elapsed_ms = (time.perf_counter() - bridge_started) * 1000.0
         except Exception as exc:
             if self._is_episode_lost_error(exc):
                 recovered = self._soft_rebind_into_current_run(
@@ -137,8 +177,14 @@ class SlayTheSpire2EnvV2(gym.Env):
                 if recovered is not None:
                     self._episode_id = recovered.get("episode_id", self._episode_id)
                     self._update_live_state(recovered)
+                    run_memory_started = time.perf_counter()
                     self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
-                    obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, self._planner_context())
+                    run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
+                    planner_context = self._planner_context()
+                    obs_encode_started = time.perf_counter()
+                    obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, planner_context)
+                    obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
+                    info_started = time.perf_counter()
                     info = self._build_info(
                         {},
                         extra={
@@ -146,8 +192,18 @@ class SlayTheSpire2EnvV2(gym.Env):
                             "bridge_episode_rebound": True,
                             "bridge_exception": str(exc),
                             "step_recovery": "soft_rebind_current_run",
+                            "python_timing_ms": self._python_timing(
+                                bridge_roundtrip=0.0,
+                                run_memory_update=run_memory_elapsed_ms,
+                                obs_encode=obs_encode_elapsed_ms,
+                                aux_targets=0.0,
+                                info_build=0.0,
+                                total=(time.perf_counter() - started) * 1000.0,
+                            ),
                         },
                     )
+                    info["python_timing_ms"]["info_build"] = (time.perf_counter() - info_started) * 1000.0
+                    info["python_timing_ms"]["total"] = (time.perf_counter() - started) * 1000.0
                     return obs, 0.0, False, False, info
                 return self._make_step_recovery_response(exc)
             raise
@@ -178,10 +234,42 @@ class SlayTheSpire2EnvV2(gym.Env):
         if not terminated and not truncated:
             self._recover_filtered_action_window(timeout_ms=self._transition_recovery_timeout_ms())
 
+        run_memory_started = time.perf_counter()
         self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
+        run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
         planner_context = self._planner_context()
+        obs_encode_started = time.perf_counter()
         obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, planner_context)
-        info = self._build_info(bridge_info)
+        obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
+        aux_started = time.perf_counter()
+        aux_targets = build_aux_targets(
+            prev_obs,
+            legal_action,
+            self._last_obs_raw,
+            prev_planner_context=prev_planner_context,
+            next_planner_context=planner_context,
+            terminated=terminated,
+            truncated=truncated,
+            legal_actions_before=legal_actions_before,
+        )
+        aux_elapsed_ms = (time.perf_counter() - aux_started) * 1000.0
+        info_started = time.perf_counter()
+        info = self._build_info(
+            bridge_info,
+            extra={
+                "aux_targets": aux_targets,
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=bridge_elapsed_ms,
+                    run_memory_update=run_memory_elapsed_ms,
+                    obs_encode=obs_encode_elapsed_ms,
+                    aux_targets=aux_elapsed_ms,
+                    info_build=0.0,
+                    total=(time.perf_counter() - started) * 1000.0,
+                ),
+            },
+        )
+        info["python_timing_ms"]["info_build"] = (time.perf_counter() - info_started) * 1000.0
+        info["python_timing_ms"]["total"] = (time.perf_counter() - started) * 1000.0
 
         if self.render_mode == "human":
             self.render()
@@ -204,7 +292,19 @@ class SlayTheSpire2EnvV2(gym.Env):
 
     def _make_terminal(self):
         obs = self.obs_encoder.encode(self._last_obs_raw or {}, [], self._planner_context())
-        info = self._build_info({})
+        info = self._build_info(
+            {},
+            extra={
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=0.0,
+                    run_memory_update=0.0,
+                    obs_encode=0.0,
+                    aux_targets=0.0,
+                    info_build=0.0,
+                    total=0.0,
+                )
+            },
+        )
         return obs, 0.0, True, False, info
 
     def render(self) -> None:
@@ -711,6 +811,7 @@ class SlayTheSpire2EnvV2(gym.Env):
             "action_overflow": self._last_action_overflow,
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "full_run",
+            "potion_mechanics_available": True,
             "planner_context": planner_context,
             "transition_state": self._transition_state(),
             "bridge_info": self._decorate_bridge_info(bridge_info),
@@ -736,12 +837,39 @@ class SlayTheSpire2EnvV2(gym.Env):
             extra={
                 "invalid_action_selected": True,
                 "invalid_action_index": attempted_action,
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=0.0,
+                    run_memory_update=0.0,
+                    obs_encode=0.0,
+                    aux_targets=0.0,
+                    info_build=0.0,
+                    total=0.0,
+                ),
             },
         )
         return obs, INVALID_ACTION_REWARD, False, True, info
 
     def _planner_context(self) -> dict[str, Any]:
         return self._run_memory.build_context(self._last_obs_raw, self._legal_actions)
+
+    @staticmethod
+    def _python_timing(
+        *,
+        bridge_roundtrip: float,
+        run_memory_update: float,
+        obs_encode: float,
+        aux_targets: float,
+        info_build: float,
+        total: float,
+    ) -> dict[str, float]:
+        return {
+            "bridge_roundtrip": float(bridge_roundtrip),
+            "run_memory_update": float(run_memory_update),
+            "obs_encode": float(obs_encode),
+            "aux_targets": float(aux_targets),
+            "info_build": float(info_build),
+            "total": float(total),
+        }
 
     def _make_step_recovery_response(self, exc: Exception):
         self._episode_id = None
@@ -758,6 +886,14 @@ class SlayTheSpire2EnvV2(gym.Env):
             extra={
                 "bridge_episode_lost": True,
                 "bridge_exception": str(exc),
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=0.0,
+                    run_memory_update=0.0,
+                    obs_encode=0.0,
+                    aux_targets=0.0,
+                    info_build=0.0,
+                    total=0.0,
+                ),
             },
         )
         return obs, 0.0, False, True, info

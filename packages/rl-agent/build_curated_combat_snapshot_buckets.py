@@ -20,7 +20,11 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from combat_snapshot_dataset import clean_combat_snapshot_rows, infer_encounter_tier_from_row
+from combat_snapshot_dataset import (
+    clean_combat_snapshot_rows,
+    infer_encounter_tier_from_row,
+    is_failed_combat_room_snapshot,
+)
 from export_offline_run_datasets import (
     _clean_run_bundle,
     _expand_single_input,
@@ -45,14 +49,28 @@ def _write_run_id_list(path: Path, run_ids: list[str]) -> None:
     path.write_text("\n".join(run_ids) + ("\n" if run_ids else ""), encoding="utf-8")
 
 
+def _load_excluded_sample_ids(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    if not path.exists():
+        raise FileNotFoundError(f"Exclude sample ids file does not exist: {path}")
+    return {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
 def _write_combined_snapshot_variants(
     output_dir: Path,
     *,
     run_rows: list[dict[str, Any]],
     combat_rows_all: list[dict[str, Any]],
+    excluded_sample_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     combined_dir = output_dir / "combined"
     combined_dir.mkdir(parents=True, exist_ok=True)
+    excluded_sample_ids = set(excluded_sample_ids or set())
 
     def _select_runs(predicate) -> list[dict[str, Any]]:
         return [row for row in run_rows if predicate(row)]
@@ -60,16 +78,78 @@ def _write_combined_snapshot_variants(
     def _select_rows(predicate) -> list[dict[str, Any]]:
         return [row for row in combat_rows_all if predicate(row)]
 
-    def _write_variant(name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def _apply_variant_filters(
+        rows: list[dict[str, Any]],
+        *,
+        roomwin_only: bool = False,
+        subtract_excluded_sample_ids: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        filtered: list[dict[str, Any]] = []
+        room_failure_rows_removed = 0
+        explicit_sample_exclusions_removed = 0
+
+        for row in rows:
+            if roomwin_only and is_failed_combat_room_snapshot(row):
+                room_failure_rows_removed += 1
+                continue
+
+            sample_id = str(row.get("sample_id") or "")
+            if subtract_excluded_sample_ids and sample_id and sample_id in excluded_sample_ids:
+                explicit_sample_exclusions_removed += 1
+                continue
+
+            filtered.append(row)
+
+        return filtered, {
+            "room_failure_rows_removed": room_failure_rows_removed,
+            "explicit_sample_exclusions_removed": explicit_sample_exclusions_removed,
+        }
+
+    def _write_variant(
+        name: str,
+        rows: list[dict[str, Any]],
+        *,
+        roomwin_only: bool = False,
+        subtract_excluded_sample_ids: bool = False,
+    ) -> dict[str, Any]:
+        filtered_rows, filter_stats = _apply_variant_filters(
+            rows,
+            roomwin_only=roomwin_only,
+            subtract_excluded_sample_ids=subtract_excluded_sample_ids,
+        )
+        rows = filtered_rows
         run_ids = sorted({str(row.get("run_id")) for row in rows if row.get("run_id")})
         _write_jsonl(combined_dir / f"{name}.jsonl", rows)
         _write_run_id_list(combined_dir / f"{name}.run_ids.txt", run_ids)
-        return {
+        potion_state_known_rows = sum(1 for row in rows if bool(row.get("potion_state_known")))
+        nonempty_potion_rows = sum(
+            1
+            for row in rows
+            if bool(row.get("potion_state_known")) and bool(row.get("potion_ids_before"))
+        )
+        report: dict[str, Any] = {
             "rows": len(rows),
             "run_ids": len(run_ids),
             "path": str(combined_dir / f"{name}.jsonl"),
             "run_ids_path": str(combined_dir / f"{name}.run_ids.txt"),
+            "potion_state_known_rows": potion_state_known_rows,
+            "potion_state_known_rate": (
+                round(potion_state_known_rows / len(rows), 4)
+                if rows else 0.0
+            ),
+            "nonempty_potion_rows": nonempty_potion_rows,
+            "nonempty_potion_rate": (
+                round(nonempty_potion_rows / len(rows), 4)
+                if rows else 0.0
+            ),
         }
+        if roomwin_only or subtract_excluded_sample_ids:
+            report["filters"] = {
+                "roomwin_only": roomwin_only,
+                "subtract_excluded_sample_ids": subtract_excluded_sample_ids,
+                **filter_stats,
+            }
+        return report
 
     human_run_pred = lambda row: str(row.get("provenance_origin") or "") == "human_zip"
     local_act1clear_run_pred = (
@@ -82,30 +162,52 @@ def _write_combined_snapshot_variants(
     bootstrap_rows = human_rows + local_act1clear_rows
 
     weak_normal_pred = lambda row: infer_encounter_tier_from_row(row) in {"weak", "normal"}
-    report = {
-        "human_only": _write_variant("human_only", human_rows),
-        "human_only_weak_normal": _write_variant(
-            "human_only_weak_normal",
-            [row for row in human_rows if weak_normal_pred(row)],
-        ),
-        "local_act1clear_only": _write_variant("local_act1clear_only", local_act1clear_rows),
-        "bootstrap_human_plus_local_act1clear": _write_variant(
-            "bootstrap_human_plus_local_act1clear",
-            bootstrap_rows,
-        ),
-        "bootstrap_human_plus_local_act1clear_weak_normal": _write_variant(
-            "bootstrap_human_plus_local_act1clear_weak_normal",
-            [row for row in bootstrap_rows if weak_normal_pred(row)],
-        ),
+    base_variants: dict[str, list[dict[str, Any]]] = {
+        "human_only": human_rows,
+        "human_only_weak_normal": [row for row in human_rows if weak_normal_pred(row)],
+        "local_act1clear_only": local_act1clear_rows,
+        "bootstrap_human_plus_local_act1clear": bootstrap_rows,
+        "bootstrap_human_plus_local_act1clear_weak_normal": [row for row in bootstrap_rows if weak_normal_pred(row)],
     }
+
+    report: dict[str, Any] = {}
+    for name, rows in base_variants.items():
+        report[name] = _write_variant(name, rows)
+        report[f"{name}_roomwin_only"] = _write_variant(
+            f"{name}_roomwin_only",
+            rows,
+            roomwin_only=True,
+        )
+
+        if excluded_sample_ids:
+            report[f"{name}_minus_combat_reset_failures"] = _write_variant(
+                f"{name}_minus_combat_reset_failures",
+                rows,
+                subtract_excluded_sample_ids=True,
+            )
+            report[f"{name}_roomwin_only_minus_combat_reset_failures"] = _write_variant(
+                f"{name}_roomwin_only_minus_combat_reset_failures",
+                rows,
+                roomwin_only=True,
+                subtract_excluded_sample_ids=True,
+            )
+
     report["rules"] = {
         "human_only": "All combat rows from pure human archives.",
         "local_act1clear_only": "Mixed local-history combat rows from runs that cleared Act 1.",
         "bootstrap_human_plus_local_act1clear": (
             "Preferred combat bootstrap set: human_zip plus local_history where cleared_act1=true."
         ),
+        "roomwin_only_suffix": (
+            "Drops only explicit losing-room combat snapshots; keeps winning combat rooms even when the overall run later failed."
+        ),
         "weak_normal_suffix": "Subset restricted to weak/normal encounters for early curriculum.",
+        "minus_combat_reset_failures_suffix": (
+            "Subtracts sample_ids listed in --exclude-sample-ids-file, e.g. known /env/combat_reset failure rows."
+        ),
     }
+    if excluded_sample_ids:
+        report["exclude_sample_ids_file_count"] = len(excluded_sample_ids)
     return report
 
 
@@ -209,12 +311,22 @@ def main() -> None:
         default=None,
         help="Optional live bridge session file. When provided, drop combat rows whose encounter_id is not present in /env/combat_catalog.",
     )
+    parser.add_argument(
+        "--exclude-sample-ids-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional newline-delimited sample_id list to subtract from combined variants. "
+            "Used for known combat_reset failure rows."
+        ),
+    )
     args = parser.parse_args()
 
     human_inputs = [Path(value) for value in args.human_source]
     local_inputs = [Path(value) for value in args.local_source]
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    excluded_sample_ids = _load_excluded_sample_ids(args.exclude_sample_ids_file)
     supported_encounter_ids: set[str] | None = None
     if args.session_file:
         supported_encounter_ids = _get_live_supported_encounter_ids(args.session_file)
@@ -333,6 +445,7 @@ def main() -> None:
         output_dir,
         run_rows=run_rows,
         combat_rows_all=combat_rows_all,
+        excluded_sample_ids=excluded_sample_ids,
     )
 
     report = {
@@ -346,6 +459,11 @@ def main() -> None:
             "session_file": args.session_file,
             "supported_encounter_count": len(supported_encounter_ids or set()),
         },
+        "sample_exclusion_filter": {
+            "enabled": bool(excluded_sample_ids),
+            "exclude_sample_ids_file": str(args.exclude_sample_ids_file) if args.exclude_sample_ids_file else None,
+            "excluded_sample_id_count": len(excluded_sample_ids),
+        },
         "run_counts": {
             "total_runs": len(run_rows),
             "by_provenance": dict(sorted(Counter(str(row.get("provenance_origin")) for row in run_rows).items())),
@@ -357,6 +475,14 @@ def main() -> None:
         },
         "combat_snapshot_counts": {
             "total_rows": len(combat_rows_all),
+            "potion_coverage": {
+                "potion_state_known_rows": sum(1 for row in combat_rows_all if bool(row.get("potion_state_known"))),
+                "nonempty_potion_rows": sum(
+                    1
+                    for row in combat_rows_all
+                    if bool(row.get("potion_state_known")) and bool(row.get("potion_ids_before"))
+                ),
+            },
             "by_bucket": {
                 bucket_name: len(rows)
                 for bucket_name, rows in sorted(bucketed_combat_rows.items())

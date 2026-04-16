@@ -56,3 +56,8 @@ packages/mcp-server/rl-smoke-logs
 packages/rl-agent/tmp/
 packages/rl-agent/train_logs/
 packages/rl-agent/offline_runs/
+packages/rl-agent/.venv-wsl-rocm/
+packages/rl-agent/analysis/
+.switchyard/
+packages/rl-agent/logs_attention/
+packages/rl-agent/checkpoints_attention/

@@ -4353,6 +4353,12 @@ internal static partial class BridgeGameApi
             };
         }
 
+        var staticTraits = creature.IsEnemy ? BuildEnemyStaticTraitPayloads(creature) : Array.Empty<object>();
+        var reactiveTriggers = creature.IsEnemy ? BuildEnemyReactiveTriggerPayloads(creature) : Array.Empty<object>();
+        var phaseRules = creature.IsEnemy ? BuildEnemyPhaseRulePayloads(creature) : Array.Empty<object>();
+        var combatTags = creature.IsEnemy ? BuildEnemyCombatTags(creature) : Array.Empty<string>();
+        var targetPriorityHints = creature.IsEnemy ? BuildEnemyTargetPriorityHints(creature, combatTags) : Array.Empty<object>();
+
         return new
         {
             name = creature.Name,
@@ -4365,8 +4371,398 @@ internal static partial class BridgeGameApi
             is_alive = creature.IsAlive,
             is_hittable = SafeGetCreatureIsHittable(creature),
             powers = creature.Powers.Select(BuildPowerPayload).ToArray(),
-            intent = creature.IsEnemy ? BuildEnemyIntentPayload(creature) : null
+            intent = creature.IsEnemy ? BuildEnemyIntentPayload(creature) : null,
+            static_traits = staticTraits,
+            reactive_triggers = reactiveTriggers,
+            phase_rules = phaseRules,
+            combat_tags = combatTags,
+            danger_profile = creature.IsEnemy ? BuildEnemyDangerProfile(creature, combatTags) : null,
+            target_priority_hints = targetPriorityHints
         };
+    }
+
+    private static object CreateEnemyTraitPayload(
+        string category,
+        string trait,
+        string description,
+        string? triggerType = null,
+        string? condition = null,
+        string? effectType = null,
+        int? threshold = null,
+        string? state = null,
+        int? effectAmount = null,
+        string? severity = null)
+    {
+        return new
+        {
+            category,
+            trait,
+            description,
+            trigger_type = triggerType,
+            condition,
+            effect_type = effectType,
+            threshold,
+            state,
+            effect_amount = effectAmount,
+            severity
+        };
+    }
+
+    private static string BuildEnemySearchText(Creature creature)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(creature.Name))
+        {
+            parts.Add(creature.Name);
+        }
+
+        if (creature.ModelId is not null)
+        {
+            parts.Add(creature.ModelId.ToString());
+        }
+
+        if (creature.Monster?.NextMove?.StateId is string stateId && !string.IsNullOrWhiteSpace(stateId))
+        {
+            parts.Add(stateId);
+        }
+
+        foreach (var power in creature.Powers.Take(4))
+        {
+            var title = TextOf(power.Title);
+            var description = TryGetDescription(power);
+            if (!string.IsNullOrWhiteSpace(title))
+            {
+                parts.Add(title);
+            }
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                parts.Add(description);
+            }
+        }
+
+        return string.Join(" ", parts).ToLowerInvariant();
+    }
+
+    private static object[] BuildEnemyStaticTraitPayloads(Creature creature)
+    {
+        var searchText = BuildEnemySearchText(creature);
+        var traits = new List<object>();
+
+        if (searchText.Contains("nexus", StringComparison.Ordinal) ||
+            searchText.Contains("progenitor", StringComparison.Ordinal) ||
+            searchText.Contains("queen", StringComparison.Ordinal) ||
+            searchText.Contains("egg", StringComparison.Ordinal))
+        {
+            traits.Add(CreateEnemyTraitPayload("static", "summon_engine", "Acts as a board-pressure engine or summon core.", severity: "high"));
+        }
+
+        if (searchText.Contains("door", StringComparison.Ordinal))
+        {
+            traits.Add(CreateEnemyTraitPayload("static", "gatekeeper", "Encounter progression is gated until this unit's cycle is solved.", severity: "high"));
+        }
+
+        if (searchText.Contains("matriarch", StringComparison.Ordinal) ||
+            searchText.Contains("nexus", StringComparison.Ordinal) ||
+            searchText.Contains("byrdonis", StringComparison.Ordinal) ||
+            searchText.Contains("wurm", StringComparison.Ordinal))
+        {
+            traits.Add(CreateEnemyTraitPayload("static", "time_scaling", "Threat grows materially if the fight drags.", severity: "high"));
+        }
+
+        if (searchText.Contains("retali", StringComparison.Ordinal) ||
+            searchText.Contains("thorn", StringComparison.Ordinal) ||
+            searchText.Contains("spiny", StringComparison.Ordinal))
+        {
+            traits.Add(CreateEnemyTraitPayload("static", "contact_retaliate", "Punishes contact hits or spammy multi-hit plans.", severity: "high"));
+        }
+
+        return traits.ToArray();
+    }
+
+    private static object[] BuildEnemyReactiveTriggerPayloads(Creature creature)
+    {
+        var searchText = BuildEnemySearchText(creature);
+        var triggers = new List<object>();
+
+        if (searchText.Contains("retali", StringComparison.Ordinal) ||
+            searchText.Contains("thorn", StringComparison.Ordinal) ||
+            searchText.Contains("spike", StringComparison.Ordinal) ||
+            searchText.Contains("spiny", StringComparison.Ordinal))
+        {
+            triggers.Add(CreateEnemyTraitPayload(
+                "reactive",
+                "retaliate",
+                "On hit or contact, this enemy punishes damage with retaliation.",
+                triggerType: "on_hit",
+                condition: "contact",
+                effectType: "retaliate",
+                severity: "high"));
+        }
+
+        if (searchText.Contains("egg", StringComparison.Ordinal) ||
+            searchText.Contains("progenitor", StringComparison.Ordinal) ||
+            searchText.Contains("summon", StringComparison.Ordinal))
+        {
+            triggers.Add(CreateEnemyTraitPayload(
+                "reactive",
+                "summon",
+                "If left alive or when killed, this enemy can continue board pressure via summons.",
+                triggerType: "on_turn_end",
+                condition: "alive",
+                effectType: "summon",
+                severity: "high"));
+        }
+
+        return triggers.ToArray();
+    }
+
+    private static object[] BuildEnemyPhaseRulePayloads(Creature creature)
+    {
+        var searchText = BuildEnemySearchText(creature);
+        var rules = new List<object>();
+
+        if (searchText.Contains("split", StringComparison.Ordinal) || searchText.Contains("prism", StringComparison.Ordinal))
+        {
+            rules.Add(CreateEnemyTraitPayload(
+                "phase",
+                "split",
+                "Crossing a threshold can split or multiply the board state.",
+                triggerType: "on_hp_threshold",
+                condition: "threshold_crossed",
+                effectType: "split",
+                severity: "medium"));
+        }
+
+        if (searchText.Contains("phase", StringComparison.Ordinal) ||
+            searchText.Contains("threshold", StringComparison.Ordinal) ||
+            searchText.Contains("subject", StringComparison.Ordinal) ||
+            searchText.Contains("doormaker", StringComparison.Ordinal))
+        {
+            rules.Add(CreateEnemyTraitPayload(
+                "phase",
+                "phase_shift",
+                "The enemy has threshold- or cycle-based phase changes.",
+                triggerType: "on_hp_threshold",
+                condition: "threshold_crossed",
+                effectType: "phase_shift",
+                severity: "high"));
+        }
+
+        if (searchText.Contains("intang", StringComparison.Ordinal))
+        {
+            rules.Add(CreateEnemyTraitPayload(
+                "phase",
+                "gain_intangible",
+                "Intangible windows change when burst should be committed.",
+                triggerType: "on_turn_start",
+                condition: "intangible_window",
+                effectType: "gain_intangible",
+                severity: "high"));
+        }
+
+        if (searchText.Contains("insatiable", StringComparison.Ordinal))
+        {
+            rules.Add(CreateEnemyTraitPayload(
+                "phase",
+                "countdown_tick",
+                "An external countdown or timer pressures the fight every turn.",
+                triggerType: "on_turn_start",
+                condition: "countdown_active",
+                effectType: "countdown_tick",
+                severity: "high"));
+        }
+
+        if (string.Equals(creature.ModelId.ToString(), "MONSTER.DOOR", StringComparison.Ordinal))
+        {
+            rules.Add(CreateEnemyTraitPayload(
+                "phase",
+                "reveal_boss",
+                "Destroying the door exposes the main boss window.",
+                triggerType: "on_death",
+                condition: "door_destroyed",
+                effectType: "reveal_boss",
+                severity: "high"));
+        }
+
+        return rules.ToArray();
+    }
+
+    private static string[] BuildEnemyCombatTags(Creature creature)
+    {
+        var searchText = BuildEnemySearchText(creature);
+        var tags = new HashSet<string>(StringComparer.Ordinal);
+
+        void Add(string tag)
+        {
+            if (!string.IsNullOrWhiteSpace(tag))
+            {
+                tags.Add(tag);
+            }
+        }
+
+        if (searchText.Contains("boss", StringComparison.Ordinal) ||
+            searchText.Contains("queen", StringComparison.Ordinal) ||
+            searchText.Contains("doormaker", StringComparison.Ordinal) ||
+            searchText.Contains("insatiable", StringComparison.Ordinal) ||
+            searchText.Contains("matriarch", StringComparison.Ordinal) ||
+            searchText.Contains("subject", StringComparison.Ordinal))
+        {
+            Add("boss");
+        }
+        if (searchText.Contains("summon", StringComparison.Ordinal) ||
+            searchText.Contains("spawn", StringComparison.Ordinal) ||
+            searchText.Contains("nexus", StringComparison.Ordinal) ||
+            searchText.Contains("progenitor", StringComparison.Ordinal) ||
+            searchText.Contains("queen", StringComparison.Ordinal) ||
+            searchText.Contains("egg", StringComparison.Ordinal))
+        {
+            Add("summoner");
+        }
+        if (searchText.Contains("retali", StringComparison.Ordinal) ||
+            searchText.Contains("thorn", StringComparison.Ordinal) ||
+            searchText.Contains("spiny", StringComparison.Ordinal))
+        {
+            Add("retaliation");
+        }
+        if (searchText.Contains("phase", StringComparison.Ordinal) ||
+            searchText.Contains("threshold", StringComparison.Ordinal) ||
+            searchText.Contains("split", StringComparison.Ordinal) ||
+            searchText.Contains("door", StringComparison.Ordinal) ||
+            searchText.Contains("subject", StringComparison.Ordinal))
+        {
+            Add("phase_shift");
+        }
+        if (searchText.Contains("matriarch", StringComparison.Ordinal) ||
+            searchText.Contains("nexus", StringComparison.Ordinal) ||
+            searchText.Contains("byrdonis", StringComparison.Ordinal) ||
+            searchText.Contains("wurm", StringComparison.Ordinal))
+        {
+            Add("scaling");
+        }
+        if (searchText.Contains("debuff", StringComparison.Ordinal) ||
+            searchText.Contains("bind", StringComparison.Ordinal) ||
+            searchText.Contains("vulnerable", StringComparison.Ordinal) ||
+            searchText.Contains("weak", StringComparison.Ordinal) ||
+            searchText.Contains("beetle", StringComparison.Ordinal))
+        {
+            Add("controller");
+        }
+
+        return tags.ToArray();
+    }
+
+    private static object BuildEnemyDangerProfile(Creature creature, IReadOnlyCollection<string>? combatTags)
+    {
+        var searchText = BuildEnemySearchText(creature);
+        var burst = 0;
+        var attrition = 0;
+        var scaling = 0;
+        var retaliation = 0;
+        var summonPressure = 0;
+        var debuffPressure = 0;
+        var phaseComplexity = 0;
+        var volatility = 0;
+        var targetPriority = 0;
+        string? notes = null;
+
+        if (combatTags is not null && combatTags.Contains("retaliation"))
+        {
+            retaliation = 5;
+            attrition = Math.Max(attrition, 3);
+            targetPriority = Math.Max(targetPriority, 4);
+        }
+        if (combatTags is not null && combatTags.Contains("summoner"))
+        {
+            summonPressure = 4;
+            targetPriority = Math.Max(targetPriority, 4);
+        }
+        if (combatTags is not null && combatTags.Contains("phase_shift"))
+        {
+            phaseComplexity = 4;
+            volatility = Math.Max(volatility, 3);
+        }
+        if (combatTags is not null && combatTags.Contains("scaling"))
+        {
+            scaling = 4;
+        }
+        if (combatTags is not null && combatTags.Contains("controller"))
+        {
+            debuffPressure = 4;
+            attrition = Math.Max(attrition, 3);
+        }
+
+        if (searchText.Contains("insatiable", StringComparison.Ordinal))
+        {
+            burst = Math.Max(burst, 4);
+            scaling = Math.Max(scaling, 4);
+            phaseComplexity = Math.Max(phaseComplexity, 4);
+            volatility = Math.Max(volatility, 5);
+            targetPriority = Math.Max(targetPriority, 5);
+            notes = "countdown boss";
+        }
+        if (searchText.Contains("doormaker", StringComparison.Ordinal) || searchText.Contains("door", StringComparison.Ordinal))
+        {
+            burst = Math.Max(burst, 4);
+            scaling = Math.Max(scaling, 4);
+            phaseComplexity = Math.Max(phaseComplexity, 5);
+            targetPriority = Math.Max(targetPriority, 5);
+        }
+        if (searchText.Contains("subject", StringComparison.Ordinal))
+        {
+            burst = Math.Max(burst, 5);
+            attrition = Math.Max(attrition, 4);
+            phaseComplexity = Math.Max(phaseComplexity, 5);
+            volatility = Math.Max(volatility, 5);
+            targetPriority = Math.Max(targetPriority, 5);
+        }
+        if (searchText.Contains("spiny", StringComparison.Ordinal))
+        {
+            targetPriority = Math.Max(targetPriority, 4);
+        }
+
+        return new
+        {
+            burst,
+            attrition,
+            scaling,
+            retaliation,
+            summon_pressure = summonPressure,
+            debuff_pressure = debuffPressure,
+            phase_complexity = phaseComplexity,
+            volatility,
+            target_priority = targetPriority,
+            notes
+        };
+    }
+
+    private static object[] BuildEnemyTargetPriorityHints(Creature creature, IReadOnlyCollection<string>? combatTags)
+    {
+        var hints = new List<object>();
+        if (combatTags is not null && combatTags.Contains("retaliation"))
+        {
+            hints.Add(new
+            {
+                priority = "high",
+                reason = "Remove retaliation sources before committing multi-hit turns."
+            });
+        }
+        if (combatTags is not null && combatTags.Contains("summoner"))
+        {
+            hints.Add(new
+            {
+                priority = "high",
+                reason = "Kill engine or summon-core enemies early if your deck is weak to board flood."
+            });
+        }
+        if (combatTags is not null && combatTags.Contains("phase_shift"))
+        {
+            hints.Add(new
+            {
+                priority = "medium",
+                reason = "Plan burst around threshold or exposed-window turns, not only raw HP racing."
+            });
+        }
+        return hints.ToArray();
     }
 
     private static object? BuildEnemyIntentPayload(Creature creature)
@@ -4807,6 +5203,7 @@ internal static partial class BridgeGameApi
     {
         var visible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
         var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
+        var state = CaptureCardSelectionUiState(cardSelectionScreen);
         var prompt = visible ? TryGetCardSelectionPrompt(cardSelectionScreen) : null;
         var texts = CollectCardSelectionSurfaceTexts(
             cardSelectionScreen,
@@ -4815,13 +5212,11 @@ internal static partial class BridgeGameApi
             cardSelectionCancelButton,
             cardSelectionCloseButton,
             cardSelectionSkipButton);
-        var selectedCount = CountSelectedCardSelectionCards(cardSelectionScreen);
-        var minSelect = GetHiddenPropertyValue<int>(prefs, "MinSelect");
-        var maxSelect = GetHiddenPropertyValue<int>(prefs, "MaxSelect");
+        var selectedCount = state.SelectedCount;
+        var minSelect = state.MinSelect ?? GetHiddenPropertyValue<int>(prefs, "MinSelect");
+        var maxSelect = state.MaxSelect ?? GetHiddenPropertyValue<int>(prefs, "MaxSelect");
         var selectionSemantics = ResolveCardSelectionSemantics(cardSelectionScreen, prompt, texts);
-        var confirmVisible = cardSelectionConfirmButton is not null &&
-                             IsNodeVisible(cardSelectionConfirmButton) &&
-                             IsButtonEnabled(cardSelectionConfirmButton);
+        var confirmVisible = state.ConfirmReady;
         var skipVisible = cardSelectionSkipButton is not null &&
                           IsNodeVisible(cardSelectionSkipButton) &&
                           IsButtonEnabled(cardSelectionSkipButton);
@@ -4844,6 +5239,8 @@ internal static partial class BridgeGameApi
             selected_count = selectedCount,
             min_select = minSelect,
             max_select = maxSelect,
+            selection_ready = state.SelectionReady,
+            opened_age_ms = state.OpenedAgeMs,
             requires_manual_confirmation = GetHiddenPropertyValue<bool>(prefs, "RequireManualConfirmation"),
             cancelable = GetHiddenPropertyValue<bool>(prefs, "Cancelable"),
             confirm_visible = confirmVisible,
@@ -7318,33 +7715,72 @@ internal static partial class BridgeGameApi
 
     private static void InvokeCardSelectionOptionAction(Node? cardSelectionScreen, NCardHolder cardHolder)
     {
+        var beforeState = CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel);
+        var invokedAnyCandidate = false;
+
+        // NChooseACardSelectionScreen intentionally ignores the first ~350 ms of
+        // holder presses after the overlay opens. The bridge only exposes the
+        // select action once the surface is already visible and actionable, so
+        // it is safe to backdate the opened tick and avoid spurious no-op
+        // selections on the first policy step after the overlay appears.
+        PrepareCardSelectionScreenForBridgeSelect(cardSelectionScreen);
+
         if (cardSelectionScreen is NPlayerHand playerHand)
         {
             if (TryInvokeSingleArgument(playerHand, "OnHolderPressed", cardHolder))
             {
-                TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
-                return;
+                invokedAnyCandidate = true;
+                if (HasCardSelectionStateProgress(
+                    beforeState,
+                    CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel)))
+                {
+                    TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
+                    return;
+                }
             }
 
             if (cardHolder is NHandCardHolder handCardHolder &&
                 (TryInvokeSingleArgument(playerHand, "SelectCardInSimpleMode", handCardHolder) ||
                  TryInvokeSingleArgument(playerHand, "SelectCardInUpgradeMode", handCardHolder)))
             {
-                TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
-                return;
+                invokedAnyCandidate = true;
+                if (HasCardSelectionStateProgress(
+                    beforeState,
+                    CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel)))
+                {
+                    TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
+                    return;
+                }
             }
         }
 
         if (TryInvokeSingleArgument(cardSelectionScreen, "SelectHolder", cardHolder))
         {
-            TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
-            return;
+            invokedAnyCandidate = true;
+            if (HasCardSelectionStateProgress(
+                beforeState,
+                CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel)))
+            {
+                TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
+                return;
+            }
         }
 
         if (cardHolder.CardModel is not null &&
             TryInvokeSingleArgument(cardSelectionScreen, "OnCardClicked", cardHolder.CardModel))
         {
-            TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
+            invokedAnyCandidate = true;
+            if (HasCardSelectionStateProgress(
+                beforeState,
+                CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel)))
+            {
+                TryAutoConfirmSelectedCardSelection(cardSelectionScreen);
+                return;
+            }
+        }
+
+        if (invokedAnyCandidate)
+        {
             return;
         }
 
@@ -7352,6 +7788,43 @@ internal static partial class BridgeGameApi
             HttpStatusCode.Conflict,
             "action_target_missing",
             $"Could not resolve a supported card-selection action for {cardSelectionScreen?.GetType().FullName ?? "<missing screen>"}.");
+    }
+
+    private const ulong NChooseACardSelectionOpenGuardMs = 350UL;
+
+    private static void PrepareCardSelectionScreenForBridgeSelect(Node? cardSelectionScreen)
+    {
+        if (cardSelectionScreen is not NChooseACardSelectionScreen chooseACardSelectionScreen)
+        {
+            return;
+        }
+
+        if (!TryGetNChooseACardSelectionOpenedAgeMs(chooseACardSelectionScreen, out var openedAgeMs) ||
+            openedAgeMs > NChooseACardSelectionOpenGuardMs)
+        {
+            return;
+        }
+
+        var now = Time.GetTicksMsec();
+        var backdatedOpenedTicks = now > NChooseACardSelectionOpenGuardMs
+            ? now - (NChooseACardSelectionOpenGuardMs + 1UL)
+            : 0UL;
+        TrySetHiddenFieldValue(chooseACardSelectionScreen, "_openedTicks", backdatedOpenedTicks);
+    }
+
+    private static bool TryGetNChooseACardSelectionOpenedAgeMs(
+        NChooseACardSelectionScreen chooseACardSelectionScreen,
+        out ulong openedAgeMs)
+    {
+        if (!TryConvertToULong(GetHiddenFieldValue(chooseACardSelectionScreen, "_openedTicks"), out var openedTicks))
+        {
+            openedAgeMs = 0UL;
+            return false;
+        }
+
+        var now = Time.GetTicksMsec();
+        openedAgeMs = now >= openedTicks ? now - openedTicks : 0UL;
+        return true;
     }
 
     private static void InvokeCardSelectionBundleAction(Node? cardSelectionScreen, NCardBundle bundle)
@@ -7382,24 +7855,15 @@ internal static partial class BridgeGameApi
 
     private static void TryAutoConfirmSelectedCardSelection(Node? cardSelectionScreen)
     {
-        if (cardSelectionScreen is NSimpleCardSelectScreen)
-        {
-            return;
-        }
-
         if (!ShouldAutoConfirmSingleCardSelection(cardSelectionScreen) ||
             CountSelectedCardSelectionCards(cardSelectionScreen) <= 0)
         {
             return;
         }
 
-        var confirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
-        if (confirmButton is null)
-        {
-            return;
-        }
-
-        InvokeCardSelectionConfirmAction(cardSelectionScreen, confirmButton);
+        InvokeCardSelectionConfirmAction(
+            cardSelectionScreen,
+            ResolveCardSelectionConfirmButton(cardSelectionScreen));
     }
 
     private static void InvokeCardSelectionConfirmAction(Node? cardSelectionScreen, Node? confirmButton)
@@ -8913,6 +9377,67 @@ internal static partial class BridgeGameApi
         }
 
         return GetHiddenFieldValue(cardSelectionScreen, "_cardSelected") is true ? 1 : 0;
+    }
+
+    private sealed class CardSelectionUiState
+    {
+        public bool Visible { get; init; }
+        public string? ScreenType { get; init; }
+        public int SelectedCount { get; init; }
+        public bool ConfirmReady { get; init; }
+        public int? MinSelect { get; init; }
+        public int? MaxSelect { get; init; }
+        public bool PreviewVisible { get; init; }
+        public bool TargetSelected { get; init; }
+        public ulong? OpenedAgeMs { get; init; }
+        public bool SelectionReady { get; init; }
+    }
+
+    private static CardSelectionUiState CaptureCardSelectionUiState(
+        Node? cardSelectionScreen,
+        CardModel? targetCard = null)
+    {
+        var visible = cardSelectionScreen is not null && IsNodeVisible(cardSelectionScreen);
+        var prefs = GetHiddenFieldValue(cardSelectionScreen, "_prefs");
+        var confirmButton = ResolveCardSelectionConfirmButton(cardSelectionScreen);
+        ulong? openedAgeMs = visible && cardSelectionScreen is NChooseACardSelectionScreen chooseACardSelectionScreen &&
+                             TryGetNChooseACardSelectionOpenedAgeMs(chooseACardSelectionScreen, out var resolvedOpenedAgeMs)
+            ? resolvedOpenedAgeMs
+            : null;
+        return new CardSelectionUiState
+        {
+            Visible = visible,
+            ScreenType = visible ? cardSelectionScreen!.GetType().Name : null,
+            SelectedCount = visible ? CountSelectedCardSelectionCards(cardSelectionScreen) : 0,
+            ConfirmReady = visible &&
+                           confirmButton is not null &&
+                           IsNodeVisible(confirmButton) &&
+                           IsButtonEnabled(confirmButton),
+            MinSelect = visible ? GetHiddenPropertyValue<int>(prefs, "MinSelect") : null,
+            MaxSelect = visible ? GetHiddenPropertyValue<int>(prefs, "MaxSelect") : null,
+            PreviewVisible = visible && IsCardSelectionPreviewVisible(cardSelectionScreen),
+            TargetSelected = visible &&
+                             targetCard is not null &&
+                             IsCardSelectionCardSelected(cardSelectionScreen, targetCard),
+            OpenedAgeMs = openedAgeMs,
+            SelectionReady = !visible ||
+                             cardSelectionScreen is not NChooseACardSelectionScreen ||
+                             (openedAgeMs.HasValue && openedAgeMs.Value > NChooseACardSelectionOpenGuardMs)
+        };
+    }
+
+    private static bool HasCardSelectionStateProgress(
+        CardSelectionUiState before,
+        CardSelectionUiState after)
+    {
+        return before.Visible != after.Visible ||
+               !string.Equals(before.ScreenType ?? string.Empty, after.ScreenType ?? string.Empty, StringComparison.Ordinal) ||
+               before.SelectedCount != after.SelectedCount ||
+               before.ConfirmReady != after.ConfirmReady ||
+               before.MinSelect != after.MinSelect ||
+               before.MaxSelect != after.MaxSelect ||
+               before.PreviewVisible != after.PreviewVisible ||
+               before.TargetSelected != after.TargetSelected;
     }
 
     private static bool IsCardSelectionCardSelected(Node? cardSelectionScreen, CardModel? card)
@@ -10444,6 +10969,52 @@ internal static partial class BridgeGameApi
                 return true;
             default:
                 number = 0;
+                return false;
+        }
+    }
+
+    private static bool TryConvertToULong(object? value, out ulong number)
+    {
+        switch (value)
+        {
+            case byte byteValue:
+                number = byteValue;
+                return true;
+            case sbyte sbyteValue when sbyteValue >= 0:
+                number = (ulong)sbyteValue;
+                return true;
+            case short shortValue when shortValue >= 0:
+                number = (ulong)shortValue;
+                return true;
+            case ushort ushortValue:
+                number = ushortValue;
+                return true;
+            case int intValue when intValue >= 0:
+                number = (ulong)intValue;
+                return true;
+            case uint uintValue:
+                number = uintValue;
+                return true;
+            case long longValue when longValue >= 0:
+                number = (ulong)longValue;
+                return true;
+            case ulong ulongValue:
+                number = ulongValue;
+                return true;
+            case decimal decimalValue when decimalValue >= 0m && decimalValue <= ulong.MaxValue:
+                number = (ulong)decimal.Truncate(decimalValue);
+                return true;
+            case float floatValue when floatValue >= 0f && floatValue <= ulong.MaxValue:
+                number = (ulong)MathF.Truncate(floatValue);
+                return true;
+            case double doubleValue when doubleValue >= 0d && doubleValue <= ulong.MaxValue:
+                number = (ulong)Math.Truncate(doubleValue);
+                return true;
+            case string stringValue when ulong.TryParse(stringValue, out var parsedNumber):
+                number = parsedNumber;
+                return true;
+            default:
+                number = 0UL;
                 return false;
         }
     }

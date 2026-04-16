@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -51,6 +52,7 @@ internal static partial class BridgeGameApi
     private const double EnvRewardSmithHealthyBonus = 0.0d;
     private const double EnvRewardSmithLowHpMismatchPenalty = 0.0d;
     private const double EnvRewardCardHeuristicLimit = 0.0d;
+    private const int EnvCardSelectionSelectFastFailTimeoutMs = 1000;
 
     private static object BuildEnvActionPayload(BridgeResolvedAction action, int index)
     {
@@ -490,7 +492,8 @@ internal static partial class BridgeGameApi
         bool truncated,
         string? truncationReason,
         string? actionError = null,
-        bool forceDone = false)
+        bool forceDone = false,
+        BridgeEnvStepTimingCollector? timing = null)
     {
         var rewardBreakdown = BuildEnvRewardBreakdown(
             episode,
@@ -500,6 +503,8 @@ internal static partial class BridgeGameApi
             truncated,
             actionError);
         var actionDiagnostics = BuildEnvActionDiagnostics(before, selectedAction, actionError);
+        var cardSelectionBefore = BuildEnvCardSelectionStepInfoPayload(before);
+        var cardSelectionAfter = BuildEnvCardSelectionStepInfoPayload(after);
         var done = forceDone || after.Done;
         SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
@@ -526,24 +531,115 @@ internal static partial class BridgeGameApi
                 phase_after = after.Phase,
                 screen_before = before.Screen,
                 screen_after = after.Screen,
+                room_type_before = before.RoomType,
+                room_type_after = after.RoomType,
+                combat_in_progress_before = before.CombatInProgress,
+                combat_in_progress_after = after.CombatInProgress,
                 logic_hash_before = before.LogicHash,
                 logic_hash_after = after.LogicHash,
+                card_selection_before = cardSelectionBefore,
+                card_selection_after = cardSelectionAfter,
                 defensive_buffs = episode.DefensiveBuffs,
                 episode_mode = episode.EpisodeMode,
                 encounter_id = episode.EncounterId,
                 truncation_reason = truncationReason,
                 action_error = actionError,
+                step_timing_ms = timing?.ToTimingPayload(),
+                step_timing_counts = timing?.ToCountPayload(),
                 action_diagnostics = actionDiagnostics,
                 reward_breakdown = rewardBreakdown
             }
         };
     }
 
+    private static bool IsCardSelectionSelectAction(BridgeResolvedActionSelection? selectedAction)
+    {
+        return selectedAction is not null &&
+               selectedAction.Action.ActionId.StartsWith("card_selection:select:", StringComparison.Ordinal);
+    }
+
+    private static int GetCardSelectionSelectFastFailTimeoutMs(int timeoutMs)
+    {
+        return Math.Clamp(Math.Min(timeoutMs, EnvCardSelectionSelectFastFailTimeoutMs), 1, timeoutMs);
+    }
+
+    private static bool HasCardSelectionSelectionProgress(BridgeEnvSnapshot before, BridgeEnvSnapshot after)
+    {
+        if (HasMeaningfulEnvSnapshotDifference(before, after))
+        {
+            return true;
+        }
+
+        var beforeState = CaptureCardSelectionUiState(before.Context.CardSelectionScreen);
+        var afterState = CaptureCardSelectionUiState(after.Context.CardSelectionScreen);
+        return HasCardSelectionStateProgress(beforeState, afterState);
+    }
+
+    private static object BuildEnvCardSelectionStepInfoPayload(BridgeEnvSnapshot snapshot)
+    {
+        var state = CaptureCardSelectionUiState(snapshot.Context.CardSelectionScreen);
+        return new
+        {
+            visible = state.Visible,
+            screen_type = state.ScreenType,
+            selected_count = state.SelectedCount,
+            confirm_ready = state.ConfirmReady,
+            min_select = state.MinSelect,
+            max_select = state.MaxSelect,
+            preview_visible = state.PreviewVisible,
+            selection_ready = state.SelectionReady,
+            opened_age_ms = state.OpenedAgeMs
+        };
+    }
+
+    private sealed class BridgeEnvStepTimingCollector
+    {
+        public double BeforeSnapshotMs { get; set; }
+        public double BeforeWaitMs { get; set; }
+        public double ActionResolveMs { get; set; }
+        public double ActionExecuteMs { get; set; }
+        public double AfterWaitMs { get; set; }
+        public double AutoConfirmMs { get; set; }
+        public double EpisodeAdjustmentsMs { get; set; }
+        public double PayloadBuildMs { get; set; }
+        public double TotalMs { get; set; }
+        public int SnapshotCalls { get; set; }
+        public int WaitPumpCalls { get; set; }
+        public int StableIterations { get; set; }
+
+        public object ToTimingPayload()
+        {
+            return new
+            {
+                before_snapshot = BeforeSnapshotMs,
+                before_wait = BeforeWaitMs,
+                action_resolve = ActionResolveMs,
+                action_execute = ActionExecuteMs,
+                after_wait = AfterWaitMs,
+                auto_confirm = AutoConfirmMs,
+                episode_adjustments = EpisodeAdjustmentsMs,
+                payload_build = PayloadBuildMs,
+                total = TotalMs
+            };
+        }
+
+        public object ToCountPayload()
+        {
+            return new
+            {
+                snapshot_calls = SnapshotCalls,
+                wait_pump_calls = WaitPumpCalls,
+                stable_iterations = StableIterations
+            };
+        }
+    }
+
     private static async Task<BridgeEnvSnapshot> ApplyEnvEpisodeAdjustmentsAsync(
         BridgeEnvEpisode episode,
         BridgeEnvSnapshot snapshot,
         int timeoutMs,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        BridgeEnvStepTimingCollector? timing = null)
     {
         if (episode.DefensiveBuffs && snapshot.RunActive)
         {
@@ -554,7 +650,15 @@ internal static partial class BridgeGameApi
                 cancellationToken);
             if (changed)
             {
+                if (timing is not null)
+                {
+                    timing.WaitPumpCalls++;
+                }
                 await WaitForPumpTicksGuardedAsync(1, "env.apply_defensive_buffs.post_pump", timeoutMs, cancellationToken);
+                if (timing is not null)
+                {
+                    timing.SnapshotCalls++;
+                }
                 snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.apply_defensive_buffs.snapshot");
             }
         }
@@ -594,7 +698,8 @@ internal static partial class BridgeGameApi
         {
             phase = snapshot.Phase,
             observation = adjustedObservation,
-            action_ids = snapshot.ResolvedActions.Select(static action => action.ActionId).ToArray()
+            action_ids = snapshot.ResolvedActions.Select(static action => action.ActionId).ToArray(),
+            surface_fingerprint = snapshot.SurfaceFingerprint
         });
 
         return new BridgeEnvSnapshot
@@ -608,6 +713,7 @@ internal static partial class BridgeGameApi
             ActionLookup = snapshot.ActionLookup,
             ResolvedActions = snapshot.ResolvedActions,
             LogicHash = adjustedLogicHash,
+            SurfaceFingerprint = snapshot.SurfaceFingerprint,
             Actionable = snapshot.Actionable,
             Done = snapshot.Done,
             CurrentHp = snapshot.CurrentHp,
@@ -847,6 +953,104 @@ internal static partial class BridgeGameApi
     {
         return !BuildEnvRoomKey(before.ActIndex, before.TotalFloor, before.RoomType, before.RoomModelId)
             .Equals(BuildEnvRoomKey(after.ActIndex, after.TotalFloor, after.RoomType, after.RoomModelId), StringComparison.Ordinal);
+    }
+
+    private static bool HasMeaningfulEnvSnapshotDifference(BridgeEnvSnapshot before, BridgeEnvSnapshot after)
+    {
+        if (!string.Equals(before.Screen, after.Screen, StringComparison.Ordinal) ||
+            !string.Equals(before.Phase, after.Phase, StringComparison.Ordinal) ||
+            !string.Equals(before.SurfaceFingerprint, after.SurfaceFingerprint, StringComparison.Ordinal) ||
+            before.Actionable != after.Actionable ||
+            before.Done != after.Done ||
+            before.RunActive != after.RunActive ||
+            before.CurrentHp != after.CurrentHp ||
+            before.MaxHp != after.MaxHp ||
+            before.PlayerBlock != after.PlayerBlock ||
+            before.CurrentEnergy != after.CurrentEnergy ||
+            before.Gold != after.Gold ||
+            before.ActIndex != after.ActIndex ||
+            before.TotalFloor != after.TotalFloor ||
+            !string.Equals(before.RoomType ?? string.Empty, after.RoomType ?? string.Empty, StringComparison.Ordinal) ||
+            !string.Equals(before.RoomModelId ?? string.Empty, after.RoomModelId ?? string.Empty, StringComparison.Ordinal) ||
+            before.RelicCount != after.RelicCount ||
+            before.PotionCount != after.PotionCount ||
+            before.DeckCount != after.DeckCount ||
+            before.CombatInProgress != after.CombatInProgress ||
+            before.RoomPreFinished != after.RoomPreFinished ||
+            before.LegalActions.Length != after.LegalActions.Length ||
+            before.ResolvedActions.Count != after.ResolvedActions.Count)
+        {
+            return true;
+        }
+
+        if (HasMeaningfulEnvActionDifference(before.ResolvedActions, after.ResolvedActions))
+        {
+            return true;
+        }
+
+        return HasMeaningfulEnvEnemyDifference(before.EnemyStates, after.EnemyStates);
+    }
+
+    private static bool IsEnvIntermediateDecisionSurface(BridgeEnvSnapshot snapshot)
+    {
+        if (snapshot.Done)
+        {
+            return false;
+        }
+
+        return string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) ||
+               string.Equals(snapshot.Phase, "deck_upgrade", StringComparison.Ordinal);
+    }
+
+    private static bool HasMeaningfulEnvActionDifference(
+        IReadOnlyList<BridgeResolvedAction> before,
+        IReadOnlyList<BridgeResolvedAction> after)
+    {
+        if (before.Count != after.Count)
+        {
+            return true;
+        }
+
+        for (var index = 0; index < before.Count; index++)
+        {
+            if (!string.Equals(before[index].ActionId, after[index].ActionId, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasMeaningfulEnvEnemyDifference(
+        IReadOnlyList<BridgeEnvEnemyState> before,
+        IReadOnlyList<BridgeEnvEnemyState> after)
+    {
+        if (before.Count != after.Count)
+        {
+            return true;
+        }
+
+        var afterById = after.ToDictionary(static enemy => enemy.CombatId);
+        foreach (var beforeEnemy in before)
+        {
+            if (!afterById.TryGetValue(beforeEnemy.CombatId, out var afterEnemy))
+            {
+                return true;
+            }
+
+            if (beforeEnemy.CurrentHp != afterEnemy.CurrentHp ||
+                beforeEnemy.Block != afterEnemy.Block ||
+                beforeEnemy.IsAlive != afterEnemy.IsAlive ||
+                beforeEnemy.IntentDamageToPlayer != afterEnemy.IntentDamageToPlayer ||
+                beforeEnemy.Weak != afterEnemy.Weak ||
+                beforeEnemy.Vulnerable != afterEnemy.Vulnerable)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsEnvEliteRoom(string? roomType)
@@ -1723,6 +1927,7 @@ internal static partial class BridgeGameApi
         public required IReadOnlyDictionary<string, BridgeResolvedAction> ActionLookup { get; init; }
         public required IReadOnlyList<BridgeResolvedAction> ResolvedActions { get; init; }
         public required string LogicHash { get; init; }
+        public required string SurfaceFingerprint { get; init; }
         public required bool Actionable { get; init; }
         public required bool Done { get; init; }
         public required int CurrentHp { get; init; }

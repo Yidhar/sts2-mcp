@@ -15,20 +15,174 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from content_registry import get_card_metadata
+
 VALID_ENCOUNTER_TIERS = {"weak", "normal", "elite", "boss"}
+DEFAULT_EXCLUDED_COMBAT_CHARACTERS = frozenset({
+    "CHARACTER.WATCHER",
+})
 VALID_CURATED_COMBINED_SUBSETS = {
     "human_only",
     "human_only_weak_normal",
+    "human_only_minus_combat_reset_failures",
+    "human_only_weak_normal_minus_combat_reset_failures",
+    "human_only_roomwin_only",
+    "human_only_roomwin_only_minus_combat_reset_failures",
+    "human_only_weak_normal_roomwin_only",
+    "human_only_weak_normal_roomwin_only_minus_combat_reset_failures",
     "local_act1clear_only",
+    "local_act1clear_only_minus_combat_reset_failures",
+    "local_act1clear_only_roomwin_only",
+    "local_act1clear_only_roomwin_only_minus_combat_reset_failures",
     "bootstrap_human_plus_local_act1clear",
+    "bootstrap_human_plus_local_act1clear_minus_combat_reset_failures",
     "bootstrap_human_plus_local_act1clear_weak_normal",
+    "bootstrap_human_plus_local_act1clear_weak_normal_minus_combat_reset_failures",
+    "bootstrap_human_plus_local_act1clear_roomwin_only",
+    "bootstrap_human_plus_local_act1clear_roomwin_only_minus_combat_reset_failures",
+    "bootstrap_human_plus_local_act1clear_weak_normal_roomwin_only",
+    "bootstrap_human_plus_local_act1clear_weak_normal_roomwin_only_minus_combat_reset_failures",
 }
-DEFAULT_CURATED_COMBINED_SUBSET = "bootstrap_human_plus_local_act1clear"
+DEFAULT_CURATED_COMBINED_SUBSET = "bootstrap_human_plus_local_act1clear_roomwin_only"
+_UNRESOLVED_CARD_TEMPLATE_MARKERS = (
+    "{CardType:",
+    "{Damage:",
+    "{Block:",
+    "{Violence:",
+    "{HasRider:",
+    "{Sapping:",
+    "{Choking:",
+    ":choose(",
+    ":diff()",
+)
+
+
+def _resolve_card_max_upgrade_level(card_id: str) -> int | None:
+    metadata = get_card_metadata(card_id)
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_upgrade_levels = metadata.get("upgrade_levels")
+    try:
+        return max(int(raw_upgrade_levels), 0)
+    except (TypeError, ValueError):
+        pass
+
+    raw_max_upgrade_level = metadata.get("max_upgrade_level")
+    try:
+        return max(int(raw_max_upgrade_level), 0)
+    except (TypeError, ValueError):
+        pass
+
+    upgrade_level_texts = metadata.get("upgrade_level_texts")
+    if isinstance(upgrade_level_texts, dict) and upgrade_level_texts:
+        available_levels: list[int] = []
+        for key in upgrade_level_texts.keys():
+            try:
+                available_levels.append(max(int(str(key)), 0))
+            except (TypeError, ValueError):
+                continue
+        if available_levels:
+            return max(available_levels)
+
+    observations = metadata.get("observations")
+    if isinstance(observations, dict):
+        raw_seen = observations.get("max_upgrade_level_seen")
+        try:
+            return max(int(raw_seen), 0)
+        except (TypeError, ValueError):
+            pass
+
+    raw_seen = metadata.get("max_upgrade_level_seen")
+    try:
+        return max(int(raw_seen), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_card_upgrade_level(card_id: str, upgrade_level: int) -> int:
+    max_upgrade_level = _resolve_card_max_upgrade_level(card_id)
+    if max_upgrade_level is None:
+        return max(upgrade_level, 0)
+    return min(max(upgrade_level, 0), max_upgrade_level)
+
+
+def _contains_unresolved_card_template(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in _UNRESOLVED_CARD_TEMPLATE_MARKERS)
+
+
+@lru_cache(maxsize=None)
+def _snapshot_deck_card_is_supported(card_id: str) -> bool:
+    metadata = get_card_metadata(card_id)
+    if not isinstance(metadata, dict):
+        return True
+
+    card_type = str(metadata.get("type") or "").strip().lower()
+    if card_type == "none":
+        return False
+
+    for key in ("description", "canonical_text", "upgrade_description", "effect"):
+        if _contains_unresolved_card_template(metadata.get(key)):
+            return False
+
+    upgrade_level_texts = metadata.get("upgrade_level_texts")
+    if isinstance(upgrade_level_texts, dict):
+        for payload in upgrade_level_texts.values():
+            if not isinstance(payload, dict):
+                continue
+            for key in ("description", "canonical_text", "effect"):
+                if _contains_unresolved_card_template(payload.get(key)):
+                    return False
+
+    return True
+
+
+def _sanitize_snapshot_deck_card_ids(card_ids: list[str]) -> list[str]:
+    return [
+        card_id
+        for card_id in card_ids
+        if card_id and _snapshot_deck_card_is_supported(card_id)
+    ]
+
+
+def _normalize_character_id(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _resolve_excluded_characters(
+    excluded_characters: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    if excluded_characters is None:
+        values = DEFAULT_EXCLUDED_COMBAT_CHARACTERS
+    else:
+        values = excluded_characters
+    return {
+        _normalize_character_id(value)
+        for value in values
+        if _normalize_character_id(value)
+    }
+
+
+def _resolve_supported_characters(
+    supported_characters: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str] | None:
+    if supported_characters is None:
+        return None
+    resolved = {
+        _normalize_character_id(value)
+        for value in supported_characters
+        if _normalize_character_id(value)
+    }
+    return resolved or None
 
 
 def infer_encounter_tier(
@@ -61,6 +215,31 @@ def infer_encounter_tier_from_row(row: dict[str, Any]) -> str:
         row.get("encounter_id"),
         room_type=row.get("room_type"),
     )
+
+
+def is_failed_combat_room_snapshot(row: dict[str, Any]) -> bool:
+    """Return True when a combat snapshot is the run-ending failed room itself."""
+
+    killed_by_encounter = str(row.get("source_killed_by_encounter") or "").strip()
+    encounter_id = str(row.get("encounter_id") or "").strip()
+    floor_number = row.get("floor_number")
+    source_run_path_point_count = row.get("source_run_path_point_count")
+
+    if bool(row.get("source_run_win")):
+        return False
+    if not killed_by_encounter or killed_by_encounter == "NONE.NONE":
+        return False
+    if encounter_id != killed_by_encounter:
+        return False
+    if not isinstance(floor_number, int) or not isinstance(source_run_path_point_count, int):
+        return False
+    return floor_number == source_run_path_point_count
+
+
+def is_room_win_combat_snapshot_row(row: dict[str, Any]) -> bool:
+    """Return True when the extracted combat room itself was won."""
+
+    return not is_failed_combat_room_snapshot(row)
 
 
 def resolve_combat_snapshot_dataset_path(
@@ -175,6 +354,8 @@ def validate_combat_snapshot_row_against(
     row: dict[str, Any],
     *,
     supported_encounter_ids: set[str] | None = None,
+    supported_characters: set[str] | None = None,
+    excluded_characters: set[str] | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     sample_id = row.get("sample_id")
@@ -184,6 +365,14 @@ def validate_combat_snapshot_row_against(
     character = row.get("character")
     if not isinstance(character, str) or not character:
         reasons.append("missing_character")
+    else:
+        normalized_character = _normalize_character_id(character)
+        resolved_supported_characters = _resolve_supported_characters(supported_characters)
+        resolved_excluded_characters = _resolve_excluded_characters(excluded_characters)
+        if resolved_supported_characters is not None and normalized_character not in resolved_supported_characters:
+            reasons.append("unsupported_character")
+        elif normalized_character in resolved_excluded_characters:
+            reasons.append("excluded_character")
 
     room_type = str(row.get("room_type") or "").lower()
     if room_type not in {"monster", "elite", "boss"}:
@@ -265,6 +454,8 @@ def clean_combat_snapshot_rows(
     *,
     dedupe_by_sample_id: bool = True,
     supported_encounter_ids: set[str] | None = None,
+    supported_characters: set[str] | None = None,
+    excluded_characters: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Filter combat snapshot rows down to the smallest reliable playable set."""
 
@@ -287,6 +478,8 @@ def clean_combat_snapshot_rows(
         reasons = validate_combat_snapshot_row_against(
             row,
             supported_encounter_ids=supported_encounter_ids,
+            supported_characters=supported_characters,
+            excluded_characters=excluded_characters,
         )
         if reasons:
             for reason in reasons:
@@ -330,6 +523,8 @@ def load_combat_snapshot_rows(
     max_rows: int | None = None,
     strict_playable_only: bool = True,
     supported_encounter_ids: set[str] | None = None,
+    supported_characters: set[str] | None = None,
+    excluded_characters: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     dataset_path = resolve_combat_snapshot_dataset_path(path, curated_subset=curated_subset)
     suffix = dataset_path.suffix.lower()
@@ -346,10 +541,17 @@ def load_combat_snapshot_rows(
     if invalid_tiers:
         raise ValueError(f"Unsupported encounter tiers: {invalid_tiers}")
     filtered: list[dict[str, Any]] = []
+    resolved_supported_characters = _resolve_supported_characters(supported_characters)
+    resolved_excluded_characters = _resolve_excluded_characters(excluded_characters)
     for row in rows:
         if split and str(row.get("split") or "") != split:
             continue
         if character and str(row.get("character") or "") != character:
+            continue
+        row_character = _normalize_character_id(row.get("character"))
+        if resolved_supported_characters is not None and row_character not in resolved_supported_characters:
+            continue
+        if row_character in resolved_excluded_characters:
             continue
         if build_id and str(row.get("build_id") or "") != build_id:
             continue
@@ -369,6 +571,8 @@ def load_combat_snapshot_rows(
         if strict_playable_only and validate_combat_snapshot_row_against(
             row,
             supported_encounter_ids=supported_encounter_ids,
+            supported_characters=resolved_supported_characters,
+            excluded_characters=resolved_excluded_characters,
         ):
             continue
 
@@ -443,6 +647,8 @@ class CombatSnapshotPool:
         tier_weights: dict[str, float] | None = None,
         encounter_weights: dict[str, float] | None = None,
         supported_encounter_ids: set[str] | None = None,
+        supported_characters: set[str] | list[str] | tuple[str, ...] | None = None,
+        excluded_characters: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> "CombatSnapshotPool":
         rows = load_combat_snapshot_rows(
             path,
@@ -456,6 +662,8 @@ class CombatSnapshotPool:
             max_floor=max_floor,
             max_rows=max_rows,
             supported_encounter_ids=supported_encounter_ids,
+            supported_characters=supported_characters,
+            excluded_characters=excluded_characters,
         )
         return cls(
             rows,
@@ -474,6 +682,7 @@ class CombatSnapshotPool:
     def summary(self) -> dict[str, Any]:
         row_count = len(self.rows)
         characters = sorted({str(row.get("character") or "unknown") for row in self.rows})
+        character_counts = Counter(str(row.get("character") or "unknown") for row in self.rows)
         build_ids = sorted({str(row.get("build_id") or "unknown") for row in self.rows})
         floors = [int(row.get("floor_number")) for row in self.rows if isinstance(row.get("floor_number"), int)]
         tier_counts = Counter(infer_encounter_tier_from_row(row) for row in self.rows)
@@ -486,6 +695,7 @@ class CombatSnapshotPool:
             "row_count": row_count,
             "encounter_count": self.encounter_count,
             "characters": characters,
+            "character_counts": dict(sorted(character_counts.items())),
             "build_ids": build_ids,
             "min_floor": min(floors) if floors else None,
             "max_floor": max(floors) if floors else None,
@@ -559,11 +769,50 @@ class CombatSnapshotPool:
         return weights / total
 
 
-def snapshot_row_to_reset_kwargs(row: dict[str, Any]) -> dict[str, Any]:
+def snapshot_row_to_reset_kwargs(
+    row: dict[str, Any],
+    *,
+    include_potions: bool = False,
+) -> dict[str, Any]:
     """Convert a combat snapshot row into ``combat_reset`` kwargs."""
 
+    deck_entries: list[dict[str, Any]] | None = None
+    sanitized_deck_ids_from_entries: list[str] | None = None
+    raw_deck_entries = row.get("deck_entries")
+    if isinstance(raw_deck_entries, list):
+        normalized_entries: list[dict[str, Any]] = []
+        for entry in raw_deck_entries:
+            if not isinstance(entry, dict):
+                continue
+            card_id = str(entry.get("id") or "").strip()
+            if not card_id:
+                continue
+            if not _snapshot_deck_card_is_supported(card_id):
+                continue
+            try:
+                upgrade_level = max(int(entry.get("upgrade_level") or 0), 0)
+            except (TypeError, ValueError):
+                upgrade_level = 0
+            upgrade_level = _clamp_card_upgrade_level(card_id, upgrade_level)
+            normalized_entries.append(
+                {
+                    "id": card_id,
+                    "upgrade_level": upgrade_level,
+                }
+            )
+        sanitized_deck_ids_from_entries = [str(entry["id"]) for entry in normalized_entries]
+        if normalized_entries:
+            deck_entries = normalized_entries
+
+    raw_deck_ids = [str(value) for value in (row.get("deck_card_ids") or []) if value]
+    sanitized_deck_ids = (
+        sanitized_deck_ids_from_entries
+        if sanitized_deck_ids_from_entries is not None
+        else _sanitize_snapshot_deck_card_ids(raw_deck_ids)
+    )
+
     potions = None
-    if row.get("potion_state_known"):
+    if include_potions and row.get("potion_state_known"):
         raw_potions = row.get("potion_ids_before")
         if isinstance(raw_potions, list):
             potions = [str(value) for value in raw_potions if value]
@@ -582,7 +831,8 @@ def snapshot_row_to_reset_kwargs(row: dict[str, Any]) -> dict[str, Any]:
         "current_hp": current_hp,
         "max_hp": row.get("snapshot_max_hp"),
         "max_energy": row.get("snapshot_max_energy"),
-        "deck": [str(value) for value in (row.get("deck_card_ids") or []) if value],
+        "deck": sanitized_deck_ids,
+        "deck_entries": deck_entries,
         "relics": [str(value) for value in (row.get("relic_ids_before") or []) if value],
         "potions": potions,
         "gold": row.get("snapshot_gold"),

@@ -170,13 +170,13 @@ def main() -> None:
     parser.add_argument("--session-file", type=str, default=None,
                         help="Optional bridge session file path. Defaults to the standard session.json.")
     parser.add_argument("--python-exe", type=str, default=sys.executable)
-    parser.add_argument("--train-script", type=str, default="train_v2.py")
+    parser.add_argument("--train-script", type=str, default="train_attention_policy.py")
     parser.add_argument("--bridge-ready-timeout", type=float, default=180.0)
     parser.add_argument("--post-launch-delay", type=float, default=8.0)
     parser.add_argument("--post-exit-delay", type=float, default=3.0)
     parser.add_argument("--max-segment-retries", type=int, default=3)
     parser.add_argument("train_args", nargs=argparse.REMAINDER,
-                        help="Arguments forwarded to train_v2.py. Prefix with '--'.")
+                        help="Arguments forwarded to the selected training script. Prefix with '--'.")
     args = parser.parse_args()
 
     train_args = list(args.train_args)

@@ -19,6 +19,7 @@ SEMANTIC_ACTION_FAMILIES = [
     "play_card",
     "use_potion",
     "discard_potion",
+    "card_selection",
     "end_turn",
     "proceed",
     "map",
@@ -136,6 +137,23 @@ def _metadata_for_action(action: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _preferred_signature_title(
+    source: dict[str, Any] | None,
+    action: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    stable_id: str,
+) -> str:
+    metadata_title = _safe_text((metadata or {}).get("title")) if isinstance(metadata, dict) else ""
+    if metadata_title:
+        return metadata_title
+    return _safe_text(
+        (source or {}).get("title")
+        or action.get("title")
+        or action.get("label")
+        or stable_id
+    )
+
+
 def _infer_family(action: dict[str, Any]) -> str:
     kind = _safe_text(action.get("kind"))
     action_id = _safe_text(action.get("action_id"))
@@ -148,6 +166,8 @@ def _infer_family(action: dict[str, Any]) -> str:
         return "use_potion"
     if kind == "discard_potion":
         return "discard_potion"
+    if kind in {"card_selection", "combat_select_card", "combat_select"} or action_id.startswith("combat_select"):
+        return "card_selection"
     if action_id == "end_turn":
         return "end_turn"
     if kind == "proceed" or action_id == "proceed":
@@ -180,7 +200,7 @@ def _infer_target_scope(action: dict[str, Any]) -> str:
         return "shop"
     if _infer_family(action) in {"event_option"}:
         return "event"
-    if _infer_family(action) in {"card_reward", "reward", "deck_upgrade"}:
+    if _infer_family(action) in {"card_reward", "reward", "deck_upgrade", "card_selection"}:
         return "choice"
 
     card = action.get("card") if isinstance(action.get("card"), dict) else None
@@ -216,6 +236,12 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
         roles.add("terminal")
     if family in {"reward", "card_reward", "shop", "rest", "smith", "deck_upgrade", "map", "treasure_relic"}:
         roles.add("resource")
+    if family == "card_selection":
+        semantics = _safe_text(action.get("selection_semantics")).lower()
+        if any(token in semantics for token in ("upgrade", "smith", "transform", "remove", "purge", "reward", "discover", "draft")):
+            roles.add("resource")
+        if any(token in semantics for token in ("exhaust", "discard")):
+            roles.add("setup")
 
     source = None
     if isinstance(action.get("card"), dict):
@@ -312,13 +338,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
     elif isinstance(action.get("potion"), dict):
         source = action["potion"]
 
-    title = _safe_text(
-        (source or {}).get("title")
-        or action.get("title")
-        or action.get("label")
-        or metadata.get("title")
-        or stable_id
-    )
+    title = _preferred_signature_title(source, action, metadata, stable_id)
     price = _float(action.get("price") if action.get("price") is not None else action.get("cost"))
     if price <= 0 and isinstance(action.get("item"), dict):
         price = _float(action["item"].get("cost"))
@@ -342,6 +362,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
             target_scope,
             _safe_text(action.get("surface")),
             _safe_text(action.get("selection")),
+            _safe_text(action.get("selection_semantics")),
             _safe_text(action.get("shop_action")),
             _safe_text((action.get("reward") or {}).get("type")),
         )
@@ -357,9 +378,11 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         "action_id": _safe_text(action.get("action_id")),
         "domain": (
             "route" if family in {"map"} else
+            "selection" if family in {"card_selection"} else
             "build" if family in {"reward", "card_reward", "shop", "rest", "smith", "deck_upgrade", "event_option", "treasure_relic", "startup", "proceed"} else
             "combat"
         ),
+        "selection_semantics": _safe_text(action.get("selection_semantics")),
         "target_scope": target_scope,
         "target_index": int(target_index) if isinstance(target_index, int) else None,
         "choice_index": int(choice_index) if isinstance(choice_index, int) else None,
@@ -406,6 +429,9 @@ def semantic_action_text(signature: dict[str, Any] | None) -> str:
         parts.append(f"family={family}")
     if target_scope and target_scope != "none":
         parts.append(f"target={target_scope}")
+    semantics = _safe_text(signature.get("selection_semantics"))
+    if semantics:
+        parts.append(f"selection={semantics}")
     if roles:
         parts.append(f"role={','.join(_safe_text(role) for role in roles if _safe_text(role))}")
     metrics: list[str] = []
@@ -470,6 +496,7 @@ def compact_semantic_signature(signature: dict[str, Any] | None) -> dict[str, An
         "domain": signature.get("domain"),
         "title": signature.get("title"),
         "stable_id": signature.get("stable_id"),
+        "selection_semantics": signature.get("selection_semantics"),
         "target_scope": signature.get("target_scope"),
         "roles": signature.get("roles"),
         "damage": signature.get("damage"),
@@ -517,4 +544,3 @@ def semantic_match_score(plan_signature: dict[str, Any] | None, candidate_signat
         score -= abs(plan_value - candidate_value) * weight
 
     return score
-

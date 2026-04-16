@@ -244,6 +244,32 @@ def _normalize_compact_text(value: Any) -> str:
     return " ".join(text.split())
 
 
+def _preferred_live_entity_title(
+    kind: str,
+    entity_id: str | None,
+    runtime_title: Any,
+    *,
+    metadata: dict[str, Any] | None = None,
+    upgrade_level: float = 0.0,
+) -> str:
+    metadata_title = _normalize_compact_text((metadata or {}).get("title")) if isinstance(metadata, dict) else ""
+    if metadata_title:
+        if kind == "card":
+            return f"{metadata_title}{'+' * max(int(upgrade_level), 0)}"
+        return metadata_title
+
+    runtime = _normalize_compact_text(runtime_title)
+    if runtime:
+        return runtime
+
+    if entity_id:
+        if kind == "card":
+            return build_card_label(entity_id, upgrade_level)
+        return _entity_title(kind, entity_id)
+
+    return ""
+
+
 def _extract_semantic_hints_from_text(text: Any) -> tuple[dict[str, Any], list[str]]:
     normalized = _normalize_compact_text(text)
     if not normalized:
@@ -682,10 +708,14 @@ def build_live_card_semantic_text(card_payload: dict[str, Any] | None) -> str:
     upgrade_level = _infer_upgrade_level_from_card_payload(card_payload)
     metadata = _resolve_card_variant_metadata(get_card_metadata(card_id), upgrade_level=upgrade_level)
 
-    title = _normalize_compact_text(card_payload.get("title"))
-    if not title and card_id:
-        title = build_card_label(card_id, upgrade_level)
-    elif not title:
+    title = _preferred_live_entity_title(
+        "card",
+        card_id,
+        card_payload.get("title"),
+        metadata=metadata,
+        upgrade_level=upgrade_level,
+    )
+    if not title:
         title = "[unknown]"
 
     runtime_summary = _compact_runtime_card_summary(card_payload)
@@ -709,10 +739,8 @@ def build_live_relic_semantic_text(relic_payload: dict[str, Any] | None) -> str:
     relic_id = str(relic_payload.get("id") or "").strip()
     metadata = get_relic_metadata(relic_id)
 
-    title = _normalize_compact_text(relic_payload.get("title"))
-    if not title and relic_id:
-        title = _entity_title("relic", relic_id)
-    elif not title:
+    title = _preferred_live_entity_title("relic", relic_id, relic_payload.get("title"), metadata=metadata)
+    if not title:
         title = "[unknown relic]"
 
     runtime_rarity = _normalize_compact_text(relic_payload.get("rarity"))
@@ -736,10 +764,8 @@ def build_live_potion_semantic_text(potion_payload: dict[str, Any] | None) -> st
     potion_id = str(potion_payload.get("id") or "").strip()
     metadata = get_potion_metadata(potion_id)
 
-    title = _normalize_compact_text(potion_payload.get("title"))
-    if not title and potion_id:
-        title = _entity_title("potion", potion_id)
-    elif not title:
+    title = _preferred_live_entity_title("potion", potion_id, potion_payload.get("title"), metadata=metadata)
+    if not title:
         title = "[unknown potion]"
 
     runtime_summary = _compact_runtime_potion_summary(potion_payload)
@@ -805,19 +831,377 @@ def build_enemy_intent_semantic_text(intent_payload: dict[str, Any] | None) -> s
     return " | ".join(part for part in parts if part)
 
 
+def _coerce_enemy_trait_entries(
+    values: Any,
+    *,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for item in values or []:
+        if not isinstance(item, dict):
+            continue
+        payload = dict(item)
+        if category and not payload.get("category"):
+            payload["category"] = category
+        trait_name = _normalize_compact_text(
+            payload.get("trait")
+            or payload.get("effect_type")
+            or payload.get("state")
+            or payload.get("condition")
+        )
+        if not trait_name:
+            continue
+        payload["trait"] = trait_name
+        description = _normalize_compact_text(payload.get("description"))
+        if not description:
+            description = trait_name
+        payload["description"] = description
+        entries.append(payload)
+    return entries
+
+
+
+def _dedupe_enemy_trait_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = "|".join(
+            _normalize_compact_text(entry.get(field))
+            for field in (
+                "category",
+                "trait",
+                "trigger_type",
+                "condition",
+                "effect_type",
+                "state",
+                "threshold",
+                "effect_amount",
+            )
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def _reactive(
+    trigger_type: str | None,
+    condition: str | None,
+    effect_type: str | None,
+    description: str | None,
+    *,
+    trait: str | None = None,
+    threshold: Any = None,
+    state: str | None = None,
+    effect_amount: Any = None,
+    severity: str | None = None,
+) -> dict[str, Any]:
+    normalized_trait = _normalize_compact_text(trait or effect_type or condition or description)
+    return {
+        "category": "reactive",
+        "trait": normalized_trait,
+        "description": _normalize_compact_text(description) or normalized_trait,
+        "trigger_type": _normalize_compact_text(trigger_type),
+        "condition": _normalize_compact_text(condition),
+        "effect_type": _normalize_compact_text(effect_type),
+        "threshold": threshold,
+        "state": _normalize_compact_text(state),
+        "effect_amount": effect_amount,
+        "severity": _normalize_compact_text(severity),
+    }
+
+
+def _phase_rule(
+    trigger_type: str | None,
+    condition: str | None,
+    effect_type: str | None,
+    description: str | None,
+    *,
+    trait: str | None = None,
+    threshold: Any = None,
+    state: str | None = None,
+    effect_amount: Any = None,
+    severity: str | None = None,
+) -> dict[str, Any]:
+    normalized_trait = _normalize_compact_text(trait or effect_type or condition or description)
+    return {
+        "category": "phase",
+        "trait": normalized_trait,
+        "description": _normalize_compact_text(description) or normalized_trait,
+        "trigger_type": _normalize_compact_text(trigger_type),
+        "condition": _normalize_compact_text(condition),
+        "effect_type": _normalize_compact_text(effect_type),
+        "threshold": threshold,
+        "state": _normalize_compact_text(state),
+        "effect_amount": effect_amount,
+        "severity": _normalize_compact_text(severity),
+    }
+
+
+def _compact_enemy_trait_entry(entry: dict[str, Any]) -> str:
+    trait = _normalize_compact_text(entry.get("trait"))
+    description = _normalize_compact_text(entry.get("description"))
+    trigger_type = _normalize_compact_text(entry.get("trigger_type"))
+    condition = _normalize_compact_text(entry.get("condition"))
+    effect_type = _normalize_compact_text(entry.get("effect_type"))
+    state = _normalize_compact_text(entry.get("state"))
+    amount = entry.get("effect_amount") or entry.get("amount")
+    threshold = entry.get("threshold")
+
+    compact_bits: list[str] = []
+    if trigger_type:
+        compact_bits.append(trigger_type)
+    if condition:
+        compact_bits.append(condition)
+    if effect_type and effect_type != trait:
+        compact_bits.append(effect_type)
+    if state:
+        compact_bits.append(state)
+    if threshold not in (None, "", False):
+        compact_bits.append(f"th={_format_compact_number(threshold)}")
+    if amount not in (None, "", False):
+        compact_bits.append(f"amt={_format_compact_number(amount)}")
+
+    label = description or trait
+    if compact_bits:
+        return f"{label} ({', '.join(compact_bits)})"
+    return label
+
+
+
+def _compact_enemy_trait_text(entries: list[dict[str, Any]], *, limit: int = 4) -> str:
+    compact: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        rendered = _compact_enemy_trait_entry(entry)
+        if not rendered or rendered in seen:
+            continue
+        seen.add(rendered)
+        compact.append(rendered)
+        if len(compact) >= limit:
+            break
+    if not compact:
+        return ""
+    return "trait " + " || ".join(compact)
+
+
+
+def _compact_enemy_danger_profile(danger_profile: dict[str, Any] | None) -> str:
+    if not isinstance(danger_profile, dict):
+        return ""
+    aliases = {
+        "burst": "burst",
+        "attrition": "attr",
+        "scaling": "scale",
+        "retaliation": "retal",
+        "summon_pressure": "summon",
+        "debuff_pressure": "debuff",
+        "phase_complexity": "phase",
+        "volatility": "vol",
+        "target_priority": "prio",
+    }
+    parts: list[str] = []
+    for key in (
+        "burst",
+        "attrition",
+        "scaling",
+        "retaliation",
+        "summon_pressure",
+        "debuff_pressure",
+        "phase_complexity",
+        "volatility",
+        "target_priority",
+    ):
+        value = danger_profile.get(key)
+        if value in (None, "", False):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric <= 0:
+            continue
+        parts.append(f"{aliases[key]}={_format_compact_number(numeric)}")
+    notes = _normalize_compact_text(danger_profile.get("notes"))
+    if notes:
+        parts.append(notes)
+    if not parts:
+        return ""
+    return "danger " + " ".join(parts)
+
+
+
+def _enemy_metadata_from_payload(enemy_payload: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
+    if not isinstance(enemy_payload, dict):
+        return "", None
+    enemy_id = _normalize_compact_text(enemy_payload.get("model_id") or enemy_payload.get("id"))
+    return enemy_id, get_enemy_metadata(enemy_id)
+
+
+
+def _collect_enemy_trait_entries(
+    enemy_payload: dict[str, Any] | None,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if metadata:
+        entries.extend(_coerce_enemy_trait_entries(metadata.get("static_traits"), category="static"))
+        entries.extend(_coerce_enemy_trait_entries(metadata.get("reactive_triggers"), category="reactive"))
+        entries.extend(_coerce_enemy_trait_entries(metadata.get("phase_rules"), category="phase"))
+        entries.extend(_coerce_enemy_trait_entries(metadata.get("trait_tokens")))
+    if isinstance(enemy_payload, dict):
+        entries.extend(_coerce_enemy_trait_entries(enemy_payload.get("static_traits"), category="static"))
+        entries.extend(_coerce_enemy_trait_entries(enemy_payload.get("reactive_triggers"), category="reactive"))
+        entries.extend(_coerce_enemy_trait_entries(enemy_payload.get("phase_rules"), category="phase"))
+        for power in enemy_payload.get("powers") or []:
+            if not isinstance(power, dict):
+                continue
+            title = _normalize_compact_text(power.get("title") or power.get("description"))
+            lowered = title.lower()
+            if "thorn" in lowered or "spike" in lowered:
+                entries.append(
+                    _reactive(
+                        "on_hit",
+                        "contact",
+                        "retaliate",
+                        title or "thorns retaliation",
+                        effect_amount=power.get("amount") or power.get("display_amount"),
+                    )
+                )
+            if "retali" in lowered or "contact" in lowered:
+                entries.append(
+                    _reactive(
+                        "on_hit",
+                        "contact",
+                        "retaliate",
+                        title or "contact retaliation",
+                        effect_amount=power.get("amount") or power.get("display_amount"),
+                    )
+                )
+            if "intang" in lowered:
+                entries.append(
+                    _phase_rule(
+                        "on_turn_start",
+                        "intangible_window",
+                        "gain_intangible",
+                        title or "intangible window",
+                    )
+                )
+            if "split" in lowered:
+                entries.append(
+                    _phase_rule(
+                        "on_hp_threshold",
+                        "threshold_crossed",
+                        "split",
+                        title or "split threshold",
+                    )
+                )
+        name_text = " ".join(
+            part
+            for part in (
+                _normalize_compact_text(enemy_payload.get("name")),
+                _normalize_compact_text(enemy_payload.get("model_id")),
+                _normalize_compact_text((enemy_payload.get("intent") or {}).get("description") if isinstance(enemy_payload.get("intent"), dict) else None),
+            )
+            if part
+        ).lower()
+        if "split" in name_text:
+            entries.append(_phase_rule("on_hp_threshold", "threshold_crossed", "split", "split_on_threshold"))
+        if "phase" in name_text or "threshold" in name_text:
+            entries.append(_phase_rule("on_hp_threshold", "threshold_crossed", "phase_shift", "hp_threshold_phase_shift"))
+    return _dedupe_enemy_trait_entries(entries)
+
+
+
+def enemy_trait_vector(enemy_payload_or_metadata: dict[str, Any] | None) -> dict[str, float]:
+    payload = enemy_payload_or_metadata if isinstance(enemy_payload_or_metadata, dict) and any(
+        key in enemy_payload_or_metadata for key in ("name", "model_id", "intent", "powers")
+    ) else None
+    metadata = enemy_payload_or_metadata if isinstance(enemy_payload_or_metadata, dict) and payload is None else None
+    if payload is not None:
+        _enemy_id, payload_metadata = _enemy_metadata_from_payload(payload)
+        metadata = payload_metadata or metadata
+    entries = _collect_enemy_trait_entries(payload, metadata=metadata)
+    danger_profile = {}
+    if isinstance(metadata, dict):
+        danger_profile = metadata.get("danger_profile") or {}
+    if isinstance(payload, dict) and isinstance(payload.get("danger_profile"), dict):
+        danger_profile = payload.get("danger_profile") or danger_profile
+
+    text_blob = " ".join(_compact_enemy_trait_entry(entry) for entry in entries).lower()
+    return {
+        "retaliation": float("retali" in text_blob or "thorn" in text_blob),
+        "summon": float("summon" in text_blob or "spawn" in text_blob),
+        "phase_shift": float("phase" in text_blob or "split" in text_blob),
+        "threshold": float("threshold" in text_blob or "th=" in text_blob),
+        "debuff": float("debuff" in text_blob or "bind" in text_blob or "vulnerable" in text_blob),
+        "intangible": float("intang" in text_blob),
+        "burst": float(min(float(danger_profile.get("burst") or 0), 5.0) / 5.0),
+        "attrition": float(min(float(danger_profile.get("attrition") or 0), 5.0) / 5.0),
+        "target_priority": float(min(float(danger_profile.get("target_priority") or 0), 5.0) / 5.0),
+    }
+
+
+
+def build_enemy_semantic_text(enemy_id: str | None) -> str:
+    enemy_key = _normalize_compact_text(enemy_id)
+    title = _entity_title("enemy", enemy_key) if enemy_key else "[unknown enemy]"
+    metadata = get_enemy_metadata(enemy_key)
+    if not metadata:
+        return title
+    trait_text = _compact_enemy_trait_text(_collect_enemy_trait_entries(None, metadata=metadata))
+    danger_text = _compact_enemy_danger_profile(metadata.get("danger_profile"))
+    summary = _normalize_compact_text(metadata.get("summary"))
+    parts = [title]
+    if trait_text:
+        parts.append(trait_text)
+    if danger_text:
+        parts.append(danger_text)
+    if summary:
+        parts.append(summary)
+    return " | ".join(part for part in parts if part)
+
+
+
+def build_live_enemy_trait_text(enemy_payload: dict[str, Any] | None) -> str:
+    if not isinstance(enemy_payload, dict):
+        return ""
+    _enemy_id, metadata = _enemy_metadata_from_payload(enemy_payload)
+    return _compact_enemy_trait_text(_collect_enemy_trait_entries(enemy_payload, metadata=metadata))
+
+
+
 def build_live_enemy_semantic_text(enemy_payload: dict[str, Any] | None) -> str:
     if not isinstance(enemy_payload, dict):
         return ""
 
-    name = _normalize_compact_text(enemy_payload.get("name")) or "[unknown enemy]"
+    enemy_id, metadata = _enemy_metadata_from_payload(enemy_payload)
+    name = _normalize_compact_text(enemy_payload.get("name"))
+    if not name:
+        name = _entity_title("enemy", enemy_id) if enemy_id else "[unknown enemy]"
     intent_text = build_enemy_intent_semantic_text(enemy_payload.get("intent"))
+    trait_text = build_live_enemy_trait_text(enemy_payload)
+    danger_text = _compact_enemy_danger_profile(
+        enemy_payload.get("danger_profile") if isinstance(enemy_payload.get("danger_profile"), dict) else (metadata.get("danger_profile") if isinstance(metadata, dict) else None)
+    )
+
+    runtime_parts: list[str] = []
+    current_hp = enemy_payload.get("current_hp")
+    max_hp = enemy_payload.get("max_hp")
+    block = enemy_payload.get("block")
+    if current_hp not in (None, "") and max_hp not in (None, ""):
+        runtime_parts.append(f"hp={_format_compact_number(current_hp)}/{_format_compact_number(max_hp)}")
+    if block not in (None, "", False):
+        runtime_parts.append(f"blk={_format_compact_number(block)}")
 
     power_parts: list[str] = []
     for power in (enemy_payload.get("powers") or [])[:3]:
         if not isinstance(power, dict):
             continue
         power_title = _normalize_compact_text(power.get("title"))
-        amount = power.get("amount")
+        amount = power.get("amount") or power.get("display_amount")
         if not power_title:
             continue
         if amount in (None, "", False):
@@ -825,11 +1209,21 @@ def build_live_enemy_semantic_text(enemy_payload: dict[str, Any] | None) -> str:
         else:
             power_parts.append(f"{power_title}:{_format_compact_number(amount)}")
 
+    static_summary = _normalize_compact_text(metadata.get("summary")) if isinstance(metadata, dict) else ""
+
     parts = [name]
+    if runtime_parts:
+        parts.append("state " + " ".join(runtime_parts))
     if intent_text:
         parts.append(intent_text)
+    if trait_text:
+        parts.append(trait_text)
+    if danger_text:
+        parts.append(danger_text)
     if power_parts:
         parts.append("pow " + " ".join(power_parts))
+    if static_summary and static_summary not in parts:
+        parts.append(static_summary)
     return " | ".join(part for part in parts if part)
 
 

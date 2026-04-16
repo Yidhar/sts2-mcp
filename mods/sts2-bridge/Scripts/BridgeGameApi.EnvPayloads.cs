@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Godot;
@@ -31,11 +32,13 @@ internal static partial class BridgeGameApi
         var runSummary = BuildEnvRunPayload(context.RunState);
         var observationCore = BuildEnvObservationCore(context, phase);
         var legalActions = BuildEnvLegalActions(context, actions);
+        var surfaceFingerprint = BuildEnvSurfaceFingerprint(context, phase);
         var logicHash = ComputeStateHash(new
         {
             phase,
             observation = observationCore,
-            action_ids = legalActions.Select(static action => action.ActionId).ToArray()
+            action_ids = legalActions.Select(static action => action.ActionId).ToArray(),
+            surface_fingerprint = surfaceFingerprint
         });
         var observation = CloneDictionary(observationCore);
         observation["logic_hash"] = logicHash;
@@ -55,6 +58,7 @@ internal static partial class BridgeGameApi
                 .ToDictionary(static g => g.Key, static g => g.First(), StringComparer.Ordinal),
             ResolvedActions = legalActions,
             LogicHash = logicHash,
+            SurfaceFingerprint = surfaceFingerprint,
             Actionable = actionable,
             Done = done,
             CurrentHp = GetPrimaryPlayerCurrentHp(context),
@@ -74,6 +78,28 @@ internal static partial class BridgeGameApi
             CombatInProgress = context.CombatManager?.IsInProgress == true,
             RoomPreFinished = context.RunState?.CurrentRoom?.IsPreFinished == true
         };
+    }
+
+    private static string BuildEnvSurfaceFingerprint(BridgeWorldContext context, string phase)
+    {
+        if (!string.Equals(phase, "card_selection", StringComparison.Ordinal) &&
+            !string.Equals(phase, "deck_upgrade", StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder(128);
+        switch (phase)
+        {
+            case "card_selection":
+                AppendCardSelectionStateFingerprint(builder, context);
+                break;
+            case "deck_upgrade":
+                AppendDeckUpgradeStateFingerprint(builder, context);
+                break;
+        }
+
+        return builder.ToString();
     }
 
     private static List<BridgeResolvedAction> FilterEnvResolvedActions(

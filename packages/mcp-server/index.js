@@ -94,6 +94,8 @@ const KNOWLEDGE_INPUT_TOPIC_ENUM = [
 ];
 const TOOL_PROFILE_NAMES = ["minimal", "strategic", "debug"];
 const OBSERVATION_DOMAIN_ENUM = ["cards", "relics", "events", "enemies"];
+const ENEMY_METADATA_PATH = path.resolve(__dirname, "..", "rl-agent", "content", "enemies.static.generated.json");
+let cachedEnemyMetadataRegistry;
 
 const TOOL_DEFINITIONS = [
   {
@@ -3806,12 +3808,17 @@ function buildRlObservation(state) {
       stars: Number.isFinite(combat.stars) ? combat.stars : null,
       hand: Array.isArray(combat.hand) ? combat.hand : [],
       draw_pile_count: Number.isFinite(combat.draw_pile_count) ? combat.draw_pile_count : null,
+      draw_preview_cards: Array.isArray(combat.draw_preview_cards) ? combat.draw_preview_cards : [],
       discard_pile_count: Number.isFinite(combat.discard_pile_count)
         ? combat.discard_pile_count
         : null,
+      discard_cards: Array.isArray(combat.discard_cards) ? combat.discard_cards : [],
       exhaust_pile_count: Number.isFinite(combat.exhaust_pile_count)
         ? combat.exhaust_pile_count
         : null,
+      exhaust_cards: Array.isArray(combat.exhaust_cards) ? combat.exhaust_cards : [],
+      play_pile_count: Number.isFinite(combat.play_pile_count) ? combat.play_pile_count : null,
+      play_pile_cards: Array.isArray(combat.play_pile_cards) ? combat.play_pile_cards : [],
       summons: Array.isArray(combat.summons) ? combat.summons : [],
       enemies: Array.isArray(combat.enemies) ? combat.enemies : [],
       target_index_map: Array.isArray(combat.target_index_map) ? combat.target_index_map : []
@@ -8562,10 +8569,25 @@ function summarizePowerForAgent(power) {
     return null;
   }
 
-  return {
+  const summary = {
     title: normalizeAgentText(power.title),
     amount: Number.isFinite(power.amount) ? power.amount : null
   };
+
+  if (typeof power.description === "string" && power.description.trim()) {
+    summary.description = normalizeAgentText(power.description);
+  }
+  if (Number.isFinite(power.display_amount)) {
+    summary.display_amount = power.display_amount;
+  }
+  if (typeof power.type === "string") {
+    summary.type = power.type;
+  }
+  if (typeof power.stack_type === "string") {
+    summary.stack_type = power.stack_type;
+  }
+
+  return summary;
 }
 
 function summarizePotionForAgent(potion) {
@@ -8771,21 +8793,327 @@ function summarizeIntentForAgent(intent) {
   return summary;
 }
 
+function getEnemyMetadataRegistry() {
+  if (cachedEnemyMetadataRegistry !== undefined) {
+    return cachedEnemyMetadataRegistry;
+  }
+
+  try {
+    const raw = fs.readFileSync(ENEMY_METADATA_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    cachedEnemyMetadataRegistry = isPlainObject(parsed) ? parsed : {};
+  } catch (_error) {
+    cachedEnemyMetadataRegistry = {};
+  }
+
+  return cachedEnemyMetadataRegistry;
+}
+
+function getEnemyMetadataForAgent(enemyId) {
+  const normalizedId = typeof enemyId === "string" ? enemyId.trim() : "";
+  if (!normalizedId) {
+    return null;
+  }
+  const registry = getEnemyMetadataRegistry();
+  return isPlainObject(registry[normalizedId]) ? registry[normalizedId] : null;
+}
+
+function normalizeEnemyTraitEntryForAgent(entry, categoryHint = null) {
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+
+  const trait = normalizeAgentText(
+    entry.trait ?? entry.effect_type ?? entry.state ?? entry.condition
+  );
+  if (!trait) {
+    return null;
+  }
+
+  const normalized = {
+    trait,
+    description: normalizeAgentText(entry.description) ?? trait
+  };
+
+  const category = typeof categoryHint === "string" && categoryHint.trim()
+    ? categoryHint.trim()
+    : typeof entry.category === "string" && entry.category.trim()
+      ? entry.category.trim()
+      : null;
+  if (category) {
+    normalized.category = category;
+  }
+  if (typeof entry.trigger_type === "string" && entry.trigger_type.trim()) {
+    normalized.trigger_type = entry.trigger_type.trim();
+  }
+  if (typeof entry.condition === "string" && entry.condition.trim()) {
+    normalized.condition = entry.condition.trim();
+  }
+  if (typeof entry.effect_type === "string" && entry.effect_type.trim()) {
+    normalized.effect_type = entry.effect_type.trim();
+  }
+  if (typeof entry.state === "string" && entry.state.trim()) {
+    normalized.state = entry.state.trim();
+  }
+  if (Number.isFinite(entry.threshold)) {
+    normalized.threshold = entry.threshold;
+  }
+  if (Number.isFinite(entry.effect_amount)) {
+    normalized.effect_amount = entry.effect_amount;
+  } else if (Number.isFinite(entry.amount)) {
+    normalized.effect_amount = entry.amount;
+  }
+  if (typeof entry.severity === "string" && entry.severity.trim()) {
+    normalized.severity = entry.severity.trim();
+  }
+
+  return normalized;
+}
+
+function dedupeEnemyTraitEntriesForAgent(entries) {
+  const result = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    if (!isPlainObject(entry)) {
+      continue;
+    }
+    const key = JSON.stringify(entry, Object.keys(entry).sort());
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(entry);
+  }
+  return result;
+}
+
+function summarizeEnemyDangerProfileForAgent(dangerProfile) {
+  if (!isPlainObject(dangerProfile)) {
+    return null;
+  }
+  const summary = {};
+  for (const key of [
+    "burst",
+    "attrition",
+    "scaling",
+    "retaliation",
+    "summon_pressure",
+    "debuff_pressure",
+    "phase_complexity",
+    "volatility",
+    "target_priority"
+  ]) {
+    if (Number.isFinite(dangerProfile[key])) {
+      summary[key] = dangerProfile[key];
+    }
+  }
+  if (typeof dangerProfile.notes === "string" && dangerProfile.notes.trim()) {
+    summary.notes = normalizeAgentText(dangerProfile.notes);
+  }
+  return Object.keys(summary).length > 0 ? summary : null;
+}
+
+function summarizeTargetPriorityHintsForAgent(hints) {
+  if (!Array.isArray(hints)) {
+    return [];
+  }
+  return hints
+    .map((entry) => {
+      if (typeof entry === "string") {
+        const reason = normalizeAgentText(entry);
+        return reason ? { reason } : null;
+      }
+      if (!isPlainObject(entry)) {
+        return null;
+      }
+      const reason = normalizeAgentText(entry.reason ?? entry.description);
+      if (!reason) {
+        return null;
+      }
+      const summary = { reason };
+      if (typeof entry.priority === "string" && entry.priority.trim()) {
+        summary.priority = entry.priority.trim();
+      }
+      if (typeof entry.when === "string" && entry.when.trim()) {
+        summary.when = entry.when.trim();
+      }
+      return summary;
+    })
+    .filter((entry) => entry !== null)
+    .slice(0, 4);
+}
+
+function inferStructuredEnemyFieldsForAgent(creature) {
+  const metadata = getEnemyMetadataForAgent(creature?.model_id);
+  const staticTraits = [];
+  const reactiveTriggers = [];
+  const phaseRules = [];
+  const combatTags = new Set();
+  const targetPriorityHints = [];
+
+  const addEntry = (bucket, entry, categoryHint = null) => {
+    const normalized = normalizeEnemyTraitEntryForAgent(entry, categoryHint);
+    if (normalized) {
+      bucket.push(normalized);
+    }
+  };
+  const addTag = (tag) => {
+    if (typeof tag === "string" && tag.trim()) {
+      combatTags.add(tag.trim());
+    }
+  };
+  const mergeCollection = (source, bucket, categoryHint = null) => {
+    if (!Array.isArray(source)) {
+      return;
+    }
+    for (const entry of source) {
+      addEntry(bucket, entry, categoryHint);
+    }
+  };
+
+  if (isPlainObject(metadata)) {
+    mergeCollection(metadata.static_traits, staticTraits, "static");
+    mergeCollection(metadata.reactive_triggers, reactiveTriggers, "reactive");
+    mergeCollection(metadata.phase_rules, phaseRules, "phase");
+    for (const tag of metadata.combat_tags ?? []) {
+      addTag(tag);
+    }
+    targetPriorityHints.push(...summarizeTargetPriorityHintsForAgent(metadata.target_priority_hints));
+  }
+
+  mergeCollection(creature?.static_traits, staticTraits, "static");
+  mergeCollection(creature?.reactive_triggers, reactiveTriggers, "reactive");
+  mergeCollection(creature?.phase_rules, phaseRules, "phase");
+  for (const tag of creature?.combat_tags ?? []) {
+    addTag(tag);
+  }
+  targetPriorityHints.push(...summarizeTargetPriorityHintsForAgent(creature?.target_priority_hints));
+
+  const powerTexts = Array.isArray(creature?.powers)
+    ? creature.powers
+      .map((power) => `${normalizeAgentText(power?.title) ?? ""} ${normalizeAgentText(power?.description) ?? ""}`.trim())
+      .filter((text) => text.length > 0)
+    : [];
+  const nameText = [
+    normalizeAgentText(creature?.name),
+    typeof creature?.model_id === "string" ? creature.model_id.trim() : null,
+    normalizeAgentText(creature?.intent?.description),
+    ...powerTexts
+  ]
+    .filter((text) => typeof text === "string" && text.length > 0)
+    .join(" ")
+    .toLowerCase();
+
+  if (nameText.includes("thorn") || nameText.includes("spiny") || nameText.includes("retali") || nameText.includes("contact")) {
+    addTag("retaliation");
+    addEntry(reactiveTriggers, {
+      trait: "retaliate",
+      description: "Contact / thorns style retaliation",
+      trigger_type: "on_hit",
+      condition: "contact",
+      effect_type: "retaliate"
+    }, "reactive");
+  }
+  if (nameText.includes("split")) {
+    addTag("phase_shift");
+    addEntry(phaseRules, {
+      trait: "split",
+      description: "Split or threshold clone behavior",
+      trigger_type: "on_hp_threshold",
+      condition: "threshold_crossed",
+      effect_type: "split"
+    }, "phase");
+  }
+  if (nameText.includes("phase") || nameText.includes("threshold")) {
+    addTag("phase_shift");
+    addEntry(phaseRules, {
+      trait: "phase_shift",
+      description: "Threshold / phase transition behavior",
+      trigger_type: "on_hp_threshold",
+      condition: "threshold_crossed",
+      effect_type: "phase_shift"
+    }, "phase");
+  }
+  if (nameText.includes("summon") || nameText.includes("spawn") || nameText.includes("nexus") || nameText.includes("progenitor") || nameText.includes("queen") || nameText.includes("egg")) {
+    addTag("summoner");
+  }
+  if (nameText.includes("boss") || nameText.includes("doormaker") || nameText.includes("insatiable") || nameText.includes("matriarch") || nameText.includes("test subject")) {
+    addTag("boss");
+  }
+
+  let dangerProfile = summarizeEnemyDangerProfileForAgent(creature?.danger_profile)
+    ?? summarizeEnemyDangerProfileForAgent(metadata?.danger_profile)
+    ?? null;
+  if (dangerProfile === null) {
+    const heuristic = {};
+    if (combatTags.has("retaliation")) {
+      heuristic.retaliation = 4;
+      heuristic.attrition = 3;
+    }
+    if (combatTags.has("summoner")) {
+      heuristic.summon_pressure = 4;
+      heuristic.target_priority = 4;
+    }
+    if (combatTags.has("phase_shift")) {
+      heuristic.phase_complexity = 4;
+    }
+    dangerProfile = Object.keys(heuristic).length > 0 ? heuristic : null;
+  }
+
+  return {
+    static_traits: dedupeEnemyTraitEntriesForAgent(staticTraits).slice(0, 6),
+    reactive_triggers: dedupeEnemyTraitEntriesForAgent(reactiveTriggers).slice(0, 6),
+    phase_rules: dedupeEnemyTraitEntriesForAgent(phaseRules).slice(0, 6),
+    combat_tags: [...combatTags],
+    danger_profile: dangerProfile,
+    target_priority_hints: dedupeEnemyTraitEntriesForAgent(targetPriorityHints).slice(0, 4)
+  };
+}
+
 function summarizeCreatureForAgent(creature) {
   if (!isPlainObject(creature)) {
     return null;
   }
 
+  const structured = inferStructuredEnemyFieldsForAgent(creature);
   const summary = {
     combat_id: Number.isFinite(creature.combat_id) ? creature.combat_id : null,
+    model_id: typeof creature.model_id === "string" ? creature.model_id.trim() : null,
+    side: typeof creature.side === "string" ? creature.side : null,
     name: normalizeAgentText(creature.name),
     current_hp: Number.isFinite(creature.current_hp) ? creature.current_hp : null,
     max_hp: Number.isFinite(creature.max_hp) ? creature.max_hp : null,
     block: Number.isFinite(creature.block) ? creature.block : 0,
+    is_alive:
+      typeof creature.is_alive === "boolean"
+        ? creature.is_alive
+        : Number.isFinite(creature.current_hp)
+          ? creature.current_hp > 0
+          : null,
+    is_hittable: typeof creature.is_hittable === "boolean" ? creature.is_hittable : null,
     powers: Array.isArray(creature.powers)
       ? creature.powers.map(summarizePowerForAgent).filter((power) => power !== null)
       : []
   };
+
+  if (structured.static_traits.length > 0) {
+    summary.static_traits = structured.static_traits;
+  }
+  if (structured.reactive_triggers.length > 0) {
+    summary.reactive_triggers = structured.reactive_triggers;
+  }
+  if (structured.phase_rules.length > 0) {
+    summary.phase_rules = structured.phase_rules;
+  }
+  if (structured.combat_tags.length > 0) {
+    summary.combat_tags = structured.combat_tags;
+  }
+  if (isPlainObject(structured.danger_profile)) {
+    summary.danger_profile = structured.danger_profile;
+  }
+  if (structured.target_priority_hints.length > 0) {
+    summary.target_priority_hints = structured.target_priority_hints;
+  }
 
   if (isPlainObject(creature.intent)) {
     summary.intent = summarizeIntentForAgent(creature.intent);
@@ -9205,12 +9533,39 @@ function summarizeStateForAgent(state) {
           .map(summarizeCardForAgent)
           .filter((card) => card !== null)
         : [],
+      draw_preview_cards: Array.isArray(playerCombat?.draw_pile?.cards)
+        ? playerCombat.draw_pile.cards
+          .slice(0, 12)
+          .map(summarizeCardForAgent)
+          .filter((card) => card !== null)
+        : [],
       discard_pile_count: Number.isFinite(playerCombat?.discard_pile?.count)
         ? playerCombat.discard_pile.count
         : null,
+      discard_cards: Array.isArray(playerCombat?.discard_pile?.cards)
+        ? playerCombat.discard_pile.cards
+          .slice(0, 24)
+          .map(summarizeCardForAgent)
+          .filter((card) => card !== null)
+        : [],
       exhaust_pile_count: Number.isFinite(playerCombat?.exhaust_pile?.count)
         ? playerCombat.exhaust_pile.count
         : null,
+      exhaust_cards: Array.isArray(playerCombat?.exhaust_pile?.cards)
+        ? playerCombat.exhaust_pile.cards
+          .slice(0, 24)
+          .map(summarizeCardForAgent)
+          .filter((card) => card !== null)
+        : [],
+      play_pile_count: Number.isFinite(playerCombat?.play_pile?.count)
+        ? playerCombat.play_pile.count
+        : null,
+      play_pile_cards: Array.isArray(playerCombat?.play_pile?.cards)
+        ? playerCombat.play_pile.cards
+          .slice(0, 12)
+          .map(summarizeCardForAgent)
+          .filter((card) => card !== null)
+        : [],
       summons,
       enemies: Array.isArray(combat.enemy_creatures)
         ? combat.enemy_creatures.map(summarizeCreatureForAgent).filter((creature) => creature !== null)
@@ -9367,12 +9722,27 @@ function summarizeActionStateForAgent(state) {
       draw_pile_count: Number.isFinite(summary.combat.draw_pile_count)
         ? summary.combat.draw_pile_count
         : null,
+      draw_preview_cards: Array.isArray(summary.combat.draw_preview_cards)
+        ? summary.combat.draw_preview_cards
+        : [],
       discard_pile_count: Number.isFinite(summary.combat.discard_pile_count)
         ? summary.combat.discard_pile_count
         : null,
+      discard_cards: Array.isArray(summary.combat.discard_cards)
+        ? summary.combat.discard_cards
+        : [],
       exhaust_pile_count: Number.isFinite(summary.combat.exhaust_pile_count)
         ? summary.combat.exhaust_pile_count
         : null,
+      exhaust_cards: Array.isArray(summary.combat.exhaust_cards)
+        ? summary.combat.exhaust_cards
+        : [],
+      play_pile_count: Number.isFinite(summary.combat.play_pile_count)
+        ? summary.combat.play_pile_count
+        : null,
+      play_pile_cards: Array.isArray(summary.combat.play_pile_cards)
+        ? summary.combat.play_pile_cards
+        : [],
       summons: Array.isArray(summary.combat.summons) ? summary.combat.summons : [],
       enemies: Array.isArray(summary.combat.enemies) ? summary.combat.enemies : []
     };

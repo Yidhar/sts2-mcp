@@ -1,0 +1,12 @@
+# Minimal rl-agent runtime for WSL ROCm training/evaluation.
+# Torch itself is installed separately from the ROCm wheel index.
+
+gymnasium==1.2.3
+numpy==1.26.4
+requests==2.33.0
+tensorboard==2.20.0
+pyarrow==23.0.1
+safetensors==0.7.0
+stable-baselines3==2.7.1
+sb3-contrib==2.7.1
+sentence-transformers>=3.0

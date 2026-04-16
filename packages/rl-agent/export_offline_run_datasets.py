@@ -577,6 +577,16 @@ def main() -> None:
             "unique_payloads": len(seen_payload_digests),
             "combat_snapshot_filter_scope": "basic_filters_plus_strict_playable_rows",
             "combat_snapshot_source_runs": len({str(row.get("run_id")) for row in combat_snapshot_samples}),
+            "combat_snapshot_potion_coverage": {
+                "potion_state_known_rows": sum(
+                    1 for row in combat_snapshot_samples if bool(row.get("potion_state_known"))
+                ),
+                "nonempty_potion_rows": sum(
+                    1
+                    for row in combat_snapshot_samples
+                    if bool(row.get("potion_state_known")) and bool(row.get("potion_ids_before"))
+                ),
+            },
             "combat_snapshot_cleaning": {
                 "input_rows": combat_snapshot_input_rows,
                 "kept_rows": len(combat_snapshot_samples),

@@ -1,11 +1,14 @@
-"""Unified three-stage training pipeline for the online STS2 policy.
+"""Legacy three-stage training pipeline for the pre-attention STS2 policy lineage.
 
 Stages:
   1. combat sandbox PPO
   2. offline build/route pretraining
   3. full-run PPO
 
-Every stage reads and writes the same checkpoint format:
+This pipeline is archived because stage 2 still depends on the routed v2 policy
+stack. The active online mainline now uses ``train_attention_policy.py``.
+
+Every legacy stage reads and writes the same checkpoint format:
   model.safetensors + metadata.json
 """
 
@@ -111,7 +114,6 @@ def add_common_train_v2_args(
     device: str,
     session_file: str | None,
     character: str | None,
-    no_text: bool,
     learning_rate: float,
     checkpoint_freq: int,
 ) -> None:
@@ -122,8 +124,6 @@ def add_common_train_v2_args(
         cmd.extend(["--session-file", session_file])
     if character:
         cmd.extend(["--character", character])
-    if no_text:
-        cmd.append("--no-text")
 
 
 def require_sandbox_source(args) -> None:
@@ -156,8 +156,6 @@ def main() -> None:
     parser.add_argument("--session-file", default=None, type=str)
     parser.add_argument("--character", default=None, type=str,
                         help="Default character for stage 1 and stage 3 unless overridden.")
-    parser.add_argument("--no-text", action="store_true", default=False)
-
     parser.add_argument("--stage1-character", default=None, type=str)
     parser.add_argument("--stage1-total-timesteps", default=50_000, type=int)
     parser.add_argument("--stage1-learning-rate", default=1e-4, type=float)
@@ -243,7 +241,7 @@ def main() -> None:
         log_path = stage_root / "sandbox.log"
         cmd = [
             sys.executable,
-            "train_v2.py",
+            "legacy/train_v2.py",
             "--combat-sandbox",
             "--total-timesteps",
             str(args.stage1_total_timesteps),
@@ -257,7 +255,6 @@ def main() -> None:
             device=args.device,
             session_file=args.session_file,
             character=args.stage1_character or args.character,
-            no_text=args.no_text,
             learning_rate=args.stage1_learning_rate,
             checkpoint_freq=args.stage1_checkpoint_freq,
         )
@@ -299,7 +296,7 @@ def main() -> None:
     log_path = stage_root / "offline.log"
     cmd = [
         sys.executable,
-        "train_offline_multitask.py",
+        "legacy/train_offline_multitask.py",
         "--dataset-root",
         args.dataset_root,
         "--out-dir",
@@ -325,8 +322,6 @@ def main() -> None:
         "--device",
         args.device,
     ]
-    if args.no_text:
-        cmd.append("--no-text")
     if args.stage2_max_train_batches is not None:
         cmd.extend(["--max-train-batches", str(args.stage2_max_train_batches)])
     if args.stage2_max_eval_batches is not None:
@@ -359,7 +354,7 @@ def main() -> None:
     log_path = stage_root / "fullrun.log"
     cmd = [
         sys.executable,
-        "train_v2.py",
+        "legacy/train_v2.py",
         "--total-timesteps",
         str(args.stage3_total_timesteps),
         "--checkpoint-dir",
@@ -374,7 +369,6 @@ def main() -> None:
         device=args.device,
         session_file=args.session_file,
         character=args.stage3_character or args.character,
-        no_text=args.no_text,
         learning_rate=args.stage3_learning_rate,
         checkpoint_freq=args.stage3_checkpoint_freq,
     )

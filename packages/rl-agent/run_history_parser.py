@@ -205,6 +205,12 @@ def _build_player_floor_views(
 
     deck_state = _infer_initial_deck_state(player_build, player_floors)
     relic_state = _infer_initial_relic_state(player_build, player_floors)
+    potion_state = _infer_initial_potion_state(player_build, player_floors)
+    final_potion_ids = _extract_player_potion_ids(player_build)
+    max_potion_slots = int(player_build.get("max_potion_slot_count") or 3)
+    if max_potion_slots <= 0:
+        max_potion_slots = 3
+    potion_state_known = True
 
     floor_views: list[dict[str, Any]] = []
     for floor in player_floors:
@@ -212,8 +218,16 @@ def _build_player_floor_views(
         derived = _derive_floor_numerics(floor)
         quality = _derive_floor_quality_flags(floor)
         relics_before = None if quality["relic_ids_before_approximate"] else list(relic_state)
+        potions_before = list(potion_state) if potion_state_known else None
 
         resolved_upgraded_cards, upgrade_label_reliable = _apply_floor_changes(deck_state, relic_state, floor)
+        next_potion_state, potion_transition_known = _apply_floor_potion_changes(
+            potion_state,
+            floor,
+            max_potion_slots=max_potion_slots,
+        )
+        potion_state = next_potion_state
+        potion_state_known = bool(potion_state_known and potion_transition_known)
 
         deck_after = _summarize_deck_instances(deck_state)
         relics_after = list(relic_state)
@@ -232,8 +246,29 @@ def _build_player_floor_views(
                 "deck_after": deck_after,
                 "relic_ids_before": relics_before,
                 "relic_ids_after": relics_after,
+                "potion_ids_before": potions_before,
+                "potion_ids_after": list(potion_state) if potion_state_known else None,
+                "potion_state_known": bool(potions_before is not None),
             }
         )
+
+    if potion_state_known and sorted(potion_state) != sorted(final_potion_ids):
+        potion_state_known = False
+
+    if not potion_state_known:
+        for floor_view in floor_views:
+            quality_flags = dict(floor_view.get("quality_flags") or {})
+            quality_flags["potion_state_final_verified"] = False
+            floor_view["quality_flags"] = quality_flags
+            floor_view["potion_ids_before"] = None
+            floor_view["potion_ids_after"] = None
+            floor_view["potion_state_known"] = False
+    else:
+        for floor_view in floor_views:
+            quality_flags = dict(floor_view.get("quality_flags") or {})
+            quality_flags["potion_state_final_verified"] = True
+            floor_view["quality_flags"] = quality_flags
+
     return summary, floor_views
 
 
@@ -954,6 +989,7 @@ def _extract_floor_records(run: dict[str, Any], summary: dict[str, Any]) -> list
                     "player_stat_index": player_stat_index,
                     "player_id": player_id,
                     "character": player.get("character"),
+                    "max_potion_slot_count": player.get("max_potion_slot_count"),
                     "map_point_type": point.get("map_point_type"),
                     "room_type": room.get("room_type"),
                     "room_model_id": room.get("model_id"),
@@ -984,6 +1020,9 @@ def _extract_floor_records(run: dict[str, Any], summary: dict[str, Any]) -> list
                     "card_choices": _normalize_card_choices(stat.get("card_choices") or []),
                     "relic_choices": _normalize_marked_choices(stat.get("relic_choices") or []),
                     "potion_choices": _normalize_marked_choices(stat.get("potion_choices") or []),
+                    "potion_used": _normalize_choice_id_list(stat.get("potion_used") or []),
+                    "potion_discarded": _normalize_choice_id_list(stat.get("potion_discarded") or []),
+                    "bought_potions": _normalize_choice_id_list(stat.get("bought_potions") or []),
                     "event_choices": _normalize_event_choices(stat.get("event_choices") or []),
                     "ancient_choices": _normalize_ancient_choices(stat.get("ancient_choice") or []),
                 }
@@ -1235,6 +1274,29 @@ def _infer_initial_relic_state(player_build: dict[str, Any], floors: list[dict[s
     return relic_ids
 
 
+def _extract_player_potion_ids(player_build: dict[str, Any]) -> list[str]:
+    return [
+        potion_id
+        for potion_id in (
+            _normalize_choice_id(potion)
+            for potion in player_build.get("potions") or []
+        )
+        if potion_id
+    ]
+
+
+def _infer_initial_potion_state(player_build: dict[str, Any], floors: list[dict[str, Any]]) -> list[str]:
+    # Native run-history payloads do not currently expose a reliable per-floor
+    # "potions before this room" inventory. Reconstruct forward from the start of
+    # the run. Starting inventory is empty; floor-local potion gain/use/discard
+    # events are applied as we walk the run.
+    #
+    # Final player potions are still used later as a verification target.
+    _ = player_build
+    _ = floors
+    return []
+
+
 def _card_instance_from_ref(
     card: dict[str, Any],
     default_floor: int,
@@ -1279,6 +1341,53 @@ def _apply_floor_changes(
     for upgraded_id in upgraded_cards:
         _upgrade_matching_card(deck_state, upgraded_id)
     return upgraded_cards, _is_upgrade_label_reliable(floor, upgraded_cards)
+
+
+def _pop_matching_choice_id(items: list[str], target_id: str) -> bool:
+    for index, item in enumerate(items):
+        if item == target_id:
+            items.pop(index)
+            return True
+    return False
+
+
+def _apply_floor_potion_changes(
+    potion_state: list[str],
+    floor: dict[str, Any],
+    *,
+    max_potion_slots: int,
+) -> tuple[list[str], bool]:
+    working = list(potion_state)
+    transition_known = True
+
+    removals = [
+        potion_id
+        for potion_id in (
+            list(floor.get("potion_used") or [])
+            + list(floor.get("potion_discarded") or [])
+        )
+        if potion_id
+    ]
+    additions = [
+        potion_id
+        for potion_id in (
+            [item.get("choice") for item in (floor.get("potion_choices") or []) if item.get("was_picked")]
+            + list(floor.get("bought_potions") or [])
+        )
+        if potion_id
+    ]
+
+    for potion_id in removals:
+        if not _pop_matching_choice_id(working, str(potion_id)):
+            transition_known = False
+
+    for potion_id in additions:
+        if len(working) >= max_potion_slots:
+            transition_known = False
+            continue
+        working.append(str(potion_id))
+
+    return working, transition_known
 
 
 def _is_upgrade_label_reliable(floor: dict[str, Any], upgraded_cards: list[str]) -> bool:
@@ -1436,6 +1545,7 @@ def _build_combat_snapshot_samples(summary: dict[str, Any], floor_views: list[di
             continue
 
         relic_ids_before = list(floor.get("relic_ids_before") or [])
+        potion_ids_before = list(floor.get("potion_ids_before") or []) if floor.get("potion_state_known") else None
 
         samples.append(
             {
@@ -1470,8 +1580,8 @@ def _build_combat_snapshot_samples(summary: dict[str, Any], floor_views: list[di
                 "deck_card_ids": deck_card_ids,
                 "deck_entries": deck_entries,
                 "relic_ids_before": relic_ids_before,
-                "potion_ids_before": None,
-                "potion_state_known": False,
+                "potion_ids_before": potion_ids_before,
+                "potion_state_known": bool(floor.get("potion_state_known")),
                 "quality_flags": floor.get("quality_flags"),
             }
         )
@@ -1765,6 +1875,27 @@ def _normalize_card_ref(card: Any) -> dict[str, Any] | None:
     return out
 
 
+def _normalize_choice_id(entry: Any) -> str | None:
+    if isinstance(entry, str):
+        value = entry.strip()
+        return value or None
+    if isinstance(entry, dict):
+        for key in ("id", "choice"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _normalize_choice_id_list(entries: list[Any]) -> list[str]:
+    out: list[str] = []
+    for entry in entries:
+        normalized = _normalize_choice_id(entry)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
 def _normalize_choice_ref(entry: Any) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
@@ -1772,6 +1903,8 @@ def _normalize_choice_ref(entry: Any) -> dict[str, Any] | None:
     out: dict[str, Any] = {}
     if entry.get("id") is not None:
         out["id"] = entry.get("id")
+    if entry.get("slot_index") is not None:
+        out["slot_index"] = entry.get("slot_index")
     if entry.get("floor_added_to_deck") is not None:
         out["floor_added_to_deck"] = entry.get("floor_added_to_deck")
     if entry.get("props") is not None:

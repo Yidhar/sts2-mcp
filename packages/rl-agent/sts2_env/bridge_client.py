@@ -5,8 +5,11 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
+
+from .path_utils import default_bridge_session_dir, normalize_path, running_in_wsl
 
 
 class BridgeError(Exception):
@@ -19,19 +22,56 @@ class BridgeError(Exception):
 
 
 def _default_session_path() -> Path:
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        return Path(appdata) / "SlayTheSpire2" / "bridge" / "session.json"
-    # Fallback for non-standard Windows setups
-    userprofile = os.environ.get("USERPROFILE", "")
-    return Path(userprofile) / "AppData" / "Roaming" / "SlayTheSpire2" / "bridge" / "session.json"
+    return default_bridge_session_dir() / "session.json"
 
 
 def _resolve_session_path() -> Path:
     override = os.environ.get("STS2_BRIDGE_SESSION_FILE")
     if override:
-        return Path(override)
+        normalized = normalize_path(override)
+        assert normalized is not None
+        return normalized
     return _default_session_path()
+
+
+def _rewrite_loopback_url_for_wsl(base_url: str) -> str:
+    """Optionally rewrite a Windows loopback bridge URL into a WSL-reachable URL.
+
+    This is only applied when running inside WSL and the caller explicitly
+    provides a host override such as the Windows host gateway IP
+    (for example ``172.28.x.1``).
+    """
+    if not running_in_wsl():
+        return base_url
+
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").strip().lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return base_url
+
+    wsl_host = os.environ.get("STS2_BRIDGE_WSL_HOST")
+    if not wsl_host:
+        return base_url
+
+    override_port = os.environ.get("STS2_BRIDGE_WSL_PORT")
+    port = int(override_port) if override_port else (parsed.port or 80)
+    netloc = f"{wsl_host}:{port}"
+    rewritten = SplitResult(
+        scheme=parsed.scheme or "http",
+        netloc=netloc,
+        path=parsed.path or "",
+        query=parsed.query,
+        fragment=parsed.fragment,
+    )
+    return urlunsplit(rewritten)
+
+
+def _resolve_base_url(session_base_url: str, *, allow_env_override: bool = True) -> str:
+    explicit_override = os.environ.get("STS2_BRIDGE_BASE_URL")
+    if explicit_override and allow_env_override:
+        return explicit_override.rstrip("/")
+
+    return _rewrite_loopback_url_for_wsl(session_base_url.rstrip("/"))
 
 
 class BridgeClient:
@@ -46,9 +86,12 @@ class BridgeClient:
     HTTP_TIMEOUT_GRACE_MS = 10_000
 
     def __init__(self, session_path: str | Path | None = None):
-        path = Path(session_path) if session_path else _resolve_session_path()
+        normalized = normalize_path(session_path) if session_path else None
+        path = normalized if normalized is not None else _resolve_session_path()
+        self._allow_env_base_url_override = normalized is None
         self._session_path = path
         self._base_url: str = ""
+        self._session_base_url: str = ""
         self._token: str = ""
         self._is_connected: bool = False
         self._session = requests.Session()
@@ -71,13 +114,21 @@ class BridgeClient:
                 "Session file missing required fields (base_url, token)."
             )
 
-        self._base_url = data["base_url"].rstrip("/")
+        self._session_base_url = str(data["base_url"]).rstrip("/")
+        self._base_url = _resolve_base_url(
+            self._session_base_url,
+            allow_env_override=self._allow_env_base_url_override,
+        )
         self._token = data["token"]
         self._session.headers.update({"Authorization": f"Bearer {self._token}"})
 
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def session_base_url(self) -> str:
+        return self._session_base_url
 
     @property
     def is_connected(self) -> bool:
@@ -162,7 +213,13 @@ class BridgeClient:
 
         raise BridgeError(
             f"Bridge unreachable after {self.MAX_RETRIES} attempts "
-            f"({method} /{endpoint}): {last_exc}"
+            f"({method} /{endpoint}) via {self._base_url}: {last_exc}"
+            + (
+                " (WSL note: if session.json still points at http://127.0.0.1:<port>/, "
+                "start the Windows WSL relay and export STS2_BRIDGE_BASE_URL=http://<windows-host-ip>:<relay-port>/)"
+                if running_in_wsl() and self._session_base_url.startswith("http://127.0.0.1")
+                else ""
+            )
         )
 
     # -- Public API --
@@ -233,6 +290,7 @@ class BridgeClient:
         max_hp: int | None = None,
         max_energy: int | None = None,
         deck: list[str] | None = None,
+        deck_entries: list[dict[str, Any]] | None = None,
         relics: list[str] | None = None,
         potions: list[str] | None = None,
         gold: int | None = None,
@@ -258,6 +316,8 @@ class BridgeClient:
             body["max_energy"] = max_energy
         if deck is not None:
             body["deck"] = deck
+        if deck_entries is not None:
+            body["deck_entries"] = deck_entries
         if relics is not None:
             body["relics"] = relics
         if potions is not None:

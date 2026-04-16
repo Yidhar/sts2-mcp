@@ -1,0 +1,3265 @@
+{
+  "MONSTER.ASSASSIN_RUBY_RAIDER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Assassin Ruby Raider",
+    "trait_tokens": []
+  },
+  "MONSTER.AXEBOT": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Axebot",
+    "trait_tokens": []
+  },
+  "MONSTER.AXE_RUBY_RAIDER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Axe Ruby Raider",
+    "trait_tokens": []
+  },
+  "MONSTER.BOWLBUG_EGG": {
+    "combat_tags": [
+      "engine"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "egg_destroyed",
+        "description": "Destroying the egg may not fully remove future pressure.",
+        "effect_type": "spawn",
+        "severity": "medium",
+        "trait": "spawn",
+        "trigger_type": "on_death"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Low direct damage, but often represents future board pressure if left alive.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Bowlbug Egg",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      },
+      {
+        "category": "phase",
+        "condition": "egg_destroyed",
+        "description": "Destroying the egg may not fully remove future pressure.",
+        "severity": "medium",
+        "trait": "spawn",
+        "trigger_type": "on_death"
+      }
+    ]
+  },
+  "MONSTER.BOWLBUG_NECTAR": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Bowlbug Nectar",
+    "trait_tokens": []
+  },
+  "MONSTER.BOWLBUG_ROCK": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Bowlbug Rock",
+    "trait_tokens": []
+  },
+  "MONSTER.BOWLBUG_SILK": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Bowlbug Silk",
+    "trait_tokens": []
+  },
+  "MONSTER.BRUTE_RUBY_RAIDER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Brute Ruby Raider",
+    "trait_tokens": []
+  },
+  "MONSTER.BYGONE_EFFIGY": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Bygone Effigy",
+    "trait_tokens": []
+  },
+  "MONSTER.BYRDONIS": {
+    "combat_tags": [
+      "scaling",
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 3,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 5,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 3
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "growth",
+      "scaling",
+      "elite_pressure"
+    ],
+    "static_traits": [
+      {
+        "description": "Gets more dangerous as turns pass.",
+        "severity": "high",
+        "trait": "time_scaling"
+      }
+    ],
+    "summary": "Growth enemy. The longer the fight goes, the more dangerous its damage race becomes.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Burst or control it early; prolonged setup lines are punished."
+      }
+    ],
+    "title": "Byrdonis",
+    "trait_tokens": [
+      {
+        "description": "Gets more dangerous as turns pass.",
+        "severity": "high",
+        "trait": "time_scaling"
+      }
+    ]
+  },
+  "MONSTER.CALCIFIED_CULTIST": {
+    "combat_tags": [
+      "engine",
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner",
+      "debuff",
+      "scaling"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Support / scaling enemy that gets more annoying if allowed repeated turns.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Calcified Cultist",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ]
+  },
+  "MONSTER.CEREMONIAL_BEAST": {
+    "combat_tags": [
+      "boss",
+      "phase_shift",
+      "burst_window"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 5,
+      "retaliation": 0,
+      "scaling": 3,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 4
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "hp_le_150",
+        "description": "At or below 150 HP it stuns and transitions phases.",
+        "effect_type": "stun_self",
+        "severity": "high",
+        "state": "stunned",
+        "threshold": 150,
+        "trait": "stun_self",
+        "trigger_type": "on_hp_threshold"
+      },
+      {
+        "category": "phase",
+        "condition": "phase_two",
+        "description": "Phase two restricts the number of cards you can play each turn.",
+        "effect_type": "card_play_limit",
+        "severity": "high",
+        "state": "phase_two",
+        "trait": "card_play_limit",
+        "trigger_type": "on_phase_start"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "threshold_stun",
+      "phase_shift",
+      "card_lock"
+    ],
+    "static_traits": [
+      {
+        "description": "Crossing the HP breakpoint creates a temporary stun / vulnerability window.",
+        "severity": "high",
+        "trait": "threshold_stun"
+      },
+      {
+        "description": "Later phase punishes decks that need long action chains.",
+        "severity": "high",
+        "trait": "one_card_lock"
+      }
+    ],
+    "summary": "Threshold phase boss. Force the HP breakpoint on your terms, exploit the stun window, then respect the single-card lockdown phase.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Bank burst so the threshold is crossed cleanly and the stun turn becomes your best tempo window."
+      }
+    ],
+    "title": "Ceremonial Beast",
+    "trait_tokens": [
+      {
+        "description": "Crossing the HP breakpoint creates a temporary stun / vulnerability window.",
+        "severity": "high",
+        "trait": "threshold_stun"
+      },
+      {
+        "description": "Later phase punishes decks that need long action chains.",
+        "severity": "high",
+        "trait": "one_card_lock"
+      },
+      {
+        "category": "phase",
+        "condition": "hp_le_150",
+        "description": "At or below 150 HP it stuns and transitions phases.",
+        "severity": "high",
+        "state": "stunned",
+        "threshold": 150,
+        "trait": "stun_self",
+        "trigger_type": "on_hp_threshold"
+      },
+      {
+        "category": "phase",
+        "condition": "phase_two",
+        "description": "Phase two restricts the number of cards you can play each turn.",
+        "severity": "high",
+        "state": "phase_two",
+        "trait": "card_play_limit",
+        "trigger_type": "on_phase_start"
+      }
+    ]
+  },
+  "MONSTER.CHOMPER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Chomper",
+    "trait_tokens": []
+  },
+  "MONSTER.CORPSE_SLUG": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable",
+      "scaling"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Corpse Slug",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.CROSSBOW_RUBY_RAIDER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Crossbow Ruby Raider",
+    "trait_tokens": []
+  },
+  "MONSTER.CRUSHER": {
+    "combat_tags": [
+      "frontline",
+      "duo"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst",
+      "multi_actor"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Crusher",
+    "trait_tokens": []
+  },
+  "MONSTER.CUBEX_CONSTRUCT": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Defensive / durable enemy that tends to stretch the fight.",
+    "target_priority_hints": [],
+    "title": "Cubex Construct",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.DAMP_CULTIST": {
+    "combat_tags": [
+      "engine",
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner",
+      "debuff",
+      "scaling"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Support / scaling enemy that gets more annoying if allowed repeated turns.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Damp Cultist",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ]
+  },
+  "MONSTER.DECIMILLIPEDE_SEGMENT_BACK": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Decimillipede Segment Back",
+    "trait_tokens": []
+  },
+  "MONSTER.DECIMILLIPEDE_SEGMENT_FRONT": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Decimillipede Segment Front",
+    "trait_tokens": []
+  },
+  "MONSTER.DECIMILLIPEDE_SEGMENT_MIDDLE": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Decimillipede Segment Middle",
+    "trait_tokens": []
+  },
+  "MONSTER.DEVOTED_SCULPTOR": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Devoted Sculptor",
+    "trait_tokens": []
+  },
+  "MONSTER.DOOR": {
+    "combat_tags": [
+      "boss_component",
+      "gate"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 3,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "door_destroyed",
+        "description": "Destroying the door exposes the boss and starts the vulnerable window.",
+        "effect_type": "reveal_boss",
+        "severity": "high",
+        "trait": "reveal_boss",
+        "trigger_type": "on_death"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss_component",
+      "gate",
+      "tempo_tax"
+    ],
+    "static_traits": [
+      {
+        "description": "Fight progression is blocked until the door is destroyed.",
+        "severity": "high",
+        "trait": "gating_body"
+      }
+    ],
+    "summary": "Boss gate object. Exists to delay access to Doormaker and scales the cycle if you fail to convert the exposed window.",
+    "target_priority_hints": [],
+    "title": "Door",
+    "trait_tokens": [
+      {
+        "description": "Fight progression is blocked until the door is destroyed.",
+        "severity": "high",
+        "trait": "gating_body"
+      },
+      {
+        "category": "phase",
+        "condition": "door_destroyed",
+        "description": "Destroying the door exposes the boss and starts the vulnerable window.",
+        "severity": "high",
+        "trait": "reveal_boss",
+        "trigger_type": "on_death"
+      }
+    ]
+  },
+  "MONSTER.DOORMAKER": {
+    "combat_tags": [
+      "boss",
+      "phase_shift",
+      "burst_window"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 5,
+      "debuff_pressure": 0,
+      "phase_complexity": 5,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 0,
+      "target_priority": 5,
+      "volatility": 4
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "door_destroyed",
+        "description": "Door break opens a brief stun / damage window on the boss.",
+        "effect_type": "stun_self",
+        "severity": "high",
+        "state": "exposed",
+        "trait": "stun_self",
+        "trigger_type": "on_phase_start"
+      },
+      {
+        "category": "phase",
+        "condition": "cycle_reset",
+        "description": "Later loops create new, often stronger doors.",
+        "effect_type": "spawn_gate",
+        "severity": "high",
+        "state": "retreated",
+        "trait": "spawn_gate",
+        "trigger_type": "on_turn_end"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "gate_cycle",
+      "burst_window",
+      "reset_loop"
+    ],
+    "static_traits": [
+      {
+        "description": "Can hide behind a new door after the exposed window closes.",
+        "severity": "high",
+        "trait": "retreat_cycle"
+      }
+    ],
+    "summary": "Boss with gate cycles. Break the door, exploit the exposed stun / burst window, then expect a retreat and repeat with a thicker gate.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Doormaker",
+    "trait_tokens": [
+      {
+        "description": "Can hide behind a new door after the exposed window closes.",
+        "severity": "high",
+        "trait": "retreat_cycle"
+      },
+      {
+        "category": "phase",
+        "condition": "door_destroyed",
+        "description": "Door break opens a brief stun / damage window on the boss.",
+        "severity": "high",
+        "state": "exposed",
+        "trait": "stun_self",
+        "trigger_type": "on_phase_start"
+      },
+      {
+        "category": "phase",
+        "condition": "cycle_reset",
+        "description": "Later loops create new, often stronger doors.",
+        "severity": "high",
+        "state": "retreated",
+        "trait": "spawn_gate",
+        "trigger_type": "on_turn_end"
+      }
+    ]
+  },
+  "MONSTER.ENTOMANCER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Entomancer",
+    "trait_tokens": []
+  },
+  "MONSTER.EXOSKELETON": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Exoskeleton",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.FABRICATOR": {
+    "combat_tags": [
+      "engine"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Engine enemy whose value comes from persistent board or support pressure.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Fabricator",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ]
+  },
+  "MONSTER.FLAIL_KNIGHT": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Flail Knight",
+    "trait_tokens": []
+  },
+  "MONSTER.FLYCONID": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Flyconid",
+    "trait_tokens": []
+  },
+  "MONSTER.FOGMOG": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Fogmog",
+    "trait_tokens": []
+  },
+  "MONSTER.FOSSIL_STALKER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Fossil Stalker",
+    "trait_tokens": []
+  },
+  "MONSTER.FROG_KNIGHT": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Frog Knight",
+    "trait_tokens": []
+  },
+  "MONSTER.FUZZY_WURM_CRAWLER": {
+    "combat_tags": [
+      "scaling",
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 5,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 3
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "growth",
+      "burst_check",
+      "scaling"
+    ],
+    "static_traits": [
+      {
+        "description": "Threat increases sharply over multiple turns.",
+        "severity": "high",
+        "trait": "damage_ramp"
+      }
+    ],
+    "summary": "Scaling attacker. Looks manageable early, then snowballs into a burst check if left alone.",
+    "target_priority_hints": [],
+    "title": "Fuzzy Wurm Crawler",
+    "trait_tokens": [
+      {
+        "description": "Threat increases sharply over multiple turns.",
+        "severity": "high",
+        "trait": "damage_ramp"
+      }
+    ]
+  },
+  "MONSTER.GLOBE_HEAD": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Globe Head",
+    "trait_tokens": []
+  },
+  "MONSTER.GREMLIN_MERC": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Gremlin Merc",
+    "trait_tokens": []
+  },
+  "MONSTER.HAUNTED_SHIP": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Haunted Ship",
+    "trait_tokens": []
+  },
+  "MONSTER.HUNTER_KILLER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Hunter Killer",
+    "trait_tokens": []
+  },
+  "MONSTER.INFESTED_PRISM": {
+    "combat_tags": [
+      "elite",
+      "summoner",
+      "phase_shift"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 4,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 4
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "threshold_crossed",
+        "description": "Threshold damage can create additional board pressure.",
+        "effect_type": "split",
+        "severity": "medium",
+        "trait": "split",
+        "trigger_type": "on_hp_threshold"
+      }
+    ],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "killed",
+        "description": "Death may create follow-up pressure rather than ending the fight.",
+        "effect_type": "summon",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_death"
+      }
+    ],
+    "semantic_tags": [
+      "elite",
+      "summoner",
+      "phase_shift",
+      "board_flood"
+    ],
+    "static_traits": [
+      {
+        "description": "Board state can multiply or persist beyond the original body.",
+        "severity": "high",
+        "trait": "infested_core"
+      }
+    ],
+    "summary": "Reactive elite fight with split / summon style board management. Single-target plans can get dragged into bad tempo.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Plan kill order around follow-up summons / splits instead of assuming one clean lethal ends the pressure."
+      }
+    ],
+    "title": "Infested Prism",
+    "trait_tokens": [
+      {
+        "description": "Board state can multiply or persist beyond the original body.",
+        "severity": "high",
+        "trait": "infested_core"
+      },
+      {
+        "category": "reactive",
+        "condition": "killed",
+        "description": "Death may create follow-up pressure rather than ending the fight.",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_death"
+      },
+      {
+        "category": "phase",
+        "condition": "threshold_crossed",
+        "description": "Threshold damage can create additional board pressure.",
+        "severity": "medium",
+        "trait": "split",
+        "trigger_type": "on_hp_threshold"
+      }
+    ]
+  },
+  "MONSTER.INKLET": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Inklet",
+    "trait_tokens": []
+  },
+  "MONSTER.KIN_FOLLOWER": {
+    "combat_tags": [
+      "duo"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "multi_actor"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Kin Follower",
+    "trait_tokens": []
+  },
+  "MONSTER.KIN_PRIEST": {
+    "combat_tags": [
+      "engine",
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner",
+      "debuff"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Support / scaling enemy that gets more annoying if allowed repeated turns.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Kin Priest",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ]
+  },
+  "MONSTER.KNOWLEDGE_DEMON": {
+    "combat_tags": [
+      "boss",
+      "debuff",
+      "attrition"
+    ],
+    "danger_profile": {
+      "attrition": 5,
+      "burst": 0,
+      "debuff_pressure": 5,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 3,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 3
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "debuff_menu",
+      "attrition",
+      "build_check"
+    ],
+    "static_traits": [
+      {
+        "description": "Imposes build-specific constraints rather than one generic debuff.",
+        "severity": "high",
+        "trait": "choice_debuffs"
+      }
+    ],
+    "summary": "Boss debuff menu fight. You repeatedly accept the least-bad long-term constraint while still producing pressure.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Knowledge Demon",
+    "trait_tokens": [
+      {
+        "description": "Imposes build-specific constraints rather than one generic debuff.",
+        "severity": "high",
+        "trait": "choice_debuffs"
+      }
+    ]
+  },
+  "MONSTER.LAGAVULIN_MATRIARCH": {
+    "combat_tags": [
+      "boss",
+      "phase_shift",
+      "anti_long_fight"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 3,
+      "debuff_pressure": 4,
+      "phase_complexity": 3,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "sleep_break",
+        "description": "Starts asleep, then enters an active cycle once the opening window ends.",
+        "effect_type": "wake",
+        "severity": "medium",
+        "state": "awake",
+        "trait": "wake",
+        "trigger_type": "on_turn_start"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "sleep_start",
+      "stat_drain",
+      "scaling"
+    ],
+    "static_traits": [
+      {
+        "description": "Offers a temporary setup window before waking.",
+        "severity": "medium",
+        "trait": "sleeping_opening"
+      },
+      {
+        "description": "Late cycle reduces your stats while increasing its own damage profile.",
+        "severity": "high",
+        "trait": "stat_drain"
+      }
+    ],
+    "summary": "Sleeping boss with a setup window, then long-fight stat suppression and scaling. Slow stat-dependent decks get punished hard.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Lagavulin Matriarch",
+    "trait_tokens": [
+      {
+        "description": "Offers a temporary setup window before waking.",
+        "severity": "medium",
+        "trait": "sleeping_opening"
+      },
+      {
+        "description": "Late cycle reduces your stats while increasing its own damage profile.",
+        "severity": "high",
+        "trait": "stat_drain"
+      },
+      {
+        "category": "phase",
+        "condition": "sleep_break",
+        "description": "Starts asleep, then enters an active cycle once the opening window ends.",
+        "severity": "medium",
+        "state": "awake",
+        "trait": "wake",
+        "trigger_type": "on_turn_start"
+      }
+    ]
+  },
+  "MONSTER.LEAF_SLIME_M": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Simple frontline attacker; mostly a baseline damage / block check.",
+    "target_priority_hints": [],
+    "title": "Leaf Slime M",
+    "trait_tokens": []
+  },
+  "MONSTER.LEAF_SLIME_S": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Simple frontline attacker; mostly a baseline damage / block check.",
+    "target_priority_hints": [],
+    "title": "Leaf Slime S",
+    "trait_tokens": []
+  },
+  "MONSTER.LIVING_FOG": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Living Fog",
+    "trait_tokens": []
+  },
+  "MONSTER.LIVING_SHIELD": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Defensive / durable enemy that tends to stretch the fight.",
+    "target_priority_hints": [],
+    "title": "Living Shield",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.LOUSE_PROGENITOR": {
+    "combat_tags": [
+      "summoner",
+      "engine",
+      "priority_target"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 5,
+      "target_priority": 5,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "alive",
+        "description": "Continues adding board pressure if not removed.",
+        "effect_type": "summon",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_turn_end"
+      }
+    ],
+    "semantic_tags": [
+      "summoner",
+      "board_flood",
+      "engine"
+    ],
+    "static_traits": [
+      {
+        "description": "Primary value comes from sustaining or replacing adds.",
+        "severity": "high",
+        "trait": "spawn_core"
+      }
+    ],
+    "summary": "Summon-centric pressure source. If left alive it snowballs board count and drags single-target decks into bad tempo.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Kill the progenitor early if your deck is weak to board flood."
+      }
+    ],
+    "title": "Louse Progenitor",
+    "trait_tokens": [
+      {
+        "description": "Primary value comes from sustaining or replacing adds.",
+        "severity": "high",
+        "trait": "spawn_core"
+      },
+      {
+        "category": "reactive",
+        "condition": "alive",
+        "description": "Continues adding board pressure if not removed.",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_turn_end"
+      }
+    ]
+  },
+  "MONSTER.MAGI_KNIGHT": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Magi Knight",
+    "trait_tokens": []
+  },
+  "MONSTER.MAWLER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Mawler",
+    "trait_tokens": []
+  },
+  "MONSTER.MECHA_KNIGHT": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Mecha Knight",
+    "trait_tokens": []
+  },
+  "MONSTER.MYTE": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Myte",
+    "trait_tokens": []
+  },
+  "MONSTER.NIBBIT": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Nibbit",
+    "trait_tokens": []
+  },
+  "MONSTER.OVICOPTER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Ovicopter",
+    "trait_tokens": []
+  },
+  "MONSTER.OWL_MAGISTRATE": {
+    "combat_tags": [
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "debuff"
+    ],
+    "static_traits": [],
+    "summary": "Fast damage body that punishes weak early tempo.",
+    "target_priority_hints": [],
+    "title": "Owl Magistrate",
+    "trait_tokens": []
+  },
+  "MONSTER.PHANTASMAL_GARDENER": {
+    "combat_tags": [
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "debuff"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Phantasmal Gardener",
+    "trait_tokens": []
+  },
+  "MONSTER.PHROG_PARASITE": {
+    "combat_tags": [
+      "summoner",
+      "tempo_tax"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 5,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner",
+      "board_flood",
+      "tempo_tax"
+    ],
+    "static_traits": [
+      {
+        "description": "Encounter taxes decks that cannot pivot into AOE or clean point-targeting.",
+        "severity": "high",
+        "trait": "board_flood"
+      }
+    ],
+    "summary": "Summon / board-flood enemy that drags single-target decks into losing tempo lines.",
+    "target_priority_hints": [],
+    "title": "Phrog Parasite",
+    "trait_tokens": [
+      {
+        "description": "Encounter taxes decks that cannot pivot into AOE or clean point-targeting.",
+        "severity": "high",
+        "trait": "board_flood"
+      }
+    ]
+  },
+  "MONSTER.PUNCH_CONSTRUCT": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Defensive / durable enemy that tends to stretch the fight.",
+    "target_priority_hints": [],
+    "title": "Punch Construct",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.QUEEN": {
+    "combat_tags": [
+      "boss",
+      "backline",
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 5,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 3,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "binding",
+      "debuff",
+      "backline"
+    ],
+    "static_traits": [
+      {
+        "description": "Early plays each turn can be constrained by binding effects.",
+        "severity": "high",
+        "trait": "binding_control"
+      },
+      {
+        "description": "Can stack outsized Frail / Vulnerable / Weak pressure.",
+        "severity": "high",
+        "trait": "long_debuffs"
+      }
+    ],
+    "summary": "Boss backline controller. Applies binding / long debuffs while Torch Head Amalgam does much of the direct damage.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Queen",
+    "trait_tokens": [
+      {
+        "description": "Early plays each turn can be constrained by binding effects.",
+        "severity": "high",
+        "trait": "binding_control"
+      },
+      {
+        "description": "Can stack outsized Frail / Vulnerable / Weak pressure.",
+        "severity": "high",
+        "trait": "long_debuffs"
+      }
+    ]
+  },
+  "MONSTER.ROCKET": {
+    "combat_tags": [
+      "frontline",
+      "duo"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst",
+      "multi_actor"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Rocket",
+    "trait_tokens": []
+  },
+  "MONSTER.SCROLL_OF_BITING": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Scroll OF Biting",
+    "trait_tokens": []
+  },
+  "MONSTER.SEAPUNK": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Seapunk",
+    "trait_tokens": []
+  },
+  "MONSTER.SEWER_CLAM": {
+    "combat_tags": [
+      "tank"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "durable"
+    ],
+    "static_traits": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Sewer Clam",
+    "trait_tokens": [
+      {
+        "description": "Likely to stretch the fight through HP, block, or mitigation.",
+        "severity": "medium",
+        "trait": "durable_body"
+      }
+    ]
+  },
+  "MONSTER.SHRINKER_BEETLE": {
+    "combat_tags": [
+      "debuff",
+      "attrition"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 5,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "debuff",
+      "attrition",
+      "output_suppression"
+    ],
+    "static_traits": [
+      {
+        "description": "Repeatedly reduces your effective output / tempo.",
+        "severity": "medium",
+        "trait": "stat_suppression"
+      }
+    ],
+    "summary": "Debuff attrition enemy. Repeated stat pressure reduces future combat quality even if immediate damage looks modest.",
+    "target_priority_hints": [],
+    "title": "Shrinker Beetle",
+    "trait_tokens": [
+      {
+        "description": "Repeatedly reduces your effective output / tempo.",
+        "severity": "medium",
+        "trait": "stat_suppression"
+      }
+    ]
+  },
+  "MONSTER.SKULKING_COLONY": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Skulking Colony",
+    "trait_tokens": []
+  },
+  "MONSTER.SLIMED_BERSERKER": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Simple frontline attacker; mostly a baseline damage / block check.",
+    "target_priority_hints": [],
+    "title": "Slimed Berserker",
+    "trait_tokens": []
+  },
+  "MONSTER.SLITHERING_STRANGLER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Slithering Strangler",
+    "trait_tokens": []
+  },
+  "MONSTER.SLUDGE_SPINNER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Sludge Spinner",
+    "trait_tokens": []
+  },
+  "MONSTER.SLUMBERING_BEETLE": {
+    "combat_tags": [
+      "controller"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "debuff"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Slumbering Beetle",
+    "trait_tokens": []
+  },
+  "MONSTER.SNAPPING_JAXFRUIT": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Snapping Jaxfruit",
+    "trait_tokens": []
+  },
+  "MONSTER.SOUL_FYSH": {
+    "combat_tags": [
+      "boss",
+      "resource_tax",
+      "phase_shift"
+    ],
+    "danger_profile": {
+      "attrition": 5,
+      "burst": 0,
+      "debuff_pressure": 4,
+      "phase_complexity": 4,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 3
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "intangible_turn",
+        "description": "Alternates into intangible windows that redirect your best damage timing.",
+        "effect_type": "gain_intangible",
+        "severity": "high",
+        "trait": "gain_intangible",
+        "trigger_type": "on_turn_start"
+      }
+    ],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "status_left_in_hand",
+        "description": "Leaving Beckon unresolved causes direct HP loss.",
+        "effect_amount": 6,
+        "effect_type": "hp_loss",
+        "severity": "high",
+        "trait": "hp_loss",
+        "trigger_type": "on_turn_end"
+      }
+    ],
+    "semantic_tags": [
+      "boss",
+      "status_pressure",
+      "intangible",
+      "resource_tax"
+    ],
+    "static_traits": [
+      {
+        "description": "Specific status cards must be cleared or they convert into unavoidable HP loss.",
+        "severity": "high",
+        "trait": "beckon_tax"
+      },
+      {
+        "description": "Large damage is poor into intangible turns; use those turns for setup instead.",
+        "severity": "high",
+        "trait": "intangible_windows"
+      }
+    ],
+    "summary": "Status-pressure boss. Beckon taxes hand space and HP, while intangible turns punish wasted burst.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Soul Fysh",
+    "trait_tokens": [
+      {
+        "description": "Specific status cards must be cleared or they convert into unavoidable HP loss.",
+        "severity": "high",
+        "trait": "beckon_tax"
+      },
+      {
+        "description": "Large damage is poor into intangible turns; use those turns for setup instead.",
+        "severity": "high",
+        "trait": "intangible_windows"
+      },
+      {
+        "category": "reactive",
+        "condition": "status_left_in_hand",
+        "description": "Leaving Beckon unresolved causes direct HP loss.",
+        "effect_amount": 6,
+        "severity": "high",
+        "trait": "hp_loss",
+        "trigger_type": "on_turn_end"
+      },
+      {
+        "category": "phase",
+        "condition": "intangible_turn",
+        "description": "Alternates into intangible windows that redirect your best damage timing.",
+        "severity": "high",
+        "trait": "gain_intangible",
+        "trigger_type": "on_turn_start"
+      }
+    ]
+  },
+  "MONSTER.SOUL_NEXUS": {
+    "combat_tags": [
+      "elite",
+      "summoner",
+      "engine",
+      "priority_target"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 5,
+      "target_priority": 5,
+      "volatility": 3
+    },
+    "phase_rules": [],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "alive",
+        "description": "Repeatedly increases board pressure / reinforcements.",
+        "effect_type": "summon",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_turn_end"
+      }
+    ],
+    "semantic_tags": [
+      "elite",
+      "summoner",
+      "scaling",
+      "engine"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as the central value engine in the encounter.",
+        "severity": "high",
+        "trait": "summon_engine"
+      },
+      {
+        "description": "Fight becomes harder the longer the nexus stays alive.",
+        "severity": "high",
+        "trait": "scaling_core"
+      }
+    ],
+    "summary": "Elite summon hub / scaling core. Long fights get much worse once the nexus gets repeated value windows.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Usually focus the engine before cleanup unless lethal on adds is trivial."
+      }
+    ],
+    "title": "Soul Nexus",
+    "trait_tokens": [
+      {
+        "description": "Acts as the central value engine in the encounter.",
+        "severity": "high",
+        "trait": "summon_engine"
+      },
+      {
+        "description": "Fight becomes harder the longer the nexus stays alive.",
+        "severity": "high",
+        "trait": "scaling_core"
+      },
+      {
+        "category": "reactive",
+        "condition": "alive",
+        "description": "Repeatedly increases board pressure / reinforcements.",
+        "severity": "high",
+        "trait": "summon",
+        "trigger_type": "on_turn_end"
+      }
+    ]
+  },
+  "MONSTER.SPECTRAL_KNIGHT": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Spectral Knight",
+    "trait_tokens": []
+  },
+  "MONSTER.SPINY_TOAD": {
+    "combat_tags": [
+      "retaliation",
+      "frontline",
+      "priority_on_spam_decks"
+    ],
+    "danger_profile": {
+      "attrition": 4,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 5,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 2
+    },
+    "phase_rules": [],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "contact",
+        "description": "On hit, retaliates / punishes contact damage.",
+        "effect_type": "retaliate",
+        "severity": "high",
+        "trait": "retaliate",
+        "trigger_type": "on_hit"
+      }
+    ],
+    "semantic_tags": [
+      "retaliation",
+      "contact_punish",
+      "attrition"
+    ],
+    "static_traits": [
+      {
+        "description": "Punishes contact hits, so small-hit spam is inefficient.",
+        "severity": "high",
+        "trait": "contact_retaliate"
+      }
+    ],
+    "summary": "Contact-punish enemy. Multi-hit turns become expensive unless you remove or route around the backlash first.",
+    "target_priority_hints": [
+      {
+        "priority": "high",
+        "reason": "Remove retaliation sources before committing multi-hit damage turns."
+      }
+    ],
+    "title": "Spiny Toad",
+    "trait_tokens": [
+      {
+        "description": "Punishes contact hits, so small-hit spam is inefficient.",
+        "severity": "high",
+        "trait": "contact_retaliate"
+      },
+      {
+        "category": "reactive",
+        "condition": "contact",
+        "description": "On hit, retaliates / punishes contact damage.",
+        "severity": "high",
+        "trait": "retaliate",
+        "trigger_type": "on_hit"
+      }
+    ]
+  },
+  "MONSTER.TERROR_EEL": {
+    "combat_tags": [
+      "frontline"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "burst"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Terror Eel",
+    "trait_tokens": []
+  },
+  "MONSTER.TEST_SUBJECT": {
+    "combat_tags": [
+      "boss",
+      "phase_shift",
+      "attrition"
+    ],
+    "danger_profile": {
+      "attrition": 5,
+      "burst": 5,
+      "debuff_pressure": 3,
+      "phase_complexity": 5,
+      "retaliation": 0,
+      "scaling": 3,
+      "summon_pressure": 0,
+      "target_priority": 5,
+      "volatility": 5
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "phase_change",
+        "description": "Progresses through multiple HP-gated phases.",
+        "effect_type": "phase_shift",
+        "severity": "high",
+        "trait": "phase_shift",
+        "trigger_type": "on_hp_threshold"
+      },
+      {
+        "category": "phase",
+        "condition": "phase_three_intangible_turn",
+        "description": "Final phase alternates into intangible turns.",
+        "effect_type": "gain_intangible",
+        "severity": "high",
+        "state": "phase_three",
+        "trait": "gain_intangible",
+        "trigger_type": "on_turn_start"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "multi_phase",
+      "intangible",
+      "wound_pressure"
+    ],
+    "static_traits": [
+      {
+        "description": "Early phase can reward restraint on unnecessary skills.",
+        "severity": "medium",
+        "trait": "skill_punish_phase"
+      },
+      {
+        "description": "Middle phase punishes taking chip through block.",
+        "severity": "high",
+        "trait": "wound_phase"
+      },
+      {
+        "description": "Final phase has turns where burst is heavily devalued.",
+        "severity": "high",
+        "trait": "intangible_phase"
+      }
+    ],
+    "summary": "Three-phase boss. Stage one punishes skill spam, stage two punishes unblocked damage with wounds, stage three alternates intangible and burn pressure.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Test Subject",
+    "trait_tokens": [
+      {
+        "description": "Early phase can reward restraint on unnecessary skills.",
+        "severity": "medium",
+        "trait": "skill_punish_phase"
+      },
+      {
+        "description": "Middle phase punishes taking chip through block.",
+        "severity": "high",
+        "trait": "wound_phase"
+      },
+      {
+        "description": "Final phase has turns where burst is heavily devalued.",
+        "severity": "high",
+        "trait": "intangible_phase"
+      },
+      {
+        "category": "phase",
+        "condition": "phase_change",
+        "description": "Progresses through multiple HP-gated phases.",
+        "severity": "high",
+        "trait": "phase_shift",
+        "trigger_type": "on_hp_threshold"
+      },
+      {
+        "category": "phase",
+        "condition": "phase_three_intangible_turn",
+        "description": "Final phase alternates into intangible turns.",
+        "severity": "high",
+        "state": "phase_three",
+        "trait": "gain_intangible",
+        "trigger_type": "on_turn_start"
+      }
+    ]
+  },
+  "MONSTER.THE_FORGOTTEN": {
+    "combat_tags": [
+      "duo"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "multi_actor"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "The Forgotten",
+    "trait_tokens": []
+  },
+  "MONSTER.THE_INSATIABLE": {
+    "combat_tags": [
+      "boss",
+      "speed_check",
+      "resource_tax"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 4,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 0,
+      "target_priority": 5,
+      "volatility": 5
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "countdown_active",
+        "description": "Each turn advances an external kill timer unless delayed.",
+        "effect_type": "countdown_tick",
+        "severity": "high",
+        "trait": "countdown_tick",
+        "trigger_type": "on_turn_start"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "countdown",
+      "dps_check",
+      "resource_tax"
+    ],
+    "static_traits": [
+      {
+        "description": "A non-standard death timer pressures you even if block is stable.",
+        "severity": "high",
+        "trait": "doom_clock"
+      },
+      {
+        "description": "Dedicated delay cards must be paid for without losing the damage race.",
+        "severity": "high",
+        "trait": "escape_card_tax"
+      }
+    ],
+    "summary": "DPS / countdown boss. You are racing both normal damage and a kill timer that must be extended with dedicated cards.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "The Insatiable",
+    "trait_tokens": [
+      {
+        "description": "A non-standard death timer pressures you even if block is stable.",
+        "severity": "high",
+        "trait": "doom_clock"
+      },
+      {
+        "description": "Dedicated delay cards must be paid for without losing the damage race.",
+        "severity": "high",
+        "trait": "escape_card_tax"
+      },
+      {
+        "category": "phase",
+        "condition": "countdown_active",
+        "description": "Each turn advances an external kill timer unless delayed.",
+        "severity": "high",
+        "trait": "countdown_tick",
+        "trigger_type": "on_turn_start"
+      }
+    ]
+  },
+  "MONSTER.THE_LOST": {
+    "combat_tags": [
+      "duo"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "multi_actor"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "The Lost",
+    "trait_tokens": []
+  },
+  "MONSTER.THE_OBSCURA": {
+    "combat_tags": [
+      "phase_shift"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 4,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 4
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "phase_shift"
+    ],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "The Obscura",
+    "trait_tokens": []
+  },
+  "MONSTER.THIEVING_HOPPER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Fast damage body that punishes weak early tempo.",
+    "target_priority_hints": [],
+    "title": "Thieving Hopper",
+    "trait_tokens": []
+  },
+  "MONSTER.TOADPOLE": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Toadpole",
+    "trait_tokens": []
+  },
+  "MONSTER.TORCH_HEAD_AMALGAM": {
+    "combat_tags": [
+      "boss_duo",
+      "frontline",
+      "burst"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 5,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 5,
+      "volatility": 4
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss_duo",
+      "multi_hit",
+      "direct_damage"
+    ],
+    "static_traits": [
+      {
+        "description": "Usually the immediate HP loss source in the duo fight.",
+        "severity": "high",
+        "trait": "primary_damage_source"
+      }
+    ],
+    "summary": "Primary direct-damage partner in the Queen fight. Removing it first often stabilizes the encounter dramatically.",
+    "target_priority_hints": [],
+    "title": "Torch Head Amalgam",
+    "trait_tokens": [
+      {
+        "description": "Usually the immediate HP loss source in the duo fight.",
+        "severity": "high",
+        "trait": "primary_damage_source"
+      }
+    ]
+  },
+  "MONSTER.TRACKER_RUBY_RAIDER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Tracker Ruby Raider",
+    "trait_tokens": []
+  },
+  "MONSTER.TUNNELER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Tunneler",
+    "trait_tokens": []
+  },
+  "MONSTER.TURRET_OPERATOR": {
+    "combat_tags": [
+      "engine"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 4,
+      "target_priority": 4,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "summoner"
+    ],
+    "static_traits": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ],
+    "summary": "Fast damage body that punishes weak early tempo.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Turret Operator",
+    "trait_tokens": [
+      {
+        "description": "Acts as a pressure engine rather than just a damage body.",
+        "severity": "medium",
+        "trait": "engine_body"
+      }
+    ]
+  },
+  "MONSTER.TWIG_SLIME_M": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Simple frontline attacker; mostly a baseline damage / block check.",
+    "target_priority_hints": [],
+    "title": "Twig Slime M",
+    "trait_tokens": []
+  },
+  "MONSTER.TWIG_SLIME_S": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Simple frontline attacker; mostly a baseline damage / block check.",
+    "target_priority_hints": [],
+    "title": "Twig Slime S",
+    "trait_tokens": []
+  },
+  "MONSTER.TWO_TAILED_RAT": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Fast damage body that punishes weak early tempo.",
+    "target_priority_hints": [],
+    "title": "Two Tailed Rat",
+    "trait_tokens": []
+  },
+  "MONSTER.VANTOM": {
+    "combat_tags": [
+      "boss",
+      "frontline",
+      "anti_big_hit"
+    ],
+    "danger_profile": {
+      "attrition": 3,
+      "burst": 4,
+      "debuff_pressure": 0,
+      "phase_complexity": 4,
+      "retaliation": 0,
+      "scaling": 3,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 4
+    },
+    "phase_rules": [
+      {
+        "category": "phase",
+        "condition": "opening_cycle",
+        "description": "Starts in a slippery / reduced-damage opening state.",
+        "effect_type": "damage_cap",
+        "severity": "high",
+        "state": "opening",
+        "trait": "damage_cap",
+        "trigger_type": "on_turn_start"
+      }
+    ],
+    "reactive_triggers": [],
+    "semantic_tags": [
+      "boss",
+      "damage_cap",
+      "multi_hit",
+      "wound_pressure"
+    ],
+    "static_traits": [
+      {
+        "description": "Early hits are heavily damped; many small attacks remove the protection faster.",
+        "severity": "high",
+        "trait": "hit_tax_opening"
+      },
+      {
+        "description": "Dangerous turns add wound clutter on top of damage.",
+        "severity": "medium",
+        "trait": "wound_pressure"
+      }
+    ],
+    "summary": "Boss with hit-tax opening, then escalating multi-hit and wound pressure. Low-cost and multi-hit answers are preferred.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Vantom",
+    "trait_tokens": [
+      {
+        "description": "Early hits are heavily damped; many small attacks remove the protection faster.",
+        "severity": "high",
+        "trait": "hit_tax_opening"
+      },
+      {
+        "description": "Dangerous turns add wound clutter on top of damage.",
+        "severity": "medium",
+        "trait": "wound_pressure"
+      },
+      {
+        "category": "phase",
+        "condition": "opening_cycle",
+        "description": "Starts in a slippery / reduced-damage opening state.",
+        "severity": "high",
+        "state": "opening",
+        "trait": "damage_cap",
+        "trigger_type": "on_turn_start"
+      }
+    ]
+  },
+  "MONSTER.VINE_SHAMBLER": {
+    "combat_tags": [],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 0,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 0,
+      "summon_pressure": 0,
+      "target_priority": 0,
+      "volatility": 0
+    },
+    "phase_rules": [],
+    "reactive_triggers": [],
+    "semantic_tags": [],
+    "static_traits": [],
+    "summary": "Generic enemy metadata bootstrap entry. Prefer live powers / intent for exact planning.",
+    "target_priority_hints": [],
+    "title": "Vine Shambler",
+    "trait_tokens": []
+  },
+  "MONSTER.WATERFALL_GIANT": {
+    "combat_tags": [
+      "boss",
+      "speed_check",
+      "burst_window"
+    ],
+    "danger_profile": {
+      "attrition": 0,
+      "burst": 5,
+      "debuff_pressure": 0,
+      "phase_complexity": 0,
+      "retaliation": 0,
+      "scaling": 4,
+      "summon_pressure": 0,
+      "target_priority": 4,
+      "volatility": 5
+    },
+    "phase_rules": [],
+    "reactive_triggers": [
+      {
+        "category": "reactive",
+        "condition": "killed",
+        "description": "Death triggers a delayed explosion rather than an immediate safe end state.",
+        "effect_type": "retaliate",
+        "severity": "high",
+        "trait": "retaliate",
+        "trigger_type": "on_death"
+      }
+    ],
+    "semantic_tags": [
+      "boss",
+      "death_explosion",
+      "speed_check",
+      "countdown_like"
+    ],
+    "static_traits": [
+      {
+        "description": "Killing the body does not immediately end danger; the explosion turn still matters.",
+        "severity": "high",
+        "trait": "death_explosion"
+      },
+      {
+        "description": "Deathburst grows if the fight drags.",
+        "severity": "high",
+        "trait": "explosion_scaling"
+      }
+    ],
+    "summary": "Speed-check boss with a lethal death explosion that grows over time. The last turn can be the real kill shot.",
+    "target_priority_hints": [
+      {
+        "priority": "medium",
+        "reason": "Usually worth prioritizing if your deck struggles with this enemy's core axis."
+      }
+    ],
+    "title": "Waterfall Giant",
+    "trait_tokens": [
+      {
+        "description": "Killing the body does not immediately end danger; the explosion turn still matters.",
+        "severity": "high",
+        "trait": "death_explosion"
+      },
+      {
+        "description": "Deathburst grows if the fight drags.",
+        "severity": "high",
+        "trait": "explosion_scaling"
+      },
+      {
+        "category": "reactive",
+        "condition": "killed",
+        "description": "Death triggers a delayed explosion rather than an immediate safe end state.",
+        "severity": "high",
+        "trait": "retaliate",
+        "trigger_type": "on_death"
+      }
+    ]
+  }
+}

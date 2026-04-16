@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Diagnostics;
 using System.Text.Json.Serialization;
 using MegaCrit.Sts2.Core.Nodes;
 
@@ -357,6 +358,8 @@ internal static partial class BridgeGameApi
         request ??= new BridgeEnvStepRequest();
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvStepTimeoutMs);
         await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
+        var totalStopwatch = Stopwatch.StartNew();
+        var timing = new BridgeEnvStepTimingCollector();
         var episodeId = request.EpisodeId?.Trim();
         if (string.IsNullOrWhiteSpace(episodeId))
         {
@@ -367,6 +370,15 @@ internal static partial class BridgeGameApi
         }
 
         var episode = RequireActiveEnvEpisode(episodeId);
+        if (string.Equals(episode.EpisodeMode, "combat_sandbox", StringComparison.Ordinal))
+        {
+            return await StepCombatSandboxEpisodeAsync(
+                request,
+                episode,
+                timeoutMs,
+                cancellationToken);
+        }
+
         if (episode.Done)
         {
             throw new BridgeRequestException(
@@ -375,35 +387,52 @@ internal static partial class BridgeGameApi
                 $"Episode '{episodeId}' is already done. Call env/reset to start a new episode.");
         }
 
+        var beforeWaitStopwatch = Stopwatch.StartNew();
         var before = await WaitForStableEnvStateAsync(
             null,
             timeoutMs,
             requireActionableOrDone: true,
-            cancellationToken);
-        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, timeoutMs, cancellationToken);
+            cancellationToken,
+            timing);
+        timing.BeforeWaitMs += beforeWaitStopwatch.Elapsed.TotalMilliseconds;
+        var adjustmentsStopwatch = Stopwatch.StartNew();
+        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, timeoutMs, cancellationToken, timing);
+        timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
 
         if (before.Done)
         {
             episode.Done = true;
-            return BuildEnvStepPayload(
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payloadStopwatch = Stopwatch.StartNew();
+            var payload = BuildEnvStepPayload(
                 episode,
                 before,
                 before,
                 selectedAction: null,
                 truncated: false,
-                truncationReason: null);
+                truncationReason: null,
+                timing: timing);
+            timing.PayloadBuildMs += payloadStopwatch.Elapsed.TotalMilliseconds;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            return payload;
         }
 
-        if (!before.Actionable)
+        if (!before.Actionable && !IsEnvIntermediateDecisionSurface(before))
         {
             episode.Done = true;
-            return BuildEnvStepPayload(
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payloadStopwatch = Stopwatch.StartNew();
+            var payload = BuildEnvStepPayload(
                 episode,
                 before,
                 before,
                 selectedAction: null,
                 truncated: true,
-                truncationReason: "step_timeout_waiting_for_actionable_or_terminal_state");
+                truncationReason: "step_timeout_waiting_for_actionable_or_terminal_state",
+                timing: timing);
+            timing.PayloadBuildMs += payloadStopwatch.Elapsed.TotalMilliseconds;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            return payload;
         }
 
         // Resolve and execute the action. All failures are captured as actionError
@@ -412,12 +441,16 @@ internal static partial class BridgeGameApi
         string? actionError = null;
         try
         {
+            var resolveStopwatch = Stopwatch.StartNew();
             selectedAction = ResolveRequestedEnvAction(before, request);
+            timing.ActionResolveMs += resolveStopwatch.Elapsed.TotalMilliseconds;
+            var executeStopwatch = Stopwatch.StartNew();
             await ExecuteEnvActionAsync(
                 selectedAction.Action,
                 timeoutMs,
                 cancellationToken,
                 $"env.step.execute:{selectedAction.Action.ActionId}");
+            timing.ActionExecuteMs += executeStopwatch.Elapsed.TotalMilliseconds;
         }
         catch (OperationCanceledException)
         {
@@ -432,23 +465,55 @@ internal static partial class BridgeGameApi
             actionError = "action_execution_error";
         }
 
-        var after = await WaitForStableEnvStateAsync(
-            before.LogicHash,
-            timeoutMs,
-            requireActionableOrDone: true,
-            cancellationToken);
+        BridgeEnvSnapshot after;
+        if (!string.IsNullOrWhiteSpace(actionError) && before.Actionable)
+        {
+            after = before;
+        }
+        else
+        {
+            var afterWaitStopwatch = Stopwatch.StartNew();
+            var afterWaitTimeoutMs = IsCardSelectionSelectAction(selectedAction)
+                ? GetCardSelectionSelectFastFailTimeoutMs(timeoutMs)
+                : timeoutMs;
+            after = await WaitForStableEnvStateAsync(
+                before.LogicHash,
+                afterWaitTimeoutMs,
+                requireActionableOrDone: !ShouldAllowIntermediateSelectionState(selectedAction),
+                cancellationToken,
+                timing,
+                baselineSnapshot: before);
+            timing.AfterWaitMs += afterWaitStopwatch.Elapsed.TotalMilliseconds;
+        }
+        var autoConfirmStopwatch = Stopwatch.StartNew();
         after = await MaybeAutoConfirmSingleDeckUpgradeAsync(
             selectedAction,
             after,
             timeoutMs,
             cancellationToken);
-        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, timeoutMs, cancellationToken);
+        after = await MaybeAutoConfirmSingleCardSelectionAsync(
+            selectedAction,
+            after,
+            timeoutMs,
+            cancellationToken);
+        timing.AutoConfirmMs += autoConfirmStopwatch.Elapsed.TotalMilliseconds;
+        adjustmentsStopwatch = Stopwatch.StartNew();
+        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, timeoutMs, cancellationToken, timing);
+        timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+
+        var cardSelectionNoProgressAfterAction =
+            IsCardSelectionSelectAction(selectedAction) &&
+            string.IsNullOrWhiteSpace(actionError) &&
+            !after.Done &&
+            !HasCardSelectionSelectionProgress(before, after);
 
         var noStateChangeAfterAction =
             selectedAction is not null &&
             string.IsNullOrWhiteSpace(actionError) &&
             !after.Done &&
-            before.LogicHash.Equals(after.LogicHash, StringComparison.Ordinal);
+            (cardSelectionNoProgressAfterAction ||
+             (before.LogicHash.Equals(after.LogicHash, StringComparison.Ordinal) &&
+              !HasMeaningfulEnvSnapshotDifference(before, after)));
 
         if (noStateChangeAfterAction)
         {
@@ -460,18 +525,25 @@ internal static partial class BridgeGameApi
         {
             episode.StepIndex++;
             episode.Done = true;
-            return BuildEnvStepPayload(episode, before, after, selectedAction,
-                truncated: false, truncationReason: null, actionError, forceDone: true);
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payloadStopwatch = Stopwatch.StartNew();
+            var payload = BuildEnvStepPayload(episode, before, after, selectedAction,
+                truncated: false, truncationReason: null, actionError, forceDone: true, timing: timing);
+            timing.PayloadBuildMs += payloadStopwatch.Elapsed.TotalMilliseconds;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            return payload;
         }
 
         episode.StepIndex++;
-        var truncated = (!after.Actionable && !after.Done) || noStateChangeAfterAction;
+        var truncated = ((!after.Actionable && !after.Done && !IsEnvIntermediateDecisionSurface(after)) || noStateChangeAfterAction);
         if (after.Done || truncated)
         {
             episode.Done = true;
         }
 
-        return BuildEnvStepPayload(
+        timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+        var finalPayloadStopwatch = Stopwatch.StartNew();
+        var finalPayload = BuildEnvStepPayload(
             episode,
             before,
             after,
@@ -482,7 +554,23 @@ internal static partial class BridgeGameApi
                     ? "step_action_no_state_change"
                     : "step_timeout_waiting_for_actionable_or_terminal_state")
                 : null,
-            actionError);
+            actionError,
+            timing: timing);
+        timing.PayloadBuildMs += finalPayloadStopwatch.Elapsed.TotalMilliseconds;
+        timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+        return finalPayload;
+    }
+
+    private static bool ShouldAllowIntermediateSelectionState(BridgeResolvedActionSelection? selectedAction)
+    {
+        if (selectedAction is null)
+        {
+            return false;
+        }
+
+        var actionId = selectedAction.Action.ActionId;
+        return actionId.StartsWith("deck_upgrade:select:", StringComparison.Ordinal) ||
+               actionId.StartsWith("card_selection:select:", StringComparison.Ordinal);
     }
 
     private static async Task<BridgeEnvSnapshot> MaybeAutoConfirmSingleDeckUpgradeAsync(
@@ -525,7 +613,71 @@ internal static partial class BridgeGameApi
             snapshot.LogicHash,
             timeoutMs,
             requireActionableOrDone: true,
-            cancellationToken);
+            cancellationToken,
+            baselineSnapshot: snapshot);
+    }
+
+    private static async Task<BridgeEnvSnapshot> MaybeAutoConfirmSingleCardSelectionAsync(
+        BridgeResolvedActionSelection? selectedAction,
+        BridgeEnvSnapshot snapshot,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        if (selectedAction is null ||
+            !selectedAction.Action.ActionId.StartsWith("card_selection:select:", StringComparison.Ordinal) ||
+            !string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) ||
+            snapshot.Done)
+        {
+            return snapshot;
+        }
+
+        var cardSelectionScreen = snapshot.Context.CardSelectionScreen;
+        if (cardSelectionScreen is null || !IsNodeVisible(cardSelectionScreen))
+        {
+            return snapshot;
+        }
+
+        if (!ShouldAutoConfirmSingleCardSelection(cardSelectionScreen) ||
+            CountSelectedCardSelectionCards(cardSelectionScreen) <= 0)
+        {
+            return snapshot;
+        }
+
+        try
+        {
+            await RunOnMainThreadGuardedAsync(
+                () =>
+                {
+                    InvokeCardSelectionConfirmAction(
+                        cardSelectionScreen,
+                        ResolveCardSelectionConfirmButton(cardSelectionScreen));
+                    return true;
+                },
+                "env.step.card_selection_confirm",
+                timeoutMs,
+                cancellationToken);
+
+            await WaitForPumpTicksGuardedAsync(
+                1,
+                "env.step.card_selection_confirm.post_pump",
+                timeoutMs,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return snapshot;
+        }
+
+        return await WaitForStableEnvStateAsync(
+            snapshot.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken,
+            baselineSnapshot: snapshot);
     }
 
     private static int NormalizeEnvTimeout(int? requestedTimeoutMs, int defaultTimeoutMs)
@@ -675,7 +827,8 @@ internal static partial class BridgeGameApi
     private static async Task<BridgeEnvSnapshot> MaybeAutoCloseResidualMapOverlayAsync(
         BridgeEnvSnapshot snapshot,
         int timeoutMs,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        BridgeEnvStepTimingCollector? timing = null)
     {
         if (!ShouldAutoCloseResidualMapOverlay(snapshot))
         {
@@ -705,7 +858,15 @@ internal static partial class BridgeGameApi
             return snapshot;
         }
 
+        if (timing is not null)
+        {
+            timing.WaitPumpCalls++;
+        }
         await WaitForPumpTicksGuardedAsync(1, "env.close_residual_map_overlay.post_pump", timeoutMs, cancellationToken);
+        if (timing is not null)
+        {
+            timing.SnapshotCalls++;
+        }
         return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.close_residual_map_overlay.snapshot");
     }
 
@@ -737,7 +898,9 @@ internal static partial class BridgeGameApi
         string? baselineLogicHash,
         int timeoutMs,
         bool requireActionableOrDone,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        BridgeEnvStepTimingCollector? timing = null,
+        BridgeEnvSnapshot? baselineSnapshot = null)
     {
         var startedAt = DateTime.UtcNow;
         var stableHash = string.Empty;
@@ -747,14 +910,24 @@ internal static partial class BridgeGameApi
         while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (timing is not null)
+            {
+                timing.StableIterations++;
+                timing.SnapshotCalls++;
+            }
             var snapshot = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.snapshot");
-            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken);
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken, timing);
             lastSnapshot = snapshot;
-            var ready = snapshot.Done || !requireActionableOrDone || snapshot.Actionable;
+            var ready = snapshot.Done ||
+                        !requireActionableOrDone ||
+                        snapshot.Actionable ||
+                        IsEnvIntermediateDecisionSurface(snapshot);
             var changedFromBaseline = baselineLogicHash is null ||
                                       !baselineLogicHash.Equals(snapshot.LogicHash, StringComparison.Ordinal);
+            var progressedFromBaseline = baselineSnapshot is not null &&
+                                         HasMeaningfulEnvSnapshotDifference(baselineSnapshot, snapshot);
 
-            if (ready && changedFromBaseline)
+            if (ready && (changedFromBaseline || progressedFromBaseline))
             {
                 if (snapshot.LogicHash.Equals(stableHash, StringComparison.Ordinal))
                 {
@@ -777,10 +950,23 @@ internal static partial class BridgeGameApi
                 stableCount = 0;
             }
 
+            if (timing is not null)
+            {
+                timing.WaitPumpCalls++;
+            }
             await WaitForPumpTicksGuardedAsync(1, "env.wait_stable.wait_pump", timeoutMs, cancellationToken);
         }
 
-        return lastSnapshot ?? await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.final_snapshot");
+        if (lastSnapshot is not null)
+        {
+            return lastSnapshot;
+        }
+
+        if (timing is not null)
+        {
+            timing.SnapshotCalls++;
+        }
+        return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.final_snapshot");
     }
 
     private static async Task<object?> TryRebindActiveRunAsync(

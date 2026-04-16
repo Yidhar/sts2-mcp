@@ -213,6 +213,7 @@ def _build_profile(obs: dict[str, Any] | None) -> dict[str, float]:
 @dataclass
 class RunMemoryState:
     episode_mode: str = "full_run"
+    potion_mechanics_available: bool = True
     combats_seen: int = 0
     elites_seen: int = 0
     bosses_seen: int = 0
@@ -239,8 +240,17 @@ class RunMemoryState:
 class RunMemoryTracker:
     """Heuristic long-horizon run memory used by the new planning stack."""
 
-    def __init__(self, *, episode_mode: str = "full_run") -> None:
-        self.state = RunMemoryState(episode_mode=episode_mode)
+    def __init__(
+        self,
+        *,
+        episode_mode: str = "full_run",
+        potion_mechanics_available: bool = True,
+    ) -> None:
+        self._default_potion_mechanics_available = bool(potion_mechanics_available)
+        self.state = RunMemoryState(
+            episode_mode=episode_mode,
+            potion_mechanics_available=self._default_potion_mechanics_available,
+        )
 
     def reset(
         self,
@@ -248,8 +258,14 @@ class RunMemoryTracker:
         legal_actions: list[dict[str, Any]] | None = None,
         *,
         episode_mode: str = "full_run",
+        potion_mechanics_available: bool | None = None,
     ) -> None:
-        self.state = RunMemoryState(episode_mode=episode_mode)
+        if potion_mechanics_available is None:
+            potion_mechanics_available = self._default_potion_mechanics_available
+        self.state = RunMemoryState(
+            episode_mode=episode_mode,
+            potion_mechanics_available=bool(potion_mechanics_available),
+        )
         self._absorb_observation(obs, legal_actions)
 
     def update_transition(
@@ -339,6 +355,8 @@ class RunMemoryTracker:
             "objective_text": objective_text,
             "semantic_actions": semantic_actions,
             "last_semantic_action": self.state.last_semantic_action or {},
+            "episode_mode": self.state.episode_mode,
+            "potion_mechanics_available": 1.0 if self.state.potion_mechanics_available else 0.0,
         }
 
     def _encode_run_memory(
@@ -358,6 +376,7 @@ class RunMemoryTracker:
         hp_ratio = hp / max_hp
         gold = _float(player.get("gold"))
         potion_count = _count_nonempty_potions(obs)
+        potion_mechanics_available = 1.0 if self.state.potion_mechanics_available else 0.0
         build = _build_profile(obs)
         route_bias = _visible_route_biases(legal_actions)
         room_type = _room_type(obs)
@@ -367,7 +386,11 @@ class RunMemoryTracker:
         rest_pressure = _clip01((0.60 - hp_ratio) * 2.0 + route_bias["rest"] * 0.5)
         preserve_hp_bias = _clip01((0.70 - hp_ratio) * 1.6 + elite_pressure * 0.5 + boss_pressure * 0.5)
         greed_bias = _clip01((hp_ratio - 0.70) * 1.5 + build["consistency"] * 0.3 - preserve_hp_bias * 0.4)
-        resource_pressure = _clip01(route_bias["shop"] * 0.5 + (1.0 if gold >= 150 else 0.0) * 0.2 + (1.0 if potion_count <= 1 else 0.0) * 0.2)
+        resource_pressure = _clip01(
+            route_bias["shop"] * 0.5
+            + (1.0 if gold >= 150 else 0.0) * 0.2
+            + potion_mechanics_available * ((1.0 if potion_count <= 1 else 0.0) * 0.2)
+        )
 
         vector[0] = _clip01(hp_ratio)
         vector[1] = _clip01(self.state.lowest_hp_ratio_seen)
@@ -400,7 +423,11 @@ class RunMemoryTracker:
         vector[28] = build["high_cost_density"]
         vector[29] = build["zero_cost_density"]
         vector[30] = build["x_cost_density"]
-        vector[31] = _clip01(0.5 * elite_pressure + 0.3 * boss_pressure + (1.0 if potion_count <= 1 else 0.0) * 0.2)
+        vector[31] = _clip01(
+            0.5 * elite_pressure
+            + 0.3 * boss_pressure
+            + potion_mechanics_available * ((1.0 if potion_count <= 1 else 0.0) * 0.2)
+        )
         vector[32] = rest_pressure
         vector[33] = elite_pressure
         vector[34] = boss_pressure
@@ -414,14 +441,19 @@ class RunMemoryTracker:
         vector[42] = 1.0 if self.state.episode_mode == "combat_sandbox" else 0.0
         vector[43] = _clip01(len(combat.get("enemies") or []) / 4.0) if isinstance(combat, dict) else 0.0
         vector[44] = _clip01(sum(1.0 for relic in (player.get("relics") or []) if isinstance(relic, dict) and "energy" in str(relic.get("summary") or "").lower()) / 3.0)
-        vector[45] = build["heal"]
+        # Use this slot for a direct "potion system exists in this env" flag.
+        # Combat sandbox currently runs without potion mechanics, while full-run
+        # does. Keeping this explicit avoids conflating "zero potions carried"
+        # with "potions are not part of the environment at all".
+        vector[45] = potion_mechanics_available
         vector[46] = build["consistency"]
         vector[47] = build["build_gap_risk"]
 
         summary = (
             f"hp={int(hp)}/{int(max_hp)} hp_mode={preserve_hp_bias:.2f} "
             f"elite={elite_pressure:.2f} boss={boss_pressure:.2f} "
-            f"deck(front={build['frontload']:.2f},blk={build['block']:.2f},draw={build['draw']:.2f},scale={build['scaling']:.2f})"
+            f"deck(front={build['frontload']:.2f},blk={build['block']:.2f},draw={build['draw']:.2f},scale={build['scaling']:.2f}) "
+            f"potions={'on' if self.state.potion_mechanics_available else 'off'}"
         )
         return vector, summary
 
@@ -445,6 +477,7 @@ class RunMemoryTracker:
         route_shop = float(run_memory_vector[18])
         route_rest = float(run_memory_vector[19])
         potion_conservation = float(run_memory_vector[31])
+        potion_mechanics_available = float(run_memory_vector[45])
         in_combat = bool((obs.get("combat") or {}))
         zero_damage_desire = _clip01(preserve_hp_bias * (1.0 if in_combat else 0.5) + elite_pressure * 0.2 + boss_pressure * 0.2)
 
@@ -452,7 +485,10 @@ class RunMemoryTracker:
         hp_loss_priority = _clip01(0.7 + preserve_hp_bias * 0.3)
         build_priority = _clip01(0.35 + greed_bias * 0.45 + (1.0 if hp_ratio > 0.70 else 0.0) * 0.10)
         resource_priority = _clip01(0.40 + resource_pressure * 0.40 + potion_conservation * 0.20)
-        save_potion_mode = _clip01(max(elite_pressure, boss_pressure) * 0.7 + (1.0 if room_type not in {"Elite", "Boss"} else 0.0) * 0.2)
+        save_potion_mode = potion_mechanics_available * _clip01(
+            max(elite_pressure, boss_pressure) * 0.7
+            + (1.0 if room_type not in {"Elite", "Boss"} else 0.0) * 0.2
+        )
         force_rest_mode = _clip01(run_memory_vector[32] * 0.8 + (1.0 if hp_ratio < 0.45 else 0.0) * 0.2)
         greed_upgrade_mode = _clip01(greed_bias * 0.8 + (1.0 if hp_ratio > 0.75 else 0.0) * 0.2)
         safe_route_bias = _clip01(preserve_hp_bias * 0.6 + boss_pressure * 0.2 + elite_pressure * 0.2)
@@ -484,4 +520,3 @@ class RunMemoryTracker:
             f"save_potion={save_potion_mode:.2f} rest={force_rest_mode:.2f}"
         )
         return vector, text
-

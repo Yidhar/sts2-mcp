@@ -3,8 +3,10 @@ using System.Net;
 using System.Reflection;
 using System.Text.Json.Serialization;
 using System.ComponentModel;
+using System.Diagnostics;
 using MegaCrit.Sts2.Core.Assets;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Entities.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Map;
@@ -17,6 +19,15 @@ using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Saves;
 
 namespace Sts2McpBridge.Scripts;
+
+internal sealed class BridgeEnvCombatDeckEntryRequest
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("upgrade_level")]
+    public int? UpgradeLevel { get; set; }
+}
 
 internal sealed class BridgeEnvCombatResetRequest
 {
@@ -41,6 +52,9 @@ internal sealed class BridgeEnvCombatResetRequest
     [JsonPropertyName("deck")]
     public string[]? Deck { get; set; }
 
+    [JsonPropertyName("deck_entries")]
+    public BridgeEnvCombatDeckEntryRequest[]? DeckEntries { get; set; }
+
     [JsonPropertyName("relics")]
     public string[]? Relics { get; set; }
 
@@ -57,6 +71,67 @@ internal sealed class BridgeEnvCombatResetRequest
 internal static partial class BridgeGameApi
 {
     private const int DefaultCombatResetTimeoutMs = 30000;
+
+    private static IReadOnlyList<(string CardId, int UpgradeLevel)> ResolveRequestedDeckEntries(
+        BridgeEnvCombatResetRequest request)
+    {
+        if (request.DeckEntries is { Length: > 0 })
+        {
+            return request.DeckEntries
+                .Where(static entry => !string.IsNullOrWhiteSpace(entry?.Id))
+                .Select(static entry => (
+                    entry!.Id!.Trim(),
+                    Math.Max(entry.UpgradeLevel ?? 0, 0)))
+                .ToArray();
+        }
+
+        if (request.Deck is { Length: > 0 })
+        {
+            return request.Deck
+                .Where(static cardId => !string.IsNullOrWhiteSpace(cardId))
+                .Select(static cardId => (cardId.Trim(), 0))
+                .ToArray();
+        }
+
+        return Array.Empty<(string CardId, int UpgradeLevel)>();
+    }
+
+    private static CardModel? BuildMutableDeckCard(
+        string cardId,
+        int upgradeLevel,
+        List<string> diagnostics)
+    {
+        if (TryModelDbGetById("CardModel", cardId, diagnostics) is not CardModel card)
+        {
+            diagnostics.Add($"Deck override skipped unknown card '{cardId}'");
+            return null;
+        }
+
+        var mutableCard = card.ToMutable();
+        var requestedUpgradeLevel = Math.Max(0, upgradeLevel);
+        var maxUpgradeLevel = Math.Max(0, mutableCard.MaxUpgradeLevel);
+        if (requestedUpgradeLevel > maxUpgradeLevel)
+        {
+            diagnostics.Add(
+                $"Deck override clamped {cardId} upgrade {requestedUpgradeLevel} -> {maxUpgradeLevel} (MaxUpgradeLevel).");
+        }
+
+        for (var i = 0; i < Math.Min(requestedUpgradeLevel, maxUpgradeLevel); i++)
+        {
+            try
+            {
+                mutableCard.UpgradeInternal();
+            }
+            catch (Exception ex)
+            {
+                diagnostics.Add(
+                    $"Deck override stopped upgrading {cardId} at level {mutableCard.CurrentUpgradeLevel}: {ex.GetType().Name}: {ex.Message}");
+                break;
+            }
+        }
+
+        return mutableCard;
+    }
 
     // -----------------------------------------------------------------------
     // POST /env/combat_reset
@@ -150,6 +225,15 @@ internal static partial class BridgeGameApi
                     diagnostics,
                     cancellationToken);
             }
+        }
+
+        if (!IsCombatSandboxResetReady(state) && !state.Done)
+        {
+            state = await TrySalvageCombatSandboxSettlingResetAsync(
+                state,
+                timeoutMs,
+                diagnostics,
+                cancellationToken);
         }
 
         if (!IsCombatSandboxResetReady(state) && !state.Done)
@@ -593,7 +677,8 @@ internal static partial class BridgeGameApi
             diagnostics.Add($"Set MaxEnergy to {request.MaxEnergy.Value}");
         }
 
-        if (request.Deck is { Length: > 0 })
+        var requestedDeckEntries = ResolveRequestedDeckEntries(request);
+        if (requestedDeckEntries.Count > 0)
         {
             var liveRunState = player.RunState as RunState;
             if (liveRunState is null)
@@ -611,15 +696,13 @@ internal static partial class BridgeGameApi
             }
 
             var added = 0;
-            foreach (var cardId in request.Deck)
+            foreach (var (cardId, upgradeLevel) in requestedDeckEntries)
             {
-                if (TryModelDbGetById("CardModel", cardId, diagnostics) is not CardModel card)
+                if (BuildMutableDeckCard(cardId, upgradeLevel, diagnostics) is not CardModel mutableCard)
                 {
-                    diagnostics.Add($"Deck override skipped unknown card '{cardId}'");
                     continue;
                 }
 
-                var mutableCard = card.ToMutable();
                 mutableCard.FloorAddedToDeck = 1;
                 player.Deck.AddInternal(mutableCard, -1, silent: true);
                 if (liveRunState is not null)
@@ -635,7 +718,7 @@ internal static partial class BridgeGameApi
                 added++;
             }
 
-            diagnostics.Add($"Deck override: added {added}/{request.Deck.Length} cards");
+            diagnostics.Add($"Deck override: added {added}/{requestedDeckEntries.Count} cards");
         }
 
         if (request.Relics is { Length: > 0 })
@@ -831,7 +914,557 @@ internal static partial class BridgeGameApi
         // playable combat frame (for example Gambling Chip mulligan). That is still a valid
         // combat sandbox start state and should not hard-fail reset.
         return string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) &&
-               string.Equals(snapshot.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase);
+               (string.Equals(snapshot.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(snapshot.Screen, "COMBAT", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsCombatSandboxExplicitPostCombatPhase(string? phase)
+    {
+        return string.Equals(phase, "terminal", StringComparison.Ordinal) ||
+               string.Equals(phase, "reward", StringComparison.Ordinal) ||
+               string.Equals(phase, "card_reward", StringComparison.Ordinal) ||
+               string.Equals(phase, "map", StringComparison.Ordinal) ||
+               string.Equals(phase, "event", StringComparison.Ordinal) ||
+               string.Equals(phase, "event_crystal_sphere", StringComparison.Ordinal) ||
+               string.Equals(phase, "shop", StringComparison.Ordinal) ||
+               string.Equals(phase, "rest_site", StringComparison.Ordinal) ||
+               string.Equals(phase, "treasure", StringComparison.Ordinal);
+    }
+
+    private static bool IsCombatSandboxExplicitTerminalSurface(BridgeEnvSnapshot snapshot)
+    {
+        if (snapshot.Done || snapshot.CurrentHp <= 0)
+        {
+            return true;
+        }
+
+        if (IsCombatSandboxExplicitPostCombatPhase(snapshot.Phase))
+        {
+            return true;
+        }
+
+        var combatLikePhase =
+            string.Equals(snapshot.Phase, "combat", StringComparison.Ordinal) ||
+            string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) ||
+            string.Equals(snapshot.Phase, "settling", StringComparison.Ordinal);
+        var combatLikeScreen =
+            string.Equals(snapshot.Screen, "COMBAT", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(snapshot.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase);
+
+        return !snapshot.CombatInProgress && !combatLikePhase && !combatLikeScreen;
+    }
+
+    private static bool LooksLikeCombatSandboxLiveSurface(BridgeEnvSnapshot snapshot)
+    {
+        if (snapshot.Done || snapshot.CurrentHp <= 0)
+        {
+            return false;
+        }
+
+        return snapshot.CombatInProgress ||
+               string.Equals(snapshot.Phase, "combat", StringComparison.Ordinal) ||
+               string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) ||
+               string.Equals(snapshot.Phase, "settling", StringComparison.Ordinal) ||
+               string.Equals(snapshot.Screen, "COMBAT", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(snapshot.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(snapshot.RoomType, "COMBAT", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldAttemptCombatSandboxLiveStateSalvage(BridgeEnvSnapshot snapshot)
+    {
+        return !snapshot.Done &&
+               !snapshot.Actionable &&
+               !IsEnvIntermediateDecisionSurface(snapshot) &&
+               !IsCombatSandboxEpisodeDone(snapshot) &&
+               LooksLikeCombatSandboxLiveSurface(snapshot);
+    }
+
+    private static async Task<BridgeEnvSnapshot> TrySalvageCombatSandboxLiveStepStateAsync(
+        BridgeEnvEpisode episode,
+        BridgeEnvSnapshot state,
+        int timeoutMs,
+        CancellationToken cancellationToken,
+        string operationName,
+        BridgeEnvStepTimingCollector? timing = null)
+    {
+        if (!ShouldAttemptCombatSandboxLiveStateSalvage(state))
+        {
+            return state;
+        }
+
+        var salvageBudgetMs = Math.Min(Math.Max(timeoutMs / 4, 1500), 5000);
+        var fastWaitBudgetMs = Math.Min(salvageBudgetMs, 2000);
+        var fastState = await WaitForCombatSandboxFastStateAsync(
+            state.LogicHash,
+            fastWaitBudgetMs,
+            requireActionableOrDone: true,
+            cancellationToken,
+            $"{operationName}.fast",
+            timing,
+            baselineSnapshot: state);
+        var adjustmentsStopwatch = Stopwatch.StartNew();
+        fastState = await ApplyEnvEpisodeAdjustmentsAsync(episode, fastState, timeoutMs, cancellationToken, timing);
+        if (timing is not null)
+        {
+            timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        if (fastState.Actionable ||
+            fastState.Done ||
+            IsEnvIntermediateDecisionSurface(fastState) ||
+            IsCombatSandboxEpisodeDone(fastState) ||
+            !LooksLikeCombatSandboxLiveSurface(fastState))
+        {
+            return fastState;
+        }
+
+        var stableWaitBudgetMs = Math.Max(salvageBudgetMs - fastWaitBudgetMs, 1500);
+        var stableState = await WaitForStableEnvStateAsync(
+            state.LogicHash,
+            stableWaitBudgetMs,
+            requireActionableOrDone: true,
+            cancellationToken,
+            timing,
+            baselineSnapshot: fastState);
+        adjustmentsStopwatch = Stopwatch.StartNew();
+        stableState = await ApplyEnvEpisodeAdjustmentsAsync(episode, stableState, timeoutMs, cancellationToken, timing);
+        if (timing is not null)
+        {
+            timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+        }
+        return stableState;
+    }
+
+    private static async Task<BridgeEnvSnapshot> TrySalvageCombatSandboxSettlingResetAsync(
+        BridgeEnvSnapshot state,
+        int timeoutMs,
+        List<string> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        if (state.Done || IsCombatSandboxResetReady(state))
+        {
+            return state;
+        }
+
+        if (!HasUsableCombatSandboxRunScene(state) || !state.CombatInProgress)
+        {
+            return state;
+        }
+
+        if (!string.Equals(state.Phase, "settling", StringComparison.Ordinal))
+        {
+            return state;
+        }
+
+        var looksLikeCombatSurface =
+            string.Equals(state.Screen, "COMBAT", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(state.Screen, "CARD_SELECTION", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(state.RoomType, "COMBAT", StringComparison.OrdinalIgnoreCase);
+        if (!looksLikeCombatSurface)
+        {
+            return state;
+        }
+
+        var salvageBudgetMs = Math.Min(Math.Max(timeoutMs / 3, 4000), 15000);
+        var fastWaitBudgetMs = Math.Min(salvageBudgetMs, 5000);
+        diagnostics.Add(
+            $"Combat sandbox reset entered settling salvage window (phase={state.Phase}, screen={state.Screen}, actionable={state.Actionable}, combat_in_progress={state.CombatInProgress}, wait_budget_ms={salvageBudgetMs})");
+
+        var fastState = await WaitForCombatSandboxFastStateAsync(
+            null,
+            fastWaitBudgetMs,
+            requireActionableOrDone: true,
+            cancellationToken,
+            "combat_sandbox.reset.settling_salvage.fast");
+        diagnostics.Add(
+            $"Combat sandbox settling salvage fast wait observed phase={fastState.Phase}, screen={fastState.Screen}, actionable={fastState.Actionable}, combat_in_progress={fastState.CombatInProgress}, room_type={fastState.RoomType}, room_model_id={fastState.RoomModelId}");
+
+        if (fastState.Done || IsCombatSandboxResetReady(fastState))
+        {
+            return fastState;
+        }
+
+        if (!HasUsableCombatSandboxRunScene(fastState) || !fastState.CombatInProgress)
+        {
+            return fastState;
+        }
+
+        var stableWaitBudgetMs = Math.Max(salvageBudgetMs - fastWaitBudgetMs, 2500);
+        var stableState = await WaitForStableEnvStateAsync(
+            null,
+            stableWaitBudgetMs,
+            requireActionableOrDone: true,
+            cancellationToken);
+        diagnostics.Add(
+            $"Combat sandbox settling salvage stable wait observed phase={stableState.Phase}, screen={stableState.Screen}, actionable={stableState.Actionable}, combat_in_progress={stableState.CombatInProgress}, room_type={stableState.RoomType}, room_model_id={stableState.RoomModelId}");
+        return stableState;
+    }
+
+    private static async Task<object> StepCombatSandboxEpisodeAsync(
+        BridgeEnvStepRequest request,
+        BridgeEnvEpisode episode,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        if (episode.Done)
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "episode_already_done",
+                $"Episode '{episode.Id}' is already done. Call env/combat_reset to start a new sandbox episode.");
+        }
+
+        var totalStopwatch = Stopwatch.StartNew();
+        var timing = new BridgeEnvStepTimingCollector();
+        timing.SnapshotCalls++;
+        var beforeSnapshotStopwatch = Stopwatch.StartNew();
+        var before = await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "combat_sandbox.step.before_snapshot");
+        timing.BeforeSnapshotMs += beforeSnapshotStopwatch.Elapsed.TotalMilliseconds;
+        before = await MaybeAutoCloseResidualMapOverlayAsync(before, timeoutMs, cancellationToken, timing);
+        var adjustmentsStopwatch = Stopwatch.StartNew();
+        before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, timeoutMs, cancellationToken, timing);
+        timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+
+        if (!before.Done && !before.Actionable && !IsEnvIntermediateDecisionSurface(before))
+        {
+            var beforeWaitStopwatch = Stopwatch.StartNew();
+            before = await WaitForCombatSandboxFastStateAsync(
+                before.LogicHash,
+                Math.Min(timeoutMs, 2500),
+                requireActionableOrDone: true,
+                cancellationToken,
+                "combat_sandbox.step.before_wait",
+                timing,
+                baselineSnapshot: before);
+            timing.BeforeWaitMs += beforeWaitStopwatch.Elapsed.TotalMilliseconds;
+            adjustmentsStopwatch = Stopwatch.StartNew();
+            before = await ApplyEnvEpisodeAdjustmentsAsync(episode, before, timeoutMs, cancellationToken, timing);
+            timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        if (before.Done || IsCombatSandboxEpisodeDone(before))
+        {
+            episode.Done = true;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payload = BuildEnvStepPayload(
+                episode,
+                before,
+                before,
+                selectedAction: null,
+                truncated: false,
+                truncationReason: null,
+                forceDone: true,
+                timing: timing);
+            return payload;
+        }
+
+        if (!before.Actionable && !IsEnvIntermediateDecisionSurface(before))
+        {
+            var beforeSalvageStopwatch = Stopwatch.StartNew();
+            before = await TrySalvageCombatSandboxLiveStepStateAsync(
+                episode,
+                before,
+                timeoutMs,
+                cancellationToken,
+                "combat_sandbox.step.before_wait_salvage",
+                timing);
+            timing.BeforeWaitMs += beforeSalvageStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        if (before.Done || IsCombatSandboxEpisodeDone(before))
+        {
+            episode.Done = true;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payload = BuildEnvStepPayload(
+                episode,
+                before,
+                before,
+                selectedAction: null,
+                truncated: false,
+                truncationReason: null,
+                forceDone: true,
+                timing: timing);
+            return payload;
+        }
+
+        if (!before.Actionable && !IsEnvIntermediateDecisionSurface(before))
+        {
+            episode.Done = true;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payload = BuildEnvStepPayload(
+                episode,
+                before,
+                before,
+                selectedAction: null,
+                truncated: true,
+                truncationReason: "combat_sandbox_timeout_waiting_for_actionable_or_terminal_state",
+                timing: timing);
+            return payload;
+        }
+
+        BridgeResolvedActionSelection? selectedAction = null;
+        string? actionError = null;
+        try
+        {
+            var resolveStopwatch = Stopwatch.StartNew();
+            selectedAction = ResolveRequestedEnvAction(before, request);
+            timing.ActionResolveMs += resolveStopwatch.Elapsed.TotalMilliseconds;
+            var executeStopwatch = Stopwatch.StartNew();
+            await ExecuteEnvActionAsync(
+                selectedAction.Action,
+                timeoutMs,
+                cancellationToken,
+                $"combat_sandbox.step.execute:{selectedAction.Action.ActionId}");
+            timing.ActionExecuteMs += executeStopwatch.Elapsed.TotalMilliseconds;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (BridgeRequestException ex)
+        {
+            actionError = ex.ErrorCode;
+        }
+        catch (Exception)
+        {
+            actionError = "action_execution_error";
+        }
+
+        BridgeEnvSnapshot after;
+        if (!string.IsNullOrWhiteSpace(actionError) && before.Actionable)
+        {
+            after = before;
+        }
+        else
+        {
+            var afterWaitStopwatch = Stopwatch.StartNew();
+            var afterWaitTimeoutMs = IsCardSelectionSelectAction(selectedAction)
+                ? GetCardSelectionSelectFastFailTimeoutMs(timeoutMs)
+                : timeoutMs;
+            after = await WaitForCombatSandboxFastStateAsync(
+                before.LogicHash,
+                afterWaitTimeoutMs,
+                requireActionableOrDone: !ShouldAllowIntermediateSelectionState(selectedAction),
+                cancellationToken,
+                "combat_sandbox.step.after_wait",
+                timing,
+                baselineSnapshot: before);
+            timing.AfterWaitMs += afterWaitStopwatch.Elapsed.TotalMilliseconds;
+        }
+        var autoConfirmStopwatch = Stopwatch.StartNew();
+        after = await MaybeAutoConfirmSingleCardSelectionForCombatSandboxAsync(
+            selectedAction,
+            after,
+            timeoutMs,
+            cancellationToken);
+        timing.AutoConfirmMs += autoConfirmStopwatch.Elapsed.TotalMilliseconds;
+        adjustmentsStopwatch = Stopwatch.StartNew();
+        after = await ApplyEnvEpisodeAdjustmentsAsync(episode, after, timeoutMs, cancellationToken, timing);
+        timing.EpisodeAdjustmentsMs += adjustmentsStopwatch.Elapsed.TotalMilliseconds;
+
+        if (!after.Actionable && !after.Done && !IsEnvIntermediateDecisionSurface(after))
+        {
+            var afterSalvageStopwatch = Stopwatch.StartNew();
+            after = await TrySalvageCombatSandboxLiveStepStateAsync(
+                episode,
+                after,
+                timeoutMs,
+                cancellationToken,
+                "combat_sandbox.step.after_wait_salvage",
+                timing);
+            timing.AfterWaitMs += afterSalvageStopwatch.Elapsed.TotalMilliseconds;
+        }
+
+        var cardSelectionNoProgressAfterAction =
+            IsCardSelectionSelectAction(selectedAction) &&
+            string.IsNullOrWhiteSpace(actionError) &&
+            !after.Done &&
+            !HasCardSelectionSelectionProgress(before, after);
+
+        var noStateChangeAfterAction =
+            selectedAction is not null &&
+            string.IsNullOrWhiteSpace(actionError) &&
+            !after.Done &&
+            (cardSelectionNoProgressAfterAction ||
+             (before.LogicHash.Equals(after.LogicHash, StringComparison.Ordinal) &&
+              !HasMeaningfulEnvSnapshotDifference(before, after)));
+
+        if (noStateChangeAfterAction)
+        {
+            actionError = "action_no_state_change";
+        }
+
+        if (!after.Done && IsCombatSandboxEpisodeDone(after))
+        {
+            episode.StepIndex++;
+            episode.Done = true;
+            timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+            var payload = BuildEnvStepPayload(
+                episode,
+                before,
+                after,
+                selectedAction,
+                truncated: false,
+                truncationReason: null,
+                actionError,
+                forceDone: true,
+                timing: timing);
+            return payload;
+        }
+
+        episode.StepIndex++;
+        var truncated = ((!after.Actionable && !after.Done && !IsEnvIntermediateDecisionSurface(after)) || noStateChangeAfterAction);
+        if (after.Done || truncated)
+        {
+            episode.Done = true;
+        }
+
+        timing.TotalMs = totalStopwatch.Elapsed.TotalMilliseconds;
+        var finalPayload = BuildEnvStepPayload(
+            episode,
+            before,
+            after,
+            selectedAction,
+            truncated,
+            truncated
+                ? (noStateChangeAfterAction
+                    ? "step_action_no_state_change"
+                    : "combat_sandbox_timeout_waiting_for_actionable_or_terminal_state")
+                : null,
+            actionError,
+            timing: timing);
+        return finalPayload;
+    }
+
+    private static async Task<BridgeEnvSnapshot> WaitForCombatSandboxFastStateAsync(
+        string? baselineLogicHash,
+        int timeoutMs,
+        bool requireActionableOrDone,
+        CancellationToken cancellationToken,
+        string operationName,
+        BridgeEnvStepTimingCollector? timing = null,
+        BridgeEnvSnapshot? baselineSnapshot = null)
+    {
+        var startedAt = DateTime.UtcNow;
+        BridgeEnvSnapshot? lastSnapshot = null;
+
+        while ((DateTime.UtcNow - startedAt).TotalMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (timing is not null)
+            {
+                timing.StableIterations++;
+                timing.SnapshotCalls++;
+            }
+            var snapshot = await CaptureEnvSnapshotAsync(
+                timeoutMs,
+                cancellationToken,
+                $"{operationName}.snapshot");
+            snapshot = await MaybeAutoCloseResidualMapOverlayAsync(snapshot, timeoutMs, cancellationToken, timing);
+            lastSnapshot = snapshot;
+
+            var ready = snapshot.Done ||
+                        IsCombatSandboxEpisodeDone(snapshot) ||
+                        !requireActionableOrDone ||
+                        snapshot.Actionable ||
+                        IsEnvIntermediateDecisionSurface(snapshot);
+            var changedFromBaseline = baselineLogicHash is null ||
+                                      !baselineLogicHash.Equals(snapshot.LogicHash, StringComparison.Ordinal);
+            var progressedFromBaseline = baselineSnapshot is not null &&
+                                         HasMeaningfulEnvSnapshotDifference(baselineSnapshot, snapshot);
+            if (ready && (changedFromBaseline || progressedFromBaseline))
+            {
+                return snapshot;
+            }
+
+            if (timing is not null)
+            {
+                timing.WaitPumpCalls++;
+            }
+            await WaitForPumpTicksGuardedAsync(
+                1,
+                $"{operationName}.wait_pump",
+                timeoutMs,
+                cancellationToken);
+        }
+
+        if (lastSnapshot is not null)
+        {
+            return lastSnapshot;
+        }
+
+        if (timing is not null)
+        {
+            timing.SnapshotCalls++;
+        }
+        return await CaptureEnvSnapshotAsync(
+            timeoutMs,
+            cancellationToken,
+            $"{operationName}.final_snapshot");
+    }
+
+    private static async Task<BridgeEnvSnapshot> MaybeAutoConfirmSingleCardSelectionForCombatSandboxAsync(
+        BridgeResolvedActionSelection? selectedAction,
+        BridgeEnvSnapshot snapshot,
+        int timeoutMs,
+        CancellationToken cancellationToken)
+    {
+        if (selectedAction is null ||
+            !selectedAction.Action.ActionId.StartsWith("card_selection:select:", StringComparison.Ordinal) ||
+            !string.Equals(snapshot.Phase, "card_selection", StringComparison.Ordinal) ||
+            snapshot.Done)
+        {
+            return snapshot;
+        }
+
+        var cardSelectionScreen = snapshot.Context.CardSelectionScreen;
+        if (cardSelectionScreen is null || !IsNodeVisible(cardSelectionScreen))
+        {
+            return snapshot;
+        }
+
+        if (!ShouldAutoConfirmSingleCardSelection(cardSelectionScreen) ||
+            CountSelectedCardSelectionCards(cardSelectionScreen) <= 0)
+        {
+            return snapshot;
+        }
+
+        try
+        {
+            await RunOnMainThreadGuardedAsync(
+                () =>
+                {
+                    InvokeCardSelectionConfirmAction(
+                        cardSelectionScreen,
+                        ResolveCardSelectionConfirmButton(cardSelectionScreen));
+                    return true;
+                },
+                "combat_sandbox.step.card_selection_confirm",
+                timeoutMs,
+                cancellationToken);
+
+            await WaitForPumpTicksGuardedAsync(
+                1,
+                "combat_sandbox.step.card_selection_confirm.post_pump",
+                timeoutMs,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return snapshot;
+        }
+
+        return await WaitForCombatSandboxFastStateAsync(
+            snapshot.LogicHash,
+            timeoutMs,
+            requireActionableOrDone: true,
+            cancellationToken,
+            "combat_sandbox.step.card_selection_confirm",
+            baselineSnapshot: snapshot);
     }
 
     private static object? PrepareEncounterForRoomEntry(object? encounter, List<string> diagnostics)
@@ -876,15 +1509,7 @@ internal static partial class BridgeGameApi
 
     private static bool IsCombatSandboxEpisodeDone(BridgeEnvSnapshot snapshot)
     {
-        // Player died
-        if (snapshot.CurrentHp <= 0)
-            return true;
-
-        // Combat ended (victory or retreat) — no longer in combat and not just settling
-        if (!snapshot.CombatInProgress && snapshot.Phase != "settling")
-            return true;
-
-        return false;
+        return IsCombatSandboxExplicitTerminalSurface(snapshot);
     }
 
     // -----------------------------------------------------------------------
@@ -915,6 +1540,8 @@ internal static partial class BridgeGameApi
     {
         try
         {
+            diagnostics.Add($"Combat sandbox setup begin: encounter_id={encounterId}");
+
             // 1. Resolve encounter model
             var encounter = ResolveEncounterModel(encounterId, diagnostics);
             if (encounter is null)
@@ -940,11 +1567,18 @@ internal static partial class BridgeGameApi
                 };
             }
 
+            diagnostics.Add("Combat sandbox setup stage: before CombatManager reset");
             ResetCombatManagerForSandboxEntry(diagnostics);
+            diagnostics.Add("Combat sandbox setup stage: after CombatManager reset");
+
+            diagnostics.Add("Combat sandbox setup stage: before run reuse overrides");
             ApplyCombatSandboxRunReuseOverrides(request, diagnostics);
+            diagnostics.Add("Combat sandbox setup stage: after run reuse overrides");
 
             // 3. Enter the requested encounter on the fresh active run scene.
+            diagnostics.Add("Combat sandbox setup stage: before combat room entry");
             var entered = TryEnterCombatViaDebugRoom(runManager, encounter, diagnostics, out var pendingTask);
+            diagnostics.Add($"Combat sandbox setup stage: combat room entry result={entered}");
             if (!entered)
             {
                 return new CombatSandboxSetupResult
@@ -955,7 +1589,9 @@ internal static partial class BridgeGameApi
                 };
             }
 
+            diagnostics.Add("Combat sandbox setup stage: before post-entry overrides");
             ApplyPostCombatSandboxOverrides(request, diagnostics);
+            diagnostics.Add("Combat sandbox setup stage: after post-entry overrides");
 
             return new CombatSandboxSetupResult
             {
@@ -966,6 +1602,12 @@ internal static partial class BridgeGameApi
         catch (Exception ex)
         {
             diagnostics.Add($"Exception during setup: {ex.GetType().Name}: {ex.Message}");
+            diagnostics.Add($"Exception detail: {ex}");
+            if (ex.InnerException is not null)
+            {
+                diagnostics.Add($"Inner exception detail: {ex.InnerException}");
+            }
+
             return new CombatSandboxSetupResult
             {
                 Success = false,
@@ -984,8 +1626,190 @@ internal static partial class BridgeGameApi
             return;
         }
 
-        combatManager.Reset(graceful: true);
+        BridgeWorldContext? context = null;
+        try
+        {
+            context = CaptureContext();
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"Combat sandbox setup: CaptureContext before reset failed: {ex.GetBaseException().Message}");
+            diagnostics.Add($"Combat sandbox setup: reset context exception detail: {ex}");
+        }
+
+        var currentRoom = context?.RunState?.CurrentRoom;
+        var currentRoomName = currentRoom?.GetType().Name ?? "<null>";
+        var hasCombatState = combatManager.DebugOnlyGetState() is not null;
+        var shouldTryGracefulReset = hasCombatState &&
+                                     combatManager.IsInProgress &&
+                                     currentRoom is CombatRoom;
+
+        diagnostics.Add(
+            $"Combat sandbox setup: reset precheck has_state={hasCombatState}, in_progress={combatManager.IsInProgress}, current_room={currentRoomName}");
+
+        if (shouldTryGracefulReset && TryResetCombatManagerGracefully(combatManager, diagnostics))
+        {
+            diagnostics.Add("Combat sandbox setup: reset CombatManager before entering new encounter");
+            return;
+        }
+
+        HardResetCombatManagerForSandboxEntry(combatManager, diagnostics);
         diagnostics.Add("Combat sandbox setup: reset CombatManager before entering new encounter");
+    }
+
+    private static bool TryResetCombatManagerGracefully(
+        CombatManager combatManager,
+        List<string> diagnostics)
+    {
+        try
+        {
+            combatManager.Reset(graceful: true);
+            diagnostics.Add("Combat sandbox setup: graceful CombatManager.Reset(true) succeeded");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"Combat sandbox setup: graceful CombatManager.Reset(true) failed: {ex.GetBaseException().Message}");
+            diagnostics.Add($"Combat sandbox setup: graceful reset exception detail: {ex}");
+            return false;
+        }
+    }
+
+    private static void HardResetCombatManagerForSandboxEntry(
+        CombatManager combatManager,
+        List<string> diagnostics)
+    {
+        var hardResetDiagnostics = new List<string>();
+
+        TrySetPrivateFieldValue(combatManager, "_state", null, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "_pendingLoss", null, hardResetDiagnostics);
+
+        try
+        {
+            combatManager.Reset(graceful: false);
+            hardResetDiagnostics.Add("CombatManager.Reset(false) succeeded after nulling _state");
+        }
+        catch (Exception ex)
+        {
+            hardResetDiagnostics.Add($"CombatManager.Reset(false) failed: {ex.GetBaseException().Message}");
+            hardResetDiagnostics.Add($"CombatManager.Reset(false) exception detail: {ex.GetType().Name}");
+        }
+
+        TrySetPrivateFieldValue(combatManager, "_state", null, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "_pendingLoss", null, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "_playerActionsDisabled", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<DebugForcedTopCardOnNextShuffle>k__BackingField", null, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<IsPaused>k__BackingField", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<IsPlayPhase>k__BackingField", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<IsEnemyTurnStarted>k__BackingField", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<EndingPlayerTurnPhaseTwo>k__BackingField", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<EndingPlayerTurnPhaseOne>k__BackingField", false, hardResetDiagnostics);
+        TrySetPrivateFieldValue(combatManager, "<IsInProgress>k__BackingField", false, hardResetDiagnostics);
+
+        TryClearPrivateCollection(combatManager, "_playersReadyToEndTurn", hardResetDiagnostics);
+        TryClearPrivateCollection(combatManager, "_playersReadyToBeginEnemyTurn", hardResetDiagnostics);
+        TryClearPrivateCollection(combatManager, "_playersTakingExtraTurn", hardResetDiagnostics);
+
+        try
+        {
+            combatManager.History.Clear();
+            hardResetDiagnostics.Add("History.Clear()");
+        }
+        catch (Exception ex)
+        {
+            hardResetDiagnostics.Add($"History.Clear() failed: {ex.GetBaseException().Message}");
+        }
+
+        if (combatManager.StateTracker is not null)
+        {
+            TrySetPrivateFieldValue(combatManager.StateTracker, "_state", null, hardResetDiagnostics);
+            TrySetPrivateFieldValue(combatManager.StateTracker, "_combatStateChangedDeferredTask", null, hardResetDiagnostics);
+        }
+
+        TryUpdateActionQueueCombatState(hardResetDiagnostics);
+
+        diagnostics.Add("Combat sandbox setup: hard CombatManager reset fallback applied");
+        diagnostics.Add($"Combat sandbox setup: hard reset details => {string.Join("; ", hardResetDiagnostics)}");
+    }
+
+    private static void TrySetPrivateFieldValue(
+        object target,
+        string fieldName,
+        object? value,
+        List<string> diagnostics)
+    {
+        try
+        {
+            var field = FindField(target.GetType(), fieldName);
+            if (field is null)
+            {
+                diagnostics.Add($"{fieldName}: field not found");
+                return;
+            }
+
+            field.SetValue(target, value);
+            diagnostics.Add($"{fieldName}={(value is null ? "null" : value)}");
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"{fieldName}: set failed ({ex.GetBaseException().Message})");
+        }
+    }
+
+    private static void TryClearPrivateCollection(
+        object target,
+        string fieldName,
+        List<string> diagnostics)
+    {
+        try
+        {
+            var field = FindField(target.GetType(), fieldName);
+            var collection = field?.GetValue(target);
+            if (collection is null)
+            {
+                diagnostics.Add($"{fieldName}: collection unavailable");
+                return;
+            }
+
+            var clearMethod = collection.GetType().GetMethod(
+                "Clear",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                Type.EmptyTypes,
+                null);
+            if (clearMethod is null)
+            {
+                diagnostics.Add($"{fieldName}: Clear() not found");
+                return;
+            }
+
+            clearMethod.Invoke(collection, null);
+            diagnostics.Add($"{fieldName}.Clear()");
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"{fieldName}: clear failed ({ex.GetBaseException().Message})");
+        }
+    }
+
+    private static void TryUpdateActionQueueCombatState(List<string> diagnostics)
+    {
+        try
+        {
+            var runManager = RunManager.Instance;
+            if (runManager?.ActionQueueSynchronizer is null)
+            {
+                diagnostics.Add("ActionQueueSynchronizer unavailable; skipped SetCombatState(NotInCombat)");
+                return;
+            }
+
+            runManager.ActionQueueSynchronizer.SetCombatState(ActionSynchronizerCombatState.NotInCombat);
+            diagnostics.Add("ActionQueueSynchronizer.SetCombatState(NotInCombat)");
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add($"ActionQueueSynchronizer.SetCombatState(NotInCombat) failed: {ex.GetBaseException().Message}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1857,7 +2681,8 @@ internal static partial class BridgeGameApi
         }
 
         // Deck override
-        if (!includeCombatOnlyOverrides && request.Deck is { Length: > 0 })
+        var requestedDeckEntries = ResolveRequestedDeckEntries(request);
+        if (!includeCombatOnlyOverrides && requestedDeckEntries.Count > 0)
         {
             try
             {
@@ -1872,21 +2697,18 @@ internal static partial class BridgeGameApi
                     {
                         cardList.Clear();
                         var added = 0;
-                        foreach (var cardId in request.Deck)
+                        foreach (var (cardId, upgradeLevel) in requestedDeckEntries)
                         {
-                            var card = TryModelDbGetById("CardModel", cardId, diagnostics);
-                            if (card is null)
+                            var mutableCard = BuildMutableDeckCard(cardId, upgradeLevel, diagnostics);
+                            if (mutableCard is null)
                             {
-                                warnings.Add($"Deck: card '{cardId}' not found");
                                 continue;
                             }
 
-                            // Try ToMutable
-                            var mutableCard = TryCallToMutable(card);
-                            cardList.Add(mutableCard ?? card);
+                            cardList.Add(mutableCard);
                             added++;
                         }
-                        diagnostics.Add($"Deck override: added {added}/{request.Deck.Length} cards");
+                        diagnostics.Add($"Deck override: added {added}/{requestedDeckEntries.Count} cards");
                     }
                     else
                     {

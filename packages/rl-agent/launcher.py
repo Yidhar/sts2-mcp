@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from sts2_env.path_utils import default_bridge_session_dir
+
 
 @dataclass
 class GameInstance:
@@ -32,8 +34,7 @@ class GameInstance:
 
 
 def session_dir() -> Path:
-    appdata = os.environ.get("APPDATA", "")
-    return Path(appdata) / "SlayTheSpire2" / "bridge"
+    return default_bridge_session_dir()
 
 
 def session_path_for(instance_id: int) -> Path:
