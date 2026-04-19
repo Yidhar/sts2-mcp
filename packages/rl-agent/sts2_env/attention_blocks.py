@@ -37,6 +37,8 @@ class RelationBias(nn.Module):
         max_zone_id: int = 15,
         max_order_id: int = 63,
         max_order_offset: int = 16,
+        power_bucket_count: int = 0,
+        power_slot_role_id: int = 0,
     ):
         super().__init__()
         self.num_token_types = int(num_token_types)
@@ -46,6 +48,20 @@ class RelationBias(nn.Module):
         self.max_zone_id = int(max_zone_id)
         self.max_order_id = int(max_order_id)
         self.max_order_offset = int(max_order_offset)
+        # Phase 6.3: per-power learned bias. When ``power_bucket_count > 0``
+        # and the key token is a POWER_SLOT role, each attention head adds
+        # a bucket-specific scalar to the attention logit. This lets
+        # "Vulnerable on enemy" vs "Strength on player" attract different
+        # heads, which the role_pair_bias alone can't distinguish (both
+        # share role=POWER_SLOT). Zero-init so pre-trained weights ignore
+        # this term initially; it only helps as the model learns.
+        self.power_bucket_count = int(power_bucket_count)
+        self.power_slot_role_id = int(power_slot_role_id)
+        if self.power_bucket_count > 0:
+            self.power_bucket_bias = nn.Embedding(self.power_bucket_count, self.n_heads)
+            nn.init.zeros_(self.power_bucket_bias.weight)
+        else:
+            self.power_bucket_bias = None
         self.type_pair_bias = nn.Embedding(self.num_token_types * self.num_token_types, self.n_heads)
         self.owner_pair_bias = nn.Embedding((self.max_owner_id + 1) * (self.max_owner_id + 1), self.n_heads)
         self.role_pair_bias = nn.Embedding((self.max_role_id + 1) * (self.max_role_id + 1), self.n_heads)
@@ -134,6 +150,27 @@ class RelationBias(nn.Module):
                 & (key_role_ids.unsqueeze(-2) > 0)
             )
             bias = bias + same_role.unsqueeze(1).float() * self.same_role_bias.view(1, -1, 1, 1)
+
+            # Phase 6.3: per-power bucket bias on key side. Fires only when
+            # the key is a POWER_SLOT role; for other keys the bucket lookup
+            # is masked to zero so it's a no-op. Requires key_entity_ids to
+            # carry the power_bucket (which observation_v3._append_power_slot_tokens
+            # stores as entity_id).
+            if (
+                self.power_bucket_bias is not None
+                and self.power_slot_role_id > 0
+                and key_entity_ids is not None
+            ):
+                key_entity_ids_t = torch.as_tensor(key_entity_ids, dtype=torch.long, device=bias.device)
+                if key_entity_ids_t.ndim == 1:
+                    key_entity_ids_t = key_entity_ids_t.unsqueeze(0)
+                bucket_ids = key_entity_ids_t.clamp(min=0, max=self.power_bucket_count - 1)
+                bucket_bias = self.power_bucket_bias(bucket_ids)  # (B, K, n_heads)
+                power_key_mask = (key_role_ids == self.power_slot_role_id).float()  # (B, K)
+                # (B, n_heads, Q, K): broadcast bucket_bias across Q
+                bucket_bias = bucket_bias.permute(0, 2, 1).unsqueeze(2)  # (B, n_heads, 1, K)
+                power_key_mask = power_key_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, K)
+                bias = bias + bucket_bias * power_key_mask
 
         same_zone = None
         if query_zone_ids is not None and key_zone_ids is not None:

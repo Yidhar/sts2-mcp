@@ -31,6 +31,7 @@ from .observation_v3 import (
     MAX_ROLE_ID,
     MAX_ZONE_ID,
     NUM_TOKEN_TYPES,
+    POWER_ID_BUCKETS,
     TOKEN_FEAT_DIM,
     TOKEN_NUMERIC_DIM,
     TOKEN_TEXT_DIM,
@@ -38,12 +39,30 @@ from .observation_v3 import (
     TOKEN_ZONE_TO_ID,
 )
 
+# Phase 6.3: shared constants for power-bucket bias plumbing.
+_POWER_SLOT_ROLE_ID = TOKEN_ROLE_TO_ID.get("POWER_SLOT", 0)
+_RELATION_BIAS_KW = {
+    "num_token_types": NUM_TOKEN_TYPES,
+    "max_owner_id": MAX_OWNER_ID,
+    "max_role_id": MAX_ROLE_ID,
+    "max_zone_id": MAX_ZONE_ID,
+    "max_order_id": MAX_ORDER_ID,
+    "power_bucket_count": POWER_ID_BUCKETS,
+    "power_slot_role_id": _POWER_SLOT_ROLE_ID,
+}
+
 DEFAULT_POLICY_CLASS_PATH = "sts2_env.omni_attention_policy.STS2OmniAttentionPolicy"
 ATTENTION_ARCHITECTURE_VERSION = "omni_attention_v1_frozen"
 GLOBAL_AUX_HEAD_NAMES = ("objective", "transition", "traits")
 CANDIDATE_AUX_HEAD_NAMES = ("candidate_objective", "candidate_transition", "candidate_traits", "candidate_build", "candidate_selection", "candidate_route")
 
-WORLD_BANK_NAMES = ("runtime", "support", "enemy", "build", "route")
+# Phase 6.2: dedicated "powers" bank. Before this, POWER_SLOT tokens were
+# routed via role_id "POWER_SLOT" which fell into no existing bank and
+# thus got dropped from candidate cross-attention. Giving them their own
+# bank lets the top-k router explicitly opt-in to buff/debuff context per
+# candidate (attack candidates → enemy+powers; defense candidates →
+# enemy_intent+powers+support; map candidates → route, skip powers).
+WORLD_BANK_NAMES = ("runtime", "support", "enemy", "build", "route", "powers")
 
 _WORLD_BANK_ROLE_NAMES = {
     "runtime": (
@@ -66,6 +85,10 @@ _WORLD_BANK_ROLE_NAMES = {
     "enemy": ("ENEMY_CORE", "ENEMY_INTENT", "ENEMY_POWER", "ENEMY_TRAIT", "ENEMY_REACTION"),
     "build": ("DECK_CARD", "BUILD_STATE", "DECK_SYNERGY", "REWARD_OPTION", "SHOP_OPTION", "UPGRADE_OPTION"),
     "route": ("ROUTE_SUMMARY", "ROUTE_NODE", "ROUTE_RISK", "ROUTE_VALUE"),
+    # v3: dedicated bank for POWER_SLOT_* and CARD_KEYWORD_SLOT tokens.
+    # Keeps enemy bank from having to carry both core/intent + every buff
+    # stacked on every enemy at tight token budget.
+    "powers": ("POWER_SLOT", "CARD_KEYWORD"),
 }
 _WORLD_BANK_ZONE_NAMES = {
     "runtime": ("WORLD", "PLAYER", "HAND", "DRAW", "DISCARD", "EXHAUST", "PLAY"),
@@ -73,6 +96,13 @@ _WORLD_BANK_ZONE_NAMES = {
     "enemy": ("ENEMY",),
     "build": ("DECK", "REWARD", "SHOP", "UPGRADE"),
     "route": ("ROUTE",),
+    # No zone entry for powers — role-only filter. Bank-mask uses role_id
+    # OR zone_id; adding PLAYER/ENEMY/HAND here would also sweep
+    # PLAYER_SURVIVAL / ENEMY_CORE / HAND_CARD into the powers bank,
+    # which defeats the purpose of a dedicated bank. Role POWER_SLOT /
+    # CARD_KEYWORD are exclusive to the new token types, so a role-only
+    # filter catches them precisely.
+    "powers": (),
 }
 WORLD_BANK_ROLE_IDS = {
     bank_name: tuple(
@@ -264,21 +294,14 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
             use_internal_text_proj=False,
         )
 
-        self.world_relation_bias = RelationBias(num_token_types=NUM_TOKEN_TYPES, n_heads=self._n_heads, max_owner_id=MAX_OWNER_ID, max_role_id=MAX_ROLE_ID, max_zone_id=MAX_ZONE_ID, max_order_id=MAX_ORDER_ID)
-        self.local_relation_bias = RelationBias(num_token_types=NUM_TOKEN_TYPES, n_heads=self._n_heads, max_owner_id=MAX_OWNER_ID, max_role_id=MAX_ROLE_ID, max_zone_id=MAX_ZONE_ID, max_order_id=MAX_ORDER_ID)
-        self.query_local_relation_bias = RelationBias(num_token_types=NUM_TOKEN_TYPES, n_heads=self._n_heads, max_owner_id=MAX_OWNER_ID, max_role_id=MAX_ROLE_ID, max_zone_id=MAX_ZONE_ID, max_order_id=MAX_ORDER_ID)
-        self.query_world_relation_bias = RelationBias(num_token_types=NUM_TOKEN_TYPES, n_heads=self._n_heads, max_owner_id=MAX_OWNER_ID, max_role_id=MAX_ROLE_ID, max_zone_id=MAX_ZONE_ID, max_order_id=MAX_ORDER_ID)
-        self.candidate_set_relation_bias = RelationBias(num_token_types=NUM_TOKEN_TYPES, n_heads=self._n_heads, max_owner_id=MAX_OWNER_ID, max_role_id=MAX_ROLE_ID, max_zone_id=MAX_ZONE_ID, max_order_id=MAX_ORDER_ID)
+        self.world_relation_bias = RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
+        self.local_relation_bias = RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
+        self.query_local_relation_bias = RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
+        self.query_world_relation_bias = RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
+        self.candidate_set_relation_bias = RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
         self.world_bank_relation_bias = nn.ModuleList(
             [
-                RelationBias(
-                    num_token_types=NUM_TOKEN_TYPES,
-                    n_heads=self._n_heads,
-                    max_owner_id=MAX_OWNER_ID,
-                    max_role_id=MAX_ROLE_ID,
-                    max_zone_id=MAX_ZONE_ID,
-                    max_order_id=MAX_ORDER_ID,
-                )
+                RelationBias(n_heads=self._n_heads, **_RELATION_BIAS_KW)
                 for _ in WORLD_BANK_NAMES
             ]
         )
