@@ -21,9 +21,23 @@ from typing import Any
 
 import numpy as np
 
-from content_registry import get_card_metadata
+from content_registry import (
+    get_card_metadata,
+    get_enemy_metadata,
+    get_potion_metadata,
+    get_relic_metadata,
+)
 
 VALID_ENCOUNTER_TIERS = {"weak", "normal", "elite", "boss"}
+
+# Deck-stage is orthogonal to encounter tier. It classifies how mature the
+# player's deck is at snapshot time. "starter_early" is the critical-coverage
+# bucket: snapshots where the player still has ~starter deck on the first
+# 1-3 floors. Full-run training crashes in act 1 because the sandbox-trained
+# policy never sees this state.
+STARTER_EARLY_MAX_FLOOR = 3
+STARTER_EARLY_MAX_DECK_SIZE = 13
+VALID_DECK_STAGES = {"starter_early", "rest"}
 DEFAULT_EXCLUDED_COMBAT_CHARACTERS = frozenset({
     "CHARACTER.WATCHER",
 })
@@ -48,6 +62,17 @@ VALID_CURATED_COMBINED_SUBSETS = {
     "bootstrap_human_plus_local_act1clear_roomwin_only_minus_combat_reset_failures",
     "bootstrap_human_plus_local_act1clear_weak_normal_roomwin_only",
     "bootstrap_human_plus_local_act1clear_weak_normal_roomwin_only_minus_combat_reset_failures",
+    # "all"-quality variants: include local_history runs regardless of cleared_act1,
+    # so starter-deck floor 1-3 snapshots from failed runs survive. Required for
+    # bridging sandbox -> full_run training after act 1 death distribution shift.
+    "bootstrap_human_plus_local_all",
+    "bootstrap_human_plus_local_all_minus_combat_reset_failures",
+    "bootstrap_human_plus_local_all_weak_normal",
+    "bootstrap_human_plus_local_all_weak_normal_minus_combat_reset_failures",
+    "bootstrap_human_plus_local_all_roomwin_only",
+    "bootstrap_human_plus_local_all_roomwin_only_minus_combat_reset_failures",
+    "bootstrap_human_plus_local_all_weak_normal_roomwin_only",
+    "bootstrap_human_plus_local_all_weak_normal_roomwin_only_minus_combat_reset_failures",
 }
 DEFAULT_CURATED_COMBINED_SUBSET = "bootstrap_human_plus_local_act1clear_roomwin_only"
 _UNRESOLVED_CARD_TEMPLATE_MARKERS = (
@@ -217,6 +242,37 @@ def infer_encounter_tier_from_row(row: dict[str, Any]) -> str:
     )
 
 
+def infer_deck_stage(
+    *,
+    floor_number: int | None,
+    deck_size: int | None,
+) -> str:
+    """Classify how mature the player's deck is at snapshot time.
+
+    "starter_early" means the deck is close to pristine starter composition
+    on an early floor — the state the model crashes in at act 1 when moved
+    from combat sandbox to full-run training. Rows without a usable floor
+    or deck size default to "rest" so they don't silently leak into the
+    starter-early bucket.
+    """
+    if not isinstance(floor_number, int) or floor_number < 1:
+        return "rest"
+    if not isinstance(deck_size, int) or deck_size < 1:
+        return "rest"
+    if floor_number <= STARTER_EARLY_MAX_FLOOR and deck_size <= STARTER_EARLY_MAX_DECK_SIZE:
+        return "starter_early"
+    return "rest"
+
+
+def infer_deck_stage_from_row(row: dict[str, Any]) -> str:
+    deck_ids = row.get("deck_card_ids")
+    deck_size = len(deck_ids) if isinstance(deck_ids, list) else None
+    return infer_deck_stage(
+        floor_number=row.get("floor_number"),
+        deck_size=deck_size,
+    )
+
+
 def is_failed_combat_room_snapshot(row: dict[str, Any]) -> bool:
     """Return True when a combat snapshot is the run-ending failed room itself."""
 
@@ -339,6 +395,72 @@ def _load_parquet_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+@lru_cache(maxsize=None)
+def _card_id_is_known(card_id: str) -> bool:
+    return isinstance(get_card_metadata(card_id), dict)
+
+
+@lru_cache(maxsize=None)
+def _relic_id_is_known(relic_id: str) -> bool:
+    return isinstance(get_relic_metadata(relic_id), dict)
+
+
+@lru_cache(maxsize=None)
+def _potion_id_is_known(potion_id: str) -> bool:
+    return isinstance(get_potion_metadata(potion_id), dict)
+
+
+@lru_cache(maxsize=None)
+def _monster_id_is_known(monster_id: str) -> bool:
+    return isinstance(get_enemy_metadata(monster_id), dict)
+
+
+def _row_non_vanilla_id_kinds(row: dict[str, Any]) -> list[str]:
+    """Return the content kinds that carry at least one id not in the static
+    registry. Empty list means the row is vanilla as far as we can tell.
+
+    The static registries are generated from the game's /static catalog, so
+    any id missing here is either modded content or a near-future-game-version
+    entry. Per project decision we treat both as "non-vanilla" and drop the
+    row to keep training distribution stable.
+    """
+    offending: list[str] = []
+
+    deck_ids = row.get("deck_card_ids") or []
+    if isinstance(deck_ids, list):
+        for card_id in deck_ids:
+            if isinstance(card_id, str) and card_id and not _card_id_is_known(card_id):
+                offending.append("card")
+                break
+
+    deck_entries = row.get("deck_entries") or []
+    if isinstance(deck_entries, list) and "card" not in offending:
+        for entry in deck_entries:
+            if not isinstance(entry, dict):
+                continue
+            card_id = entry.get("id")
+            if isinstance(card_id, str) and card_id and not _card_id_is_known(card_id):
+                offending.append("card")
+                break
+
+    for field_key, is_known in (
+        ("relic_ids_before", _relic_id_is_known),
+        ("potion_ids_before", _potion_id_is_known),
+        ("monster_ids", _monster_id_is_known),
+    ):
+        values = row.get(field_key) or []
+        if not isinstance(values, list):
+            continue
+        kind = field_key.split("_", 1)[0]  # relic / potion / monster
+        if any(
+            isinstance(value, str) and value and not is_known(value)
+            for value in values
+        ):
+            offending.append(kind)
+
+    return offending
+
+
 def validate_combat_snapshot_row(row: dict[str, Any]) -> list[str]:
     """Return a list of reject reasons for an unusable combat snapshot row.
 
@@ -356,8 +478,15 @@ def validate_combat_snapshot_row_against(
     supported_encounter_ids: set[str] | None = None,
     supported_characters: set[str] | None = None,
     excluded_characters: set[str] | None = None,
+    reject_non_vanilla: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
+    if reject_non_vanilla:
+        offending_kinds = _row_non_vanilla_id_kinds(row)
+        if offending_kinds:
+            # One rejection reason per kind so Counter reports are useful.
+            for kind in offending_kinds:
+                reasons.append(f"non_vanilla_{kind}")
     sample_id = row.get("sample_id")
     if not isinstance(sample_id, str) or not sample_id:
         reasons.append("missing_sample_id")
@@ -456,6 +585,7 @@ def clean_combat_snapshot_rows(
     supported_encounter_ids: set[str] | None = None,
     supported_characters: set[str] | None = None,
     excluded_characters: set[str] | None = None,
+    reject_non_vanilla: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Filter combat snapshot rows down to the smallest reliable playable set."""
 
@@ -480,6 +610,7 @@ def clean_combat_snapshot_rows(
             supported_encounter_ids=supported_encounter_ids,
             supported_characters=supported_characters,
             excluded_characters=excluded_characters,
+            reject_non_vanilla=reject_non_vanilla,
         )
         if reasons:
             for reason in reasons:
@@ -593,14 +724,23 @@ class CombatSnapshotPool:
         sample_mode: str = "encounter_balanced",
         tier_weights: dict[str, float] | None = None,
         encounter_weights: dict[str, float] | None = None,
+        starter_early_boost: float = 0.0,
     ) -> None:
         if not rows:
             raise ValueError("CombatSnapshotPool requires at least one row")
         if sample_mode not in {"row_uniform", "encounter_balanced", "tier_weighted_encounter_balanced"}:
             raise ValueError(f"Unsupported sample_mode: {sample_mode}")
+        if not isinstance(starter_early_boost, (int, float)):
+            raise ValueError("starter_early_boost must be numeric")
+        starter_early_boost_f = float(starter_early_boost)
+        if not 0.0 <= starter_early_boost_f <= 1.0:
+            raise ValueError(
+                f"starter_early_boost must be in [0, 1], got {starter_early_boost_f}"
+            )
 
         self.rows = rows
         self.sample_mode = sample_mode
+        self.starter_early_boost = starter_early_boost_f
         self.tier_weights = {
             str(tier).strip().lower(): float(weight)
             for tier, weight in (tier_weights or {}).items()
@@ -613,6 +753,7 @@ class CombatSnapshotPool:
         }
         self._rows_by_encounter: dict[str, list[dict[str, Any]]] = {}
         self._rows_by_tier_encounter: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        self._starter_early_rows_by_encounter: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             encounter_id = str(row.get("encounter_id") or "")
             if not encounter_id:
@@ -620,12 +761,20 @@ class CombatSnapshotPool:
             self._rows_by_encounter.setdefault(encounter_id, []).append(row)
             tier = infer_encounter_tier_from_row(row)
             self._rows_by_tier_encounter.setdefault(tier, {}).setdefault(encounter_id, []).append(row)
+            if infer_deck_stage_from_row(row) == "starter_early":
+                self._starter_early_rows_by_encounter.setdefault(encounter_id, []).append(row)
         self._encounter_ids = sorted(self._rows_by_encounter.keys())
         self._tier_ids = sorted(self._rows_by_tier_encounter.keys())
+        self._starter_early_encounter_ids = sorted(self._starter_early_rows_by_encounter.keys())
         if not self._encounter_ids:
             raise ValueError("CombatSnapshotPool found no usable encounter_id rows")
         if sample_mode == "tier_weighted_encounter_balanced" and not self._tier_ids:
             raise ValueError("CombatSnapshotPool found no encounter tiers for weighted sampling")
+        if starter_early_boost_f > 0.0 and not self._starter_early_encounter_ids:
+            raise ValueError(
+                "CombatSnapshotPool starter_early_boost > 0 but no starter_early rows in the pool "
+                f"(floor<={STARTER_EARLY_MAX_FLOOR} AND deck_size<={STARTER_EARLY_MAX_DECK_SIZE})."
+            )
 
         self._normalized_tier_weights = self._build_normalized_tier_weights()
 
@@ -646,6 +795,7 @@ class CombatSnapshotPool:
         sample_mode: str = "encounter_balanced",
         tier_weights: dict[str, float] | None = None,
         encounter_weights: dict[str, float] | None = None,
+        starter_early_boost: float = 0.0,
         supported_encounter_ids: set[str] | None = None,
         supported_characters: set[str] | list[str] | tuple[str, ...] | None = None,
         excluded_characters: set[str] | list[str] | tuple[str, ...] | None = None,
@@ -670,6 +820,7 @@ class CombatSnapshotPool:
             sample_mode=sample_mode,
             tier_weights=tier_weights,
             encounter_weights=encounter_weights,
+            starter_early_boost=starter_early_boost,
         )
 
     def __len__(self) -> int:
@@ -686,6 +837,10 @@ class CombatSnapshotPool:
         build_ids = sorted({str(row.get("build_id") or "unknown") for row in self.rows})
         floors = [int(row.get("floor_number")) for row in self.rows if isinstance(row.get("floor_number"), int)]
         tier_counts = Counter(infer_encounter_tier_from_row(row) for row in self.rows)
+        deck_stage_counts = Counter(infer_deck_stage_from_row(row) for row in self.rows)
+        starter_early_row_count = sum(
+            len(rows) for rows in self._starter_early_rows_by_encounter.values()
+        )
         encounter_sizes = {encounter_id: len(rows) for encounter_id, rows in self._rows_by_encounter.items()}
         top_encounters = sorted(
             encounter_sizes.items(),
@@ -702,11 +857,22 @@ class CombatSnapshotPool:
             "sample_mode": self.sample_mode,
             "tier_counts": dict(sorted(tier_counts.items())),
             "tier_sampling_weights": dict(sorted(self._normalized_tier_weights.items())),
+            "deck_stage_counts": dict(sorted(deck_stage_counts.items())),
+            "starter_early_boost": self.starter_early_boost,
+            "starter_early_row_count": starter_early_row_count,
+            "starter_early_encounter_count": len(self._starter_early_encounter_ids),
             "encounter_weight_overrides": dict(sorted(self.encounter_weights.items())[:10]),
             "top_encounters": top_encounters,
         }
 
     def sample(self, rng) -> dict[str, Any]:
+        if (
+            self.starter_early_boost > 0.0
+            and self._starter_early_encounter_ids
+            and float(rng.random()) < self.starter_early_boost
+        ):
+            return self._sample_starter_early(rng)
+
         if self.sample_mode == "row_uniform":
             index = int(rng.integers(len(self.rows)))
             return self.rows[index]
@@ -727,6 +893,23 @@ class CombatSnapshotPool:
         encounter_index = int(rng.choice(len(self._encounter_ids), p=encounter_probs))
         encounter_id = self._encounter_ids[encounter_index]
         encounter_rows = self._rows_by_encounter[encounter_id]
+        row_index = int(rng.integers(len(encounter_rows)))
+        return encounter_rows[row_index]
+
+    def _sample_starter_early(self, rng) -> dict[str, Any]:
+        """Encounter-balanced sample over the starter_early bucket.
+
+        Using encounter-balanced regardless of the outer sample_mode keeps
+        the boost's intent crisp: we want fair coverage over *which weak
+        monster fight* the starter deck is facing, not the underlying
+        pool's tier/encounter distribution which is already skewed toward
+        later-game rows.
+        """
+        encounter_ids = self._starter_early_encounter_ids
+        encounter_probs = self._encounter_probabilities(encounter_ids)
+        encounter_index = int(rng.choice(len(encounter_ids), p=encounter_probs))
+        encounter_id = encounter_ids[encounter_index]
+        encounter_rows = self._starter_early_rows_by_encounter[encounter_id]
         row_index = int(rng.integers(len(encounter_rows)))
         return encounter_rows[row_index]
 

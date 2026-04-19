@@ -18,7 +18,16 @@ from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 
-from .aux_targets import NUM_BUILD_HEADS, NUM_OBJECTIVE_HEADS, NUM_ROUTE_HEADS, NUM_SELECTION_HEADS, NUM_TRAIT_HEADS, NUM_TRANSITION_HEADS
+from .aux_targets import (
+    ENEMY_STATE_SLOT_COUNT,
+    NUM_BUILD_HEADS,
+    NUM_ENEMY_STATE_FIELDS,
+    NUM_OBJECTIVE_HEADS,
+    NUM_ROUTE_HEADS,
+    NUM_SELECTION_HEADS,
+    NUM_TRAIT_HEADS,
+    NUM_TRANSITION_HEADS,
+)
 
 
 def _resolve_amp_dtype(amp_dtype: str | None) -> tuple[str, th.dtype]:
@@ -57,6 +66,8 @@ class AuxMaskableDictRolloutBufferSamples(NamedTuple):
     aux_selection_mask: th.Tensor
     aux_route_targets: th.Tensor
     aux_route_mask: th.Tensor
+    aux_enemy_state_targets: th.Tensor
+    aux_enemy_state_mask: th.Tensor
 
 
 class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
@@ -74,6 +85,8 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
     aux_selection_mask: np.ndarray
     aux_route_targets: np.ndarray
     aux_route_mask: np.ndarray
+    aux_enemy_state_targets: np.ndarray
+    aux_enemy_state_mask: np.ndarray
 
     def reset(self) -> None:
         super().reset()
@@ -89,6 +102,13 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
         self.aux_selection_mask = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.aux_route_targets = np.zeros((self.buffer_size, self.n_envs, NUM_ROUTE_HEADS), dtype=np.float32)
         self.aux_route_mask = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.aux_enemy_state_targets = np.zeros(
+            (self.buffer_size, self.n_envs, ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS),
+            dtype=np.float32,
+        )
+        self.aux_enemy_state_mask = np.zeros(
+            (self.buffer_size, self.n_envs, ENEMY_STATE_SLOT_COUNT), dtype=np.float32
+        )
 
     def add(self, *args, action_masks: Optional[np.ndarray] = None, aux_targets: Optional[dict[str, np.ndarray]] = None, **kwargs) -> None:
         pos = self.pos
@@ -109,6 +129,12 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
         self.aux_selection_mask[pos] = self._coerce_mask_vector(aux_targets.get("selection_mask"), self.n_envs)
         self.aux_route_targets[pos] = self._coerce_target_matrix(aux_targets.get("route"), self.n_envs, NUM_ROUTE_HEADS)
         self.aux_route_mask[pos] = self._coerce_mask_vector(aux_targets.get("route_mask"), self.n_envs)
+        self.aux_enemy_state_targets[pos] = self._coerce_enemy_state_targets(
+            aux_targets.get("enemy_state"), self.n_envs
+        )
+        self.aux_enemy_state_mask[pos] = self._coerce_enemy_state_mask(
+            aux_targets.get("enemy_state_mask"), self.n_envs
+        )
 
     @staticmethod
     def _coerce_target_matrix(value: Any, n_envs: int, dim: int) -> np.ndarray:
@@ -119,6 +145,30 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
             array = np.repeat(array.reshape(1, dim), n_envs, axis=0)
         if array.shape != (n_envs, dim):
             return np.zeros((n_envs, dim), dtype=np.float32)
+        return array
+
+    @staticmethod
+    def _coerce_enemy_state_targets(value: Any, n_envs: int) -> np.ndarray:
+        target_shape = (n_envs, ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS)
+        if value is None:
+            return np.zeros(target_shape, dtype=np.float32)
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape == (ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS):
+            array = np.repeat(array.reshape(1, *array.shape), n_envs, axis=0)
+        if array.shape != target_shape:
+            return np.zeros(target_shape, dtype=np.float32)
+        return array
+
+    @staticmethod
+    def _coerce_enemy_state_mask(value: Any, n_envs: int) -> np.ndarray:
+        target_shape = (n_envs, ENEMY_STATE_SLOT_COUNT)
+        if value is None:
+            return np.zeros(target_shape, dtype=np.float32)
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape == (ENEMY_STATE_SLOT_COUNT,):
+            array = np.repeat(array.reshape(1, ENEMY_STATE_SLOT_COUNT), n_envs, axis=0)
+        if array.shape != target_shape:
+            return np.zeros(target_shape, dtype=np.float32)
         return array
 
     @staticmethod
@@ -158,6 +208,8 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
                 "aux_selection_mask",
                 "aux_route_targets",
                 "aux_route_mask",
+                "aux_enemy_state_targets",
+                "aux_enemy_state_mask",
             ]
             for tensor in tensor_names:
                 self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
@@ -192,6 +244,8 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
             aux_selection_mask=self.to_torch(self.aux_selection_mask[batch_inds].flatten()),
             aux_route_targets=self.to_torch(self.aux_route_targets[batch_inds]),
             aux_route_mask=self.to_torch(self.aux_route_mask[batch_inds].flatten()),
+            aux_enemy_state_targets=self.to_torch(self.aux_enemy_state_targets[batch_inds]),
+            aux_enemy_state_mask=self.to_torch(self.aux_enemy_state_mask[batch_inds]),
         )
 
 
@@ -248,6 +302,13 @@ class AsyncAuxMaskableDictRolloutBuffer:
         self.aux_selection_mask = np.zeros((self.buffer_size,), dtype=np.float32)
         self.aux_route_targets = np.zeros((self.buffer_size, NUM_ROUTE_HEADS), dtype=np.float32)
         self.aux_route_mask = np.zeros((self.buffer_size,), dtype=np.float32)
+        self.aux_enemy_state_targets = np.zeros(
+            (self.buffer_size, ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS),
+            dtype=np.float32,
+        )
+        self.aux_enemy_state_mask = np.zeros(
+            (self.buffer_size, ENEMY_STATE_SLOT_COUNT), dtype=np.float32
+        )
         self._prepared_filled = -1
         self._prepared_observations: dict[str, th.Tensor] = {}
         self._prepared_tensors: dict[str, th.Tensor] = {}
@@ -294,6 +355,8 @@ class AsyncAuxMaskableDictRolloutBuffer:
             self.aux_selection_mask[index] = AuxMaskableDictRolloutBuffer._coerce_mask_vector(aux_targets.get("selection_mask"), 1)[0]
             self.aux_route_targets[index] = AuxMaskableDictRolloutBuffer._coerce_target_matrix(aux_targets.get("route"), 1, NUM_ROUTE_HEADS)[0]
             self.aux_route_mask[index] = AuxMaskableDictRolloutBuffer._coerce_mask_vector(aux_targets.get("route_mask"), 1)[0]
+            self.aux_enemy_state_targets[index] = AuxMaskableDictRolloutBuffer._coerce_enemy_state_targets(aux_targets.get("enemy_state"), 1)[0]
+            self.aux_enemy_state_mask[index] = AuxMaskableDictRolloutBuffer._coerce_enemy_state_mask(aux_targets.get("enemy_state_mask"), 1)[0]
 
         self.pos += 1
         self.full = self.pos >= self.buffer_size
@@ -352,6 +415,8 @@ class AsyncAuxMaskableDictRolloutBuffer:
                 aux_selection_mask=self._prepared_tensors["aux_selection_mask"].index_select(0, batch_inds),
                 aux_route_targets=self._prepared_tensors["aux_route_targets"].index_select(0, batch_inds),
                 aux_route_mask=self._prepared_tensors["aux_route_mask"].index_select(0, batch_inds),
+                aux_enemy_state_targets=self._prepared_tensors["aux_enemy_state_targets"].index_select(0, batch_inds),
+                aux_enemy_state_mask=self._prepared_tensors["aux_enemy_state_mask"].index_select(0, batch_inds),
             )
             start_idx += batch_size
 
@@ -396,6 +461,8 @@ class AsyncAuxMaskableDictRolloutBuffer:
             "aux_selection_mask": _slice_to_torch(self.aux_selection_mask, flatten=True),
             "aux_route_targets": _slice_to_torch(self.aux_route_targets),
             "aux_route_mask": _slice_to_torch(self.aux_route_mask, flatten=True),
+            "aux_enemy_state_targets": _slice_to_torch(self.aux_enemy_state_targets),
+            "aux_enemy_state_mask": _slice_to_torch(self.aux_enemy_state_mask),
         }
         self._prepared_filled = filled
 
@@ -417,6 +484,7 @@ class AuxMaskablePPO(MaskablePPO):
         aux_build_coef: float = 0.10,
         aux_selection_coef: float = 0.10,
         aux_route_coef: float = 0.10,
+        aux_enemy_state_coef: float = 0.10,
         amp: bool = False,
         amp_dtype: str = "bf16",
         **kwargs,
@@ -428,6 +496,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.aux_build_coef = float(aux_build_coef)
         self.aux_selection_coef = float(aux_selection_coef)
         self.aux_route_coef = float(aux_route_coef)
+        self.aux_enemy_state_coef = float(aux_enemy_state_coef)
         self._amp_requested = bool(amp)
         self._amp_dtype_name, self._amp_dtype = _resolve_amp_dtype(amp_dtype)
         self._amp_enabled = False
@@ -529,6 +598,15 @@ class AuxMaskablePPO(MaskablePPO):
     ) -> dict[str, Any]:
         assert self.policy is not None
         self.policy.set_training_mode(False)
+        # Hard fail if every env has been permanently failed by the
+        # collector — without any live env, the rollout loop would block
+        # forever waiting for items that no worker can produce.
+        if hasattr(collector, "live_env_ids") and not collector.live_env_ids:
+            raise RuntimeError(
+                "AsyncReadyCollector has 0 live envs (all permanently failed). "
+                f"Failed envs: {getattr(collector, 'permanently_failed_env_ids', [])}. "
+                "Training cannot continue without at least one live env."
+            )
         rollout_buffer.reset()
         ready_pool: dict[int, Any] = {}
         pending: dict[int, dict[str, Any]] = {}
@@ -577,6 +655,25 @@ class AuxMaskablePPO(MaskablePPO):
                     ready_pool.pop(env_id, None)
                     if pending.pop(env_id, None) is not None:
                         collector_counts["dropped_pending_envs"] += 1
+                    if event.get("permanently_failed"):
+                        # Counted separately so the train log can surface
+                        # this distinct from ordinary worker restarts.
+                        collector_counts.setdefault("permanently_failed_envs", 0)
+                        collector_counts["permanently_failed_envs"] += 1
+            # Mid-rollout sanity check: if every env has died and we have
+            # no in-flight work left, we'd block forever waiting on items
+            # nobody can produce. Raise so the operator can intervene.
+            if (
+                hasattr(collector, "live_env_ids")
+                and not collector.live_env_ids
+                and not pending
+                and not ready_pool
+            ):
+                raise RuntimeError(
+                    "AsyncReadyCollector lost all live envs during rollout "
+                    f"(failed: {collector.permanently_failed_env_ids}). "
+                    f"Buffer had {rollout_buffer.pos}/{n_rollout_steps} steps."
+                )
             need_item = rollout_buffer.pos < n_rollout_steps and not ready_pool
             wait_for_ready = need_item or (pending and not ready_pool)
             min_items = 1 if wait_for_ready else 0
@@ -742,6 +839,7 @@ class AuxMaskablePPO(MaskablePPO):
         clip_fractions = []
         objective_losses, transition_losses, trait_losses = [], [], []
         build_losses, selection_losses, route_losses = [], [], []
+        enemy_state_losses: list[float] = []
 
         if hasattr(self.rollout_buffer, "prepare_for_training"):
             prepare_started = time.perf_counter()
@@ -831,6 +929,7 @@ class AuxMaskablePPO(MaskablePPO):
                 build_losses.append(aux_metrics["build"])
                 selection_losses.append(aux_metrics["selection"])
                 route_losses.append(aux_metrics["route"])
+                enemy_state_losses.append(aux_metrics["enemy_state"])
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + aux_total_loss
 
@@ -870,6 +969,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.logger.record("train/aux_build_loss", np.mean(build_losses) if build_losses else 0.0)
         self.logger.record("train/aux_selection_loss", np.mean(selection_losses) if selection_losses else 0.0)
         self.logger.record("train/aux_route_loss", np.mean(route_losses) if route_losses else 0.0)
+        self.logger.record("train/aux_enemy_state_loss", np.mean(enemy_state_losses) if enemy_state_losses else 0.0)
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
@@ -882,6 +982,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.logger.record("train/aux_build_coef", self.aux_build_coef)
         self.logger.record("train/aux_selection_coef", self.aux_selection_coef)
         self.logger.record("train/aux_route_coef", self.aux_route_coef)
+        self.logger.record("train/aux_enemy_state_coef", self.aux_enemy_state_coef)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self._last_train_timing = {
@@ -948,6 +1049,10 @@ class AuxMaskablePPO(MaskablePPO):
         selection_mask = np.zeros((n_envs,), dtype=np.float32)
         route = np.zeros((n_envs, NUM_ROUTE_HEADS), dtype=np.float32)
         route_mask = np.zeros((n_envs,), dtype=np.float32)
+        enemy_state = np.zeros(
+            (n_envs, ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS), dtype=np.float32
+        )
+        enemy_state_mask = np.zeros((n_envs, ENEMY_STATE_SLOT_COUNT), dtype=np.float32)
 
         for index, info in enumerate(infos):
             aux = info.get("aux_targets") if isinstance(info, dict) else None
@@ -965,6 +1070,8 @@ class AuxMaskablePPO(MaskablePPO):
             selection_mask[index] = self._extract_scalar(aux, "selection_mask", 1.0)
             route[index] = self._extract_target(aux, "route", NUM_ROUTE_HEADS)
             route_mask[index] = self._extract_scalar(aux, "route_mask", 1.0)
+            enemy_state[index] = self._extract_enemy_state_target(aux)
+            enemy_state_mask[index] = self._extract_enemy_state_mask(aux)
 
         return {
             "objective": objective,
@@ -979,7 +1086,33 @@ class AuxMaskablePPO(MaskablePPO):
             "selection_mask": selection_mask,
             "route": route,
             "route_mask": route_mask,
+            "enemy_state": enemy_state,
+            "enemy_state_mask": enemy_state_mask,
         }
+
+    @staticmethod
+    def _extract_enemy_state_target(aux: dict[str, Any]) -> np.ndarray:
+        value = aux.get("enemy_state")
+        target_shape = (ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS)
+        if value is None:
+            return np.zeros(target_shape, dtype=np.float32)
+        array = np.asarray(value, dtype=np.float32)
+        if array.shape == target_shape:
+            return array
+        if array.size == ENEMY_STATE_SLOT_COUNT * NUM_ENEMY_STATE_FIELDS:
+            return array.reshape(target_shape)
+        return np.zeros(target_shape, dtype=np.float32)
+
+    @staticmethod
+    def _extract_enemy_state_mask(aux: dict[str, Any]) -> np.ndarray:
+        value = aux.get("enemy_state_mask")
+        target_shape = (ENEMY_STATE_SLOT_COUNT,)
+        if value is None:
+            return np.zeros(target_shape, dtype=np.float32)
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        if array.shape == target_shape:
+            return array
+        return np.zeros(target_shape, dtype=np.float32)
 
     @staticmethod
     def _extract_target(aux: dict[str, Any], key: str, dim: int) -> np.ndarray:
@@ -1005,7 +1138,7 @@ class AuxMaskablePPO(MaskablePPO):
         aux_outputs: dict[str, th.Tensor] | None = None,
     ) -> tuple[th.Tensor, dict[str, float]]:
         aux_total = th.zeros((), device=self.device)
-        metrics = {"objective": 0.0, "transition": 0.0, "traits": 0.0, "build": 0.0, "selection": 0.0, "route": 0.0}
+        metrics = {"objective": 0.0, "transition": 0.0, "traits": 0.0, "build": 0.0, "selection": 0.0, "route": 0.0, "enemy_state": 0.0}
         aux_outputs = aux_outputs or self.policy.forward_aux_heads(rollout_data.observations)
 
         if self.aux_objective_coef > 0.0:
@@ -1044,7 +1177,42 @@ class AuxMaskablePPO(MaskablePPO):
             aux_total = aux_total + self.aux_route_coef * route_loss
             metrics["route"] = float(route_loss.detach().cpu().item())
 
+        if self.aux_enemy_state_coef > 0.0 and "enemy_state" in aux_outputs:
+            enemy_state_pred = aux_outputs["enemy_state"]
+            enemy_state_loss = self._masked_enemy_state_loss(
+                enemy_state_pred,
+                rollout_data.aux_enemy_state_targets,
+                rollout_data.aux_enemy_state_mask,
+            )
+            aux_total = aux_total + self.aux_enemy_state_coef * enemy_state_loss
+            metrics["enemy_state"] = float(enemy_state_loss.detach().cpu().item())
+
         return aux_total, metrics
+
+    @staticmethod
+    def _masked_enemy_state_loss(
+        pred: th.Tensor,
+        targets: th.Tensor,
+        mask: th.Tensor,
+    ) -> th.Tensor:
+        """MSE on hp/attribution slots + BCE on alive_next slot, per-enemy masked."""
+        if pred.shape != targets.shape:
+            return th.zeros((), device=pred.device)
+        mask_f = mask.to(pred.dtype)
+        total_mass = mask_f.sum().clamp_min(1.0)
+        # Regression slots 0 (hp delta), 1 (attribution)
+        reg_pred = pred[..., :2]
+        reg_targets = targets[..., :2]
+        reg_diff = (reg_pred - reg_targets).pow(2).sum(dim=-1)
+        reg_loss = (reg_diff * mask_f).sum() / total_mass
+        # Classification slot 2 (alive_next) via BCE-with-logits
+        alive_pred = pred[..., 2]
+        alive_target = targets[..., 2]
+        alive_loss_elem = F.binary_cross_entropy_with_logits(
+            alive_pred, alive_target, reduction="none"
+        )
+        alive_loss = (alive_loss_elem * mask_f).sum() / total_mass
+        return reg_loss + alive_loss
 
     @staticmethod
     def _select_aux_prediction(aux_outputs: dict[str, th.Tensor], actions: th.Tensor, *, candidate_key: str, global_key: str) -> th.Tensor:

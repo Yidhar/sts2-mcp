@@ -13,7 +13,16 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule
 
 from .attention_blocks import CandidateDecoderBlock, CrossAttentionBlock, EntityPooling, RelationBias, TransformerEncoderBlock
-from .aux_targets import NUM_BUILD_HEADS, NUM_OBJECTIVE_HEADS, NUM_ROUTE_HEADS, NUM_SELECTION_HEADS, NUM_TRAIT_HEADS, NUM_TRANSITION_HEADS
+from .aux_targets import (
+    ENEMY_STATE_SLOT_COUNT,
+    NUM_BUILD_HEADS,
+    NUM_ENEMY_STATE_FIELDS,
+    NUM_OBJECTIVE_HEADS,
+    NUM_ROUTE_HEADS,
+    NUM_SELECTION_HEADS,
+    NUM_TRAIT_HEADS,
+    NUM_TRANSITION_HEADS,
+)
 from .observation_v3 import (
     ENTITY_HASH_BUCKETS,
     MAX_ACTIONS,
@@ -314,6 +323,10 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
         self.candidate_build_head = nn.Sequential(nn.LayerNorm(self._d_model), nn.Linear(self._d_model, NUM_BUILD_HEADS))
         self.candidate_selection_head = nn.Sequential(nn.LayerNorm(self._d_model), nn.Linear(self._d_model, NUM_SELECTION_HEADS))
         self.candidate_route_head = nn.Sequential(nn.LayerNorm(self._d_model), nn.Linear(self._d_model, NUM_ROUTE_HEADS))
+        self.enemy_state_head = nn.Sequential(
+            nn.LayerNorm(self._d_model),
+            nn.Linear(self._d_model, ENEMY_STATE_SLOT_COUNT * NUM_ENEMY_STATE_FIELDS),
+        )
 
         # Pre-register constant bank role/zone ID tensors as buffers to avoid
         # re-creating them via torch.as_tensor on every forward pass.
@@ -757,6 +770,10 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
         return projected_batches
 
     def _aux_from_embeddings(self, world_pool, candidate_x):
+        enemy_state_flat = self.enemy_state_head(world_pool)
+        enemy_state = enemy_state_flat.view(
+            enemy_state_flat.shape[0], ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS
+        )
         return {
             "objective": self.objective_head(world_pool),
             "transition": self.transition_head(world_pool),
@@ -767,6 +784,7 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
             "candidate_build": self.candidate_build_head(candidate_x),
             "candidate_selection": self.candidate_selection_head(candidate_x),
             "candidate_route": self.candidate_route_head(candidate_x),
+            "enemy_state": enemy_state,
         }
 
     def forward_world_bank_routing(self, obs):

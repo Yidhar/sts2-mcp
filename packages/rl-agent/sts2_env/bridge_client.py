@@ -93,6 +93,10 @@ class BridgeClient:
         self._base_url: str = ""
         self._session_base_url: str = ""
         self._token: str = ""
+        # Session-file freshness tracking so we can hot-reload after launcher
+        # kills and restarts the bridge mod (new PID → new token → new
+        # session_N.json written in place).
+        self._session_mtime: float = 0.0
         self._is_connected: bool = False
         self._session = requests.Session()
         self._load_session()
@@ -100,7 +104,8 @@ class BridgeClient:
     def _load_session(self) -> None:
         """Read session.json and extract base_url and token."""
         try:
-            data = json.loads(self._session_path.read_text(encoding="utf-8"))
+            raw = self._session_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
         except FileNotFoundError:
             raise BridgeError(
                 f"Session file not found: {self._session_path}. "
@@ -121,6 +126,50 @@ class BridgeClient:
         )
         self._token = data["token"]
         self._session.headers.update({"Authorization": f"Bearer {self._token}"})
+        try:
+            self._session_mtime = self._session_path.stat().st_mtime
+        except OSError:
+            self._session_mtime = 0.0
+
+    def _session_file_changed_on_disk(self) -> bool:
+        """Return True if session_N.json has been re-written since last load
+        (e.g., launcher killed and restarted this instance and wrote a fresh
+        token/port). Used to trigger a hot reload in the retry loop.
+        """
+        try:
+            current_mtime = self._session_path.stat().st_mtime
+        except OSError:
+            return False
+        # Treat any mtime forward-movement as a change. A new session file
+        # written by the launcher after a kill+restart always has a later
+        # mtime than the one we originally loaded.
+        return current_mtime > self._session_mtime
+
+    def _maybe_rebind_session(self, reason: str) -> bool:
+        """If the session file has changed on disk, reload it and return True.
+
+        Silently return False when nothing changed or the reload itself
+        fails (we want the caller's retry/backoff to carry on rather than
+        fatally raising in the middle of a transient network blip).
+        """
+        if not self._session_file_changed_on_disk():
+            return False
+        old_base_url = self._base_url
+        old_token_prefix = self._token[:6] if self._token else ""
+        try:
+            self._load_session()
+        except BridgeError:
+            return False
+        new_token_prefix = self._token[:6] if self._token else ""
+        # Keep this print — it's the only operator-visible signal that the
+        # client auto-rebound after a launcher-side restart. Without it the
+        # restart is silent and very hard to correlate with watchdog events.
+        print(
+            f"[bridge-client] rebound session ({reason}): "
+            f"{old_base_url} token={old_token_prefix}... -> "
+            f"{self._base_url} token={new_token_prefix}..."
+        )
+        return True
 
     @property
     def base_url(self) -> str:
@@ -157,7 +206,6 @@ class BridgeClient:
         Raises:
             BridgeError: On non-retryable HTTP errors or after retries exhausted.
         """
-        url = f"{self._base_url}/{endpoint.lstrip('/')}"
         http_timeout_s = (
             (timeout_ms + self.HTTP_TIMEOUT_GRACE_MS) / 1000.0
             if timeout_ms is not None
@@ -166,6 +214,10 @@ class BridgeClient:
 
         last_exc: Exception | None = None
         for attempt in range(1, self.MAX_RETRIES + 1):
+            # Recompute per attempt so a rebind during the retry loop picks
+            # up the new base_url. Token lives in self._session.headers
+            # which _load_session() updated.
+            url = f"{self._base_url}/{endpoint.lstrip('/')}"
             try:
                 resp = self._session.request(
                     method,
@@ -179,15 +231,28 @@ class BridgeClient:
                         resp_body = resp.json()
                     except Exception:
                         resp_body = resp.text
-                    if (
-                        resp.status_code == 401
-                        and isinstance(resp_body, dict)
-                        and str(resp_body.get("error") or "").strip() == "missing_or_invalid_token"
-                        and attempt < self.MAX_RETRIES
-                    ):
-                        self._load_session()
-                        time.sleep(self.RETRY_DELAY_S)
-                        continue
+                    if resp.status_code == 401 and attempt < self.MAX_RETRIES:
+                        # Widened from the narrow "missing_or_invalid_token"
+                        # match: ANY 401 may indicate a stale token after a
+                        # launcher-side restart. Try a fresh session reload
+                        # first, fall back to same credentials if unchanged.
+                        rebound = self._maybe_rebind_session(
+                            reason=f"401 on {method} /{endpoint}",
+                        )
+                        if not rebound and isinstance(resp_body, dict) and str(
+                            resp_body.get("error") or ""
+                        ).strip() == "missing_or_invalid_token":
+                            # Legacy narrow path: re-read even without mtime
+                            # change to preserve prior behavior on the one
+                            # error code we know means "token rejected".
+                            self._load_session()
+                        if rebound or (
+                            isinstance(resp_body, dict)
+                            and str(resp_body.get("error") or "").strip()
+                            == "missing_or_invalid_token"
+                        ):
+                            time.sleep(self.RETRY_DELAY_S)
+                            continue
                     raise BridgeError(
                         f"Bridge returned HTTP {resp.status_code} for {method} /{endpoint}: "
                         f"{resp_body}",
@@ -204,9 +269,16 @@ class BridgeClient:
             except requests.ConnectionError as exc:
                 self._is_connected = False
                 last_exc = exc
+                # Launcher may have just killed the process mid-request and
+                # is writing a fresh session_N.json — try to pick that up on
+                # the next retry.
+                if attempt < self.MAX_RETRIES:
+                    self._maybe_rebind_session(reason=f"ConnectionError on {method} /{endpoint}")
             except requests.Timeout as exc:
                 self._is_connected = False
                 last_exc = exc
+                if attempt < self.MAX_RETRIES:
+                    self._maybe_rebind_session(reason=f"Timeout on {method} /{endpoint}")
 
             if attempt < self.MAX_RETRIES:
                 time.sleep(self.RETRY_DELAY_S)

@@ -61,6 +61,12 @@ class AsyncReadyCollector:
         reset_watchdog_timeout_s: float = 75.0,
         initial_reset_watchdog_timeout_s: float = 120.0,
         restart_cooldown_s: float = 15.0,
+        # Per-env cap on total restarts (timeout + error-triggered combined)
+        # before the collector gives up and propagates the exception to the
+        # main training loop. Set high enough that a few launcher-side kill+
+        # restart cycles don't kill training, but low enough that an
+        # unrecoverable env bug doesn't flap forever.
+        max_worker_restarts: int = 20,
         event_log_path: str | None = None,
     ) -> None:
         self._env_factories = list(env_factories)
@@ -83,6 +89,13 @@ class AsyncReadyCollector:
         self._reset_watchdog_timeout_s = max(float(reset_watchdog_timeout_s), 1.0)
         self._initial_reset_watchdog_timeout_s = max(float(initial_reset_watchdog_timeout_s), 1.0)
         self._restart_cooldown_s = max(float(restart_cooldown_s), 0.0)
+        self._max_worker_restarts = max(int(max_worker_restarts), 1)
+        # Envs whose restart budget has been exhausted are marked here. The
+        # main training loop is expected to keep rolling on whatever envs
+        # remain — the rollout buffer is flat (per-transition env_indices,
+        # not (n_envs, n_steps, ...)) so reducing the live env count just
+        # makes each rollout iteration take more cycles to fill.
+        self._permanently_failed_envs: set[int] = set()
         self._prewarmed_slots = dict(prewarmed_slots or {})
         self._event_log_path = Path(event_log_path).expanduser() if event_log_path else None
         self._event_log_lock = threading.Lock()
@@ -158,7 +171,32 @@ class AsyncReadyCollector:
 
     def dispatch_actions(self, env_ids: list[int], actions: np.ndarray | list[int]) -> None:
         for env_id, action in zip(env_ids, np.asarray(actions).reshape(-1), strict=True):
+            # Defensive: trainer should already be filtering on live_env_ids,
+            # but if a dead env's id slips through (e.g. a stale reference
+            # held across the restart event), silently drop the action so we
+            # don't push to a queue whose worker is gone forever.
+            if env_id in self._permanently_failed_envs:
+                continue
             self._action_queues[env_id].put(int(action))
+
+    @property
+    def live_env_ids(self) -> list[int]:
+        """env_ids that have NOT been marked permanently failed.
+
+        Order is the original env_id order with dead ones removed. Trainer
+        loops should iterate this rather than ``range(num_envs)``.
+        """
+        return [
+            env_id for env_id in range(self.num_envs)
+            if env_id not in self._permanently_failed_envs
+        ]
+
+    def is_env_permanently_failed(self, env_id: int) -> bool:
+        return env_id in self._permanently_failed_envs
+
+    @property
+    def permanently_failed_env_ids(self) -> list[int]:
+        return sorted(self._permanently_failed_envs)
 
     def pop_restart_events(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -402,8 +440,34 @@ class AsyncReadyCollector:
                 )
         except BaseException as exc:  # noqa: BLE001
             self._update_worker_status(env_id, generation=generation, phase="failed", error=repr(exc))
-            if self._is_current_generation(env_id, generation):
+            # Fatal exception types are always propagated — these represent
+            # interpreter-level failures (shutdown requests, OOM, keyboard
+            # interrupt) that retrying a worker thread cannot fix and that
+            # must surface to the main training loop immediately.
+            fatal_types: tuple[type, ...] = (
+                KeyboardInterrupt, SystemExit, MemoryError,
+            )
+            if not self._is_current_generation(env_id, generation):
+                # Stale-generation exception (a parallel restart already
+                # took over). Drop silently.
+                pass
+            elif isinstance(exc, fatal_types) or self._stop_event.is_set():
                 self._error_queue.put(exc)
+            elif self._attempt_worker_error_restart(env_id, exc, generation):
+                # Successfully spawned a replacement worker — this generation
+                # is retiring cleanly. Swallow the exception; the new thread
+                # is already rolling on the fresh BridgeClient, which (via
+                # its session-file rebind) will pick up the post-restart
+                # bridge credentials as soon as the launcher finishes
+                # respawning the game process.
+                pass
+            else:
+                # Restart budget exhausted. Mark this env permanently failed
+                # so the trainer can keep rolling on the remaining live
+                # envs. We deliberately DO NOT push to _error_queue — the
+                # whole point of the resilience work is to avoid bringing
+                # down 8h+ training runs over a single instance.
+                self._mark_env_permanently_failed(env_id, exc, generation)
         finally:
             self._update_worker_status(env_id, generation=generation, phase="closed")
             if env is not None:
@@ -411,6 +475,133 @@ class AsyncReadyCollector:
                     env.close()
                 except Exception:
                     pass
+
+    def _mark_env_permanently_failed(
+        self,
+        env_id: int,
+        exc: BaseException,
+        stale_generation: int,
+    ) -> None:
+        """Record env_id as permanently dead and notify the trainer.
+
+        After this call:
+        - ``live_env_ids`` no longer includes env_id
+        - ``dispatch_actions`` silently drops actions targeting env_id
+        - the worker thread for this generation is exiting; no replacement
+          will be started
+        - a restart_event with phase="permanently_failed" is queued so the
+          trainer can log it
+        - any pending action / cached ready obs for this env in the trainer
+          will be naturally cleaned up via the same restart-event path that
+          handles ordinary worker restarts (this event uses
+          ``stale_generation = current_generation`` to invalidate them)
+        """
+        with self._worker_control_lock:
+            self._permanently_failed_envs.add(env_id)
+            current_generation = int(self._worker_generation.get(env_id, 0))
+            event = {
+                "env_id": env_id,
+                "stale_generation": current_generation,
+                "generation": current_generation,
+                "phase": "permanently_failed",
+                "age_s": 0.0,
+                "restart_count": int(self._worker_restart_count.get(env_id, 0)),
+                "error": repr(exc),
+                "permanently_failed": True,
+            }
+            self._restart_event_queue.put(event)
+            self._log_event(
+                {
+                    "event": "worker_permanently_failed",
+                    "timestamp_unix_s": time.time(),
+                    "env_id": env_id,
+                    "stale_generation": current_generation,
+                    "generation": current_generation,
+                    "phase": "permanently_failed",
+                    "restart_count": int(self._worker_restart_count.get(env_id, 0)),
+                    "error": repr(exc),
+                    "live_env_count_after": self.num_envs - len(self._permanently_failed_envs),
+                }
+            )
+        # Print a stderr-visible line so a human watching the training
+        # console immediately knows one env is gone for good. Without this
+        # the failure is silent in stdout-suppressed setups.
+        print(
+            f"[async-collector] env {env_id} PERMANENTLY FAILED after "
+            f"{self._worker_restart_count.get(env_id, 0)} restart attempts: "
+            f"{exc!r}. Training will continue with "
+            f"{self.num_envs - len(self._permanently_failed_envs)}/{self.num_envs} "
+            f"live envs.",
+            flush=True,
+        )
+
+    def _attempt_worker_error_restart(
+        self,
+        env_id: int,
+        exc: BaseException,
+        stale_generation: int,
+    ) -> bool:
+        """Replace the dying worker with a fresh generation. Returns True
+        if restart was launched (caller should swallow the exception);
+        False if the restart budget is exhausted (caller propagates).
+        """
+        now = time.perf_counter()
+        with self._worker_control_lock:
+            current_generation = int(self._worker_generation.get(env_id, 0))
+            if stale_generation != current_generation:
+                # Another path (watchdog timeout) already scheduled a restart
+                # for this generation; drop this exception silently.
+                return True
+            restart_count = int(self._worker_restart_count.get(env_id, 0))
+            if restart_count >= self._max_worker_restarts:
+                # Circuit breaker: stop trying and let the main loop see
+                # the original error. Something is persistently wrong.
+                return False
+            self._last_restart_ts[env_id] = now
+            self._worker_generation[env_id] = current_generation + 1
+            self._worker_restart_count[env_id] = restart_count + 1
+            new_generation = self._worker_generation[env_id]
+            self._action_queues[env_id] = Queue(maxsize=1)
+            event = {
+                "env_id": env_id,
+                "stale_generation": current_generation,
+                "generation": new_generation,
+                "phase": "worker_exception",
+                "age_s": 0.0,
+                "restart_count": int(self._worker_restart_count[env_id]),
+                "error": repr(exc),
+            }
+            self._restart_event_queue.put(event)
+            self._log_event(
+                {
+                    "event": "worker_restart",
+                    "timestamp_unix_s": time.time(),
+                    "env_id": env_id,
+                    "stale_generation": current_generation,
+                    "generation": new_generation,
+                    "phase": "worker_exception",
+                    "age_s": 0.0,
+                    "restart_count": int(self._worker_restart_count[env_id]),
+                    "worker_restart_happened": True,
+                    "error": repr(exc),
+                }
+            )
+            self._start_worker(
+                env_id,
+                self._env_factories[env_id],
+                self._action_queues[env_id],
+                None,
+                generation=new_generation,
+            )
+            self._update_worker_status(
+                env_id,
+                generation=new_generation,
+                phase="restarting",
+                restart_reason="worker_exception",
+                restart_count=int(self._worker_restart_count[env_id]),
+                error=repr(exc),
+            )
+        return True
 
     def _update_worker_status(self, env_id: int, *, generation: int, phase: str, **extra: Any) -> None:
         if not self._is_current_generation(env_id, generation):
@@ -452,6 +643,11 @@ class AsyncReadyCollector:
         bridge_action = bridge_info.get("action") if isinstance(bridge_info.get("action"), dict) else {}
         step_timing = bridge_info.get("step_timing_ms") if isinstance(bridge_info.get("step_timing_ms"), dict) else {}
         step_counts = bridge_info.get("step_timing_counts") if isinstance(bridge_info.get("step_timing_counts"), dict) else {}
+        reward_breakdown = (
+            bridge_info.get("reward_breakdown")
+            if isinstance(bridge_info.get("reward_breakdown"), dict)
+            else {}
+        )
         card_selection_before = (
             bridge_info.get("card_selection_before")
             if isinstance(bridge_info.get("card_selection_before"), dict)
@@ -463,6 +659,20 @@ class AsyncReadyCollector:
             else {}
         )
         restart_count = int(self._worker_restart_count.get(env_id, 0))
+        # Pull floor metrics that env_v2 surfaces into info (via _build_info).
+        # transition_info may also carry transition_state.run.floor as fallback.
+        final_floor = transition_info.get("current_floor")
+        max_floor = transition_info.get("max_floor_reached")
+        if final_floor is None or max_floor is None:
+            ts_run = (
+                (transition_info.get("transition_state") or {}).get("run") or {}
+                if isinstance(transition_info.get("transition_state"), dict)
+                else {}
+            )
+            if final_floor is None:
+                final_floor = ts_run.get("floor")
+            if max_floor is None:
+                max_floor = ts_run.get("floor")
         self._log_event(
             {
                 "event": "episode_terminal",
@@ -472,6 +682,8 @@ class AsyncReadyCollector:
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
                 "reward": float(reward),
+                "final_floor": final_floor,
+                "max_floor_reached": max_floor,
                 "encounter_id": transition_info.get("encounter_id"),
                 "action_id": bridge_action.get("action_id"),
                 "action_kind": bridge_action.get("kind"),
@@ -485,6 +697,16 @@ class AsyncReadyCollector:
                 "combat_in_progress_after": bridge_info.get("combat_in_progress_after"),
                 "truncation_reason": bridge_info.get("truncation_reason"),
                 "action_error": bridge_info.get("action_error"),
+                "reward_breakdown_total": reward_breakdown.get("total"),
+                "reward_anomaly_clamped": reward_breakdown.get("reward_anomaly_clamped"),
+                "reward_anomaly_reasons": reward_breakdown.get("reward_anomaly_reasons"),
+                "reward_raw_gold_gain": reward_breakdown.get("raw_gold_gain"),
+                "reward_raw_gold_spend": reward_breakdown.get("raw_gold_spend"),
+                "reward_raw_relic_gain_count": reward_breakdown.get("raw_relic_gain_count"),
+                "reward_raw_floor_delta": reward_breakdown.get("raw_floor_delta"),
+                "reward_raw_act_clear": reward_breakdown.get("raw_act_clear"),
+                "reward_raw_room_hp_delta_normalized": reward_breakdown.get("raw_room_hp_delta_normalized"),
+                "reward_raw_max_hp_gain_normalized": reward_breakdown.get("raw_max_hp_gain_normalized"),
                 "card_selection_screen_type_before": card_selection_before.get("screen_type"),
                 "card_selection_screen_type_after": card_selection_after.get("screen_type"),
                 "card_selection_selected_count_before": card_selection_before.get("selected_count"),

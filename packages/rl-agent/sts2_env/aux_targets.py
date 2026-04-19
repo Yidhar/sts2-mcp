@@ -72,6 +72,15 @@ ROUTE_HEAD_NAMES = (
 )
 NUM_ROUTE_HEADS = len(ROUTE_HEAD_NAMES)
 
+ENEMY_STATE_FIELD_NAMES = (
+    "next_hp_delta_ratio",
+    "attributable_player_hp_loss_ratio",
+    "alive_next",
+)
+NUM_ENEMY_STATE_FIELDS = len(ENEMY_STATE_FIELD_NAMES)
+ENEMY_STATE_SLOT_COUNT = obs_common.MAX_ENEMIES
+
+
 SELECTION_HEAD_NAMES = (
     "source_hand",
     "source_draw",
@@ -146,6 +155,11 @@ def _combat_state(obs: dict[str, Any] | None) -> dict[str, Any]:
 def _player_state(obs: dict[str, Any] | None) -> dict[str, Any]:
     player = (obs or {}).get("player") if isinstance(obs, dict) else None
     return player if isinstance(player, dict) else {}
+
+
+def _self_inflicted_hp_loss_cumulative(obs: dict[str, Any] | None) -> float:
+    """Bridge-side cumulative counter; see combat_memory._self_inflicted_hp_loss_cumulative."""
+    return _float(_combat_state(obs).get("self_inflicted_hp_loss_cumulative"))
 
 
 def _player_hp(obs: dict[str, Any] | None) -> float:
@@ -752,6 +766,95 @@ def compute_transition_targets(
     return target
 
 
+def _enemy_identity_key(enemy: dict[str, Any] | None, fallback_index: int) -> str:
+    if isinstance(enemy, dict):
+        for key in ("combat_id", "id", "model_id", "name"):
+            value = enemy.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return f"idx_{fallback_index}"
+
+
+def compute_enemy_state_targets(
+    prev_obs: dict[str, Any] | None,
+    next_obs: dict[str, Any] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-enemy next-step prediction targets.
+
+    Self-supervised — uses only prev/next observation diffs so the signal
+    covers on-death bursts, enrage scaling, summons, and any unseen or
+    modded mechanic without requiring hand labels.
+    """
+    targets = np.zeros(
+        (ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS), dtype=np.float32
+    )
+    mask = np.zeros(ENEMY_STATE_SLOT_COUNT, dtype=np.float32)
+
+    prev_enemies = _combat_enemies(prev_obs)
+    next_enemies = _combat_enemies(next_obs)
+    if not prev_enemies:
+        return targets, mask
+
+    next_by_key: dict[str, dict[str, Any]] = {}
+    for index, enemy in enumerate(next_enemies):
+        key = _enemy_identity_key(enemy, index)
+        next_by_key[key] = enemy
+
+    prev_player_hp = _player_hp(prev_obs)
+    next_player_hp = _player_hp(next_obs)
+    player_max_hp = max(_player_max_hp(prev_obs), _player_max_hp(next_obs), 1.0)
+    raw_player_hp_loss = max(prev_player_hp - next_player_hp, 0.0)
+
+    # Strip self-inflicted HP loss (Offering / Bloodletting / etc) using the
+    # bridge's cumulative counter so enemy attribution targets cleanly.
+    prev_self_cum = _self_inflicted_hp_loss_cumulative(prev_obs)
+    next_self_cum = _self_inflicted_hp_loss_cumulative(next_obs)
+    self_inflicted_delta = max(next_self_cum - prev_self_cum, 0.0)
+    actual_player_hp_loss = max(raw_player_hp_loss - self_inflicted_delta, 0.0)
+
+    total_predicted = 0.0
+    predicted_damages: list[float] = []
+    for enemy in prev_enemies[:ENEMY_STATE_SLOT_COUNT]:
+        intent = enemy.get("intent") if isinstance(enemy.get("intent"), dict) else {}
+        if not isinstance(intent, dict):
+            intent = {}
+        predicted = _float(intent.get("total_damage"))
+        predicted_damages.append(predicted)
+        total_predicted += predicted
+
+    for slot_index, enemy in enumerate(prev_enemies[:ENEMY_STATE_SLOT_COUNT]):
+        prev_hp = _float(enemy.get("hp", enemy.get("current_hp")))
+        prev_max_hp = max(_float(enemy.get("max_hp"), prev_hp), 1.0)
+        key = _enemy_identity_key(enemy, slot_index)
+        next_enemy = next_by_key.get(key)
+        if next_enemy is not None:
+            next_hp = _float(next_enemy.get("hp", next_enemy.get("current_hp")))
+            alive_next = 1.0 if next_hp > 0.0 else 0.0
+        else:
+            next_hp = 0.0
+            alive_next = 0.0
+        delta = next_hp - prev_hp
+        delta_ratio = delta / max(prev_max_hp, 1.0)
+        if delta_ratio > 1.0:
+            delta_ratio = 1.0
+        elif delta_ratio < -1.0:
+            delta_ratio = -1.0
+
+        predicted = predicted_damages[slot_index]
+        if total_predicted > 0.0 and actual_player_hp_loss > 0.0:
+            attributable = predicted * (actual_player_hp_loss / total_predicted)
+        else:
+            attributable = 0.0
+        attribution_ratio = min(attributable / player_max_hp, 1.0)
+
+        targets[slot_index, 0] = delta_ratio
+        targets[slot_index, 1] = attribution_ratio
+        targets[slot_index, 2] = alive_next
+        mask[slot_index] = 1.0 if prev_hp > 0.0 else 0.0
+
+    return targets, mask
+
+
 def compute_trait_targets(
     prev_obs: dict[str, Any] | None,
     action: dict[str, Any] | None,
@@ -853,6 +956,7 @@ def build_aux_targets(
     build_targets = compute_build_targets(prev_obs, action, planner_context=prev_planner_context)
     selection_targets = compute_selection_targets(prev_obs, action, planner_context=prev_planner_context)
     route_targets = compute_route_targets(prev_obs, action, planner_context=prev_planner_context)
+    enemy_state_targets, enemy_state_mask = compute_enemy_state_targets(prev_obs, next_obs)
     return {
         "objective": objective,
         "objective_mask": 1.0,
@@ -866,13 +970,16 @@ def build_aux_targets(
         "selection_mask": selection_mask,
         "route": route_targets,
         "route_mask": route_mask,
+        "enemy_state": enemy_state_targets,
+        "enemy_state_mask": enemy_state_mask,
         "objective_names": OBJECTIVE_HEAD_NAMES,
         "transition_names": TRANSITION_HEAD_NAMES,
         "trait_names": TRAIT_HEAD_NAMES,
         "build_names": BUILD_HEAD_NAMES,
         "selection_names": SELECTION_HEAD_NAMES,
         "route_names": ROUTE_HEAD_NAMES,
-        "version": 2,
+        "enemy_state_field_names": ENEMY_STATE_FIELD_NAMES,
+        "version": 3,
     }
 
 
@@ -895,4 +1002,8 @@ __all__ = [
     "compute_route_targets",
     "compute_transition_targets",
     "compute_trait_targets",
+    "compute_enemy_state_targets",
+    "ENEMY_STATE_FIELD_NAMES",
+    "NUM_ENEMY_STATE_FIELDS",
+    "ENEMY_STATE_SLOT_COUNT",
 ]

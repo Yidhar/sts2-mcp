@@ -373,6 +373,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         self._buf_world = self._alloc_flat_bufs(MAX_WORLD_TOKENS)
         self._buf_candidate = self._alloc_flat_bufs(MAX_ACTIONS)
         self._buf_candidate_local = self._alloc_nested_bufs(MAX_ACTIONS, MAX_CANDIDATE_LOCAL_TOKENS)
+        self._current_planner_context: dict[str, Any] | None = None
 
     @staticmethod
     def _alloc_flat_bufs(n):
@@ -455,8 +456,9 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         try:
             self._begin_text_registry()
             features = self._build_feature_view(obs_dict, action_list, planner_context)
-            self._append_global_tokens(world_entries, obs_dict, features)
-            self._append_entity_tokens(world_entries, obs_dict, features)
+            self._current_planner_context = planner_context
+            self._append_global_tokens(world_entries, obs_dict, features, planner_context)
+            self._append_entity_tokens(world_entries, obs_dict, features, planner_context)
             self._append_candidate_tokens(candidate_entries, candidate_local_entries, action_mask, obs_dict, features, action_list)
             self._resolve_entry_text_embeddings(world_entries, candidate_entries, candidate_local_entries)
             self._resolve_text_registry()
@@ -527,6 +529,8 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         except Exception:
             self._clear_text_registry()
             raise
+        finally:
+            self._current_planner_context = None
 
     def _build_feature_view(
         self,
@@ -693,7 +697,13 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     postprocess=_compress_text_embedding,
                 )
 
-    def _append_global_tokens(self, world_entries: list[dict[str, Any]], obs: dict[str, Any], features: dict[str, np.ndarray]) -> None:
+    def _append_global_tokens(
+        self,
+        world_entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+        features: dict[str, np.ndarray],
+        planner_context: dict[str, Any] | None = None,
+    ) -> None:
         scalars = features["scalars"]
         decision_domain = features["decision_domain"]
         world_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
@@ -740,6 +750,19 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         threat[2] = obs_common._log_norm(sum(obs_common._float(enemy.get("hp", enemy.get("current_hp"))) for enemy in enemies if isinstance(enemy, dict)), obs_common._LOG1P_1200)
         threat[3] = obs_common._log_norm(sum(obs_common._float(enemy.get("block")) for enemy in enemies if isinstance(enemy, dict)), obs_common._LOG1P_200)
         threat[4] = float(any(self._infer_enemy_traits(enemy)[0] for enemy in enemies if isinstance(enemy, dict)))
+        combat_memory = (planner_context or {}).get("combat_memory") or {}
+        if combat_memory:
+            player_max_hp = max(obs_common._float(combat_memory.get("player_max_hp"), max_hp or 1.0), 1.0)
+            initial_total_hp = max(obs_common._float(combat_memory.get("initial_enemy_total_hp"), 1.0), 1.0)
+            threat[5] = min(obs_common._float(combat_memory.get("turns_in_combat")) / 20.0, 1.0)
+            threat[6] = obs_common._signed_log_norm(obs_common._float(combat_memory.get("player_hp_delta_last_turn")), obs_common._LOG1P_200)
+            threat[7] = obs_common._signed_log_norm(obs_common._float(combat_memory.get("player_block_delta_last_turn")), obs_common._LOG1P_200)
+            threat[8] = max(-1.0, min(obs_common._float(combat_memory.get("player_energy_delta_last_turn")) / 5.0, 1.0))
+            enemy_hp_delta = obs_common._float(combat_memory.get("enemy_total_hp_delta_last_turn"))
+            threat[9] = max(-1.0, min(enemy_hp_delta / initial_total_hp, 1.0))
+            threat[10] = min(obs_common._float(combat_memory.get("surprise_damage_last_turn")) / player_max_hp, 1.0)
+            threat[11] = max(-1.0, min(obs_common._float(combat_memory.get("enemy_count_delta_last_turn")) / 3.0, 1.0))
+            threat[12] = min(obs_common._float(combat_memory.get("cum_surprise_damage")) / player_max_hp, 1.0)
         world_entries.append(self._entry("THREAT_SUMMARY", threat, owner_id=OWNER_NONE, entity_id=0))
 
         objective_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
@@ -749,7 +772,13 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         run_numeric[: min(obs_common.RUN_MEMORY_DIM, TOKEN_NUMERIC_DIM)] = features["run_memory"][:TOKEN_NUMERIC_DIM]
         world_entries.append(self._entry("RUN_CONTEXT", run_numeric, owner_id=OWNER_NONE, entity_id=0))
 
-    def _append_entity_tokens(self, world_entries: list[dict[str, Any]], obs: dict[str, Any], features: dict[str, np.ndarray]) -> None:
+    def _append_entity_tokens(
+        self,
+        world_entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+        features: dict[str, np.ndarray],
+        planner_context: dict[str, Any] | None = None,
+    ) -> None:
         player = obs.get("player") or {}
         hand_cards = self._runtime_cards(obs, "hand", "hand")
         deck_cards = player.get("deck_cards") or []
@@ -769,14 +798,31 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         self._append_potion_collection(world_entries, player.get("potions") or [], features["potions"], features["potion_mask"])
 
         enemies = obs.get("combat", {}).get("enemies") or []
+        combat_memory = (planner_context or {}).get("combat_memory") or {}
+        memory_enemies = combat_memory.get("enemies") if isinstance(combat_memory, dict) else None
         for enemy_index in range(features["enemy_mask"].shape[0]):
             if features["enemy_mask"][enemy_index] <= 0:
                 continue
             owner_id = self._enemy_owner_id(enemy_index)
             enemy = enemies[enemy_index] if enemy_index < len(enemies) and isinstance(enemies[enemy_index], dict) else {}
             enemy_entity_id = _stable_bucket(self._enemy_entity_key(enemy, enemy_index))
+            enemy_memory = None
+            if isinstance(memory_enemies, dict):
+                enemy_memory = memory_enemies.get(self._enemy_entity_key(enemy, enemy_index))
             core = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
             core[: obs_common.ENEMY_FEAT_DIM] = features["enemies"][enemy_index]
+            if isinstance(enemy_memory, dict):
+                base = obs_common.ENEMY_FEAT_DIM
+                core[base + 0] = obs_common._float(enemy_memory.get("hp_delta_last_turn_ratio"))
+                core[base + 1] = obs_common._float(enemy_memory.get("hp_delta_last_3_turns_ratio"))
+                core[base + 2] = obs_common._float(enemy_memory.get("block_delta_last_turn_ratio"))
+                core[base + 3] = obs_common._float(enemy_memory.get("turns_alive_norm"))
+                core[base + 4] = obs_common._float(enemy_memory.get("is_new_this_turn"))
+                core[base + 5] = obs_common._float(enemy_memory.get("cum_damage_dealt_to_player_ratio"))
+                core[base + 6] = obs_common._float(enemy_memory.get("died_last_turn"))
+                core[base + 7] = obs_common._float(enemy_memory.get("attributable_damage_last_turn_ratio"))
+                core[base + 8] = obs_common._float(enemy_memory.get("alive_rank_by_hp"))
+                core[base + 9] = obs_common._float(enemy_memory.get("threat_rank_by_intent"))
             world_entries.append(
                 self._entry(
                     "ENEMY_CORE",
@@ -795,6 +841,13 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 numeric[1] = obs_common._log_norm(obs_common._float(intent.get("damage_per_hit")), obs_common._LOG1P_100)
                 numeric[2] = min(obs_common._float(intent.get("repeats")) / 5.0, 1.0)
                 numeric[3:7] = np.asarray(obs_common._infer_enemy_intent_flags(intent, obs_common._float(intent.get("total_damage"))), dtype=np.float32)
+                if isinstance(enemy_memory, dict):
+                    numeric[7] = obs_common._float(enemy_memory.get("intent_changed_this_turn"))
+                    numeric[8] = obs_common._float(enemy_memory.get("turns_since_intent_change_norm"))
+                    numeric[9] = obs_common._float(enemy_memory.get("intent_total_damage_delta"))
+                    numeric[10] = obs_common._float(enemy_memory.get("intent_damage_per_hit_delta"))
+                    numeric[11] = obs_common._float(enemy_memory.get("intent_damage_trend_3_turns"))
+                    numeric[12] = obs_common._float(enemy_memory.get("intent_predicted_vs_actual"))
                 world_entries.append(
                     self._entry(
                         "ENEMY_INTENT",
@@ -806,6 +859,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     )
                 )
 
+            memory_powers = enemy_memory.get("powers") if isinstance(enemy_memory, dict) else None
             for power in (enemy.get("powers") or [])[:5]:
                 if not isinstance(power, dict):
                     continue
@@ -817,6 +871,26 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 numeric[2] = float("artifact" in title)
                 numeric[3] = float("buffer" in title)
                 numeric[4] = float("intang" in title)
+                power_key = None
+                for candidate in ("id", "power_id", "type", "key"):
+                    value = power.get(candidate)
+                    if value not in (None, ""):
+                        power_key = str(value)
+                        break
+                if power_key is None and power.get("title") not in (None, ""):
+                    power_key = f"title::{power.get('title')}"
+                power_memory = memory_powers.get(power_key) if isinstance(memory_powers, dict) and power_key else None
+                if isinstance(power_memory, dict):
+                    numeric[5] = obs_common._normalize_power_amount(
+                        obs_common._float(power_memory.get("amount_delta_last_turn"))
+                    ) * (1.0 if obs_common._float(power_memory.get("amount_delta_last_turn")) >= 0 else -1.0)
+                    numeric[6] = obs_common._normalize_power_amount(
+                        obs_common._float(power_memory.get("amount_delta_since_first_seen"))
+                    ) * (1.0 if obs_common._float(power_memory.get("amount_delta_since_first_seen")) >= 0 else -1.0)
+                    numeric[7] = min(obs_common._float(power_memory.get("turns_since_first_seen")) / 10.0, 1.0)
+                    numeric[8] = obs_common._float(power_memory.get("stack_trend_3_turns"))
+                    numeric[9] = obs_common._float(power_memory.get("is_new_this_turn"))
+                    numeric[10] = obs_common._float(power_memory.get("is_growing_without_player_action"))
                 power_index = sum(
                     1
                     for entry in world_entries
@@ -1381,6 +1455,47 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         build_numeric[53] = features["actions"][action_index, 13] if features["actions"].shape[1] > 13 else 0.0
         build_numeric[54] = features["actions"][action_index, 14] if features["actions"].shape[1] > 14 else 0.0
         build_numeric[55] = features["actions"][action_index, 18] if features["actions"].shape[1] > 18 else 0.0
+
+        # Event-option structured effect deltas (from bridge regex). These slots
+        # replace the text encoder as the primary signal for event choice
+        # outcomes; slots stay zero for non-event-option actions.
+        if str(action.get("kind") or "") == "event_option":
+            option = action.get("option") if isinstance(action.get("option"), dict) else None
+            deltas = option.get("effect_deltas") if isinstance(option, dict) else None
+            if isinstance(deltas, dict):
+                player_max_hp = max(obs_common._float((obs.get("player") or {}).get("max_hp"), 1.0), 1.0)
+                hp_delta = obs_common._float(deltas.get("hp_delta"))
+                max_hp_delta = obs_common._float(deltas.get("max_hp_delta"))
+                gold_delta = obs_common._float(deltas.get("gold_delta"))
+                # Signed normalized — positive = gain, negative = loss.
+                build_numeric[56] = max(-1.0, min(hp_delta / player_max_hp, 1.0))
+                build_numeric[57] = obs_common._signed_log_norm(max_hp_delta, obs_common._LOG1P_100)
+                build_numeric[58] = obs_common._signed_log_norm(gold_delta, obs_common._LOG1P_500)
+                build_numeric[59] = 1.0 if deltas.get("heal_full") else 0.0
+                build_numeric[60] = min(obs_common._float(deltas.get("card_add_count")) / 3.0, 1.0)
+                build_numeric[61] = 1.0 if deltas.get("card_add_attack") else 0.0
+                build_numeric[62] = 1.0 if deltas.get("card_add_skill") else 0.0
+                build_numeric[63] = 1.0 if deltas.get("card_add_power") else 0.0
+                build_numeric[64] = 1.0 if deltas.get("card_add_curse") else 0.0
+                build_numeric[65] = 1.0 if deltas.get("card_add_status") else 0.0
+                build_numeric[66] = min(obs_common._float(deltas.get("card_remove_count")) / 3.0, 1.0)
+                build_numeric[67] = min(obs_common._float(deltas.get("card_transform_count")) / 3.0, 1.0)
+                build_numeric[68] = min(obs_common._float(deltas.get("card_upgrade_count")) / 3.0, 1.0)
+                build_numeric[69] = min(obs_common._float(deltas.get("card_duplicate_count")) / 3.0, 1.0)
+                build_numeric[70] = 1.0 if deltas.get("relic_gain") else 0.0
+                build_numeric[71] = 1.0 if deltas.get("potion_gain") else 0.0
+                build_numeric[72] = 1.0 if deltas.get("enter_combat") else 0.0
+                # Aggregate cost / benefit magnitudes as quick-lookup summaries.
+                total_cost_magnitude = max(0.0, -hp_delta) / player_max_hp + max(0.0, -gold_delta) / 500.0
+                total_benefit_magnitude = (
+                    max(0.0, hp_delta) / player_max_hp
+                    + max(0.0, gold_delta) / 500.0
+                    + (1.0 if deltas.get("relic_gain") else 0.0)
+                    + (1.0 if deltas.get("potion_gain") else 0.0)
+                )
+                build_numeric[73] = min(total_cost_magnitude, 1.0)
+                build_numeric[74] = min(total_benefit_magnitude, 1.0)
+
         entries.append(
             self._entry(
                 "BUILD_STATE_LOCAL",
@@ -2058,6 +2173,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
     ) -> None:
         owner_id = self._enemy_owner_id(target_enemy_index)
         entity_id = _stable_bucket(self._enemy_entity_key(target_enemy, target_enemy_index))
+        combat_memory = (self._current_planner_context or {}).get("combat_memory") or {}
+        memory_enemies = combat_memory.get("enemies") if isinstance(combat_memory, dict) else None
+        enemy_memory = None
+        if isinstance(memory_enemies, dict):
+            enemy_memory = memory_enemies.get(self._enemy_entity_key(target_enemy, target_enemy_index))
         intent = target_enemy.get("intent") if isinstance(target_enemy.get("intent"), dict) else None
         if isinstance(intent, dict):
             numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
@@ -2065,6 +2185,13 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             numeric[1] = obs_common._log_norm(obs_common._float(intent.get("damage_per_hit")), obs_common._LOG1P_100)
             numeric[2] = min(obs_common._float(intent.get("repeats")) / 5.0, 1.0)
             numeric[3:7] = np.asarray(obs_common._infer_enemy_intent_flags(intent, obs_common._float(intent.get("total_damage"))), dtype=np.float32)
+            if isinstance(enemy_memory, dict):
+                numeric[7] = obs_common._float(enemy_memory.get("intent_changed_this_turn"))
+                numeric[8] = obs_common._float(enemy_memory.get("turns_since_intent_change_norm"))
+                numeric[9] = obs_common._float(enemy_memory.get("intent_total_damage_delta"))
+                numeric[10] = obs_common._float(enemy_memory.get("intent_damage_per_hit_delta"))
+                numeric[11] = obs_common._float(enemy_memory.get("intent_damage_trend_3_turns"))
+                numeric[12] = obs_common._float(enemy_memory.get("intent_predicted_vs_actual"))
             entries.append(
                 self._entry(
                     "ENEMY_INTENT",
@@ -2075,6 +2202,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     text=str(intent.get("description") or intent.get("label") or ""),
                 )
             )
+        memory_powers = enemy_memory.get("powers") if isinstance(enemy_memory, dict) else None
         for power_index, power in enumerate((target_enemy.get("powers") or [])[:2]):
             if not isinstance(power, dict):
                 continue
@@ -2086,6 +2214,24 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             numeric[2] = float("artifact" in title)
             numeric[3] = float("buffer" in title)
             numeric[4] = float("intang" in title)
+            power_key = None
+            for candidate in ("id", "power_id", "type", "key"):
+                value = power.get(candidate)
+                if value not in (None, ""):
+                    power_key = str(value)
+                    break
+            if power_key is None and power.get("title") not in (None, ""):
+                power_key = f"title::{power.get('title')}"
+            power_memory = memory_powers.get(power_key) if isinstance(memory_powers, dict) and power_key else None
+            if isinstance(power_memory, dict):
+                delta_last = obs_common._float(power_memory.get("amount_delta_last_turn"))
+                delta_since = obs_common._float(power_memory.get("amount_delta_since_first_seen"))
+                numeric[5] = obs_common._normalize_power_amount(delta_last) * (1.0 if delta_last >= 0 else -1.0)
+                numeric[6] = obs_common._normalize_power_amount(delta_since) * (1.0 if delta_since >= 0 else -1.0)
+                numeric[7] = min(obs_common._float(power_memory.get("turns_since_first_seen")) / 10.0, 1.0)
+                numeric[8] = obs_common._float(power_memory.get("stack_trend_3_turns"))
+                numeric[9] = obs_common._float(power_memory.get("is_new_this_turn"))
+                numeric[10] = obs_common._float(power_memory.get("is_growing_without_player_action"))
             entries.append(
                 self._entry(
                     "ENEMY_POWER",

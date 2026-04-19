@@ -46,6 +46,43 @@ def mask_fn(env):
     return env.unwrapped.action_masks()
 
 
+class PerfStatsPeriodicLogger(gym.Wrapper):
+    """Pulls bridge.perf_stats() every N successful steps and appends to a
+    JSONL log. Used to confirm whether the C# hang-relief drain patches are
+    firing — non-zero deadline counters in the dumps point at paths still
+    hitting their wall-clock budgets."""
+
+    def __init__(self, env, *, log_path, interval_steps: int, env_index: int):
+        super().__init__(env)
+        self._log_path = Path(log_path)
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._interval = max(int(interval_steps), 1)
+        self._env_index = int(env_index)
+        self._step_count = 0
+
+    def step(self, action):
+        out = self.env.step(action)
+        self._step_count += 1
+        if self._step_count % self._interval == 0:
+            try:
+                stats = self.env.unwrapped.bridge.perf_stats()
+            except Exception as exc:  # noqa: BLE001
+                stats = {"_error": repr(exc)}
+            line = {
+                "t": time.time(),
+                "env_index": self._env_index,
+                "step_count": self._step_count,
+                "stats": stats,
+            }
+            try:
+                with self._log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(line, ensure_ascii=False, sort_keys=True))
+                    fh.write("\n")
+            except OSError:
+                pass
+        return out
+
+
 def parse_csv(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -85,6 +122,7 @@ def resolve_snapshot_pool(args) -> CombatSnapshotPool | None:
         max_rows=getattr(args, "snapshot_max_rows", None),
         sample_mode=getattr(args, "snapshot_sample_mode", "encounter_balanced"),
         tier_weights=tier_weights or None,
+        starter_early_boost=float(getattr(args, "snapshot_starter_early_boost", 0.0) or 0.0),
     )
 
 
@@ -128,9 +166,27 @@ def build_env_factory(
     snapshot_pool: CombatSnapshotPool | None,
     reset_timeout_ms: int,
     step_timeout_ms: int,
+    use_sim: bool = False,
+    sim_exe_path: str | None = None,
+    perf_stats_log_path: str | None = None,
+    perf_stats_interval_steps: int = 0,
+    encode_pool: "Any | None" = None,
 ) -> Callable[[], object]:
     def _factory():
-        obs_encoder = WorldTokenObservationEncoder(use_text=use_text, text_device=text_device)
+        local_encoder = WorldTokenObservationEncoder(use_text=use_text, text_device=text_device)
+        if encode_pool is not None:
+            from sts2_env.encode_pool import PooledObsEncoder
+            obs_encoder = PooledObsEncoder(pool=encode_pool, local_encoder=local_encoder)
+        else:
+            obs_encoder = local_encoder
+        # When --use-sim, drive the frankqwang/sts2-ai C# headless sim
+        # instead of a live Godot game instance. Sim bridge is injected per
+        # env (one subprocess each). This bypasses all session_file / HTTP
+        # bridge machinery — sim speaks line-delimited JSON over stdio.
+        sim_bridge = None
+        if use_sim:
+            from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
+            sim_bridge = HeadlessSimBridgeClient(exe_path=sim_exe_path)
         if combat_sandbox:
             env = CombatSandboxEnv(
                 session_file=session_file,
@@ -141,6 +197,7 @@ def build_env_factory(
                 reset_timeout_ms=reset_timeout_ms,
                 step_timeout_ms=step_timeout_ms,
                 obs_encoder=obs_encoder,
+                bridge=sim_bridge,
             )
         else:
             env = SlayTheSpire2EnvV2(
@@ -149,9 +206,24 @@ def build_env_factory(
                 reset_timeout_ms=reset_timeout_ms,
                 step_timeout_ms=step_timeout_ms,
                 obs_encoder=obs_encoder,
+                bridge=sim_bridge,
+            )
+        if use_sim and perf_stats_log_path and perf_stats_interval_steps > 0:
+            env = PerfStatsPeriodicLogger(
+                env,
+                log_path=perf_stats_log_path,
+                interval_steps=perf_stats_interval_steps,
+                env_index=env_index,
             )
         monitor_name = "monitor" if env_index == 0 else f"monitor_{env_index}"
-        env = Monitor(env, filename=str(Path(log_dir) / monitor_name))
+        # info_keywords: SB3 Monitor persists these info fields into
+        # monitor.monitor.csv alongside r,l,t when an episode ends. Gives
+        # us per-episode floor progression at the training-log level.
+        env = Monitor(
+            env,
+            filename=str(Path(log_dir) / monitor_name),
+            info_keywords=("max_floor_reached", "current_floor"),
+        )
         env = ActionMasker(env, mask_fn)
         return env
 
@@ -208,11 +280,13 @@ def build_checkpoint_metadata(
         "aux_build_coef": float(args.aux_build_coef),
         "aux_selection_coef": float(args.aux_selection_coef),
         "aux_route_coef": float(args.aux_route_coef),
+        "aux_enemy_state_coef": float(args.aux_enemy_state_coef),
         "snapshot_pool_root": args.snapshot_pool,
         "snapshot_curated_subset": getattr(args, "snapshot_curated_subset", None),
         "snapshot_sample_mode": getattr(args, "snapshot_sample_mode", None),
         "snapshot_encounter_tiers": parse_csv(getattr(args, "snapshot_encounter_tiers", None)),
         "snapshot_tier_weights": parse_weight_map(getattr(args, "snapshot_tier_weights", None)),
+        "snapshot_starter_early_boost": float(getattr(args, "snapshot_starter_early_boost", 0.0) or 0.0),
         "timesteps": int(model.num_timesteps),
         "mode": "combat_sandbox" if args.combat_sandbox else "full_run",
         "trained_at_unix_s": time.time(),
@@ -505,7 +579,53 @@ def main() -> None:
     )
     parser.add_argument("--snapshot-encounter-tiers", type=str, default=None)
     parser.add_argument("--snapshot-tier-weights", type=str, default=None)
+    parser.add_argument(
+        "--snapshot-starter-early-boost",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of drawing a starter-early deck snapshot "
+            "(floor<=%d AND deck_size<=%d) for each reset, bypassing the "
+            "normal sample mode. 0 disables (default); 0.2-0.3 is a sane "
+            "starting point when bridging sandbox->full_run."
+        ) % (3, 13),
+    )
     parser.add_argument("--snapshot-max-rows", type=int, default=None)
+    parser.add_argument(
+        "--use-sim",
+        action="store_true",
+        default=False,
+        help=(
+            "Drive training against the frankqwang/sts2-ai HeadlessSim "
+            "(decompiled-game headless C# simulator) instead of live Godot "
+            "instances. Bypasses session-file plumbing. 100-1000x faster; "
+            "no game crashes. See sts2_env/headless_sim_bridge_client.py."
+        ),
+    )
+    parser.add_argument(
+        "--sim-exe-path",
+        type=str,
+        default=None,
+        help="Override HeadlessSim exe path (defaults to third_party/sts2-ai build).",
+    )
+    parser.add_argument(
+        "--perf-stats-interval-steps",
+        type=int,
+        default=0,
+        help="When >0 and --use-sim, every N successful env steps pull bridge.perf_stats() and append to {log_dir}/perf_stats.jsonl for hang diagnosis.",
+    )
+    parser.add_argument(
+        "--encode-pool-workers",
+        type=int,
+        default=0,
+        help=(
+            "Offload observation encoding to a multiprocessing pool of N "
+            "workers. 0 disables (in-thread encoding, GIL-serialized). A "
+            "positive N sidesteps GIL contention when n_envs>1 — typical "
+            "win is 3-7x on the encode step. Recommended: set equal to "
+            "--n-envs. Only effective for --collector-mode async."
+        ),
+    )
     parser.add_argument("--print-startup-events", action="store_true")
     parser.add_argument("--stdout-rollout-log-interval", type=int, default=0)
     parser.add_argument("--logger-stdout", action="store_true")
@@ -541,8 +661,14 @@ def main() -> None:
     parser.add_argument("--aux-build-coef", type=float, default=0.10)
     parser.add_argument("--aux-selection-coef", type=float, default=0.10)
     parser.add_argument("--aux-route-coef", type=float, default=0.10)
+    parser.add_argument("--aux-enemy-state-coef", type=float, default=0.10)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--text-device", type=str, default="auto")
+    parser.add_argument(
+        "--no-text",
+        action="store_true",
+        help="Disable text features in observations. Attention runtime stays unchanged; text slices are zeroed.",
+    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=("bf16", "bfloat16"))
     parser.add_argument("--reset-timeout-ms", type=int, default=60000)
@@ -558,7 +684,7 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.0)
     args = parser.parse_args()
 
-    use_text = True
+    use_text = not bool(args.no_text)
     text_device = resolve_text_device(args.text_device, args.device)
     session_files = resolve_training_session_files(
         n_envs=args.n_envs,
@@ -578,9 +704,19 @@ def main() -> None:
                 "snapshot_sample_mode": getattr(args, "snapshot_sample_mode", None),
                 "snapshot_encounter_tiers": parse_csv(getattr(args, "snapshot_encounter_tiers", None)),
                 "snapshot_tier_weights": parse_weight_map(getattr(args, "snapshot_tier_weights", None)),
+                "snapshot_starter_early_boost": float(getattr(args, "snapshot_starter_early_boost", 0.0) or 0.0),
                 "summary": snapshot_pool.summary(),
             },
             enabled=bool(args.print_startup_events),
+        )
+
+    encode_pool = None
+    encode_pool_workers = int(getattr(args, "encode_pool_workers", 0) or 0)
+    if encode_pool_workers > 0:
+        from sts2_env.encode_pool import build_encode_pool
+        encode_pool = build_encode_pool(
+            max_workers=encode_pool_workers,
+            encoder_kwargs={"use_text": use_text, "text_device": text_device},
         )
 
     env_fns = [
@@ -597,6 +733,11 @@ def main() -> None:
             snapshot_pool=snapshot_pool,
             reset_timeout_ms=args.reset_timeout_ms,
             step_timeout_ms=args.step_timeout_ms,
+            use_sim=bool(getattr(args, "use_sim", False)),
+            sim_exe_path=getattr(args, "sim_exe_path", None),
+            perf_stats_log_path=str(Path(args.log_dir) / "perf_stats.jsonl"),
+            perf_stats_interval_steps=int(getattr(args, "perf_stats_interval_steps", 0) or 0),
+            encode_pool=encode_pool,
         )
         for index in range(args.n_envs)
     ]
@@ -628,6 +769,7 @@ def main() -> None:
         aux_build_coef=args.aux_build_coef,
         aux_selection_coef=args.aux_selection_coef,
         aux_route_coef=args.aux_route_coef,
+        aux_enemy_state_coef=args.aux_enemy_state_coef,
         amp=args.amp,
         amp_dtype=args.amp_dtype,
         policy_kwargs=policy_kwargs,
@@ -697,6 +839,8 @@ def main() -> None:
         model.learn(total_timesteps=int(args.total_timesteps), progress_bar=False)
     elapsed_s = time.time() - started
     env.close()
+    if encode_pool is not None:
+        encode_pool.shutdown(wait=True, cancel_futures=True)
 
     metadata = checkpoint_metadata_factory()
     output_dir = Path(args.checkpoint_dir) / "final"

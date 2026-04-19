@@ -20,6 +20,7 @@ from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
 from .observation_common import DenseObservationEncoder, MAX_ACTIONS
 from .observation_v3 import WorldTokenObservationEncoder
+from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
 
 from .reward_constants import (
@@ -27,9 +28,16 @@ from .reward_constants import (
     COMBAT_SANDBOX_WASTE_ENERGY as END_TURN_WASTE_ENERGY_PENALTY,
     COMBAT_SANDBOX_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
     COMBAT_SANDBOX_WASTE_EXTRA_ACTION as END_TURN_WASTE_EXTRA_ACTION_PENALTY,
+    ENEMY_HP_DELTA_REWARD_MAX_ABS,
     ENEMY_HP_DELTA_REWARD_SCALE,
+    ENEMY_HP_SENTINEL_THRESHOLD,
     INVALID_ACTION_REWARD,
     PLAYER_HP_LOSS_REWARD_SCALE,
+    SENTINEL_COMBAT_LOSS_PENALTY_BASE,
+    SENTINEL_COMBAT_LOSS_PENALTY_SCALE,
+    SENTINEL_COMBAT_WIN_BONUS_BASE,
+    SENTINEL_COMBAT_WIN_BONUS_SCALE,
+    SENTINEL_DEATH_DAMAGE_POWER_KEYWORDS,
 )
 
 INVALID_ACTION_REASON = "invalid_action_index"
@@ -76,10 +84,14 @@ class CombatSandboxEnv(gym.Env):
         render_mode: str | None = None,
         obs_encoder: DenseObservationEncoder | None = None,
         include_debug_info: bool = False,
+        bridge: "BridgeClient | None" = None,
     ) -> None:
         super().__init__()
 
-        self.bridge = BridgeClient(session_path=session_file)
+        # Allow external injection of a bridge (e.g., a HeadlessSimBridgeClient
+        # that drives frankqwang/sts2-ai's C# headless sim in place of a real
+        # game HTTP bridge). If not provided, fall back to the real bridge.
+        self.bridge = bridge if bridge is not None else BridgeClient(session_path=session_file)
         self.obs_encoder = obs_encoder or WorldTokenObservationEncoder(use_text=False)
         self.character = character
         self.encounter_id = encounter_id
@@ -110,10 +122,13 @@ class CombatSandboxEnv(gym.Env):
         self._last_action_overflow: int = 0
         self._current_snapshot: dict[str, Any] | None = None
         self._last_reset_kwargs: dict[str, Any] = {}
+        self._sentinel_combat_active: bool = False
+        self._sentinel_combat_start_max_hp: float = 0.0
         self._run_memory = RunMemoryTracker(
             episode_mode="combat_sandbox",
             potion_mechanics_available=self.sandbox_supports_potions,
         )
+        self._combat_memory = CombatMemoryTracker()
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -199,6 +214,13 @@ class CombatSandboxEnv(gym.Env):
 
         self._episode_id = result["episode_id"]
         self._update_live_state(result)
+        sentinel_enemy = self._find_sentinel_enemy(self._last_obs_raw)
+        self._sentinel_combat_active = sentinel_enemy is not None
+        if self._sentinel_combat_active:
+            _, start_max = self._player_hp_and_max(self._last_obs_raw)
+            self._sentinel_combat_start_max_hp = start_max
+        else:
+            self._sentinel_combat_start_max_hp = 0.0
         run_memory_started = time.perf_counter()
         self._run_memory.reset(
             self._last_obs_raw,
@@ -206,6 +228,7 @@ class CombatSandboxEnv(gym.Env):
             episode_mode="combat_sandbox",
             potion_mechanics_available=self.sandbox_supports_potions,
         )
+        self._combat_memory.reset(self._last_obs_raw)
         run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
 
         planner_context = self._planner_context()
@@ -246,16 +269,33 @@ class CombatSandboxEnv(gym.Env):
         end_turn_penalty = self._end_turn_waste_penalty(prev_obs, self._legal_actions, legal_action)
 
         bridge_started = time.perf_counter()
-        result = self.bridge.step(
-            episode_id=self._episode_id,
-            action_id=legal_action.get("action_id"),
-            timeout_ms=self.step_timeout_ms,
-        )
+        try:
+            result = self.bridge.step(
+                episode_id=self._episode_id,
+                action_id=legal_action.get("action_id"),
+                timeout_ms=self.step_timeout_ms,
+            )
+        except BridgeError as e:
+            # Bridge rejected the action (e.g. TOCTOU race, phase mismatch).
+            # We cannot safely continue with the stale _last_obs_raw /
+            # _legal_actions — the next step would sample from a mask that no
+            # longer matches live bridge state, which tends to loop on invalid
+            # actions. Truncate so the collector restarts the episode cleanly;
+            # this matches the truncated=True behavior of _make_invalid_action_response.
+            obs = self.obs_encoder.encode(
+                self._last_obs_raw, self._legal_actions, prev_planner_context
+            )
+            info = self._build_info(
+                {"truncation_reason": "bridge_error"},
+                extra={"action_error": str(e)},
+            )
+            return obs, float(INVALID_ACTION_REWARD), False, True, info
         bridge_elapsed_ms = (time.perf_counter() - bridge_started) * 1000.0
 
         self._update_live_state(result)
         run_memory_started = time.perf_counter()
         self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
+        self._combat_memory.update(prev_obs, legal_action, self._last_obs_raw)
         run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
 
         next_planner_context = self._planner_context()
@@ -268,6 +308,12 @@ class CombatSandboxEnv(gym.Env):
         reward += end_turn_penalty
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
+        sentinel_terminal = self._sentinel_terminal_reward(
+            prev_obs, self._last_obs_raw, terminated, truncated
+        )
+        reward += sentinel_terminal
+        if terminated or truncated:
+            self._sentinel_combat_active = False
         aux_started = time.perf_counter()
         aux_targets = build_aux_targets(
             prev_obs,
@@ -305,8 +351,9 @@ class CombatSandboxEnv(gym.Env):
 
     def action_masks(self) -> np.ndarray:
         mask = np.zeros(MAX_ACTIONS, dtype=bool)
-        n = min(len(self._legal_actions), MAX_ACTIONS)
-        mask[:n] = True
+        for i, action in enumerate(self._legal_actions[:MAX_ACTIONS]):
+            if isinstance(action, dict):
+                mask[i] = True
         return mask
 
     def _make_terminal(self):
@@ -439,8 +486,10 @@ class CombatSandboxEnv(gym.Env):
         for enemy in enemies:
             if not isinstance(enemy, dict):
                 continue
-            hp = enemy.get("hp", enemy.get("current_hp"))
-            total += float(hp or 0.0)
+            hp = float(enemy.get("hp", enemy.get("current_hp")) or 0.0)
+            if hp > ENEMY_HP_SENTINEL_THRESHOLD:
+                continue
+            total += hp
         return total
 
     def _enemy_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
@@ -448,7 +497,12 @@ class CombatSandboxEnv(gym.Env):
         after_total = self._combat_enemy_total_hp(after_obs)
         if before_total <= 0.0 and after_total <= 0.0:
             return 0.0
-        return (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+        raw = (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+        if raw > ENEMY_HP_DELTA_REWARD_MAX_ABS:
+            return ENEMY_HP_DELTA_REWARD_MAX_ABS
+        if raw < -ENEMY_HP_DELTA_REWARD_MAX_ABS:
+            return -ENEMY_HP_DELTA_REWARD_MAX_ABS
+        return raw
 
     def _player_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
         before_player = before_obs.get("player") if isinstance(before_obs, dict) else {}
@@ -457,7 +511,98 @@ class CombatSandboxEnv(gym.Env):
         after_hp = _float((after_player or {}).get("hp"))
         if before_hp <= 0.0 and after_hp <= 0.0:
             return 0.0
-        return -max(before_hp - after_hp, 0.0) * PLAYER_HP_LOSS_REWARD_SCALE
+        # Symmetric with env_v2.py: positive for HP gain (rest, heal, etc.),
+        # negative for HP loss. Asymmetric "loss-only" shaping left rest-site
+        # and heal-potion decisions without any immediate signal.
+        return (after_hp - before_hp) * PLAYER_HP_LOSS_REWARD_SCALE
+
+    @staticmethod
+    def _find_sentinel_enemy(obs: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(obs, dict):
+            return None
+        combat = obs.get("combat")
+        if not isinstance(combat, dict):
+            return None
+        enemies = combat.get("enemies")
+        if not isinstance(enemies, list):
+            return None
+        for enemy in enemies:
+            if not isinstance(enemy, dict):
+                continue
+            hp = _float(enemy.get("hp", enemy.get("current_hp")))
+            if hp > ENEMY_HP_SENTINEL_THRESHOLD:
+                return enemy
+        return None
+
+    @staticmethod
+    def _player_hp_and_max(obs: dict[str, Any] | None) -> tuple[float, float]:
+        if not isinstance(obs, dict):
+            return 0.0, 0.0
+        player = obs.get("player") or {}
+        return _float(player.get("hp")), _float(player.get("max_hp"))
+
+    @staticmethod
+    def _estimate_sentinel_death_damage(enemy: dict[str, Any] | None) -> float:
+        """Upper-bound estimate of the on-death damage a sentinel enemy will deal.
+
+        Takes the max of any matching on-death-flavored buff stack count and
+        the currently announced intent damage, so the overshoot calculation is
+        conservative (larger penalty if either signal is high).
+        """
+        if not isinstance(enemy, dict):
+            return 0.0
+        best = 0.0
+        powers = enemy.get("powers")
+        if isinstance(powers, list):
+            for power in powers:
+                if not isinstance(power, dict):
+                    continue
+                title = str(power.get("title") or "").lower()
+                if not any(kw in title for kw in SENTINEL_DEATH_DAMAGE_POWER_KEYWORDS):
+                    continue
+                amount = _float(power.get("amount"))
+                if amount > best:
+                    best = amount
+        intent = enemy.get("intent")
+        if isinstance(intent, dict):
+            intent_damage = _float(intent.get("total_damage"))
+            if intent_damage > best:
+                best = intent_damage
+        return best
+
+    def _sentinel_terminal_reward(
+        self,
+        prev_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+        terminated: bool,
+        truncated: bool,
+    ) -> float:
+        if not self._sentinel_combat_active or not (terminated or truncated):
+            return 0.0
+
+        after_hp, after_max = self._player_hp_and_max(after_obs)
+        ref_max = self._sentinel_combat_start_max_hp or after_max
+        if ref_max <= 0.0:
+            ref_max = 1.0
+
+        victory = terminated and (not truncated) and after_hp > 0.0
+        if victory:
+            hp_fraction = max(0.0, min(after_hp / ref_max, 1.0))
+            return SENTINEL_COMBAT_WIN_BONUS_BASE + SENTINEL_COMBAT_WIN_BONUS_SCALE * hp_fraction
+
+        # Loss branch: scale penalty by how much the expected death damage
+        # overshot the player's (block + hp) buffer right before the terminal step.
+        sentinel_before = self._find_sentinel_enemy(prev_obs)
+        expected_death_damage = self._estimate_sentinel_death_damage(sentinel_before)
+        prev_player = prev_obs.get("player") if isinstance(prev_obs, dict) else None
+        prev_block = _float((prev_player or {}).get("block"))
+        prev_hp = _float((prev_player or {}).get("hp"))
+        overshoot = max(0.0, expected_death_damage - (prev_block + prev_hp))
+        overshoot_fraction = max(0.0, min(overshoot / ref_max, 1.0))
+        return -(
+            SENTINEL_COMBAT_LOSS_PENALTY_BASE
+            + SENTINEL_COMBAT_LOSS_PENALTY_SCALE * overshoot_fraction
+        )
 
     @staticmethod
     def _source_preview_metric(source: dict[str, Any] | None, key: str) -> float:
@@ -602,6 +747,11 @@ class CombatSandboxEnv(gym.Env):
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "combat_sandbox",
             "potion_mechanics_available": self.sandbox_supports_potions,
+            # Combat sandbox has no map — floor is always 0. But Monitor's
+            # info_keywords=("max_floor_reached","current_floor") hard-reads
+            # both keys at episode end, so they must exist or SB3 KeyErrors.
+            "max_floor_reached": 0,
+            "current_floor": 0,
             "encounter_id": self._current_encounter_id,
             "encounter_pool": self.encounter_pool,
             "snapshot_sample_id": current_snapshot.get("sample_id"),
@@ -648,7 +798,9 @@ class CombatSandboxEnv(gym.Env):
         return obs, INVALID_ACTION_REWARD, False, True, info
 
     def _planner_context(self) -> dict[str, Any]:
-        return self._run_memory.build_context(self._last_obs_raw, self._legal_actions)
+        context = self._run_memory.build_context(self._last_obs_raw, self._legal_actions)
+        context["combat_memory"] = self._combat_memory.snapshot()
+        return context
 
     @staticmethod
     def _python_timing(

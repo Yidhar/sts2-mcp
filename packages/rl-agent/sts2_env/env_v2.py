@@ -25,10 +25,13 @@ from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
 from .observation_common import DenseObservationEncoder, MAX_ACTIONS
 from .observation_v3 import WorldTokenObservationEncoder
+from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
 
 from .reward_constants import (
+    ENEMY_HP_DELTA_REWARD_MAX_ABS,
     ENEMY_HP_DELTA_REWARD_SCALE,
+    ENEMY_HP_SENTINEL_THRESHOLD,
     FULL_RUN_WASTE_BASE as END_TURN_WASTE_BASE_PENALTY,
     FULL_RUN_WASTE_ENERGY as END_TURN_WASTE_ENERGY_PENALTY,
     FULL_RUN_WASTE_EXTRA_ACTION as END_TURN_WASTE_EXTRA_ACTION_PENALTY,
@@ -72,10 +75,13 @@ class SlayTheSpire2EnvV2(gym.Env):
         render_mode: str | None = None,
         obs_encoder: DenseObservationEncoder | None = None,
         include_debug_info: bool = False,
+        bridge: "BridgeClient | None" = None,
     ) -> None:
         super().__init__()
 
-        self.bridge = BridgeClient(session_path=session_file)
+        # Allow external injection — e.g., HeadlessSimBridgeClient driving
+        # the frankqwang/sts2-ai C# sim instead of a real Godot game process.
+        self.bridge = bridge if bridge is not None else BridgeClient(session_path=session_file)
         self.obs_encoder = obs_encoder or WorldTokenObservationEncoder(use_text=False)
         self.character = character
         self.defensive_buffs = defensive_buffs
@@ -91,10 +97,12 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._legal_actions: list[dict[str, Any]] = []
         self._last_obs_raw: dict[str, Any] | None = None
         self._last_action_overflow: int = 0
+        self._max_floor_reached: int = 0
         self._run_memory = RunMemoryTracker(
             episode_mode="full_run",
             potion_mechanics_available=True,
         )
+        self._combat_memory = CombatMemoryTracker()
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -103,6 +111,10 @@ class SlayTheSpire2EnvV2(gym.Env):
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
         started = time.perf_counter()
+        # Reset before _update_live_state so the first floor observed gets
+        # recorded into _max_floor_reached rather than left over from the
+        # previous episode.
+        self._max_floor_reached = 0
 
         bridge_started = time.perf_counter()
         result = self._reset_with_ready_gate(timeout_ms=self.reset_timeout_ms)
@@ -118,6 +130,7 @@ class SlayTheSpire2EnvV2(gym.Env):
             episode_mode="full_run",
             potion_mechanics_available=True,
         )
+        self._combat_memory.reset(self._last_obs_raw)
         run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
 
         planner_context = self._planner_context()
@@ -179,6 +192,7 @@ class SlayTheSpire2EnvV2(gym.Env):
                     self._update_live_state(recovered)
                     run_memory_started = time.perf_counter()
                     self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
+                    self._combat_memory.update(prev_obs, legal_action, self._last_obs_raw)
                     run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
                     planner_context = self._planner_context()
                     obs_encode_started = time.perf_counter()
@@ -236,6 +250,7 @@ class SlayTheSpire2EnvV2(gym.Env):
 
         run_memory_started = time.perf_counter()
         self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
+        self._combat_memory.update(prev_obs, legal_action, self._last_obs_raw)
         run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
         planner_context = self._planner_context()
         obs_encode_started = time.perf_counter()
@@ -278,8 +293,9 @@ class SlayTheSpire2EnvV2(gym.Env):
 
     def action_masks(self) -> np.ndarray:
         mask = np.zeros(MAX_ACTIONS, dtype=bool)
-        n = min(len(self._legal_actions), MAX_ACTIONS)
-        mask[:n] = True
+        for i, action in enumerate(self._legal_actions[:MAX_ACTIONS]):
+            if isinstance(action, dict):
+                mask[i] = True
         return mask
 
     def recover_actionable_state(self, timeout_ms: int | None = None):
@@ -350,6 +366,22 @@ class SlayTheSpire2EnvV2(gym.Env):
         obs = result.get("obs", {})
         self._last_obs_raw = obs if isinstance(obs, dict) else {}
         self._last_action_overflow = max(len(self._legal_actions) - MAX_ACTIONS, 0)
+        # Track deepest floor this episode has reached (for episode-terminal
+        # logging + Monitor CSV aggregation). obs["run"]["floor"] is now
+        # populated for sim after the April 2026 translator fix.
+        run = self._last_obs_raw.get("run") if isinstance(self._last_obs_raw, dict) else None
+        if isinstance(run, dict):
+            floor_val = run.get("floor")
+            if floor_val is None:
+                floor_val = run.get("total_floor")
+            if floor_val is None:
+                floor_val = run.get("act_floor")
+            try:
+                current_floor = int(floor_val) if floor_val is not None else 0
+            except (TypeError, ValueError):
+                current_floor = 0
+            if current_floor > self._max_floor_reached:
+                self._max_floor_reached = current_floor
 
     def _extract_phase(self, result: dict[str, Any]) -> str:
         obs = result.get("obs")
@@ -378,8 +410,10 @@ class SlayTheSpire2EnvV2(gym.Env):
         for enemy in enemies:
             if not isinstance(enemy, dict):
                 continue
-            hp = enemy.get("hp", enemy.get("current_hp"))
-            total += float(hp or 0.0)
+            hp = float(enemy.get("hp", enemy.get("current_hp")) or 0.0)
+            if hp > ENEMY_HP_SENTINEL_THRESHOLD:
+                continue
+            total += hp
         return total
 
     def _enemy_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
@@ -387,7 +421,12 @@ class SlayTheSpire2EnvV2(gym.Env):
         after_total = self._combat_enemy_total_hp(after_obs)
         if before_total <= 0.0 and after_total <= 0.0:
             return 0.0
-        return (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+        raw = (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+        if raw > ENEMY_HP_DELTA_REWARD_MAX_ABS:
+            return ENEMY_HP_DELTA_REWARD_MAX_ABS
+        if raw < -ENEMY_HP_DELTA_REWARD_MAX_ABS:
+            return -ENEMY_HP_DELTA_REWARD_MAX_ABS
+        return raw
 
     def _player_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
         before_player = before_obs.get("player") if isinstance(before_obs, dict) else {}
@@ -396,7 +435,12 @@ class SlayTheSpire2EnvV2(gym.Env):
         after_hp = _float((after_player or {}).get("hp"))
         if before_hp <= 0.0 and after_hp <= 0.0:
             return 0.0
-        return -max(before_hp - after_hp, 0.0) * PLAYER_HP_LOSS_REWARD_SCALE
+        # Symmetric shaping: positive for HP gain (rest site, heal potion,
+        # heal event, lifesteal cards), negative for HP loss. Previously
+        # we only penalized loss, which made rest-site decisions invisible
+        # to PPO (0 reward whether agent rests or skips) and left HP
+        # management as a distant-future credit-assignment problem.
+        return (after_hp - before_hp) * PLAYER_HP_LOSS_REWARD_SCALE
 
     @staticmethod
     def _source_preview_metric(source: dict[str, Any] | None, key: str) -> float:
@@ -803,6 +847,14 @@ class SlayTheSpire2EnvV2(gym.Env):
 
     def _build_info(self, bridge_info: Any, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         planner_context = self._planner_context()
+        run_obs = (self._last_obs_raw or {}).get("run") or {}
+        current_floor_val = run_obs.get("floor")
+        if current_floor_val is None:
+            current_floor_val = run_obs.get("total_floor")
+        try:
+            current_floor = int(current_floor_val) if current_floor_val is not None else 0
+        except (TypeError, ValueError):
+            current_floor = 0
         info: dict[str, Any] = {
             "episode_id": self._episode_id,
             "action_mask": self.action_masks(),
@@ -812,6 +864,12 @@ class SlayTheSpire2EnvV2(gym.Env):
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "full_run",
             "potion_mechanics_available": True,
+            # Floor metrics: surface current AND max-reached so SB3's
+            # Monitor (with info_keywords) and episode_terminal event log
+            # can aggregate progression. Real bridge used to emit these
+            # natively; sim training was flying blind on progression.
+            "current_floor": current_floor,
+            "max_floor_reached": int(self._max_floor_reached),
             "planner_context": planner_context,
             "transition_state": self._transition_state(),
             "bridge_info": self._decorate_bridge_info(bridge_info),
@@ -850,7 +908,9 @@ class SlayTheSpire2EnvV2(gym.Env):
         return obs, INVALID_ACTION_REWARD, False, True, info
 
     def _planner_context(self) -> dict[str, Any]:
-        return self._run_memory.build_context(self._last_obs_raw, self._legal_actions)
+        context = self._run_memory.build_context(self._last_obs_raw, self._legal_actions)
+        context["combat_memory"] = self._combat_memory.snapshot()
+        return context
 
     @staticmethod
     def _python_timing(

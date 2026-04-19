@@ -33,7 +33,10 @@ from export_offline_run_datasets import (
     _load_source_payload,
 )
 from run_history_parser import build_offline_training_samples
-from sts2_env.bridge_client import BridgeClient
+# BridgeClient is imported lazily (inside _get_live_supported_encounter_ids)
+# because importing sts2_env/__init__.py drags in torch via AuxMaskablePPO.
+# This build script can run fine without torch when --session-file isn't
+# specified, which is the common dataset-rebuild case.
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -156,10 +159,15 @@ def _write_combined_snapshot_variants(
         lambda row: str(row.get("provenance_origin") or "") == "local_history"
         and bool(row.get("cleared_act1"))
     )
+    local_all_run_pred = (
+        lambda row: str(row.get("provenance_origin") or "") == "local_history"
+    )
 
     human_rows = _select_rows(human_run_pred)
     local_act1clear_rows = _select_rows(local_act1clear_run_pred)
+    local_all_rows = _select_rows(local_all_run_pred)
     bootstrap_rows = human_rows + local_act1clear_rows
+    bootstrap_all_rows = human_rows + local_all_rows
 
     weak_normal_pred = lambda row: infer_encounter_tier_from_row(row) in {"weak", "normal"}
     base_variants: dict[str, list[dict[str, Any]]] = {
@@ -168,6 +176,11 @@ def _write_combined_snapshot_variants(
         "local_act1clear_only": local_act1clear_rows,
         "bootstrap_human_plus_local_act1clear": bootstrap_rows,
         "bootstrap_human_plus_local_act1clear_weak_normal": [row for row in bootstrap_rows if weak_normal_pred(row)],
+        # "all"-quality variants include local_history runs regardless of
+        # cleared_act1. This is where floor 1-3 starter-deck snapshots live —
+        # 99% of local runs fail act 1, so act1clear-only variants drop them.
+        "bootstrap_human_plus_local_all": bootstrap_all_rows,
+        "bootstrap_human_plus_local_all_weak_normal": [row for row in bootstrap_all_rows if weak_normal_pred(row)],
     }
 
     report: dict[str, Any] = {}
@@ -286,6 +299,9 @@ def _enrich_run_row(
 
 
 def _get_live_supported_encounter_ids(session_file: str | Path | None) -> set[str]:
+    # Lazy import — see top-of-file comment. Only needed when the caller
+    # passes --session-file to filter against the live bridge catalog.
+    from sts2_env.bridge_client import BridgeClient  # noqa: PLC0415
     client = BridgeClient(session_path=session_file)
     catalog = client.combat_catalog()
     return {
@@ -318,6 +334,16 @@ def main() -> None:
         help=(
             "Optional newline-delimited sample_id list to subtract from combined variants. "
             "Used for known combat_reset failure rows."
+        ),
+    )
+    parser.add_argument(
+        "--reject-non-vanilla",
+        action="store_true",
+        default=False,
+        help=(
+            "Drop combat rows whose deck cards / relics / potions / monsters reference "
+            "ids not present in the static content registry. Removes mod content and "
+            "near-future-version content so training distribution stays stable."
         ),
     )
     args = parser.parse_args()
@@ -405,6 +431,7 @@ def main() -> None:
         cleaned_combat_rows, clean_report = clean_combat_snapshot_rows(
             raw_combat_rows,
             supported_encounter_ids=supported_encounter_ids,
+            reject_non_vanilla=bool(args.reject_non_vanilla),
         )
         for reason_name, count in (clean_report.get("reject_reasons") or {}).items():
             if isinstance(count, int):

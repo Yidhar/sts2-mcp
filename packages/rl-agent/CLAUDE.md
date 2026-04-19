@@ -27,8 +27,11 @@ python train_attention_policy.py \
 python evaluate_attention_policy.py checkpoints_attention/step_NNN \
   --episodes 10 --combat-sandbox --device cuda --deterministic
 
-# Launch parallel game instances
-python launcher.py --instances 4 --game-exe "E:/SlayTheSpire2.exe"
+# Launch parallel game instances (recommended: wrapped script with watchdog)
+bash launch_games_with_watchdog.sh
+# Or manually:
+python launcher.py --instances 4 --game-exe "E:/SlayTheSpire2.exe" \
+  --watchdog --watchdog-state-stall-s 90 --watchdog-log-flood-mb-per-s 10
 
 # TensorBoard
 tensorboard --logdir logs_attention
