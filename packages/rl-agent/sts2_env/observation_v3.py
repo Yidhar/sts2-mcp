@@ -17,7 +17,11 @@ from . import observation_common as obs_common
 from .text_encoder import TEXT_DIM
 
 MAX_ACTIONS = obs_common.MAX_ACTIONS
-MAX_WORLD_TOKENS = 320
+# Phase 6 (attention_obs_v3): +64 tokens for dedicated POWER_SLOT /
+# CARD_KEYWORD tokens, split out of the entity numeric inlining. At typical
+# STS2 scale we see <= 35 active powers (player + 4 enemies × 5 powers) and
+# a handful of card-keyword tokens; 64 is comfortable headroom.
+MAX_WORLD_TOKENS = 384
 MAX_CANDIDATE_LOCAL_TOKENS = 24
 TOKEN_NUMERIC_DIM = 96
 TOKEN_TEXT_DIM = 64
@@ -25,7 +29,18 @@ TOKEN_FEAT_DIM = TOKEN_NUMERIC_DIM + TOKEN_TEXT_DIM
 ENTITY_HASH_BUCKETS = 8192
 MAX_OWNER_ID = 127
 MAX_ORDER_ID = 63
-OBSERVATION_API_VERSION = "attention_obs_v2"
+# v3: POWER_SLOT + CARD_KEYWORD token types exist. v2 checkpoints will NOT
+# load — the 700k run was trained on a schema the fixes already invalidated.
+OBSERVATION_API_VERSION = "attention_obs_v3"
+
+# Maximum number of POWER_SLOT tokens emitted per step. Covers the typical
+# worst case (3-5 player buffs + 4 enemies × 5 powers each ≈ 25-30) with
+# headroom. Anything beyond is dropped by emission order.
+MAX_POWER_SLOT_TOKENS = 40
+# Bucket space for power_id categorical embedding. STS2 has ~50 canonical
+# powers + mod headroom. Use a prime-ish power of 2 and hash unknowns into
+# it deterministically.
+POWER_ID_BUCKETS = 128
 
 OWNER_NONE = 0
 OWNER_ENEMY_BASE = 1
@@ -38,6 +53,9 @@ OWNER_PLAY = 44
 OWNER_DECK = 45
 OWNER_RELIC = 50
 OWNER_POTION = 51
+# v3: distinguish power-owned slots from their host entity so attention
+# can route power→card edges without colliding with entity→card routing.
+OWNER_POWER = 52
 OWNER_ROUTE = 60
 OWNER_SHOP = 61
 OWNER_REWARD = 62
@@ -105,6 +123,16 @@ TOKEN_TYPES = [
     "SHOP_ECON_LOCAL",
     "ROUTE_RISK_LOCAL",
     "ROUTE_VALUE_LOCAL",
+    # v3 additions:
+    # - POWER_SLOT_PLAYER / POWER_SLOT_ENEMY are split from the inline
+    #   power numerics previously stuffed into PLAYER_SURVIVAL / ENEMY_POWER.
+    #   One token per power instance. owner_id encodes which creature it
+    #   belongs to (player or enemy_base+combat_idx).
+    # - CARD_KEYWORD_SLOT surfaces retain/ethereal/exhaust/innate/etc. as
+    #   first-class tokens instead of bitflags buried inside card numerics.
+    "POWER_SLOT_PLAYER",
+    "POWER_SLOT_ENEMY",
+    "CARD_KEYWORD_SLOT",
 ]
 TOKEN_TYPE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_TYPES)}
 NUM_TOKEN_TYPES = len(TOKEN_TYPES)
@@ -155,6 +183,10 @@ TOKEN_ROLES = [
     "SHOP_ECON",
     "ROUTE_RISK",
     "ROUTE_VALUE",
+    # v3: dedicated role for POWER_SLOT / CARD_KEYWORD tokens so the
+    # eventual POWER bank can top-k-route exclusively to them.
+    "POWER_SLOT",
+    "CARD_KEYWORD",
 ]
 TOKEN_ROLE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_ROLES)}
 MAX_ROLE_ID = len(TOKEN_ROLES) - 1
@@ -180,6 +212,107 @@ TOKEN_ZONES = [
 ]
 TOKEN_ZONE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_ZONES)}
 MAX_ZONE_ID = len(TOKEN_ZONES) - 1
+
+
+# ---------------------------------------------------------------------------
+# Power effect-algebra table (Phase 6.0)
+# ---------------------------------------------------------------------------
+#
+# Canonical STS2 powers have known multiplicative/additive effects on
+# damage dealt / damage taken / block / draw / energy / stacks. Encoding
+# those coefficients directly into each POWER_SLOT token's numeric
+# vector lets attention LEARN interactions (e.g. "this card's damage
+# input × target's incoming_dmg_mult") without having to memorize
+# the combinatorial lookup table.
+#
+# All coefficients are *additive deltas from neutral 1.0/0.0*. Neutral
+# tokens (PAD, unknown) read zeros.
+#
+# Fields per power (indexed slot in the numeric vector):
+#   0:  damage_mult_given     — multiplier on damage THIS creature deals
+#                                (e.g. Weak: -0.25; no effect: 0.0)
+#   1:  damage_flat_given     — additive damage per hit (Strength: +1/stack)
+#   2:  damage_mult_received  — multiplier on damage THIS creature receives
+#                                (Vulnerable: +0.5; Intangible: -0.75)
+#   3:  damage_flat_received  — additive damage reduction (Buffer: absorb)
+#   4:  block_mult_given      — multiplier on block THIS creature grants
+#                                (Frail: -0.25)
+#   5:  block_flat_given      — additive block (Dexterity: +1/stack)
+#   6:  block_persistent      — 1.0 if block persists across turns
+#                                (Barricade)
+#   7:  end_of_turn_dmg_self  — self-damage at turn end (Poison on owner
+#                                → stacks dealt to self each enemy turn)
+#   8:  end_of_turn_dmg_given — damage dealt at turn end to attackers
+#                                (Thorns, Plated Armor)
+#   9:  stacks_on_applied     — counter (1=stacks accumulate, 0=duration)
+#   10: decays_each_turn      — 1 if Amount decreases each owner turn (most
+#                                debuffs: Vulnerable, Weak, Frail, Poison)
+#   11: is_buff               — classification (1 buff, 0 debuff/neutral)
+#   12: is_debuff             — (1 debuff, 0 buff/neutral)
+#
+# All unmentioned powers default to zeros (no algebraic effect
+# surfaced). Attention can still learn from their power_id bucket + text.
+
+_POWER_ALGEBRA_DIM = 13
+_POWER_ALGEBRA: dict[str, tuple[float, ...]] = {
+    # Core debuffs
+    "VULNERABLE_POWER": (0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0),
+    "WEAK_POWER":       (-0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0),
+    "FRAIL_POWER":      (0.0, 0.0, 0.0, 0.0, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0),
+    "POISON_POWER":     (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0),
+    # Core buffs
+    "STRENGTH_POWER":   (0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "DEXTERITY_POWER":  (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "INTANGIBLE_POWER": (0.0, 0.0, -0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0),
+    "METALLICIZE_POWER":(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "THORNS_POWER":     (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0),
+    "BARRICADE_POWER":  (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+    "BUFFER_POWER":     (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "ARTIFACT_POWER":   (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    # Enemy buffs
+    "RITUAL_POWER":     (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "CURL_UP_POWER":    (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+    "WEBBED_POWER":     (-0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0),
+    # Rocket / map-specific (downstream fork)
+    "BACK_ATTACK_LEFT_POWER":  (0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    "BACK_ATTACK_RIGHT_POWER": (0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    "SURROUNDED_POWER":        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+}
+
+
+def _power_algebra(power_id: str) -> tuple[float, ...]:
+    """Return the 13-dim effect-algebra vector for a canonical power id.
+
+    Unknown/mod powers return all-zeros so attention falls back to the
+    power_id bucket + text features alone — safe degradation, no crash.
+    """
+    if not power_id:
+        return (0.0,) * _POWER_ALGEBRA_DIM
+    return _POWER_ALGEBRA.get(
+        power_id.upper(),
+        (0.0,) * _POWER_ALGEBRA_DIM,
+    )
+
+
+def _power_id_bucket(power_id: str) -> int:
+    """Stable categorical bucket for a power_id.
+
+    Canonical powers get fixed low buckets (0..N-1, sorted by id).
+    Unknown/mod powers hash into the tail region so attention still
+    distinguishes them without colliding with canonicals.
+    """
+    if not power_id:
+        return 0
+    pid = power_id.upper()
+    # Canonical powers occupy buckets 1..len(_POWER_ALGEBRA) — reserve 0
+    # for PAD / unknown-collision.
+    canonical_order = sorted(_POWER_ALGEBRA.keys())
+    if pid in _POWER_ALGEBRA:
+        return 1 + canonical_order.index(pid)
+    # Non-canonical: hash into tail of bucket space.
+    tail_start = 1 + len(_POWER_ALGEBRA)
+    tail_size = max(POWER_ID_BUCKETS - tail_start, 1)
+    return tail_start + (_stable_bucket(pid) % tail_size)
 
 
 def _compress_numeric(values: np.ndarray | list[float] | tuple[float, ...], out_dim: int) -> np.ndarray:
@@ -293,6 +426,10 @@ def _role_for_token(token_type: str) -> int:
         "ROUTE_NODE": "ROUTE_NODE",
         "ROUTE_RISK_LOCAL": "ROUTE_RISK",
         "ROUTE_VALUE_LOCAL": "ROUTE_VALUE",
+        # v3:
+        "POWER_SLOT_PLAYER": "POWER_SLOT",
+        "POWER_SLOT_ENEMY": "POWER_SLOT",
+        "CARD_KEYWORD_SLOT": "CARD_KEYWORD",
     }.get(token_type, "NONE")
     return TOKEN_ROLE_TO_ID[role_name]
 
@@ -359,6 +496,10 @@ def _zone_for_token(token_type: str) -> int:
         "ROUTE_NODE": "ROUTE",
         "ROUTE_RISK_LOCAL": "ROUTE",
         "ROUTE_VALUE_LOCAL": "ROUTE",
+        # v3:
+        "POWER_SLOT_PLAYER": "PLAYER",
+        "POWER_SLOT_ENEMY": "ENEMY",
+        "CARD_KEYWORD_SLOT": "HAND",
     }.get(token_type, "NONE")
     return TOKEN_ZONE_TO_ID[zone_name]
 
@@ -459,6 +600,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             self._current_planner_context = planner_context
             self._append_global_tokens(world_entries, obs_dict, features, planner_context)
             self._append_entity_tokens(world_entries, obs_dict, features, planner_context)
+            # v3: POWER_SLOT tokens split out of entity-inlined numerics.
+            # One token per power instance on player + each enemy. Emits
+            # (power_id bucket as entity_id) + (effect-algebra vector in
+            # numeric slots 0..12) + (amount scalars in slots 13..15).
+            self._append_power_slot_tokens(world_entries, obs_dict)
             self._append_candidate_tokens(candidate_entries, candidate_local_entries, action_mask, obs_dict, features, action_list)
             self._resolve_entry_text_embeddings(world_entries, candidate_entries, candidate_local_entries)
             self._resolve_text_registry()
@@ -2265,6 +2411,124 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     text=str(rule.get("description") or rule.get("trait") or ""),
                 )
             )
+
+    def _append_power_slot_tokens(
+        self,
+        world_entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+    ) -> None:
+        """Emit one POWER_SLOT token per active buff/debuff instance.
+
+        Phase 6.1: splits the previously-inlined per-entity power numerics
+        into first-class tokens. Each token exposes the power's categorical
+        id (via entity_id bucket) and its effect-algebra coefficients (via
+        numeric vector) so that attention can learn interactions directly
+        (e.g. "this card's damage × target's damage_mult_received").
+
+        The original inline power features in PLAYER_SURVIVAL / ENEMY tokens
+        are preserved for back-compat; POWER_SLOT tokens add a richer
+        per-power view on top. Phase 6.2/6.3 will wire a dedicated POWER
+        bank + effect_class × target_power_bucket relational bias that
+        consumes these tokens exclusively.
+        """
+        emitted = 0
+        budget = MAX_POWER_SLOT_TOKENS
+
+        # ---- Player-owned powers ----
+        player = obs.get("player") or {}
+        player_powers = player.get("status") or player.get("powers") or []
+        if isinstance(player_powers, list):
+            for slot_index, power in enumerate(player_powers):
+                if emitted >= budget:
+                    break
+                if not isinstance(power, dict):
+                    continue
+                token = self._build_power_slot_numeric(power)
+                if token is None:
+                    continue
+                world_entries.append(
+                    self._entry(
+                        "POWER_SLOT_PLAYER",
+                        token["numeric"],
+                        owner_id=OWNER_PLAYER,
+                        entity_id=token["bucket"],
+                        order_id=min(slot_index, MAX_ORDER_ID),
+                        text=token["label"],
+                    )
+                )
+                emitted += 1
+
+        # ---- Enemy-owned powers ----
+        combat = obs.get("combat") or {}
+        enemies = combat.get("enemies") or []
+        if isinstance(enemies, list):
+            for enemy_index, enemy in enumerate(enemies):
+                if emitted >= budget:
+                    break
+                if not isinstance(enemy, dict):
+                    continue
+                owner_id = self._enemy_owner_id(enemy_index)
+                enemy_powers = enemy.get("powers") or enemy.get("status") or []
+                if not isinstance(enemy_powers, list):
+                    continue
+                for slot_index, power in enumerate(enemy_powers):
+                    if emitted >= budget:
+                        break
+                    if not isinstance(power, dict):
+                        continue
+                    token = self._build_power_slot_numeric(power)
+                    if token is None:
+                        continue
+                    world_entries.append(
+                        self._entry(
+                            "POWER_SLOT_ENEMY",
+                            token["numeric"],
+                            owner_id=owner_id,
+                            entity_id=token["bucket"],
+                            order_id=min(slot_index, MAX_ORDER_ID),
+                            text=token["label"],
+                        )
+                    )
+                    emitted += 1
+
+    def _build_power_slot_numeric(self, power: dict[str, Any]) -> dict[str, Any] | None:
+        """Pack a single power dict into the numeric + categorical fields
+        a POWER_SLOT token needs. Returns None on malformed input.
+
+        Numeric layout (TOKEN_NUMERIC_DIM=96 slots available; we use 16):
+          [0..12]  effect algebra (damage_mult_given, damage_flat_given,
+                                   damage_mult_received, damage_flat_received,
+                                   block_mult_given, block_flat_given,
+                                   block_persistent, end_of_turn_dmg_self,
+                                   end_of_turn_dmg_given, stacks_on_applied,
+                                   decays_each_turn, is_buff, is_debuff)
+          [13]     amount clipped + log-normalized
+          [14]     amount sign (positive/negative for reversible powers)
+          [15]     amount ratio vs typical cap (amount/10, clipped to 1)
+          [16..95] unused — reserved for Phase 6.x extensions (duration,
+                            applier/target hints, etc.)
+        """
+        pid = str(power.get("id") or "").strip()
+        if not pid:
+            return None
+        amount = power.get("amount")
+        try:
+            amount_f = float(amount) if amount is not None else 0.0
+        except (TypeError, ValueError):
+            amount_f = 0.0
+
+        numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+        algebra = _power_algebra(pid)
+        numeric[: _POWER_ALGEBRA_DIM] = algebra
+        # Amount features: log-scaled magnitude, sign, clipped ratio.
+        numeric[13] = obs_common._log_norm(abs(amount_f), obs_common._LOG1P_200)
+        numeric[14] = 1.0 if amount_f > 0 else (-1.0 if amount_f < 0 else 0.0)
+        numeric[15] = max(-1.0, min(amount_f / 10.0, 1.0))
+        return {
+            "numeric": numeric,
+            "bucket": _power_id_bucket(pid),
+            "label": pid,
+        }
 
     def _append_relic_collection(
         self,
