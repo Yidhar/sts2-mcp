@@ -21,7 +21,10 @@ MAX_ACTIONS = obs_common.MAX_ACTIONS
 # CARD_KEYWORD tokens, split out of the entity numeric inlining. At typical
 # STS2 scale we see <= 35 active powers (player + 4 enemies × 5 powers) and
 # a handful of card-keyword tokens; 64 is comfortable headroom.
-MAX_WORLD_TOKENS = 384
+# Phase 8 Tier 1 (attention_obs_v4): +28 HISTORY tokens (20 step-detail +
+# 8 turn-summary) so the policy can reason about "what did I just do"
+# without needing a recurrent architecture. See action_history.py.
+MAX_WORLD_TOKENS = 412
 MAX_CANDIDATE_LOCAL_TOKENS = 24
 TOKEN_NUMERIC_DIM = 96
 TOKEN_TEXT_DIM = 64
@@ -29,9 +32,10 @@ TOKEN_FEAT_DIM = TOKEN_NUMERIC_DIM + TOKEN_TEXT_DIM
 ENTITY_HASH_BUCKETS = 8192
 MAX_OWNER_ID = 127
 MAX_ORDER_ID = 63
-# v3: POWER_SLOT + CARD_KEYWORD token types exist. v2 checkpoints will NOT
-# load — the 700k run was trained on a schema the fixes already invalidated.
-OBSERVATION_API_VERSION = "attention_obs_v3"
+# v4: HISTORY_STEP_DETAIL / HISTORY_TURN_SUMMARY token types exist.
+# v3 checkpoints load with strict=False; new history-specific embeddings
+# zero-init. See _design_phase8_history.md for the migration plan.
+OBSERVATION_API_VERSION = "attention_obs_v4"
 
 # Maximum number of POWER_SLOT tokens emitted per step. Covers the typical
 # worst case (3-5 player buffs + 4 enemies × 5 powers each ≈ 25-30) with
@@ -41,6 +45,18 @@ MAX_POWER_SLOT_TOKENS = 40
 # powers + mod headroom. Use a prime-ish power of 2 and hash unknowns into
 # it deterministically.
 POWER_ID_BUCKETS = 128
+
+# Phase 8 Tier 1: action-history tokens. Imported at module load so we
+# can also expose MAX_HISTORY_TOKENS / MAX_STEP_DETAIL_TOKENS /
+# MAX_TURN_SUMMARY_TOKENS without cross-module duplication.
+from .action_history import (
+    KEY_POWER_CARD_BUCKETS,
+    MAX_HISTORY_TOKENS,
+    MAX_STEP_DETAIL_TOKENS,
+    MAX_TURN_SUMMARY_TOKENS,
+    NUM_KEY_POWER_FLAGS,
+    NUM_SEMANTIC_ROLES,
+)
 
 # Phase 6.4: per-card keyword tokens (Retain/Ethereal/Exhaust/Innate/...).
 # Previously these were bitflags buried inside HAND_CARD numerics; breaking
@@ -79,6 +95,11 @@ OWNER_POTION = 51
 # v3: distinguish power-owned slots from their host entity so attention
 # can route power→card edges without colliding with entity→card routing.
 OWNER_POWER = 52
+# Phase 8 Tier 1: dedicated owner id for HISTORY tokens so the
+# owner_pair_bias can learn "history-to-candidate" edges distinct from
+# any entity-hosted token's owner. All history tokens (step-detail and
+# turn-summary alike) share this one owner.
+OWNER_HISTORY = 53
 OWNER_ROUTE = 60
 OWNER_SHOP = 61
 OWNER_REWARD = 62
@@ -156,6 +177,20 @@ TOKEN_TYPES = [
     "POWER_SLOT_PLAYER",
     "POWER_SLOT_ENEMY",
     "CARD_KEYWORD_SLOT",
+    # v4 additions (Phase 8 Tier 1):
+    # - HISTORY_STEP_DETAIL is one-per-recent-env.step record. Numeric
+    #   block packs family one-hot, semantic_role bitmap, target scope,
+    #   step_offset, same_turn/encounter/floor flags, and scalar deltas
+    #   (enemy_hp_delta, player_hp_delta, block_delta, energy_delta).
+    # - HISTORY_TURN_SUMMARY is one-per-completed-combat-turn aggregate.
+    #   Numeric block packs attack/skill/power counts, total damage /
+    #   block / hp-lost, end-of-turn strength/dex/focus, key-power-card
+    #   bitmap, and outcome flags.
+    # Both share the HISTORY role + HISTORY zone so the new 7th world
+    # bank ("history" in omni_attention_policy.WORLD_BANK_NAMES) routes
+    # them cleanly without also sweeping in entity-hosted tokens.
+    "HISTORY_STEP_DETAIL",
+    "HISTORY_TURN_SUMMARY",
 ]
 TOKEN_TYPE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_TYPES)}
 NUM_TOKEN_TYPES = len(TOKEN_TYPES)
@@ -210,6 +245,11 @@ TOKEN_ROLES = [
     # eventual POWER bank can top-k-route exclusively to them.
     "POWER_SLOT",
     "CARD_KEYWORD",
+    # v4: single HISTORY role shared by step-detail + turn-summary
+    # tokens. The token_type bit separates the two fine-grained views;
+    # routing by role is what lets the dedicated "history" bank collect
+    # them exclusively.
+    "HISTORY",
 ]
 TOKEN_ROLE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_ROLES)}
 MAX_ROLE_ID = len(TOKEN_ROLES) - 1
@@ -232,6 +272,12 @@ TOKEN_ZONES = [
     "REWARD",
     "UPGRADE",
     "SELECTION",
+    # v4: dedicated zone for HISTORY tokens. Lets the world_bank_router
+    # pick up history tokens via zone==HISTORY AND/OR role==HISTORY —
+    # the bank definition in omni_attention_policy uses role-only so
+    # adding this zone entry doesn't sweep any existing tokens into the
+    # history bank.
+    "HISTORY",
 ]
 TOKEN_ZONE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_ZONES)}
 MAX_ZONE_ID = len(TOKEN_ZONES) - 1
@@ -453,6 +499,12 @@ def _role_for_token(token_type: str) -> int:
         "POWER_SLOT_PLAYER": "POWER_SLOT",
         "POWER_SLOT_ENEMY": "POWER_SLOT",
         "CARD_KEYWORD_SLOT": "CARD_KEYWORD",
+        # v4 (Phase 8 Tier 1): HISTORY role is shared between step-detail
+        # and turn-summary tokens so the single "history" bank picks them
+        # both up via role-filter; the token_type one-hot separates them
+        # in the EntityTokenEmbedder's type embedding.
+        "HISTORY_STEP_DETAIL": "HISTORY",
+        "HISTORY_TURN_SUMMARY": "HISTORY",
     }.get(token_type, "NONE")
     return TOKEN_ROLE_TO_ID[role_name]
 
@@ -523,6 +575,12 @@ def _zone_for_token(token_type: str) -> int:
         "POWER_SLOT_PLAYER": "PLAYER",
         "POWER_SLOT_ENEMY": "ENEMY",
         "CARD_KEYWORD_SLOT": "HAND",
+        # v4 (Phase 8 Tier 1): dedicated HISTORY zone. Role-only bank
+        # filter in omni_attention_policy means this zone tag is more
+        # documentation than routing, but it's cheap insurance against
+        # any downstream code that probes by zone_id.
+        "HISTORY_STEP_DETAIL": "HISTORY",
+        "HISTORY_TURN_SUMMARY": "HISTORY",
     }.get(token_type, "NONE")
     return TOKEN_ZONE_TO_ID[zone_name]
 
@@ -633,6 +691,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             # to the POWER bank where attention can learn the interaction
             # patterns ("Ethereal + turn ending + not playable = waste").
             self._append_card_keyword_slot_tokens(world_entries, obs_dict)
+            # v4 (Phase 8 Tier 1): HISTORY tokens. 20 step-detail slots +
+            # 8 turn-summary slots, populated from env_v2's
+            # ActionHistoryTracker snapshot attached under
+            # obs["_action_history"]. Padded tokens carry is_empty=1.
+            self._append_history_tokens(world_entries, obs_dict)
             self._append_candidate_tokens(candidate_entries, candidate_local_entries, action_mask, obs_dict, features, action_list)
             self._resolve_entry_text_embeddings(world_entries, candidate_entries, candidate_local_entries)
             self._resolve_text_registry()
@@ -2644,6 +2707,219 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "bucket": _power_id_bucket(pid),
             "label": pid,
         }
+
+    def _append_history_tokens(
+        self,
+        world_entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+    ) -> None:
+        """Emit MAX_STEP_DETAIL_TOKENS step-detail + MAX_TURN_SUMMARY_TOKENS
+        turn-summary tokens from ``obs["_action_history"]``.
+
+        Always emits a fixed number of tokens (padded with is_empty=1 when
+        the tracker is shorter) so MAX_WORLD_TOKENS stays invariant across
+        calls — rollout buffers and type_id arrays are fixed-shape.
+
+        Numeric layout is split between step-detail and turn-summary so a
+        single shared HISTORY role / zone / owner still produces distinct
+        feature distributions the model can separate via the token_type
+        one-hot (type id carried on world_token_type_ids).
+        """
+        history_dict = obs.get("_action_history") if isinstance(obs, dict) else None
+        if not isinstance(history_dict, dict):
+            history_dict = {"step_detail": [], "turn_summary": []}
+        step_detail_entries = history_dict.get("step_detail") if isinstance(history_dict.get("step_detail"), list) else []
+        turn_summary_entries = history_dict.get("turn_summary") if isinstance(history_dict.get("turn_summary"), list) else []
+
+        # --- Step-detail tokens ---
+        for slot in range(MAX_STEP_DETAIL_TOKENS):
+            entry = step_detail_entries[slot] if slot < len(step_detail_entries) else None
+            numeric, card_bucket, text = self._build_history_step_numeric(entry, slot)
+            world_entries.append(
+                self._entry(
+                    "HISTORY_STEP_DETAIL",
+                    numeric,
+                    owner_id=OWNER_HISTORY,
+                    entity_id=int(card_bucket),
+                    order_id=min(slot, MAX_ORDER_ID),
+                    zone_id=TOKEN_ZONE_TO_ID.get("HISTORY", 0),
+                    text=text,
+                )
+            )
+
+        # --- Turn-summary tokens ---
+        for slot in range(MAX_TURN_SUMMARY_TOKENS):
+            entry = turn_summary_entries[slot] if slot < len(turn_summary_entries) else None
+            numeric, text = self._build_history_turn_summary_numeric(entry, slot)
+            world_entries.append(
+                self._entry(
+                    "HISTORY_TURN_SUMMARY",
+                    numeric,
+                    owner_id=OWNER_HISTORY,
+                    entity_id=0,
+                    order_id=min(slot, MAX_ORDER_ID),
+                    zone_id=TOKEN_ZONE_TO_ID.get("HISTORY", 0),
+                    text=text,
+                )
+            )
+
+    def _build_history_step_numeric(
+        self, entry: dict[str, Any] | None, slot: int
+    ) -> tuple[np.ndarray, int, str]:
+        """Pack a single step-detail numeric block.
+
+        Layout (TOKEN_NUMERIC_DIM = 96):
+          [0]      is_empty              (1 = padding, tracker had no entry for this slot)
+          [1]      is_step_detail        (always 1 here; turn-summary sets [1]=0)
+          [2..]    family one-hot        (len = NUM_FAMILIES)
+          [next]   semantic_role flags   (NUM_SEMANTIC_ROLES bits)
+          [next]   target_scope one-hot  (len = NUM_TARGET_SCOPES)
+          [next]   step_offset one-hot   (MAX_STEP_DETAIL_TOKENS slots)
+          [next]   same_turn / same_encounter / same_floor / phase_changed /
+                   combat_ended / rejected / reward_nonzero (7 flags)
+          [next]   scalar deltas (7 slots):
+                     reward, abs(reward), enemy_hp_delta, hp_delta_player,
+                     block_delta, energy_delta, step_offset_norm
+          remainder zero (spare — keeps room for Tier 2 pre/post state vecs)
+        """
+        from .semantic_action import SEMANTIC_ACTION_FAMILIES, SEMANTIC_TARGET_SCOPES
+
+        numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+        # [1] = is_step_detail marker — makes linear probes trivial.
+        numeric[1] = 1.0
+
+        if not isinstance(entry, dict):
+            # Padded / empty slot.
+            numeric[0] = 1.0
+            return numeric, 0, ""
+
+        cursor = 2
+        # family one-hot
+        family_idx = int(entry.get("family_idx") or 0)
+        if 0 <= family_idx < len(SEMANTIC_ACTION_FAMILIES):
+            numeric[cursor + family_idx] = 1.0
+        cursor += len(SEMANTIC_ACTION_FAMILIES)
+        # semantic_role_flags bits
+        role_flags = int(entry.get("semantic_role_flags") or 0)
+        for bit in range(NUM_SEMANTIC_ROLES):
+            if role_flags & (1 << bit):
+                numeric[cursor + bit] = 1.0
+        cursor += NUM_SEMANTIC_ROLES
+        # target_scope one-hot
+        scope_idx = int(entry.get("target_scope_idx") or 0)
+        if 0 <= scope_idx < len(SEMANTIC_TARGET_SCOPES):
+            numeric[cursor + scope_idx] = 1.0
+        cursor += len(SEMANTIC_TARGET_SCOPES)
+        # step_offset one-hot
+        step_offset = int(entry.get("step_offset") or 0)
+        step_offset = max(0, min(step_offset, MAX_STEP_DETAIL_TOKENS - 1))
+        numeric[cursor + step_offset] = 1.0
+        cursor += MAX_STEP_DETAIL_TOKENS
+
+        # Flags
+        numeric[cursor + 0] = 1.0 if entry.get("same_turn") else 0.0
+        numeric[cursor + 1] = 1.0 if entry.get("same_encounter") else 0.0
+        numeric[cursor + 2] = 1.0 if entry.get("same_floor") else 0.0
+        numeric[cursor + 3] = 1.0 if entry.get("phase_changed") else 0.0
+        numeric[cursor + 4] = 1.0 if entry.get("combat_ended") else 0.0
+        numeric[cursor + 5] = 1.0 if entry.get("rejected") else 0.0
+        numeric[cursor + 6] = 1.0 if entry.get("reward_nonzero") else 0.0
+        cursor += 7
+
+        # Scalar deltas (normalized / clipped)
+        reward = float(entry.get("reward") or 0.0)
+        numeric[cursor + 0] = max(-1.0, min(reward, 1.0))
+        numeric[cursor + 1] = min(abs(reward), 1.0)
+        numeric[cursor + 2] = max(0.0, min(float(entry.get("enemy_hp_delta") or 0.0) / 30.0, 1.0))
+        numeric[cursor + 3] = max(-1.0, min(float(entry.get("hp_delta_player") or 0.0) / 30.0, 1.0))
+        numeric[cursor + 4] = max(-1.0, min(float(entry.get("block_delta") or 0.0) / 30.0, 1.0))
+        numeric[cursor + 5] = max(-1.0, min(float(entry.get("energy_delta") or 0.0) / 3.0, 1.0))
+        numeric[cursor + 6] = step_offset / max(MAX_STEP_DETAIL_TOKENS - 1, 1)
+        cursor += 7
+        # cursor now points into the "spare" zone; leave as zeros so
+        # Tier 2 pre_state / post_state vecs can land here without
+        # reshuffling the layout.
+
+        card_bucket = int(entry.get("card_id_bucket") or 0)
+        text = str(entry.get("canonical_text") or "")
+        return numeric, card_bucket, text
+
+    def _build_history_turn_summary_numeric(
+        self, entry: dict[str, Any] | None, slot: int
+    ) -> tuple[np.ndarray, str]:
+        """Pack a single turn-summary numeric block.
+
+        Layout (TOKEN_NUMERIC_DIM = 96):
+          [0]       is_empty                (1 = padding)
+          [1]       is_step_detail          (0 — this is a turn summary)
+          [2..10]   turn_offset one-hot     (MAX_TURN_SUMMARY_TOKENS=8 slots, offset 1..8)
+          [10..14]  action counts           (n_attacks/n_skills/n_powers/n_potions normalized)
+          [14..17]  totals                  (damage/block/hp_lost normalized)
+          [17..22]  end-of-turn stats       (strength/dex/focus/block/enemy_hp_ratio)
+          [22]      end_enemy_vuln_total normalized
+          [23]      turn_num normalized
+          [24..40]  key_power_card_flags    (16 bits, one per slot)
+          [40..44]  outcome flags           (enemy_killed / player_took_dmg /
+                                             player_scaled / low_energy_waste)
+          remainder zero — Tier 2 can add cross-turn comparison scalars here.
+        """
+        numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+        # [1] = 0: this is NOT step_detail. Stays zero for turn summaries.
+
+        if not isinstance(entry, dict):
+            numeric[0] = 1.0
+            return numeric, ""
+
+        cursor = 2
+        # turn_offset one-hot
+        turn_offset = int(entry.get("turn_offset") or 1)
+        turn_offset_slot = max(0, min(turn_offset - 1, MAX_TURN_SUMMARY_TOKENS - 1))
+        numeric[cursor + turn_offset_slot] = 1.0
+        cursor += MAX_TURN_SUMMARY_TOKENS
+
+        # Action counts (normalized by a generous ceiling — 8 cards/turn is a lot)
+        numeric[cursor + 0] = min(float(entry.get("n_attacks") or 0) / 8.0, 1.0)
+        numeric[cursor + 1] = min(float(entry.get("n_skills") or 0) / 8.0, 1.0)
+        numeric[cursor + 2] = min(float(entry.get("n_powers") or 0) / 4.0, 1.0)
+        numeric[cursor + 3] = min(float(entry.get("n_potions_used") or 0) / 3.0, 1.0)
+        cursor += 4
+
+        # Totals
+        numeric[cursor + 0] = min(float(entry.get("total_damage_dealt") or 0) / 50.0, 1.0)
+        numeric[cursor + 1] = min(float(entry.get("total_block_gained") or 0) / 30.0, 1.0)
+        numeric[cursor + 2] = min(float(entry.get("total_hp_lost") or 0) / 30.0, 1.0)
+        cursor += 3
+
+        # End-of-turn stats
+        numeric[cursor + 0] = min(float(entry.get("end_strength") or 0) / 10.0, 1.0)
+        numeric[cursor + 1] = min(float(entry.get("end_dex") or 0) / 10.0, 1.0)
+        numeric[cursor + 2] = min(float(entry.get("end_focus") or 0) / 10.0, 1.0)
+        numeric[cursor + 3] = min(float(entry.get("end_player_block") or 0) / 40.0, 1.0)
+        numeric[cursor + 4] = max(0.0, min(float(entry.get("end_enemy_total_hp_ratio") or 0), 1.0))
+        cursor += 5
+
+        numeric[cursor + 0] = min(float(entry.get("end_enemy_vuln_total") or 0) / 10.0, 1.0)
+        cursor += 1
+        numeric[cursor + 0] = min(float(entry.get("turn_num") or 0) / 30.0, 1.0)
+        cursor += 1
+
+        # Key-power-card flags (16 bits, one per slot so attention doesn't
+        # have to learn a bitmap decoder)
+        key_flags = int(entry.get("key_power_card_flags") or 0)
+        for bit in range(NUM_KEY_POWER_FLAGS):
+            if key_flags & (1 << bit):
+                numeric[cursor + bit] = 1.0
+        cursor += NUM_KEY_POWER_FLAGS
+
+        # Outcome flags
+        numeric[cursor + 0] = 1.0 if entry.get("enemy_killed") else 0.0
+        numeric[cursor + 1] = 1.0 if entry.get("player_took_dmg") else 0.0
+        numeric[cursor + 2] = 1.0 if entry.get("player_scaled") else 0.0
+        numeric[cursor + 3] = 1.0 if entry.get("low_energy_waste") else 0.0
+        cursor += 4
+
+        text = str(entry.get("canonical_text") or "")
+        return numeric, text
 
     def _append_relic_collection(
         self,

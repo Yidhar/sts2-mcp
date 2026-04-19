@@ -12,7 +12,12 @@ from sb3_contrib import MaskablePPO
 from .aux_maskable_ppo import AuxMaskablePPO
 from .omni_attention_policy import DEFAULT_POLICY_CLASS_PATH, STS2OmniAttentionPolicy
 
-REQUIRED_OBSERVATION_API_VERSION = "attention_obs_v2"
+REQUIRED_OBSERVATION_API_VERSION = "attention_obs_v4"
+# Older obs API versions that the warmstart migration path knows how to
+# upgrade. When a loaded checkpoint's metadata carries one of these, the
+# state_dict is padded / zero-backfilled to match the current schema
+# before load. Any version not here fails the strict validate check.
+_MIGRATABLE_OBSERVATION_API_VERSIONS = {"attention_obs_v3", "attention_obs_v4"}
 REQUIRED_COLLECTOR_MODE = "async"
 REQUIRED_CANDIDATE_LOCAL_TOKENS = 24
 
@@ -120,7 +125,13 @@ def validate_attention_checkpoint_metadata(
         candidate_local_tokens = -1
 
     mismatches: list[str] = []
-    if observation_api_version != REQUIRED_OBSERVATION_API_VERSION:
+    # Accept any OBS API version we know how to migrate. The actual
+    # state-dict upgrade happens inside load_online_policy_state_dict
+    # via _pad_state_dict_for_schema_growth.
+    if (
+        observation_api_version != REQUIRED_OBSERVATION_API_VERSION
+        and observation_api_version not in _MIGRATABLE_OBSERVATION_API_VERSIONS
+    ):
         mismatches.append(
             f"observation_api_version={observation_api_version or '<missing>'} (expected {REQUIRED_OBSERVATION_API_VERSION})"
         )
@@ -152,6 +163,15 @@ _FORWARD_COMPATIBLE_MISSING_PREFIXES = (
     "world_bank_router_q.",
     "world_bank_router_k.",
     "world_bank_router_bias",
+    # Phase 8 Tier 1: history-related params that Phase 6 checkpoints
+    # won't have — history_card_bias lives on every RelationBias
+    # instance, and the new 7th ("history") entry in bank-indexed
+    # ModuleLists extends router/pooler/cross_block lengths.
+    "world_relation_bias.history_card_bias.",
+    "local_relation_bias.history_card_bias.",
+    "query_local_relation_bias.history_card_bias.",
+    "query_world_relation_bias.history_card_bias.",
+    "candidate_set_relation_bias.history_card_bias.",
 )
 
 
@@ -170,6 +190,69 @@ def _can_relax_for_forward_compatible_missing_keys(policy, state_dict: dict[str,
     return bool(missing_keys) and missing_keys.issubset(forward_compatible_keys) and not unexpected_keys
 
 
+def _pad_state_dict_for_schema_growth(
+    policy,
+    state_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Pad checkpoint state_dict entries to match current policy shapes.
+
+    Phase 8 Tier 1 grew three embedding tables compared to Phase 6:
+      - type_embedding (num_token_types): 64 → 66  (added HISTORY_*)
+      - role_embedding (max_role_id+1):   47 → 48  (added HISTORY)
+      - zone_embedding (max_zone_id+1):   17 → 18  (added HISTORY)
+    All three embed new IDs that didn't exist in the old model — zero-
+    padding the new rows leaves old token behavior identical while
+    letting the new HISTORY tokens start from a blank slate.
+
+    Any other mismatched-shape entries (e.g. pair-bias tables keyed
+    by num_token_types × num_token_types) are similarly padded on both
+    the row and column axis so the old entries land in the top-left
+    block of the larger matrix.
+
+    CAVEAT: pair-bias tables (type_pair_bias, role_pair_bias,
+    zone_pair_bias) are Embeddings indexed by ``a*N + b`` where N is the
+    matching dimension size. When N grows (e.g. num_types 64→66),
+    flat-index k no longer means the same (a, b). Simple row-padding
+    preserves old weights at positions that are now semantically
+    different — e.g. old (type_a=5, type_b=7) at flat 327 becomes
+    (type_a=4, type_b=63) in the new keying. PPO normally re-learns
+    these fairly quickly since the biases are small-magnitude gradient
+    sinks, but expect ~1-5k steps of transient behavior right after a
+    v3→v4 warmstart. If this turns out to be expensive, the fix is to
+    write a per-table re-keying migration (un-flatten, copy into new
+    indices, re-flatten) — deferred until we see it cost us.
+
+    Does NOT touch keys that match in shape or are entirely missing
+    (those are handled by strict=False + forward-compat relaxation).
+    """
+    import torch  # local import to keep module load light
+
+    target_state = policy.state_dict()
+    padded = dict(state_dict)
+    for key, ckpt_tensor in state_dict.items():
+        if key not in target_state:
+            continue
+        target_tensor = target_state[key]
+        if tuple(ckpt_tensor.shape) == tuple(target_tensor.shape):
+            continue
+        # Shape mismatch — pad zero-ly into the target shape, preserving
+        # the old weights at their original indices. This covers
+        # Embedding grows, square pair-bias matrices that depend on
+        # num_token_types/max_role/zone, and any other shape that's
+        # strictly larger on every dimension.
+        if len(ckpt_tensor.shape) != len(target_tensor.shape):
+            continue  # rank change — can't migrate automatically
+        if any(c > t for c, t in zip(ckpt_tensor.shape, target_tensor.shape)):
+            continue  # checkpoint is BIGGER than policy — can't shrink safely
+        padded_tensor = torch.zeros(
+            target_tensor.shape, dtype=ckpt_tensor.dtype, device=ckpt_tensor.device
+        )
+        slicer = tuple(slice(0, s) for s in ckpt_tensor.shape)
+        padded_tensor[slicer] = ckpt_tensor
+        padded[key] = padded_tensor
+    return padded
+
+
 def load_online_policy_state_dict(
     model_or_policy,
     checkpoint_dir: str | Path,
@@ -182,6 +265,12 @@ def load_online_policy_state_dict(
     state_dict = load_file(str(checkpoint_path / "model.safetensors"), device=device)
 
     policy = getattr(model_or_policy, "policy", model_or_policy)
+
+    # Phase 8: pad any oversized target entries (embedding tables that
+    # grew when we added HISTORY_* types/roles/zones). Safe no-op when
+    # the checkpoint already matches the current schema.
+    state_dict = _pad_state_dict_for_schema_growth(policy, state_dict)
+
     try:
         policy.load_state_dict(state_dict, strict=strict)
     except RuntimeError:

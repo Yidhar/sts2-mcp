@@ -21,6 +21,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .action_compact import compact_legal_actions
+from .action_history import ActionHistoryTracker
 from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
 from .observation_common import DenseObservationEncoder, MAX_ACTIONS
@@ -76,6 +77,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         obs_encoder: DenseObservationEncoder | None = None,
         include_debug_info: bool = False,
         bridge: "BridgeClient | None" = None,
+        stuck_watchdog_steps: int = 400,
     ) -> None:
         super().__init__()
 
@@ -89,6 +91,13 @@ class SlayTheSpire2EnvV2(gym.Env):
         self.step_timeout_ms = step_timeout_ms
         self.render_mode = render_mode
         self.include_debug_info = bool(include_debug_info)
+        # Phase-stuck watchdog: truncate the episode when the fingerprint
+        # (phase, floor, combat_round, enemy_hp_total, player_hp) stays the
+        # same for >= stuck_watchdog_steps. Set to 0 to disable. Motivated
+        # by sim long-train where 23% of episodes ran 1000–6000 steps on the
+        # same floor without progressing — dominating rollouts with
+        # non-combat noise and zeroing aux_enemy_state / value losses.
+        self.stuck_watchdog_steps = int(stuck_watchdog_steps)
 
         self.observation_space = self.obs_encoder.obs_space
         self.action_space = spaces.Discrete(MAX_ACTIONS)
@@ -98,6 +107,13 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._last_obs_raw: dict[str, Any] | None = None
         self._last_action_overflow: int = 0
         self._max_floor_reached: int = 0
+        self._stuck_fingerprint: tuple | None = None
+        self._stuck_steps: int = 0
+        # Phase 8 Tier 1: per-step action + per-turn summary history.
+        # Fed as ``raw_obs["_action_history"]`` for observation_v3 to emit
+        # HISTORY tokens into the world-token budget. See
+        # sts2_env/action_history.py for the data-flow design.
+        self._action_history = ActionHistoryTracker()
         self._run_memory = RunMemoryTracker(
             episode_mode="full_run",
             potion_mechanics_available=True,
@@ -115,6 +131,9 @@ class SlayTheSpire2EnvV2(gym.Env):
         # recorded into _max_floor_reached rather than left over from the
         # previous episode.
         self._max_floor_reached = 0
+        self._stuck_fingerprint = None
+        self._stuck_steps = 0
+        self._action_history.reset()
 
         bridge_started = time.perf_counter()
         result = self._reset_with_ready_gate(timeout_ms=self.reset_timeout_ms)
@@ -122,7 +141,9 @@ class SlayTheSpire2EnvV2(gym.Env):
 
         self._episode_id = result["episode_id"]
         self._update_live_state(result)
+        self._inject_action_history_into_obs()
         self._recover_filtered_action_window(timeout_ms=min(self.reset_timeout_ms, RECOVERY_MAX_WAIT_MS))
+        self._inject_action_history_into_obs()
         run_memory_started = time.perf_counter()
         self._run_memory.reset(
             self._last_obs_raw,
@@ -195,6 +216,7 @@ class SlayTheSpire2EnvV2(gym.Env):
                     self._combat_memory.update(prev_obs, legal_action, self._last_obs_raw)
                     run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
                     planner_context = self._planner_context()
+                    self._inject_action_history_into_obs()
                     obs_encode_started = time.perf_counter()
                     obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, planner_context)
                     obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
@@ -230,6 +252,18 @@ class SlayTheSpire2EnvV2(gym.Env):
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
         bridge_info = result.get("info", {})
+        # Phase 8 Tier 1: record the transition into the action-history
+        # tracker. Done here (before soft-rebind / recovery) so the "next"
+        # state matches what the bridge returned — recovery may advance
+        # the sim further, which would dilute the "this step's direct
+        # consequence" signal.
+        self._action_history.record(
+            action=legal_action,
+            prev_obs=prev_obs,
+            next_obs=self._last_obs_raw,
+            reward=reward,
+            rejected=bool(bridge_info.get("action_error")) if isinstance(bridge_info, dict) else False,
+        )
 
         if truncated and not terminated:
             recovered = self._soft_rebind_into_current_run(
@@ -248,11 +282,18 @@ class SlayTheSpire2EnvV2(gym.Env):
         if not terminated and not truncated:
             self._recover_filtered_action_window(timeout_ms=self._transition_recovery_timeout_ms())
 
+        if not terminated and not truncated and self.stuck_watchdog_steps > 0:
+            stuck_truncated, stuck_bridge_info = self._check_stuck_watchdog(bridge_info)
+            if stuck_truncated:
+                truncated = True
+                bridge_info = stuck_bridge_info
+
         run_memory_started = time.perf_counter()
         self._run_memory.update_transition(prev_obs, legal_action, self._last_obs_raw, legal_actions=self._legal_actions)
         self._combat_memory.update(prev_obs, legal_action, self._last_obs_raw)
         run_memory_elapsed_ms = (time.perf_counter() - run_memory_started) * 1000.0
         planner_context = self._planner_context()
+        self._inject_action_history_into_obs()
         obs_encode_started = time.perf_counter()
         obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, planner_context)
         obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
@@ -302,11 +343,13 @@ class SlayTheSpire2EnvV2(gym.Env):
         recovered = self._recover_filtered_action_window(
             timeout_ms=min(timeout_ms or self.step_timeout_ms, RECOVERY_MAX_WAIT_MS)
         )
+        self._inject_action_history_into_obs()
         obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions, self._planner_context())
         info = self._build_info({})
         return recovered, obs, info
 
     def _make_terminal(self):
+        self._inject_action_history_into_obs()
         obs = self.obs_encoder.encode(self._last_obs_raw or {}, [], self._planner_context())
         info = self._build_info(
             {},
@@ -427,6 +470,92 @@ class SlayTheSpire2EnvV2(gym.Env):
         if raw < -ENEMY_HP_DELTA_REWARD_MAX_ABS:
             return -ENEMY_HP_DELTA_REWARD_MAX_ABS
         return raw
+
+    def _inject_action_history_into_obs(self) -> None:
+        """Attach the tracker's current snapshot onto ``_last_obs_raw`` so
+        observation_v3 can emit HISTORY tokens. Called on a freshly-assigned
+        obs dict (after ``_update_live_state``) — we own the mutation, no
+        bridge reader cares about the underscore-prefixed key.
+        """
+        if isinstance(self._last_obs_raw, dict):
+            self._last_obs_raw["_action_history"] = self._action_history.to_obs_dict()
+
+    def _progress_fingerprint(self) -> tuple:
+        """Coarse snapshot of 'has the world meaningfully advanced?' signals.
+
+        Two consecutive steps sharing the same fingerprint means the agent
+        chose an action that left the visible game state identical — no
+        floor change, no combat round tick, no damage dealt, no hp loss.
+        A handful of these can happen legitimately (0-cost card draws,
+        null-effect selections). Hundreds in a row means the policy is
+        stuck in a no-op loop and should be truncated.
+        """
+        obs = self._last_obs_raw or {}
+        run = obs.get("run") if isinstance(obs, dict) else None
+        combat = obs.get("combat") if isinstance(obs, dict) else None
+        player = obs.get("player") if isinstance(obs, dict) else None
+        floor = 0
+        if isinstance(run, dict):
+            for key in ("floor", "total_floor", "act_floor"):
+                val = run.get(key)
+                if val is not None:
+                    try:
+                        floor = int(val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        combat_round = 0
+        enemy_hp_total = 0
+        if isinstance(combat, dict):
+            try:
+                combat_round = int(combat.get("round") or 0)
+            except (TypeError, ValueError):
+                combat_round = 0
+            enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
+            for enemy in enemies:
+                if not isinstance(enemy, dict):
+                    continue
+                try:
+                    enemy_hp_total += int(enemy.get("hp") or 0)
+                except (TypeError, ValueError):
+                    continue
+        player_hp = 0
+        if isinstance(player, dict):
+            try:
+                player_hp = int(player.get("hp") or 0)
+            except (TypeError, ValueError):
+                player_hp = 0
+        phase = str(obs.get("phase") or "")
+        return (phase, floor, combat_round, enemy_hp_total, player_hp)
+
+    def _check_stuck_watchdog(self, bridge_info: Any) -> tuple[bool, Any]:
+        """Increment stuck counter; truncate if fingerprint stable too long.
+
+        Returns ``(truncated, bridge_info)``. When truncation fires, the
+        returned bridge_info has ``truncation_reason="phase_stuck_watchdog"``
+        plus ``stuck_phase`` / ``stuck_floor`` / ``stuck_steps`` fields so
+        the async collector's ``episode_terminal`` event captures the
+        reason. The bridge_info passed in is treated as the existing dict
+        we should append to (not replaced).
+        """
+        fingerprint = self._progress_fingerprint()
+        if fingerprint == self._stuck_fingerprint:
+            self._stuck_steps += 1
+        else:
+            self._stuck_fingerprint = fingerprint
+            self._stuck_steps = 1
+        if self._stuck_steps < self.stuck_watchdog_steps:
+            return False, bridge_info
+        # Stuck — truncate and annotate.
+        info_out: dict[str, Any] = dict(bridge_info) if isinstance(bridge_info, dict) else {}
+        info_out["truncation_reason"] = "phase_stuck_watchdog"
+        info_out["stuck_phase"] = fingerprint[0]
+        info_out["stuck_floor"] = fingerprint[1]
+        info_out["stuck_combat_round"] = fingerprint[2]
+        info_out["stuck_enemy_hp_total"] = fingerprint[3]
+        info_out["stuck_player_hp"] = fingerprint[4]
+        info_out["stuck_steps"] = int(self._stuck_steps)
+        return True, info_out
 
     def _player_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
         before_player = before_obs.get("player") if isinstance(before_obs, dict) else {}
@@ -882,6 +1011,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         return info
 
     def _make_invalid_action_response(self, attempted_action: Any):
+        self._inject_action_history_into_obs()
         obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions, self._planner_context())
         bridge_info = {
             "action_error": INVALID_ACTION_REASON,
@@ -933,6 +1063,7 @@ class SlayTheSpire2EnvV2(gym.Env):
 
     def _make_step_recovery_response(self, exc: Exception):
         self._episode_id = None
+        self._inject_action_history_into_obs()
         obs = self.obs_encoder.encode(self._last_obs_raw or {}, [], self._planner_context())
         bridge_info = {
             "action_error": STEP_RECOVERY_TRUNCATION_REASON,

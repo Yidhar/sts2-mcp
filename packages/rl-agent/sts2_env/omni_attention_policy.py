@@ -41,6 +41,13 @@ from .observation_v3 import (
 
 # Phase 6.3: shared constants for power-bucket bias plumbing.
 _POWER_SLOT_ROLE_ID = TOKEN_ROLE_TO_ID.get("POWER_SLOT", 0)
+# Phase 8 Tier 1: shared constants for history-card-bucket bias plumbing.
+# ENTITY_HASH_BUCKETS matches the hash space used by _stable_card_bucket
+# inside action_history.py, so HISTORY tokens' entity_ids land in the
+# same bucket namespace as hand/deck/discard card entity_ids.
+from .observation_v3 import ENTITY_HASH_BUCKETS
+
+_HISTORY_ROLE_ID = TOKEN_ROLE_TO_ID.get("HISTORY", 0)
 _RELATION_BIAS_KW = {
     "num_token_types": NUM_TOKEN_TYPES,
     "max_owner_id": MAX_OWNER_ID,
@@ -49,6 +56,8 @@ _RELATION_BIAS_KW = {
     "max_order_id": MAX_ORDER_ID,
     "power_bucket_count": POWER_ID_BUCKETS,
     "power_slot_role_id": _POWER_SLOT_ROLE_ID,
+    "history_card_bucket_count": ENTITY_HASH_BUCKETS,
+    "history_role_id": _HISTORY_ROLE_ID,
 }
 
 DEFAULT_POLICY_CLASS_PATH = "sts2_env.omni_attention_policy.STS2OmniAttentionPolicy"
@@ -62,7 +71,7 @@ CANDIDATE_AUX_HEAD_NAMES = ("candidate_objective", "candidate_transition", "cand
 # bank lets the top-k router explicitly opt-in to buff/debuff context per
 # candidate (attack candidates → enemy+powers; defense candidates →
 # enemy_intent+powers+support; map candidates → route, skip powers).
-WORLD_BANK_NAMES = ("runtime", "support", "enemy", "build", "route", "powers")
+WORLD_BANK_NAMES = ("runtime", "support", "enemy", "build", "route", "powers", "history")
 
 _WORLD_BANK_ROLE_NAMES = {
     "runtime": (
@@ -89,6 +98,13 @@ _WORLD_BANK_ROLE_NAMES = {
     # Keeps enemy bank from having to carry both core/intent + every buff
     # stacked on every enemy at tight token budget.
     "powers": ("POWER_SLOT", "CARD_KEYWORD"),
+    # v4 (Phase 8 Tier 1): dedicated bank for HISTORY_STEP_DETAIL and
+    # HISTORY_TURN_SUMMARY tokens. Lets the top-k router opt in to
+    # "what did I just do" context per candidate — attack candidates
+    # often need runtime+enemy+powers+history (last 2 turns' scaling);
+    # map candidates often need route+history (did I just buy a
+    # strategy-defining card at the last shop).
+    "history": ("HISTORY",),
 }
 _WORLD_BANK_ZONE_NAMES = {
     "runtime": ("WORLD", "PLAYER", "HAND", "DRAW", "DISCARD", "EXHAUST", "PLAY"),
@@ -103,6 +119,10 @@ _WORLD_BANK_ZONE_NAMES = {
     # CARD_KEYWORD are exclusive to the new token types, so a role-only
     # filter catches them precisely.
     "powers": (),
+    # Same role-only filter for history. HISTORY zone is set on
+    # history tokens for documentation/probe ease but we don't want
+    # any other token sweeping in via zone.
+    "history": (),
 }
 WORLD_BANK_ROLE_IDS = {
     bank_name: tuple(

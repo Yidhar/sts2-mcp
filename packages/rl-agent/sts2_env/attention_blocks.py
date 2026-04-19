@@ -39,6 +39,8 @@ class RelationBias(nn.Module):
         max_order_offset: int = 16,
         power_bucket_count: int = 0,
         power_slot_role_id: int = 0,
+        history_card_bucket_count: int = 0,
+        history_role_id: int = 0,
     ):
         super().__init__()
         self.num_token_types = int(num_token_types)
@@ -62,6 +64,21 @@ class RelationBias(nn.Module):
             nn.init.zeros_(self.power_bucket_bias.weight)
         else:
             self.power_bucket_bias = None
+        # Phase 8 Tier 1: per-card learned bias on HISTORY tokens. Mirrors
+        # the power_bucket_bias pattern — when the key is a HISTORY role
+        # token, the entity_id (populated by observation_v3 with the
+        # action's card_id bucket) selects a per-card head bias. This
+        # teaches the policy things like "recently-played Inflame → favor
+        # Strike-family candidates" without requiring any explicit rule.
+        # Zero-init so Phase 6 checkpoints load without drift; the bias
+        # only contributes once training adapts it.
+        self.history_card_bucket_count = int(history_card_bucket_count)
+        self.history_role_id = int(history_role_id)
+        if self.history_card_bucket_count > 0:
+            self.history_card_bias = nn.Embedding(self.history_card_bucket_count, self.n_heads)
+            nn.init.zeros_(self.history_card_bias.weight)
+        else:
+            self.history_card_bias = None
         self.type_pair_bias = nn.Embedding(self.num_token_types * self.num_token_types, self.n_heads)
         self.owner_pair_bias = nn.Embedding((self.max_owner_id + 1) * (self.max_owner_id + 1), self.n_heads)
         self.role_pair_bias = nn.Embedding((self.max_role_id + 1) * (self.max_role_id + 1), self.n_heads)
@@ -171,6 +188,28 @@ class RelationBias(nn.Module):
                 bucket_bias = bucket_bias.permute(0, 2, 1).unsqueeze(2)  # (B, n_heads, 1, K)
                 power_key_mask = power_key_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, K)
                 bias = bias + bucket_bias * power_key_mask
+
+            # Phase 8 Tier 1: per-history-card bucket bias on key side.
+            # Same mechanic as power_bucket_bias but keyed off the HISTORY
+            # role. key_entity_ids on HISTORY tokens = card_id_bucket
+            # (populated by observation_v3._append_history_tokens using the
+            # same hash family the main entity embedding uses — so the
+            # bucket space aligns with hand/deck/discard card references
+            # without a separate vocab).
+            if (
+                self.history_card_bias is not None
+                and self.history_role_id > 0
+                and key_entity_ids is not None
+            ):
+                key_entity_ids_t = torch.as_tensor(key_entity_ids, dtype=torch.long, device=bias.device)
+                if key_entity_ids_t.ndim == 1:
+                    key_entity_ids_t = key_entity_ids_t.unsqueeze(0)
+                hist_bucket_ids = key_entity_ids_t.clamp(min=0, max=self.history_card_bucket_count - 1)
+                hist_bias_vals = self.history_card_bias(hist_bucket_ids)  # (B, K, n_heads)
+                hist_key_mask = (key_role_ids == self.history_role_id).float()  # (B, K)
+                hist_bias_vals = hist_bias_vals.permute(0, 2, 1).unsqueeze(2)  # (B, n_heads, 1, K)
+                hist_key_mask = hist_key_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, K)
+                bias = bias + hist_bias_vals * hist_key_mask
 
         same_zone = None
         if query_zone_ids is not None and key_zone_ids is not None:

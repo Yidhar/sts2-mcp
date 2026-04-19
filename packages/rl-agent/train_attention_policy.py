@@ -171,6 +171,7 @@ def build_env_factory(
     perf_stats_log_path: str | None = None,
     perf_stats_interval_steps: int = 0,
     encode_pool: "Any | None" = None,
+    stuck_watchdog_steps: int = 400,
 ) -> Callable[[], object]:
     def _factory():
         local_encoder = WorldTokenObservationEncoder(use_text=use_text, text_device=text_device)
@@ -207,6 +208,7 @@ def build_env_factory(
                 step_timeout_ms=step_timeout_ms,
                 obs_encoder=obs_encoder,
                 bridge=sim_bridge,
+                stuck_watchdog_steps=stuck_watchdog_steps,
             )
         if use_sim and perf_stats_log_path and perf_stats_interval_steps > 0:
             env = PerfStatsPeriodicLogger(
@@ -673,6 +675,18 @@ def main() -> None:
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=("bf16", "bfloat16"))
     parser.add_argument("--reset-timeout-ms", type=int, default=60000)
     parser.add_argument("--step-timeout-ms", type=int, default=20000)
+    parser.add_argument(
+        "--stuck-watchdog-steps",
+        type=int,
+        default=400,
+        help=(
+            "Truncate full-run episode when the (phase, floor, combat_round, "
+            "enemy_hp_total, player_hp) fingerprint stays constant for this "
+            "many consecutive steps. 0 disables. Default 400 catches the "
+            "sim-training pathology where 23%% of episodes ran 1000-6000 "
+            "steps on the same floor without progressing."
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--ffn-dim", type=int, default=1024)
@@ -738,6 +752,7 @@ def main() -> None:
             perf_stats_log_path=str(Path(args.log_dir) / "perf_stats.jsonl"),
             perf_stats_interval_steps=int(getattr(args, "perf_stats_interval_steps", 0) or 0),
             encode_pool=encode_pool,
+            stuck_watchdog_steps=int(getattr(args, "stuck_watchdog_steps", 400) or 0),
         )
         for index in range(args.n_envs)
     ]

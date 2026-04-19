@@ -50,6 +50,13 @@ _SIM_KIND_TO_BRIDGE_KIND: dict[str, str] = {
     "confirm_selection": "card_selection",
     "cancel_selection": "card_selection",
     "choose_card_select_option": "card_selection",
+    # Combat-scope card selection (Scry / Discovery / keyword-scaled card pick
+    # mid-combat). Sim emits these from BuildCombatLegalActions when
+    # HandSelection or CardSelection is active inside a battle. Previously
+    # unmapped → they fell through to "unknown" kind and the policy/encoder
+    # couldn't recognize them.
+    "combat_select_card": "card_selection",
+    "combat_confirm_selection": "card_selection",
     "skip_rewards": "proceed",
     "claim_reward": "reward",
     "claim_relic": "treasure_relic",
@@ -1433,13 +1440,29 @@ def _translate_legal_actions(
                 entry["card"] = _translate_card(card_reward_by_index[cidx], pile="Reward")
                 entry["selection"] = "pick"
                 entry["index"] = cidx
-        elif kind in {"select_card", "select_hand_card"}:
+        elif kind in {"select_card", "select_hand_card", "combat_select_card"}:
+            # Combat variants carry ``card_index`` on the action (mapped
+            # from sim's hand index), while the non-combat variants use
+            # ``index``. Take whichever is present.
             cidx = action.get("index")
+            if cidx is None:
+                cidx = action.get("card_index")
             if isinstance(cidx, int) and cidx in card_select_by_index:
                 entry["card"] = _translate_card(card_select_by_index[cidx], pile="Select")
                 entry["selection"] = "pick"
                 entry["index"] = cidx
                 entry["selection_semantics"] = str(action.get("selection_semantics") or "")
+            elif isinstance(cidx, int):
+                # Combat hand-selection — the card isn't in card_select_by_index
+                # (that dict is seeded from the non-combat ``card_select`` block);
+                # fall back to the hand slot so the token encoder still sees
+                # something meaningful.
+                hand_card = hand_by_index.get(cidx)
+                if isinstance(hand_card, dict):
+                    entry["card"] = _translate_card(hand_card, pile="Hand")
+                    entry["selection"] = "pick"
+                    entry["index"] = cidx
+                    entry["selection_semantics"] = str(action.get("selection_semantics") or "")
         elif kind == "claim_treasure":
             ridx = action.get("index")
             if isinstance(ridx, int) and ridx in treasure_relics_by_index:
@@ -1454,7 +1477,100 @@ def _translate_legal_actions(
         entry["canonical_text"] = _build_action_canonical_text(entry, kind)
 
         out.append(entry)
+
+    # ------------------------------------------------------------------
+    # Card-selection shaping:
+    #   (a) filter out select_card/combat_select_card entries whose card
+    #       has already been selected — without this, a policy whose
+    #       argmax has collapsed onto idx=0 will keep re-picking the same
+    #       card (sim treats re-select-of-selected-card as no-op), never
+    #       accumulating enough picks to reach CanConfirm=true. This was
+    #       responsible for ~42% of training episodes getting stuck in
+    #       card_selection (see reset_events.jsonl stuck_phase stats).
+    #   (b) hoist the confirm action to index 0 when it's emitted. The
+    #       policy's action prior is strongly biased toward low indices
+    #       early in training; putting confirm at idx=0 means "when
+    #       confirm is available, default to confirming" rather than
+    #       "keep poking the selection list".
+    # Both transforms are safe no-ops when no card_selection actions
+    # are present — the loop below early-exits.
+    # ------------------------------------------------------------------
+    selected_indices = _collect_selected_card_indices(
+        card_select=card_select,
+        combat_card_selection=battle.get("card_selection") if battle else None,
+    )
+    out = _shape_card_selection_actions(out, selected_indices)
     return out
+
+
+_SELECT_CARD_SIM_ACTIONS = frozenset({"select_card", "select_hand_card", "combat_select_card"})
+_CONFIRM_SIM_ACTIONS = frozenset({"confirm_selection", "combat_confirm_selection"})
+
+
+def _collect_selected_card_indices(
+    *,
+    card_select: dict[str, Any],
+    combat_card_selection: Any,
+) -> set[int]:
+    """Gather ChoiceIndex values for cards already placed in the pending
+    selection. Covers both the non-combat ``card_select`` block and the
+    combat-scope ``battle.card_selection`` block (sim exposes both under
+    different parents depending on the state_type).
+    """
+    selected: set[int] = set()
+    for source in (card_select, combat_card_selection if isinstance(combat_card_selection, dict) else None):
+        if not isinstance(source, dict):
+            continue
+        for card in source.get("selected_cards") or []:
+            if not isinstance(card, dict):
+                continue
+            idx = card.get("index")
+            if idx is None:
+                idx = card.get("choice_index")
+            if idx is None:
+                idx = card.get("card_index")
+            if isinstance(idx, int):
+                selected.add(idx)
+    return selected
+
+
+def _shape_card_selection_actions(
+    entries: list[dict[str, Any]],
+    selected_indices: set[int],
+) -> list[dict[str, Any]]:
+    """Drop duplicate-select entries and move confirm to slot 0.
+
+    Rewrites ``idx`` / ``action_index`` on surviving entries so they are
+    contiguous — downstream code (observation_common MAX_ACTIONS masking
+    and env_v2 normalize_action) indexes entries positionally, so gaps
+    would break action dispatch.
+    """
+    filtered: list[dict[str, Any]] = []
+    confirm_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        raw = entry.get("_sim_raw") if isinstance(entry.get("_sim_raw"), dict) else {}
+        sim_action = str(raw.get("action") or "")
+        if sim_action in _SELECT_CARD_SIM_ACTIONS:
+            card_idx = raw.get("index")
+            if card_idx is None:
+                card_idx = raw.get("card_index")
+            if isinstance(card_idx, int) and card_idx in selected_indices:
+                # Already selected — drop it so the policy cannot sit on
+                # a no-op loop.
+                continue
+            filtered.append(entry)
+        elif sim_action in _CONFIRM_SIM_ACTIONS:
+            confirm_entries.append(entry)
+        else:
+            filtered.append(entry)
+    if confirm_entries:
+        reordered = confirm_entries + filtered
+    else:
+        reordered = filtered
+    for new_slot, entry in enumerate(reordered):
+        entry["idx"] = new_slot
+        entry["action_index"] = new_slot
+    return reordered
 
 
 def _build_action_canonical_text(entry: dict[str, Any], sim_kind: str) -> str:
