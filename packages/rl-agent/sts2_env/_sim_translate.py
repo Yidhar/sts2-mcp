@@ -1495,11 +1495,11 @@ def _translate_legal_actions(
     # Both transforms are safe no-ops when no card_selection actions
     # are present — the loop below early-exits.
     # ------------------------------------------------------------------
-    selected_indices = _collect_selected_card_indices(
+    selected_indices, max_select = _collect_selection_state(
         card_select=card_select,
         combat_card_selection=battle.get("card_selection") if battle else None,
     )
-    out = _shape_card_selection_actions(out, selected_indices)
+    out = _shape_card_selection_actions(out, selected_indices, max_select)
     return out
 
 
@@ -1507,17 +1507,22 @@ _SELECT_CARD_SIM_ACTIONS = frozenset({"select_card", "select_hand_card", "combat
 _CONFIRM_SIM_ACTIONS = frozenset({"confirm_selection", "combat_confirm_selection"})
 
 
-def _collect_selected_card_indices(
+def _collect_selection_state(
     *,
     card_select: dict[str, Any],
     combat_card_selection: Any,
-) -> set[int]:
-    """Gather ChoiceIndex values for cards already placed in the pending
-    selection. Covers both the non-combat ``card_select`` block and the
-    combat-scope ``battle.card_selection`` block (sim exposes both under
-    different parents depending on the state_type).
+) -> tuple[set[int], int]:
+    """Gather (``selected_indices``, ``max_select``) from whichever sim
+    state block is populated for the active selection screen.
+
+    ``selected_indices`` = ChoiceIndex values of cards already committed
+    to the pending selection. ``max_select`` = the hard cap the sim
+    enforces (typically 1 for TO_UPGRADE, 2 for TO_REMOVE). We return 0
+    when no selection state is present so callers know the cap is
+    unknown and should leave the full select_card list intact.
     """
     selected: set[int] = set()
+    max_select = 0
     for source in (card_select, combat_card_selection if isinstance(combat_card_selection, dict) else None):
         if not isinstance(source, dict):
             continue
@@ -1531,32 +1536,61 @@ def _collect_selected_card_indices(
                 idx = card.get("card_index")
             if isinstance(idx, int):
                 selected.add(idx)
-    return selected
+        ms = source.get("max_select")
+        if isinstance(ms, int) and ms > max_select:
+            max_select = ms
+    return selected, max_select
 
 
 def _shape_card_selection_actions(
     entries: list[dict[str, Any]],
     selected_indices: set[int],
+    max_select: int,
 ) -> list[dict[str, Any]]:
-    """Drop duplicate-select entries and move confirm to slot 0.
+    """Drop no-op select entries and hoist confirm to slot 0.
+
+    Three defensive passes against policy-collapse loops in
+    card_selection screens:
+
+    1. Drop select_card entries whose target card is already in
+       ``selected_indices`` (sim treats duplicate-select-of-selected as
+       a no-op → policy argmax-collapsed onto such an idx loops forever).
+    2. **When ``len(selected_indices) >= max_select > 0``: drop ALL
+       select_card entries regardless of target.** At cap, the only
+       semantically-valid next action is ``confirm_selection`` (or
+       ``cancel_selection`` if the screen allows it). Without this pass,
+       a biased argmax that scores some select_card above confirm can
+       endlessly swap the currently-selected card (sim accepts swaps
+       when at cap), fingerprint-identical but making no progress — this
+       was the source of 21/21 NEOW TO_UPGRADE watchdog false-stucks
+       observed at smoke time.
+    3. Hoist confirm/combat_confirm_selection to slot 0 so argmax-biased
+       policies naturally pick it when available.
 
     Rewrites ``idx`` / ``action_index`` on surviving entries so they are
     contiguous — downstream code (observation_common MAX_ACTIONS masking
     and env_v2 normalize_action) indexes entries positionally, so gaps
     would break action dispatch.
     """
+    at_cap = max_select > 0 and len(selected_indices) >= max_select
     filtered: list[dict[str, Any]] = []
     confirm_entries: list[dict[str, Any]] = []
     for entry in entries:
         raw = entry.get("_sim_raw") if isinstance(entry.get("_sim_raw"), dict) else {}
         sim_action = str(raw.get("action") or "")
         if sim_action in _SELECT_CARD_SIM_ACTIONS:
+            if at_cap:
+                # Selection is full — no select_card action is a valid
+                # forward move. The only way out is confirm (or cancel,
+                # which is preserved via the else branch since cancel
+                # isn't in _SELECT_CARD_SIM_ACTIONS).
+                continue
             card_idx = raw.get("index")
             if card_idx is None:
                 card_idx = raw.get("card_index")
             if isinstance(card_idx, int) and card_idx in selected_indices:
-                # Already selected — drop it so the policy cannot sit on
-                # a no-op loop.
+                # Already selected — dropping prevents the idempotent
+                # "pick already-selected" loop even below cap.
                 continue
             filtered.append(entry)
         elif sim_action in _CONFIRM_SIM_ACTIONS:

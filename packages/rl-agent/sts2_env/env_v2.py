@@ -485,10 +485,18 @@ class SlayTheSpire2EnvV2(gym.Env):
 
         Two consecutive steps sharing the same fingerprint means the agent
         chose an action that left the visible game state identical — no
-        floor change, no combat round tick, no damage dealt, no hp loss.
-        A handful of these can happen legitimately (0-cost card draws,
-        null-effect selections). Hundreds in a row means the policy is
-        stuck in a no-op loop and should be truncated.
+        floor change, no combat round tick, no damage dealt, no hp loss,
+        no card selection progress. A handful of these can happen
+        legitimately (0-cost card draws, null-effect selections). Hundreds
+        in a row means the policy is stuck in a no-op loop and should be
+        truncated.
+
+        Phase 8.1: extended with (selected_count, card_selection_prompt,
+        can_confirm) so multi-step NEOW / card_reward / campfire selection
+        flows don't get falsely flagged. These screens keep the basic 5-
+        tuple constant for dozens of legit choice steps (no combat, no hp
+        change, no floor change) — previously caused 21/21 floor-1 stuck
+        cases in the Phase 8 smoke to all land on exactly stuck_steps=400.
         """
         obs = self._last_obs_raw or {}
         run = obs.get("run") if isinstance(obs, dict) else None
@@ -526,7 +534,24 @@ class SlayTheSpire2EnvV2(gym.Env):
             except (TypeError, ValueError):
                 player_hp = 0
         phase = str(obs.get("phase") or "")
-        return (phase, floor, combat_round, enemy_hp_total, player_hp)
+        # Phase 8.1 additions: selection-aware fields.
+        selected_count = 0
+        selection_prompt = ""
+        can_confirm = False
+        decision = obs.get("decision") if isinstance(obs, dict) else None
+        if isinstance(decision, dict):
+            try:
+                selected_count = int(decision.get("selected_count") or 0)
+            except (TypeError, ValueError):
+                selected_count = 0
+        card_selection = obs.get("card_selection") if isinstance(obs, dict) else None
+        if isinstance(card_selection, dict):
+            selection_prompt = str(card_selection.get("prompt") or "")
+            can_confirm = bool(card_selection.get("can_confirm"))
+        return (
+            phase, floor, combat_round, enemy_hp_total, player_hp,
+            selected_count, selection_prompt, bool(can_confirm),
+        )
 
     def _check_stuck_watchdog(self, bridge_info: Any) -> tuple[bool, Any]:
         """Increment stuck counter; truncate if fingerprint stable too long.
