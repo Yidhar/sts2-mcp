@@ -21,6 +21,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from .aux_targets import (
     ENEMY_STATE_SLOT_COUNT,
     NUM_BUILD_HEADS,
+    NUM_CAUSALITY_HEADS,
     NUM_ENEMY_STATE_FIELDS,
     NUM_OBJECTIVE_HEADS,
     NUM_ROUTE_HEADS,
@@ -68,6 +69,9 @@ class AuxMaskableDictRolloutBufferSamples(NamedTuple):
     aux_route_mask: th.Tensor
     aux_enemy_state_targets: th.Tensor
     aux_enemy_state_mask: th.Tensor
+    # Phase 8 Tier 2:
+    aux_causality_targets: th.Tensor
+    aux_causality_mask: th.Tensor
 
 
 class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
@@ -87,6 +91,9 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
     aux_route_mask: np.ndarray
     aux_enemy_state_targets: np.ndarray
     aux_enemy_state_mask: np.ndarray
+    # Phase 8 Tier 2
+    aux_causality_targets: np.ndarray
+    aux_causality_mask: np.ndarray
 
     def reset(self) -> None:
         super().reset()
@@ -108,6 +115,14 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
         )
         self.aux_enemy_state_mask = np.zeros(
             (self.buffer_size, self.n_envs, ENEMY_STATE_SLOT_COUNT), dtype=np.float32
+        )
+        # Phase 8 Tier 2 causality (single 8-d target per env-step;
+        # loss dispatches it to the chosen-candidate row at training time).
+        self.aux_causality_targets = np.zeros(
+            (self.buffer_size, self.n_envs, NUM_CAUSALITY_HEADS), dtype=np.float32
+        )
+        self.aux_causality_mask = np.zeros(
+            (self.buffer_size, self.n_envs), dtype=np.float32
         )
 
     def add(self, *args, action_masks: Optional[np.ndarray] = None, aux_targets: Optional[dict[str, np.ndarray]] = None, **kwargs) -> None:
@@ -134,6 +149,12 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
         )
         self.aux_enemy_state_mask[pos] = self._coerce_enemy_state_mask(
             aux_targets.get("enemy_state_mask"), self.n_envs
+        )
+        self.aux_causality_targets[pos] = self._coerce_target_matrix(
+            aux_targets.get("causality"), self.n_envs, NUM_CAUSALITY_HEADS
+        )
+        self.aux_causality_mask[pos] = self._coerce_mask_vector(
+            aux_targets.get("causality_mask"), self.n_envs
         )
 
     @staticmethod
@@ -210,6 +231,8 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
                 "aux_route_mask",
                 "aux_enemy_state_targets",
                 "aux_enemy_state_mask",
+                "aux_causality_targets",
+                "aux_causality_mask",
             ]
             for tensor in tensor_names:
                 self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
@@ -246,6 +269,8 @@ class AuxMaskableDictRolloutBuffer(MaskableDictRolloutBuffer):
             aux_route_mask=self.to_torch(self.aux_route_mask[batch_inds].flatten()),
             aux_enemy_state_targets=self.to_torch(self.aux_enemy_state_targets[batch_inds]),
             aux_enemy_state_mask=self.to_torch(self.aux_enemy_state_mask[batch_inds]),
+            aux_causality_targets=self.to_torch(self.aux_causality_targets[batch_inds]),
+            aux_causality_mask=self.to_torch(self.aux_causality_mask[batch_inds].flatten()),
         )
 
 
@@ -309,6 +334,14 @@ class AsyncAuxMaskableDictRolloutBuffer:
         self.aux_enemy_state_mask = np.zeros(
             (self.buffer_size, ENEMY_STATE_SLOT_COUNT), dtype=np.float32
         )
+        # Phase 8 Tier 2 (async buffer). Single-env variant — still
+        # n_envs = env_count collapsed into buffer_size via per-env add().
+        self.aux_causality_targets = np.zeros(
+            (self.buffer_size, NUM_CAUSALITY_HEADS), dtype=np.float32
+        )
+        self.aux_causality_mask = np.zeros(
+            (self.buffer_size,), dtype=np.float32
+        )
         self._prepared_filled = -1
         self._prepared_observations: dict[str, th.Tensor] = {}
         self._prepared_tensors: dict[str, th.Tensor] = {}
@@ -357,6 +390,9 @@ class AsyncAuxMaskableDictRolloutBuffer:
             self.aux_route_mask[index] = AuxMaskableDictRolloutBuffer._coerce_mask_vector(aux_targets.get("route_mask"), 1)[0]
             self.aux_enemy_state_targets[index] = AuxMaskableDictRolloutBuffer._coerce_enemy_state_targets(aux_targets.get("enemy_state"), 1)[0]
             self.aux_enemy_state_mask[index] = AuxMaskableDictRolloutBuffer._coerce_enemy_state_mask(aux_targets.get("enemy_state_mask"), 1)[0]
+            # Phase 8 Tier 2 causality (per-step 8-d delta + scalar mask).
+            self.aux_causality_targets[index] = AuxMaskableDictRolloutBuffer._coerce_target_matrix(aux_targets.get("causality"), 1, NUM_CAUSALITY_HEADS)[0]
+            self.aux_causality_mask[index] = AuxMaskableDictRolloutBuffer._coerce_mask_vector(aux_targets.get("causality_mask"), 1)[0]
 
         self.pos += 1
         self.full = self.pos >= self.buffer_size
@@ -417,6 +453,8 @@ class AsyncAuxMaskableDictRolloutBuffer:
                 aux_route_mask=self._prepared_tensors["aux_route_mask"].index_select(0, batch_inds),
                 aux_enemy_state_targets=self._prepared_tensors["aux_enemy_state_targets"].index_select(0, batch_inds),
                 aux_enemy_state_mask=self._prepared_tensors["aux_enemy_state_mask"].index_select(0, batch_inds),
+                aux_causality_targets=self._prepared_tensors["aux_causality_targets"].index_select(0, batch_inds),
+                aux_causality_mask=self._prepared_tensors["aux_causality_mask"].index_select(0, batch_inds),
             )
             start_idx += batch_size
 
@@ -463,6 +501,8 @@ class AsyncAuxMaskableDictRolloutBuffer:
             "aux_route_mask": _slice_to_torch(self.aux_route_mask, flatten=True),
             "aux_enemy_state_targets": _slice_to_torch(self.aux_enemy_state_targets),
             "aux_enemy_state_mask": _slice_to_torch(self.aux_enemy_state_mask),
+            "aux_causality_targets": _slice_to_torch(self.aux_causality_targets),
+            "aux_causality_mask": _slice_to_torch(self.aux_causality_mask, flatten=True),
         }
         self._prepared_filled = filled
 
@@ -485,6 +525,7 @@ class AuxMaskablePPO(MaskablePPO):
         aux_selection_coef: float = 0.10,
         aux_route_coef: float = 0.10,
         aux_enemy_state_coef: float = 0.10,
+        aux_causality_coef: float = 0.10,
         amp: bool = False,
         amp_dtype: str = "bf16",
         **kwargs,
@@ -497,6 +538,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.aux_selection_coef = float(aux_selection_coef)
         self.aux_route_coef = float(aux_route_coef)
         self.aux_enemy_state_coef = float(aux_enemy_state_coef)
+        self.aux_causality_coef = float(aux_causality_coef)
         self._amp_requested = bool(amp)
         self._amp_dtype_name, self._amp_dtype = _resolve_amp_dtype(amp_dtype)
         self._amp_enabled = False
@@ -840,6 +882,7 @@ class AuxMaskablePPO(MaskablePPO):
         objective_losses, transition_losses, trait_losses = [], [], []
         build_losses, selection_losses, route_losses = [], [], []
         enemy_state_losses: list[float] = []
+        causality_losses: list[float] = []
 
         if hasattr(self.rollout_buffer, "prepare_for_training"):
             prepare_started = time.perf_counter()
@@ -930,6 +973,7 @@ class AuxMaskablePPO(MaskablePPO):
                 selection_losses.append(aux_metrics["selection"])
                 route_losses.append(aux_metrics["route"])
                 enemy_state_losses.append(aux_metrics["enemy_state"])
+                causality_losses.append(aux_metrics["causality"])
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + aux_total_loss
 
@@ -970,6 +1014,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.logger.record("train/aux_selection_loss", np.mean(selection_losses) if selection_losses else 0.0)
         self.logger.record("train/aux_route_loss", np.mean(route_losses) if route_losses else 0.0)
         self.logger.record("train/aux_enemy_state_loss", np.mean(enemy_state_losses) if enemy_state_losses else 0.0)
+        self.logger.record("train/aux_causality_loss", np.mean(causality_losses) if causality_losses else 0.0)
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
@@ -983,6 +1028,7 @@ class AuxMaskablePPO(MaskablePPO):
         self.logger.record("train/aux_selection_coef", self.aux_selection_coef)
         self.logger.record("train/aux_route_coef", self.aux_route_coef)
         self.logger.record("train/aux_enemy_state_coef", self.aux_enemy_state_coef)
+        self.logger.record("train/aux_causality_coef", self.aux_causality_coef)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
         self._last_train_timing = {
@@ -1053,6 +1099,8 @@ class AuxMaskablePPO(MaskablePPO):
             (n_envs, ENEMY_STATE_SLOT_COUNT, NUM_ENEMY_STATE_FIELDS), dtype=np.float32
         )
         enemy_state_mask = np.zeros((n_envs, ENEMY_STATE_SLOT_COUNT), dtype=np.float32)
+        causality = np.zeros((n_envs, NUM_CAUSALITY_HEADS), dtype=np.float32)
+        causality_mask = np.zeros((n_envs,), dtype=np.float32)
 
         for index, info in enumerate(infos):
             aux = info.get("aux_targets") if isinstance(info, dict) else None
@@ -1072,6 +1120,8 @@ class AuxMaskablePPO(MaskablePPO):
             route_mask[index] = self._extract_scalar(aux, "route_mask", 1.0)
             enemy_state[index] = self._extract_enemy_state_target(aux)
             enemy_state_mask[index] = self._extract_enemy_state_mask(aux)
+            causality[index] = self._extract_target(aux, "causality", NUM_CAUSALITY_HEADS)
+            causality_mask[index] = self._extract_scalar(aux, "causality_mask", 1.0)
 
         return {
             "objective": objective,
@@ -1088,6 +1138,8 @@ class AuxMaskablePPO(MaskablePPO):
             "route_mask": route_mask,
             "enemy_state": enemy_state,
             "enemy_state_mask": enemy_state_mask,
+            "causality": causality,
+            "causality_mask": causality_mask,
         }
 
     @staticmethod
@@ -1138,7 +1190,11 @@ class AuxMaskablePPO(MaskablePPO):
         aux_outputs: dict[str, th.Tensor] | None = None,
     ) -> tuple[th.Tensor, dict[str, float]]:
         aux_total = th.zeros((), device=self.device)
-        metrics = {"objective": 0.0, "transition": 0.0, "traits": 0.0, "build": 0.0, "selection": 0.0, "route": 0.0, "enemy_state": 0.0}
+        metrics = {
+            "objective": 0.0, "transition": 0.0, "traits": 0.0,
+            "build": 0.0, "selection": 0.0, "route": 0.0,
+            "enemy_state": 0.0, "causality": 0.0,
+        }
         aux_outputs = aux_outputs or self.policy.forward_aux_heads(rollout_data.observations)
 
         if self.aux_objective_coef > 0.0:
@@ -1186,6 +1242,25 @@ class AuxMaskablePPO(MaskablePPO):
             )
             aux_total = aux_total + self.aux_enemy_state_coef * enemy_state_loss
             metrics["enemy_state"] = float(enemy_state_loss.detach().cpu().item())
+
+        # Phase 8 Tier 2: action_causality. candidate_causality is
+        # (B, n_actions, NUM_CAUSALITY_HEADS); gather the chosen-action
+        # row per batch element via _select_aux_prediction, then compare
+        # against the per-step 8-d delta. Mask is scalar per env-step
+        # (skipped for e.g. terminal truncation/recovery paths).
+        if self.aux_causality_coef > 0.0 and "candidate_causality" in aux_outputs:
+            causality_pred = self._select_aux_prediction(
+                aux_outputs, actions,
+                candidate_key="candidate_causality",
+                global_key="candidate_causality",
+            )
+            causality_loss = self._masked_regression_loss(
+                causality_pred,
+                rollout_data.aux_causality_targets,
+                rollout_data.aux_causality_mask,
+            )
+            aux_total = aux_total + self.aux_causality_coef * causality_loss
+            metrics["causality"] = float(causality_loss.detach().cpu().item())
 
         return aux_total, metrics
 

@@ -283,6 +283,7 @@ def build_checkpoint_metadata(
         "aux_selection_coef": float(args.aux_selection_coef),
         "aux_route_coef": float(args.aux_route_coef),
         "aux_enemy_state_coef": float(args.aux_enemy_state_coef),
+        "aux_causality_coef": float(args.aux_causality_coef),
         "snapshot_pool_root": args.snapshot_pool,
         "snapshot_curated_subset": getattr(args, "snapshot_curated_subset", None),
         "snapshot_sample_mode": getattr(args, "snapshot_sample_mode", None),
@@ -664,6 +665,18 @@ def main() -> None:
     parser.add_argument("--aux-selection-coef", type=float, default=0.10)
     parser.add_argument("--aux-route-coef", type=float, default=0.10)
     parser.add_argument("--aux-enemy-state-coef", type=float, default=0.10)
+    parser.add_argument(
+        "--aux-causality-coef",
+        type=float,
+        default=0.10,
+        help=(
+            "Weight for the Phase 8 Tier 2 action_causality aux head. Per-step "
+            "8-d target (damage/block/hp_loss/draw/energy/strength/dex/vuln "
+            "delta) self-supervised from the actual transition, masked to the "
+            "chosen-candidate row. Teaches the model 'what would this card "
+            "do' conditioned on history context. Set 0 to disable."
+        ),
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--text-device", type=str, default="auto")
     parser.add_argument(
@@ -785,6 +798,7 @@ def main() -> None:
         aux_selection_coef=args.aux_selection_coef,
         aux_route_coef=args.aux_route_coef,
         aux_enemy_state_coef=args.aux_enemy_state_coef,
+        aux_causality_coef=args.aux_causality_coef,
         amp=args.amp,
         amp_dtype=args.amp_dtype,
         policy_kwargs=policy_kwargs,

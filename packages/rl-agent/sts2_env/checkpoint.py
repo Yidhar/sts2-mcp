@@ -339,6 +339,8 @@ def load_online_checkpoint(
             aux_build_coef=float(metadata.get("aux_build_coef", 0.10)),
             aux_selection_coef=float(metadata.get("aux_selection_coef", 0.10)),
             aux_route_coef=float(metadata.get("aux_route_coef", 0.10)),
+            aux_enemy_state_coef=float(metadata.get("aux_enemy_state_coef", 0.10)),
+            aux_causality_coef=float(metadata.get("aux_causality_coef", 0.10)),
         )
 
     model = algorithm_class(

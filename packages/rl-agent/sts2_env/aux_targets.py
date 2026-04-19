@@ -80,6 +80,18 @@ ENEMY_STATE_FIELD_NAMES = (
 NUM_ENEMY_STATE_FIELDS = len(ENEMY_STATE_FIELD_NAMES)
 ENEMY_STATE_SLOT_COUNT = obs_common.MAX_ENEMIES
 
+# Phase 8 Tier 2: per-step causality target. 8-d delta describing what
+# the chosen action ACTUALLY did (damage/block/hp_loss/draw/energy/
+# strength/dex/vuln). Self-supervised from the (prev_obs, next_obs)
+# pair — no labeling needed. The aux head learns to predict this
+# delta from the candidate token, conditioned on history/powers/enemy
+# context.
+from .action_history import (
+    CAUSALITY_HEAD_NAMES,
+    NUM_CAUSALITY_HEADS,
+    _build_causality_delta,
+)
+
 
 SELECTION_HEAD_NAMES = (
     "source_hand",
@@ -957,6 +969,20 @@ def build_aux_targets(
     selection_targets = compute_selection_targets(prev_obs, action, planner_context=prev_planner_context)
     route_targets = compute_route_targets(prev_obs, action, planner_context=prev_planner_context)
     enemy_state_targets, enemy_state_mask = compute_enemy_state_targets(prev_obs, next_obs)
+    # Phase 8 Tier 2 causality target. Single 8-d delta per step (the
+    # actually-observed post-pre diff). The AuxMaskablePPO buffer
+    # expands this into a (n_actions, 8) tensor with the vector placed
+    # at the chosen-candidate row (action index) and a scalar mask=1;
+    # all other rows zero and masked out.
+    causality_delta = np.asarray(_build_causality_delta(prev_obs, next_obs), dtype=np.float32)
+    # Mask the causality target in the same cases where no combat
+    # advancement can happen (truncation with rebind, recovery step).
+    # We still credit non-combat actions because their effect on the
+    # state (e.g. rest-site heal → player_hp_post > pre → damage=0,
+    # but self_hp_loss=0 and hp gain signals block the 3rd field) is
+    # informative — the head can learn that map choice usually has
+    # damage=block=hp_loss=0 and small draw/energy changes.
+    causality_mask = 0.0 if (terminated and truncated) else 1.0
     return {
         "objective": objective,
         "objective_mask": 1.0,
@@ -972,6 +998,8 @@ def build_aux_targets(
         "route_mask": route_mask,
         "enemy_state": enemy_state_targets,
         "enemy_state_mask": enemy_state_mask,
+        "causality": causality_delta,
+        "causality_mask": float(causality_mask),
         "objective_names": OBJECTIVE_HEAD_NAMES,
         "transition_names": TRANSITION_HEAD_NAMES,
         "trait_names": TRAIT_HEAD_NAMES,
@@ -979,7 +1007,8 @@ def build_aux_targets(
         "selection_names": SELECTION_HEAD_NAMES,
         "route_names": ROUTE_HEAD_NAMES,
         "enemy_state_field_names": ENEMY_STATE_FIELD_NAMES,
-        "version": 3,
+        "causality_names": CAUSALITY_HEAD_NAMES,
+        "version": 4,
     }
 
 
@@ -996,6 +1025,8 @@ __all__ = [
     "NUM_SELECTION_HEADS",
     "ROUTE_HEAD_NAMES",
     "NUM_ROUTE_HEADS",
+    "CAUSALITY_HEAD_NAMES",
+    "NUM_CAUSALITY_HEADS",
     "build_aux_targets",
     "compute_build_targets",
     "compute_selection_targets",

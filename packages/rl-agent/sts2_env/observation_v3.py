@@ -2769,54 +2769,59 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         """Pack a single step-detail numeric block.
 
         Layout (TOKEN_NUMERIC_DIM = 96):
-          [0]      is_empty              (1 = padding, tracker had no entry for this slot)
-          [1]      is_step_detail        (always 1 here; turn-summary sets [1]=0)
-          [2..]    family one-hot        (len = NUM_FAMILIES)
-          [next]   semantic_role flags   (NUM_SEMANTIC_ROLES bits)
-          [next]   target_scope one-hot  (len = NUM_TARGET_SCOPES)
-          [next]   step_offset one-hot   (MAX_STEP_DETAIL_TOKENS slots)
-          [next]   same_turn / same_encounter / same_floor / phase_changed /
-                   combat_ended / rejected / reward_nonzero (7 flags)
-          [next]   scalar deltas (7 slots):
-                     reward, abs(reward), enemy_hp_delta, hp_delta_player,
-                     block_delta, energy_delta, step_offset_norm
-          remainder zero (spare — keeps room for Tier 2 pre/post state vecs)
+          [0]       is_empty             (1 = padding, tracker had no entry)
+          [1]       is_step_detail       (always 1 here; turn-summary sets [1]=0)
+          [2..]     family one-hot       (len = NUM_FAMILIES)
+          [next]    semantic_role flags  (NUM_SEMANTIC_ROLES bits)
+          [next]    target_scope one-hot (len = NUM_TARGET_SCOPES)
+          [next]    step_offset one-hot  (MAX_STEP_DETAIL_TOKENS slots)
+          [next]    flags (7):            same_turn / same_encounter /
+                    same_floor / phase_changed / combat_ended / rejected /
+                    reward_nonzero
+          [next]    reward scalars (2):   reward clipped [-1,1], abs(reward)
+          [next]    pre_state_vec  (STATE_SNAPSHOT_DIM = 8) — Tier 2
+          [next]    post_state_vec (STATE_SNAPSHOT_DIM = 8) — Tier 2
+          [next]    step_offset_norm (1)
+          remainder zero (~11 spare slots — room for future additions)
+
+        The pre/post snapshot pair lets any downstream linear probe
+        compute "delta = post - pre" on every dimension. The separate
+        causality_delta tensor in the tracker is NOT packed here: it's
+        delivered to the aux head's loss target path directly (via
+        env_v2 info → aux_maskable_ppo buffer), NOT through the obs
+        tensor. Keeping targets off the observation tensor avoids
+        teaching the policy to trivially shortcut — the policy sees
+        pre/post context but has to actively predict the delta.
         """
         from .semantic_action import SEMANTIC_ACTION_FAMILIES, SEMANTIC_TARGET_SCOPES
+        from .action_history import STATE_SNAPSHOT_DIM
 
         numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-        # [1] = is_step_detail marker — makes linear probes trivial.
         numeric[1] = 1.0
 
         if not isinstance(entry, dict):
-            # Padded / empty slot.
             numeric[0] = 1.0
             return numeric, 0, ""
 
         cursor = 2
-        # family one-hot
         family_idx = int(entry.get("family_idx") or 0)
         if 0 <= family_idx < len(SEMANTIC_ACTION_FAMILIES):
             numeric[cursor + family_idx] = 1.0
         cursor += len(SEMANTIC_ACTION_FAMILIES)
-        # semantic_role_flags bits
         role_flags = int(entry.get("semantic_role_flags") or 0)
         for bit in range(NUM_SEMANTIC_ROLES):
             if role_flags & (1 << bit):
                 numeric[cursor + bit] = 1.0
         cursor += NUM_SEMANTIC_ROLES
-        # target_scope one-hot
         scope_idx = int(entry.get("target_scope_idx") or 0)
         if 0 <= scope_idx < len(SEMANTIC_TARGET_SCOPES):
             numeric[cursor + scope_idx] = 1.0
         cursor += len(SEMANTIC_TARGET_SCOPES)
-        # step_offset one-hot
         step_offset = int(entry.get("step_offset") or 0)
         step_offset = max(0, min(step_offset, MAX_STEP_DETAIL_TOKENS - 1))
         numeric[cursor + step_offset] = 1.0
         cursor += MAX_STEP_DETAIL_TOKENS
 
-        # Flags
         numeric[cursor + 0] = 1.0 if entry.get("same_turn") else 0.0
         numeric[cursor + 1] = 1.0 if entry.get("same_encounter") else 0.0
         numeric[cursor + 2] = 1.0 if entry.get("same_floor") else 0.0
@@ -2826,19 +2831,24 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         numeric[cursor + 6] = 1.0 if entry.get("reward_nonzero") else 0.0
         cursor += 7
 
-        # Scalar deltas (normalized / clipped)
         reward = float(entry.get("reward") or 0.0)
         numeric[cursor + 0] = max(-1.0, min(reward, 1.0))
         numeric[cursor + 1] = min(abs(reward), 1.0)
-        numeric[cursor + 2] = max(0.0, min(float(entry.get("enemy_hp_delta") or 0.0) / 30.0, 1.0))
-        numeric[cursor + 3] = max(-1.0, min(float(entry.get("hp_delta_player") or 0.0) / 30.0, 1.0))
-        numeric[cursor + 4] = max(-1.0, min(float(entry.get("block_delta") or 0.0) / 30.0, 1.0))
-        numeric[cursor + 5] = max(-1.0, min(float(entry.get("energy_delta") or 0.0) / 3.0, 1.0))
-        numeric[cursor + 6] = step_offset / max(MAX_STEP_DETAIL_TOKENS - 1, 1)
-        cursor += 7
-        # cursor now points into the "spare" zone; leave as zeros so
-        # Tier 2 pre_state / post_state vecs can land here without
-        # reshuffling the layout.
+        cursor += 2
+
+        # Tier 2: pre_state_vec
+        pre_vec = entry.get("pre_state_vec") or []
+        for i in range(STATE_SNAPSHOT_DIM):
+            numeric[cursor + i] = float(pre_vec[i]) if i < len(pre_vec) else 0.0
+        cursor += STATE_SNAPSHOT_DIM
+        # Tier 2: post_state_vec
+        post_vec = entry.get("post_state_vec") or []
+        for i in range(STATE_SNAPSHOT_DIM):
+            numeric[cursor + i] = float(post_vec[i]) if i < len(post_vec) else 0.0
+        cursor += STATE_SNAPSHOT_DIM
+
+        numeric[cursor] = step_offset / max(MAX_STEP_DETAIL_TOKENS - 1, 1)
+        cursor += 1
 
         card_bucket = int(entry.get("card_id_bucket") or 0)
         text = str(entry.get("canonical_text") or "")

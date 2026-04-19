@@ -62,11 +62,11 @@ Both produce dict observations and action masks. Legal actions come from the bri
 
 `observation_v3.py` (`WorldTokenObservationEncoder`) encodes game state as a fixed-size token sequence:
 
-- **320 world tokens** across roles (hand cards, enemies, relics, deck, route nodes, etc.)
+- **412 world tokens** across roles (hand cards, enemies, relics, deck, route nodes, POWER_SLOT, CARD_KEYWORD, HISTORY_STEP_DETAIL × 20, HISTORY_TURN_SUMMARY × 8)
 - **24 candidate local tokens** for action-specific context
 - Each token: 96-d numeric features + 64-d text features = 160-d
 - 66 token types, with owner/role/zone/order metadata fields
-- Constant: `OBSERVATION_API_VERSION = "attention_obs_v2"`
+- Constant: `OBSERVATION_API_VERSION = "attention_obs_v4"` (Phase 8 Tier 2)
 
 The base class `DenseObservationEncoder` in `observation_common.py` defines `MAX_ACTIONS = 127` and shared encoding utilities.
 
@@ -75,16 +75,16 @@ The base class `DenseObservationEncoder` in `observation_common.py` defines `MAX
 `STS2OmniAttentionPolicy` (extends `MaskableActorCriticPolicy`):
 
 1. **EntityTokenEmbedder** — projects numeric + text features, adds type/owner/role/zone/order embeddings
-2. **5 World Banks** (TransformerEncoderBlocks) — `runtime`, `support`, `enemy`, `build`, `route`; tokens are routed to banks by role/zone IDs defined in `WORLD_BANK_ROLE_IDS`/`WORLD_BANK_ZONE_IDS`
+2. **7 World Banks** (TransformerEncoderBlocks) — `runtime`, `support`, `enemy`, `build`, `route`, `powers`, `history`; tokens are routed to banks by role/zone IDs defined in `WORLD_BANK_ROLE_IDS`/`WORLD_BANK_ZONE_IDS`
 3. **Cross-attention** between banks
 4. **CandidateDecoder** — attends world context to candidate local tokens
-5. **Policy head** (masked categorical) + **value head** + **6 auxiliary heads**
+5. **Policy head** (masked categorical) + **value head** + **8 auxiliary heads** (adds action_causality in Phase 8 Tier 2)
 
-Building blocks live in `attention_blocks.py`: `TransformerEncoderBlock`, `CrossAttentionBlock`, `CandidateDecoderBlock`, `EntityPooling`, `RelationBias`.
+Building blocks live in `attention_blocks.py`: `TransformerEncoderBlock`, `CrossAttentionBlock`, `CandidateDecoderBlock`, `EntityPooling`, `RelationBias` (with `power_bucket_bias` + `history_card_bias`).
 
 ### Auxiliary supervision
 
-`AuxMaskablePPO` (`aux_maskable_ppo.py`) extends SB3's `MaskablePPO` with 6 auxiliary loss terms built by `aux_targets.py`:
+`AuxMaskablePPO` (`aux_maskable_ppo.py`) extends SB3's `MaskablePPO` with 8 auxiliary loss terms built by `aux_targets.py`:
 
 | Head group | Count | Examples |
 |---|---|---|
@@ -94,8 +94,10 @@ Building blocks live in `attention_blocks.py`: `TransformerEncoderBlock`, `Cross
 | build | 8 | frontload_fit, defense_fit, scaling_fit, ... |
 | selection | 6 | source_hand, source_draw, target_mine, ... |
 | route | 8 | safe_value, elite_value, rest_value, ... |
+| enemy_state | 3 × 5 slots | next_hp_delta, attrib_hp_loss, alive_next |
+| causality | 8 | damage_dealt, block_gained, self_hp_loss, draw/energy/strength/dex/vuln_delta (Phase 8 Tier 2) |
 
-Each has an independent loss coefficient (`--aux-*-coef` flags).
+Each has an independent loss coefficient (`--aux-*-coef` flags). The causality head is per-candidate, masked to the chosen action row, self-supervised from observed pre/post transition deltas — see `_design_phase8_history.md` for the design motivation.
 
 ### Data collection
 
@@ -130,7 +132,7 @@ Saved as `model.safetensors` + `metadata.json` in versioned directories. `checkp
 | Constant | Value | Location |
 |---|---|---|
 | `MAX_ACTIONS` | 127 | `observation_common.py` |
-| `MAX_WORLD_TOKENS` | 320 | `observation_v3.py` |
+| `MAX_WORLD_TOKENS` | 412 | `observation_v3.py` |
 | `MAX_CANDIDATE_LOCAL_TOKENS` | 24 | `observation_v3.py` |
 | `TOKEN_FEAT_DIM` | 160 (96+64) | `observation_v3.py` |
 | `NUM_TOKEN_TYPES` | 66 | `observation_v3.py` |
@@ -138,6 +140,10 @@ Saved as `model.safetensors` + `metadata.json` in versioned directories. `checkp
 | `SEMANTIC_ACTION_DIM` | 49 | `semantic_action.py` |
 | `RUN_MEMORY_DIM` | 48 | `run_memory.py` |
 | `TEXT_DIM` | 512 | `text_encoder.py` |
+| `MAX_STEP_DETAIL_TOKENS` | 20 | `action_history.py` |
+| `MAX_TURN_SUMMARY_TOKENS` | 8 | `action_history.py` |
+| `STATE_SNAPSHOT_DIM` | 8 | `action_history.py` |
+| `NUM_CAUSALITY_HEADS` | 8 | `action_history.py` |
 
 ## Environment variables
 

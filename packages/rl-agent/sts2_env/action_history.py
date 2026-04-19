@@ -61,6 +61,41 @@ MAX_TURN_SUMMARY_TOKENS = 8
 # enough headroom.
 MAX_HISTORY_TOKENS = MAX_STEP_DETAIL_TOKENS + MAX_TURN_SUMMARY_TOKENS  # 28
 
+# Phase 8 Tier 2: state snapshot vectors attached to each StepDetailEntry.
+# Eight absolute-state scalars captured at pre- and post-action moments,
+# so attention can trivially derive "this card did X" deltas and also
+# read the pre-context ("I did Demon Form at low energy → worth less").
+# Each vec is 8-d; kept identical between pre/post so the token numeric
+# block exposes a contiguous [pre || post] 16-d window policy heads can
+# probe with a single linear projection.
+STATE_SNAPSHOT_DIM = 8
+STATE_SNAPSHOT_FIELD_NAMES = (
+    "energy_norm",            # combat.energy / 5
+    "hand_size_norm",         # len(combat.hand) / 10
+    "player_hp_ratio",        # player.hp / player.max_hp
+    "enemy_total_hp_ratio",   # sum enemy.hp / sum enemy.max_hp (filtered)
+    "player_strength_norm",   # strength stacks / 10 (clamped)
+    "player_dex_norm",        # dexterity stacks / 10 (clamped)
+    "player_block_norm",      # combat.block / 40
+    "enemy_total_vuln_norm",  # sum(vuln stacks on live enemies) / 10
+)
+
+# Phase 8 Tier 2: action_causality aux head predicts an 8-d delta (what
+# would the chosen action DO) per step. Target is self-supervised from
+# the (pre_state, post_state) pair the tracker already captures, folded
+# into deltas and masked to the actually-chosen candidate row.
+NUM_CAUSALITY_HEADS = 8
+CAUSALITY_HEAD_NAMES = (
+    "damage_dealt",        # max(enemy_total_hp_pre - post, 0) / 30
+    "block_gained",        # max(player_block_post - pre, 0) / 30
+    "self_hp_loss",        # max(player_hp_pre - post, 0) / 30
+    "draw_delta",          # (hand_size_post - pre) / 5, signed
+    "energy_delta",        # (energy_post - pre) / 3, signed, clipped [-1,1]
+    "strength_delta",      # (strength_post - pre) / 5, signed, clipped
+    "dex_delta",           # (dex_post - pre) / 5, signed, clipped
+    "vuln_applied",        # max(enemy_total_vuln_post - pre, 0) / 10
+)
+
 # 16-bit bitmap of "key power cards" whose presence in a turn's play
 # sequence unlocks meaningfully different future strategies. Expansion
 # knobs: add more entries; slot 16 is the last bit we have room for in
@@ -237,6 +272,124 @@ def _player_power_amount(obs: dict[str, Any] | None, power_id_substring: str) ->
     return 0.0
 
 
+def _hand_size(obs: dict[str, Any] | None) -> int:
+    combat = _combat(obs)
+    hand = combat.get("hand") if isinstance(combat, dict) else None
+    return len(hand) if isinstance(hand, list) else 0
+
+
+def _player_max_hp(obs: dict[str, Any] | None) -> float:
+    if not isinstance(obs, dict):
+        return 1.0
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else None
+    if isinstance(player, dict):
+        mh = _float(player.get("max_hp"), 1.0)
+        return mh if mh > 0 else 1.0
+    return 1.0
+
+
+def _build_state_snapshot(obs: dict[str, Any] | None) -> tuple[float, ...]:
+    """Compute the 8-d absolute-state snapshot used by both HISTORY token
+    pre/post vectors and the action_causality target-building path.
+
+    Normalization constants chosen so a typical early-Act-1 turn sits
+    well inside [0, 1]. The same normalization is applied identically
+    to pre and post so the policy's delta-probe is uniform-scale.
+    """
+    import math
+
+    combat = _combat(obs)
+    player = obs.get("player") if isinstance(obs, dict) and isinstance(obs.get("player"), dict) else {}
+    energy = _float(combat.get("energy")) if combat else 0.0
+    hand_size = _hand_size(obs)
+    player_hp = _player_hp(obs)
+    max_hp = _player_max_hp(obs)
+    player_block = _player_block(obs)
+    player_strength = _player_power_amount(obs, "strength")
+    player_dex = _player_power_amount(obs, "dexterity")
+    enemy_hp = _enemy_total_hp(obs)
+    enemy_max = max(_enemy_total_hp(obs), 1.0)
+    # enemy_max here is a weak proxy; for the ratio we want pre-state
+    # total maxhp which doesn't drop as enemies die. Use the sum of
+    # enemy.max_hp filtered for sentinels.
+    enemy_max_hp_accum = 0.0
+    for e in (combat.get("enemies") or []) if isinstance(combat, dict) else []:
+        if not isinstance(e, dict):
+            continue
+        mh = _float(e.get("max_hp"))
+        if 0 < mh < 10_000:
+            enemy_max_hp_accum += mh
+    enemy_max_ref = enemy_max_hp_accum if enemy_max_hp_accum > 0 else max(enemy_hp, 1.0)
+    enemy_vuln = _enemy_vuln_amount(obs)
+    return (
+        max(0.0, min(energy / 5.0, 1.0)),
+        max(0.0, min(hand_size / 10.0, 1.0)),
+        max(0.0, min(player_hp / max_hp, 1.0)),
+        max(0.0, min(enemy_hp / enemy_max_ref, 1.0)),
+        max(0.0, min(player_strength / 10.0, 1.0)),
+        max(0.0, min(player_dex / 10.0, 1.0)),
+        max(0.0, min(player_block / 40.0, 1.0)),
+        max(0.0, min(enemy_vuln / 10.0, 1.0)),
+    )
+
+
+def _build_causality_delta(
+    prev_obs: dict[str, Any] | None,
+    next_obs: dict[str, Any] | None,
+) -> tuple[float, ...]:
+    """Compute the 8-d per-step causality target vector.
+
+    Deltas are independently normalized (not simply post_snapshot -
+    pre_snapshot) because effects have their own natural scales — raw
+    damage is /30, block is /30, energy is /3, etc. Clamped to [-1, 1]
+    to keep smooth_l1 loss well-behaved.
+
+    Returns the 8-d target in the order of CAUSALITY_HEAD_NAMES.
+    """
+    pre_enemy_hp = _enemy_total_hp(prev_obs)
+    post_enemy_hp = _enemy_total_hp(next_obs)
+    damage_dealt = max(pre_enemy_hp - post_enemy_hp, 0.0)
+
+    pre_block = _player_block(prev_obs)
+    post_block = _player_block(next_obs)
+    block_gained = max(post_block - pre_block, 0.0)
+
+    pre_hp = _player_hp(prev_obs)
+    post_hp = _player_hp(next_obs)
+    self_hp_loss = max(pre_hp - post_hp, 0.0)
+
+    pre_hand = _hand_size(prev_obs)
+    post_hand = _hand_size(next_obs)
+    draw_delta_raw = post_hand - pre_hand
+
+    pre_energy = _float(_combat(prev_obs).get("energy")) if _combat(prev_obs) else 0.0
+    post_energy = _float(_combat(next_obs).get("energy")) if _combat(next_obs) else 0.0
+    energy_delta_raw = post_energy - pre_energy
+
+    pre_str = _player_power_amount(prev_obs, "strength")
+    post_str = _player_power_amount(next_obs, "strength")
+    strength_delta_raw = post_str - pre_str
+
+    pre_dex = _player_power_amount(prev_obs, "dexterity")
+    post_dex = _player_power_amount(next_obs, "dexterity")
+    dex_delta_raw = post_dex - pre_dex
+
+    pre_vuln = _enemy_vuln_amount(prev_obs)
+    post_vuln = _enemy_vuln_amount(next_obs)
+    vuln_applied = max(post_vuln - pre_vuln, 0.0)
+
+    return (
+        max(0.0, min(damage_dealt / 30.0, 1.0)),
+        max(0.0, min(block_gained / 30.0, 1.0)),
+        max(0.0, min(self_hp_loss / 30.0, 1.0)),
+        max(-1.0, min(draw_delta_raw / 5.0, 1.0)),
+        max(-1.0, min(energy_delta_raw / 3.0, 1.0)),
+        max(-1.0, min(strength_delta_raw / 5.0, 1.0)),
+        max(-1.0, min(dex_delta_raw / 5.0, 1.0)),
+        max(0.0, min(vuln_applied / 10.0, 1.0)),
+    )
+
+
 def _enemy_vuln_amount(obs: dict[str, Any] | None) -> float:
     """Sum Vulnerable stacks across all live enemies. Proxy signal for
     "have I applied debuffs this turn?" in turn_summary encoding.
@@ -282,33 +435,39 @@ class StepDetailEntry:
     """A single past action + its immediate consequences.
 
     Step-level tokens pack most of the 96 numeric feature slots with
-    categorical one-hots and a few scalar deltas. See
-    ``observation_v3._append_history_tokens`` for the exact feature
-    layout; this dataclass exposes the primitives in a form that
-    layout code can consume without having to know what a
+    categorical one-hots plus the Tier 2 pre_state / post_state / delta
+    vectors. See ``observation_v3._append_history_tokens`` for the
+    exact feature layout; this dataclass exposes the primitives in a
+    form that layout code can consume without having to know what a
     ``semantic_action_signature`` is shaped like.
+
+    Note: Phase 8 Tier 2 replaced the Tier 1 scalar delta fields
+    (hp_delta_player, enemy_hp_delta, block_delta, energy_delta) with
+    the richer ``causality_delta`` vector. The new vector contains
+    everything the scalar deltas did plus strength/dex/draw/vuln/block
+    signal — removing the old fields avoids carrying duplicate data.
     """
 
-    family: str                     # one of SEMANTIC_ACTION_FAMILIES or "other"
-    family_idx: int                 # cached index into SEMANTIC_ACTION_FAMILIES (0..N-1, N=other)
-    semantic_role_flags: int        # bitmask over semantic_action.SEMANTIC_ROLE_NAMES
-    target_scope_idx: int           # one-hot index into SEMANTIC_TARGET_SCOPES
-    card_id: str                    # "CARD.*" or "" if non-card action
-    card_id_bucket: int             # _stable_card_bucket(card_id)
-    same_turn: bool                 # True if combat.round didn't change during this step
-    same_encounter: bool            # True if still in the same combat (cleared on combat exit)
-    same_floor: bool                # True if run.floor didn't change
-    phase: str                      # phase at the moment the action was taken
-    reward: float                   # scalar reward returned by env.step (already shaped)
-    hp_delta_player: float          # player_hp_post - player_hp_pre
-    enemy_hp_delta: float           # enemy_total_hp_pre - enemy_total_hp_post (damage dealt)
-    block_delta: float              # block_post - block_pre (approximate)
-    energy_delta: float             # energy_post - energy_pre (pre-end_turn only)
+    family: str
+    family_idx: int
+    semantic_role_flags: int
+    target_scope_idx: int
+    card_id: str
+    card_id_bucket: int
+    same_turn: bool
+    same_encounter: bool
+    same_floor: bool
+    phase: str
+    reward: float
     reward_nonzero: bool
     rejected: bool
     phase_changed: bool
     combat_ended: bool
-    canonical_text: str             # for text embedding head
+    canonical_text: str
+    # Tier 2 additions:
+    pre_state_vec: tuple          # STATE_SNAPSHOT_DIM floats (absolute-state snapshot at prev_obs)
+    post_state_vec: tuple         # STATE_SNAPSHOT_DIM floats (absolute-state snapshot at next_obs)
+    causality_delta: tuple        # NUM_CAUSALITY_HEADS floats (self-supervised target for action_causality)
 
     @classmethod
     def from_transition(
@@ -337,9 +496,6 @@ class StepDetailEntry:
 
         prev_round = _combat_round(prev_obs)
         next_round = _combat_round(next_obs)
-        # same_turn = neither side stepped the turn counter. During a
-        # combat step this stays True for every card played in the
-        # active turn; it flips False on the turn-end tick.
         same_turn = (prev_round == next_round)
         prev_in_combat = _in_combat(prev_obs)
         next_in_combat = _in_combat(next_obs)
@@ -350,23 +506,9 @@ class StepDetailEntry:
         phase_changed = phase_before != phase_after
         combat_ended = prev_in_combat and not next_in_combat
 
-        enemy_pre = _enemy_total_hp(prev_obs)
-        enemy_post = _enemy_total_hp(next_obs)
-        enemy_hp_delta = enemy_pre - enemy_post  # positive = damage dealt
-
-        hp_pre = _player_hp(prev_obs)
-        hp_post = _player_hp(next_obs)
-        hp_delta_player = hp_post - hp_pre  # negative = hp lost
-
-        block_pre = _player_block(prev_obs)
-        block_post = _player_block(next_obs)
-        block_delta = block_post - block_pre
-
-        prev_combat = _combat(prev_obs)
-        next_combat = _combat(next_obs)
-        energy_pre = _float(prev_combat.get("energy")) if prev_combat else 0.0
-        energy_post = _float(next_combat.get("energy")) if next_combat else 0.0
-        energy_delta = energy_post - energy_pre
+        pre_state_vec = _build_state_snapshot(prev_obs)
+        post_state_vec = _build_state_snapshot(next_obs)
+        causality_delta = _build_causality_delta(prev_obs, next_obs)
 
         canonical_text = ""
         if isinstance(action, dict):
@@ -384,15 +526,14 @@ class StepDetailEntry:
             same_floor=bool(same_floor),
             phase=phase_before,
             reward=float(reward),
-            hp_delta_player=hp_delta_player,
-            enemy_hp_delta=enemy_hp_delta,
-            block_delta=block_delta,
-            energy_delta=energy_delta,
             reward_nonzero=abs(reward) > 1e-6,
             rejected=bool(rejected),
             phase_changed=bool(phase_changed),
             combat_ended=bool(combat_ended),
             canonical_text=canonical_text,
+            pre_state_vec=pre_state_vec,
+            post_state_vec=post_state_vec,
+            causality_delta=causality_delta,
         )
 
 
@@ -480,12 +621,19 @@ class TurnAccumulator:
         elif entry.family == "use_potion":
             self.n_potions_used += 1
 
-        if entry.enemy_hp_delta > 0:
-            self.total_damage_dealt += entry.enemy_hp_delta
-        if entry.block_delta > 0:
-            self.total_block_gained += entry.block_delta
-        if entry.hp_delta_player < 0:
-            self.total_hp_lost += -entry.hp_delta_player
+        # causality_delta fields are normalized — de-normalize by inverting
+        # the scaling factors documented in CAUSALITY_HEAD_NAMES. Keeping
+        # the absorb logic on RAW amounts preserves the turn_summary
+        # dynamic range (sum of damage can exceed 1.0).
+        damage_dealt = entry.causality_delta[0] * 30.0 if len(entry.causality_delta) > 0 else 0.0
+        block_gained = entry.causality_delta[1] * 30.0 if len(entry.causality_delta) > 1 else 0.0
+        self_hp_loss = entry.causality_delta[2] * 30.0 if len(entry.causality_delta) > 2 else 0.0
+        if damage_dealt > 0:
+            self.total_damage_dealt += damage_dealt
+        if block_gained > 0:
+            self.total_block_gained += block_gained
+        if self_hp_loss > 0:
+            self.total_hp_lost += self_hp_loss
             self.player_took_dmg = True
 
         # Track scaling buffs: any strength/dex/focus delta during this
@@ -663,15 +811,14 @@ class ActionHistoryTracker:
                     "same_floor": entry.same_floor,
                     "phase": entry.phase,
                     "reward": entry.reward,
-                    "hp_delta_player": entry.hp_delta_player,
-                    "enemy_hp_delta": entry.enemy_hp_delta,
-                    "block_delta": entry.block_delta,
-                    "energy_delta": entry.energy_delta,
                     "reward_nonzero": entry.reward_nonzero,
                     "rejected": entry.rejected,
                     "phase_changed": entry.phase_changed,
                     "combat_ended": entry.combat_ended,
                     "canonical_text": entry.canonical_text,
+                    "pre_state_vec": list(entry.pre_state_vec),
+                    "post_state_vec": list(entry.post_state_vec),
+                    "causality_delta": list(entry.causality_delta),
                 }
             )
         turn_summary = []
@@ -734,6 +881,10 @@ __all__ = [
     "NUM_KEY_POWER_FLAGS",
     "NUM_RESULT_FLAGS",
     "NUM_SEMANTIC_ROLES",
+    "STATE_SNAPSHOT_DIM",
+    "STATE_SNAPSHOT_FIELD_NAMES",
+    "NUM_CAUSALITY_HEADS",
+    "CAUSALITY_HEAD_NAMES",
     "KEY_POWER_CARD_BUCKETS",
     "RESULT_FLAG_REWARD_NONZERO",
     "RESULT_FLAG_REJECTED",
@@ -744,4 +895,6 @@ __all__ = [
     "TurnAccumulator",
     "ActionHistoryTracker",
     "_stable_card_bucket",
+    "_build_state_snapshot",
+    "_build_causality_delta",
 ]

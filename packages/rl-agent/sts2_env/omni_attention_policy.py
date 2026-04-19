@@ -63,7 +63,16 @@ _RELATION_BIAS_KW = {
 DEFAULT_POLICY_CLASS_PATH = "sts2_env.omni_attention_policy.STS2OmniAttentionPolicy"
 ATTENTION_ARCHITECTURE_VERSION = "omni_attention_v1_frozen"
 GLOBAL_AUX_HEAD_NAMES = ("objective", "transition", "traits")
-CANDIDATE_AUX_HEAD_NAMES = ("candidate_objective", "candidate_transition", "candidate_traits", "candidate_build", "candidate_selection", "candidate_route")
+CANDIDATE_AUX_HEAD_NAMES = (
+    "candidate_objective",
+    "candidate_transition",
+    "candidate_traits",
+    "candidate_build",
+    "candidate_selection",
+    "candidate_route",
+    # Phase 8 Tier 2:
+    "candidate_causality",
+)
 
 # Phase 6.2: dedicated "powers" bank. Before this, POWER_SLOT tokens were
 # routed via role_id "POWER_SLOT" which fell into no existing bank and
@@ -369,6 +378,21 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
         self.enemy_state_head = nn.Sequential(
             nn.LayerNorm(self._d_model),
             nn.Linear(self._d_model, ENEMY_STATE_SLOT_COUNT * NUM_ENEMY_STATE_FIELDS),
+        )
+        # Phase 8 Tier 2: action_causality head.
+        # Per-candidate prediction of the 8-d state delta that candidate
+        # would produce if played (damage_dealt / block_gained /
+        # self_hp_loss / draw_delta / energy_delta / strength_delta /
+        # dex_delta / vuln_applied). Target is self-supervised from the
+        # actual post-pre delta at each step, masked to the chosen
+        # candidate's row (same pattern as candidate_objective).
+        # Distinguishes "this card deals 6 base damage" from "this card
+        # deals 6 damage in current buff context" — pure prediction,
+        # no rules.
+        from .action_history import NUM_CAUSALITY_HEADS
+        self.candidate_causality_head = nn.Sequential(
+            nn.LayerNorm(self._d_model),
+            nn.Linear(self._d_model, NUM_CAUSALITY_HEADS),
         )
 
         # Pre-register constant bank role/zone ID tensors as buffers to avoid
@@ -828,6 +852,11 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
             "candidate_selection": self.candidate_selection_head(candidate_x),
             "candidate_route": self.candidate_route_head(candidate_x),
             "enemy_state": enemy_state,
+            # Phase 8 Tier 2: per-candidate causality prediction
+            # (batch, num_candidates, NUM_CAUSALITY_HEADS). Loss
+            # computed at the chosen-candidate row only, via the same
+            # masked-regression pattern as candidate_objective.
+            "candidate_causality": self.candidate_causality_head(candidate_x),
         }
 
     def forward_world_bank_routing(self, obs):
