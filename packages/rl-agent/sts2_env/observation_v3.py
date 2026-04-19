@@ -42,6 +42,29 @@ MAX_POWER_SLOT_TOKENS = 40
 # it deterministically.
 POWER_ID_BUCKETS = 128
 
+# Phase 6.4: per-card keyword tokens (Retain/Ethereal/Exhaust/Innate/...).
+# Previously these were bitflags buried inside HAND_CARD numerics; breaking
+# them out lets attention learn per-keyword patterns like "Ethereal +
+# unplayed + end-of-turn approaching → penalty" directly.
+MAX_CARD_KEYWORD_SLOTS = 16
+# Stable bucket ids for card-keyword categorical embedding. Source: the
+# content_registry semantic_tags vocabulary; only keywords that affect
+# play-phase decisions are surfaced. 0 reserved for PAD/unknown.
+_CARD_KEYWORD_BUCKETS: dict[str, int] = {
+    "retain": 1,
+    "ethereal": 2,
+    "exhaust_self": 3,
+    "innate": 4,
+    "unplayable": 5,
+    "x_cost": 6,
+    "purge": 7,
+    "scry": 8,
+    "return_to_hand": 9,
+    "add_to_hand": 10,
+    "upgrade_self": 11,
+    "add_to_draw": 12,
+}
+
 OWNER_NONE = 0
 OWNER_ENEMY_BASE = 1
 OWNER_PLAYER = 32
@@ -605,6 +628,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             # (power_id bucket as entity_id) + (effect-algebra vector in
             # numeric slots 0..12) + (amount scalars in slots 13..15).
             self._append_power_slot_tokens(world_entries, obs_dict)
+            # v3: CARD_KEYWORD_SLOT tokens for Retain/Ethereal/Exhaust/etc.
+            # One token per keyword per hand card, surfaces keyword binding
+            # to the POWER bank where attention can learn the interaction
+            # patterns ("Ethereal + turn ending + not playable = waste").
+            self._append_card_keyword_slot_tokens(world_entries, obs_dict)
             self._append_candidate_tokens(candidate_entries, candidate_local_entries, action_mask, obs_dict, features, action_list)
             self._resolve_entry_text_embeddings(world_entries, candidate_entries, candidate_local_entries)
             self._resolve_text_registry()
@@ -2490,6 +2518,93 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                         )
                     )
                     emitted += 1
+
+    def _append_card_keyword_slot_tokens(
+        self,
+        world_entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+    ) -> None:
+        """Emit one CARD_KEYWORD_SLOT token per (hand card × recognized
+        keyword) pair.
+
+        Looks up each hand card's semantic_tags in content_registry and
+        emits a token per matched keyword. owner_id = OWNER_HAND + card
+        position so attention can route keyword → source card binding.
+        entity_id = keyword bucket id (shared categorical space with the
+        POWER_ID vocabulary via distinct low-end numbering).
+        """
+        combat = obs.get("combat") or {}
+        hand = combat.get("hand") or []
+        if not isinstance(hand, list) or not hand:
+            return
+
+        try:
+            from content_registry import get_card_metadata  # noqa: PLC0415
+        except Exception:
+            return
+
+        emitted = 0
+        budget = MAX_CARD_KEYWORD_SLOTS
+
+        for hand_index, card in enumerate(hand):
+            if emitted >= budget:
+                break
+            if not isinstance(card, dict):
+                continue
+            card_id = str(card.get("id") or "")
+            if not card_id:
+                continue
+            md = get_card_metadata(card_id)
+            if not isinstance(md, dict):
+                continue
+            tags = md.get("semantic_tags") or []
+            if not isinstance(tags, list):
+                continue
+
+            # Also fold explicit card.keywords (from sim translator) in case
+            # some mod cards carry keywords but no content_registry entry.
+            card_keywords = card.get("keywords") or []
+            all_tags: list[str] = []
+            for t in list(tags) + list(card_keywords if isinstance(card_keywords, list) else []):
+                t_norm = str(t).strip().lower()
+                if t_norm in _CARD_KEYWORD_BUCKETS and t_norm not in all_tags:
+                    all_tags.append(t_norm)
+
+            # Bind this keyword slot to the hand card via owner_id so the
+            # attention owner_pair_bias can learn "keyword-for-this-card"
+            # as a same-owner relation.
+            owner_id = min(OWNER_HAND + hand_index, MAX_OWNER_ID)
+            for slot_index, kw in enumerate(all_tags):
+                if emitted >= budget:
+                    break
+                bucket = _CARD_KEYWORD_BUCKETS[kw]
+                numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+                # Minimal feature set — keywords are mostly categorical.
+                numeric[0] = 1.0                               # active flag
+                numeric[1] = hand_index / 10.0                 # card position hint
+                numeric[2] = float(card.get("is_playable", True))
+                numeric[3] = obs_common._float(card.get("cost")) / 3.0
+                # Flag which keyword family (for fast linear probing by
+                # other downstream heads without embedding lookup).
+                if kw in ("ethereal", "exhaust_self", "purge"):
+                    numeric[4] = 1.0  # auto-removal-on-use/eot
+                if kw in ("retain",):
+                    numeric[5] = 1.0  # persists across turns
+                if kw in ("innate",):
+                    numeric[6] = 1.0  # opening-hand guarantee
+                if kw in ("unplayable",):
+                    numeric[7] = 1.0  # curse/blank
+                world_entries.append(
+                    self._entry(
+                        "CARD_KEYWORD_SLOT",
+                        numeric,
+                        owner_id=owner_id,
+                        entity_id=bucket,
+                        order_id=min(slot_index, MAX_ORDER_ID),
+                        text=kw,
+                    )
+                )
+                emitted += 1
 
     def _build_power_slot_numeric(self, power: dict[str, Any]) -> dict[str, Any] | None:
         """Pack a single power dict into the numeric + categorical fields
