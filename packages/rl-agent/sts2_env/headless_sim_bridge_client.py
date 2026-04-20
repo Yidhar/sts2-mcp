@@ -610,23 +610,61 @@ class HeadlessSimBridgeClient:
                 enc = enc[len("ENCOUNTER."):]
             params["encounter_id"] = enc
         if seed is not None:
-            params["seed"] = int(seed)
+            params["seed"] = str(seed)
+
+        # Sim's CombatResetAsync only reads 4 flat params (character_id,
+        # encounter_id, seed, ascension_level) + a nested `build` object of
+        # type SimulationBuildSpec. Flat deck/relics/current_hp/etc. are
+        # silently ignored — every combat_reset was running on the default
+        # starter Ironclad configuration regardless of snapshot content.
+        # Fix: pack snapshot fields into `build`. SimulationBuildSpec fields
+        # per third_party/sts2-ai/.../FullRunSimulationDtos.cs:
+        #   deck: list[SimulationBuildCardSpec{id, upgrade_level}]
+        #   relics: list[SimulationBuildRelicSpec{id}]
+        #   current_hp / max_hp / max_energy / gold: int
+        build: dict[str, Any] = {}
         if current_hp is not None:
-            params["current_hp"] = int(current_hp)
+            build["current_hp"] = int(current_hp)
         if max_hp is not None:
-            params["max_hp"] = int(max_hp)
+            build["max_hp"] = int(max_hp)
         if max_energy is not None:
-            params["max_energy"] = int(max_energy)
-        if deck is not None:
-            params["deck"] = list(deck)
-        if deck_entries is not None:
-            params["deck_entries"] = list(deck_entries)
-        if relics is not None:
-            params["relics"] = list(relics)
-        if potions is not None:
-            params["potions"] = list(potions)
+            build["max_energy"] = int(max_energy)
         if gold is not None:
-            params["gold"] = int(gold)
+            build["gold"] = int(gold)
+        # Sim's SimulationBuildSupport.ResolveCard re-prepends "CARD." (and
+        # analogous for RELIC./POTION.), same bug pattern as encounter_id.
+        # Strip the category prefix so we don't end up with CARD.CARD.ANGER.
+        def _strip_prefix(raw: str, prefix: str) -> str:
+            s = str(raw)
+            if s.upper().startswith(prefix):
+                s = s[len(prefix):]
+            return s
+
+        if deck_entries is not None and len(deck_entries) > 0:
+            # Prefer upgrade-aware entries when we have them.
+            build["deck"] = [
+                {
+                    "id": _strip_prefix(entry.get("id"), "CARD."),
+                    "upgrade_level": int(entry.get("upgrade_level") or 0),
+                }
+                for entry in deck_entries
+                if isinstance(entry, dict) and entry.get("id")
+            ]
+        elif deck is not None:
+            build["deck"] = [
+                {"id": _strip_prefix(cid, "CARD."), "upgrade_level": 0}
+                for cid in deck if cid
+            ]
+        if relics is not None:
+            build["relics"] = [
+                {"id": _strip_prefix(rid, "RELIC.")} for rid in relics if rid
+            ]
+        if potions is not None:
+            # SimulationBuildSpec may or may not have potions; include under
+            # build to be future-proof; sim ignores unknown fields.
+            build["potions"] = [_strip_prefix(pid, "POTION.") for pid in potions if pid]
+        if build:
+            params["build"] = build
         combat_result = self._rpc("combat_reset", params)
         # The sim's combat_reset RPC returns a CombatTrainingStateSnapshot
         # (top-level keys: combat_active, enemies, hand, piles, ...). That
