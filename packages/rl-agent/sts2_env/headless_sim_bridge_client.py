@@ -50,8 +50,8 @@ class HeadlessSimBridgeClient:
     """
 
     DEFAULT_EXE_PATH = Path(
-        "E:/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/Host/"
-        "bin/Debug/net9.0/headless_sim_host_0991.exe"
+        "E:/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/"
+        "bin/Debug/net9.0/HeadlessSim.exe"
     )
 
     def __init__(
