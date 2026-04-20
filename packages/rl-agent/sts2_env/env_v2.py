@@ -124,11 +124,49 @@ class SlayTheSpire2EnvV2(gym.Env):
         # HISTORY tokens into the world-token budget. See
         # sts2_env/action_history.py for the data-flow design.
         self._action_history = ActionHistoryTracker()
+        # Phase 8.2 telemetry: per-episode counters tracking whether the
+        # reward-shape patches (6643917 floor-clear/boss-damage + 65b5196
+        # rest-HP/potion) are actually shifting observed behavior. Reset
+        # at episode start, surfaced in info["episode_telemetry"] at
+        # terminal step so async_ready_collector flattens them into
+        # reset_events.jsonl.
+        self._episode_telemetry: dict[str, float] = self._blank_telemetry()
         self._run_memory = RunMemoryTracker(
             episode_mode="full_run",
             potion_mechanics_available=True,
         )
         self._combat_memory = CombatMemoryTracker()
+
+    @staticmethod
+    def _blank_telemetry() -> dict[str, float]:
+        """Zeroed per-episode behavior-counter dict.
+
+        Keys chosen so a flat JSON write into reset_events is easy
+        to grep/aggregate. Floats + ints both stored as floats (json
+        serialization doesn't care and downstream aggregators cast).
+        """
+        return {
+            # Potion usage ----------------------------------------------
+            "potion_use_count": 0.0,
+            "potion_use_boss_count": 0.0,
+            "potion_use_elite_count": 0.0,
+            "potion_use_bonus_total": 0.0,
+            "potion_discard_count": 0.0,
+            # Rest site -------------------------------------------------
+            "rest_site_encounters": 0.0,
+            "rest_heal_chosen": 0.0,
+            "rest_skip_heal_chosen": 0.0,
+            "rest_skip_heal_at_low_hp": 0.0,
+            "rest_penalty_total": 0.0,
+            # Boss combat ------------------------------------------------
+            "boss_damage_dealt_raw": 0.0,
+            "boss_damage_bonus_total": 0.0,
+            "boss_encounter_steps": 0.0,
+            # Floor clear ladder ----------------------------------------
+            "floor_clear_reward_total": 0.0,
+            "floor_clear_events": 0.0,
+            "boss_floor_entry_events": 0.0,
+        }
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -144,6 +182,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._stuck_fingerprint = None
         self._stuck_steps = 0
         self._action_history.reset()
+        self._episode_telemetry = self._blank_telemetry()
 
         bridge_started = time.perf_counter()
         result = self._reset_with_ready_gate(timeout_ms=self.reset_timeout_ms)
@@ -333,10 +372,16 @@ class SlayTheSpire2EnvV2(gym.Env):
         )
         aux_elapsed_ms = (time.perf_counter() - aux_started) * 1000.0
         info_started = time.perf_counter()
+        # Phase 8.2 telemetry: surface the per-episode counters into
+        # info at EVERY step (cheap, tiny dict). async_ready_collector
+        # only actually reads them on terminal events, but making them
+        # always-available keeps the info schema uniform across steps.
+        episode_telemetry_snapshot = dict(self._episode_telemetry)
         info = self._build_info(
             bridge_info,
             extra={
                 "aux_targets": aux_targets,
+                "episode_telemetry": episode_telemetry_snapshot,
                 "python_timing_ms": self._python_timing(
                     bridge_roundtrip=bridge_elapsed_ms,
                     run_memory_update=run_memory_elapsed_ms,
@@ -551,6 +596,10 @@ class SlayTheSpire2EnvV2(gym.Env):
         """
         if not self._is_boss_encounter(before_obs) and not self._is_boss_encounter(after_obs):
             return 0.0
+        # Count any step where one side of the transition was a boss
+        # encounter, even if no damage this tick (captures block / setup
+        # turns so we can see "boss engagement density" not just dmg).
+        self._episode_telemetry["boss_encounter_steps"] += 1.0
         before_total = self._combat_enemy_total_hp(before_obs)
         after_total = self._combat_enemy_total_hp(after_obs)
         if before_total <= 0.0:
@@ -558,12 +607,15 @@ class SlayTheSpire2EnvV2(gym.Env):
         raw_damage = max(before_total - after_total, 0.0)
         if raw_damage <= 0.0:
             return 0.0
+        self._episode_telemetry["boss_damage_dealt_raw"] += float(raw_damage)
         extra_multiplier = max(BOSS_DAMAGE_MULTIPLIER - 1.0, 0.0)
         bonus = raw_damage * ENEMY_HP_DELTA_REWARD_SCALE * extra_multiplier
         # Cap using the same safety bound as the base path, scaled by
         # the extra multiplier so total boss damage reward can be up
         # to MULTIPLIER × ENEMY_HP_DELTA_REWARD_MAX_ABS.
-        return min(bonus, ENEMY_HP_DELTA_REWARD_MAX_ABS * extra_multiplier)
+        bonus = min(bonus, ENEMY_HP_DELTA_REWARD_MAX_ABS * extra_multiplier)
+        self._episode_telemetry["boss_damage_bonus_total"] += float(bonus)
+        return bonus
 
     def _rest_site_skip_heal_penalty(
         self,
@@ -605,8 +657,14 @@ class SlayTheSpire2EnvV2(gym.Env):
             or any(marker in action_id for marker in heal_markers)
             or any(marker in label for marker in heal_markers)
         )
+        # Telemetry: always count rest-site encounters + the HEAL/non-HEAL
+        # split, regardless of HP threshold. Helps diagnose "is the
+        # policy even reaching campfires" vs "is it choosing correctly".
+        self._episode_telemetry["rest_site_encounters"] += 1.0
         if heal_picked:
+            self._episode_telemetry["rest_heal_chosen"] += 1.0
             return 0.0
+        self._episode_telemetry["rest_skip_heal_chosen"] += 1.0
 
         if not isinstance(before_obs, dict):
             return 0.0
@@ -620,7 +678,10 @@ class SlayTheSpire2EnvV2(gym.Env):
         hp_ratio = hp / max_hp
         if hp_ratio >= REST_SITE_SKIP_HEAL_HP_THRESHOLD:
             return 0.0
-        return float(REST_SITE_SKIP_HEAL_PENALTY)
+        penalty = float(REST_SITE_SKIP_HEAL_PENALTY)
+        self._episode_telemetry["rest_skip_heal_at_low_hp"] += 1.0
+        self._episode_telemetry["rest_penalty_total"] += penalty
+        return penalty
 
     def _potion_use_bonus(
         self,
@@ -644,15 +705,26 @@ class SlayTheSpire2EnvV2(gym.Env):
         if not isinstance(action, dict):
             return 0.0
         kind = str(action.get("kind") or "").lower()
+        if kind == "discard_potion":
+            self._episode_telemetry["potion_discard_count"] += 1.0
+            return 0.0
         if kind != "use_potion":
             return 0.0
+        self._episode_telemetry["potion_use_count"] += 1.0
         base = float(POTION_USE_BASE_BONUS)
         if self._is_boss_encounter(before_obs):
-            return base * float(POTION_USE_BOSS_MULTIPLIER)
+            bonus = base * float(POTION_USE_BOSS_MULTIPLIER)
+            self._episode_telemetry["potion_use_boss_count"] += 1.0
+            self._episode_telemetry["potion_use_bonus_total"] += bonus
+            return bonus
         run = before_obs.get("run") if isinstance(before_obs, dict) and isinstance(before_obs.get("run"), dict) else {}
         state_type = str(run.get("state_type") or run.get("room_type") or "").strip().lower()
         if state_type in {"elite", "miniboss"}:
-            return base * float(POTION_USE_ELITE_MULTIPLIER)
+            bonus = base * float(POTION_USE_ELITE_MULTIPLIER)
+            self._episode_telemetry["potion_use_elite_count"] += 1.0
+            self._episode_telemetry["potion_use_bonus_total"] += bonus
+            return bonus
+        self._episode_telemetry["potion_use_bonus_total"] += base
         return base
 
     def _floor_clear_reward(
@@ -687,8 +759,14 @@ class SlayTheSpire2EnvV2(gym.Env):
         if after_floor < FLOOR_CLEAR_MIN_FLOOR:
             return 0.0
         if after_floor in BOSS_ACT_FLOORS:
-            return float(BOSS_FLOOR_ENTRY_BONUS)
-        return float(FLOOR_CLEAR_BONUS_PER_FLOOR)
+            reward = float(BOSS_FLOOR_ENTRY_BONUS)
+            self._episode_telemetry["boss_floor_entry_events"] += 1.0
+            self._episode_telemetry["floor_clear_reward_total"] += reward
+            return reward
+        reward = float(FLOOR_CLEAR_BONUS_PER_FLOOR)
+        self._episode_telemetry["floor_clear_events"] += 1.0
+        self._episode_telemetry["floor_clear_reward_total"] += reward
+        return reward
 
     def _progress_fingerprint(self) -> tuple:
         """Coarse snapshot of 'has the world meaningfully advanced?' signals.

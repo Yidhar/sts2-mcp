@@ -640,6 +640,17 @@ class AsyncReadyCollector:
     ) -> None:
         bridge_info = transition_info.get("bridge_info") if isinstance(transition_info, dict) else None
         bridge_info = bridge_info if isinstance(bridge_info, dict) else {}
+        # Phase 8.2 telemetry: per-episode behavior counters (potion
+        # use, rest-site choices, boss damage, floor-clear events) set
+        # in SlayTheSpire2EnvV2._episode_telemetry. Flattened into the
+        # terminal event alongside existing bridge_info / reward_breakdown
+        # fields.
+        telemetry = (
+            transition_info.get("episode_telemetry")
+            if isinstance(transition_info, dict)
+            else None
+        )
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
         bridge_action = bridge_info.get("action") if isinstance(bridge_info.get("action"), dict) else {}
         step_timing = bridge_info.get("step_timing_ms") if isinstance(bridge_info.get("step_timing_ms"), dict) else {}
         step_counts = bridge_info.get("step_timing_counts") if isinstance(bridge_info.get("step_timing_counts"), dict) else {}
@@ -724,6 +735,25 @@ class AsyncReadyCollector:
                 "stable_iterations": step_counts.get("stable_iterations"),
                 "worker_restart_happened": restart_count > 0,
                 "worker_restart_count": restart_count,
+                # Phase 8.2 reward-shape telemetry (from env_v2's
+                # per-episode counters). Flat fields so grep / jq /
+                # pandas aggregation is trivial.
+                "potion_use_count": telemetry.get("potion_use_count"),
+                "potion_use_boss_count": telemetry.get("potion_use_boss_count"),
+                "potion_use_elite_count": telemetry.get("potion_use_elite_count"),
+                "potion_use_bonus_total": telemetry.get("potion_use_bonus_total"),
+                "potion_discard_count": telemetry.get("potion_discard_count"),
+                "rest_site_encounters": telemetry.get("rest_site_encounters"),
+                "rest_heal_chosen": telemetry.get("rest_heal_chosen"),
+                "rest_skip_heal_chosen": telemetry.get("rest_skip_heal_chosen"),
+                "rest_skip_heal_at_low_hp": telemetry.get("rest_skip_heal_at_low_hp"),
+                "rest_penalty_total": telemetry.get("rest_penalty_total"),
+                "boss_damage_dealt_raw": telemetry.get("boss_damage_dealt_raw"),
+                "boss_damage_bonus_total": telemetry.get("boss_damage_bonus_total"),
+                "boss_encounter_steps": telemetry.get("boss_encounter_steps"),
+                "floor_clear_reward_total": telemetry.get("floor_clear_reward_total"),
+                "floor_clear_events": telemetry.get("floor_clear_events"),
+                "boss_floor_entry_events": telemetry.get("boss_floor_entry_events"),
             }
         )
 
