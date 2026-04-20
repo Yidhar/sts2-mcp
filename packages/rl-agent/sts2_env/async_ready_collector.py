@@ -754,6 +754,8 @@ class AsyncReadyCollector:
                 "floor_clear_reward_total": telemetry.get("floor_clear_reward_total"),
                 "floor_clear_events": telemetry.get("floor_clear_events"),
                 "boss_floor_entry_events": telemetry.get("boss_floor_entry_events"),
+                "potion_hoarding_unused_at_end": telemetry.get("potion_hoarding_unused_at_end"),
+                "potion_hoarding_penalty_total": telemetry.get("potion_hoarding_penalty_total"),
             }
         )
 

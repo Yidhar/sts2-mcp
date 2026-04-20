@@ -64,28 +64,40 @@ BOSS_DAMAGE_MULTIPLIER = 5.0
 REST_SITE_SKIP_HEAL_HP_THRESHOLD = 0.60
 REST_SITE_SKIP_HEAL_PENALTY = -0.15
 
-# Potion-use bonus — encounter-scoped absolute values (NOT a base×mult).
+# Potion-use bonus — encounter-scoped absolute values (NOT a base×mult)
+# with a hoarding penalty at episode end.
 #
-# Phase 8.2b initially used a flat base bonus + boss/elite multipliers,
-# but first-run telemetry (153 uses / 66 eps = 2.32/ep, but 100% on
-# ordinary monsters and 0% on boss/elite) showed the 0.10 base made
-# non-boss potion use net-positive enough that the policy burned
-# potions on easy fights before ever reaching the decisive ones.
-# Removing the base and keeping only the encounter-specific absolute
-# bonuses: policy gets 0 reward signal for burning a potion on a
-# cultist, but +0.20 / +0.30 for saving it for elite / boss. The
-# POTION_USE_MONSTER_PENALTY is a small negative correction that can
-# be enabled to actively discourage early-floor use; defaulted to 0
-# to keep the change conservative and avoid over-fitting.
-POTION_USE_MONSTER_BONUS = 0.0
+# Design iteration history:
+#   v1 (65b5196): flat base 0.10 + 2x/3x elite/boss multipliers. Result:
+#     153 uses / 66 eps, but 100% in monster fights — the 0.10 base
+#     made non-boss use net-positive so policy burned potions before
+#     ever reaching a boss.
+#   v2 (84f8ca6): base removed, monster use = 0. Result: policy now
+#     indifferent between "use in monster" and "never use" (both 0).
+#     Still wastes potions that sit unused through episode end.
+#   v3 (this commit): small positive for any use, bigger for elite,
+#     biggest for boss, PLUS per-unused-potion penalty at episode end.
+#     Ranking the policy sees: boss > elite > monster > hoard.
+POTION_USE_MONSTER_BONUS = 0.05
 POTION_USE_ELITE_BONUS = 0.20
 POTION_USE_BOSS_BONUS = 0.30
-# Optional negative signal on monster-fight potion use. Stays strictly
-# smaller in magnitude than a floor-clear bonus (0.30) so policy can
-# never learn "avoid having potions" as a shortcut. Enable by setting
-# to a negative value like -0.05 if telemetry still shows monster-fight
-# burning after the base-removal patch.
+# Optional ADDITIONAL negative signal layered on monster-fight use.
+# Defaulted to 0. Only enable if the hoarding penalty isn't enough
+# pressure and the policy still prefers monster-fight burning over
+# saving for bosses. Must stay |x| < FLOOR_CLEAR_BONUS_PER_FLOOR so
+# policy can't learn "avoid potions entirely" as a shortcut.
 POTION_USE_MONSTER_PENALTY = 0.0
+
+# End-of-episode hoarding penalty per unused potion. Fires on BOTH
+# terminated and truncated episode ends (unused potions are wasted
+# regardless of win/loss/watchdog). STS has 3 potion slots max, so
+# worst case = 3 × PENALTY = -0.30, which is intentionally capped at
+# exactly FLOOR_CLEAR_BONUS_PER_FLOOR so policy can never learn
+# "avoid having potions in inventory" — the savings from skipping
+# a potion reward event are always bounded by the guaranteed
+# floor-clear value of actually progressing.
+POTION_HOARDING_PENALTY_PER_POTION = -0.10
+POTION_HOARDING_MAX_PENALTY_ABS = 0.30
 
 # Enemies reporting hp above this are treated as sentinel-invulnerable (e.g.
 # WATERFALL_GIANT_BOSS has hp ≈ 1e9 until a kill condition triggers). Without

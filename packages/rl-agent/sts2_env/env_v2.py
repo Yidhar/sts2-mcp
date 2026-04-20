@@ -44,6 +44,8 @@ from .reward_constants import (
     FULL_RUN_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
     INVALID_ACTION_REWARD,
     PLAYER_HP_LOSS_REWARD_SCALE,
+    POTION_HOARDING_MAX_PENALTY_ABS,
+    POTION_HOARDING_PENALTY_PER_POTION,
     POTION_USE_BOSS_BONUS,
     POTION_USE_ELITE_BONUS,
     POTION_USE_MONSTER_BONUS,
@@ -167,6 +169,9 @@ class SlayTheSpire2EnvV2(gym.Env):
             "floor_clear_reward_total": 0.0,
             "floor_clear_events": 0.0,
             "boss_floor_entry_events": 0.0,
+            # Hoarding penalty (fires at episode end) --------------------
+            "potion_hoarding_unused_at_end": 0.0,
+            "potion_hoarding_penalty_total": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -314,6 +319,15 @@ class SlayTheSpire2EnvV2(gym.Env):
         reward += self._potion_use_bonus(prev_obs, legal_action)
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
+        # Phase 8.2c: end-of-episode hoarding penalty. Unused potions
+        # left in inventory at episode end are wasted resources — the
+        # penalty creates a gradient against "never use potions" so
+        # the ranking the policy sees becomes boss > elite > monster >
+        # hoard. Capped at one floor-clear bonus so it can't dominate
+        # progression incentive.
+        reward += self._potion_hoarding_penalty(
+            self._last_obs_raw, terminated=terminated, truncated=truncated,
+        )
         bridge_info = result.get("info", {})
         # Phase 8 Tier 1: record the transition into the action-history
         # tracker. Done here (before soft-rebind / recovery) so the "next"
@@ -736,6 +750,63 @@ class SlayTheSpire2EnvV2(gym.Env):
         monster_signal = float(POTION_USE_MONSTER_BONUS) + float(POTION_USE_MONSTER_PENALTY)
         self._episode_telemetry["potion_use_bonus_total"] += monster_signal
         return monster_signal
+
+    @staticmethod
+    def _count_nonempty_potions(obs: dict[str, Any] | None) -> int:
+        """How many real potions are currently in the inventory.
+
+        STS2 represents empty potion slots as the string "[empty]" (or
+        a dict with that title). Only count actual potions. Returns 0
+        on malformed obs.
+        """
+        if not isinstance(obs, dict):
+            return 0
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else None
+        if not isinstance(player, dict):
+            return 0
+        potions = player.get("potions")
+        if not isinstance(potions, list):
+            return 0
+        count = 0
+        for potion in potions:
+            if isinstance(potion, str):
+                s = potion.strip()
+                if s and s != "[empty]":
+                    count += 1
+            elif isinstance(potion, dict):
+                title = str(potion.get("title") or potion.get("id") or "").strip()
+                if title and title != "[empty]":
+                    count += 1
+        return count
+
+    def _potion_hoarding_penalty(
+        self,
+        final_obs: dict[str, Any] | None,
+        *,
+        terminated: bool,
+        truncated: bool,
+    ) -> float:
+        """One-shot penalty at episode end per unused potion in inventory.
+
+        Fires on both natural termination (death/victory) and watchdog
+        truncation — any end-of-episode unused potion is a wasted
+        resource regardless of cause. Capped at
+        POTION_HOARDING_MAX_PENALTY_ABS so the total penalty can never
+        exceed one floor-clear bonus, preserving the "policy should
+        still prefer to have potions over not having them" invariant.
+        """
+        if not (terminated or truncated):
+            return 0.0
+        unused = self._count_nonempty_potions(final_obs)
+        if unused <= 0:
+            return 0.0
+        raw = unused * float(POTION_HOARDING_PENALTY_PER_POTION)
+        cap = float(POTION_HOARDING_MAX_PENALTY_ABS)
+        # Keep the sign; clip magnitude.
+        penalty = max(raw, -cap) if raw < 0 else min(raw, cap)
+        self._episode_telemetry["potion_hoarding_unused_at_end"] = float(unused)
+        self._episode_telemetry["potion_hoarding_penalty_total"] += penalty
+        return penalty
 
     def _floor_clear_reward(
         self,
