@@ -44,6 +44,11 @@ from .reward_constants import (
     FULL_RUN_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
     INVALID_ACTION_REWARD,
     PLAYER_HP_LOSS_REWARD_SCALE,
+    POTION_USE_BASE_BONUS,
+    POTION_USE_BOSS_MULTIPLIER,
+    POTION_USE_ELITE_MULTIPLIER,
+    REST_SITE_SKIP_HEAL_HP_THRESHOLD,
+    REST_SITE_SKIP_HEAL_PENALTY,
 )
 
 INVALID_ACTION_REASON = "invalid_action_index"
@@ -262,6 +267,11 @@ class SlayTheSpire2EnvV2(gym.Env):
         # the 800k baseline.
         reward += self._floor_clear_reward(prev_obs, self._last_obs_raw)
         reward += self._boss_damage_bonus_reward(prev_obs, self._last_obs_raw)
+        # Phase 8.2b: non-combat decision shaping. Fires only when
+        # the action that was just dispatched matches specific kinds
+        # (rest / use_potion) so it can't distort combat-step rewards.
+        reward += self._rest_site_skip_heal_penalty(prev_obs, legal_action)
+        reward += self._potion_use_bonus(prev_obs, legal_action)
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
         bridge_info = result.get("info", {})
@@ -554,6 +564,96 @@ class SlayTheSpire2EnvV2(gym.Env):
         # the extra multiplier so total boss damage reward can be up
         # to MULTIPLIER × ENEMY_HP_DELTA_REWARD_MAX_ABS.
         return min(bonus, ENEMY_HP_DELTA_REWARD_MAX_ABS * extra_multiplier)
+
+    def _rest_site_skip_heal_penalty(
+        self,
+        before_obs: dict[str, Any] | None,
+        action: dict[str, Any] | None,
+    ) -> float:
+        """Penalize picking a non-HEAL rest-site option when low on HP.
+
+        Magnitude stays strictly below FLOOR_CLEAR_BONUS_PER_FLOOR so
+        the policy can never prefer "skip the campfire tile entirely
+        on the map" over "take the campfire tile and pick SMITH". The
+        within-campfire contrast between HEAL and non-HEAL is what we
+        want biased, not the campfire-vs-monster decision at map time.
+
+        Activates only when:
+          1. action kind is a rest-site choice
+          2. the chosen option isn't HEAL/REST
+          3. player HP ratio (pre-step) is below the threshold
+        """
+        if not isinstance(action, dict):
+            return 0.0
+        kind = str(action.get("kind") or "").lower()
+        if kind not in {"rest", "rest_site", "choose_rest_option"}:
+            return 0.0
+        option = action.get("option") if isinstance(action.get("option"), dict) else None
+        option_type = ""
+        option_title = ""
+        if isinstance(option, dict):
+            option_type = str(option.get("type") or option.get("option_type") or "").lower()
+            option_title = str(option.get("title") or option.get("label") or "").lower()
+        # Also check the action's own label / action_id in case the
+        # option dict isn't populated (sim compat path).
+        action_id = str(action.get("action_id") or "").lower()
+        label = str(action.get("label") or "").lower()
+        heal_markers = ("rest", "heal")
+        heal_picked = (
+            option_type in {"rest", "heal"}
+            or any(marker in option_title for marker in heal_markers)
+            or any(marker in action_id for marker in heal_markers)
+            or any(marker in label for marker in heal_markers)
+        )
+        if heal_picked:
+            return 0.0
+
+        if not isinstance(before_obs, dict):
+            return 0.0
+        player = before_obs.get("player") if isinstance(before_obs.get("player"), dict) else None
+        if not isinstance(player, dict):
+            return 0.0
+        hp = _float(player.get("hp"))
+        max_hp = max(_float(player.get("max_hp"), 1.0), 1.0)
+        if hp <= 0.0:
+            return 0.0
+        hp_ratio = hp / max_hp
+        if hp_ratio >= REST_SITE_SKIP_HEAL_HP_THRESHOLD:
+            return 0.0
+        return float(REST_SITE_SKIP_HEAL_PENALTY)
+
+    def _potion_use_bonus(
+        self,
+        before_obs: dict[str, Any] | None,
+        action: dict[str, Any] | None,
+    ) -> float:
+        """Encourage use_potion actions, with context-dependent scaling.
+
+        STS potions are single-use combat consumables that, by the
+        800k baseline, the policy had learned to hoard almost
+        indefinitely. Base hp/damage rewards didn't distinguish them
+        enough from card plays to overcome the implicit "save it for
+        later" bias. This flat bonus lifts the expected value of
+        use_potion slightly above an equivalent-damage card play, and
+        the boss/elite multipliers concentrate the bias where potions
+        actually matter.
+
+        Only fires for ``use_potion`` — ``discard_potion`` gets
+        nothing (discarding is itself a waste signal).
+        """
+        if not isinstance(action, dict):
+            return 0.0
+        kind = str(action.get("kind") or "").lower()
+        if kind != "use_potion":
+            return 0.0
+        base = float(POTION_USE_BASE_BONUS)
+        if self._is_boss_encounter(before_obs):
+            return base * float(POTION_USE_BOSS_MULTIPLIER)
+        run = before_obs.get("run") if isinstance(before_obs, dict) and isinstance(before_obs.get("run"), dict) else {}
+        state_type = str(run.get("state_type") or run.get("room_type") or "").strip().lower()
+        if state_type in {"elite", "miniboss"}:
+            return base * float(POTION_USE_ELITE_MULTIPLIER)
+        return base
 
     def _floor_clear_reward(
         self,

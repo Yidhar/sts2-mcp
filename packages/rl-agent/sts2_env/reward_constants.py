@@ -46,6 +46,33 @@ BOSS_ACT_FLOORS = (17, 34, 51)
 # fights intrinsically more punishing.
 BOSS_DAMAGE_MULTIPLIER = 5.0
 
+# ---- Phase 8.2b — rest-site HP gate + potion-use shaping ----
+# The 800k policy learned to almost never use potions and to prefer
+# SMITH over HEAL at campfires even at dangerous HP levels. The base
+# hp-delta reward DOES already compensate resting (+~0.7 for a 24-hp
+# heal at scale 0.03) but the learned preference persists — the signal
+# is dominated by noise. These shaping terms provide direct gradient.
+
+# Penalty for picking a non-HEAL rest-site option (smith / dig / pray /
+# recall / clone / hatch / cook / toke / lift / ...) when the player's
+# HP ratio is below REST_SITE_SKIP_HEAL_HP_THRESHOLD. MUST stay smaller
+# in magnitude than FLOOR_CLEAR_BONUS_PER_FLOOR (0.30) — otherwise the
+# policy learns to AVOID campfire tiles on the map rather than use
+# them wisely. At -0.15 (half the floor-clear bonus) the per-campfire
+# net is still positive for the policy overall, just the within-rest-
+# site choice becomes biased toward HEAL when HP is low.
+REST_SITE_SKIP_HEAL_HP_THRESHOLD = 0.60
+REST_SITE_SKIP_HEAL_PENALTY = -0.15
+
+# Flat bonus for any ``use_potion`` action, with multipliers during
+# high-stakes encounters where potion expenditure is most justified.
+# Context detection reuses BOSS_ACT_FLOORS / state_type="boss" logic.
+# Elite multiplier is intentionally lower than boss — bosses are
+# decisive, elites are preparatory.
+POTION_USE_BASE_BONUS = 0.10
+POTION_USE_BOSS_MULTIPLIER = 3.0
+POTION_USE_ELITE_MULTIPLIER = 2.0
+
 # Enemies reporting hp above this are treated as sentinel-invulnerable (e.g.
 # WATERFALL_GIANT_BOSS has hp ≈ 1e9 until a kill condition triggers). Without
 # this filter the terminal hp→0 transition produces reward ≈ 1e7 and blows up
