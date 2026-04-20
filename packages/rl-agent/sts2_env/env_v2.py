@@ -44,9 +44,10 @@ from .reward_constants import (
     FULL_RUN_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
     INVALID_ACTION_REWARD,
     PLAYER_HP_LOSS_REWARD_SCALE,
-    POTION_USE_BASE_BONUS,
-    POTION_USE_BOSS_MULTIPLIER,
-    POTION_USE_ELITE_MULTIPLIER,
+    POTION_USE_BOSS_BONUS,
+    POTION_USE_ELITE_BONUS,
+    POTION_USE_MONSTER_BONUS,
+    POTION_USE_MONSTER_PENALTY,
     REST_SITE_SKIP_HEAL_HP_THRESHOLD,
     REST_SITE_SKIP_HEAL_PENALTY,
 )
@@ -711,21 +712,30 @@ class SlayTheSpire2EnvV2(gym.Env):
         if kind != "use_potion":
             return 0.0
         self._episode_telemetry["potion_use_count"] += 1.0
-        base = float(POTION_USE_BASE_BONUS)
+        # Encounter-scoped absolute bonuses. Unlike the earlier
+        # base×multiplier scheme, non-boss / non-elite use gets
+        # MONSTER_BONUS (default 0) or MONSTER_PENALTY (default 0)
+        # — there's no longer an unconditional positive gradient for
+        # use_potion in ordinary combat. First-run telemetry showed
+        # the previous base bonus caused the policy to burn all
+        # potions on floor 3-7 monsters before reaching the boss.
         if self._is_boss_encounter(before_obs):
-            bonus = base * float(POTION_USE_BOSS_MULTIPLIER)
+            bonus = float(POTION_USE_BOSS_BONUS)
             self._episode_telemetry["potion_use_boss_count"] += 1.0
             self._episode_telemetry["potion_use_bonus_total"] += bonus
             return bonus
         run = before_obs.get("run") if isinstance(before_obs, dict) and isinstance(before_obs.get("run"), dict) else {}
         state_type = str(run.get("state_type") or run.get("room_type") or "").strip().lower()
         if state_type in {"elite", "miniboss"}:
-            bonus = base * float(POTION_USE_ELITE_MULTIPLIER)
+            bonus = float(POTION_USE_ELITE_BONUS)
             self._episode_telemetry["potion_use_elite_count"] += 1.0
             self._episode_telemetry["potion_use_bonus_total"] += bonus
             return bonus
-        self._episode_telemetry["potion_use_bonus_total"] += base
-        return base
+        # Monster-fight use — net signal depends on whether the
+        # optional penalty is configured. Default config gives 0.
+        monster_signal = float(POTION_USE_MONSTER_BONUS) + float(POTION_USE_MONSTER_PENALTY)
+        self._episode_telemetry["potion_use_bonus_total"] += monster_signal
+        return monster_signal
 
     def _floor_clear_reward(
         self,

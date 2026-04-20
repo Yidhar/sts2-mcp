@@ -64,14 +64,28 @@ BOSS_DAMAGE_MULTIPLIER = 5.0
 REST_SITE_SKIP_HEAL_HP_THRESHOLD = 0.60
 REST_SITE_SKIP_HEAL_PENALTY = -0.15
 
-# Flat bonus for any ``use_potion`` action, with multipliers during
-# high-stakes encounters where potion expenditure is most justified.
-# Context detection reuses BOSS_ACT_FLOORS / state_type="boss" logic.
-# Elite multiplier is intentionally lower than boss — bosses are
-# decisive, elites are preparatory.
-POTION_USE_BASE_BONUS = 0.10
-POTION_USE_BOSS_MULTIPLIER = 3.0
-POTION_USE_ELITE_MULTIPLIER = 2.0
+# Potion-use bonus — encounter-scoped absolute values (NOT a base×mult).
+#
+# Phase 8.2b initially used a flat base bonus + boss/elite multipliers,
+# but first-run telemetry (153 uses / 66 eps = 2.32/ep, but 100% on
+# ordinary monsters and 0% on boss/elite) showed the 0.10 base made
+# non-boss potion use net-positive enough that the policy burned
+# potions on easy fights before ever reaching the decisive ones.
+# Removing the base and keeping only the encounter-specific absolute
+# bonuses: policy gets 0 reward signal for burning a potion on a
+# cultist, but +0.20 / +0.30 for saving it for elite / boss. The
+# POTION_USE_MONSTER_PENALTY is a small negative correction that can
+# be enabled to actively discourage early-floor use; defaulted to 0
+# to keep the change conservative and avoid over-fitting.
+POTION_USE_MONSTER_BONUS = 0.0
+POTION_USE_ELITE_BONUS = 0.20
+POTION_USE_BOSS_BONUS = 0.30
+# Optional negative signal on monster-fight potion use. Stays strictly
+# smaller in magnitude than a floor-clear bonus (0.30) so policy can
+# never learn "avoid having potions" as a shortcut. Enable by setting
+# to a negative value like -0.05 if telemetry still shows monster-fight
+# burning after the base-removal patch.
+POTION_USE_MONSTER_PENALTY = 0.0
 
 # Enemies reporting hp above this are treated as sentinel-invulnerable (e.g.
 # WATERFALL_GIANT_BOSS has hp ≈ 1e9 until a kill condition triggers). Without
