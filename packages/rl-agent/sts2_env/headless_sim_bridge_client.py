@@ -105,6 +105,16 @@ class HeadlessSimBridgeClient:
         from sts2_env._sim_translate import SelfInflictedHpTracker  # noqa: PLC0415
         self._self_inflicted_tracker = SelfInflictedHpTracker()
         self._last_in_combat: bool = False
+        # Combat-sandbox terminal-reward parity. Sim's C# side emits a flat
+        # -1.0 / +1.0 terminal reward which does NOT match live bridge mod's
+        # breakdown (BridgeGameApi.EnvHelpers.BuildEnvCombatSandboxReward-
+        # Breakdown). Live formula for sandbox loss: death(-2.0) +
+        # room_hp_delta_normalized*1.5 = -3.5 on full-HP-loss boss defeat.
+        # We track per-combat start state at combat_reset and override sim's
+        # terminal reward with the live-parity formula.
+        self._sandbox_start_hp: float | None = None
+        self._sandbox_max_hp: float | None = None
+        self._sandbox_encounter_id: str | None = None
         self._start_subprocess(startup_timeout_s)
 
     # ------------------------------------------------------------------
@@ -466,6 +476,11 @@ class HeadlessSimBridgeClient:
         if character is not None:
             params["character_id"] = _normalize_character(character)
         sim_state = self._rpc("reset", params)
+        # Full-run reset clears any combat_sandbox tracking — the sandbox
+        # reward formula shouldn't fire during full-run episodes.
+        self._sandbox_start_hp = None
+        self._sandbox_max_hp = None
+        self._sandbox_encounter_id = None
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
         )
@@ -626,6 +641,14 @@ class HeadlessSimBridgeClient:
                 f"{str(combat_result.get('error'))[:500]}"
             )
         sim_state = self._rpc("state")
+        # Capture starting HP for live-parity terminal reward computation.
+        # max_hp in the sandbox reset request sets the new combat's max;
+        # current_hp sets the starting HP. Fall back to observed player HP
+        # if either is missing from the request.
+        observed_hp = _extract_player_hp(sim_state)
+        self._sandbox_start_hp = float(current_hp if current_hp is not None else (observed_hp or 0))
+        self._sandbox_max_hp = float(max_hp if max_hp is not None else (observed_hp or 0))
+        self._sandbox_encounter_id = str(encounter_id) if encounter_id else None
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
         )
@@ -716,6 +739,48 @@ def _build_bridge_step_response(
     info = dict(sim_state.get("info") or {})
     if info_extra:
         info.update(info_extra)
+
+    # Live-parity combat_sandbox terminal reward. Live bridge mod emits a
+    # 5-term breakdown (BuildEnvCombatSandboxRewardBreakdown): combat_won
+    # (+1.0), room_hp_quality (clamp((hp-start)/max,-1,1) * 1.5), boss_clear
+    # (+1.5), elite_clear (+0.75), death (-2.0). Sim's C# side hardcodes
+    # -1.0 / +1.0 which training treats as ~uniform signal. Override here
+    # at terminal when we were running a sandbox combat. Clears sandbox
+    # tracking after firing so stale state can't bleed into the next run.
+    if terminal and client._sandbox_encounter_id is not None:
+        cur_hp = float(_extract_player_hp(sim_state) or 0)
+        start_hp = float(client._sandbox_start_hp or 0)
+        max_hp = float(client._sandbox_max_hp or 0)
+        enc = str(client._sandbox_encounter_id).upper()
+        room_hp_delta_normalized = 0.0
+        if max_hp > 0.0:
+            room_hp_delta_normalized = max(-1.0, min(1.0, (cur_hp - start_hp) / max_hp))
+        room_hp_quality_bonus = room_hp_delta_normalized * 1.5
+        combat_won = cur_hp > 0.0
+        combat_won_bonus = 1.0 if combat_won else 0.0
+        boss_clear_bonus = 1.5 if combat_won and enc.endswith("_BOSS") else 0.0
+        elite_clear_bonus = 0.75 if combat_won and enc.endswith("_ELITE") else 0.0
+        death_penalty = -2.0 if cur_hp <= 0.0 else 0.0
+        parity_reward = (
+            combat_won_bonus
+            + room_hp_quality_bonus
+            + boss_clear_bonus
+            + elite_clear_bonus
+            + death_penalty
+        )
+        info["_sandbox_parity_reward_breakdown"] = {
+            "sim_original_reward": float(reward),
+            "combat_won_bonus": combat_won_bonus,
+            "room_hp_quality_bonus": room_hp_quality_bonus,
+            "boss_clear_bonus": boss_clear_bonus,
+            "elite_clear_bonus": elite_clear_bonus,
+            "death_penalty": death_penalty,
+            "total": parity_reward,
+        }
+        reward = parity_reward
+        client._sandbox_start_hp = None
+        client._sandbox_max_hp = None
+        client._sandbox_encounter_id = None
 
     return {
         "ok": True,
