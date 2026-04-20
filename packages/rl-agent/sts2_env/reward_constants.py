@@ -13,6 +13,39 @@ ENEMY_HP_DELTA_REWARD_SCALE = 0.01
 PLAYER_HP_LOSS_REWARD_SCALE = 0.03
 INVALID_ACTION_REWARD = -1.0
 
+# ---- Phase 8.2 reward density shaping ----
+# After the 800k Phase 8 long-train, the policy reliably reached Act 1
+# boss (2% of episodes at floor 17) but almost never killed it
+# (0.05% at floor 18+). Diagnosis: binary terminal reward (+1 win /
+# -1 loss) carries too little signal density when diluted across ~150-
+# step episodes, and per-step hp-delta shaping doesn't distinguish boss
+# damage from act-1-cultist grind. Fix: dense floor-clear ladder +
+# boss-specific damage multiplier so value head can attribute "being
+# deep / fighting boss" as strongly positive.
+
+# Per-step bonus when the observation's run.floor increments past
+# FLOOR_CLEAR_MIN_FLOOR. Captures Act 1 late-game push without
+# rewarding easy early floors.
+FLOOR_CLEAR_MIN_FLOOR = 11
+FLOOR_CLEAR_BONUS_PER_FLOOR = 0.3
+# Boss-room entry gets an even larger one-shot bonus — this is the
+# trajectory that needs to become value-function-attractive so the
+# policy doesn't prefer "play safe, stall on floor 5-8".
+BOSS_FLOOR_ENTRY_BONUS = 2.0
+# Canonical STS2 act-boss floors (assumed: act length 16). If a mod
+# changes act length, the state_type=="boss" detection below catches
+# it as a fallback.
+BOSS_ACT_FLOORS = (17, 34, 51)
+
+# Multiplier applied ON TOP OF the base enemy_hp_delta reward when the
+# current encounter is flagged as a boss fight. 5.0 = total reward is
+# 5× what it would be for a basic monster of the same damage dealt.
+# Asymmetric: only damage dealt gets amplified, hp lost penalty stays
+# at base scale — we want the value function to rate "dealing damage
+# to boss" much higher than any non-boss action, not to make boss
+# fights intrinsically more punishing.
+BOSS_DAMAGE_MULTIPLIER = 5.0
+
 # Enemies reporting hp above this are treated as sentinel-invulnerable (e.g.
 # WATERFALL_GIANT_BOSS has hp ≈ 1e9 until a kill condition triggers). Without
 # this filter the terminal hp→0 transition produces reward ≈ 1e7 and blows up

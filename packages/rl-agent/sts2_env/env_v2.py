@@ -30,9 +30,14 @@ from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
 
 from .reward_constants import (
+    BOSS_ACT_FLOORS,
+    BOSS_DAMAGE_MULTIPLIER,
+    BOSS_FLOOR_ENTRY_BONUS,
     ENEMY_HP_DELTA_REWARD_MAX_ABS,
     ENEMY_HP_DELTA_REWARD_SCALE,
     ENEMY_HP_SENTINEL_THRESHOLD,
+    FLOOR_CLEAR_BONUS_PER_FLOOR,
+    FLOOR_CLEAR_MIN_FLOOR,
     FULL_RUN_WASTE_BASE as END_TURN_WASTE_BASE_PENALTY,
     FULL_RUN_WASTE_ENERGY as END_TURN_WASTE_ENERGY_PENALTY,
     FULL_RUN_WASTE_EXTRA_ACTION as END_TURN_WASTE_EXTRA_ACTION_PENALTY,
@@ -249,6 +254,14 @@ class SlayTheSpire2EnvV2(gym.Env):
         reward += self._enemy_hp_delta_reward(prev_obs, self._last_obs_raw)
         reward += self._player_hp_delta_reward(prev_obs, self._last_obs_raw)
         reward += end_turn_penalty
+        # Phase 8.2 reward density: per-floor-clear ladder +
+        # boss-damage multiplier. See reward_constants.py for why.
+        # These are dense positive signals meant to pull value-function
+        # attention toward "go deep / kill boss" trajectories that
+        # were otherwise indistinguishable from "grind floor 3-5" in
+        # the 800k baseline.
+        reward += self._floor_clear_reward(prev_obs, self._last_obs_raw)
+        reward += self._boss_damage_bonus_reward(prev_obs, self._last_obs_raw)
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
         bridge_info = result.get("info", {})
@@ -479,6 +492,103 @@ class SlayTheSpire2EnvV2(gym.Env):
         """
         if isinstance(self._last_obs_raw, dict):
             self._last_obs_raw["_action_history"] = self._action_history.to_obs_dict()
+
+    def _is_boss_encounter(self, obs: dict[str, Any] | None) -> bool:
+        """True when the observation represents a boss-room combat.
+
+        Primary signal is ``run.state_type == "boss"`` (sim emits it, real
+        bridge emits a compatible ``room_type``). Falls back to the
+        canonical act-boss floor list (17/34/51) for environments that
+        don't populate the string tag. Having two independent signals
+        keeps the bonus from over-firing on mis-tagged rooms — both
+        must at least not contradict the boss-ness judgment.
+        """
+        if not isinstance(obs, dict):
+            return False
+        run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
+        state_type = str(run.get("state_type") or run.get("room_type") or "").strip().lower()
+        if state_type == "boss":
+            return True
+        floor_val = run.get("floor")
+        try:
+            floor = int(floor_val) if floor_val is not None else 0
+        except (TypeError, ValueError):
+            floor = 0
+        if floor in BOSS_ACT_FLOORS:
+            # Only treat as boss if we're actually IN combat (avoids
+            # awarding bonus for walking onto the boss tile without the
+            # encounter starting yet).
+            combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else None
+            if isinstance(combat, dict) and combat.get("enemies"):
+                return True
+        return False
+
+    def _boss_damage_bonus_reward(
+        self,
+        before_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+    ) -> float:
+        """Additive bonus on damage dealt during boss encounters.
+
+        The base ``_enemy_hp_delta_reward`` already handles damage
+        dealing at 0.01/hp. This method adds ``(MULTIPLIER - 1) ×`` the
+        same raw delta when either side of the transition is flagged as
+        boss, so the NET effective multiplier on boss damage is
+        MULTIPLIER. Sign-asymmetric: only POSITIVE damage (enemy losing
+        HP) gets amplified — taking damage from boss still penalizes
+        at base scale, otherwise bosses would become MORE aversive in
+        value than normal monsters, the opposite of what we want.
+        """
+        if not self._is_boss_encounter(before_obs) and not self._is_boss_encounter(after_obs):
+            return 0.0
+        before_total = self._combat_enemy_total_hp(before_obs)
+        after_total = self._combat_enemy_total_hp(after_obs)
+        if before_total <= 0.0:
+            return 0.0
+        raw_damage = max(before_total - after_total, 0.0)
+        if raw_damage <= 0.0:
+            return 0.0
+        extra_multiplier = max(BOSS_DAMAGE_MULTIPLIER - 1.0, 0.0)
+        bonus = raw_damage * ENEMY_HP_DELTA_REWARD_SCALE * extra_multiplier
+        # Cap using the same safety bound as the base path, scaled by
+        # the extra multiplier so total boss damage reward can be up
+        # to MULTIPLIER × ENEMY_HP_DELTA_REWARD_MAX_ABS.
+        return min(bonus, ENEMY_HP_DELTA_REWARD_MAX_ABS * extra_multiplier)
+
+    def _floor_clear_reward(
+        self,
+        before_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+    ) -> float:
+        """One-shot bonus on every floor advancement past FLOOR_CLEAR_MIN_FLOOR.
+
+        Two-tier:
+          - Reaching a boss floor (BOSS_ACT_FLOORS) → BOSS_FLOOR_ENTRY_BONUS
+          - Reaching any other qualifying floor → FLOOR_CLEAR_BONUS_PER_FLOOR
+
+        Fires exactly once per floor transition (when floor strictly
+        increases), not every step. Decays back to zero on same-floor
+        combats. Low-floor advancement (floor 0-10) gives nothing —
+        those are the easy half of Act 1 where the policy already
+        regularly reaches, and rewarding them would be wasteful
+        shaping on solved states.
+        """
+        if not isinstance(before_obs, dict) or not isinstance(after_obs, dict):
+            return 0.0
+        before_run = before_obs.get("run") if isinstance(before_obs.get("run"), dict) else {}
+        after_run = after_obs.get("run") if isinstance(after_obs.get("run"), dict) else {}
+        try:
+            before_floor = int(before_run.get("floor") or 0)
+            after_floor = int(after_run.get("floor") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if after_floor <= before_floor:
+            return 0.0
+        if after_floor < FLOOR_CLEAR_MIN_FLOOR:
+            return 0.0
+        if after_floor in BOSS_ACT_FLOORS:
+            return float(BOSS_FLOOR_ENTRY_BONUS)
+        return float(FLOOR_CLEAR_BONUS_PER_FLOOR)
 
     def _progress_fingerprint(self) -> tuple:
         """Coarse snapshot of 'has the world meaningfully advanced?' signals.
