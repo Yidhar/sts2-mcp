@@ -294,6 +294,24 @@ Once this decision is acknowledged:
 
 Context: combat sandbox curriculum has ALREADY been run extensively and succeeded. Combat subpolicy is fine. The real problem is macro-decision transfer from sandbox (hand-crafted starting states) to full-run (self-produced starting states).
 
+## 🚨 SECOND REVISION (2026-04-20, later) — sandbox wins were MuZero era
+
+User clarified: **the 50% / 90% combat sandbox results are from the retired MuZero / MCTS-based architecture** (checkpoints named `muzero_combat_*`). After pivoting to the current PPO + attention architecture (Phase 6 → Phase 8), **combat-only sandbox training has never been run**.
+
+This invalidates the "freeze combat heads" path as written:
+
+- ❌ We can't warmstart from MuZero — different algorithm, different network topology, state-dict incompatible
+- ❌ We can't assume current PPO is combat-competent at floor-17-difficulty states — it's only been measured implicitly through floor reach (2-5% touch 17, and those 45 episodes at floor 17 are heavily filtered for "made it that far", not random boss-fight starting states)
+- ❌ The "P1' freeze-combat-heads" plan requires competent combat heads to freeze, which we don't actually have on the current arch
+
+Three possible interpretations, needs data:
+
+1. **Current PPO combat IS competent** — it's just diluted by macro gradient in full-run training. Easy to verify: run current checkpoint on combat sandbox, measure boss win rate. If >30%, proceed with freeze-heads plan.
+2. **Current PPO combat is weak** — the 2-5% boss touch reflects random survival, not skill. Need to actually train combat sandbox on current arch first.
+3. **Combat and macro are co-dependent** — can't really be trained separately on this arch. Need end-to-end with better exploration / longer horizons / potential-based shaping.
+
+**We need to measure before committing to any of the three.**
+
 ## The four macro decisions that break in full-run
 
 Each corresponds directly to a phase the Skada BC dataset covers:
@@ -309,6 +327,37 @@ Each corresponds directly to a phase the Skada BC dataset covers:
 Total Skada non-combat samples: **1.97M** of exactly the decisions the agent is failing on.
 
 ## New priority order (replaces original P1 / P2 / P3)
+
+### P-1 (NEW, MUST DO FIRST) — Measure current-arch combat competence
+
+**Goal**: stop assuming. Take the current Phase 8 checkpoint
+(`sim_phase8_longtrain_820k_20260420_000838/step_000819200`), run it against a curated combat sandbox slice covering Act 1 bosses + late Act 1 elite/hallway, and report boss win rate by encounter. This is the gate that decides which of three paths we're actually on.
+
+**Implementation**:
+- Reuse existing `evaluate_attention_policy.py --combat-sandbox` (already supports sandbox mode)
+- Need a curated Act 1 boss snapshot pool; reviewer note #4 says extend `resolve_snapshot_pool` to filter by `min_floor=17 / max_floor=17` rather than write a new exporter
+- Run 50-100 episodes per boss type (Ceremonial Beast / Vantom / The Kin / Waterfall Giant / Soul Fysh / Lagavulin Matriarch — both Overgrowth and Underdocks branches per codex §1.3.1)
+- Report: win rate, avg turns to kill, avg HP remaining on win, avg HP on loss
+
+**Budget**: 1-2 hours engineering (pool filter flags + eval script tweaks), 30 min compute.
+
+**Decision tree based on P-1 result**:
+
+| Boss win rate | Interpretation | Next path |
+|---|---|---|
+| ≥30% | Combat IS competent, just diluted in full-run gradient | Go P1' (freeze combat, train macro) — but with sandbox-eval-as-regression-test during full-run training |
+| 10-30% | Combat is weak — floor 17 reach was mostly luck | Go P0'' (actually train combat sandbox on current arch first) |
+| <10% | Current arch has combat problems we haven't seen | Debug first: attention architecture capacity? aux head alignment? Before any curriculum. |
+
+### P0'' (conditional on P-1 showing <30%) — Combat sandbox training on current arch
+
+**Only if P-1 says combat needs work.** Train PPO on combat-sandbox-only rollouts, 200-400k steps, warm-start from current Phase 8 checkpoint. Objective: get boss win rate to 30%+ before moving to macro-focused work.
+
+**Implementation**:
+- `train_attention_policy.py --combat-sandbox --snapshot-pool <filtered to Act 1 bosses>`
+- Use the same filter flags we add in P-1 (`min_floor=17 / encounter_ids=<boss list>`)
+- Keep reward shaping as is (it's already combat-aware via boss-damage multiplier)
+- Budget: 10-15h compute + 2h engineering
 
 ### P1' — Sandbox-to-full-run transfer via combat-head freezing
 
@@ -368,16 +417,40 @@ Only deploy after P1'+P2' if macro alignment is still under 50%.
 
 Codex report + reviewer note #11: tag `ancient` as distinct screen in telemetry + policy routing. Affects Ironclad too, mandatory high-leverage decisions. ~1 hour change.
 
-## Revised immediate actions
+## Revised-revised immediate actions (after MuZero clarification)
 
-1. **Verify the sandbox checkpoint we're supposed to warmstart from** — which sandbox run had 50% boss / 90% individual? Path please.
-2. **Extend `skada_bc_train.py` with `--phase-cap` flag** (reviewer note #8) — 20 min code change. Dump phase histogram at start, cap oversampled phases.
-3. **P2' first (BC calibration, quickest win)**: 30 min run on WSL+ROCm → 10k verify → commit the calibrated checkpoint.
-4. **P1' design** (freeze-combat-heads warmstart): needs checkpoint migration helper that loads sandbox weights, maps to full-run policy structure, freezes specified submodules. ~2 days engineering.
-5. **Skip the original "build_act1_boss_snapshot_pool.py" work entirely** — sandbox is already trained. We just need to LOAD it.
+**The MuZero-era sandbox checkpoints are not usable** — different algorithm, different state dict. We must establish combat competence on the current PPO arch from scratch or confirm it's already there implicitly.
 
-## Open questions (revised)
+Three concurrent tracks:
 
-1. **Which sandbox checkpoint to warmstart from?** The 50% / 90% run path + step number.
-2. **Freeze granularity for P1'**: freeze whole transformer backbone (conservative) vs only candidate_combat_head (aggressive)?
-3. **Do we have any full-run checkpoint that benefited from sandbox warmstart already?** If yes, its telemetry would show whether "combat skill transfers but macro skill doesn't" is indeed the failure mode I'm hypothesizing.
+### Track A (diagnosis-first, zero-risk): run P-1 now
+
+1. **Extend `resolve_snapshot_pool`** with `--snapshot-min-floor / --snapshot-max-floor / --snapshot-encounter-ids` flags (reviewer note #4). ~1 hour. Zero behavioral change; just filtering.
+2. **Run P-1 evaluation** against current Phase 8 checkpoint using the new filter flags. ~30 min compute. Report per-boss win rate.
+3. **Let the result decide** whether we go P0'' (combat training) or directly to P1' (freeze + macro).
+
+### Track B (parallel, cheap quick-win): P2' BC calibration
+
+Independent of P-1 / P0'' decisions. Runs in parallel on WSL+ROCm.
+
+1. **Extend `skada_bc_train.py` with `--phase-cap` flag** (reviewer note #8). 20 min code change.
+2. **Dump phase histogram** from `data/skada_bc/samples.jsonl` first to decide caps.
+3. **Run BC calibration**: 500k samples, per-phase capped, 30 min.
+4. **Verify with `eval_bc_calibration_delta.py`** on 5k held-out slice.
+5. **Keep the calibrated checkpoint** as a candidate starting point for whichever path Track A chooses.
+
+### Track C (implementation prep): freeze-heads infrastructure
+
+Regardless of whether P-1 says combat is strong or weak, we'll eventually want the freeze-heads capability. Prep the infrastructure now:
+
+1. Design `freeze_submodules` arg for the policy class, parameter-name patterns for "combat path" vs "macro path"
+2. Add a `--freeze-patterns` CLI flag that marks matched parameter tensors with `requires_grad=False`
+3. Add a matching `bc_freeze_patterns` concept to `skada_bc_train.py` so we can fine-tune ONLY specific heads
+
+Budget: 1 day engineering. Doesn't commit to a path, just enables both P1' and P0''-then-P1'.
+
+## Open questions (second revision)
+
+1. **Is there any evaluation output from the retired MuZero `muzero_combat_*` runs?** Its boss win rates might inform whether the difficulty is arch-specific or inherent to STS2 combat mechanics.
+2. **Does current Phase 8 `evaluate_attention_policy.py --combat-sandbox` actually produce per-encounter win rates?** Or does it just return aggregate floor reach? We need per-boss granularity for P-1.
+3. **What's the largest curated `data/curated_combat_snapshot_*` bucket available for Act 1 bosses?** If existing curated subsets already cover this, we skip the "extend resolve_snapshot_pool" work and just use `--snapshot-curated-subset act1_boss` directly if it exists.
