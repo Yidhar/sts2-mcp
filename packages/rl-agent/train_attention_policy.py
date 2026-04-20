@@ -114,11 +114,14 @@ def resolve_snapshot_pool(args) -> CombatSnapshotPool | None:
         return None
 
     encounter_tiers = parse_csv(getattr(args, "snapshot_encounter_tiers", None))
+    encounter_ids = parse_csv(getattr(args, "snapshot_encounter_ids", None))
     tier_weights = parse_weight_map(getattr(args, "snapshot_tier_weights", None))
     return CombatSnapshotPool.from_path(
         args.snapshot_pool,
         curated_subset=getattr(args, "snapshot_curated_subset", None),
+        build_id=getattr(args, "snapshot_build_id", None),
         encounter_tiers=encounter_tiers or None,
+        encounter_ids=encounter_ids or None,
         max_rows=getattr(args, "snapshot_max_rows", None),
         sample_mode=getattr(args, "snapshot_sample_mode", "encounter_balanced"),
         tier_weights=tier_weights or None,
@@ -581,6 +584,22 @@ def main() -> None:
         choices=("row_uniform", "encounter_balanced", "tier_weighted_encounter_balanced"),
     )
     parser.add_argument("--snapshot-encounter-tiers", type=str, default=None)
+    parser.add_argument(
+        "--snapshot-encounter-ids",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated encounter_ids to restrict the snapshot pool to "
+            "(e.g. ENCOUNTER.CEREMONIAL_BEAST_BOSS,ENCOUNTER.DOORMAKER_BOSS). "
+            "Used for targeted boss-sandbox curriculum on specific losers."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-build-id",
+        type=str,
+        default=None,
+        help="Restrict snapshot pool to rows whose build_id matches (e.g. v0.99.1).",
+    )
     parser.add_argument("--snapshot-tier-weights", type=str, default=None)
     parser.add_argument(
         "--snapshot-starter-early-boost",
