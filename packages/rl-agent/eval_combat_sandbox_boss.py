@@ -199,14 +199,41 @@ def main() -> None:
             reward_sum += float(reward)
             steps += 1
 
-        # Classify outcome
-        outcome = "win" if terminated and reward_sum > 0 else "truncated" if truncated else "loss"
-        # More robust: bridge usually sets info['combat_won'] or similar
+        # Classify outcome.
+        #
+        # DON'T use `reward_sum > 0` — the combat-end transition empties
+        # `combat.enemies` on both live and sim bridges, which can emit a
+        # false +5 "kill reward" via `_enemy_hp_delta_reward` even on
+        # losses. Prior to the 2026-04-20 fix this made ~every short loss
+        # classify as a win. Instead, trust:
+        #   1) explicit bridge outcome tag if present,
+        #   2) else terminal player HP (alive = win, dead = loss) since
+        #      combat-sandbox only terminates via kill or death.
         outcome_bridge = info.get("combat_outcome")
         if outcome_bridge == "win":
             outcome = "win"
         elif outcome_bridge in ("loss", "defeat"):
             outcome = "loss"
+        elif truncated:
+            outcome = "truncated"
+        elif terminated:
+            # Fallback: inspect terminal player HP from transition_state or raw_obs
+            terminal_player_hp = None
+            ts = info.get("transition_state")
+            if isinstance(ts, dict):
+                tp = ts.get("player")
+                if isinstance(tp, dict):
+                    terminal_player_hp = tp.get("hp")
+            if terminal_player_hp is None:
+                raw_obs = info.get("raw_obs")
+                if isinstance(raw_obs, dict):
+                    rp = raw_obs.get("player")
+                    if isinstance(rp, dict):
+                        terminal_player_hp = rp.get("hp")
+            outcome = "win" if (terminal_player_hp is not None and float(terminal_player_hp) > 0.0) else "loss"
+        else:
+            # Shouldn't happen — loop exited without terminated/truncated.
+            outcome = "truncated"
 
         per_encounter[encounter_id]["total"] += 1
         per_encounter[encounter_id][outcome if outcome in ("wins", "losses", "truncated") else {"win": "wins", "loss": "losses", "truncated": "truncated"}[outcome]] += 1

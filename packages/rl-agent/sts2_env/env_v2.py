@@ -547,6 +547,28 @@ class SlayTheSpire2EnvV2(gym.Env):
         after_total = self._combat_enemy_total_hp(after_obs)
         if before_total <= 0.0 and after_total <= 0.0:
             return 0.0
+
+        # Bridge empties `combat.enemies` the moment a combat ends (both
+        # death transitions and victory transitions). If the player died
+        # with enemies still alive, crediting (before_total - 0) emits a
+        # false "+5.66 kill reward" on the defeat step. Guard: skip the
+        # delta when after-state has empty enemies AND player is dead.
+        # Full-run episode doesn't usually terminate on player death (run
+        # ends), but combat-end transitions still drop enemies to [].
+        after_player_hp = 0.0
+        if isinstance(after_obs, dict):
+            player = after_obs.get("player") if isinstance(after_obs.get("player"), dict) else {}
+            after_player_hp = _float((player or {}).get("hp"))
+        # Both "enemies key missing (sim)" and "enemies=[] (live)" reduce
+        # to after_total==0 through _combat_enemy_total_hp. On player-death
+        # transitions we see that AND player_hp<=0; skip the delta.
+        if (
+            before_total > 0.0
+            and after_total <= 0.0
+            and after_player_hp <= 0.0
+        ):
+            return 0.0
+
         raw = (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
         if raw > ENEMY_HP_DELTA_REWARD_MAX_ABS:
             return ENEMY_HP_DELTA_REWARD_MAX_ABS

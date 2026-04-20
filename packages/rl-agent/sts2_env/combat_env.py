@@ -497,6 +497,36 @@ class CombatSandboxEnv(gym.Env):
         after_total = self._combat_enemy_total_hp(after_obs)
         if before_total <= 0.0 and after_total <= 0.0:
             return 0.0
+
+        # Guard against bridge clearing enemies list at terminal step when the
+        # player DIED. Both live bridge mod and sim drop `combat.enemies` to
+        # an empty list the moment the combat ends regardless of outcome —
+        # if we naively credit (before_total - 0) as "damage dealt", every
+        # loss emits a positive shaping reward equal to the still-alive
+        # enemies' total HP × 0.01. On a 566-HP terminal clear that's +5.66,
+        # which drowns the bridge's loss penalty (-3.5 live, -1.0 sim) and
+        # causes every short loss to be misclassified as a win under the
+        # eval's `reward_sum > 0` heuristic. Skip the delta when the
+        # after-state shows empty enemies AND the player is dead.
+        after_enemies: Any = None
+        after_player_hp = 0.0
+        if isinstance(after_obs, dict):
+            combat = after_obs.get("combat") if isinstance(after_obs.get("combat"), dict) else {}
+            after_enemies = combat.get("enemies") if isinstance(combat, dict) else None
+            player = after_obs.get("player") if isinstance(after_obs.get("player"), dict) else {}
+            after_player_hp = _float((player or {}).get("hp"))
+        # Both "enemies is missing key (sim: combat={in_progress:False})" and
+        # "enemies is empty list (live: combat={...,enemies:[]})" are terminal
+        # transitions. Catch both by checking after_total==0 (we already have
+        # that via _combat_enemy_total_hp == 0 when enemies not-a-list) AND
+        # player_hp<=0 (defeat).
+        if (
+            before_total > 0.0
+            and after_total <= 0.0
+            and after_player_hp <= 0.0
+        ):
+            return 0.0
+
         raw = (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
         if raw > ENEMY_HP_DELTA_REWARD_MAX_ABS:
             return ENEMY_HP_DELTA_REWARD_MAX_ABS
