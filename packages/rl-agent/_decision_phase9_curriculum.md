@@ -4,11 +4,45 @@
 **Author synthesis**: empirical telemetry + Anthropic white paper (`_design_sts2_rl_whitepaper.md`) + codex research report + 6 reward-shape iterations
 **Current commit**: `a8d532d` (potion v3 + hoarding penalty)
 
+---
+
+## 🚨 REVISION (2026-04-20 evening, after user correction)
+
+**Original P1 ("Act 1 boss curriculum") is REDUNDANT.** The team has already run combat-sandbox curriculum extensively — with tiered difficulty (weak / normal / elite / boss) and tiered deck quality. Sandbox results are STRONG:
+
+- **Overall boss win rate in sandbox: ~50%**
+- **Individual boss win rate: up to 90%+**
+- Combat subpolicy is functionally competent across all Act 1 bosses
+
+Yet full-run boss_kill rate is still ~0%. This means the gap is **NOT combat competence**, it's:
+
+1. **Sandbox → full-run transfer gap**: sandbox gives the policy a hand-crafted boss-fight starting state (specific deck, HP, relics, potions). Full-run policy produces its OWN starting states via 16 floors of macro decisions.
+2. **The full-run policy arrives at floor 17 (when it arrives at all) with bad decks + low HP + wrong relics**, because the 4 macro decision classes are untrained in the sandbox-only curriculum:
+   - **HP management** across floors (rest vs smith, route risk)
+   - **Route selection** (elite timing, shop/rest access before boss)
+   - **Deck construction** (which card_reward to pick, what to skip, what to remove)
+   - **Event decisions** (HP/gold/deck tradeoffs)
+
+**The correct Phase 9 is therefore NOT another combat curriculum.** It's:
+
+- **Transfer the already-good combat skill** from sandbox checkpoint into the full-run policy (warmstart + freeze combat-related heads)
+- **Train ONLY the macro decisions** with BC-calibration on Skada human data + potential-based shaping over deck quality + macro head split
+- **KPI shift**: measure macro decision quality directly (card_reward alignment, route-to-boss survival, deck quality at floor 17) rather than relying on boss-kill as the only signal
+
+See "Revised plan" section below. The original plan (kept for history) is now superseded.
+
+---
+
 ## TL;DR
 
-**Stop iterating on reward shaping.** Six shaping commits moved mean floor from 5.67 → 8.66 (+54%), but `Act 1 boss kill rate is mathematically bounded by `Act 1 boss touch rate`, which is 2-5% regardless of how we tune potion bonuses. Next serious gain requires changing WHICH samples the policy learns from, not what reward they earn.
+**Stop iterating on reward shaping.** Six shaping commits moved mean floor from 5.67 → 8.66 (+54%), but **Act 1 boss kill rate is mathematically bounded by Act 1 boss touch rate**, which is 2-5% regardless of how we tune potion bonuses. Next serious gain requires changing WHICH samples the policy learns from, not what reward they earn.
 
-**Decision**: pivot to **Act 1 boss curriculum via `CombatSandboxEnv`**, plus **BC calibration excluding campfire** (protect reward-shaped behaviors). Estimated cost: 2-3 days engineering. Expected impact: boss touch rate from 2-5% → 30-50% within curriculum pretrain, boss kill rate 0% → 5-15% after fine-tune.
+**Decision**: pivot to **Act 1 boss curriculum via `CombatSandboxEnv`**, plus **BC calibration excluding campfire** (protect reward-shaped behaviors). Estimated cost: 2-3 days engineering. Expected impact: **boss conversion conditional on reaching the boss** should move materially; full-run boss touch may improve only indirectly via combat transfer. The direct curriculum KPI should therefore be **sandbox boss survival / kill**, not "boss touch during curriculum pretrain".
+
+> **Reviewer note (audit, 2026-04-20):**
+> - I agree with the main pivot: stop micro-tuning shaping and move training signal upstream via curriculum.
+> - The one wording issue to fix is **boss touch vs boss conversion**. A boss-only sandbox does **not** directly optimize `P(reach floor 17)`; it optimizes `P(kill boss | reach floor 17 state)` and maybe transfers back to late Act 1 hallway fights.
+> - So Phase 9 should treat **boss touch** and **boss kill given touch** as separate KPIs, otherwise we risk declaring P1 a failure for the wrong reason.
 
 ## Evidence consolidated
 
@@ -96,9 +130,16 @@ These are mechanics we're currently missing in the observation:
 
 Freeze `reward_constants.py` at `a8d532d` values. 6 iterations was enough; diminishing returns confirmed. Further tuning is zero-ROI relative to the work below.
 
+> **Reviewer note:** freeze **reward magnitude iteration** by default, but do **not** freeze:
+> 1. reward/telemetry instrumentation,
+> 2. exploit fixes,
+> 3. sandbox-only shaping if a curriculum-specific bug appears.
+>
+> In other words: stop policy-chasing by retuning constants, but keep the ability to patch correctness issues.
+
 ### Priority 1 — Act 1 boss curriculum (COMMIT THIS)
 
-**Goal**: raise Act 1 boss touch rate from 5.7% to 50%+ by giving the policy direct combat training against bosses, then fine-tune on full-run.
+**Goal**: raise **Act 1 boss conversion** by giving the policy direct combat training against boss states, then fine-tune on full-run. In full-run metrics, the primary lift should be in `boss_kill | boss_touch`; any lift in `boss_touch` is a transfer bonus, not the direct target.
 
 **Deliverable**: a new `launch_act1_boss_sandbox.sh` + a snapshot pool scoped to Act 1 boss encounters.
 
@@ -107,17 +148,27 @@ Freeze `reward_constants.py` at `a8d532d` values. 6 iterations was enough; dimin
    - Scraping Skada runs for "entered floor 17" states (most realistic starting deck/relic/hp)
    - OR synthesizing via sim: replay known-good Skada traces to floor 17, dump state each time
 2. Use existing `CombatSandboxEnv` + `CombatSnapshotPool` (already built!)
-3. Train 200k steps against Act 1 boss snapshots ONLY
+   - **Reviewer note**: also reuse `launch_sandbox_starter_early_patch_20260418.sh` as the launch-script template instead of starting from a blank shell script.
+   - **Reviewer note**: before writing a bespoke snapshot exporter, consider the lower-cost option of extending `train_attention_policy.py` / `resolve_snapshot_pool()` to accept `snapshot_min_floor`, `snapshot_max_floor`, and/or explicit `snapshot_encounter_ids`. That may cut the engineering scope for P1.
+3. Train 200k steps against a **boss-heavy** Act 1 snapshot pool
    - `--combat-sandbox --snapshot-pool data/act1_boss_snapshots/`
-   - Weight: 100% Act 1 boss (no hallway dilution)
+   - **Reviewer recommendation**: do **not** make this 100% boss-only on day 1. Start with something like:
+     - 70-80% Act 1 boss
+     - 20-30% late Act 1 hard hallway / elite / pre-boss states
+   - Rationale: pure boss-only pretrain risks overfitting to floor-17 deck states and may not transfer enough to floors 12-16, which are the states that determine `boss_touch`.
 4. Fine-tune 200k steps on full-run warmstarted from sandbox checkpoint
    - 30/70 mix replay: 30% sandbox boss replays, 70% fresh full-run rollouts
+   - **Reviewer note**: this mixing policy is directionally good, but I do not think it is already present as a first-class training primitive in `train_attention_policy.py`. Treat it as an implementation task, not as "free because sandbox exists".
 
-**Expected**: boss-kill rate 0% → 5-15% within 400k sandbox + fine-tune.
+**Expected**: `boss_kill | boss_touch` should move first; overall boss-kill rate can plausibly go 0% → 5-15% only if touch is preserved or modestly improved during fine-tune.
 
 **Budget**: 2 days engineering (snapshot pool), 4-6h compute (sandbox), 10h (fine-tune).
 
 **Fallback if boss-kill still <5%**: it's a combat-skill ceiling, not exposure. Escalate to Priority 4.
+
+> **Reviewer note:** if P1 fails, distinguish between:
+> - **sandbox boss kill is good, full-run touch still low** → the bottleneck is not boss combat, it is macro / pre-boss survival / route / rewards;
+> - **sandbox boss kill is still poor** → then yes, escalate to combat-skill / belief-memory work.
 
 ### Priority 2 — BC calibration (excluding campfire)
 
@@ -131,6 +182,8 @@ Freeze `reward_constants.py` at `a8d532d` values. 6 iterations was enough; dimin
 - card_reward acc: 34.5% → 45%+
 - relic_relic: 32.3% → 45%+
 - relic_ancient: 57.1% → 65%+
+
+> **Reviewer note:** before running BC, dump a **phase histogram** from the Skada sample source. I want to avoid "map/proceed" rows numerically swamping the more valuable `card_reward` / `relic_ancient` supervision. If the mix is badly imbalanced, cap `map` or run per-phase quotas.
 
 ### Priority 3 — Macro head split (both reports agree)
 
@@ -149,6 +202,8 @@ Currently all decisions use a single candidate-conditioned policy head with 8 au
 
 **Expected**: each head's gradient stays focused on its phase's reward signal. Value loss on specific phases improves 15-30% (per Anthropic report).
 
+> **Reviewer note:** I agree with the direction, but I would **not** bundle P3 into P1 unless attribution clarity is unimportant. P1/P2 already change the sample distribution; adding head-split in the same window makes it much harder to know whether curriculum or architecture caused the gain. My preference: **P1 + P2 first, P3 after the first clean comparison**.
+
 ### Priority 4 — Conditional on P1 failing: recurrent belief memory
 
 Only if boss-kill rate still <5% after curriculum. Details in codex report §2.1 / Anthropic §3.
@@ -157,7 +212,11 @@ Only if boss-kill rate still <5% after curriculum. Details in codex report §2.1
 
 ### Priority 5 — Explicit STS2 mechanic encoding (long-horizon)
 
-From codex report: add encodings for Ancients / Enchantments / Afflictions / Unknown-room history / Act branches. Not urgent for Ironclad early-training but critical if we ever tackle Regent / Necrobinder / A10+.
+From codex report: add encodings for Ancients / Enchantments / Afflictions / Unknown-room history / Act branches. Not urgent for the full long-tail refactor, but **some** of this is already relevant for Ironclad.
+
+> **Reviewer note:** I would split this into:
+> - **P5a (cheap, do now/soon):** explicitly tag `ancient` as a screen / phase in telemetry and policy routing, because Ancients affect Ironclad too and are high-leverage decisions.
+> - **P5b (larger refactor):** full per-card enchantment / affliction / branch-history schema work.
 
 **Budget**: 1-2 weeks observation schema refactor. Lower priority until P1-P3 settle.
 
@@ -176,8 +235,12 @@ From codex report: add encodings for Ancients / Enchantments / Afflictions / Unk
 |---|---|
 | Act 1 boss survival rate (sandbox) | > 50% |
 | Act 1 boss kill rate (sandbox) | > 30% |
-| Full-run fine-tune mean_floor | > 12 |
+| Full-run boss kill given boss touch | materially up vs baseline |
+| Full-run boss_touch | non-decreasing (nice-to-have: moderate lift) |
+| Full-run fine-tune mean_floor | > 12 **or** clear gain in late-Act1 survival metrics |
 | Full-run boss_kill | > 2% |
+
+> **Reviewer note:** `mean_floor > 12` is a useful headline metric, but it should not be the only pass/fail gate for a **boss-centric** curriculum. If sandbox boss kill jumps and `boss_kill | boss_touch` jumps, but mean floor only moves modestly, that is still evidence P1 worked.
 
 ### After Priority 2 (BC calibration)
 
@@ -204,6 +267,11 @@ Escalate to Priority 4 (recurrent belief memory) OR Priority 5 (STS2 mechanic en
 2. **P1 vs P2 order**: run curriculum first (bigger impact, higher cost) or BC first (quick win, lower ceiling)?
 3. **P3 timing**: bundle macro head split with P1 checkpoint migration, or defer to Phase 10?
 
+> **Reviewer recommendation:**
+> 1. Start with **sim-synthesized** or existing curated subsets for speed, prove the loop, then backfill with Skada-scraped floor-17 states if the first sandbox result is promising.
+> 2. Run **P2 in parallel** because it is cheap, but do not let it block P1.
+> 3. **Defer P3** until after the first clean P1/P2 comparison unless you explicitly optimize for total wall-clock over experimental attribution.
+
 ## Immediate commit plan
 
 Once this decision is acknowledged:
@@ -219,3 +287,97 @@ Once this decision is acknowledged:
 - (external) codex STS2 research report — user pasted 2026-04-20
 - `_design_phase8_history.md` — Phase 8 Tier 1+2 architecture rationale
 - `_handoff_phase8_smoke.md` — Phase 8 smoke gate definitions
+
+---
+
+# Revised plan (2026-04-20 evening)
+
+Context: combat sandbox curriculum has ALREADY been run extensively and succeeded. Combat subpolicy is fine. The real problem is macro-decision transfer from sandbox (hand-crafted starting states) to full-run (self-produced starting states).
+
+## The four macro decisions that break in full-run
+
+Each corresponds directly to a phase the Skada BC dataset covers:
+
+| Decision class | Phase | Sandbox coverage | Full-run policy status | Skada samples available |
+|---|---|---|---|---|
+| HP management | `campfire` + implicit in `combat` | Starting HP given | Rest-HP gate overcorrects (100% HEAL, 0% SMITH); doesn't trade off | 187k (excluded from BC to protect shaping — but SEE below) |
+| Route selection | `map` | Starting node given | Greedy; doesn't plan for boss proximity / pre-boss rest | 877k |
+| Deck construction | `card_reward` | Starting deck given | 34% human agreement; picks low-value attacks, skips power cards | 527k |
+| Event decisions | `event_option` | N/A | Largely untested in current training signals | Mixed (part of map/proceed samples) |
+| Relic selection | `relic_relic` / `relic_ancient` | Starting relics given | 32% / 57% human agreement | 314k / 66k |
+
+Total Skada non-combat samples: **1.97M** of exactly the decisions the agent is failing on.
+
+## New priority order (replaces original P1 / P2 / P3)
+
+### P1' — Sandbox-to-full-run transfer via combat-head freezing
+
+**Goal**: when running PPO on full-run, freeze the combat subpolicy (which already works from sandbox) and pour gradient into macro heads only.
+
+**Why**: with single-shared-policy architecture, the COMBAT gradient dominates training volume (100+ combat steps per episode vs 5-8 macro decisions). The macro heads receive diluted signal even after shaping. Separating the gradient pressures eliminates this dilution.
+
+**Implementation**:
+1. Warmstart full-run PPO from the best sandbox checkpoint (which already handles bosses at 50-90%)
+2. Freeze parameters affecting combat action scoring:
+   - `combat_head` outputs (play_card / end_turn / use_potion candidate scoring)
+   - Power/history/enemy/runtime world banks (combat-context encoders)
+   - POWER_SLOT relation bias
+3. Train ONLY:
+   - Route/reward/shop/rest/event/ancient candidate scoring paths
+   - build/route aux heads
+   - value head (need to re-fit since full-run returns differ from sandbox)
+
+**Risk**: freezing combat might break when full-run produces novel boss-fight starting states the sandbox didn't cover. Mitigation: periodic unfreeze-and-retrain-combat passes if sandbox kill rate degrades.
+
+**Budget**: ~2 days engineering (freeze mechanics + retrain loop), 10-20h compute.
+
+**KPI**:
+- Sandbox boss kill rate (continuous check): stays ≥40%
+- Full-run mean_floor: 8.7 → 11+
+- Full-run deck quality at floor 17 (NEW metric): measurable via aux_build head
+
+### P2' — BC calibration on the 4 macro phases (elevated from original P2)
+
+**Now the top quick-win.** 500k samples on WSL+ROCm, ~30 min. Excludes campfire by default to protect rest-HP shaping, but with reviewer note #8 sampling balance:
+
+```bash
+# Per-phase sample cap to prevent map (877k) from swamping relic_ancient (66k)
+--phase-filter map,card_reward,relic_relic,relic_ancient
+--phase-cap 100000  # NEW flag: max samples per phase
+```
+
+This requires a small extension to `SkadaBcDataset` to track per-phase counts — reviewer note #8 is correct.
+
+**Expected deltas** (post-calibration, measured on held-out):
+- card_reward acc: 34.5% → 45-55%
+- relic_relic: 32.3% → 45-55%
+- relic_ancient: 57.1% → 65-70%
+- campfire: 0% (unchanged — by exclusion)
+
+### P3' — Macro head split (deferred per reviewer note #9)
+
+Defer until after P1' + P2' show clean comparison. Doing it now confounds attribution.
+
+### P4' — Conditional on macro decisions still weak: deck-quality potential shaping
+
+From Anthropic white paper: potential-based shaping `Φ(s) = deck_quality × boss_distance × floor`. Continuous gradient signal on "deck is getting better" every time a card is added/removed/upgraded.
+
+Only deploy after P1'+P2' if macro alignment is still under 50%.
+
+### P5' — Ancient screen as distinct phase (cheap, do alongside P3')
+
+Codex report + reviewer note #11: tag `ancient` as distinct screen in telemetry + policy routing. Affects Ironclad too, mandatory high-leverage decisions. ~1 hour change.
+
+## Revised immediate actions
+
+1. **Verify the sandbox checkpoint we're supposed to warmstart from** — which sandbox run had 50% boss / 90% individual? Path please.
+2. **Extend `skada_bc_train.py` with `--phase-cap` flag** (reviewer note #8) — 20 min code change. Dump phase histogram at start, cap oversampled phases.
+3. **P2' first (BC calibration, quickest win)**: 30 min run on WSL+ROCm → 10k verify → commit the calibrated checkpoint.
+4. **P1' design** (freeze-combat-heads warmstart): needs checkpoint migration helper that loads sandbox weights, maps to full-run policy structure, freezes specified submodules. ~2 days engineering.
+5. **Skip the original "build_act1_boss_snapshot_pool.py" work entirely** — sandbox is already trained. We just need to LOAD it.
+
+## Open questions (revised)
+
+1. **Which sandbox checkpoint to warmstart from?** The 50% / 90% run path + step number.
+2. **Freeze granularity for P1'**: freeze whole transformer backbone (conservative) vs only candidate_combat_head (aggressive)?
+3. **Do we have any full-run checkpoint that benefited from sandbox warmstart already?** If yes, its telemetry would show whether "combat skill transfers but macro skill doesn't" is indeed the failure mode I'm hypothesizing.
