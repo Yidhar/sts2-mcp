@@ -417,7 +417,65 @@ Only deploy after P1'+P2' if macro alignment is still under 50%.
 
 Codex report + reviewer note #11: tag `ancient` as distinct screen in telemetry + policy routing. Affects Ironclad too, mandatory high-leverage decisions. ~1 hour change.
 
-## Revised-revised immediate actions (after MuZero clarification)
+## 🎯 THIRD REVISION (2026-04-20, analysis/ + tmp/offline_dataset_full/ discovered)
+
+User pointed to pre-existing evaluation and dataset artifacts that change P-1 into a data look-up rather than a new experiment.
+
+### Eval data already exists — P-1 is effectively answered
+
+From `analysis/training_curves/`:
+
+| Checkpoint | Arch | Boss win rate | Elite | Normal | Weak | Samples |
+|---|---|---|---|---|---|---|
+| `muzero_step_00251923` | MuZero (retired) | **29.4%** | 76.0% | 86.9% | 94.3% | 1,915 |
+| `longtrain_ironclad_ckptrot_bridgefix_20260417_010123` | PPO+attention (Phase 6) | **15.4%** | 48.2% | 74.2% | 90.7% | 3,036 |
+| `sandbox_starter_early_patch_20260418_122809/step_000450560` | PPO+attention sandbox | untested on boss (20-ep benchmark, weak/normal/elite only) | — | — | — | 20 |
+
+**User's recollection was imprecise but the direction was right.** MuZero boss win was 29% (not 50%); current PPO is at 15% (not 0%). Both imply **combat subpolicy is not the critical bottleneck** — the 14pp gap between MuZero and current PPO is worth closing but not the 300× gap between 15% combat win and 0.05% full-run boss kill.
+
+**Math confirms macro is the ceiling**:
+```
+full-run boss_kill = P(reach floor 17) × P(win boss | reached)
+                   = 0.047 × 0.154 (theoretical max)
+                   = 0.72% (actual observed: 0.05%, i.e. 14× worse)
+```
+Even if we push combat from 15% → 29% (MuZero level), full-run boss_kill cap is still 1.4% without macro improvement. To reach a 10% full-run boss_kill, macro survival must raise `P(reach floor 17)` from ~5% to ~35%.
+
+**Decision**: skip P-1 re-measurement, proceed directly to macro-focused work.
+
+### Better BC dataset discovered: `tmp/offline_dataset_full/`
+
+Previously I was targeting `data/skada_bc/samples.jsonl` (1.97M samples, phase-mixed). The offline_dataset_full is materially better for this job:
+
+- **Already split by decision type** — no `--phase-filter` complexity
+- **Enriched context fields** — `deck_before/after`, `hp_before`, `relic_ids_before`, `quality_flags`, `supervision_type`, `split` (train/val)
+- **Quality-labeled** — `quality_flags` can filter to demonstrations known to lead to successful runs (via runs_summary.jsonl)
+- **Totals fit the training goal**:
+  - route: 6,262 (full paths)
+  - card_choice: 3,425 (card_reward decisions)
+  - event_choice: 1,821
+  - potion_choice: 1,537
+  - ancient_choice: 956
+  - rest_site: 427
+  - shop: 353
+  - relic_choice: 407
+  - card_remove + upgrade + transform: ~670
+
+Total 23k high-quality macro samples (excluding build/floor_records/decision_records which are derived).
+
+**Implication**: existing `skada_bc_train.py` is less useful than building a macro-oriented BC trainer on `tmp/offline_dataset_full/`. The translation layer (`skada_bc_translate.py`) will likely need extension per decision type.
+
+### Sandbox starter-early checkpoint exists but untested on bosses
+
+`checkpoints_attention/sandbox_starter_early_patch_20260418_122809/step_000450560` is a Phase 6 PPO+attention checkpoint that DID undergo combat-sandbox training. Its boss-tier win rate has never been properly measured (only 20-episode benchmarks exist, none covering boss tier).
+
+**Action**: before P2' (BC), run a proper boss-tier eval on this checkpoint. This settles two questions at once:
+1. Does sandbox pretrain meaningfully lift boss win above the 15.4% baseline?
+2. If yes, is it worth warmstarting from THIS checkpoint rather than the Phase 8 long-train?
+
+Budget: 1 hour compute using existing `analysis/evaluate_attention_checkpoint_benchmark.py` with a larger N (200 eps across tiers).
+
+## Revised-revised-revised immediate actions (after MuZero clarification)
 
 **The MuZero-era sandbox checkpoints are not usable** — different algorithm, different state dict. We must establish combat competence on the current PPO arch from scratch or confirm it's already there implicitly.
 
