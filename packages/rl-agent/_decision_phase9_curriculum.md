@@ -6,6 +6,69 @@
 
 ---
 
+## 🚨 REVISION 4 (2026-04-20 late, P-1 eval completed)
+
+**P-1 answered, but answer forces re-pivot on REVISION 3.**
+
+REVISION 3 inherited the claim that "sandbox boss win rate ≈ 50%, individual bosses up to 90%+" from the archived MuZero-era numbers. Because those numbers came from a different architecture, the user requested an actual P-1 eval on the current PPO+attention arch before committing to "combat is good, train macro instead".
+
+While setting up the eval, **two latent sim bugs were fixed** that silently broke every prior sandbox eval / training attempt on `headless_sim_host_0991` (v0.99.1). They were invisible in the long-train numbers only because every recent long-train ran `full_run` (no `--combat-sandbox`), so `combat_reset` was never invoked:
+
+1. `HeadlessSimBridgeClient.combat_reset` passed `ENCOUNTER.<SUFFIX>` to the sim's `CombatTrainingMode.ResolveEncounter`, which re-prepends `ENCOUNTER.`, yielding `ModelNotFoundException: Model id=ENCOUNTER.ENCOUNTER.SLIMES_WEAK not found`. Fix: strip `ENCOUNTER.` prefix before RPC.
+2. Sim's `combat_reset` RPC returns a `CombatTrainingStateSnapshot` (top-level `enemies`/`hand`/`player`) but our `translate_to_bridge_shape` expects `FullRunSimulationStateSnapshot` (`battle.enemies`/`run.floor`). Fix: after `combat_reset`, refetch via `state` RPC which exposes the full-run shape of the now-active combat.
+
+Both landed in `sts2_env/headless_sim_bridge_client.py`.
+
+### P-1 result (Phase 8 checkpoint `sim_phase8_resume_potion_v3_20260420_125815/step_001054720`, 50 boss episodes, v0.99.1 snapshots, `ActionMasker`, deterministic, compact info):
+
+| KPI | Value |
+|---|---|
+| Overall boss WR | **32.0%** (16/50) |
+| Avg steps/ep | 24.9 |
+| Avg reward/ep | -0.111 |
+| Broken resets | 0 |
+
+**Per-encounter breakdown (bimodal — this is the critical finding):**
+
+| Encounter | n | wins | WR |
+|---|---|---|---|
+| QUEEN_BOSS | 7 | 7 | **100%** |
+| KNOWLEDGE_DEMON_BOSS | 2 | 2 | **100%** |
+| KAISER_CRAB_BOSS | 8 | 7 | **87.5%** |
+| CEREMONIAL_BEAST_BOSS | 9 | 0 | 0% |
+| WATERFALL_GIANT_BOSS | 6 | 0 | 0% |
+| DOORMAKER_BOSS | 4 | 0 | 0% |
+| SOUL_FYSH_BOSS | 4 | 0 | 0% |
+| THE_INSATIABLE_BOSS | 4 | 0 | 0% |
+| TEST_SUBJECT_BOSS | 3 | 0 | 0% |
+| THE_KIN_BOSS | 3 | 0 | 0% |
+
+Artifact: `analysis/training_curves/phase8_p1_boss_eval_20260420_150923.json`.
+
+### What this means for Phase 9
+
+REVISION 3's premise ("combat is already competent, gap is transfer to full-run") was wrong for the current arch.
+
+- **3/10 boss archetypes solved (≥87% WR).** QUEEN (mass-summon clear), KAISER_CRAB (big-single-target), KNOWLEDGE_DEMON (tempo).
+- **7/10 boss archetypes at 0%.** CEREMONIAL_BEAST (phase/ritual), WATERFALL_GIANT (sentinel-HP speed check — we explicitly reward-shaped for this one and still 0/6), DOORMAKER, SOUL_FYSH, INSATIABLE, TEST_SUBJECT, KIN. These are mostly the "mechanics-heavy" bosses (status piles, stacking buffs, targeted weak points, phase transitions).
+- The **32% overall** is arithmetically "above the P1' threshold" in the pre-P-1 decision matrix, **but the distribution invalidates that rule**: macro routing cannot avoid 70% of possible Act 1 bosses (all are valid floor-17 selections).
+
+### Revised plan order
+
+- **P-1** (eval) — ✅ done, see above.
+- **P-0''** (new) — **targeted boss-sandbox training on the 7 failed encounters.** Not uniform tier weights; use `--snapshot-encounter-ids` with the 7 losers and optionally over-weight toward CEREMONIAL_BEAST / WATERFALL_GIANT / KIN where we have the most snapshots (9/6/5). Starter-early boost stays 0 (we want realistic boss-phase decks). Target: push the 7-loser WR off 0 — even 20% would be a big signal gain for the value head. Likely 100k-200k combat-sandbox steps.
+- **P-1'** (was P1 in REVISION 3) — **freeze combat-related heads, train macro only** — GATED on P-0'' lifting the 7-loser WR above ~20%. Running P-1' now with 7/10 bosses at 0% would produce a policy that routes correctly but loses to 70% of floor-17 encounters anyway.
+- **P-2' / P-3'** — BC calibration (excluding campfire phases), macro-head split — unchanged from REVISION 3, sequenced after P-1'.
+
+### Reviewer notes (carried forward from earlier revisions, re-weighted by P-1)
+
+- Reviewer note #1 (boss touch vs boss conversion) — **validated**: current arch's conversion is 32% overall but 0% on 70% of bosses, so "P(kill boss | reach floor 17)" is heavily encounter-dependent. Use per-encounter WR as the P-0'' gate, not overall.
+- Reviewer note #5 (don't make sandbox 100% boss-only) — **still holds for P-0''**: boost the 7 losers but keep ≥30% mix of weak/normal/elite so combat sub-skills don't drift.
+- `--snapshot-encounter-ids` only exists on `eval_combat_sandbox_boss.py` right now; `train_attention_policy.py` does **not** plumb it through `resolve_snapshot_pool`. A small prereq for P-0'' is adding that arg + forwarding to `CombatSnapshotPool.from_path(encounter_ids=...)`.
+- Re-run Phase 8 long-train sanity too: because the two sim-bridge bugs shipped silently, any previously reported "sandbox combat metric" from this codebase is suspect. Treat the P-1 32% as the current-arch ground truth baseline.
+
+---
+
 ## 🚨 REVISION (2026-04-20 evening, after user correction)
 
 **Original P1 ("Act 1 boss curriculum") is REDUNDANT.** The team has already run combat-sandbox curriculum extensively — with tiered difficulty (weak / normal / elite / boss) and tiered deck quality. Sandbox results are STRONG:

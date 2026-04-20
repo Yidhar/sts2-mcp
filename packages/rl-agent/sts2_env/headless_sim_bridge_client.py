@@ -585,7 +585,15 @@ class HeadlessSimBridgeClient:
         if character is not None:
             params["character_id"] = _normalize_character(character)
         if encounter_id is not None:
-            params["encounter_id"] = encounter_id
+            # Sim's CombatTrainingMode.ResolveEncounter re-prepends "ENCOUNTER."
+            # via new ModelId(ModelId.SlugifyCategory<EncounterModel>(), value),
+            # producing "ENCOUNTER.ENCOUNTER.<SUFFIX>" if we pass the fully
+            # qualified id. Strip any leading "ENCOUNTER." (case-insensitive)
+            # so the sim receives the raw suffix it expects.
+            enc = str(encounter_id)
+            if enc.upper().startswith("ENCOUNTER."):
+                enc = enc[len("ENCOUNTER."):]
+            params["encounter_id"] = enc
         if seed is not None:
             params["seed"] = int(seed)
         if current_hp is not None:
@@ -604,7 +612,20 @@ class HeadlessSimBridgeClient:
             params["potions"] = list(potions)
         if gold is not None:
             params["gold"] = int(gold)
-        sim_state = self._rpc("combat_reset", params)
+        combat_result = self._rpc("combat_reset", params)
+        # The sim's combat_reset RPC returns a CombatTrainingStateSnapshot
+        # (top-level keys: combat_active, enemies, hand, piles, ...). That
+        # shape is different from FullRunSimulationStateSnapshot which our
+        # translate_to_bridge_shape expects (battle.enemies, run.floor, ...).
+        # After combat_reset, the sim's full-run state mirrors the active
+        # combat, so re-fetch via the "state" RPC to get the shape the
+        # translator knows how to read.
+        if isinstance(combat_result, dict) and "error" in combat_result:
+            raise HeadlessSimError(
+                f"combat_reset failed: {combat_result.get('error_code')}: "
+                f"{str(combat_result.get('error'))[:500]}"
+            )
+        sim_state = self._rpc("state")
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
         )
