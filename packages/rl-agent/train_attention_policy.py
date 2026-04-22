@@ -175,6 +175,7 @@ def build_env_factory(
     perf_stats_interval_steps: int = 0,
     encode_pool: "Any | None" = None,
     stuck_watchdog_steps: int = 400,
+    run_chain_pool: "Any | None" = None,
 ) -> Callable[[], object]:
     def _factory():
         local_encoder = WorldTokenObservationEncoder(use_text=use_text, text_device=text_device)
@@ -197,12 +198,18 @@ def build_env_factory(
                 character=character,
                 encounter_id=encounter_id,
                 encounter_pool=encounter_pool,
-                snapshot_pool=snapshot_pool,
+                # Run-chain wrapper owns snapshot selection; pass None so
+                # CombatSandboxEnv.reset() respects options["snapshot"]
+                # injections instead of auto-sampling from a flat pool.
+                snapshot_pool=(snapshot_pool if run_chain_pool is None else None),
                 reset_timeout_ms=reset_timeout_ms,
                 step_timeout_ms=step_timeout_ms,
                 obs_encoder=obs_encoder,
                 bridge=sim_bridge,
             )
+            if run_chain_pool is not None:
+                from sts2_env.run_chained_combat_env import RunChainedCombatEnv
+                env = RunChainedCombatEnv(env, run_pool=run_chain_pool)
         else:
             env = SlayTheSpire2EnvV2(
                 session_file=session_file,
@@ -614,6 +621,36 @@ def main() -> None:
     )
     parser.add_argument("--snapshot-max-rows", type=int, default=None)
     parser.add_argument(
+        "--run-chain-mode",
+        action="store_true",
+        default=False,
+        help=(
+            "Replay human runs' combat sequences as single episodes with "
+            "HP+potion carry-over between sub-combats. Uses RunChainedSnapshotPool "
+            "(groups snapshots by run_id, ordered by path_index). Mutually "
+            "exclusive with flat snapshot sampling — when enabled, the chain "
+            "wrapper owns snapshot selection regardless of --snapshot-sample-mode."
+        ),
+    )
+    parser.add_argument(
+        "--run-chain-min-length",
+        type=int,
+        default=3,
+        help="Skip runs with fewer combats than this (default: 3).",
+    )
+    parser.add_argument(
+        "--run-chain-quality-weights",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated quality_fine=weight pairs for run sampling "
+            "(e.g. 'high_win=0.25,deep_act3_loss=0.10,mid_act2_loss=0.25,low_act1_loss=0.40'). "
+            "Defaults baked in: see combat_snapshot_dataset.DEFAULT_RUN_CHAIN_QUALITY_WEIGHTS. "
+            "Default weights bias toward boss-containing runs to boost boss exposure "
+            "despite raw dataset being ~99 percent early-loss runs."
+        ),
+    )
+    parser.add_argument(
         "--use-sim",
         action="store_true",
         default=False,
@@ -739,6 +776,34 @@ def main() -> None:
     )
     encounter_pool = parse_csv(args.encounter_pool)
     snapshot_pool = resolve_snapshot_pool(args)
+
+    # Run-chain mode: replay human runs' combat sequences as single
+    # episodes with HP/potion carry-over. Mutually exclusive with flat
+    # snapshot_pool sampling — when --run-chain-mode is on, the chain
+    # wrapper owns snapshot selection.
+    run_chain_pool = None
+    if getattr(args, "run_chain_mode", False):
+        from combat_snapshot_dataset import RunChainedSnapshotPool
+        quality_weights = parse_weight_map(getattr(args, "run_chain_quality_weights", None))
+        run_chain_pool = RunChainedSnapshotPool.from_path(
+            args.snapshot_pool,
+            curated_subset=getattr(args, "snapshot_curated_subset", None),
+            build_id=getattr(args, "snapshot_build_id", None),
+            quality_weights=quality_weights or None,
+            min_chain_length=int(getattr(args, "run_chain_min_length", 3) or 3),
+        )
+        _emit_json_event(
+            {
+                "phase": "run_chain_pool_summary",
+                "snapshot_pool_root": args.snapshot_pool,
+                "snapshot_curated_subset": getattr(args, "snapshot_curated_subset", None),
+                "run_chain_quality_weights": quality_weights,
+                "run_chain_min_length": int(getattr(args, "run_chain_min_length", 3) or 3),
+                "summary": run_chain_pool.summary(),
+            },
+            enabled=bool(args.print_startup_events),
+        )
+
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     if snapshot_pool is not None:
@@ -785,6 +850,7 @@ def main() -> None:
             perf_stats_interval_steps=int(getattr(args, "perf_stats_interval_steps", 0) or 0),
             encode_pool=encode_pool,
             stuck_watchdog_steps=int(getattr(args, "stuck_watchdog_steps", 400) or 0),
+            run_chain_pool=run_chain_pool,
         )
         for index in range(args.n_envs)
     ]

@@ -1020,3 +1020,159 @@ def snapshot_row_to_reset_kwargs(
         "potions": potions,
         "gold": row.get("snapshot_gold"),
     }
+
+
+# ----------------------------------------------------------------------
+# RunChainedSnapshotPool — groups snapshots by run_id, samples ordered
+# chains for cross-combat HP/potion-aware training. See
+# RunChainedCombatEnv for the consuming wrapper.
+# ----------------------------------------------------------------------
+
+# Sampling weights by quality_fine. Bias toward boss-containing runs so
+# policy sees realistic boss contexts often, without starving early-run
+# distribution (mostly low_act1_loss at ~99% of raw dataset).
+DEFAULT_RUN_CHAIN_QUALITY_WEIGHTS = {
+    "high_win": 0.25,
+    "deep_act3_loss": 0.10,
+    "mid_act2_loss": 0.25,
+    "low_act1_loss": 0.40,
+}
+MIN_CHAIN_LENGTH = 3  # skip runs with <3 combats — no cross-combat signal
+
+
+class RunChainedSnapshotPool:
+    """Groups snapshot rows by run_id, samples an ordered chain per episode.
+
+    Each sample returns the full ordered list of combat snapshots belonging
+    to one human run, sorted by path_index (== in-run chronological order).
+    The consuming env is responsible for replaying these in sequence with
+    HP/potion carry-over rules.
+    """
+
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        quality_weights: dict[str, float] | None = None,
+        min_chain_length: int = MIN_CHAIN_LENGTH,
+    ) -> None:
+        if not rows:
+            raise ValueError("RunChainedSnapshotPool requires at least one row")
+        self.quality_weights: dict[str, float] = dict(
+            quality_weights if quality_weights is not None else DEFAULT_RUN_CHAIN_QUALITY_WEIGHTS
+        )
+        self.min_chain_length = int(min_chain_length)
+
+        # Group by run_id
+        by_run: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            run_id = row.get("run_id")
+            if run_id is None:
+                continue
+            by_run.setdefault(str(run_id), []).append(row)
+        # Sort each run's snapshots by path_index (fallback to floor_number)
+        for run_id, run_rows in by_run.items():
+            run_rows.sort(
+                key=lambda r: (
+                    int(r.get("path_index") if r.get("path_index") is not None else -1),
+                    int(r.get("floor_number") if r.get("floor_number") is not None else -1),
+                )
+            )
+
+        # Filter runs below min_chain_length
+        self._runs: dict[str, list[dict[str, Any]]] = {
+            rid: rr for rid, rr in by_run.items() if len(rr) >= self.min_chain_length
+        }
+        if not self._runs:
+            raise ValueError(
+                f"RunChainedSnapshotPool: no runs with >= {self.min_chain_length} combats "
+                f"(had {len(by_run)} runs total)"
+            )
+
+        # Precompute per-run quality and sampling weight
+        self._run_ids = sorted(self._runs.keys())
+        self._run_weights: list[float] = []
+        for rid in self._run_ids:
+            # Quality typically consistent across a run's snapshots; use first row's tag
+            first = self._runs[rid][0]
+            quality = str(first.get("quality_fine") or "low_act1_loss")
+            w = self.quality_weights.get(quality, 0.0)
+            self._run_weights.append(max(0.0, float(w)))
+        # Normalize (any run with weight==0 still gets a floor to avoid starvation)
+        total_w = sum(self._run_weights)
+        if total_w <= 0.0:
+            # Degenerate: no quality match, fall back uniform
+            self._run_weights = [1.0 / float(len(self._run_ids))] * len(self._run_ids)
+        else:
+            self._run_weights = [w / total_w for w in self._run_weights]
+
+    def __len__(self) -> int:
+        return len(self._run_ids)
+
+    @property
+    def run_count(self) -> int:
+        return len(self._run_ids)
+
+    @property
+    def total_snapshots(self) -> int:
+        return sum(len(v) for v in self._runs.values())
+
+    def summary(self) -> dict[str, Any]:
+        quality_counts: dict[str, int] = {}
+        chain_lens: list[int] = []
+        boss_runs = 0
+        for rid, rows in self._runs.items():
+            q = str(rows[0].get("quality_fine") or "unknown")
+            quality_counts[q] = quality_counts.get(q, 0) + 1
+            chain_lens.append(len(rows))
+            if any(
+                str(r.get("encounter_id") or "").upper().endswith("_BOSS")
+                for r in rows
+            ):
+                boss_runs += 1
+        return {
+            "run_count": len(self._run_ids),
+            "total_snapshots": self.total_snapshots,
+            "quality_counts": quality_counts,
+            "chain_length_min": min(chain_lens) if chain_lens else 0,
+            "chain_length_max": max(chain_lens) if chain_lens else 0,
+            "chain_length_mean": (sum(chain_lens) / len(chain_lens)) if chain_lens else 0.0,
+            "runs_containing_boss": boss_runs,
+            "runs_containing_boss_pct": (boss_runs / len(self._run_ids) * 100.0) if self._run_ids else 0.0,
+        }
+
+    def sample_run(self, rng) -> list[dict[str, Any]]:
+        """Sample one run_id weighted by quality, return ordered snapshot list."""
+        import numpy as _np
+        idx = int(_np.asarray(rng.choice(len(self._run_ids), p=self._run_weights)))
+        rid = self._run_ids[idx]
+        # Return a shallow copy so caller can safely mutate
+        return list(self._runs[rid])
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        curated_subset: str | None = None,
+        build_id: str | None = None,
+        min_chain_length: int = MIN_CHAIN_LENGTH,
+        quality_weights: dict[str, float] | None = None,
+        supported_encounter_ids: set[str] | None = None,
+        supported_characters: set[str] | None = None,
+        excluded_characters: set[str] | None = None,
+    ) -> "RunChainedSnapshotPool":
+        rows = load_combat_snapshot_rows(
+            path,
+            curated_subset=curated_subset,
+            build_id=build_id,
+            strict_playable_only=True,
+            supported_encounter_ids=supported_encounter_ids,
+            supported_characters=supported_characters,
+            excluded_characters=excluded_characters,
+        )
+        return cls(
+            rows,
+            quality_weights=quality_weights,
+            min_chain_length=min_chain_length,
+        )
