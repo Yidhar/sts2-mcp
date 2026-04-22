@@ -78,29 +78,42 @@ class RunChainedCombatEnv(gym.Wrapper):
         """Return an options dict for CombatSandboxEnv.reset(options=...).
 
         Full snapshot applied for deck/relics/encounter/gold/max_hp/max_energy.
-        HP and potions get overridden per the carry-over rules.
+        HP and potions **always** get explicitly set by the wrapper (not left
+        to CombatSandboxEnv's internal snapshot_row_to_reset_kwargs) so the
+        chain's carry-over logic is the single source of truth regardless of
+        snapshot.potion_state_known flags. About 51 percent of the dataset's
+        snapshots have potion_state_known=False (all with empty
+        potion_ids_before — dataset extractor's safe default); relying on
+        CombatSandboxEnv's implicit fallback would make the first sub-combat
+        silently potion-less for half the runs. Explicit injection avoids
+        that and makes the flow observable.
         """
         snap = self._chain[snap_idx]
         kwargs: dict[str, Any] = {"snapshot": snap}
+
+        this_potions = [str(p) for p in (snap.get("potion_ids_before") or []) if p]
+        snap_hp = int(snap.get("snapshot_current_hp") or snap.get("snapshot_max_hp") or 0)
+
         if snap_idx == 0:
-            # First sub-combat: pristine snapshot, nothing to carry
+            # First sub-combat: trust snapshot verbatim, no carry-over to apply.
+            kwargs["current_hp"] = snap_hp
+            kwargs["potions"] = list(this_potions)[: self.potion_slot_cap]
             return kwargs
 
         # HP cap: policy can't exceed human-path HP ceiling at this snapshot
-        snap_hp = int(snap.get("snapshot_current_hp") or snap.get("snapshot_max_hp") or 0)
         carried_hp = int(self._carried_hp) if self._carried_hp is not None else snap_hp
         kwargs["current_hp"] = max(0, min(snap_hp, carried_hp))
 
         # Potions: policy's remaining + human's additions between prev and cur
         prev_snap = self._chain[snap_idx - 1]
         prev_potions = [str(p) for p in (prev_snap.get("potion_ids_before") or []) if p]
-        this_potions = [str(p) for p in (snap.get("potion_ids_before") or []) if p]
         # Human's additions = what's in this snapshot that wasn't in prev (net new)
-        # Use multiset math: count -> subtract -> remaining positives are additions
+        # Multiset subtraction; Counter drops negatives automatically so human's
+        # *usage* between combats doesn't subtract from policy's independent state.
         from collections import Counter
-        added = Counter(this_potions) - Counter(prev_potions)
+        added_multiset = Counter(this_potions) - Counter(prev_potions)
         added_list: list[str] = []
-        for pid, count in added.items():
+        for pid, count in added_multiset.items():
             added_list.extend([pid] * count)
 
         carried = list(self._carried_potions or [])
@@ -244,4 +257,9 @@ class RunChainedCombatEnv(gym.Wrapper):
             info["run_chain_encounter_id"] = snap.get("encounter_id")
             info["run_chain_floor_number"] = snap.get("floor_number")
             info["run_chain_run_id"] = str(snap.get("run_id") or "")
+        # Observability: every sub-combat records what the wrapper actually
+        # injected, so reset_events.jsonl / debug probes can verify the
+        # carry-over math is doing what we think it's doing.
+        info["run_chain_carried_hp_before_combat"] = self._carried_hp
+        info["run_chain_carried_potions_before_combat"] = list(self._carried_potions or [])
         return info
