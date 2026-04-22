@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Diagnostics;
 using System.Text.Json.Serialization;
+using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Nodes;
 
 namespace Sts2McpBridge.Scripts;
@@ -181,9 +182,18 @@ internal static partial class BridgeGameApi
         // StartRunLobby.BeginRunIfAllPlayersReady; we want it set BEFORE any
         // embark trigger. Skip when rebinding an already-active run (mid-run
         // re-seed would be meaningless — run's RunRngSet is already baked).
+        // NOTE: NCharacterSelectScreen.AfterInitialized() wipes this field
+        // during screen init, so we ALSO re-assert it on every reset-loop
+        // action dispatch below. The up-front write here is a defense in
+        // case the reset short-circuits (e.g., already at character select).
         if (!rebindActiveRun && NGame.Instance != null)
         {
             NGame.Instance.DebugSeedOverride = requestedSeed;
+            if (requestedSeed != null)
+            {
+                Log.Info(
+                    $"[{BridgeRuntime.ModId}] env.reset: initial DebugSeedOverride={requestedSeed}");
+            }
         }
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
         await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
@@ -303,6 +313,25 @@ internal static partial class BridgeGameApi
 
             try
             {
+                // NCharacterSelectScreen.AfterInitialized() defensively writes
+                // NGame.Instance.DebugSeedOverride = null during its init
+                // pass (src/.../NCharacterSelectScreen.cs:743). Our earlier
+                // up-front write at ResetEnvResponseAsync entry gets wiped
+                // the moment we navigate onto the character-select screen.
+                // Re-assert the override on every reset-loop dispatch so
+                // that when embark finally fires (inside
+                // StartRunLobby.BeginRunIfAllPlayersReady), the field still
+                // holds our pinned seed instead of the screen's null-reset.
+                if (requestedSeed != null && NGame.Instance != null)
+                {
+                    var preWrite = NGame.Instance.DebugSeedOverride;
+                    NGame.Instance.DebugSeedOverride = requestedSeed;
+                    if (nextAction.Value.Action.ActionId == "embark")
+                    {
+                        Log.Info(
+                            $"[{BridgeRuntime.ModId}] env.reset: re-asserting DebugSeedOverride={requestedSeed} before embark (was={preWrite ?? "null"})");
+                    }
+                }
                 await ExecuteEnvActionAsync(
                     nextAction.Value.Action,
                     timeoutMs,
