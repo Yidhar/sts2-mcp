@@ -91,6 +91,8 @@ class SlayTheSpire2EnvV2(gym.Env):
         include_debug_info: bool = False,
         bridge: "BridgeClient | None" = None,
         stuck_watchdog_steps: int = 400,
+        seed_pool: list[str] | None = None,
+        seed_strategy: str = "round_robin",
     ) -> None:
         super().__init__()
 
@@ -104,6 +106,18 @@ class SlayTheSpire2EnvV2(gym.Env):
         self.step_timeout_ms = step_timeout_ms
         self.render_mode = render_mode
         self.include_debug_info = bool(include_debug_info)
+        # Seed pool: list of 10-char STS2 seed strings. When non-empty, each
+        # env.reset() picks one per seed_strategy and pins the run's RNG via
+        # bridge /env/reset seed parameter. Gives deterministic map /
+        # encounters / rewards / monster AI for that run. Empty/None ==
+        # game's built-in random seed each run (original behavior).
+        self.seed_pool: list[str] = list(seed_pool or [])
+        if seed_strategy not in ("round_robin", "random_per_episode"):
+            raise ValueError(
+                f"seed_strategy must be round_robin|random_per_episode, got {seed_strategy}"
+            )
+        self.seed_strategy = seed_strategy
+        self._seed_pool_cursor: int = 0
         # Phase-stuck watchdog: truncate the episode when the fingerprint
         # (phase, floor, combat_round, enemy_hp_total, player_hp) stays the
         # same for >= stuck_watchdog_steps. Set to 0 to disable. Motivated
@@ -1141,10 +1155,27 @@ class SlayTheSpire2EnvV2(gym.Env):
                 return True
         return exc.status_code in (401, 409)
 
+    def _next_seed_from_pool(self) -> str | None:
+        if not self.seed_pool:
+            return None
+        if self.seed_strategy == "round_robin":
+            seed = self.seed_pool[self._seed_pool_cursor % len(self.seed_pool)]
+            self._seed_pool_cursor += 1
+            return seed
+        # random_per_episode — use gym's np_random for reproducibility
+        if self.np_random is None:
+            import numpy as np
+            return self.seed_pool[int(np.random.randint(len(self.seed_pool)))]
+        return self.seed_pool[int(self.np_random.integers(len(self.seed_pool)))]
+
     def _reset_with_ready_gate(self, *, timeout_ms: int) -> dict[str, Any]:
         deadline = time.monotonic() + (max(timeout_ms, RESET_READY_MAX_WAIT_MS) / 1000.0)
         last_exc: Exception | None = None
         force_fresh_next = False
+        # Pin one seed for this *entire reset call* even across retries —
+        # we want the completed episode to match what we promised, not a
+        # different seed because a retry happened to land here.
+        pinned_seed = self._next_seed_from_pool()
 
         while time.monotonic() < deadline:
             try:
@@ -1152,6 +1183,7 @@ class SlayTheSpire2EnvV2(gym.Env):
                     character=self.character,
                     force_fresh=force_fresh_next,
                     defensive_buffs=self.defensive_buffs,
+                    seed=pinned_seed,
                     timeout_ms=timeout_ms,
                 )
                 force_fresh_next = False

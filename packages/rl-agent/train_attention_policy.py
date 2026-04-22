@@ -176,6 +176,8 @@ def build_env_factory(
     encode_pool: "Any | None" = None,
     stuck_watchdog_steps: int = 400,
     run_chain_pool: "Any | None" = None,
+    seed_pool: list[str] | None = None,
+    seed_strategy: str = "round_robin",
 ) -> Callable[[], object]:
     def _factory():
         local_encoder = WorldTokenObservationEncoder(use_text=use_text, text_device=text_device)
@@ -211,6 +213,10 @@ def build_env_factory(
                 from sts2_env.run_chained_combat_env import RunChainedCombatEnv
                 env = RunChainedCombatEnv(env, run_pool=run_chain_pool)
         else:
+            # Each env gets the same seed_pool but an independent cursor.
+            # round_robin strategy means env_index 0 starts at pool[0], env 1
+            # at pool[1], ... by shifting the cursor initial position.
+            env_seed_pool = list(seed_pool) if seed_pool else []
             env = SlayTheSpire2EnvV2(
                 session_file=session_file,
                 character=character,
@@ -219,7 +225,11 @@ def build_env_factory(
                 obs_encoder=obs_encoder,
                 bridge=sim_bridge,
                 stuck_watchdog_steps=stuck_watchdog_steps,
+                seed_pool=env_seed_pool,
+                seed_strategy=seed_strategy,
             )
+            if env_seed_pool and seed_strategy == "round_robin" and env_index > 0:
+                env._seed_pool_cursor = env_index % len(env_seed_pool)
         if use_sim and perf_stats_log_path and perf_stats_interval_steps > 0:
             env = PerfStatsPeriodicLogger(
                 env,
@@ -651,6 +661,40 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--seed-pool",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of STS2 seed strings (10 chars each, 0-9A-Z "
+            "minus O/I) to pin run RNG. When non-empty, each env.reset() "
+            "picks one and passes it to bridge /env/reset, fully "
+            "determining map / encounters / rewards / monster AI for that "
+            "run. Needs bridge mod env_api_version >= bridge-env-v2-seed."
+        ),
+    )
+    parser.add_argument(
+        "--seed-pool-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a newline-delimited seed list (one seed per line; lines "
+            "starting with # are ignored). Takes precedence over --seed-pool. "
+            "Use for large curricula (e.g. 50-200 train seeds)."
+        ),
+    )
+    parser.add_argument(
+        "--seed-strategy",
+        type=str,
+        default="round_robin",
+        choices=("round_robin", "random_per_episode"),
+        help=(
+            "How to pick from --seed-pool per reset. round_robin cycles "
+            "through in order (each env starts at a different offset so 4 "
+            "envs see 4 different seeds concurrently); random_per_episode "
+            "samples uniformly from pool each reset."
+        ),
+    )
+    parser.add_argument(
         "--use-sim",
         action="store_true",
         default=False,
@@ -830,6 +874,35 @@ def main() -> None:
             encoder_kwargs={"use_text": use_text, "text_device": text_device},
         )
 
+    # Resolve seed pool. Accepts either:
+    #   1) --seed-pool-file <path> — newline-delimited seeds (preferred for
+    #      large pools / curricula)
+    #   2) --seed-pool SEED1,SEED2,... — inline CSV
+    # If both supplied, file wins. Empty/absent == no pinning (original behavior).
+    seed_pool: list[str] = []
+    seed_pool_file = getattr(args, "seed_pool_file", None)
+    if seed_pool_file:
+        try:
+            seed_pool = [
+                line.strip().upper()
+                for line in Path(seed_pool_file).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read --seed-pool-file {seed_pool_file}: {exc}")
+    elif getattr(args, "seed_pool", None):
+        seed_pool = [s.strip().upper() for s in str(args.seed_pool).split(",") if s.strip()]
+    if seed_pool:
+        _emit_json_event(
+            {
+                "phase": "seed_pool_configured",
+                "seed_pool_size": len(seed_pool),
+                "seed_strategy": str(getattr(args, "seed_strategy", "round_robin")),
+                "seed_pool_first_10": seed_pool[:10],
+            },
+            enabled=bool(args.print_startup_events),
+        )
+
     env_fns = [
         build_env_factory(
             env_index=index,
@@ -851,6 +924,8 @@ def main() -> None:
             encode_pool=encode_pool,
             stuck_watchdog_steps=int(getattr(args, "stuck_watchdog_steps", 400) or 0),
             run_chain_pool=run_chain_pool,
+            seed_pool=seed_pool,
+            seed_strategy=str(getattr(args, "seed_strategy", "round_robin") or "round_robin"),
         )
         for index in range(args.n_envs)
     ]

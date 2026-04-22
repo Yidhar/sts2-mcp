@@ -306,9 +306,19 @@ class BridgeClient:
         rebind_active_run: bool = False,
         force_fresh: bool = False,
         defensive_buffs: bool = False,
+        seed: str | None = None,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
         """POST /env/reset -- start a new episode.
+
+        If ``seed`` is supplied (10-char alphanumeric — canonicalized on the
+        server via SeedHelper.CanonicalizeSeed), the bridge writes
+        NGame.Instance.DebugSeedOverride before the embark trigger, fully
+        determining map / encounters / card rewards / potion drops / monster
+        AI / treasure relics / shuffle order for the new run. ``seed`` is
+        ignored when ``rebind_active_run`` is True (run's RNG already baked).
+
+        Requires bridge mod ``env_api_version >= bridge-env-v2-seed``.
 
         Returns dict with keys:
             ok, episode_id, step_index, done, truncated, obs, legal_actions, info
@@ -322,6 +332,8 @@ class BridgeClient:
             body["force_fresh"] = True
         if defensive_buffs:
             body["defensive_buffs"] = True
+        if seed is not None:
+            body["seed"] = str(seed)
         return self._request("POST", "env/reset", body=body, timeout_ms=timeout_ms)
 
     def step(

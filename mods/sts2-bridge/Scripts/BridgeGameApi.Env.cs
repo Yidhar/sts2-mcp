@@ -22,6 +22,17 @@ internal sealed class BridgeEnvResetRequest
 
     [JsonPropertyName("timeout_ms")]
     public int? TimeoutMs { get; set; }
+
+    /// <summary>
+    /// Optional 10-char seed (canonicalized via SeedHelper.CanonicalizeSeed).
+    /// When supplied and starting a FRESH episode, we write NGame.Instance.
+    /// DebugSeedOverride so StartRunLobby.BeginRunIfAllPlayersReady picks it
+    /// up at run-start, fully determining map / encounters / card rewards /
+    /// potion drops / monster AI / treasure relics / shuffle order.
+    /// Ignored on rebind_active_run (run already started).
+    /// </summary>
+    [JsonPropertyName("seed")]
+    public string? Seed { get; set; }
 }
 
 internal sealed class BridgeEnvStepRequest
@@ -55,7 +66,7 @@ internal static partial class BridgeGameApi
         return new
         {
             ok = true,
-            env_api_version = "bridge-env-v1",
+            env_api_version = "bridge-env-v2-seed",
             single_env = true,
             direct_bridge = true,
             model_oriented = true,
@@ -65,7 +76,7 @@ internal static partial class BridgeGameApi
                 supported_run_modes = new[] { "standard" },
                 supports_character = true,
                 supports_defensive_buffs = true,
-                supports_seed = false,
+                supports_seed = true,
                 supports_ascension = false
             },
             observation = new
@@ -163,6 +174,17 @@ internal static partial class BridgeGameApi
         var rebindActiveRun = request.RebindActiveRun == true;
         var forceFresh = request.ForceFresh == true;
         var defensiveBuffs = request.DefensiveBuffs == true;
+        var requestedSeed = string.IsNullOrWhiteSpace(request.Seed)
+            ? null
+            : MegaCrit.Sts2.Core.Helpers.SeedHelper.CanonicalizeSeed(request.Seed!.Trim());
+        // Apply seed override up-front. NGame consumes DebugSeedOverride inside
+        // StartRunLobby.BeginRunIfAllPlayersReady; we want it set BEFORE any
+        // embark trigger. Skip when rebinding an already-active run (mid-run
+        // re-seed would be meaningless — run's RunRngSet is already baked).
+        if (!rebindActiveRun && NGame.Instance != null)
+        {
+            NGame.Instance.DebugSeedOverride = requestedSeed;
+        }
         var timeoutMs = NormalizeEnvTimeout(request.TimeoutMs, DefaultEnvResetTimeoutMs);
         await WaitForEnvDispatcherReadyAsync(timeoutMs, cancellationToken);
         var executedActions = new List<object>();
@@ -171,8 +193,12 @@ internal static partial class BridgeGameApi
             cancellationToken,
             "env.reset.initial_snapshot");
 
+        // When caller pins a seed, always restart the run — reusing a
+        // stale fresh episode would silently ignore the seed override
+        // (RunRngSet was baked at that old run's start).
+        var seedForcesFresh = requestedSeed != null && !rebindActiveRun;
         var reuseCharacterConstraint = rebindActiveRun ? null : requestedCharacter;
-        if (!forceFresh && CanReuseFreshEpisode(state, reuseCharacterConstraint))
+        if (!forceFresh && !seedForcesFresh && CanReuseFreshEpisode(state, reuseCharacterConstraint))
         {
             var readyEpisode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
             state = await ApplyEnvEpisodeAdjustmentsAsync(readyEpisode, state, timeoutMs, cancellationToken);
@@ -228,7 +254,7 @@ internal static partial class BridgeGameApi
                 break;
             }
 
-            if (CanReuseFreshEpisode(state, requestedCharacter))
+            if (!seedForcesFresh && CanReuseFreshEpisode(state, requestedCharacter))
             {
                 var episode = CreateEnvEpisode(requestedCharacter, defensiveBuffs);
                 state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, timeoutMs, cancellationToken);
@@ -460,8 +486,9 @@ internal static partial class BridgeGameApi
         {
             actionError = ex.ErrorCode;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            BridgeDebugTrace.Write($"[env.step] Unexpected action execution error: {ex.GetType().Name}: {ex.Message}");
             actionError = "action_execution_error";
         }
 
@@ -643,25 +670,18 @@ internal static partial class BridgeGameApi
             return snapshot;
         }
 
+        if (!snapshot.ActionLookup.TryGetValue("card_selection:confirm", out var confirmAction))
+        {
+            return snapshot;
+        }
+
         try
         {
-            await RunOnMainThreadGuardedAsync(
-                () =>
-                {
-                    InvokeCardSelectionConfirmAction(
-                        cardSelectionScreen,
-                        ResolveCardSelectionConfirmButton(cardSelectionScreen));
-                    return true;
-                },
-                "env.step.card_selection_confirm",
+            await ExecuteEnvActionAsync(
+                confirmAction,
                 timeoutMs,
-                cancellationToken);
-
-            await WaitForPumpTicksGuardedAsync(
-                1,
-                "env.step.card_selection_confirm.post_pump",
-                timeoutMs,
-                cancellationToken);
+                cancellationToken,
+                "env.step.card_selection_confirm");
         }
         catch (OperationCanceledException)
         {
@@ -799,7 +819,13 @@ internal static partial class BridgeGameApi
         await RunOnMainThreadGuardedAsync(
             () =>
             {
-                action.Execute();
+                var actionToExecute = action;
+                if (action.ActionId.StartsWith("card_selection:", StringComparison.Ordinal))
+                {
+                    actionToExecute = ResolveCurrentEnvCardSelectionActionOrThrow(action.ActionId);
+                }
+
+                actionToExecute.Execute();
                 return true;
             },
             normalizedOperation,
@@ -811,6 +837,42 @@ internal static partial class BridgeGameApi
             $"{normalizedOperation}.post_pump",
             timeoutMs,
             cancellationToken);
+    }
+
+    private static BridgeResolvedAction ResolveCurrentEnvCardSelectionActionOrThrow(string actionId)
+    {
+        var snapshot = CaptureEnvSnapshot();
+        if (!IsCardSelectionVisible(snapshot.Context))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "card_selection_screen_gone",
+                $"Card selection screen is no longer visible while executing '{actionId}'.",
+                new
+                {
+                    action_id = actionId,
+                    phase = snapshot.Phase,
+                    screen = snapshot.Screen,
+                    legal_actions = snapshot.LegalActions
+                });
+        }
+
+        if (!snapshot.ActionLookup.TryGetValue(actionId, out var currentAction))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "card_selection_action_not_available_at_execution",
+                $"Card selection action '{actionId}' is no longer available at execution time.",
+                new
+                {
+                    action_id = actionId,
+                    phase = snapshot.Phase,
+                    screen = snapshot.Screen,
+                    legal_actions = snapshot.LegalActions
+                });
+        }
+
+        return currentAction;
     }
 
     private static bool ShouldAutoCloseResidualMapOverlay(BridgeEnvSnapshot snapshot)

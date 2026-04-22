@@ -8,6 +8,7 @@ using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Models.Powers;
+using MegaCrit.Sts2.Core.Nodes;
 
 namespace Sts2McpBridge.Scripts;
 
@@ -53,6 +54,12 @@ internal static partial class BridgeGameApi
     private const double EnvRewardSmithLowHpMismatchPenalty = 0.0d;
     private const double EnvRewardCardHeuristicLimit = 0.0d;
     private const int EnvCardSelectionSelectFastFailTimeoutMs = 1000;
+    private const int EnvCombatSandboxGoldDeltaAnomalyThreshold = 10000;
+    private const int EnvCombatSandboxFloorDeltaAnomalyThreshold = 3;
+    private const int EnvCombatSandboxActDeltaAnomalyThreshold = 1;
+    private const int EnvCombatSandboxRelicGainAnomalyThreshold = 3;
+    private const double EnvCombatSandboxRoomHpDeltaNormalizedLimit = 1.0d;
+    private const double EnvCombatSandboxMaxHpGainNormalizedLimit = 1.0d;
 
     private static object BuildEnvActionPayload(BridgeResolvedAction action, int index)
     {
@@ -109,6 +116,12 @@ internal static partial class BridgeGameApi
                 entry["option_type"] = TryGetNestedString(payload, "option", "option_type");
                 entry["proceed"] = TryGetNestedBool(payload, "option", "is_proceed");
                 entry["coord"] = CompactCoordPayload(TryGetNestedElement(payload, "option", "coord"));
+                var eventEffectDeltas = TryGetNestedElement(payload, "option", "effect_deltas");
+                if (eventEffectDeltas is { ValueKind: JsonValueKind.Object })
+                {
+                    entry["effect_deltas"] = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+                        eventEffectDeltas.Value.GetRawText());
+                }
                 break;
 
             case "map":
@@ -462,6 +475,22 @@ internal static partial class BridgeGameApi
         IReadOnlyList<object> resetActions)
     {
         SyncEnvEpisodeAnchor(episode, state, force: true);
+        // Fresh episode → clear any residual self-inflicted HP loss counter from
+        // the previous run. Covers both full_run env/reset and combat_sandbox
+        // (which also funnels through BuildEnvResetPayload).
+        ResetSelfInflictedHpLossTrackerForNewCombat(null);
+        // Episode boundary is a game-quiescent window — drain finalizers here
+        // so GodotObject disposal can't race the next combat's ObjectDB
+        // mutations. combat_sandbox has its own call site at reset time;
+        // full_run relies entirely on this hook plus the per-combat-end drain
+        // in PerformActionResponseAsync.
+        DrainManagedFinalizersLogged($"env.reset.{episode.EpisodeMode}");
+        // DebugSeedOverride still holding the pin tells caller "yes your seed
+        // was honored on the run-start we just completed" — useful for
+        // training-loop asserts. Null means either no seed was requested or
+        // the game already consumed + cleared the override.
+        string? debugSeedOverrideField = null;
+        try { debugSeedOverrideField = NGame.Instance?.DebugSeedOverride; } catch { }
         return new
         {
             ok = true,
@@ -479,6 +508,7 @@ internal static partial class BridgeGameApi
                 defensive_buffs = episode.DefensiveBuffs,
                 episode_mode = episode.EpisodeMode,
                 encounter_id = episode.EncounterId,
+                debug_seed_override = debugSeedOverrideField,
                 reset_actions = resetActions
             }
         };
@@ -844,28 +874,82 @@ internal static partial class BridgeGameApi
         bool truncated,
         string? actionError)
     {
+        var combatSandbox = string.Equals(episode.EpisodeMode, "combat_sandbox", StringComparison.Ordinal);
         var maxHp = Math.Max(after.MaxHp, before.MaxHp);
         var hpLoss = Math.Max(0, before.CurrentHp - after.CurrentHp);
         var hpGain = Math.Max(0, after.CurrentHp - before.CurrentHp);
         var hpLossNormalized = maxHp > 0 ? (double)hpLoss / maxHp : 0d;
         var hpGainNormalized = maxHp > 0 ? (double)hpGain / maxHp : 0d;
-        var floorDelta = Math.Max(0, after.TotalFloor - before.TotalFloor);
+        var rawFloorDelta = Math.Max(0, after.TotalFloor - before.TotalFloor);
         var roomComplete = HasEnvRoomTransition(before, after) ? 1 : 0;
         var combatRoom = IsEnvCombatRewardRoom(before.RoomType);
         var combatRoomComplete = roomComplete == 1 && combatRoom ? 1 : 0;
         var roomHpMax = episode.RoomStartMaxHp > 0 ? episode.RoomStartMaxHp : maxHp;
         var death = after.Done && after.CurrentHp <= 0 ? 1 : 0;
         var combatRoomSettled = combatRoom && (combatRoomComplete == 1 || death == 1);
-        var roomHpDeltaNormalized = combatRoomSettled && roomHpMax > 0
+        var rawRoomHpDeltaNormalized = combatRoomSettled && roomHpMax > 0
             ? (double)(after.CurrentHp - episode.RoomStartHp) / roomHpMax
             : 0d;
-        var actClear = Math.Max(0, after.ActIndex - before.ActIndex);
+        var rawActClear = Math.Max(0, after.ActIndex - before.ActIndex);
         var victory = after.Done && after.CurrentHp > 0 ? 1 : 0;
-        var relicGainCount = Math.Max(0, after.RelicCount - before.RelicCount);
-        var goldGain = Math.Max(0, after.Gold - before.Gold);
-        var goldSpend = Math.Max(0, before.Gold - after.Gold);
+        var rawRelicGainCount = Math.Max(0, after.RelicCount - before.RelicCount);
+        var rawGoldGain = Math.Max(0, after.Gold - before.Gold);
+        var rawGoldSpend = Math.Max(0, before.Gold - after.Gold);
         var maxHpGain = Math.Max(0, after.MaxHp - before.MaxHp);
-        var maxHpGainNormalized = maxHp > 0 ? (double)maxHpGain / maxHp : 0d;
+        var rawMaxHpGainNormalized = maxHp > 0 ? (double)maxHpGain / maxHp : 0d;
+        var anomalyReasons = new List<string>();
+
+        if (combatSandbox)
+        {
+            if (rawGoldGain >= EnvCombatSandboxGoldDeltaAnomalyThreshold ||
+                rawGoldSpend >= EnvCombatSandboxGoldDeltaAnomalyThreshold)
+            {
+                anomalyReasons.Add("combat_sandbox_gold_delta_out_of_range");
+            }
+
+            if (rawFloorDelta > EnvCombatSandboxFloorDeltaAnomalyThreshold)
+            {
+                anomalyReasons.Add("combat_sandbox_floor_delta_out_of_range");
+            }
+
+            if (rawActClear > EnvCombatSandboxActDeltaAnomalyThreshold)
+            {
+                anomalyReasons.Add("combat_sandbox_act_delta_out_of_range");
+            }
+
+            if (rawRelicGainCount > EnvCombatSandboxRelicGainAnomalyThreshold)
+            {
+                anomalyReasons.Add("combat_sandbox_relic_gain_out_of_range");
+            }
+
+            if (Math.Abs(rawRoomHpDeltaNormalized) > EnvCombatSandboxRoomHpDeltaNormalizedLimit + 1e-9d)
+            {
+                anomalyReasons.Add("combat_sandbox_room_hp_delta_out_of_range");
+            }
+
+            if (Math.Abs(rawMaxHpGainNormalized) > EnvCombatSandboxMaxHpGainNormalizedLimit + 1e-9d)
+            {
+                anomalyReasons.Add("combat_sandbox_max_hp_delta_out_of_range");
+            }
+        }
+
+        var roomHpDeltaNormalized = combatSandbox
+            ? Math.Clamp(
+                rawRoomHpDeltaNormalized,
+                -EnvCombatSandboxRoomHpDeltaNormalizedLimit,
+                EnvCombatSandboxRoomHpDeltaNormalizedLimit)
+            : rawRoomHpDeltaNormalized;
+        var floorDelta = combatSandbox ? 0 : rawFloorDelta;
+        var actClear = combatSandbox ? 0 : rawActClear;
+        var relicGainCount = combatSandbox ? 0 : rawRelicGainCount;
+        var goldGain = combatSandbox ? 0 : rawGoldGain;
+        var goldSpend = combatSandbox ? 0 : rawGoldSpend;
+        var maxHpGainNormalized = combatSandbox
+            ? Math.Clamp(
+                rawMaxHpGainNormalized,
+                -EnvCombatSandboxMaxHpGainNormalizedLimit,
+                EnvCombatSandboxMaxHpGainNormalizedLimit)
+            : rawMaxHpGainNormalized;
 
         var combatRoomCompleteBonus = combatRoomComplete * EnvRewardCombatWinBonus;
         var combatRoomQualityBonus = roomHpDeltaNormalized * EnvRewardRoomHpDeltaWeight;
@@ -924,7 +1008,16 @@ internal static partial class BridgeGameApi
             RunVictoryBonus = RoundEnvNumber(runVictoryBonus),
             ActionErrorPenalty = RoundEnvNumber(actionErrorPenalty),
             TruncatedPenalty = RoundEnvNumber(truncatedPenalty),
-            Total = RoundEnvNumber(total)
+            Total = RoundEnvNumber(total),
+            RawFloorDelta = rawFloorDelta,
+            RawActClear = rawActClear,
+            RawGoldGain = rawGoldGain,
+            RawGoldSpend = rawGoldSpend,
+            RawRelicGainCount = rawRelicGainCount,
+            RawRoomHpDeltaNormalized = RoundEnvNumber(rawRoomHpDeltaNormalized),
+            RawMaxHpGainNormalized = RoundEnvNumber(rawMaxHpGainNormalized),
+            RewardAnomalyClamped = anomalyReasons.Count > 0,
+            RewardAnomalyReasons = anomalyReasons.Count > 0 ? anomalyReasons.ToArray() : Array.Empty<string>()
         };
     }
 
@@ -1868,6 +1961,262 @@ internal static partial class BridgeGameApi
         return 0;
     }
 
+    internal sealed class EventOptionEffectDeltas
+    {
+        public int HpDelta { get; set; }                  // signed: lose → negative, gain/heal → positive
+        public int MaxHpDelta { get; set; }
+        public int GoldDelta { get; set; }
+        public bool HealFull { get; set; }
+        public int CardAddCount { get; set; }
+        public bool CardAddAttack { get; set; }
+        public bool CardAddSkill { get; set; }
+        public bool CardAddPower { get; set; }
+        public bool CardAddCurse { get; set; }
+        public bool CardAddStatus { get; set; }
+        public int CardRemoveCount { get; set; }
+        public int CardTransformCount { get; set; }
+        public int CardUpgradeCount { get; set; }
+        public int CardDuplicateCount { get; set; }
+        public bool RelicGain { get; set; }
+        public bool PotionGain { get; set; }
+        public bool EnterCombat { get; set; }
+
+        public object ToPayload()
+        {
+            return new
+            {
+                hp_delta = HpDelta,
+                max_hp_delta = MaxHpDelta,
+                gold_delta = GoldDelta,
+                heal_full = HealFull,
+                card_add_count = CardAddCount,
+                card_add_attack = CardAddAttack,
+                card_add_skill = CardAddSkill,
+                card_add_power = CardAddPower,
+                card_add_curse = CardAddCurse,
+                card_add_status = CardAddStatus,
+                card_remove_count = CardRemoveCount,
+                card_transform_count = CardTransformCount,
+                card_upgrade_count = CardUpgradeCount,
+                card_duplicate_count = CardDuplicateCount,
+                relic_gain = RelicGain,
+                potion_gain = PotionGain,
+                enter_combat = EnterCombat
+            };
+        }
+    }
+
+    /// <summary>
+    /// Extract structured effect signals from an event_option description so the
+    /// policy can reason about choice outcomes without the text encoder. Pattern
+    /// coverage spans EN and ZH; missing patterns degrade to 0 rather than lying.
+    /// </summary>
+    internal static EventOptionEffectDeltas ExtractEventOptionEffectDeltas(string? title, string? description)
+    {
+        var deltas = new EventOptionEffectDeltas();
+        if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(description))
+        {
+            return deltas;
+        }
+
+        var combined = string.Join(" \n ",
+            new[] { title ?? string.Empty, description ?? string.Empty }
+            .Where(static s => !string.IsNullOrWhiteSpace(s)));
+        var lower = combined.ToLowerInvariant();
+        var chineseInput = combined;
+
+        // ---- HP delta (signed) ----
+        var hpLose = SumFirstMatch(lower, chineseInput,
+            new[] { @"lose\s*(\d+)\s*hp", @"take\s*(\d+)\s*damage", @"you\s*take\s*(\d+)",
+                    @"suffer\s*(\d+)\s*damage", @"receive\s*(\d+)\s*damage" },
+            new[] { @"失去(\d+)点?(?:生命|hp)", @"受到(\d+)点?伤害", @"扣除?(\d+)点?(?:生命|hp)" });
+        var hpGain = SumFirstMatch(lower, chineseInput,
+            new[] { @"gain\s*(\d+)\s*hp", @"heal\s*(\d+)\s*hp?", @"restore\s*(\d+)\s*hp",
+                    @"recover\s*(\d+)\s*hp" },
+            new[] { @"(?:回复|恢复|治疗)(\d+)点?(?:生命|hp)", @"获得(\d+)点?(?:生命|hp)" });
+        deltas.HpDelta = hpGain - hpLose;
+        if (Regex.IsMatch(lower, @"\b(heal(ed)?\s*(to\s*)?full|fully\s*heal|restore\s*all\s*hp)\b") ||
+            Regex.IsMatch(chineseInput, "(回满|满血|回复全部生命|治疗至满)"))
+        {
+            deltas.HealFull = true;
+        }
+
+        // ---- Max HP delta (signed) ----
+        var maxHpGain = SumFirstMatch(lower, chineseInput,
+            new[] { @"max\s*hp\s*\+\s*(\d+)", @"gain\s*(\d+)\s*max\s*hp",
+                    @"(\d+)\s*max\s*hp", @"increase\s*max\s*hp\s*by\s*(\d+)" },
+            new[] { @"最大生命(?:增加|提高|提升|上升)?\+?(\d+)", @"max\s*hp\s*\+?(\d+)" });
+        var maxHpLose = SumFirstMatch(lower, chineseInput,
+            new[] { @"max\s*hp\s*-\s*(\d+)", @"lose\s*(\d+)\s*max\s*hp",
+                    @"decrease\s*max\s*hp\s*by\s*(\d+)" },
+            new[] { @"最大生命(?:减少|降低|下降)(\d+)", @"失去(\d+)点?最大生命" });
+        deltas.MaxHpDelta = maxHpGain - maxHpLose;
+
+        // ---- Gold delta ----
+        var goldGain = SumFirstMatch(lower, chineseInput,
+            new[] { @"gain\s*(\d+)\s*gold", @"receive\s*(\d+)\s*gold",
+                    @"(\d+)\s*gold", @"obtain\s*(\d+)\s*gold" },
+            new[] { @"获得(\d+)点?金币", @"(\d+)点?金币" });
+        var goldLose = SumFirstMatch(lower, chineseInput,
+            new[] { @"lose\s*(\d+)\s*gold", @"pay\s*(\d+)\s*gold", @"spend\s*(\d+)\s*gold" },
+            new[] { @"失去(\d+)点?金币", @"支付(\d+)点?金币", @"花费(\d+)点?金币" });
+        deltas.GoldDelta = goldGain - goldLose;
+
+        // ---- Card add (to deck) ----
+        // Explicit count with type: "add a curse" / "obtain 2 skills" / "加入一张诅咒"
+        deltas.CardAddCount += CountCardMentions(lower, chineseInput, out var types);
+        if (types.Attack) deltas.CardAddAttack = true;
+        if (types.Skill) deltas.CardAddSkill = true;
+        if (types.Power) deltas.CardAddPower = true;
+        if (types.Curse) deltas.CardAddCurse = true;
+        if (types.Status) deltas.CardAddStatus = true;
+
+        // ---- Card ops (remove / transform / upgrade / duplicate) ----
+        deltas.CardRemoveCount = CountCardOp(lower, chineseInput,
+            new[] { @"remove\s*(a|an|one|\d+)\s*cards?", @"purge\s*(a|an|\d+)\s*cards?" },
+            new[] { @"移除(一|两|三|\d+)张", @"删除(一|两|三|\d+)张" });
+        deltas.CardTransformCount = CountCardOp(lower, chineseInput,
+            new[] { @"transform\s*(a|an|one|two|\d+)\s*cards?" },
+            new[] { @"变化(一|两|三|\d+)张", @"变形(一|两|三|\d+)张" });
+        deltas.CardUpgradeCount = CountCardOp(lower, chineseInput,
+            new[] { @"upgrade\s*(a|an|one|\d+)\s*cards?", @"smith\s*(a|an|\d+)\s*cards?" },
+            new[] { @"升级(一|两|三|\d+)张", @"锻造(一|两|三|\d+)张" });
+        deltas.CardDuplicateCount = CountCardOp(lower, chineseInput,
+            new[] { @"duplicate\s*(a|an|one|\d+)\s*cards?", @"copy\s*(a|an|\d+)\s*cards?" },
+            new[] { @"复制(一|两|三|\d+)张" });
+
+        // ---- Relic / potion gain ----
+        if (Regex.IsMatch(lower, @"\b(gain|obtain|receive|get)\s+(a|an|one|\d+)?\s*relic\b") ||
+            Regex.IsMatch(chineseInput, "获得.{0,6}遗物"))
+        {
+            deltas.RelicGain = true;
+        }
+        if (Regex.IsMatch(lower, @"\b(gain|obtain|receive|get)\s+(a|an|one|\d+)?\s*potion\b") ||
+            Regex.IsMatch(chineseInput, "获得.{0,6}药水"))
+        {
+            deltas.PotionGain = true;
+        }
+
+        // ---- Enter combat ----
+        if (Regex.IsMatch(lower, @"\b(fight|enter\s*combat|start\s*combat|begin\s*battle)\b") ||
+            Regex.IsMatch(chineseInput, "(战斗|进入战斗|开始战斗|遭遇敌人)"))
+        {
+            deltas.EnterCombat = true;
+        }
+
+        return deltas;
+    }
+
+    private static int SumFirstMatch(string lower, string original, string[] englishPatterns, string[] chinesePatterns)
+    {
+        foreach (var pattern in englishPatterns)
+        {
+            var match = Regex.Match(lower, pattern, RegexOptions.IgnoreCase);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out var value))
+            {
+                return value;
+            }
+        }
+        foreach (var pattern in chinesePatterns)
+        {
+            var match = Regex.Match(original, pattern);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out var value))
+            {
+                return value;
+            }
+        }
+        return 0;
+    }
+
+    private static int CountCardOp(string lower, string original, string[] englishPatterns, string[] chinesePatterns)
+    {
+        foreach (var pattern in englishPatterns)
+        {
+            var match = Regex.Match(lower, pattern, RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                var raw = match.Groups[1].Value;
+                return ParseCardCountToken(raw);
+            }
+        }
+        foreach (var pattern in chinesePatterns)
+        {
+            var match = Regex.Match(original, pattern);
+            if (match.Success)
+            {
+                return ParseCardCountToken(match.Groups[1].Value);
+            }
+        }
+        return 0;
+    }
+
+    private static int ParseCardCountToken(string raw)
+    {
+        if (int.TryParse(raw, out var numeric))
+        {
+            return numeric;
+        }
+        return raw.ToLowerInvariant() switch
+        {
+            "a" or "an" or "one" or "一" => 1,
+            "two" or "两" => 2,
+            "three" or "三" => 3,
+            _ => 1
+        };
+    }
+
+    private readonly struct CardTypeFlags
+    {
+        public bool Attack { get; init; }
+        public bool Skill { get; init; }
+        public bool Power { get; init; }
+        public bool Curse { get; init; }
+        public bool Status { get; init; }
+    }
+
+    private static int CountCardMentions(string lower, string original, out CardTypeFlags types)
+    {
+        var attack = Regex.IsMatch(lower, @"\battack\b") || original.Contains("攻击");
+        var skill = Regex.IsMatch(lower, @"\bskill\b") || original.Contains("技能");
+        var power = Regex.IsMatch(lower, @"\bpower\b") || original.Contains("能力");
+        var curse = Regex.IsMatch(lower, @"\bcurse\b") || original.Contains("诅咒");
+        var status = Regex.IsMatch(lower, @"\bstatus\b") || original.Contains("状态");
+
+        types = new CardTypeFlags
+        {
+            Attack = attack,
+            Skill = skill,
+            Power = power,
+            Curse = curse,
+            Status = status,
+        };
+
+        // Look for explicit card-add verbs; ignore mere mentions (e.g. "choose a card to remove").
+        var enAddMatch = Regex.Match(lower,
+            @"\b(add|obtain|receive|gain|get)\s+(a|an|one|two|three|\d+)\s+(attack|skill|power|curse|status|card)");
+        if (enAddMatch.Success)
+        {
+            return ParseCardCountToken(enAddMatch.Groups[2].Value);
+        }
+        // Chinese: "获得一张/加入一张 XXX 牌"
+        var zhAddMatch = Regex.Match(original,
+            @"(?:获得|加入|得到|塞入)(一|两|三|\d+)张(?:攻击|技能|能力|诅咒|状态)?牌");
+        if (zhAddMatch.Success)
+        {
+            return ParseCardCountToken(zhAddMatch.Groups[1].Value);
+        }
+        // Pure curse/status mention without "add" verb is still meaningful in events.
+        if (curse || status)
+        {
+            var curseVerb = Regex.Match(original, @"(?:获得|得到|塞入|加入)\s*诅咒");
+            if (curseVerb.Success || Regex.IsMatch(lower, @"\b(gain|obtain|receive|add)\s+a\s+curse\b"))
+            {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     private static bool IsEnvSelectionLikeAction(BridgeResolvedActionSelection action)
     {
         return action.Kind is "card_selection" or "deck_upgrade" or "character_select" or "run_mode_selection";
@@ -2034,6 +2383,33 @@ internal static partial class BridgeGameApi
 
         [JsonPropertyName("truncated_penalty")]
         public required double TruncatedPenalty { get; init; }
+
+        [JsonPropertyName("raw_floor_delta")]
+        public required int RawFloorDelta { get; init; }
+
+        [JsonPropertyName("raw_act_clear")]
+        public required int RawActClear { get; init; }
+
+        [JsonPropertyName("raw_gold_gain")]
+        public required int RawGoldGain { get; init; }
+
+        [JsonPropertyName("raw_gold_spend")]
+        public required int RawGoldSpend { get; init; }
+
+        [JsonPropertyName("raw_relic_gain_count")]
+        public required int RawRelicGainCount { get; init; }
+
+        [JsonPropertyName("raw_room_hp_delta_normalized")]
+        public required double RawRoomHpDeltaNormalized { get; init; }
+
+        [JsonPropertyName("raw_max_hp_gain_normalized")]
+        public required double RawMaxHpGainNormalized { get; init; }
+
+        [JsonPropertyName("reward_anomaly_clamped")]
+        public required bool RewardAnomalyClamped { get; init; }
+
+        [JsonPropertyName("reward_anomaly_reasons")]
+        public required string[] RewardAnomalyReasons { get; init; }
 
         [JsonPropertyName("total")]
         public required double Total { get; init; }
