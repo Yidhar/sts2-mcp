@@ -1089,22 +1089,45 @@ class RunChainedSnapshotPool:
                 f"(had {len(by_run)} runs total)"
             )
 
-        # Precompute per-run quality and sampling weight
+        # Precompute per-run quality + bucket-level weighted sampling.
+        # CORRECT normalization: user-specified quality_weights target the
+        # BUCKET total (e.g. 40 percent of all episodes drawn from
+        # low_act1_loss regardless of that bucket's run count). Each run
+        # within a bucket gets bucket_weight / bucket_count so bucket totals
+        # sum to the target. Naive "per-run × quality_weight then normalize"
+        # makes the most populous bucket swallow ~100 percent of probability
+        # when raw run counts are skewed (low_act1_loss 2957 vs high_win 21
+        # → naive approach sends >99 percent of episodes to low_act1_loss
+        # despite weight 0.40).
         self._run_ids = sorted(self._runs.keys())
-        self._run_weights: list[float] = []
+        # Group run indices by quality bucket
+        bucket_members: dict[str, list[int]] = {}
+        run_quality: list[str] = []
         for rid in self._run_ids:
-            # Quality typically consistent across a run's snapshots; use first row's tag
-            first = self._runs[rid][0]
-            quality = str(first.get("quality_fine") or "low_act1_loss")
-            w = self.quality_weights.get(quality, 0.0)
-            self._run_weights.append(max(0.0, float(w)))
-        # Normalize (any run with weight==0 still gets a floor to avoid starvation)
-        total_w = sum(self._run_weights)
-        if total_w <= 0.0:
-            # Degenerate: no quality match, fall back uniform
+            quality = str(self._runs[rid][0].get("quality_fine") or "low_act1_loss")
+            run_quality.append(quality)
+            bucket_members.setdefault(quality, []).append(len(run_quality) - 1)
+        # Normalize bucket-level targets to sum to 1; drop buckets we don't
+        # have any runs in, redistribute their weight proportionally.
+        raw_targets = {
+            q: float(self.quality_weights.get(q, 0.0))
+            for q in bucket_members
+        }
+        total_raw = sum(raw_targets.values())
+        if total_raw <= 0.0:
+            # Degenerate: no matching quality_weights → uniform per run
             self._run_weights = [1.0 / float(len(self._run_ids))] * len(self._run_ids)
         else:
-            self._run_weights = [w / total_w for w in self._run_weights]
+            bucket_norm = {q: raw_targets[q] / total_raw for q in raw_targets}
+            self._run_weights = [0.0] * len(self._run_ids)
+            for q, members in bucket_members.items():
+                per_run = bucket_norm[q] / float(len(members))
+                for idx in members:
+                    self._run_weights[idx] = per_run
+        self._bucket_target_weights = {
+            q: (raw_targets[q] / total_raw if total_raw > 0 else 1.0 / len(bucket_members))
+            for q in bucket_members
+        }
 
     def __len__(self) -> int:
         return len(self._run_ids)
