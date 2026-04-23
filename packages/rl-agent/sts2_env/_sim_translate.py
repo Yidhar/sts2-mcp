@@ -1251,19 +1251,191 @@ def _translate_run_block(sim_run: dict[str, Any], state_type: str, game_over: di
     }
 
 
+_EVENT_DELTA_CARD_COUNT_TOKENS = {
+    "a": 1, "an": 1, "one": 1, "一": 1,
+    "two": 2, "两": 2,
+    "three": 3, "三": 3,
+}
+
+
+def _event_parse_card_count_token(raw: str) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _EVENT_DELTA_CARD_COUNT_TOKENS.get(raw.lower(), 1)
+
+
+def _event_sum_first_match(
+    lower: str, original: str,
+    english_patterns: list[str], chinese_patterns: list[str],
+) -> int:
+    import re as _re
+    for pattern in english_patterns:
+        m = _re.search(pattern, lower, _re.IGNORECASE)
+        if m and m.group(1).isdigit():
+            return int(m.group(1))
+    for pattern in chinese_patterns:
+        m = _re.search(pattern, original)
+        if m and m.group(1).isdigit():
+            return int(m.group(1))
+    return 0
+
+
+def _event_count_card_op(
+    lower: str, original: str,
+    english_patterns: list[str], chinese_patterns: list[str],
+) -> int:
+    import re as _re
+    for pattern in english_patterns:
+        m = _re.search(pattern, lower, _re.IGNORECASE)
+        if m:
+            return _event_parse_card_count_token(m.group(1))
+    for pattern in chinese_patterns:
+        m = _re.search(pattern, original)
+        if m:
+            return _event_parse_card_count_token(m.group(1))
+    return 0
+
+
+def _extract_event_option_effect_deltas(title: str | None, description: str | None) -> dict[str, Any]:
+    """Port of bridge BridgeGameApi.EnvHelpers.ExtractEventOptionEffectDeltas
+    (EN + ZH regex patterns). Parses event option text into 17 structured
+    signal fields the obs encoder consumes for event-choice reasoning.
+
+    Missing patterns degrade to 0 rather than lying. Exact parity with
+    live bridge's parser for the 17 keys emitted under effect_deltas.
+    """
+    import re as _re
+    deltas: dict[str, Any] = {
+        "hp_delta": 0,
+        "max_hp_delta": 0,
+        "gold_delta": 0,
+        "heal_full": False,
+        "card_add_count": 0,
+        "card_add_attack": False,
+        "card_add_skill": False,
+        "card_add_power": False,
+        "card_add_curse": False,
+        "card_add_status": False,
+        "card_remove_count": 0,
+        "card_transform_count": 0,
+        "card_upgrade_count": 0,
+        "card_duplicate_count": 0,
+        "relic_gain": False,
+        "potion_gain": False,
+        "enter_combat": False,
+    }
+    if not (title or description):
+        return deltas
+    combined = " \n ".join(s for s in (title or "", description or "") if s)
+    lower = combined.lower()
+    original = combined
+
+    # HP delta (signed)
+    hp_lose = _event_sum_first_match(lower, original,
+        [r"lose\s*(\d+)\s*hp", r"take\s*(\d+)\s*damage", r"you\s*take\s*(\d+)",
+         r"suffer\s*(\d+)\s*damage", r"receive\s*(\d+)\s*damage"],
+        [r"失去(\d+)点?(?:生命|hp)", r"受到(\d+)点?伤害", r"扣除?(\d+)点?(?:生命|hp)"])
+    hp_gain = _event_sum_first_match(lower, original,
+        [r"gain\s*(\d+)\s*hp", r"heal\s*(\d+)\s*hp?", r"restore\s*(\d+)\s*hp",
+         r"recover\s*(\d+)\s*hp"],
+        [r"(?:回复|恢复|治疗)(\d+)点?(?:生命|hp)", r"获得(\d+)点?(?:生命|hp)"])
+    deltas["hp_delta"] = hp_gain - hp_lose
+    if (_re.search(r"\b(heal(ed)?\s*(to\s*)?full|fully\s*heal|restore\s*all\s*hp)\b", lower)
+            or _re.search(r"(回满|满血|回复全部生命|治疗至满)", original)):
+        deltas["heal_full"] = True
+
+    # Max HP delta (signed)
+    max_gain = _event_sum_first_match(lower, original,
+        [r"max\s*hp\s*\+\s*(\d+)", r"gain\s*(\d+)\s*max\s*hp",
+         r"(\d+)\s*max\s*hp", r"increase\s*max\s*hp\s*by\s*(\d+)"],
+        [r"最大生命(?:增加|提高|提升|上升)?\+?(\d+)", r"max\s*hp\s*\+?(\d+)"])
+    max_lose = _event_sum_first_match(lower, original,
+        [r"max\s*hp\s*-\s*(\d+)", r"lose\s*(\d+)\s*max\s*hp",
+         r"decrease\s*max\s*hp\s*by\s*(\d+)"],
+        [r"最大生命(?:减少|降低|下降)(\d+)", r"失去(\d+)点?最大生命"])
+    deltas["max_hp_delta"] = max_gain - max_lose
+
+    # Gold
+    gold_gain = _event_sum_first_match(lower, original,
+        [r"gain\s*(\d+)\s*gold", r"receive\s*(\d+)\s*gold",
+         r"(\d+)\s*gold", r"obtain\s*(\d+)\s*gold"],
+        [r"获得(\d+)点?金币", r"(\d+)点?金币"])
+    gold_lose = _event_sum_first_match(lower, original,
+        [r"lose\s*(\d+)\s*gold", r"pay\s*(\d+)\s*gold", r"spend\s*(\d+)\s*gold"],
+        [r"失去(\d+)点?金币", r"支付(\d+)点?金币", r"花费(\d+)点?金币"])
+    deltas["gold_delta"] = gold_gain - gold_lose
+
+    # Card-add count + types
+    attack = bool(_re.search(r"\battack\b", lower)) or ("攻击" in original)
+    skill = bool(_re.search(r"\bskill\b", lower)) or ("技能" in original)
+    power = bool(_re.search(r"\bpower\b", lower)) or ("能力" in original)
+    curse = bool(_re.search(r"\bcurse\b", lower)) or ("诅咒" in original)
+    status = bool(_re.search(r"\bstatus\b", lower)) or ("状态" in original)
+    deltas["card_add_attack"] = attack
+    deltas["card_add_skill"] = skill
+    deltas["card_add_power"] = power
+    deltas["card_add_curse"] = curse
+    deltas["card_add_status"] = status
+    # Count of card mentions (simplified): 1 if any type mentioned else 0;
+    # boost to explicit number if "add N cards" pattern matches.
+    add_count_explicit = _event_count_card_op(lower, original,
+        [r"(?:add|gain|obtain|receive)\s*(a|an|one|\d+)\s*cards?",
+         r"(?:add|gain|obtain|receive)\s*(a|an|one|\d+)\s*(?:attack|skill|power|curse|status)"],
+        [r"加入(一|两|三|\d+)张", r"获得(一|两|三|\d+)张"])
+    if add_count_explicit:
+        deltas["card_add_count"] = add_count_explicit
+    elif any([attack, skill, power, curse, status]):
+        deltas["card_add_count"] = 1
+
+    # Card ops
+    deltas["card_remove_count"] = _event_count_card_op(lower, original,
+        [r"remove\s*(a|an|one|\d+)\s*cards?", r"purge\s*(a|an|\d+)\s*cards?"],
+        [r"移除(一|两|三|\d+)张", r"删除(一|两|三|\d+)张"])
+    deltas["card_transform_count"] = _event_count_card_op(lower, original,
+        [r"transform\s*(a|an|one|two|\d+)\s*cards?"],
+        [r"变化(一|两|三|\d+)张", r"变形(一|两|三|\d+)张"])
+    deltas["card_upgrade_count"] = _event_count_card_op(lower, original,
+        [r"upgrade\s*(a|an|one|\d+)\s*cards?", r"smith\s*(a|an|\d+)\s*cards?"],
+        [r"升级(一|两|三|\d+)张", r"锻造(一|两|三|\d+)张"])
+    deltas["card_duplicate_count"] = _event_count_card_op(lower, original,
+        [r"duplicate\s*(a|an|one|\d+)\s*cards?", r"copy\s*(a|an|\d+)\s*cards?"],
+        [r"复制(一|两|三|\d+)张"])
+
+    # Relic / potion gain
+    if (_re.search(r"\b(gain|obtain|receive|get)\s+(a|an|one|\d+)?\s*relic\b", lower)
+            or _re.search(r"获得.{0,6}遗物", original)):
+        deltas["relic_gain"] = True
+    if (_re.search(r"\b(gain|obtain|receive|get)\s+(a|an|one|\d+)?\s*potion\b", lower)
+            or _re.search(r"获得.{0,6}药水", original)):
+        deltas["potion_gain"] = True
+
+    # Combat entry
+    if (_re.search(r"\b(fight|enter\s*combat|start\s*combat|begin\s*battle)\b", lower)
+            or _re.search(r"(战斗|进入战斗|开始战斗|遭遇敌人)", original)):
+        deltas["enter_combat"] = True
+
+    return deltas
+
+
 def _translate_event_options(event: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for opt in event.get("options") or []:
         if not isinstance(opt, dict):
             continue
+        text = str(opt.get("text") or "")
+        # Sim emits only `text` on option; split into title/description is
+        # approximate (title = first line if any). Parser ok with whole text
+        # in description.
+        title = text.split("\n", 1)[0] if text else ""
         out.append({
             "index": int(opt.get("index") or 0),
-            "label": str(opt.get("text") or ""),
-            "description": str(opt.get("text") or ""),
+            "label": text,
+            "description": text,
             "is_enabled": not bool(opt.get("is_locked", False)),
             "is_chosen": bool(opt.get("is_chosen", False)),
             "is_proceed": bool(opt.get("is_proceed", False)),
-            "effect_deltas": {},  # Requires resolved text → Phase 3+ C# port
+            "effect_deltas": _extract_event_option_effect_deltas(title, text),
         })
     return out
 
@@ -1550,18 +1722,21 @@ def _translate_legal_actions(
             if isinstance(eidx, int) and eidx in event_options_by_index:
                 opt = event_options_by_index[eidx]
                 # Flat fields mirror bridge EnvHelpers.cs:112-123.
+                text = str(opt.get("text") or "")
+                title = text.split("\n", 1)[0] if text else ""
+                deltas = _extract_event_option_effect_deltas(title, text)
                 entry["index"] = eidx
-                entry["title"] = str(opt.get("text") or "")
+                entry["title"] = text
                 entry["option_type"] = str(opt.get("option_type") or "")
                 entry["proceed"] = bool(opt.get("is_proceed", False))
-                entry["effect_deltas"] = {}  # sim locale stub — Phase 5+
+                entry["effect_deltas"] = deltas
                 # Legacy nested key kept for back-compat.
                 entry["event_option"] = {
                     "index": eidx,
-                    "label": str(opt.get("text") or ""),
+                    "label": text,
                     "is_locked": bool(opt.get("is_locked", False)),
                     "is_proceed": bool(opt.get("is_proceed", False)),
-                    "effect_deltas": {},
+                    "effect_deltas": deltas,
                 }
         elif kind == "choose_rest_option":
             ridx = action.get("index")
