@@ -952,6 +952,95 @@ def _translate_intent(intents: list[Any] | None) -> dict[str, Any]:
     }
 
 
+def _build_enemy_trait_payloads(
+    name: str, model_id: str, next_move_id: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Mirror of live bridge's BuildEnemyStaticTraitPayloads +
+    BuildEnemyReactiveTriggerPayloads + BuildEnemyPhaseRulePayloads.
+    Keyword-driven detection of combat-critical enemy traits.
+
+    Returns (static_traits, reactive_triggers, phase_rules). Each entry has
+    the 10-field trait payload shape the obs encoder reads (trait,
+    description, trigger_type, condition, effect_type, effect_amount,
+    severity, etc.).
+
+    Obs encoder (_infer_enemy_traits in observation_v3.py) reads these
+    three arrays directly from each enemy dict. Live bridge emits them;
+    sim never did, so policy missed ~6-12 trait classes like
+    summon_engine, gatekeeper, time_scaling, countdown_tick, reveal_boss.
+    """
+    search = " ".join([name, model_id, next_move_id]).lower()
+    static_traits: list[dict[str, Any]] = []
+    reactive_triggers: list[dict[str, Any]] = []
+    phase_rules: list[dict[str, Any]] = []
+
+    def _mk(category: str, trait: str, description: str,
+            trigger_type: str | None = None, condition: str | None = None,
+            effect_type: str | None = None, effect_amount: int | None = None,
+            severity: str = "medium") -> dict[str, Any]:
+        return {
+            "category": category, "trait": trait, "description": description,
+            "trigger_type": trigger_type, "condition": condition,
+            "effect_type": effect_type, "effect_amount": effect_amount,
+            "severity": severity,
+        }
+
+    # Static traits
+    if any(k in search for k in ("nexus", "progenitor", "queen", "egg")):
+        static_traits.append(_mk("static", "summon_engine",
+            "Acts as a board-pressure engine or summon core.", severity="high"))
+    if "door" in search:
+        static_traits.append(_mk("static", "gatekeeper",
+            "Encounter progression is gated until this unit's cycle is solved.", severity="high"))
+    if any(k in search for k in ("matriarch", "nexus", "byrdonis", "wurm")):
+        static_traits.append(_mk("static", "time_scaling",
+            "Threat grows materially if the fight drags.", severity="high"))
+    if any(k in search for k in ("retali", "thorn", "spiny")):
+        static_traits.append(_mk("static", "contact_retaliate",
+            "Punishes contact hits or spammy multi-hit plans.", severity="high"))
+
+    # Reactive triggers
+    if any(k in search for k in ("retali", "thorn", "spike", "spiny")):
+        reactive_triggers.append(_mk("reactive", "retaliate",
+            "On hit or contact, this enemy punishes damage with retaliation.",
+            trigger_type="on_hit", condition="contact", effect_type="retaliate",
+            severity="high"))
+    if any(k in search for k in ("egg", "progenitor", "summon")):
+        reactive_triggers.append(_mk("reactive", "summon",
+            "If left alive or when killed, this enemy can continue board pressure via summons.",
+            trigger_type="on_turn_end", condition="alive", effect_type="summon",
+            severity="high"))
+
+    # Phase rules
+    if any(k in search for k in ("split", "prism")):
+        phase_rules.append(_mk("phase", "split",
+            "Crossing a threshold can split or multiply the board state.",
+            trigger_type="on_hp_threshold", condition="threshold_crossed",
+            effect_type="split", severity="medium"))
+    if any(k in search for k in ("phase", "threshold", "subject", "doormaker")):
+        phase_rules.append(_mk("phase", "phase_shift",
+            "The enemy has threshold- or cycle-based phase changes.",
+            trigger_type="on_hp_threshold", condition="threshold_crossed",
+            effect_type="phase_shift", severity="high"))
+    if "intang" in search:
+        phase_rules.append(_mk("phase", "gain_intangible",
+            "Intangible windows change when burst should be committed.",
+            trigger_type="on_turn_start", condition="intangible_window",
+            effect_type="gain_intangible", severity="high"))
+    if "insatiable" in search:
+        phase_rules.append(_mk("phase", "countdown_tick",
+            "An external countdown or timer pressures the fight every turn.",
+            trigger_type="on_turn_start", condition="countdown_active",
+            effect_type="countdown_tick", severity="high"))
+    if model_id.upper() == "MONSTER.DOOR":
+        phase_rules.append(_mk("phase", "reveal_boss",
+            "Destroying the door exposes the main boss window.",
+            trigger_type="on_death", condition="door_destroyed",
+            effect_type="reveal_boss", severity="high"))
+
+    return static_traits, reactive_triggers, phase_rules
+
+
 def _translate_combat_block(
     battle: dict[str, Any],
     sim_player: dict[str, Any],
@@ -964,9 +1053,16 @@ def _translate_combat_block(
         if not isinstance(enemy, dict):
             continue
         powers = _translate_player_powers(enemy.get("status"))
+        enemy_name = str(enemy.get("name") or enemy.get("entity_id") or "")
+        enemy_model_id = str(enemy.get("entity_id") or "")
+        enemy_next_move = str(enemy.get("next_move_id") or "")
+        static_traits, reactive_triggers, phase_rules = _build_enemy_trait_payloads(
+            enemy_name, enemy_model_id, enemy_next_move,
+        )
         enemies.append({
             "id": int(enemy.get("combat_id") or 0),
-            "name": str(enemy.get("name") or enemy.get("entity_id") or ""),
+            "name": enemy_name,
+            "model_id": enemy_model_id,
             "hp": int(enemy.get("hp") or 0),
             "max_hp": int(enemy.get("max_hp") or 0),
             "block": int(enemy.get("block") or 0),
@@ -977,8 +1073,15 @@ def _translate_combat_block(
             ),
             "intent": _translate_intent(enemy.get("intents")),
             "powers": powers,
-            "next_move_id": str(enemy.get("next_move_id") or ""),
+            "next_move_id": enemy_next_move,
             "intends_to_attack": bool(enemy.get("intends_to_attack", False)),
+            # Effect algebra payloads (live parity). Obs encoder's
+            # _infer_enemy_traits reads these to populate POWER_SLOT
+            # structured effect vectors (Phase 6.1). Without them, sim
+            # training saw zero structured effects for 6+ trait classes.
+            "static_traits": static_traits,
+            "reactive_triggers": reactive_triggers,
+            "phase_rules": phase_rules,
         })
     hand_cards = [_translate_card(c, pile="Hand") for c in (sim_player.get("hand") or [])]
     # Sim exposes full pile lists under player.{draw,discard,exhaust}_pile.
