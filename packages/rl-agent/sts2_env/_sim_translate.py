@@ -278,6 +278,14 @@ def _build_route_summary(
     # player's current position).
     queue: list[tuple[tuple[int, int], int]] = [(start_coord, 1)]
     head = 0
+    # Per-node tree records — what obs encoder consumes as
+    # action.route_nodes. Each entry: {coord, point_type, depth,
+    # child_count, is_leaf}.
+    tree_nodes: list[dict[str, Any]] = []
+    # Tracks first-branch location for forced_path_steps_before_branch:
+    # number of depth levels from start_coord until a node has >=2
+    # children. A value of 0 means the start_coord itself branches.
+    forced_steps: int | None = None
     while head < len(queue):
         coord, depth = queue[head]
         head += 1
@@ -289,16 +297,33 @@ def _build_route_summary(
             counts[pt] += 1
         if pt and pt not in first_depth:
             first_depth[pt] = depth
-        for child in node.get("children") or []:
+        children_list = node.get("children") or []
+        child_count = 0
+        for child in children_list:
             if isinstance(child, (list, tuple)) and len(child) >= 2:
                 cc = (int(child[0]), int(child[1]))
             elif isinstance(child, dict):
                 cc = (int(child.get("col") or 0), int(child.get("row") or 0))
             else:
                 continue
+            child_count += 1
             if cc not in visited:
                 visited.add(cc)
                 queue.append((cc, depth + 1))
+        # Record per-node tree structure for route_nodes emission.
+        tree_nodes.append({
+            "coord": {"col": coord[0], "row": coord[1]},
+            "point_type": str(node.get("point_type") or "").title() or "Monster",
+            "depth": depth,
+            "child_count": child_count,
+            "is_leaf": child_count == 0,
+        })
+        # First branching node (child_count >= 2) determines how many
+        # forced-path steps there are before a real choice. Value is the
+        # depth-from-start (0-indexed), i.e., depth - 1 since queue starts
+        # at depth=1.
+        if forced_steps is None and child_count >= 2:
+            forced_steps = max(0, depth - 1)
 
     elite_depth = first_depth.get("elite", 10**6)
     rest_depth = first_depth.get("rest_site", 10**6)
@@ -306,6 +331,7 @@ def _build_route_summary(
     can_reach_elite_then_rest = (
         elite_depth < 10**6 and rest_depth < 10**6 and rest_depth > elite_depth
     )
+    max_depth = max((n["depth"] for n in tree_nodes), default=1)
 
     # None for unreachable types so reward_constants._norm_step (or whatever
     # _norm_step maps unreachable to) can distinguish "no elite in subtree"
@@ -321,6 +347,13 @@ def _build_route_summary(
         "count_boss": counts["boss"],
         "direct_child_count": int(parent_child_count),
         "reachable_node_count": len(visited),
+        # Max depth reachable from start (obs encoder uses for tree-depth
+        # feature). Capped at 15 normalization later in obs.
+        "max_depth": int(max_depth),
+        # Steps from start before a real choice point (branching); None
+        # when there's never a branch (linear path). Obs encoder divides
+        # by 10.
+        "forced_path_steps_before_branch": forced_steps,
         "next_elite_steps": first_depth.get("elite"),
         "next_rest_steps": first_depth.get("rest_site"),
         "next_shop_steps": first_depth.get("shop"),
@@ -330,6 +363,11 @@ def _build_route_summary(
         "next_boss_steps": first_depth.get("boss"),
         "can_reach_rest_site_before_elite": can_reach_rest_before_elite,
         "can_reach_elite_then_rest_site": can_reach_elite_then_rest,
+        # Per-node tree records. Obs encoder reads these as
+        # action.route_nodes for POWER_SLOT + route-attention features.
+        # Cap at MAX_ROUTE_NODES (obs encoder trims to 32). Keep BFS
+        # order so shallower nodes come first.
+        "nodes": tree_nodes,
     }
 
 
@@ -1500,6 +1538,13 @@ def _translate_legal_actions(
                     )
                     if summary:
                         entry["route_summary"] = summary
+                        # Obs encoder consumes per-node tree under the
+                        # action's own `route_nodes` list (parallel to
+                        # `route_summary`). Live bridge flattens summary
+                        # nodes to action-level for the same reason.
+                        nodes_list = summary.get("nodes") or []
+                        if nodes_list:
+                            entry["route_nodes"] = list(nodes_list)
         elif kind == "choose_event_option":
             eidx = action.get("index")
             if isinstance(eidx, int) and eidx in event_options_by_index:
