@@ -392,49 +392,67 @@ def _build_decision_block(
     """
     if state_type == "event":
         opts = event.get("options") or []
-        return {"option_count": len(opts)}
+        title = str(event.get("title") or event.get("name") or "事件")
+        return {
+            "option_count": len(opts),
+            "decision_text": f"事件｜{title}｜{len(opts)}个选项",
+        }
     if state_type == "card_reward":
         choices = card_reward.get("cards") or []
         return {
             "option_count": len(choices),
             "can_skip": bool(card_reward.get("can_skip", True)),
+            "decision_text": f"卡牌奖励｜{len(choices)}张卡牌可选",
         }
     if state_type in {"rewards", "combat_rewards", "combat_post_end_pending"}:
         items = rewards.get("items") or []
         return {
             "reward_count": len(items),
             "proceed_only": bool(rewards.get("can_proceed", False)) and len(items) == 0,
+            "decision_text": f"奖励选择｜可领取{len(items)}项奖励",
         }
     if state_type == "map":
         opts = map_state.get("next_options") or []
-        return {"travelable_count": len(opts)}
+        return {
+            "travelable_count": len(opts),
+            "decision_text": f"地图｜{len(opts)}个可选节点",
+        }
     if state_type == "rest_site":
         opts = rest_site.get("options") or []
         return {
             "option_count": len(opts),
             "can_proceed": bool(rest_site.get("can_proceed", False)),
+            "decision_text": "营火｜选择休息或锻造",
         }
     if state_type == "shop":
         items = shop.get("items") or []
         return {
             "is_open": bool(shop.get("is_open", False)),
             "item_count": len(items),
+            "decision_text": f"商店｜{len(items)}件商品",
         }
     if state_type == "treasure":
         relic_opts = treasure.get("relics") or []
         return {
             "option_count": len(relic_opts),
             "can_proceed": bool(treasure.get("can_open", True)),
+            "decision_text": f"宝箱｜{len(relic_opts)}件遗物可选",
         }
     if state_type in {"card_select", "hand_select"}:
         src = card_select if card_select else hand_select
         if not isinstance(src, dict):
             src = {}
+        prompt = str(src.get("prompt") or "").strip()
+        min_sel = int(src.get("min_select") or 0)
+        max_sel = int(src.get("max_select") or 1)
+        selected = len(src.get("selected_cards") or [])
+        label = prompt or ("手牌选择" if state_type == "hand_select" else "卡牌选择")
         return {
-            "selected_count": len(src.get("selected_cards") or []),
-            "min_select": int(src.get("min_select") or 0),
-            "max_select": int(src.get("max_select") or 1),
+            "selected_count": selected,
+            "min_select": min_sel,
+            "max_select": max_sel,
             "can_skip": bool(src.get("can_cancel", False)),
+            "decision_text": f"{label}｜已选{selected}｜{min_sel}-{max_sel}张",
         }
     if in_combat:
         # During combat there's no global decision prompt — return empty.
@@ -619,6 +637,20 @@ def translate_to_bridge_shape(
         treasure=treasure,
     )
 
+    phase = _phase_from_state(state_type, in_combat=in_combat)
+    # Mirror live ResolveEnvDecisionDomain (BridgeGameApi.EnvPayloads.cs:442):
+    # combat→combat, map→route, card_selection/settling→combat if in-combat
+    # else build, everything else→build. Obs encoder (_resolve_domain at
+    # observation_common.py:1547) reads this top-level.
+    if phase == "combat":
+        decision_domain = "combat"
+    elif phase == "map":
+        decision_domain = "route"
+    elif phase in {"card_selection", "settling"}:
+        decision_domain = "combat" if in_combat else "build"
+    else:
+        decision_domain = "build"
+
     bridge_state: dict[str, Any] = {
         "ok": True,
         "backend": "headless_sim",
@@ -628,6 +660,7 @@ def translate_to_bridge_shape(
         "semantic_state_hash": str(sim_state.get("semantic_state_hash") or ""),
         "schema_version": "sim-v1",
         "bridge_version": "headless_sim",
+        "decision_domain": decision_domain,
         "screen": screen,
         "players": bridge_players,
         "player": bridge_player,
@@ -669,7 +702,7 @@ def translate_to_bridge_shape(
         "available_actions": bridge_actions,
         "_sim_raw": sim_state,
         "episode_id": episode_id,
-        "phase": _phase_from_state(state_type, in_combat=in_combat),
+        "phase": phase,
     }
     return bridge_state
 
@@ -711,6 +744,11 @@ def _translate_card(sim_card: Any, *, pile: str = "Deck") -> dict[str, Any]:
     card_id = raw_id if raw_id.startswith("CARD.") else f"CARD.{raw_id}"
     cost = sim_card.get("cost")
     cost_int = int(cost) if isinstance(cost, int) else 0
+    # X-cost detection: sim runtime card DTO doesn't expose `is_x_cost` on the
+    # hand payload (FullRunApiCardOption only has `cost: int?`), so infer from
+    # the static card registry where energy_cost_text == "X". obs encoder
+    # (observation_common.py:988) reads `x_cost`; legacy `costs_x` kept.
+    is_x_cost = _card_is_x_cost_from_registry(card_id) or (cost is None and cost_int == 0)
     is_upgraded = bool(sim_card.get("is_upgraded"))
     upgrade_level = 1 if is_upgraded else 0
     target = str(sim_card.get("target_type") or "None")
@@ -748,7 +786,15 @@ def _translate_card(sim_card: Any, *, pile: str = "Deck") -> dict[str, Any]:
         "is_playable": bool(sim_card.get("can_play", True)),
         "canonical_energy_cost": cost_int,
         "resolved_energy_cost": cost_int,
-        "costs_x": False,
+        "costs_x": is_x_cost,
+        "x_cost": is_x_cost,
+        # Regent-only star resource. Sim's FullRunApiCardOption has no
+        # per-card star field (only the combat-global `stars` counter).
+        # Emit None explicitly so the probe sees the key as "translated"
+        # rather than "discarded"; obs encoder's 0.0 fallback for missing
+        # keys is the correct signal for non-Regent characters.
+        "star": None,
+        "star_x": False,
         "keywords": list(sim_card.get("keywords") or []),
         "valid_target_ids": [int(t) for t in valid_targets if isinstance(t, (int, float))],
         # Populate effect_preview from content_registry's semantic_signals
@@ -812,6 +858,18 @@ _SEMANTIC_SIGNAL_TO_PREVIEW: dict[str, str] = {
     "damage_per_hit": "damage_per_hit",
     "summon": "summon",
 }
+
+
+def _card_is_x_cost_from_registry(card_id: str) -> bool:
+    try:
+        from content_registry import get_card_metadata  # noqa: PLC0415
+        md = get_card_metadata(card_id)
+    except Exception:
+        return False
+    if not isinstance(md, dict):
+        return False
+    text = str(md.get("energy_cost_text") or "").strip().upper()
+    return text == "X"
 
 
 def _card_effect_preview_from_registry(card_id: str) -> dict[str, Any]:
@@ -1674,6 +1732,7 @@ def _translate_legal_actions(
                 entry["potion"] = _translate_potion(potions_by_slot[slot])
                 entry["slot"] = slot
                 entry["potion_slot"] = slot  # legacy alias
+                entry["slot_index"] = slot   # obs encoder reads this name
             tid = action.get("target_id")
             target_name = ""
             if tid is not None:
@@ -1791,11 +1850,17 @@ def _translate_legal_actions(
             cidx = action.get("index")
             if cidx is None:
                 cidx = action.get("card_index")
+            # Carry the source block's prompt onto each action entry so obs
+            # encoder's action.get("selection_prompt") resolves (previously
+            # always None on sim). Live bridge's BridgeGameApi.EnvHelpers.cs
+            # :143 does the same flattening.
+            selection_prompt = str(card_select.get("prompt") or "") if card_select else ""
             if isinstance(cidx, int) and cidx in card_select_by_index:
                 entry["card"] = _translate_card(card_select_by_index[cidx], pile="Select")
                 entry["selection"] = "pick"
                 entry["index"] = cidx
                 entry["selection_semantics"] = str(action.get("selection_semantics") or "")
+                entry["selection_prompt"] = selection_prompt
             elif isinstance(cidx, int):
                 # Combat hand-selection — the card isn't in card_select_by_index
                 # (that dict is seeded from the non-combat ``card_select`` block);
@@ -1807,6 +1872,7 @@ def _translate_legal_actions(
                     entry["selection"] = "pick"
                     entry["index"] = cidx
                     entry["selection_semantics"] = str(action.get("selection_semantics") or "")
+                    entry["selection_prompt"] = selection_prompt
         elif kind == "claim_treasure":
             ridx = action.get("index")
             if isinstance(ridx, int) and ridx in treasure_relics_by_index:
