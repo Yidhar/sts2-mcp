@@ -45,38 +45,51 @@ DICT_STRING_KEY_PATTERN = re.compile(r'\["([a-z][a-z0-9_]*)"\]\s*=')
 
 
 def extract_emitted_keys_cs(root: Path) -> Counter:
-    """Scan C# files for response payload key names (anonymous-object + string-indexed dict)."""
+    """Scan C# files for response payload key names:
+    1) anonymous-object field assignments (live bridge pattern):  name = value
+    2) string-indexed dict assignments (sim Program.cs pattern):  ["name"] = value
+    3) typed DTO public properties (sim FullRunApiStateDtos.cs pattern):
+       public T name { get; set; }  — these are the JSON-serialized keys
+       when the DTO is returned as a response.
+    4) JsonPropertyName attributes: [JsonPropertyName("name")]
+    """
     counts: Counter = Counter()
     if not root.exists():
         return counts
+    # Typed property: `public <type> <name> { get; ... }` — JSON serializer
+    # emits these as response keys. Match lowercase + snake_case names.
+    prop_pattern = re.compile(
+        r'^\s*public\s+(?:readonly\s+)?(?:virtual\s+)?(?:override\s+)?'
+        r'[A-Za-z_][A-Za-z0-9_<>?\[\]\.\s]*?\s+'
+        r'([a-z][a-z0-9_]*)\s*\{\s*get'
+    )
+    # JsonPropertyName attribute: [JsonPropertyName("name")]
+    json_prop_pattern = re.compile(r'\[JsonPropertyName\(\s*"([^"]+)"\s*\)\]')
+
     for cs in root.rglob("*.cs"):
         try:
             lines = cs.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
-        in_anonymous = False
-        brace_depth = 0
         for line in lines:
-            # Dict-string-key always counted
+            # Dict-string-key
             for m in DICT_STRING_KEY_PATTERN.finditer(line):
                 counts[m.group(1)] += 1
-            # Anonymous object detection — look for "new" keyword followed by {
-            # and count ident = entries inside. Simplified heuristic: treat any
-            # line-leading "ident = " in a block opened by "new" or "new { ..."
-            # Capture via heuristic: lines that match anon pattern AND are
-            # likely inside an object literal (contain "=" but no ";"
-            # immediately after, suggesting they're comma-terminated fields).
+            # JsonPropertyName attribute (live bridge's BridgeEnvResetRequest
+            # uses this; sim DTOs don't, relying on property name itself)
+            for m in json_prop_pattern.finditer(line):
+                counts[m.group(1)] += 1
+            # Typed DTO public property
+            m = prop_pattern.match(line)
+            if m:
+                counts[m.group(1)] += 1
+            # Anonymous-object field (indent-heuristic)
             trimmed = line.strip().rstrip(",")
             if "=" in trimmed and not trimmed.endswith(";"):
                 m = re.match(r'^([a-z][a-z0-9_]*)\s*=\s*', trimmed)
                 if m:
-                    # Filter obvious non-payload: variable assignments usually
-                    # have a type before, e.g. "int x = 0" or "var y = ...".
-                    # Anonymous-object fields just start with the name.
-                    # Indent-based heuristic: anon-object fields are deeper
-                    # indented (typically 4+ spaces from a "new" keyword).
                     leading_spaces = len(line) - len(line.lstrip(" "))
-                    if leading_spaces >= 8:  # deeper than top-level
+                    if leading_spaces >= 8:
                         counts[m.group(1)] += 1
     return counts
 

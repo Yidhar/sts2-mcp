@@ -325,6 +325,7 @@ def _build_route_summary(
         "next_rest_steps": first_depth.get("rest_site"),
         "next_shop_steps": first_depth.get("shop"),
         "next_event_steps": first_depth.get("event"),
+        "next_question_mark_steps": first_depth.get("question_mark"),
         "next_treasure_steps": first_depth.get("treasure"),
         "next_boss_steps": first_depth.get("boss"),
         "can_reach_rest_site_before_elite": can_reach_rest_before_elite,
@@ -1052,9 +1053,29 @@ def _translate_run_block(sim_run: dict[str, Any], state_type: str, game_over: di
     act = int(sim_run.get("act") or 1)
     room_type = str(sim_run.get("room_type") or "").title() or "Monster"
     is_game_over = state_type in {"game_over", "victory"}
+    # Map act 1/2/3 -> STS2 act model ids. Obs encoder's _parse_act reads the
+    # trailing digit, so "ACT.UNDERDOCKS" would give 0. We need the real
+    # ACT.<name> id matching the specific act played. Sim doesn't directly
+    # expose act model id (just int index), but we can construct the
+    # canonical form from act index + the character.
+    # Act names per src/Core/Models/Acts/: UNDERDOCKS (1), HIVE (2), GLORY (3).
+    act_id_canonical = {
+        1: "ACT.UNDERDOCKS",
+        2: "ACT.HIVE",
+        3: "ACT.GLORY",
+    }.get(act, "ACT.UNDERDOCKS")
     return {
         "has_run": True,
         "is_game_over": is_game_over,
+        # Gate field: obs encoder reads run.active to know if we're mid-run.
+        # True whenever we're past character-select and before game_over.
+        # Sim doesn't expose this directly — infer from state_type.
+        "active": state_type not in {"", "menu", "game_over"},
+        # Obs encoder reads act_id via _parse_act which pulls the trailing
+        # digit. For ACT.UNDERDOCKS/HIVE/GLORY that isn't a digit, so the
+        # feature was always 0 on sim. Emit a synthesized id that ends in
+        # the act number so _parse_act can extract it.
+        "act_id": f"ACT.{act}",
         "current_location": f"act {act} coord (0, {floor})",
         "current_act_index": act - 1,  # bridge was 0-indexed
         "ascension_level": int(sim_run.get("ascension_level") or 0),
@@ -1067,7 +1088,7 @@ def _translate_run_block(sim_run: dict[str, Any], state_type: str, game_over: di
         "act_floor": floor,
         "total_floor": floor,
         "act": {
-            "id": f"ACT.UNDERDOCKS",
+            "id": act_id_canonical,
             "title": "Underdocks" if act == 1 else ("Hive" if act == 2 else "Glory"),
             "description": "",
             "kind": "Underdocks" if act == 1 else ("Hive" if act == 2 else "Glory"),
