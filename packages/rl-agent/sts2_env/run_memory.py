@@ -155,7 +155,7 @@ def _build_profile(obs: dict[str, Any] | None) -> dict[str, float]:
         hits = _preview_metric(card, "hits")
         cost = _float(card.get("cost"))
         card_type = str(card.get("type") or "").strip().lower()
-        target = str(card.get("target") or "").strip().lower()
+        target = str(card.get("target_type") or card.get("target") or "").strip().lower()
         if damage > 0:
             frontload += 1.0
         if block_value > 0:

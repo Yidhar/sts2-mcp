@@ -803,6 +803,13 @@ def _translate_card(sim_card: Any, *, pile: str = "Deck") -> dict[str, Any]:
         # static values here. Upgrade modifiers skipped (Phase 5+).
         "effect_preview": effect_preview,
     }
+    # Keep runtime per-card modifiers if the simulator exposes them.  Live
+    # bridge emits the same compact fields; observation_v3 turns these into
+    # CARD_KEYWORD_SLOT tokens (bound/card_lock/cost_lock/temporary/etc.).
+    for _modifier_field in ("afflictions", "enchantments", "modifiers", "card_modifiers"):
+        _mods = sim_card.get(_modifier_field)
+        if isinstance(_mods, list) and _mods:
+            payload[_modifier_field] = _mods[:16]
     # Bridge compact card emits ``effect`` (short summary) when present,
     # falling back to ``description``. effect_preview.summary isn't
     # populated today but description is non-empty — keep both.

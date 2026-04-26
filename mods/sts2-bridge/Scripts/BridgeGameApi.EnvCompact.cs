@@ -70,6 +70,8 @@ internal static partial class BridgeGameApi
             payload["star_x"] = true;
         }
 
+        AppendCompactCardKeywordsAndFlags(payload, element.Value);
+
         var type = TryGetNestedString(element.Value, "type");
         if (!string.IsNullOrWhiteSpace(type))
         {
@@ -79,7 +81,11 @@ internal static partial class BridgeGameApi
         var target = TryGetNestedString(element.Value, "target_type");
         if (!string.IsNullOrWhiteSpace(target))
         {
-            payload["target"] = target;
+            // Key renamed from "target" -> "target_type" to stop colliding with the
+            // legal-action top-level `target` (creature dict). The old name shadowed
+            // the real creature object in compact_action_signature, which broke
+            // Kaiser facing-change detection (target_combat_id always resolved to None).
+            payload["target_type"] = target;
         }
 
         var effect = TryGetNestedString(element.Value, "effect_preview", "summary");
@@ -93,28 +99,142 @@ internal static partial class BridgeGameApi
             payload["description"] = description;
         }
 
-        // Canonical Chinese semantic text — delegate to shared builder in EnvText.cs
+        // Canonical Chinese semantic text - delegate to shared builder in EnvText.cs
         // to avoid dual-source drift. Build from the same fields the compact payload exposes.
         {
-            var ct = new System.Text.StringBuilder("卡牌｜");
+            var ct = new System.Text.StringBuilder("\u5361\u724c\uff5c");
             ct.Append(NormalizeSemanticText(title ?? ""));
-            ct.Append("｜").Append(TryGetNestedString(element.Value, "type") ?? "");
+            ct.Append("\uff5c").Append(TryGetNestedString(element.Value, "type") ?? "");
             if (TryGetNestedBool(element.Value, "costs_x") == true)
-                ct.Append("｜能量X");
+                ct.Append("\uff5c\u80fd\u91cfX");
             else if (cost.HasValue)
-                ct.Append("｜能量").Append(cost.Value);
+                ct.Append("\uff5c\u80fd\u91cf").Append(cost.Value);
             if (starCost is { } sc)
-                ct.Append(TryGetNestedBool(element.Value, "has_star_cost_x") == true ? "｜星辉X" : $"｜星辉{sc}");
-            ct.Append("｜目标").Append(TranslateTargetType(TryGetNestedString(element.Value, "target_type")));
+                ct.Append(TryGetNestedBool(element.Value, "has_star_cost_x") == true ? "\uff5c\u661f\u8f89X" : $"\uff5c\u661f\u8f89{sc}");
+            ct.Append("\uff5c\u76ee\u6807").Append(TranslateTargetType(TryGetNestedString(element.Value, "target_type")));
             var effectText = effect ?? description ?? "";
             if (!string.IsNullOrWhiteSpace(effectText))
-                ct.Append("｜效果：").Append(NormalizeSemanticText(effectText));
+                ct.Append("\uff5c\u6548\u679c\uff1a").Append(NormalizeSemanticText(effectText));
             payload["canonical_text"] = ct.ToString();
         }
 
         AppendCompactPreviewFields(payload, element.Value);
+        AppendCompactCardModifiers(payload, element.Value, "afflictions");
+        AppendCompactCardModifiers(payload, element.Value, "enchantments");
 
         return payload;
+    }
+
+    private static void AppendCompactCardKeywordsAndFlags(Dictionary<string, object?> payload, JsonElement element)
+    {
+        var keywords = TryGetNestedElement(element, "keywords");
+        if (keywords is not null && keywords.Value.ValueKind == JsonValueKind.Array)
+        {
+            var compactKeywords = keywords.Value.EnumerateArray()
+                .Select(static item => item.ValueKind == JsonValueKind.String ? item.GetString() : item.ToString())
+                .Where(static item => !string.IsNullOrWhiteSpace(item))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(static item => item, StringComparer.Ordinal)
+                .ToArray();
+            if (compactKeywords.Length > 0)
+            {
+                payload["keywords"] = compactKeywords;
+            }
+        }
+
+        foreach (var flag in new[] { "exhaust", "exhaust_self", "will_exhaust", "ethereal", "retain" })
+        {
+            if (TryGetNestedBool(element, flag) == true)
+            {
+                payload[flag] = true;
+            }
+        }
+    }
+
+    private static void AppendCompactCardModifiers(Dictionary<string, object?> payload, JsonElement element, string fieldName)
+    {
+        var modifiers = TryGetNestedElement(element, fieldName);
+        if (modifiers is null || modifiers.Value.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var compact = new List<object?>();
+        foreach (var modifier in modifiers.Value.EnumerateArray())
+        {
+            var title = TryGetNestedString(modifier, "title");
+            var id = TryGetNestedString(modifier, "id");
+            var type = TryGetNestedString(modifier, "type");
+            var description = TryGetNestedString(modifier, "description");
+            var amount = TryGetNestedInt(modifier, "amount");
+            if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(id) && string.IsNullOrWhiteSpace(type))
+            {
+                continue;
+            }
+            compact.Add(new
+            {
+                id,
+                title,
+                type,
+                description,
+                amount,
+                status = TryGetNestedString(modifier, "status"),
+                enabled = TryGetNestedBool(modifier, "enabled"),
+                semantic_tags = CompactStringArray(TryGetNestedElement(modifier, "semantic_tags")),
+                semantic_values = CompactObject(TryGetNestedElement(modifier, "semantic_values")),
+                is_debuff = TryGetNestedBool(modifier, "is_debuff"),
+                is_buff = TryGetNestedBool(modifier, "is_buff")
+            });
+            if (compact.Count >= 8)
+            {
+                break;
+            }
+        }
+
+        if (compact.Count > 0)
+        {
+            payload[fieldName] = compact.ToArray();
+        }
+    }
+
+
+    private static string[] CompactStringArray(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+        return element.Value.EnumerateArray()
+            .Where(static item => item.ValueKind == JsonValueKind.String)
+            .Select(static item => item.GetString() ?? string.Empty)
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .Take(24)
+            .ToArray();
+    }
+
+    private static object? CompactObject(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (element.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+        var result = new Dictionary<string, object?>();
+        foreach (var prop in element.Value.EnumerateObject())
+        {
+            result[prop.Name] = prop.Value.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Number => prop.Value.TryGetInt32(out var i) ? i : prop.Value.TryGetDouble(out var d) ? d : null,
+                JsonValueKind.String => prop.Value.GetString(),
+                _ => null,
+            };
+        }
+        return result.Count > 0 ? result : null;
     }
 
     private static object? CompactRewardPayload(JsonElement? element)
@@ -164,7 +284,8 @@ internal static partial class BridgeGameApi
 
         if (!string.IsNullOrWhiteSpace(target))
         {
-            payload["target"] = target;
+            // Same "target" -> "target_type" rename applies to potions.
+            payload["target_type"] = target;
         }
 
         AppendCompactPreviewValue(payload, "damage", TryExtractEnvMetric(element.Value, "damage"));
@@ -479,3 +600,4 @@ internal static partial class BridgeGameApi
         }
     }
 }
+

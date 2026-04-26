@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .boss_mechanics import build_boss_mechanics_context, enemy_mechanics_key
+
 
 _ALL_ENEMY_TARGET_TYPES = {"ALLENEMIES"}
 _UNSUPPORTED_COST = {"X", "?", ""}
@@ -65,6 +67,9 @@ class _EnemyState:
     vulnerable: int
     thorns: int
     damage_cap_per_hit: int
+    deathburst_damage: int
+    revive_once: bool
+    linked_support_alive: bool
 
 
 @dataclass(frozen=True)
@@ -95,8 +100,13 @@ def analyze_local_combat_turn(raw_obs: dict | None) -> CombatTacticalAnalysis:
 
     combat = raw_obs.get("combat") if isinstance(raw_obs.get("combat"), dict) else {}
     player = raw_obs.get("player") if isinstance(raw_obs.get("player"), dict) else {}
+    boss_context = build_boss_mechanics_context(raw_obs)
+    boss_states = boss_context.get("enemy_states_by_key") if isinstance(boss_context, dict) else {}
     enemies = tuple(
-        _normalize_enemy(enemy)
+        _normalize_enemy(
+            enemy,
+            boss_state=(boss_states.get(enemy_mechanics_key(enemy, "")) if isinstance(boss_states, dict) else None),
+        )
         for enemy in combat.get("enemies", [])
         if isinstance(enemy, dict)
     )
@@ -159,8 +169,9 @@ def _player_energy_units(combat: dict) -> int:
         return 0
 
 
-def _normalize_enemy(enemy: dict) -> _EnemyState:
+def _normalize_enemy(enemy: dict, *, boss_state: dict | None = None) -> _EnemyState:
     powers = enemy.get("powers") if isinstance(enemy.get("powers"), list) else []
+    boss_state = boss_state if isinstance(boss_state, dict) else {}
     return _EnemyState(
         entity_id=str(enemy.get("entity_id", enemy.get("id", enemy.get("name", ""))) or ""),
         hp=max(0, _to_int(enemy.get("hp", enemy.get("current_hp")))),
@@ -168,7 +179,10 @@ def _normalize_enemy(enemy: dict) -> _EnemyState:
         incoming_damage=_enemy_intent_damage(enemy),
         vulnerable=max(0, _status_amount(powers, _VULNERABLE_TOKENS)),
         thorns=max(0, _status_amount(powers, _THORNS_TOKENS)),
-        damage_cap_per_hit=(1 if _has_status(powers, _DAMAGE_CAP_ONE_TOKENS) else 0),
+        damage_cap_per_hit=_infer_damage_cap_per_hit(powers, boss_state),
+        deathburst_damage=max(0, _to_int(boss_state.get("deathburst_damage"))),
+        revive_once=bool(float(boss_state.get("revive_once", 0.0) or 0.0) > 0.0),
+        linked_support_alive=bool(float(boss_state.get("linked_support_alive", 0.0) or 0.0) > 0.0),
     )
 
 
@@ -199,6 +213,16 @@ def _has_status(statuses: list[object], token_groups: tuple[str, ...]) -> bool:
         isinstance(status, dict) and any(group in str(status.get("id", status.get("name", "")) or "").upper() for group in token_groups)
         for status in statuses
     )
+
+
+def _infer_damage_cap_per_hit(powers: list[object], boss_state: dict) -> int:
+    """Return per-hit damage cap from generic statuses or boss-mechanic context."""
+    if _has_status(powers, _DAMAGE_CAP_ONE_TOKENS):
+        return 1
+    if float(boss_state.get("damage_cap_active", 0.0) or 0.0) <= 0.0:
+        return 0
+    cap_value = _to_int(boss_state.get("damage_cap_value"))
+    return max(1, cap_value)
 
 
 def _parse_attack_card(card: dict, current_energy: int) -> _ParsedAttackCard | None:
@@ -327,6 +351,9 @@ def _enemy_signature(enemies: tuple[_EnemyState, ...]) -> tuple[tuple[object, ..
             enemy.vulnerable,
             enemy.thorns,
             enemy.damage_cap_per_hit,
+            enemy.deathburst_damage,
+            enemy.revive_once,
+            enemy.linked_support_alive,
         )
         for enemy in enemies
     )
@@ -380,6 +407,27 @@ def _apply_attack(
             total_damage += hit_damage
         if total_damage > 0:
             retaliation += enemy.thorns
+        died = hp <= 0
+        revive_once = enemy.revive_once
+        if died and revive_once:
+            # Boss/event revive mechanics (Test Subject-style second life, etc.)
+            # mean local tactical search must not mark this as final lethal.
+            # Keep the body alive at 1 HP and clear the one-shot revive flag so
+            # follow-up hits in the same local line can still finish it.
+            hp = 1
+            remaining_block = 0
+            died = False
+            revive_once = False
+        if died and enemy.linked_support_alive:
+            # Linked boss/support mechanics (Queen + Torch Head, Doormaker + Door)
+            # can invalidate a naive boss lethal while the linked body is present.
+            # Treat the target as not finally killable in this one-step local
+            # abstraction; attention features still expose the exact relation.
+            hp = 1
+            remaining_block = 0
+            died = False
+        if died and enemy.deathburst_damage > 0:
+            retaliation += enemy.deathburst_damage
         vulnerable = enemy.vulnerable + card.vulnerable_amount if hp > 0 else 0
         next_enemies.append(
             _EnemyState(
@@ -390,6 +438,9 @@ def _apply_attack(
                 vulnerable=vulnerable,
                 thorns=enemy.thorns if hp > 0 else 0,
                 damage_cap_per_hit=enemy.damage_cap_per_hit if hp > 0 else 0,
+                deathburst_damage=enemy.deathburst_damage if hp > 0 else 0,
+                revive_once=revive_once if hp > 0 else False,
+                linked_support_alive=enemy.linked_support_alive if hp > 0 else False,
             )
         )
     return tuple(next_enemies), retaliation

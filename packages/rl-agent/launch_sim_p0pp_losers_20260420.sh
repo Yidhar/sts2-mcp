@@ -47,7 +47,7 @@ echo "[p0pp_losers] starting 200k targeted boss-sandbox curriculum..."
   --use-sim \
   --sim-exe-path '/mnt/e/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/Host/bin/Debug/net9.0/headless_sim_host_0991.exe' \
   --init-checkpoint "${INIT_CKPT}" \
-  --total-timesteps 204800 \
+  --total-timesteps 1320960 \
   --n-envs 8 \
   --encode-pool-workers 2 \
   --collector-mode async \
@@ -94,6 +94,7 @@ echo "[p0pp_losers] running 50-ep eval over the 7 losers to measure lift..."
   --device cuda \
   --no-text \
   --use-sim \
+  --sim-exe-path '/mnt/e/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/Host/bin/Debug/net9.0/headless_sim_host_0991.exe' \
   --deterministic \
   --output-json "${EVAL_OUT}"
 

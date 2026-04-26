@@ -1,5 +1,8 @@
-"""Compatibility wrapper for the archived MuZero network stack."""
+"""Compatibility wrapper for the MuZero network stack.
+
+Prefer new imports from ``muzero.sts2_env.muzero_model``.
+"""
 
 from __future__ import annotations
 
-from legacy.sts2_env.muzero_model import *  # noqa: F401,F403
+from muzero.sts2_env.muzero_model import *  # noqa: F401,F403

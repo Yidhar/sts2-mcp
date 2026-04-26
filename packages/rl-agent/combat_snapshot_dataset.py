@@ -959,6 +959,50 @@ def snapshot_row_to_reset_kwargs(
 ) -> dict[str, Any]:
     """Convert a combat snapshot row into ``combat_reset`` kwargs."""
 
+    def _extract_modifier_list(raw: Any) -> list[dict[str, Any]]:
+        """Normalize a snapshot's modifier list into bridge wire format.
+
+        Accepts:
+          * list[str]               → [{"id": s}]
+          * list[dict{id,amount?,status?}] → keep id/amount/status
+          * dict{id->amount}        → [{"id": k, "amount": v}]
+        Anything else returns [].  Modifiers without a non-empty id are dropped.
+        """
+        out: list[dict[str, Any]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    name = item.strip()
+                    if name:
+                        out.append({"id": name})
+                elif isinstance(item, dict):
+                    name = str(item.get("id") or item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    norm: dict[str, Any] = {"id": name}
+                    amount_raw = item.get("amount", item.get("stacks"))
+                    if amount_raw is not None:
+                        try:
+                            norm["amount"] = int(amount_raw)
+                        except (TypeError, ValueError):
+                            pass
+                    status_raw = item.get("status")
+                    if isinstance(status_raw, str) and status_raw.strip():
+                        norm["status"] = status_raw.strip()
+                    out.append(norm)
+        elif isinstance(raw, dict):
+            for key, val in raw.items():
+                name = str(key or "").strip()
+                if not name:
+                    continue
+                norm = {"id": name}
+                try:
+                    norm["amount"] = int(val)
+                except (TypeError, ValueError):
+                    pass
+                out.append(norm)
+        return out
+
     deck_entries: list[dict[str, Any]] | None = None
     sanitized_deck_ids_from_entries: list[str] | None = None
     raw_deck_entries = row.get("deck_entries")
@@ -977,12 +1021,30 @@ def snapshot_row_to_reset_kwargs(
             except (TypeError, ValueError):
                 upgrade_level = 0
             upgrade_level = _clamp_card_upgrade_level(card_id, upgrade_level)
-            normalized_entries.append(
-                {
-                    "id": card_id,
-                    "upgrade_level": upgrade_level,
-                }
+            normalized: dict[str, Any] = {
+                "id": card_id,
+                "upgrade_level": upgrade_level,
+            }
+            # Bridge now accepts pre-combat enchantments / afflictions per
+            # deck card (sandbox WRITE-side modifier injection).  Snapshot
+            # rows can carry these under a few common shapes — we accept
+            # `enchantments` / `enchantment_ids` / `enchantment_summary`
+            # interchangeably.  Same for afflictions.
+            ench = _extract_modifier_list(
+                entry.get("enchantments")
+                or entry.get("enchantment_ids")
+                or entry.get("enchantment_summary")
             )
+            if ench:
+                normalized["enchantments"] = ench
+            aff = _extract_modifier_list(
+                entry.get("afflictions")
+                or entry.get("affliction_ids")
+                or entry.get("affliction_summary")
+            )
+            if aff:
+                normalized["afflictions"] = aff
+            normalized_entries.append(normalized)
         sanitized_deck_ids_from_entries = [str(entry["id"]) for entry in normalized_entries]
         if normalized_entries:
             deck_entries = normalized_entries

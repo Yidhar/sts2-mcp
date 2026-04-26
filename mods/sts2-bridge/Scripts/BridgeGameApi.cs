@@ -98,6 +98,13 @@ internal sealed class BridgeRequestException : Exception
 internal static partial class BridgeGameApi
 {
     private const int NextFrontierWaitTimeoutMs = 5000;
+    // Fast combat frontier gate: after play_card/use_potion/card_selection, do
+    // not stack long heuristic waits. Re-sample direct CombatManager state and
+    // return as soon as the state itself says the player can act
+    // (IsPlayPhase && !PlayerActionsDisabled && !IsPaused), or combat exits.
+    // The short budget only covers the UI-lock frame while an action resolves.
+    private const int ActionableFrontierTimeoutMs = 250;
+    private const int ActionableFrontierPollIntervalMs = 16;
     private const int PassiveFrontierWaitTimeoutMs = 1000;
     private const int MaxShopOpenActionsPerRoom = 2;
     private const int DefaultMainThreadTaskTimeoutMs = 3000;
@@ -127,6 +134,16 @@ internal static partial class BridgeGameApi
     };
     private static string? _shopOpenLimiterRoomKey;
     private static int _shopOpenLimiterCount;
+
+    // Cumulative self-inflicted HP loss tracker, used by the Python env to isolate
+    // player-initiated HP loss (Offering / Bloodletting / Hemokinesis / Curse draw
+    // side effects declared via card effect_preview.hp_loss) from enemy damage.
+    // Resets when the combat identity changes. Exposed via BuildEnvCombatPayload
+    // as `self_inflicted_hp_loss_cumulative`.
+    private static readonly object SelfInflictedHpLossSync = new();
+    private static WeakReference<object>? _selfInflictedHpLossCombatKey;
+    private static double _selfInflictedHpLossCumulative;
+    private static int _selfInflictedHpLossLastRound = -1;
 
     public static async Task<object> GetStateResponseAsync(CancellationToken cancellationToken = default)
     {
@@ -178,7 +195,10 @@ internal static partial class BridgeGameApi
                 "Request body must include a non-empty action_id.");
         }
 
+        var perfOuterStart = DateTimeOffset.UtcNow;
+        var beforeObsStart = perfOuterStart;
         var before = await ObserveFrontierAsync(cancellationToken);
+        var beforeObsEnd = DateTimeOffset.UtcNow;
         BridgeDebugTrace.Write($"perform_action snapshot_before action={actionId} version={before.Sequence}");
 
         if (request.ExpectedStateVersion is long expectedStateVersion &&
@@ -216,12 +236,15 @@ internal static partial class BridgeGameApi
         }
 
         var waitAfterMs = Math.Clamp(request.WaitAfterMs ?? 0, 0, 5000);
+        AccumulateSelfInflictedHpLossIfPlayCard(actionId, action);
+        var executeStart = DateTimeOffset.UtcNow;
         var after = await ExecuteActionAndWaitForFrontierAsync(
             before,
             actionId,
             action,
             waitAfterMs,
             cancellationToken);
+        var executeEnd = DateTimeOffset.UtcNow;
         var autoExecutedActions = new List<object>();
 
         if (IsRewardResolutionAction(actionId))
@@ -231,6 +254,27 @@ internal static partial class BridgeGameApi
         else if (IsCardSelectionResolutionAction(actionId))
         {
             (after, autoExecutedActions) = await MaybeAutoCompleteCardSelectionAsync(after, cancellationToken);
+        }
+        var postProcessEnd = DateTimeOffset.UtcNow;
+
+        DumpPerformActionOuterTiming(
+            actionId,
+            perfOuterStart,
+            beforeObsStart,
+            beforeObsEnd,
+            executeStart,
+            executeEnd,
+            postProcessEnd);
+
+        // Combat→post-combat transition is a game-quiescent window equivalent to
+        // combat_sandbox's reset moment: the combat's GodotObjects become
+        // eligible for finalization here. Draining now prevents the finalize
+        // queue from accumulating across a full run's many combats, which was
+        // the root cause of the native AV in HashMap._lookup_pos under long
+        // training. Triggered only on true combat exit, not per-step.
+        if (IsCombatExitTransition(before.Snapshot.Fields.Screen, after.Snapshot.Fields.Screen))
+        {
+            DrainManagedFinalizersLogged("perform_action.combat_exit");
         }
 
         BridgeDebugTrace.Write($"perform_action snapshot_after action={actionId} version={after.Sequence}");
@@ -266,6 +310,88 @@ internal static partial class BridgeGameApi
         return BridgeFrontierStore.PublishSnapshot(snapshot);
     }
 
+    // Diagnostic-only: unconditional dump of per-phase timing for slow
+    // perform_action paths.  Writes a single line to perform_action-timing.log
+    // in the bridge session directory whenever total exceeds 1500ms, so we
+    // can see where time goes without needing STS2_BRIDGE_DEBUG_TRACE.
+    private static readonly object PerformActionTimingSync = new();
+
+    private static void DumpPerformActionOuterTiming(
+        string actionId,
+        DateTimeOffset outerStart,
+        DateTimeOffset beforeObsStart,
+        DateTimeOffset beforeObsEnd,
+        DateTimeOffset executeStart,
+        DateTimeOffset executeEnd,
+        DateTimeOffset postProcessEnd)
+    {
+        var totalMs = (postProcessEnd - outerStart).TotalMilliseconds;
+        if (totalMs < 1500.0)
+        {
+            return;
+        }
+        var beforeObsMs = (beforeObsEnd - beforeObsStart).TotalMilliseconds;
+        var gapMs = (executeStart - beforeObsEnd).TotalMilliseconds;
+        var executeMs = (executeEnd - executeStart).TotalMilliseconds;
+        var postMs = (postProcessEnd - executeEnd).TotalMilliseconds;
+        try
+        {
+            lock (PerformActionTimingSync)
+            {
+                Directory.CreateDirectory(BridgeRuntime.SessionDirectoryPath);
+                var path = Path.Combine(
+                    BridgeRuntime.SessionDirectoryPath,
+                    BridgeRuntime.IsMultiInstance
+                        ? $"perform_action-outer-{BridgeRuntime.InstanceId}.log"
+                        : "perform_action-outer.log");
+                File.AppendAllText(
+                    path,
+                    $"{DateTimeOffset.UtcNow:O} action={actionId} total_ms={totalMs:F0} before_obs_ms={beforeObsMs:F0} gap_ms={gapMs:F0} execute_ms={executeMs:F0} post_ms={postMs:F0}{System.Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // Diagnostics must never break gameplay or the bridge.
+        }
+    }
+    private static void DumpPerformActionTiming(
+        string actionId,
+        string outcome,
+        DateTimeOffset start,
+        DateTimeOffset executeEnd,
+        DateTimeOffset waitAfterEnd,
+        int pollCount)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var totalMs = (now - start).TotalMilliseconds;
+        if (totalMs < 1500.0)
+        {
+            return;
+        }
+        var executeMs = (executeEnd - start).TotalMilliseconds;
+        var waitAfterMs = (waitAfterEnd - executeEnd).TotalMilliseconds;
+        var pollMs = (now - waitAfterEnd).TotalMilliseconds;
+        try
+        {
+            lock (PerformActionTimingSync)
+            {
+                Directory.CreateDirectory(BridgeRuntime.SessionDirectoryPath);
+                var path = Path.Combine(
+                    BridgeRuntime.SessionDirectoryPath,
+                    BridgeRuntime.IsMultiInstance
+                        ? $"perform_action-timing-{BridgeRuntime.InstanceId}.log"
+                        : "perform_action-timing.log");
+                File.AppendAllText(
+                    path,
+                    $"{now:O} action={actionId} outcome={outcome} total_ms={totalMs:F0} execute_ms={executeMs:F0} wait_after_ms={waitAfterMs:F0} poll_ms={pollMs:F0} polls={pollCount}{System.Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // Diagnostics must never break gameplay or the bridge.
+        }
+    }
+
     private static async Task<ObservedFrontier> ExecuteActionAndWaitForFrontierAsync(
         ObservedFrontier before,
         string actionId,
@@ -273,45 +399,136 @@ internal static partial class BridgeGameApi
         int waitAfterMs,
         CancellationToken cancellationToken)
     {
+        var timingStart = DateTimeOffset.UtcNow;
         await RunOnMainThreadGuardedAsync(
             () =>
             {
                 BridgeDebugTrace.Write($"perform_action executing action={actionId}");
-                action.Execute();
+                var actionToExecute = action;
+                if (actionId.StartsWith("card_selection:", StringComparison.Ordinal))
+                {
+                    actionToExecute = ResolveCurrentCardSelectionActionOrThrow(actionId);
+                }
+
+                actionToExecute.Execute();
                 return true;
             },
             $"perform_action.execute:{actionId}",
             DefaultMainThreadTaskTimeoutMs,
             cancellationToken);
+        var executeEnd = DateTimeOffset.UtcNow;
 
         if (waitAfterMs > 0)
         {
             await Task.Delay(waitAfterMs, cancellationToken);
         }
+        var waitAfterEnd = DateTimeOffset.UtcNow;
 
-        if (ShouldTryImmediateObservedFrontier(actionId))
+        // For combat-mutating actions, use direct CombatManager state rather than
+        // waiting for end_turn/action-list heuristics. A real end-turn-only state
+        // is actionable immediately once PlayerActionsDisabled clears; a transient
+        // animation frame is identified by direct disabled/paused/playphase flags.
+        var requireActionable = ShouldTryImmediateObservedFrontier(actionId);
+
+        if (requireActionable)
         {
-            var immediateFrontier = await ObserveFrontierAsync(cancellationToken);
-            if (HasFrontierChanged(before, immediateFrontier))
+            var pollDeadline = DateTimeOffset.UtcNow.AddMilliseconds(ActionableFrontierTimeoutMs);
+            ObservedFrontier latest = before;
+            int pollCount = 0;
+            while (true)
             {
-                BridgeDebugTrace.Write(
-                    $"perform_action immediate_frontier action={actionId} version={immediateFrontier.Sequence}");
-                return immediateFrontier;
+                var frontier = await ObserveFrontierAsync(cancellationToken);
+                pollCount++;
+                latest = frontier;
+                if (IsFrontierActionableAfterCombatAction(frontier))
+                {
+                    BridgeDebugTrace.Write(
+                        $"perform_action direct_actionable_frontier action={actionId} version={frontier.Sequence}");
+                    DumpPerformActionTiming(actionId, "direct_actionable", timingStart, executeEnd, waitAfterEnd, pollCount);
+                    return frontier;
+                }
+                var remainingMs = (pollDeadline - DateTimeOffset.UtcNow).TotalMilliseconds;
+                if (remainingMs <= 0)
+                {
+                    break;
+                }
+                var delay = (int)Math.Min(ActionableFrontierPollIntervalMs, remainingMs);
+                if (delay > 0)
+                {
+                    await Task.Delay(delay, cancellationToken);
+                }
             }
+
+            BridgeDebugTrace.Write(
+                $"perform_action direct_actionable_frontier_timeout action={actionId} after_version={before.Sequence}");
+            DumpPerformActionTiming(actionId, "direct_timeout", timingStart, executeEnd, waitAfterEnd, pollCount);
+            return latest;
         }
 
-        var frontier = await BridgeFrontierStore.WaitForNextFrontierAsync(
-            before.Sequence,
-            NextFrontierWaitTimeoutMs,
-            cancellationToken);
-        if (frontier is not null)
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(NextFrontierWaitTimeoutMs);
+        var waitAfterSequence = before.Sequence;
+        while (true)
         {
+            var remaining = (int)Math.Max(1, (deadline - DateTimeOffset.UtcNow).TotalMilliseconds);
+            if (remaining <= 1)
+            {
+                break;
+            }
+            var frontier = await BridgeFrontierStore.WaitForNextFrontierAsync(
+                waitAfterSequence,
+                remaining,
+                cancellationToken);
+            if (frontier is null)
+            {
+                break;
+            }
             return frontier;
         }
 
         BridgeDebugTrace.Write(
             $"perform_action frontier_wait_timeout action={actionId} after_version={before.Sequence}");
         return await ObserveFrontierAsync(cancellationToken);
+    }
+
+    private static bool IsCardSelectionVisible(BridgeSnapshot snapshot)
+    {
+        var cardSelection = JsonSerializer.SerializeToElement(snapshot.Fields.CardSelection);
+        return cardSelection.TryGetProperty("visible", out var visibleProperty) &&
+               visibleProperty.ValueKind == JsonValueKind.True;
+    }
+
+    private static BridgeResolvedAction ResolveCurrentCardSelectionActionOrThrow(string actionId)
+    {
+        var snapshot = CaptureSnapshot();
+        if (!IsCardSelectionVisible(snapshot))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "card_selection_screen_gone",
+                $"Card selection screen is no longer visible while executing '{actionId}'.",
+                new
+                {
+                    action_id = actionId,
+                    current_screen = snapshot.Fields.Screen,
+                    available_actions = snapshot.ActionPayloads
+                });
+        }
+
+        if (!snapshot.ActionLookup.TryGetValue(actionId, out var currentAction))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "card_selection_action_not_available_at_execution",
+                $"Card selection action '{actionId}' is no longer available at execution time.",
+                new
+                {
+                    action_id = actionId,
+                    current_screen = snapshot.Fields.Screen,
+                    available_actions = snapshot.ActionPayloads
+                });
+        }
+
+        return currentAction;
     }
 
     private static int NormalizeMainThreadGuardTimeout(int timeoutMs, int fallbackMs)
@@ -425,6 +642,34 @@ internal static partial class BridgeGameApi
                !before.FrontierHash.Equals(after.FrontierHash, StringComparison.Ordinal);
     }
 
+    // Direct-state actionability. In combat, legal-action shape is not the
+    // source of truth during animations; CombatManager flags are. Once combat
+    // is in play phase and the UI is neither paused nor action-disabled, even
+    // an end_turn-only frontier is a real actionable state and must not be
+    // delayed. Card-selection and out-of-combat surfaces are actionable too.
+    private static bool IsFrontierActionableAfterCombatAction(ObservedFrontier frontier)
+    {
+        if (frontier is null)
+        {
+            return false;
+        }
+
+        var snapshot = frontier.Snapshot;
+        if (!IsCombatLikeScreen(snapshot.Fields.Screen) || !snapshot.Fields.CombatInProgress)
+        {
+            return true;
+        }
+
+        if (snapshot.Fields.CardSelectionVisible || IsCardSelectionVisible(snapshot))
+        {
+            return true;
+        }
+
+        return snapshot.Fields.CombatIsPlayPhase &&
+               !snapshot.Fields.CombatPlayerActionsDisabled &&
+               !snapshot.Fields.CombatIsPaused;
+    }
+
     private static object BuildResolvedActionAckPayload(object? payload)
     {
         var targetPayload = ReadPayloadPropertyValue(payload, "target");
@@ -451,6 +696,85 @@ internal static partial class BridgeGameApi
     {
         var value = ReadPayloadPropertyValue(payload, propertyName);
         return value as string;
+    }
+
+    internal static void ResetSelfInflictedHpLossTrackerForNewCombat(object? combatKey)
+    {
+        lock (SelfInflictedHpLossSync)
+        {
+            _selfInflictedHpLossCombatKey = combatKey is null
+                ? null
+                : new WeakReference<object>(combatKey);
+            _selfInflictedHpLossCumulative = 0.0;
+            _selfInflictedHpLossLastRound = -1;
+        }
+    }
+
+    internal static double ObserveSelfInflictedHpLossCumulative(object? combatKey, int currentRound)
+    {
+        // Called from env payload building. Two fresh-combat detections:
+        //   (a) CombatState reference changed — new object, new combat.
+        //   (b) Round number rolled back vs. the last observed value — same
+        //       object reused across combats (engine object pooling).
+        // Either fires a flush so full_run combat→combat transitions don't
+        // leak self-damage counters into the next encounter.
+        lock (SelfInflictedHpLossSync)
+        {
+            if (combatKey is null)
+            {
+                return 0.0;
+            }
+            object? currentKey = null;
+            _selfInflictedHpLossCombatKey?.TryGetTarget(out currentKey);
+            var refChanged = !ReferenceEquals(currentKey, combatKey);
+            var roundRolledBack =
+                _selfInflictedHpLossLastRound >= 0 &&
+                currentRound >= 0 &&
+                currentRound < _selfInflictedHpLossLastRound;
+            if (refChanged || roundRolledBack)
+            {
+                _selfInflictedHpLossCombatKey = new WeakReference<object>(combatKey);
+                _selfInflictedHpLossCumulative = 0.0;
+            }
+            if (currentRound >= 0)
+            {
+                _selfInflictedHpLossLastRound = currentRound;
+            }
+            return _selfInflictedHpLossCumulative;
+        }
+    }
+
+    private static void AccumulateSelfInflictedHpLossIfPlayCard(
+        string actionId, BridgeResolvedAction action)
+    {
+        if (string.IsNullOrEmpty(actionId) || !actionId.StartsWith("play_card:", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        double hpLoss;
+        try
+        {
+            var payload = JsonSerializer.SerializeToElement(action.Payload);
+            var fromCard = TryGetNestedInt(payload, "card", "effect_preview", "hp_loss");
+            var fromTop = TryGetNestedInt(payload, "effect_preview", "hp_loss");
+            var resolved = fromCard ?? fromTop;
+            if (!resolved.HasValue || resolved.Value <= 0)
+            {
+                return;
+            }
+            hpLoss = resolved.Value;
+        }
+        catch
+        {
+            // Malformed payload — skip accumulation rather than crash the request path.
+            return;
+        }
+
+        lock (SelfInflictedHpLossSync)
+        {
+            _selfInflictedHpLossCumulative += hpLoss;
+        }
     }
 
     private static int? ReadPayloadIntegerProperty(object? payload, string propertyName)
@@ -978,7 +1302,7 @@ internal static partial class BridgeGameApi
         builder.Append(":card=")
             .Append(card.Id.ToString())
             .Append('/').Append(card.EnergyCost.GetResolved())
-            .Append('/').Append(card.CurrentStarCost)
+            .Append('/').Append(SafeResolveCardStarCost(card) ?? -1)
             .Append('/').Append(card.EnergyCost.CostsX ? '1' : '0')
             .Append('/').Append(SafeGetCardIsPlayable(card) ? '1' : '0');
     }
@@ -1588,6 +1912,11 @@ internal static partial class BridgeGameApi
         return new BridgeStateFields
         {
             Screen = context.Screen,
+            CombatInProgress = context.CombatManager?.IsInProgress == true,
+            CombatIsPlayPhase = context.CombatManager?.IsPlayPhase == true,
+            CombatIsPaused = context.CombatManager?.IsPaused == true,
+            CombatPlayerActionsDisabled = context.CombatManager?.PlayerActionsDisabled == true,
+            CardSelectionVisible = IsCardSelectionVisible(context),
             Automation = BuildAutomationPayload(),
             Run = BuildRunPayload(context.RunState),
             Combat = BuildCombatPayload(context.CombatManager, context.CombatState),
@@ -1603,6 +1932,7 @@ internal static partial class BridgeGameApi
                 context.CardRewardOptions,
                 context.CardRewardSkipButton),
             CardSelection = BuildCardSelectionPayload(
+                context,
                 context.CardSelectionScreen,
                 context.CardSelectionOptions,
                 context.CardSelectionConfirmButton,
@@ -1798,6 +2128,7 @@ internal static partial class BridgeGameApi
         }
 
         if (context.CombatManager?.IsInProgress == true &&
+            context.CombatManager.IsPlayPhase &&
             !IsCardSelectionVisible(context) &&
             !context.CombatManager.PlayerActionsDisabled)
         {
@@ -1806,6 +2137,7 @@ internal static partial class BridgeGameApi
         }
 
         if (context.CombatManager?.IsInProgress == true &&
+            context.CombatManager.IsPlayPhase &&
             !IsCardSelectionVisible(context) &&
             !context.CombatManager.PlayerActionsDisabled &&
             context.EndTurnButton is not null &&
@@ -2948,6 +3280,7 @@ internal static partial class BridgeGameApi
                             hand_index = handIndex,
                             card_ref = cardRef,
                             card = BuildCardPayload(card, resolvedTarget.Target),
+                            semantic = BuildPlayCardSemantic(card, resolvedTarget.Target),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
                             target_action_suffix = resolvedTarget.ActionSuffix,
                             target_combat_id = resolvedTarget.Target?.CombatId,
@@ -3016,6 +3349,7 @@ internal static partial class BridgeGameApi
                             player_net_id = player.NetId,
                             slot_index = slotIndex,
                             potion = BuildPotionPayload(potion),
+                            semantic = BuildUsePotionSemantic(potion),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
                             target_action_suffix = resolvedTarget.ActionSuffix,
                             target_combat_id = resolvedTarget.Target?.CombatId,
@@ -3298,6 +3632,19 @@ internal static partial class BridgeGameApi
 
     private static void ExecuteCardPlay(CardModel card, Creature? target)
     {
+        // Guard: re-check play phase at execution time to prevent TOCTOU races.
+        // The action mask snapshot may have been taken before a phase transition
+        // (e.g. enemy turn started, card was queued, or a settling phase began).
+        var cm = CombatManager.Instance;
+        if (cm is not null && cm.IsInProgress && (!cm.IsPlayPhase || cm.PlayerActionsDisabled || cm.IsPaused))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "play_card_not_in_play_phase",
+                $"Cannot play card '{TextOf(card.Title)}': not in play phase " +
+                $"(IsPlayPhase={cm.IsPlayPhase}, PlayerActionsDisabled={cm.PlayerActionsDisabled}, IsPaused={cm.IsPaused}).");
+        }
+
         // Guard: verify target is still alive before executing.
         // During RL training, rapid action execution can cause the target
         // to die between action resolution and execution.
@@ -3452,8 +3799,27 @@ internal static partial class BridgeGameApi
         return targets;
     }
 
+    private static bool SafeGetCardIsQueued(CardModel card)
+    {
+        try
+        {
+            return GetHiddenPropertyValue<bool>(card, "IsQueued") ?? false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static bool CanPlayCard(CardModel card)
     {
+        // Reject cards that are already in-flight (queued for execution).
+        // Potions have the same guard via potion.IsQueued in CanUsePotion.
+        if (SafeGetCardIsQueued(card))
+        {
+            return false;
+        }
+
         if (TryInvokeBoolean(card, "CanPlay") is bool canPlay)
         {
             return canPlay;
@@ -3806,6 +4172,87 @@ internal static partial class BridgeGameApi
         };
     }
 
+    // Surfaces the small set of fields the Python policy code reads via
+    // `action.semantic.{family,roles,damage,block,hits}` when shaping rewards
+    // or biasing direct-rollout priors (see muzero/train.py
+    // `_action_metric` / `_action_roles` / `_action_immediate_impact`).
+    // Without this the metric calculations all see None / 0 because they
+    // historically expected a richer `semantic` dict the bridge never emitted.
+    private static object BuildPlayCardSemantic(CardModel? card, Creature? previewTarget)
+    {
+        if (card is null)
+        {
+            return new { family = "play_card", roles = Array.Empty<string>() };
+        }
+
+        var resolvedTarget = previewTarget ?? card.CurrentTarget;
+        var previewVars = BuildCardPreviewVarSet(card, resolvedTarget);
+        var damagePerHit = GetDynamicVarInt(previewVars, "Damage");
+        var totalDamage = GetDynamicVarInt(previewVars, "CalculatedDamage") ?? damagePerHit;
+        var repeats = GetDynamicVarInt(previewVars, "Repeat");
+        if (totalDamage is null && damagePerHit.HasValue && repeats.GetValueOrDefault(1) > 1)
+        {
+            totalDamage = damagePerHit.Value * repeats!.Value;
+        }
+        var totalBlock = GetDynamicVarInt(previewVars, "CalculatedBlock") ?? GetDynamicVarInt(previewVars, "Block");
+        var drawCount = GetDynamicVarInt(previewVars, "Cards");
+        var weakAmount = GetDynamicVarInt(previewVars, "Weak");
+        var vulnerableAmount = GetDynamicVarInt(previewVars, "Vulnerable");
+        var poisonAmount = GetDynamicVarInt(previewVars, "Poison");
+        var strengthAmount = GetDynamicVarInt(previewVars, "Strength");
+        var dexterityAmount = GetDynamicVarInt(previewVars, "Dexterity");
+
+        var roles = new List<string>();
+        var cardType = card.Type.ToString();
+        if (totalBlock is > 0) roles.Add("block");
+        if (weakAmount is > 0) { roles.Add("weak"); roles.Add("debuff"); }
+        if (vulnerableAmount is > 0) { roles.Add("vulnerable"); roles.Add("debuff"); }
+        if (poisonAmount is > 0) { roles.Add("poison"); roles.Add("debuff"); }
+        if (drawCount is > 0) roles.Add("draw");
+        if (strengthAmount is > 0 || dexterityAmount is > 0) roles.Add("scaling");
+        if (string.Equals(cardType, "Power", StringComparison.OrdinalIgnoreCase)) roles.Add("power");
+        if (string.Equals(cardType, "Attack", StringComparison.OrdinalIgnoreCase) && totalDamage is > 0) roles.Add("attack");
+
+        return new
+        {
+            family = "play_card",
+            roles = roles.Distinct().ToArray(),
+            damage = totalDamage ?? 0,
+            damage_per_hit = damagePerHit ?? 0,
+            block = totalBlock ?? 0,
+            hits = repeats ?? (totalDamage is > 0 ? 1 : 0),
+            draw = drawCount ?? 0,
+            weak = weakAmount ?? 0,
+            vulnerable = vulnerableAmount ?? 0,
+            poison = poisonAmount ?? 0,
+            strength = strengthAmount ?? 0,
+            dexterity = dexterityAmount ?? 0,
+            card_type = cardType
+        };
+    }
+
+    private static object BuildUsePotionSemantic(PotionModel? potion)
+    {
+        if (potion is null)
+        {
+            return new { family = "use_potion", roles = Array.Empty<string>() };
+        }
+        var profileEntry = TryGetPotionProfileEntry(potion);
+        var roles = InferUsePotionRoles(profileEntry).ToArray();
+        return new
+        {
+            family = "use_potion",
+            roles,
+            potion_id = potion.Id.ToString(),
+            rarity = profileEntry?.Rarity ?? potion.Rarity.ToString(),
+            target_scope = profileEntry?.TargetScope,
+            effect_family = profileEntry?.EffectFamily.ToArray() ?? Array.Empty<string>(),
+            effect_profile = BuildPotionEffectProfilePayload(profileEntry),
+            semantic_tags = profileEntry?.SemanticTags.ToArray() ?? Array.Empty<string>(),
+            timing_tags = profileEntry?.TimingTags.ToArray() ?? Array.Empty<string>()
+        };
+    }
+
     private static object BuildCardPayload(CardModel? card, Creature? previewTarget = null)
     {
         if (card is null)
@@ -3839,6 +4286,7 @@ internal static partial class BridgeGameApi
         var extraDamage = GetDynamicVarInt(previewVars, "ExtraDamage");
         var description = GetCardDescription(card, resolvedTarget);
         var xCostValue = card.EnergyCost.CostsX ? SafeResolveCardEnergyXValue(card) : null;
+        var currentStarCost = SafeResolveCardStarCost(card);
         var xCostSemantics = ResolveXCostSemantics(card, description, damagePerHit, totalDamage, repeats, xCostValue);
         (damagePerHit, totalDamage, repeats) = ApplyXCostPreviewMapping(
             damagePerHit,
@@ -3862,6 +4310,17 @@ internal static partial class BridgeGameApi
             summonCount,
             extraDamage,
             xCostValue);
+        var keywordNames = card.Keywords
+            .Where(static keyword => keyword != CardKeyword.None)
+            .Select(static keyword => keyword.ToString())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(static keyword => keyword, StringComparer.Ordinal)
+            .ToArray();
+        var keywordSet = card.Keywords.ToHashSet();
+        var afflictions = BuildCardModifierPayloads(card, "afflictions");
+        var enchantments = BuildCardModifierPayloads(card, "enchantments");
+        var modifierSummary = BuildCardModifierSummaryPayload(keywordSet, afflictions, enchantments, card.Type.ToString());
+        var cardFlow = BuildCardFlowPayload(card, keywordSet, modifierSummary);
 
         return new
         {
@@ -3881,8 +4340,14 @@ internal static partial class BridgeGameApi
             resolved_energy_cost = card.EnergyCost.GetResolved(),
             costs_x = card.EnergyCost.CostsX,
             canonical_star_cost = card.CanonicalStarCost,
-            current_star_cost = card.CurrentStarCost,
+            current_star_cost = currentStarCost,
             has_star_cost_x = card.HasStarCostX,
+            keywords = keywordNames,
+            exhaust = keywordSet.Contains(CardKeyword.Exhaust),
+            exhaust_self = keywordSet.Contains(CardKeyword.Exhaust),
+            will_exhaust = keywordSet.Contains(CardKeyword.Exhaust),
+            ethereal = keywordSet.Contains(CardKeyword.Ethereal),
+            retain = keywordSet.Contains(CardKeyword.Retain),
             effect_preview = new
             {
                 summary = effectSummary,
@@ -3904,8 +4369,379 @@ internal static partial class BridgeGameApi
                 x_cost_value = xCostValue,
                 x_cost_semantics = xCostSemantics
             },
-            dynamic_vars = BuildDynamicVarPayloads(previewVars)
+            dynamic_vars = BuildDynamicVarPayloads(previewVars),
+            afflictions,
+            enchantments,
+            modifier_summary = modifierSummary,
+            card_flow = cardFlow
         };
+    }
+
+    private static object[] BuildCardModifierPayloads(CardModel card, string modifierKind)
+    {
+        // Bosses/events can attach runtime per-card restrictions or buffs (Queen
+        // binding/chains, forced retain/exhaust/cost mutations, etc.).  Their
+        // concrete STS2 classes have moved across builds, so expose them through
+        // reflection rather than coupling the bridge to one exact API surface.
+        var candidates = modifierKind.Equals("afflictions", StringComparison.OrdinalIgnoreCase)
+            ? new[] { "Afflictions", "AfflictionModels", "CardAfflictions", "Statuses", "StatusEffects" }
+            : new[] { "Enchantments", "EnchantmentModels", "CardEnchantments", "Modifiers", "CardModifiers" };
+
+        var emitted = new List<object>();
+        foreach (var memberName in candidates)
+        {
+            foreach (var item in EnumerateHiddenCollectionMember(card, memberName))
+            {
+                var payload = BuildCardModifierPayload(item, modifierKind, memberName);
+                if (payload is not null)
+                {
+                    emitted.Add(payload);
+                    if (emitted.Count >= 16)
+                    {
+                        return emitted.ToArray();
+                    }
+                }
+            }
+        }
+
+        return emitted.ToArray();
+    }
+
+    private static IEnumerable<object?> EnumerateHiddenCollectionMember(object? target, string memberName)
+    {
+        if (target is null)
+        {
+            yield break;
+        }
+
+        object? value = null;
+        try
+        {
+            value = GetHiddenPropertyObjectValue(target, memberName);
+        }
+        catch
+        {
+            value = null;
+        }
+        if (value is null)
+        {
+            try
+            {
+                value = GetHiddenFieldValue(target, memberName);
+            }
+            catch
+            {
+                value = null;
+            }
+        }
+        if (value is null || value is string)
+        {
+            yield break;
+        }
+
+        if (value is IDictionary dictionary)
+        {
+            foreach (DictionaryEntry entry in dictionary)
+            {
+                yield return entry.Value;
+            }
+            yield break;
+        }
+
+        if (value is IEnumerable enumerable)
+        {
+            foreach (var item in enumerable)
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        yield return value;
+    }
+
+    private static object? BuildCardModifierPayload(object? modifier, string kind, string sourceMember)
+    {
+        if (modifier is null)
+        {
+            return null;
+        }
+
+        var id = FirstNonEmptyText(
+            GetHiddenPropertyObjectValue(modifier, "Id"),
+            GetHiddenPropertyObjectValue(modifier, "ModelId"),
+            GetHiddenPropertyObjectValue(modifier, "Key"),
+            GetHiddenFieldValue(modifier, "Id"),
+            GetHiddenFieldValue(modifier, "_id"));
+        var title = FirstNonEmptyText(
+            GetHiddenPropertyObjectValue(modifier, "Title"),
+            GetHiddenPropertyObjectValue(modifier, "Name"),
+            GetHiddenPropertyObjectValue(modifier, "TitleLocString"),
+            GetHiddenFieldValue(modifier, "Title"),
+            GetHiddenFieldValue(modifier, "_title"));
+        var description = FirstNonEmptyText(
+            GetHiddenPropertyObjectValue(modifier, "Description"),
+            GetHiddenPropertyObjectValue(modifier, "DynamicDescription"),
+            GetHiddenPropertyObjectValue(modifier, "DescriptionLocString"),
+            GetHiddenFieldValue(modifier, "Description"),
+            GetHiddenFieldValue(modifier, "_description"));
+
+        var amount = FirstNumber(
+            GetHiddenPropertyObjectValue(modifier, "Amount"),
+            GetHiddenPropertyObjectValue(modifier, "Value"),
+            GetHiddenPropertyObjectValue(modifier, "Stacks"),
+            GetHiddenFieldValue(modifier, "Amount"),
+            GetHiddenFieldValue(modifier, "_amount"));
+
+        var typeName = modifier.GetType().Name;
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            id = typeName;
+        }
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            title = id;
+        }
+
+        var status = FirstNonEmptyText(
+            GetHiddenPropertyObjectValue(modifier, "Status"),
+            GetHiddenPropertyObjectValue(modifier, "CurrentStatus"),
+            GetHiddenFieldValue(modifier, "Status"),
+            GetHiddenFieldValue(modifier, "_status"));
+        var enabled = !string.Equals(status, "Disabled", StringComparison.OrdinalIgnoreCase);
+        var semanticTags = ResolveCardModifierSemanticTags(kind, id, typeName, title, description, amount, status);
+        var semanticValues = ResolveCardModifierSemanticValues(kind, id, typeName, title, description, amount, status);
+
+        return new
+        {
+            kind,
+            source_member = sourceMember,
+            id,
+            type = typeName,
+            title,
+            description,
+            amount,
+            status,
+            enabled,
+            semantic_tags = semanticTags,
+            semantic_values = semanticValues,
+            is_debuff = GetHiddenPropertyValue<bool>(modifier, "IsDebuff"),
+            is_buff = GetHiddenPropertyValue<bool>(modifier, "IsBuff")
+        };
+    }
+
+    private static string[] ResolveCardModifierSemanticTags(
+        string kind,
+        string id,
+        string typeName,
+        string title,
+        string description,
+        decimal? amount,
+        string status)
+    {
+        var tags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var key = NormalizeModifierKey(id, typeName, title);
+        var text = $"{kind} {id} {typeName} {title} {description}".ToLowerInvariant();
+        void Add(params string[] values)
+        {
+            foreach (var value in values)
+            {
+                if (!string.IsNullOrWhiteSpace(value)) tags.Add(value);
+            }
+        }
+
+        switch (key)
+        {
+            case "adroit": Add("block_on_play"); break;
+            case "swift": Add("draw_on_play", "once_per_combat", "disabled_after_play"); break;
+            case "inky": Add("weak_on_play", "damage_add"); break;
+            case "sown": Add("energy_gain", "once_per_combat", "disabled_after_play"); break;
+            case "corrupted": Add("damage_mult", "self_damage"); break;
+            case "imbued": Add("autoplay_round_1", "start_bottom_draw"); break;
+            case "glam": Add("replay", "once_per_combat", "disabled_after_play"); break;
+            case "goopy": Add("adds_exhaust", "block_add", "grows_on_play"); break;
+            case "instinct": Add("damage_mult"); break;
+            case "momentum": Add("damage_add", "grows_on_play"); break;
+            case "nimble": Add("block_add"); break;
+            case "perfectfit": Add("shuffle_top"); break;
+            case "royallyapproved": Add("adds_retain"); break;
+            case "sharp": Add("damage_add"); break;
+            case "slither": Add("cost_randomizes_on_draw"); break;
+            case "slumberingessence": Add("cost_reduction_until_played"); break;
+            case "soulspower": Add("removes_exhaust"); break;
+            case "spiral": Add("replay"); break;
+            case "steady": Add("adds_retain"); break;
+            case "tezcatarasember": Add("sets_cost_zero", "eternal"); break;
+            case "vigorous": Add("damage_add", "once_per_combat", "disabled_after_play"); break;
+            case "weighted": Add("energy_loss_on_play"); break;
+            case "hexed": Add("adds_ethereal"); break;
+            case "devoured": Add("adds_exhaust"); break;
+        }
+
+        if (text.Contains("retain", StringComparison.Ordinal) || text.Contains("??", StringComparison.Ordinal)) Add("adds_retain");
+        if (text.Contains("ethereal", StringComparison.Ordinal) || text.Contains("??", StringComparison.Ordinal)) Add("adds_ethereal");
+        if (text.Contains("exhaust", StringComparison.Ordinal) || text.Contains("??", StringComparison.Ordinal)) Add("adds_exhaust");
+        if (text.Contains("draw", StringComparison.Ordinal) || text.Contains("?", StringComparison.Ordinal)) Add("draw_on_play");
+        if (text.Contains("energy", StringComparison.Ordinal) || text.Contains("??", StringComparison.Ordinal) || text.Contains("??", StringComparison.Ordinal)) Add("energy_modifier");
+        if (!string.IsNullOrWhiteSpace(status)) Add("status_" + NormalizeModifierKey(status, string.Empty, string.Empty));
+        return tags.OrderBy(static tag => tag, StringComparer.Ordinal).ToArray();
+    }
+
+    private static Dictionary<string, object?> ResolveCardModifierSemanticValues(
+        string kind,
+        string id,
+        string typeName,
+        string title,
+        string description,
+        decimal? amount,
+        string status)
+    {
+        var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+        var key = NormalizeModifierKey(id, typeName, title);
+        var amt = amount ?? 1m;
+        var enabled = !string.Equals(status, "Disabled", StringComparison.OrdinalIgnoreCase);
+        void Set(string name, object? value) => values[name] = value;
+        void Num(string name, decimal value) => values[name] = value;
+        Set("currently_enabled", enabled);
+
+        switch (key)
+        {
+            case "adroit": Num("block_on_play", amt); break;
+            case "swift": Num("draw", amt); Set("once_per_combat", true); Set("disabled_after_play", true); break;
+            case "inky": Num("damage_add", 2m); Num("weak", Math.Max(amt, 1m)); break;
+            case "sown": Num("energy_gain", amt); Set("once_per_combat", true); Set("disabled_after_play", true); break;
+            case "corrupted": Num("damage_mult", 1.5m); Num("self_damage", 2m); break;
+            case "imbued": Set("autoplay_round_1", true); Set("start_bottom_draw", true); break;
+            case "glam": Num("play_count_bonus", Math.Max(amt, 1m)); Set("once_per_combat", true); Set("disabled_after_play", true); break;
+            case "goopy": Set("adds_exhaust", true); Num("block_add", Math.Max(amt - 1m, 0m)); Set("grows_on_play", true); break;
+            case "instinct": Num("damage_mult", 2m); break;
+            case "momentum": Num("damage_add", amt); Set("grows_on_play", true); break;
+            case "nimble": Num("block_add", amt); break;
+            case "perfectfit": Set("shuffle_top", true); break;
+            case "royallyapproved": Set("adds_retain", true); break;
+            case "sharp": Num("damage_add", amt); break;
+            case "slither": Set("cost_randomizes_on_draw", true); Num("cost_random_min", 0m); Num("cost_random_max", 3m); break;
+            case "slumberingessence": Num("cost_reduction_until_played", 1m); break;
+            case "soulspower": Set("removes_exhaust", true); break;
+            case "spiral": Num("play_count_bonus", Math.Max(amt, 1m)); break;
+            case "steady": Set("adds_retain", true); break;
+            case "tezcatarasember": Set("sets_cost_zero", true); Set("eternal", true); break;
+            case "vigorous": Num("damage_add", amt); Set("once_per_combat", true); Set("disabled_after_play", true); break;
+            case "weighted": Num("energy_loss_on_play", amt); break;
+            case "hexed": Set("adds_ethereal", true); break;
+            case "devoured": Set("adds_exhaust", true); break;
+        }
+        return values;
+    }
+
+    private static string NormalizeModifierKey(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (string.IsNullOrWhiteSpace(value)) continue;
+            var chars = value.Where(char.IsLetterOrDigit).ToArray();
+            if (chars.Length > 0) return new string(chars).ToLowerInvariant();
+        }
+        return string.Empty;
+    }
+
+    private static Dictionary<string, object?> BuildCardModifierSummaryPayload(
+        HashSet<CardKeyword> keywordSet,
+        object[] afflictions,
+        object[] enchantments,
+        string cardType)
+    {
+        var summary = new Dictionary<string, object?>(StringComparer.Ordinal);
+        bool Flag(string name) => summary.TryGetValue(name, out var value) && value is bool b && b;
+        decimal NumValue(string name) => summary.TryGetValue(name, out var value) && value is decimal d ? d : 0m;
+        void SetFlag(string name) => summary[name] = true;
+        void AddNum(string name, decimal delta) => summary[name] = NumValue(name) + delta;
+
+        foreach (var payload in afflictions.Concat(enchantments))
+        {
+            var values = payload.GetType().GetProperty("semantic_values")?.GetValue(payload) as Dictionary<string, object?>;
+            if (values is null) continue;
+            foreach (var pair in values)
+            {
+                if (pair.Value is bool b)
+                {
+                    if (b) SetFlag(pair.Key);
+                }
+                else if (pair.Value is decimal d)
+                {
+                    AddNum(pair.Key, d);
+                }
+                else if (!summary.ContainsKey(pair.Key))
+                {
+                    summary[pair.Key] = pair.Value;
+                }
+            }
+        }
+
+        if (keywordSet.Contains(CardKeyword.Exhaust)) SetFlag("base_exhaust");
+        if (keywordSet.Contains(CardKeyword.Ethereal)) SetFlag("base_ethereal");
+        if (keywordSet.Contains(CardKeyword.Retain)) SetFlag("base_retain");
+        summary["effective_exhaust"] = (keywordSet.Contains(CardKeyword.Exhaust) || Flag("adds_exhaust")) && !Flag("removes_exhaust");
+        summary["effective_ethereal"] = keywordSet.Contains(CardKeyword.Ethereal) || Flag("adds_ethereal");
+        summary["effective_retain"] = keywordSet.Contains(CardKeyword.Retain) || Flag("adds_retain");
+        summary["card_type"] = cardType;
+        return summary;
+    }
+
+    private static object BuildCardFlowPayload(CardModel card, HashSet<CardKeyword> keywordSet, Dictionary<string, object?> summary)
+    {
+        bool Flag(string name) => summary.TryGetValue(name, out var value) && value is bool b && b;
+        var cardType = card.Type.ToString();
+        var exhaustOnPlay = Flag("effective_exhaust");
+        var retainOnSkip = Flag("effective_retain");
+        var etherealOnSkip = Flag("effective_ethereal");
+        var playDestination = string.Equals(cardType, "Power", StringComparison.OrdinalIgnoreCase)
+            ? "power"
+            : exhaustOnPlay ? "exhaust" : "discard";
+        var skipDestination = retainOnSkip ? "hand" : etherealOnSkip ? "exhaust" : "discard";
+        return new
+        {
+            source_zone = card.Pile?.Type.ToString(),
+            destination_if_played = playDestination,
+            destination_if_skipped_end_turn = skipDestination,
+            will_exhaust_on_play = exhaustOnPlay,
+            will_retain_on_end_turn = retainOnSkip,
+            will_ethereal_exhaust_on_end_turn = etherealOnSkip,
+            strategic_skip_candidate = exhaustOnPlay || retainOnSkip || Flag("energy_loss_on_play") || Flag("self_damage")
+        };
+    }
+
+    private static string FirstNonEmptyText(params object?[] values)
+    {
+        foreach (var value in values)
+        {
+            var text = DescribeText(value, value);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+        return string.Empty;
+    }
+
+    private static decimal? FirstNumber(params object?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (value is null)
+            {
+                continue;
+            }
+            try
+            {
+                return Convert.ToDecimal(value, CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                // ignore non-scalar modifier fields
+            }
+        }
+        return null;
     }
 
     private static bool SafeGetCardIsPlayable(CardModel? card)
@@ -4119,18 +4955,45 @@ internal static partial class BridgeGameApi
 
         try
         {
+            // X-cost is a live combat resource decision. Prefer the owner's current
+            // combat energy over CardModel.ResolveEnergyXValue(), because the latter
+            // can retain the turn-start/preview value and make a 0-energy X card look
+            // like X=3 to the policy. Extra X-effect bonuses should be represented as
+            // separate effect modifiers, not as spendable energy.
             currentEnergy = card.Owner?.PlayerCombatState?.Energy;
-            var resolvedXValue = card.ResolveEnergyXValue();
             if (currentEnergy.HasValue)
             {
-                return Math.Max(resolvedXValue, currentEnergy.Value);
+                return Math.Max(currentEnergy.Value, 0);
             }
 
-            return resolvedXValue;
+            return Math.Max(card.ResolveEnergyXValue(), 0);
         }
         catch
         {
-            return currentEnergy;
+            return currentEnergy.HasValue ? Math.Max(currentEnergy.Value, 0) : null;
+        }
+    }
+
+    private static int? SafeResolveCardStarCost(CardModel card)
+    {
+        int? currentStars = null;
+
+        try
+        {
+            // Star-X has the same stale-preview failure mode as energy X: the
+            // strategic value is determined by the live combat star resource, not
+            // by a card-side preview cached earlier in the turn/animation window.
+            currentStars = card.Owner?.PlayerCombatState?.Stars;
+            if (card.HasStarCostX && currentStars.HasValue)
+            {
+                return Math.Max(currentStars.Value, 0);
+            }
+
+            return card.CurrentStarCost;
+        }
+        catch
+        {
+            return card.HasStarCostX && currentStars.HasValue ? Math.Max(currentStars.Value, 0) : null;
         }
     }
 
@@ -5194,6 +6057,7 @@ internal static partial class BridgeGameApi
     }
 
     private static object BuildCardSelectionPayload(
+        BridgeWorldContext context,
         Node? cardSelectionScreen,
         IReadOnlyList<NCardHolder> cardSelectionOptions,
         Node? cardSelectionConfirmButton,
@@ -5216,6 +6080,8 @@ internal static partial class BridgeGameApi
         var minSelect = state.MinSelect ?? GetHiddenPropertyValue<int>(prefs, "MinSelect");
         var maxSelect = state.MaxSelect ?? GetHiddenPropertyValue<int>(prefs, "MaxSelect");
         var selectionSemantics = ResolveCardSelectionSemantics(cardSelectionScreen, prompt, texts);
+        var selectionDomain = ResolveCardSelectionDomain(context, selectionSemantics);
+        var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
         var confirmVisible = state.ConfirmReady;
         var skipVisible = cardSelectionSkipButton is not null &&
                           IsNodeVisible(cardSelectionSkipButton) &&
@@ -5228,6 +6094,9 @@ internal static partial class BridgeGameApi
             prompt,
             texts,
             selection_semantics = selectionSemantics,
+            selection_domain = selectionDomain,
+            source_effect_type = selectionSemantics,
+            remaining_select = remainingSelect,
             decision_text = BuildCardSelectionDecisionText(
                 selectionSemantics,
                 prompt,
@@ -6025,15 +6894,20 @@ internal static partial class BridgeGameApi
         // the visible text-only path here; static export keeps the richer data.
         var glossary = Array.Empty<object>();
 
+        var resolvedTitle = option is null ? string.Empty : DescribeText(option.Title, optionTextContext);
+        var resolvedDescription = option is null ? string.Empty : DescribeText(option.Description, optionTextContext);
         return new
         {
             index,
-            title = option is null ? string.Empty : DescribeText(option.Title, optionTextContext),
-            description = option is null ? string.Empty : DescribeText(option.Description, optionTextContext),
+            title = resolvedTitle,
+            description = resolvedDescription,
             is_locked = option?.IsLocked ?? true,
             is_proceed = option?.IsProceed ?? false,
             relic = (object?)null,
-            glossary
+            glossary,
+            // Structured delta extraction lets a text-free policy reason about
+            // what the option does (hp/gold cost, card ops, relic/potion gain).
+            effect_deltas = ExtractEventOptionEffectDeltas(resolvedTitle, resolvedDescription).ToPayload()
         };
     }
 
@@ -6741,6 +7615,9 @@ internal static partial class BridgeGameApi
             };
         }
 
+        var profileEntry = TryGetPotionProfileEntry(potion);
+        var effectProfile = BuildPotionEffectProfilePayload(profileEntry);
+
         return new
         {
             id = potion.Id.ToString(),
@@ -6751,7 +7628,15 @@ internal static partial class BridgeGameApi
             selection_screen_prompt = DescribeText(potion.SelectionScreenPrompt, potion),
             can_throw_at_ally = SafeCanThrowPotionAtAlly(potion),
             is_usable = SafeGetPotionIsUsable(potion),
-            is_queued = SafeGetPotionIsQueued(potion)
+            is_queued = SafeGetPotionIsQueued(potion),
+            has_been_removed_from_state = SafeGetPotionHasBeenRemovedFromState(potion),
+            target_scope = profileEntry?.TargetScope,
+            effect_family = profileEntry?.EffectFamily.ToArray() ?? Array.Empty<string>(),
+            effect_profile = effectProfile,
+            semantic_tags = profileEntry?.SemanticTags.ToArray() ?? Array.Empty<string>(),
+            timing_tags = profileEntry?.TimingTags.ToArray() ?? Array.Empty<string>(),
+            training_tags = profileEntry?.TrainingTags.ToArray() ?? Array.Empty<string>(),
+            enabled_for_training = profileEntry?.EnabledForTraining ?? true
         };
     }
 
@@ -7107,6 +7992,38 @@ internal static partial class BridgeGameApi
                actionId.StartsWith("card_reward:", StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// True when an action's resulting screen transitioned out of a combat
+    /// surface into a post-combat screen (rewards, map, game-over). Used as
+    /// the trigger for the per-combat finalize drain on the full_run path.
+    /// </summary>
+    private static bool IsCombatExitTransition(string? screenBefore, string? screenAfter)
+    {
+        if (string.IsNullOrEmpty(screenBefore) || string.IsNullOrEmpty(screenAfter))
+        {
+            return false;
+        }
+        if (string.Equals(screenBefore, screenAfter, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        var beforeIsCombat = IsCombatLikeScreen(screenBefore);
+        var afterIsCombat = IsCombatLikeScreen(screenAfter);
+        return beforeIsCombat && !afterIsCombat;
+    }
+
+    private static bool IsCombatLikeScreen(string? screen)
+    {
+        if (string.IsNullOrEmpty(screen))
+        {
+            return false;
+        }
+        return screen.IndexOf("combat", StringComparison.OrdinalIgnoreCase) >= 0
+            || screen.Equals("COMBAT", StringComparison.OrdinalIgnoreCase)
+            || screen.Equals("BATTLE", StringComparison.OrdinalIgnoreCase)
+            || screen.Equals("FIGHTING", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsCardSelectionResolutionAction(string actionId)
     {
         return actionId.StartsWith("card_selection:select:", StringComparison.Ordinal);
@@ -7185,6 +8102,17 @@ internal static partial class BridgeGameApi
         CancellationToken cancellationToken)
     {
         var autoExecutedActions = new List<object>();
+
+        if (!ShouldAutoCompleteCardSelection(frontier.Snapshot))
+        {
+            return (frontier, autoExecutedActions);
+        }
+
+        var latestFrontier = await ObserveFrontierAsync(cancellationToken);
+        if (HasFrontierChanged(frontier, latestFrontier))
+        {
+            frontier = latestFrontier;
+        }
 
         if (!ShouldAutoCompleteCardSelection(frontier.Snapshot))
         {
@@ -7293,6 +8221,18 @@ internal static partial class BridgeGameApi
         try
         {
             return potion.IsQueued;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool SafeGetPotionHasBeenRemovedFromState(PotionModel potion)
+    {
+        try
+        {
+            return potion.HasBeenRemovedFromState;
         }
         catch
         {
@@ -7715,6 +8655,8 @@ internal static partial class BridgeGameApi
 
     private static void InvokeCardSelectionOptionAction(Node? cardSelectionScreen, NCardHolder cardHolder)
     {
+        EnsureCardSelectionOptionStillPresentOrThrow(cardSelectionScreen, cardHolder);
+
         var beforeState = CaptureCardSelectionUiState(cardSelectionScreen, cardHolder.CardModel);
         var invokedAnyCandidate = false;
 
@@ -7788,6 +8730,41 @@ internal static partial class BridgeGameApi
             HttpStatusCode.Conflict,
             "action_target_missing",
             $"Could not resolve a supported card-selection action for {cardSelectionScreen?.GetType().FullName ?? "<missing screen>"}.");
+    }
+
+    private static void EnsureCardSelectionOptionStillPresentOrThrow(Node? cardSelectionScreen, NCardHolder cardHolder)
+    {
+        if (cardSelectionScreen is null || !IsNodeVisible(cardSelectionScreen))
+        {
+            throw new BridgeRequestException(
+                HttpStatusCode.Conflict,
+                "card_selection_screen_gone",
+                "Card selection screen is no longer visible at execution time.");
+        }
+
+        var currentOptions = GetCardSelectionOptions(cardSelectionScreen);
+        var holderStillPresent = currentOptions.Any(holder => ReferenceEquals(holder, cardHolder));
+        if (!holderStillPresent && cardHolder.CardModel is not null)
+        {
+            holderStillPresent = currentOptions.Any(holder => ReferenceEquals(holder.CardModel, cardHolder.CardModel));
+        }
+
+        if (holderStillPresent)
+        {
+            return;
+        }
+
+        var selectionId = cardHolder.CardModel is not null ? GetCardReference(cardHolder.CardModel) : null;
+        throw new BridgeRequestException(
+            HttpStatusCode.Conflict,
+            "card_selection_option_gone",
+            $"Card selection option '{selectionId ?? "<unknown>"}' is no longer present at execution time.",
+            new
+            {
+                selection_id = selectionId,
+                screen_type = cardSelectionScreen.GetType().Name,
+                option_count = currentOptions.Count
+            });
     }
 
     private const ulong NChooseACardSelectionOpenGuardMs = 350UL;
@@ -12038,6 +13015,16 @@ internal static partial class BridgeGameApi
     private sealed class BridgeStateFields
     {
         public required string Screen { get; init; }
+
+        public required bool CombatInProgress { get; init; }
+
+        public required bool CombatIsPlayPhase { get; init; }
+
+        public required bool CombatIsPaused { get; init; }
+
+        public required bool CombatPlayerActionsDisabled { get; init; }
+
+        public required bool CardSelectionVisible { get; init; }
 
         public required object Automation { get; init; }
 

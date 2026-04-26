@@ -459,6 +459,275 @@ def _relic_line_score(obs: dict[str, Any] | None, action: dict[str, Any] | None,
     return float(np.clip(score, 0.0, 1.0))
 
 
+def _action_numeric_value(
+    action: dict[str, Any] | None,
+    source: dict[str, Any] | None,
+    signature: dict[str, Any] | None,
+    keys: tuple[str, ...],
+) -> float:
+    """Read an action/potion/card numeric preview from all bridge variants.
+
+    The live bridge and the simulator have evolved through several payload
+    shapes.  Potion timing supervision must not depend on one exact key path,
+    otherwise the trait head silently regresses into "has potion => use it".
+    """
+
+    alias_map = {
+        "damage": ("damage", "total_damage", "preview_damage"),
+        "block": ("block", "total_block", "preview_block"),
+        "heal": ("heal", "hp_gain", "healing"),
+        "draw": ("draw", "cards_drawn", "card_draw"),
+        "energy": ("energy", "energy_gain", "gain_energy", "energy_delta"),
+        "weak": ("weak", "apply_weak"),
+        "vulnerable": ("vulnerable", "apply_vulnerable"),
+        "poison": ("poison", "apply_poison"),
+        "hits": ("hits", "hit_count"),
+    }
+    expanded_keys: list[str] = []
+    for key in keys:
+        expanded_keys.extend(alias_map.get(key, (key,)))
+
+    values: list[float] = []
+    signature = signature if isinstance(signature, dict) else {}
+    for key in expanded_keys:
+        if key in signature:
+            value = _float(signature.get(key), float("nan"))
+            if not np.isnan(value):
+                values.append(value)
+
+    candidates: list[Any] = []
+    if isinstance(action, dict):
+        candidates.extend(
+            [
+                action,
+                action.get("semantic") if isinstance(action.get("semantic"), dict) else None,
+                action.get("preview") if isinstance(action.get("preview"), dict) else None,
+                action.get("effect_preview") if isinstance(action.get("effect_preview"), dict) else None,
+                action.get("card") if isinstance(action.get("card"), dict) else None,
+                action.get("potion") if isinstance(action.get("potion"), dict) else None,
+            ]
+        )
+    if isinstance(source, dict):
+        candidates.extend(
+            [
+                source,
+                source.get("preview") if isinstance(source.get("preview"), dict) else None,
+                source.get("effect_preview") if isinstance(source.get("effect_preview"), dict) else None,
+            ]
+        )
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in expanded_keys:
+            value = candidate.get(key)
+            if value is None:
+                continue
+            numeric = _float(value, float("nan"))
+            if not np.isnan(numeric):
+                values.append(numeric)
+    return max(values) if values else 0.0
+
+
+def _alive_enemy_hp_values(obs: dict[str, Any] | None) -> list[float]:
+    values: list[float] = []
+    for enemy in _combat_enemies(obs):
+        hp = _float(enemy.get("hp", enemy.get("current_hp")))
+        if hp > 0.0:
+            values.append(hp)
+    return values
+
+
+def _target_enemy_hp(obs: dict[str, Any] | None, action: dict[str, Any] | None) -> float:
+    enemy = _choose_target_enemy(obs, action)
+    if isinstance(enemy, dict):
+        hp = _float(enemy.get("hp", enemy.get("current_hp")))
+        if hp > 0.0:
+            return hp
+    values = _alive_enemy_hp_values(obs)
+    return min(values) if values else 0.0
+
+
+def _action_energy_cost(action: dict[str, Any] | None, signature: dict[str, Any] | None, source_profile: dict[str, float] | None = None) -> float:
+    signature = signature if isinstance(signature, dict) else {}
+    profile = source_profile if isinstance(source_profile, dict) else {}
+    if bool(signature.get("is_x_cost")) or float(profile.get("x_cost", 0.0)) > 0.5:
+        return 999.0
+    if "cost" in signature:
+        cost = _float(signature.get("cost"), -1.0)
+        if cost >= 0.0:
+            return cost
+    source = _action_source(action)
+    if isinstance(source, dict):
+        cost = _float(source.get("cost"), -1.0)
+        if cost >= 0.0:
+            return cost
+    return max(float(profile.get("cost", 0.0)), 0.0)
+
+
+def _action_positive_preview(action: dict[str, Any] | None, signature: dict[str, Any] | None = None) -> bool:
+    if not isinstance(action, dict):
+        return False
+    signature = signature if isinstance(signature, dict) else semantic_action_signature(action)
+    family = str(signature.get("family") or "")
+    if family != "play_card":
+        return False
+    source = _action_source(action)
+    profile = _source_profile(source)
+    roles = {str(role or "").lower() for role in (signature.get("roles") or []) if str(role or "").strip()}
+    damage = max(float(profile.get("damage", 0.0)), _action_numeric_value(action, source, signature, ("damage",)))
+    block = max(float(profile.get("block", 0.0)), _action_numeric_value(action, source, signature, ("block",)))
+    draw = max(float(profile.get("draw", 0.0)), _action_numeric_value(action, source, signature, ("draw",)))
+    energy = max(float(profile.get("energy", 0.0)), _action_numeric_value(action, source, signature, ("energy",)))
+    return bool(
+        damage > 0.0
+        or block > 0.0
+        or draw > 0.0
+        or energy > 0.0
+        or roles.intersection({"attack", "block", "draw", "debuff", "buff", "heal", "setup", "scaling", "resource"})
+    )
+
+
+def _has_resource_followup_for_potion(
+    legal_actions_before: list[dict[str, Any]] | None,
+    action: dict[str, Any] | None,
+    energy_after: float,
+) -> bool:
+    """Whether a resource/draw/energy potion can be converted this turn.
+
+    This is deliberately conservative: if the only exposed follow-up is another
+    potion/end-turn, a resource potion should be considered deferable instead of
+    automatically positive.
+    """
+
+    if not isinstance(legal_actions_before, list):
+        return False
+    action_id = str((action or {}).get("action_id") or "")
+    for candidate in legal_actions_before:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("action_id") or "")
+        if action_id and candidate_id and candidate_id == action_id:
+            continue
+        candidate_sig = semantic_action_signature(candidate)
+        family = str(candidate_sig.get("family") or "")
+        if family != "play_card":
+            continue
+        candidate_source = _action_source(candidate)
+        candidate_profile = _source_profile(candidate_source)
+        if bool(candidate_sig.get("is_x_cost")):
+            if energy_after <= 0.05:
+                continue
+        elif _action_energy_cost(candidate, candidate_sig, candidate_profile) > max(energy_after, 0.0) + 1e-3:
+            continue
+        if _action_positive_preview(candidate, candidate_sig):
+            return True
+    return False
+
+
+def _potion_timing_line_score(
+    prev_obs: dict[str, Any] | None,
+    action: dict[str, Any] | None,
+    signature: dict[str, Any],
+    source_profile: dict[str, float],
+    legal_actions_before: list[dict[str, Any]] | None,
+) -> float:
+    """Trait supervision for *when* to use a potion, not merely that one exists.
+
+    Head index 1 remains named ``potion_line`` for checkpoint compatibility, but
+    its target is now "potion timing quality":
+
+    - high when a selected potion is lethal, prevents lethal/major HP loss, or
+      answers a visible dangerous mechanic;
+    - moderate when it creates resources that can immediately be converted;
+    - low when using it is overkill, block waste, or resource-without-follow-up;
+    - tiny context signal for non-potion combat actions while potions are held.
+    """
+
+    family = str(signature.get("family") or "")
+    if not _in_combat(prev_obs):
+        return 0.08 if family in {"use_potion", "discard_potion"} else 0.0
+
+    potions = _nonempty_potions(prev_obs)
+    if family not in {"use_potion", "discard_potion"}:
+        if potions and family in _COMBAT_ACTION_FAMILIES:
+            # Keep only a faint context affordance.  The old 0.30-0.65 target was
+            # enough to make the candidate path equate "has potion" with
+            # "potion should be used now".
+            return 0.04 + 0.04 * float(_action_positive_preview(action, signature))
+        return 0.0
+
+    if family == "discard_potion":
+        return 0.06 + 0.04 * float(bool(potions))
+
+    source = _action_source(action)
+    roles = {str(role or "").lower() for role in (signature.get("roles") or []) if str(role or "").strip()}
+    text = _source_text(source)
+    incoming = _combat_total_intent_damage(prev_obs)
+    current_block = _player_block(prev_obs)
+    hp = _player_hp(prev_obs)
+    max_hp = max(_player_max_hp(prev_obs), 1.0)
+    hp_ratio = float(np.clip(hp / max_hp, 0.0, 1.0))
+    threat_gap = max(incoming - current_block, 0.0)
+    target_hp = _target_enemy_hp(prev_obs, action)
+
+    damage = max(float(source_profile.get("damage", 0.0)), _action_numeric_value(action, source, signature, ("damage",)))
+    block = max(float(source_profile.get("block", 0.0)), _action_numeric_value(action, source, signature, ("block",)))
+    draw = max(float(source_profile.get("draw", 0.0)), _action_numeric_value(action, source, signature, ("draw",)))
+    energy_gain = max(float(source_profile.get("energy", 0.0)), _action_numeric_value(action, source, signature, ("energy",)))
+    heal = max(float(source_profile.get("heal", 0.0)), _action_numeric_value(action, source, signature, ("heal",)))
+    weak = max(float(source_profile.get("weak", 0.0)), _action_numeric_value(action, source, signature, ("weak",)))
+    vulnerable = max(float(source_profile.get("vulnerable", 0.0)), _action_numeric_value(action, source, signature, ("vulnerable",)))
+    poison = _action_numeric_value(action, source, signature, ("poison",))
+    debuff = bool(roles.intersection({"debuff", "weak", "vulnerable"}) or weak > 0.0 or vulnerable > 0.0 or poison > 0.0)
+    resource_potion = bool(draw > 0.0 or energy_gain > 0.0 or "energy" in text or "draw" in text or roles.intersection({"draw", "resource"}))
+    current_energy = _combat_energy(prev_obs)
+    followup_available = _has_resource_followup_for_potion(legal_actions_before, action, current_energy + max(energy_gain, 0.0))
+
+    lethal = bool(damage > 0.0 and target_hp > 0.0 and damage >= target_hp)
+    high_damage = bool(
+        damage > 0.0
+        and (
+            (target_hp > 0.0 and damage >= min(target_hp, max(12.0, 0.35 * target_hp)))
+            or (target_hp <= 0.0 and damage >= 18.0)
+        )
+    )
+    prevent_lethal = bool(threat_gap >= max(hp, 1.0) and (block + heal >= min(max(threat_gap, 1.0), 24.0) or debuff or lethal))
+    prevent_major_loss = bool(
+        threat_gap >= max(8.0, 0.24 * max(hp, 1.0))
+        and (block + heal >= min(threat_gap, 18.0) * 0.45 or debuff or high_damage)
+    )
+    any_enemy_risk = max((_enemy_risk_score(enemy) for enemy in _combat_enemies(prev_obs)), default=0.0)
+    mechanism_answer = bool(any_enemy_risk >= 0.55 and (lethal or high_damage or debuff or block > 0.0 or heal > 0.0))
+    overkill = bool(damage > 0.0 and target_hp > 0.0 and damage > max(target_hp + 8.0, target_hp * 1.75) and not roles.intersection({"aoe"}))
+    block_waste = bool(block > 0.0 and threat_gap <= 1.0 and hp_ratio >= 0.45)
+    no_followup = bool(resource_potion and not followup_available)
+    save_recommended = bool(
+        not lethal
+        and not prevent_lethal
+        and not mechanism_answer
+        and threat_gap <= max(2.0, 0.08 * max_hp)
+        and hp_ratio >= 0.62
+    )
+
+    score = 0.14
+    score += 0.72 * float(lethal)
+    score += 0.72 * float(prevent_lethal)
+    score += 0.36 * float(prevent_major_loss)
+    score += 0.28 * float(high_damage and not overkill)
+    score += 0.32 * float(block > 0.0 and threat_gap > 1.0 and not block_waste)
+    score += 0.18 * float(heal > 0.0 and hp_ratio < 0.75)
+    score += 0.25 * float(debuff and incoming > 0.0)
+    score += 0.35 * float(resource_potion and followup_available)
+    score += 0.24 * float(mechanism_answer)
+
+    score -= 0.34 * float(overkill)
+    score -= 0.36 * float(block_waste)
+    score -= 0.48 * float(no_followup)
+    score -= 0.28 * float(save_recommended)
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def _same_card_count(obs: dict[str, Any] | None, source: dict[str, Any] | None) -> float:
     if not isinstance(source, dict):
         return 0.0
@@ -885,7 +1154,6 @@ def compute_trait_targets(
     draw_count = len(_runtime_cards(prev_obs, "draw_pile"))
     discard_count = len(_runtime_cards(prev_obs, "discard_pile"))
     exhaust_count = len(_runtime_cards(prev_obs, "exhaust_pile"))
-    potions = _nonempty_potions(prev_obs)
 
     target = np.zeros(NUM_TRAIT_HEADS, dtype=np.float32)
 
@@ -897,13 +1165,13 @@ def compute_trait_targets(
     energy_line += float(current_energy > 0.0 and current_energy <= max(source_profile["cost"], 1.0)) * 0.20
     target[0] = float(np.clip(energy_line, 0.0, 1.0))
 
-    potion_line = 0.0
-    potion_line += float(family in {"use_potion", "discard_potion"}) * 1.00
-    potion_line += float(bool(potions) and family in _COMBAT_ACTION_FAMILIES) * 0.30
-    potion_line += float(bool(potions) and (source_profile["damage"] > 0.0 or source_profile["block"] > 0.0 or source_profile["draw"] > 0.0 or bool(signature.get("is_x_cost")))) * 0.35
-    if isinstance(legal_actions_before, list):
-        potion_line += 0.20 * float(any(str((candidate or {}).get("kind") or "") == "use_potion" for candidate in legal_actions_before if isinstance(candidate, dict)))
-    target[1] = float(np.clip(potion_line, 0.0, 1.0))
+    target[1] = float(
+        np.clip(
+            _potion_timing_line_score(prev_obs, action, signature, source_profile, legal_actions_before),
+            0.0,
+            1.0,
+        )
+    )
 
     target[2] = float(np.clip(_relic_line_score(prev_obs, action, signature), 0.0, 1.0))
 

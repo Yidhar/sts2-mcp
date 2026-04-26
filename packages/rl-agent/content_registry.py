@@ -487,9 +487,29 @@ def _compact_runtime_card_summary(card_payload: dict[str, Any] | None) -> str:
 
     effect = _normalize_compact_text(card_payload.get("effect") or card_payload.get("description"))
 
+    runtime_mods: list[str] = []
+    for field_name, prefix in (("afflictions", "aff"), ("enchantments", "ench")):
+        modifiers = card_payload.get(field_name)
+        if not isinstance(modifiers, list):
+            continue
+        for modifier in modifiers[:4]:
+            if isinstance(modifier, dict):
+                label = _normalize_compact_text(modifier.get("title") or modifier.get("id") or modifier.get("type"))
+                amount = modifier.get("amount")
+                if label:
+                    if amount not in (None, "", False):
+                        label = f"{label}:{_format_compact_number(amount)}"
+                    runtime_mods.append(f"{prefix}={label}")
+            elif modifier not in (None, ""):
+                label = _normalize_compact_text(modifier)
+                if label:
+                    runtime_mods.append(f"{prefix}={label}")
+
     parts: list[str] = []
     if tokens:
         parts.append(" ".join(tokens))
+    if runtime_mods:
+        parts.append("mods " + " ".join(runtime_mods))
     if effect:
         parts.append(effect)
     return " | ".join(parts)
@@ -771,9 +791,25 @@ def build_live_potion_semantic_text(potion_payload: dict[str, Any] | None) -> st
     runtime_summary = _compact_runtime_potion_summary(potion_payload)
     static_summary = _compact_entity_static_summary("potion", metadata)
 
+    # Phase 3 of potion-timing-modeling-plan.md §7.5: surface effect_family +
+    # timing_tags from the bridge payload (or registry fallback) so the text
+    # trunk also sees the structured profile, not just title + 中文 description.
+    timing_parts: list[str] = []
+    family = potion_payload.get("effect_family")
+    if isinstance(family, list) and family:
+        timing_parts.append("fam " + " ".join(str(f) for f in family[:6]))
+    timing = potion_payload.get("timing_tags")
+    if isinstance(timing, list) and timing:
+        timing_parts.append("timing " + " ".join(str(t) for t in timing[:6]))
+    target_scope = potion_payload.get("target_scope")
+    if target_scope:
+        timing_parts.append(f"scope {target_scope}")
+
     parts = [title]
     if runtime_summary:
         parts.append(runtime_summary)
+    if timing_parts:
+        parts.append(" ".join(timing_parts))
     if static_summary and static_summary != runtime_summary:
         parts.append(static_summary)
     return " | ".join(part for part in parts if part)

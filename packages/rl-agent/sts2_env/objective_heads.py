@@ -145,6 +145,8 @@ def scalarize_objective_components_torch(
     )
     if components.dim() == 1:
         return (components.unsqueeze(0) * weights).sum(dim=-1)
+    while weights.dim() < components.dim():
+        weights = weights.unsqueeze(1)
     return (components * weights).sum(dim=-1)
 
 
@@ -360,7 +362,17 @@ def compute_transition_objective_rewards(
 
     resource_efficiency = float(np.clip(resource_delta * 2.0, -1.0, 1.0))
     if family == "use_potion":
-        resource_efficiency -= 0.10 + 0.20 * save_potion_mode
+        # Potion use is a cost in hallway fights, but in boss/lethal windows the
+        # old blanket penalty taught the policy to die with potions.  Without
+        # encounter metadata in this pure transition function, infer tactical
+        # pressure from incoming intent, low HP, and large enemy HP pools.
+        hp_ratio = next_hp / max_hp if max_hp > 0.0 else 0.0
+        lethal_pressure = prev_intent > max(prev_block + prev_hp * 0.35, 0.0)
+        boss_like_pressure = prev_enemy_hp >= 180.0 or next_enemy_hp >= 180.0
+        if lethal_pressure or hp_ratio <= 0.35 or boss_like_pressure:
+            resource_efficiency += 0.12 + 0.10 * float(lethal_pressure) + 0.08 * float(boss_like_pressure)
+        else:
+            resource_efficiency -= 0.10 + 0.20 * save_potion_mode
     elif family == "rest":
         resource_efficiency -= 0.04 * max(1.0 - force_rest_mode, 0.0)
     elif family == "shop" and build_progress > 0.0:

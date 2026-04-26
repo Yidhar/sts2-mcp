@@ -61,3 +61,7 @@ packages/rl-agent/analysis/
 .switchyard/
 packages/rl-agent/logs_attention/
 packages/rl-agent/checkpoints_attention/
+*.sh
+packages/rl-agent/checkpoints_muzero/
+packages/rl-agent/logs_muzero/
+

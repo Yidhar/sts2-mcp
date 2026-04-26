@@ -207,9 +207,9 @@ def _infer_target_scope(action: dict[str, Any]) -> str:
     potion = action.get("potion") if isinstance(action.get("potion"), dict) else None
     target = ""
     if isinstance(card, dict):
-        target = _safe_text(card.get("target") or card.get("target_type"))
+        target = _safe_text(card.get("target_type") or card.get("target"))
     elif isinstance(potion, dict):
-        target = _safe_text(potion.get("target") or potion.get("target_type"))
+        target = _safe_text(potion.get("target_type") or potion.get("target"))
     if not target:
         target_obj = action.get("target")
         if isinstance(target_obj, dict):
@@ -274,7 +274,11 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
         roles.add("buff")
     if hits > 1 or _infer_target_scope(action) == "all_enemies":
         roles.add("aoe")
-    if isinstance(source, dict) and bool(source.get("x_cost")):
+    if isinstance(source, dict) and (
+        bool(source.get("x_cost") or source.get("costs_x"))
+        or _safe_text(source.get("cost")).strip().upper() == "X"
+        or _safe_text(source.get("canonical_energy_cost")).strip().upper() == "X"
+    ):
         roles.add("x_cost")
     if isinstance(source, dict):
         card_type = _safe_text(source.get("type")).lower()
@@ -298,6 +302,46 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
             roles.add("block")
         if "attack" in joined:
             roles.add("attack")
+
+    # Phase 3 of potion-timing-modeling-plan.md §7.4: when this action is a
+    # potion use, lift effect_family from the potion profile (bridge live or
+    # registry fallback) into roles. Map onto existing SEMANTIC_ROLE_NAMES so
+    # action feature dim stays unchanged.
+    if family == "use_potion" and isinstance(action.get("potion"), dict):
+        potion_payload = action["potion"]
+        effect_family = potion_payload.get("effect_family")
+        if not isinstance(effect_family, list):
+            effect_family = []
+        if not effect_family:
+            try:
+                from .potion_profiles import get_potion_profile as _gpp
+                pid = _safe_text(potion_payload.get("id"))
+                if pid:
+                    effect_family = list(_gpp(pid).get("effect_family") or [])
+            except Exception:
+                effect_family = []
+        family_to_role = {
+            "damage": "attack", "aoe": "aoe", "self_damage": "aoe",
+            "block": "block", "intangible": "block", "prevent_damage": "block",
+            "delayed_block": "block",
+            "draw": "draw",
+            "energy": "resource", "energy_gain": "resource",
+            "generate_cards": "resource", "discover": "resource",
+            "retrieve_from_discard": "resource",
+            "weak": "debuff", "vulnerable": "debuff", "poison": "debuff",
+            "debuff": "debuff",
+            "strength": "buff", "dexterity": "buff", "focus": "buff",
+            "scaling": "scaling", "ritual": "buff", "thorns": "buff",
+            "plated": "buff", "regen": "buff", "buffer": "buff",
+            "heal": "heal", "max_hp": "heal",
+            "upgrade": "setup", "duplicate_next": "setup",
+            "transform_hand": "setup", "exhaust_hand": "setup",
+            "free_play": "setup", "snecko": "setup", "long_term": "setup",
+        }
+        for fam in effect_family:
+            mapped = family_to_role.get(_safe_text(fam).lower())
+            if mapped:
+                roles.add(mapped)
 
     return [role for role in SEMANTIC_ROLE_NAMES if role in roles]
 
@@ -405,7 +449,15 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         "hits": _preview_metric(source, "hits"),
         "damage_per_hit": _preview_metric(source, "damage_per_hit"),
         "x_cost_value": _preview_metric(source, "x_cost_value"),
-        "is_x_cost": bool((source or {}).get("x_cost")),
+        "is_x_cost": bool(
+            isinstance(source, dict)
+            and (
+                source.get("x_cost")
+                or source.get("costs_x")
+                or _safe_text(source.get("cost")).strip().upper() == "X"
+                or _safe_text(source.get("canonical_energy_cost")).strip().upper() == "X"
+            )
+        ),
         "is_attack": card_type.lower() == "attack",
         "is_skill": card_type.lower() == "skill",
         "is_power": card_type.lower() == "power",

@@ -92,7 +92,8 @@ internal static partial class BridgeGameApi
                 entry["target"] = new
                 {
                     combat_id = TryGetNestedInt(payload, "target_combat_id"),
-                    name = TryGetNestedString(payload, "target_name")
+                    name = TryGetNestedString(payload, "target_name"),
+                    side = TryGetNestedString(payload, "target_side")
                 };
                 break;
 

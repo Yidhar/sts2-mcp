@@ -45,9 +45,19 @@ def compact_action_signature(action: Any) -> dict[str, Any]:
         "surface": action.get("surface"),
         "target_index": action.get("target_index"),
         "title": title,
-        "target": card.get("target") or potion.get("target") or action.get("target"),
+        # Keep the concrete action target (creature dict) separate from card/potion
+        # target_type (SingleEnemy/Self/AllEnemies). Mixing the two under "target"
+        # caused targeted-action diagnostics to lose combat_id when a compact card
+        # also carried target metadata.
+        "target": action.get("target") or card.get("target") or potion.get("target"),
+        "target_type": card.get("target_type") or potion.get("target_type") or card.get("target") or potion.get("target"),
         "card_id": card.get("id") or action.get("card_id"),
         "card_cost": _coerce_float(card.get("cost") if card else action.get("card_cost")),
+        # card.type is Attack / Skill / Power / Status / Curse — keep it so the
+        # Python positive-action judgement can distinguish playable output cards
+        # (Attack/Skill/Power) from unplayable forced draws (Status/Curse) even
+        # when the bridge-provided semantic.roles list is empty.
+        "card_type": card.get("type") or action.get("card_type"),
         "potion_id": potion.get("id") or action.get("potion_id"),
         "relic_id": relic.get("id") or action.get("relic_id"),
         "choice_index": action.get("index") if action.get("index") is not None else action.get("choice_index"),

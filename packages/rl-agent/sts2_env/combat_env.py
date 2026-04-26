@@ -16,9 +16,10 @@ from gymnasium import spaces
 
 from combat_snapshot_dataset import snapshot_row_to_reset_kwargs
 from .action_compact import compact_legal_actions
+from .boss_mechanics import build_boss_mechanics_context
 from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
-from .observation_common import DenseObservationEncoder, MAX_ACTIONS
+from .observation_common import DenseObservationEncoder, MAX_ACTIONS, _aggregate_card_modifier_semantics
 from .observation_v3 import WorldTokenObservationEncoder
 from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
@@ -28,16 +29,56 @@ from .reward_constants import (
     COMBAT_SANDBOX_WASTE_ENERGY as END_TURN_WASTE_ENERGY_PENALTY,
     COMBAT_SANDBOX_WASTE_ZERO_COST as END_TURN_WASTE_ZERO_COST_BONUS_PENALTY,
     COMBAT_SANDBOX_WASTE_EXTRA_ACTION as END_TURN_WASTE_EXTRA_ACTION_PENALTY,
+    BOSS_COMBAT_LOSS_DAMAGE_UNDO_PERCENT_SCALE,
+    BOSS_COMBAT_LOSS_PENALTY_BASE,
+    BOSS_COMBAT_LOSS_PENALTY_MISSING_HP_SCALE,
+    BOSS_COMBAT_WIN_BONUS_BASE,
+    BOSS_COMBAT_WIN_BONUS_HP_SCALE,
+    BOSS_ENEMY_HP_DELTA_PERCENT_SCALE,
+    BOSS_DAMAGE_MULTIPLIER,
+    CURRICULUM_HP_WEIGHT_LERP_MAX_TIER,
+    CURRICULUM_HP_WEIGHT_LERP_MIN_TIER,
+    CURRICULUM_MIN_EPISODES_FOR_PHASE,
+    CURRICULUM_PHASE_WIN_RATE_THRESHOLDS,
+    CURRICULUM_WIN_RATE_WINDOW,
+    HP_PRESERVE_WIN_BONUS_TIER_SCALE,
+    KAISER_BACK_ATTACK_HP_LOSS_PENALTY_SCALE,
+    KAISER_BACK_ATTACK_DEFENSE_BONUS,
+    KAISER_BACK_ATTACK_RISK_REDUCTION_BONUS,
+    KAISER_BACK_ATTACK_END_TURN_PENALTY,
+    KAISER_FACING_CHANGE_BONUS,
+    KAISER_PRESSURE_KILL_BONUS,
+    KAISER_NO_RESPONSE_PENALTY_SOFTEN,
+    KNOWLEDGE_DEMON_GOOD_CURSE_PICK_BONUS,
+    KNOWLEDGE_DEMON_BAD_CURSE_PICK_PENALTY,
+    KNOWLEDGE_DEMON_END_TURN_PENALTY,
+    CEREMONIAL_STUN_WINDOW_ENTER_BONUS,
+    CEREMONIAL_THRESHOLD_PROGRESS_BONUS,
+    CEREMONIAL_STUN_DAMAGE_MULTIPLIER,
+    CEREMONIAL_ONE_CARD_HIGH_IMPACT_BONUS,
+    CEREMONIAL_ONE_CARD_LOW_IMPACT_PENALTY,
+    CEREMONIAL_ONE_CARD_END_TURN_PENALTY,
     ENEMY_HP_DELTA_REWARD_MAX_ABS,
     ENEMY_HP_DELTA_REWARD_SCALE,
     ENEMY_HP_SENTINEL_THRESHOLD,
     INVALID_ACTION_REWARD,
+    OUTCOME_TIER_SCALE,
+    PLAYER_HP_LOSS_BOSS_NO_HEAL_SCALE,
     PLAYER_HP_LOSS_REWARD_SCALE,
+    PLAYER_HP_LOSS_TIER_SCALE,
+    WASTEFUL_END_TURN_TIER_MULTIPLIER,
+    POTION_HOARDING_MAX_PENALTY_ABS,
+    POTION_HOARDING_PENALTY_PER_POTION,
+    POTION_USE_BOSS_BONUS,
+    POTION_USE_ELITE_BONUS,
+    POTION_USE_MONSTER_BONUS,
+    POTION_USE_MONSTER_PENALTY,
     SENTINEL_COMBAT_LOSS_PENALTY_BASE,
     SENTINEL_COMBAT_LOSS_PENALTY_SCALE,
     SENTINEL_COMBAT_WIN_BONUS_BASE,
     SENTINEL_COMBAT_WIN_BONUS_SCALE,
     SENTINEL_DEATH_DAMAGE_POWER_KEYWORDS,
+    TURN_EFFICIENCY_PENALTY_PER_END_TURN_TIER,
 )
 
 INVALID_ACTION_REASON = "invalid_action_index"
@@ -51,6 +92,146 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# ---------------------------------------------------------------------------
+# Curriculum tracker (combat-reward-curriculum.md §4, §13)
+# ---------------------------------------------------------------------------
+#
+# Keeps a sliding window of the last N win/loss outcomes per encounter.  The
+# resulting per-encounter win rate drives a 0..1 "progress" scalar:
+#
+#   progress = clamp((win_rate - P0_P1_threshold) / (P2_P3_threshold - P0_P1_threshold), 0, 1)
+#
+# which lerps the HP-loss shaping multiplier between
+# CURRICULUM_HP_WEIGHT_LERP_MIN_TIER[tier] and CURRICULUM_HP_WEIGHT_LERP_MAX_TIER[tier].
+# This keeps the policy in "just win baby" mode until it can actually win, then
+# gradually ramps up HP pressure as competence grows.
+#
+# The tracker is *process-wide* and deliberately NOT persisted across runs �?
+# each training process accumulates its own view of progression.  That matches
+# how Phase 0..3 should reset when the checkpoint/config changes enough that
+# the policy may regress.
+class CurriculumTracker:
+    """Sliding per-encounter win/loss tracker with phase classification."""
+
+    __slots__ = ("_window", "_outcomes", "_phase_cache")
+
+    def __init__(self, window: int = CURRICULUM_WIN_RATE_WINDOW) -> None:
+        self._window = max(4, int(window))
+        # encounter_id (str) -> list[int] of 0/1 outcomes, newest at end
+        self._outcomes: dict[str, list[int]] = {}
+        # encounter_id -> last reported phase (0..3).  Used to emit a one-line
+        # "[curriculum] phase N→M" switch annotation when the phase changes.
+        self._phase_cache: dict[str, int] = {}
+
+    def record(self, encounter_id: str, win: bool) -> None:
+        key = str(encounter_id or "unknown").strip().lower() or "unknown"
+        bucket = self._outcomes.setdefault(key, [])
+        bucket.append(1 if win else 0)
+        if len(bucket) > self._window:
+            del bucket[: len(bucket) - self._window]
+
+    def win_rate(self, encounter_id: str) -> tuple[float, int]:
+        key = str(encounter_id or "unknown").strip().lower() or "unknown"
+        bucket = self._outcomes.get(key, [])
+        if not bucket:
+            return 0.0, 0
+        return float(sum(bucket)) / float(len(bucket)), len(bucket)
+
+    @staticmethod
+    def _phase_for_win_rate(win_rate: float) -> int:
+        p0_p1, p1_p2, p2_p3 = CURRICULUM_PHASE_WIN_RATE_THRESHOLDS
+        if win_rate < p0_p1:
+            return 0
+        if win_rate < p1_p2:
+            return 1
+        if win_rate < p2_p3:
+            return 2
+        return 3
+
+    def phase(self, encounter_id: str) -> int:
+        wr, n = self.win_rate(encounter_id)
+        if n < CURRICULUM_MIN_EPISODES_FOR_PHASE:
+            return 0
+        return self._phase_for_win_rate(wr)
+
+    def progress(self, encounter_id: str) -> float:
+        """0.0 at win_rate<=30%, 1.0 at win_rate>=80%, linear in between."""
+        wr, n = self.win_rate(encounter_id)
+        if n < CURRICULUM_MIN_EPISODES_FOR_PHASE:
+            return 0.0
+        p0_p1, _, p2_p3 = CURRICULUM_PHASE_WIN_RATE_THRESHOLDS
+        span = max(1e-6, p2_p3 - p0_p1)
+        return float(np.clip((wr - p0_p1) / span, 0.0, 1.0))
+
+    def hp_weight(self, encounter_id: str, tier: str) -> float:
+        """Current tier-aware HP-loss shaping multiplier for this encounter.
+
+        Returns the lerped weight that should be MULTIPLIED with
+        PLAYER_HP_LOSS_TIER_SCALE[tier] to get the effective scale.
+        """
+        prog = self.progress(encounter_id)
+        tier_key = tier if tier in CURRICULUM_HP_WEIGHT_LERP_MIN_TIER else "unknown"
+        lo = float(CURRICULUM_HP_WEIGHT_LERP_MIN_TIER[tier_key])
+        hi = float(CURRICULUM_HP_WEIGHT_LERP_MAX_TIER[tier_key])
+        return lo + prog * (hi - lo)
+
+    def check_phase_switch(self, encounter_id: str) -> tuple[int, int] | None:
+        """Return (old_phase, new_phase) if a phase boundary was just crossed."""
+        key = str(encounter_id or "unknown").strip().lower() or "unknown"
+        new_phase = self.phase(key)
+        old_phase = self._phase_cache.get(key, -1)
+        if new_phase != old_phase:
+            self._phase_cache[key] = new_phase
+            if old_phase >= 0:
+                return (old_phase, new_phase)
+        return None
+
+    def dump_all_state(self) -> str:
+        """Render every tracked encounter's current (tier, n, wr, phase) as
+        one line per encounter, sorted by tier-then-name.
+
+        Used for the periodic `[curriculum/state]` snapshot so the operator
+        can see encounters that haven't yet crossed a phase boundary (which
+        would normally never appear in the per-transition log).
+        """
+        def _tier_for(enc: str) -> str:
+            e = enc.lower()
+            if "boss" in e:
+                return "boss"
+            if "elite" in e:
+                return "elite"
+            if "weak" in e:
+                return "weak"
+            return "normal"
+
+        # Order: boss > elite > normal > weak so heaviest tiers print first.
+        tier_order = {"boss": 0, "elite": 1, "normal": 2, "weak": 3, "unknown": 4}
+        rows: list[tuple[int, str, str, int, float, int]] = []
+        for encounter, bucket in self._outcomes.items():
+            tier = _tier_for(encounter)
+            n = len(bucket)
+            wr = float(sum(bucket)) / float(n) if n > 0 else 0.0
+            phase = self._phase_for_win_rate(wr) if n >= CURRICULUM_MIN_EPISODES_FOR_PHASE else 0
+            rows.append((tier_order.get(tier, 4), encounter, tier, n, wr, phase))
+        rows.sort()
+        lines = [
+            f"  {tier:>6} {enc} n={n} wr={wr:.3f} phase=P{phase}"
+            for _, enc, tier, n, wr, phase in rows
+        ]
+        return "\n".join(lines) if lines else "  (no encounters tracked)"
+
+
+_CURRICULUM_TRACKER_SINGLETON: CurriculumTracker | None = None
+
+
+def get_curriculum_tracker() -> CurriculumTracker:
+    """Process-wide shared CurriculumTracker so all envs contribute to the same window."""
+    global _CURRICULUM_TRACKER_SINGLETON
+    if _CURRICULUM_TRACKER_SINGLETON is None:
+        _CURRICULUM_TRACKER_SINGLETON = CurriculumTracker()
+    return _CURRICULUM_TRACKER_SINGLETON
 
 
 class CombatSandboxEnv(gym.Env):
@@ -129,6 +310,27 @@ class CombatSandboxEnv(gym.Env):
             potion_mechanics_available=self.sandbox_supports_potions,
         )
         self._combat_memory = CombatMemoryTracker()
+        # Shared curriculum tracker �?per combat-reward-curriculum.md §13 the
+        # HP-loss shaping weight is gated by per-encounter win rate.  All
+        # CombatSandboxEnv instances in the process share one window.
+        self._curriculum_tracker = get_curriculum_tracker()
+        # Counts the total number of terminal events fed into the curriculum
+        # tracker; used to throttle the full state dump (every N episodes).
+        self._curriculum_episode_count: int = 0
+        # Track episode-initial HP/max_hp so the terminal preserve bonus can
+        # reward "win with HP left" against a stable baseline rather than the
+        # fluctuating current max_hp mid-fight.
+        self._episode_start_hp: float = 0.0
+        self._episode_start_max_hp: float = 1.0
+        # Cumulative wasteful end_turn counter �?used by the throttled stdout
+        # breadcrumb in `_end_turn_waste_penalty` and surfaced into hourly
+        # reports so we can confirm the §9.1 penalty is actually firing.
+        self._wasteful_end_turn_count: int = 0
+        # Kaiser positive-response counters (§12) �?track how often the
+        # facing-change / pressure-kill bonuses actually fire so we can
+        # confirm the new signals are reaching the policy.
+        self._kaiser_facing_change_count: int = 0
+        self._kaiser_pressure_kill_count: int = 0
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -213,6 +415,11 @@ class CombatSandboxEnv(gym.Env):
             bridge_elapsed_ms = (time.perf_counter() - bridge_started) * 1000.0
 
         self._episode_id = result["episode_id"]
+        # NOTE: the previous lines here mirrored step()'s post-action diagnostics
+        # merge (pre_action_diagnostics + end_turn_penalty), but those names do
+        # not exist in reset()'s scope.  Reset has no chosen-action context, so
+        # any bridge-side action_diagnostics on the reset payload is forwarded
+        # as-is via _update_live_state below.
         self._update_live_state(result)
         sentinel_enemy = self._find_sentinel_enemy(self._last_obs_raw)
         self._sentinel_combat_active = sentinel_enemy is not None
@@ -221,6 +428,14 @@ class CombatSandboxEnv(gym.Env):
             self._sentinel_combat_start_max_hp = start_max
         else:
             self._sentinel_combat_start_max_hp = 0.0
+        # Snapshot episode-start HP for the terminal preserve-bonus / tier
+        # outcome reward (combat-reward-curriculum.md §6.2).
+        self._episode_start_hp, self._episode_start_max_hp = self._player_hp_and_max(self._last_obs_raw)
+        # Snapshot the boss tier total enemy HP at episode start so the
+        # boss-loss damage-undo can compute "how much damage was rewarded
+        # via per-step shaping" without per-step bookkeeping.  Stored as a
+        # plain float; only consumed in `_boss_terminal_reward` when loss.
+        self._episode_start_boss_total_hp: float = float(self._combat_enemy_total_hp(self._last_obs_raw))
         run_memory_started = time.perf_counter()
         self._run_memory.reset(
             self._last_obs_raw,
@@ -266,6 +481,7 @@ class CombatSandboxEnv(gym.Env):
         legal_actions_before = list(self._legal_actions)
         prev_obs = self._last_obs_raw or {}
         prev_planner_context = self._planner_context()
+        pre_action_diagnostics = self._action_quality_diagnostics(prev_obs, self._legal_actions, legal_action)
         end_turn_penalty = self._end_turn_waste_penalty(prev_obs, self._legal_actions, legal_action)
 
         bridge_started = time.perf_counter()
@@ -278,7 +494,7 @@ class CombatSandboxEnv(gym.Env):
         except BridgeError as e:
             # Bridge rejected the action (e.g. TOCTOU race, phase mismatch).
             # We cannot safely continue with the stale _last_obs_raw /
-            # _legal_actions — the next step would sample from a mask that no
+            # _legal_actions �?the next step would sample from a mask that no
             # longer matches live bridge state, which tends to loop on invalid
             # actions. Truncate so the collector restarts the episode cleanly;
             # this matches the truncated=True behavior of _make_invalid_action_response.
@@ -291,6 +507,12 @@ class CombatSandboxEnv(gym.Env):
             )
             return obs, float(INVALID_ACTION_REWARD), False, True, info
         bridge_elapsed_ms = (time.perf_counter() - bridge_started) * 1000.0
+        if bridge_elapsed_ms > 1500.0:
+            action_id_diag = legal_action.get("action_id") if isinstance(legal_action, dict) else None
+            print(
+                f"[combat_env] slow_bridge_step ms={bridge_elapsed_ms:.0f} action_id={action_id_diag}",
+                flush=True,
+            )
 
         self._update_live_state(result)
         run_memory_started = time.perf_counter()
@@ -303,17 +525,38 @@ class CombatSandboxEnv(gym.Env):
         obs = self.obs_encoder.encode(self._last_obs_raw, self._legal_actions, next_planner_context)
         obs_encode_elapsed_ms = (time.perf_counter() - obs_encode_started) * 1000.0
         reward = float(result.get("reward", 0.0))
+        # --- R_hp_efficiency: per-step HP delta with tier × curriculum weights ---
         reward += self._enemy_hp_delta_reward(prev_obs, self._last_obs_raw)
         reward += self._player_hp_delta_reward(prev_obs, self._last_obs_raw)
+        # --- R_action_quality: wasteful end_turn (existing detector) ---
         reward += end_turn_penalty
+        # --- R_turn_efficiency §8.2: per-end_turn tier-aware penalty ---
+        reward += self._turn_efficiency_penalty(legal_action)
         terminated = bool(result.get("done", False))
         truncated = bool(result.get("truncated", False))
+        # --- R_resource_quality: all potion shaping zeroed in v4 (constants=0) ---
+        reward += self._encounter_potion_use_reward(legal_action)
+        reward += self._potion_hoarding_terminal_reward(self._last_obs_raw, terminated, truncated)
+        # --- R_outcome: tier-weighted symmetric win/loss for non-boss tiers ---
+        reward += self._tier_outcome_reward(self._last_obs_raw, terminated, truncated)
+        # --- R_hp_efficiency §6.2: HP preserve bonus on non-boss win ---
+        reward += self._hp_preserve_win_bonus(self._last_obs_raw, terminated, truncated)
+        # --- Boss terminal shaping (preserved �?boss has its own signal) ---
+        reward += self._boss_terminal_reward(prev_obs, self._last_obs_raw, terminated, truncated)
+        # --- R_mechanic_quality: kaiser/ceremonial (preserved) ---
+        reward += self._boss_mechanic_reward(prev_obs, self._last_obs_raw, legal_action)
         sentinel_terminal = self._sentinel_terminal_reward(
             prev_obs, self._last_obs_raw, terminated, truncated
         )
         reward += sentinel_terminal
         if terminated or truncated:
             self._sentinel_combat_active = False
+            # Curriculum bookkeeping §13: record encounter win/loss and emit
+            # any phase-switch annotations.  Must run BEFORE the next reset so
+            # the tracker window stays aligned with terminal events only.
+            self._record_terminal_outcome_for_curriculum(
+                self._last_obs_raw, terminated, truncated
+            )
         aux_started = time.perf_counter()
         aux_targets = build_aux_targets(
             prev_obs,
@@ -327,9 +570,12 @@ class CombatSandboxEnv(gym.Env):
         )
         aux_elapsed_ms = (time.perf_counter() - aux_started) * 1000.0
         info_started = time.perf_counter()
+        action_diagnostics = dict(pre_action_diagnostics)
+        action_diagnostics["wasteful_end_turn_penalty_applied"] = float(end_turn_penalty < 0.0)
         info = self._build_info(
             result.get("info", {}),
             extra={
+                "action_diagnostics": action_diagnostics,
                 "aux_targets": aux_targets,
                 "python_timing_ms": self._python_timing(
                     bridge_roundtrip=bridge_elapsed_ms,
@@ -492,6 +738,484 @@ class CombatSandboxEnv(gym.Env):
             total += hp
         return total
 
+    def _current_encounter_tier(self) -> str:
+        encounter_id = str(self._current_encounter_id or "").lower()
+        if "boss" in encounter_id:
+            return "boss"
+        if "elite" in encounter_id:
+            return "elite"
+        if "weak" in encounter_id:
+            return "weak"
+        return "normal" if encounter_id else "unknown"
+
+    @staticmethod
+    def _action_family(action: dict[str, Any] | None) -> str:
+        if not isinstance(action, dict):
+            return ""
+        semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+        for key in ("family", "action_kind", "kind", "type"):
+            value = semantic.get(key) if key in semantic else action.get(key)
+            if value:
+                return str(value).strip().lower()
+        action_id = str(action.get("action_id") or "").lower()
+        if "potion" in action_id:
+            return "use_potion"
+        return ""
+
+    @staticmethod
+    def _nonempty_potion_count(obs: dict[str, Any] | None) -> int:
+        player = (obs or {}).get("player") if isinstance(obs, dict) else {}
+        potions = player.get("potions") if isinstance(player, dict) else None
+        if not isinstance(potions, list):
+            return 0
+        count = 0
+        # STS2 bridge serializes empty potion slots as title="[empty]" — note
+        # the BRACKETS.  An earlier exclusion set of {"empty","none","null"}
+        # missed that form, so every empty slot was counted as a usable
+        # potion.  That misled the potion-hoarding terminal reward and the
+        # potion-use diagnostics.
+        EMPTY_NAMES = {"empty", "[empty]", "none", "null", ""}
+        for potion in potions:
+            if not potion:
+                continue
+            if isinstance(potion, dict):
+                if bool(potion.get("empty")):
+                    continue
+                name = str(potion.get("name") or potion.get("id") or potion.get("title") or "").strip().lower()
+                if name and name not in EMPTY_NAMES:
+                    count += 1
+            else:
+                name = str(potion or "").strip().lower()
+                if name and name not in EMPTY_NAMES:
+                    count += 1
+        return count
+
+    def _encounter_potion_use_reward(self, action: dict[str, Any] | None) -> float:
+        if self._action_family(action) not in {"use_potion", "potion"}:
+            return 0.0
+        tier = self._current_encounter_tier()
+        if tier == "boss":
+            return float(POTION_USE_BOSS_BONUS)
+        if tier == "elite":
+            return float(POTION_USE_ELITE_BONUS)
+        return float(POTION_USE_MONSTER_BONUS + POTION_USE_MONSTER_PENALTY)
+
+    def _potion_hoarding_terminal_reward(self, after_obs: dict[str, Any] | None, terminated: bool, truncated: bool) -> float:
+        if not (terminated or truncated):
+            return 0.0
+        unused = self._nonempty_potion_count(after_obs)
+        if unused <= 0:
+            return 0.0
+        raw = float(POTION_HOARDING_PENALTY_PER_POTION) * float(unused)
+        return float(np.clip(raw, -abs(float(POTION_HOARDING_MAX_PENALTY_ABS)), abs(float(POTION_HOARDING_MAX_PENALTY_ABS))))
+
+
+    @staticmethod
+    def _boss_context_max(context: dict[str, Any], key: str) -> float:
+        if not isinstance(context, dict):
+            return 0.0
+        vals: list[float] = []
+        player_state = context.get("player_state") if isinstance(context.get("player_state"), dict) else {}
+        if key in player_state:
+            vals.append(_float(player_state.get(key)))
+        enemy_states = context.get("enemy_states_by_index")
+        if isinstance(enemy_states, list):
+            vals.extend(_float((state or {}).get(key)) for state in enemy_states if isinstance(state, dict))
+        return max(vals) if vals else 0.0
+
+    @staticmethod
+    def _action_semantic(action: dict[str, Any] | None) -> dict[str, Any]:
+        return action.get("semantic") if isinstance(action, dict) and isinstance(action.get("semantic"), dict) else {}
+
+    @classmethod
+    def _action_roles(cls, action: dict[str, Any] | None) -> set[str]:
+        semantic = cls._action_semantic(action)
+        roles = semantic.get("roles")
+        if not isinstance(roles, list):
+            return set()
+        return {str(role).strip().lower() for role in roles if str(role).strip()}
+
+    @classmethod
+    def _action_metric(cls, action: dict[str, Any] | None, key: str) -> float:
+        semantic = cls._action_semantic(action)
+        if key in semantic:
+            return _float(semantic.get(key))
+        if isinstance(action, dict):
+            if key in action:
+                return _float(action.get(key))
+            card = action.get("card") if isinstance(action.get("card"), dict) else {}
+            preview = card.get("preview") if isinstance(card.get("preview"), dict) else {}
+            for source in (card, preview):
+                if key in source:
+                    return _float(source.get(key))
+        return 0.0
+
+    @classmethod
+    def _action_immediate_impact(cls, action: dict[str, Any] | None) -> float:
+        roles = cls._action_roles(action)
+        damage = cls._action_metric(action, "damage")
+        block = cls._action_metric(action, "block")
+        hits = max(cls._action_metric(action, "hits"), 1.0 if damage > 0.0 else 0.0)
+        debuff_bonus = 8.0 if roles.intersection({"debuff", "weak", "vulnerable", "poison", "exhaust", "discard"}) else 0.0
+        scaling_bonus = 6.0 if roles.intersection({"scaling", "power", "draw", "energy", "retain"}) else 0.0
+        return float(damage + 0.75 * block + 1.5 * max(hits - 1.0, 0.0) + debuff_bonus + scaling_bonus)
+
+    def _boss_mechanic_reward(
+        self,
+        before_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+        action: dict[str, Any] | None,
+    ) -> float:
+        """Dense tactical shaping for boss-only mechanics (Kaiser / Ceremonial / Knowledge Demon)."""
+        if self._current_encounter_tier() != "boss":
+            return 0.0
+        encounter = str(self._current_encounter_id or "").lower()
+        if not ("kaiser" in encounter or "ceremonial" in encounter or "knowledge_demon" in encounter):
+            return 0.0
+        try:
+            before_ctx = build_boss_mechanics_context(before_obs)
+            after_ctx = build_boss_mechanics_context(after_obs)
+        except Exception:
+            return 0.0
+
+        reward = 0.0
+        before_hp, _ = self._player_hp_and_max(before_obs)
+        after_hp, _ = self._player_hp_and_max(after_obs)
+        hp_loss = max(before_hp - after_hp, 0.0)
+        enemy_hp_delta = max(self._combat_enemy_total_hp(before_obs) - self._combat_enemy_total_hp(after_obs), 0.0)
+        family = self._action_family(action)
+        roles = self._action_roles(action)
+        impact = self._action_immediate_impact(action)
+
+        if "kaiser" in encounter:
+            # H25: switch the Kaiser branch to the PRIMARY-threat back-attack
+            # signal.  Old code used max(...) across all enemies for risk —
+            # but Kaiser has two parts both flagging back_attack_active=1
+            # most turns, so the metric was pinned at 1.0 and facing_change
+            # 1→0 detection never fired.  primary_back_attack_active reads
+            # only the highest-intent-damage enemy's status, so when the
+            # player correctly faces the high-damage attacker it flips 1→0
+            # even if the low-damage attacker still has multiplier=1.5.
+            before_primary = self._boss_context_max(before_ctx, "primary_back_attack_active")
+            after_primary = self._boss_context_max(after_ctx, "primary_back_attack_active")
+            before_risk = max(
+                self._boss_context_max(before_ctx, "primary_back_attack_risk"),
+                before_primary,
+            )
+            after_risk = max(
+                self._boss_context_max(after_ctx, "primary_back_attack_risk"),
+                after_primary,
+            )
+            # §12 soften factor: don't fully penalize if the agent had no
+            # mechanically valid response available this frame.
+            defense_candidates = self._boss_context_max(before_ctx, "kaiser_defense_candidate_count")
+            facing_change_candidates = self._boss_context_max(before_ctx, "kaiser_facing_change_candidate_count")
+            pressure_candidates = self._boss_context_max(before_ctx, "kaiser_pressure_candidate_count")
+            no_response_avail = (
+                defense_candidates < 0.5
+                and facing_change_candidates < 0.5
+                and pressure_candidates < 0.5
+            )
+            soften = float(KAISER_NO_RESPONSE_PENALTY_SOFTEN) if no_response_avail else 1.0
+
+            if before_risk > 0.05:
+                reward -= hp_loss * float(KAISER_BACK_ATTACK_HP_LOSS_PENALTY_SCALE) * (1.0 + before_risk) * soften
+                if family == "end_turn":
+                    reward += float(KAISER_BACK_ATTACK_END_TURN_PENALTY) * min(1.0, before_risk) * soften
+                if family in {"play_card", "use_potion", "potion"} and (
+                    "block" in roles or "debuff" in roles or "weak" in roles or self._action_metric(action, "block") > 0.0
+                ):
+                    reward += float(KAISER_BACK_ATTACK_DEFENSE_BONUS) * min(1.0, before_risk)
+            risk_drop = max(before_risk - after_risk, 0.0)
+            if risk_drop > 0.05:
+                reward += float(KAISER_BACK_ATTACK_RISK_REDUCTION_BONUS) * min(1.0, risk_drop)
+
+            # §12 missing positive signals �?facing change + pressure kill.
+            # back_attack_active flipping from 1 �?0 means the player
+            # successfully re-faced (took an action that turned the boss
+            # so the back enemy is no longer active threat).  We only fire
+            # this on play_card / use_potion (not end_turn).
+            # Use primary-threat active flag (set above) so facing_change
+            # detects "now correctly facing the high-damage attacker".
+            facing_changed = before_primary > 0.5 and after_primary <= 0.5
+            if facing_changed and family in {"play_card", "use_potion", "potion"}:
+                reward += float(KAISER_FACING_CHANGE_BONUS)
+                self._kaiser_facing_change_count += 1
+
+            # Pressure kill: dealt damage AND back-attack risk dropped
+            # meaningfully in the same step (proxy for "killed the back side
+            # part / enemy without re-facing").  Differentiated from facing
+            # change: facing_changed=True covers refacing; pressure_kill is
+            # the alternative win condition where you just out-DPS the back.
+            if (
+                not facing_changed
+                and family == "play_card"
+                and enemy_hp_delta > 5.0
+                and risk_drop > 0.20
+                and before_risk > 0.20
+            ):
+                reward += float(KAISER_PRESSURE_KILL_BONUS)
+                self._kaiser_pressure_kill_count += 1
+
+            # Lightweight stdout breadcrumb for visibility (every 25 events).
+            if (self._kaiser_facing_change_count + self._kaiser_pressure_kill_count) > 0 and \
+               (self._kaiser_facing_change_count + self._kaiser_pressure_kill_count) % 25 == 0:
+                print(
+                    f"[combat_env] kaiser_response facing_change={self._kaiser_facing_change_count} "
+                    f"pressure_kill={self._kaiser_pressure_kill_count}",
+                    flush=True,
+                )
+
+        if "ceremonial" in encounter:
+            before_one = self._boss_context_max(before_ctx, "one_card_lock")
+            after_one = self._boss_context_max(after_ctx, "one_card_lock")
+            before_stun = self._boss_context_max(before_ctx, "stun_window")
+            after_stun = self._boss_context_max(after_ctx, "stun_window")
+            before_pending = self._boss_context_max(before_ctx, "transform_pending")
+            after_threshold = self._boss_context_max(after_ctx, "threshold_active")
+            if before_stun <= 0.05 and after_stun > 0.05:
+                reward += float(CEREMONIAL_STUN_WINDOW_ENTER_BONUS)
+            if before_pending > 0.05 and after_threshold > 0.05:
+                reward += float(CEREMONIAL_THRESHOLD_PROGRESS_BONUS)
+            if before_stun > 0.05 and enemy_hp_delta > 0.0:
+                reward += min(0.75, enemy_hp_delta * float(CEREMONIAL_STUN_DAMAGE_MULTIPLIER))
+            one_card_lock = max(before_one, after_one)
+            if one_card_lock > 0.05:
+                if family == "end_turn":
+                    reward += float(CEREMONIAL_ONE_CARD_END_TURN_PENALTY)
+                elif family in {"play_card", "use_potion", "potion"}:
+                    if impact >= 12.0:
+                        reward += float(CEREMONIAL_ONE_CARD_HIGH_IMPACT_BONUS)
+                    elif impact <= 2.0 and not roles.intersection({"draw", "energy", "scaling", "power"}):
+                        reward += float(CEREMONIAL_ONE_CARD_LOW_IMPACT_PENALTY)
+
+        if "knowledge_demon" in encounter:
+            # Knowledge Demon (知识恶魔) curse-selection shaping per user
+            # strategy guidance:
+            #   Curse 1 (no prior 瓦解 stack)  → prefer Option B "draw -1"
+            #     (status / debuff card-selection, NOT damage_per_turn).
+            #   Curse 2 (some 瓦解 stack)      → prefer Option A "+7 damage,
+            #     blockable" (HP-loss easier to mitigate than max-3-cards).
+            #   Curse 3 (heavy 瓦解 stack)     → prefer Option A
+            #     (energy-loss is crippling).
+            # We infer "which curse" from the cumulative 瓦解 / disintegrate
+            # damage already on the player (read via _power_amount needles).
+            # We detect the curse-selection event by checking the action's
+            # surface/family/text keywords for damage-per-turn clauses.
+            family_lc = family or ""
+            action_text = ""
+            if isinstance(action, dict):
+                for key in ("title", "label", "name"):
+                    val = action.get(key)
+                    if val:
+                        action_text += " " + str(val)
+                card = action.get("card") if isinstance(action.get("card"), dict) else {}
+                for key in ("title", "description", "effect", "canonical_text"):
+                    val = card.get(key) if isinstance(card, dict) else None
+                    if val:
+                        action_text += " " + str(val)
+            action_text_l = action_text.lower()
+            is_curse_event = any(
+                kw in action_text_l
+                for kw in ("disintegrate", "瓦解", "card_selection:select", "event_option", "card_reward:skip")
+            )
+            picks_disintegrate = any(
+                kw in action_text_l
+                for kw in ("disintegrate", "瓦解", "受到 6 点", "受到 7 点", "受到 8 点", "每回合收到", "每回合受到")
+            )
+            picks_draw_loss = any(
+                kw in action_text_l
+                for kw in ("少抽 1 张", "少抽一张", "draw 1 fewer", "draw -1", "fewer card")
+            )
+            picks_play_cap = any(
+                kw in action_text_l
+                for kw in ("最多打出 3 张", "最多打 3 张", "max 3 cards", "play 3 cards")
+            )
+            picks_energy_loss = any(
+                kw in action_text_l
+                for kw in ("减少 1 点能量", "失去 1 点能量", "lose 1 energy", "-1 energy", "energy -1")
+            )
+            # Estimate which curse number we're choosing using the
+            # current Disintegrate stack (see boss_mechanics if it's there;
+            # fall back to scanning player_powers text).
+            disintegrate_stack = 0.0
+            before_player = before_obs.get("player") if isinstance(before_obs, dict) else None
+            if isinstance(before_player, dict):
+                powers = before_player.get("powers") if isinstance(before_player.get("powers"), list) else []
+                for power in powers:
+                    if not isinstance(power, dict):
+                        continue
+                    text = " ".join(
+                        str(power.get(k) or "") for k in ("id", "title", "description")
+                    ).lower()
+                    if any(kw in text for kw in ("disintegrate", "瓦解")):
+                        disintegrate_stack = max(disintegrate_stack, float(power.get("amount") or power.get("display_amount") or 0))
+            curse_index = (
+                1 if disintegrate_stack < 5.5
+                else 2 if disintegrate_stack < 12.5
+                else 3
+            )
+
+            if is_curse_event:
+                if curse_index == 1:
+                    # Prefer Option B (draw_loss).  A is the bad pick now.
+                    if picks_draw_loss:
+                        reward += float(KNOWLEDGE_DEMON_GOOD_CURSE_PICK_BONUS)
+                    elif picks_disintegrate:
+                        reward += float(KNOWLEDGE_DEMON_BAD_CURSE_PICK_PENALTY)
+                elif curse_index == 2:
+                    # Prefer Option A (disintegrate +7, blockable).
+                    if picks_disintegrate:
+                        reward += float(KNOWLEDGE_DEMON_GOOD_CURSE_PICK_BONUS)
+                    elif picks_play_cap:
+                        reward += float(KNOWLEDGE_DEMON_BAD_CURSE_PICK_PENALTY)
+                else:  # curse_index == 3
+                    # Prefer Option A (energy_loss is crippling).
+                    if picks_disintegrate:
+                        reward += float(KNOWLEDGE_DEMON_GOOD_CURSE_PICK_BONUS)
+                    elif picks_energy_loss:
+                        reward += float(KNOWLEDGE_DEMON_BAD_CURSE_PICK_PENALTY)
+            # Speed-kill incentive: every end_turn lets the boss tick another
+            # round of disintegrate + advance toward the next (worse) curse.
+            if family_lc == "end_turn":
+                reward += float(KNOWLEDGE_DEMON_END_TURN_PENALTY)
+
+        return float(np.clip(reward, -1.25, 1.25))
+
+    def _boss_terminal_reward(
+        self,
+        before_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+        terminated: bool,
+        truncated: bool,
+    ) -> float:
+        if self._current_encounter_tier() != "boss" or not (terminated or truncated):
+            return 0.0
+        after_hp, after_max_hp = self._player_hp_and_max(after_obs)
+        before_hp, before_max_hp = self._player_hp_and_max(before_obs)
+        max_hp = max(after_max_hp, before_max_hp, 1.0)
+        if terminated and (not truncated) and after_hp > 0.0:
+            return float(BOSS_COMBAT_WIN_BONUS_BASE + BOSS_COMBAT_WIN_BONUS_HP_SCALE * np.clip(after_hp / max_hp, 0.0, 1.0))
+        missing_ratio = 1.0 - float(np.clip(max(after_hp, 0.0) / max_hp, 0.0, 1.0))
+        # H22 v3 damage-undo (percent-based): on loss, undo the per-step
+        # damage shaping that paid out during this episode by subtracting
+        # BOSS_COMBAT_LOSS_DAMAGE_UNDO_PERCENT_SCALE × damage_dealt_ratio.
+        # UNDO_SCALE (7.0) > per-step PERCENT_SCALE (5.0) so net damage
+        # contribution is mildly negative even on a "deal everything but
+        # die" loss, regardless of boss size.
+        end_enemy_total = float(self._combat_enemy_total_hp(after_obs))
+        base_hp = float(getattr(self, "_episode_start_boss_total_hp", 0.0) or 0.0)
+        if base_hp > 0.0:
+            damage_dealt_ratio = max(0.0, (base_hp - end_enemy_total) / base_hp)
+            damage_undo = damage_dealt_ratio * float(BOSS_COMBAT_LOSS_DAMAGE_UNDO_PERCENT_SCALE)
+        else:
+            damage_undo = 0.0
+        return -float(
+            BOSS_COMBAT_LOSS_PENALTY_BASE
+            + BOSS_COMBAT_LOSS_PENALTY_MISSING_HP_SCALE * missing_ratio
+            + damage_undo
+        )
+
+    # ----- R_hp_efficiency §6.2 -----
+    def _hp_preserve_win_bonus(
+        self,
+        after_obs: dict[str, Any] | None,
+        terminated: bool,
+        truncated: bool,
+    ) -> float:
+        """Terminal bonus for winning a non-boss combat with HP left.
+
+        Uses sqrt(hp_end / max_hp) so the marginal value of each additional
+        preserved HP tapers �?the first 20% preserved is worth more than
+        the last 20%.  Boss tier gets zero weight because non-A10 bosses
+        restore HP post-combat.
+        """
+        if not (terminated and not truncated):
+            return 0.0
+        after_hp, after_max_hp = self._player_hp_and_max(after_obs)
+        if after_hp <= 0.0:
+            return 0.0
+        tier = self._current_encounter_tier()
+        scale = float(HP_PRESERVE_WIN_BONUS_TIER_SCALE.get(tier, 0.0))
+        if scale <= 0.0:
+            return 0.0
+        ratio = float(np.clip(after_hp / max(after_max_hp, 1.0), 0.0, 1.0))
+        return scale * float(np.sqrt(ratio))
+
+    # ----- R_turn_efficiency §8.2 -----
+    def _turn_efficiency_penalty(self, action: dict[str, Any] | None) -> float:
+        """Small tier-aware per-end_turn penalty to counter defend-forever."""
+        if self._action_family(action) != "end_turn":
+            return 0.0
+        tier = self._current_encounter_tier()
+        return float(TURN_EFFICIENCY_PENALTY_PER_END_TURN_TIER.get(tier, 0.0))
+
+    # ----- R_outcome §5 �?tier-weighted outcome scaling -----
+    def _tier_outcome_reward(
+        self,
+        after_obs: dict[str, Any] | None,
+        terminated: bool,
+        truncated: bool,
+    ) -> float:
+        """Symmetric win/loss bonus scaled by tier.
+
+        Runs AFTER `_boss_terminal_reward` so boss-specific terminal shaping
+        already carries its own magnitude; this function only supplements
+        non-boss tiers (where there is no corresponding terminal bonus).
+        Net effect: normal/elite wins and losses get a fixed ±(tier_scale)
+        multiplier on top of the sparse bridge-side outcome reward.
+        """
+        if not (terminated or truncated):
+            return 0.0
+        tier = self._current_encounter_tier()
+        if tier == "boss":
+            # Boss already gets boss-specific terminal shaping; don't double-dip.
+            return 0.0
+        scale = float(OUTCOME_TIER_SCALE.get(tier, 1.0))
+        if scale <= 0.0:
+            return 0.0
+        after_hp, _ = self._player_hp_and_max(after_obs)
+        win = terminated and (not truncated) and after_hp > 0.0
+        return (scale if win else -scale)
+
+    # ----- Curriculum bookkeeping (§13) -----
+    def _record_terminal_outcome_for_curriculum(
+        self,
+        after_obs: dict[str, Any] | None,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        """Feed win/loss into the CurriculumTracker and emit a one-line
+        phase-switch annotation when the encounter crosses a boundary."""
+        if not (terminated or truncated):
+            return
+        encounter = str(self._current_encounter_id or "").strip()
+        if not encounter:
+            return
+        after_hp, _ = self._player_hp_and_max(after_obs)
+        win = bool(terminated and (not truncated) and after_hp > 0.0)
+        self._curriculum_tracker.record(encounter, win)
+        switch = self._curriculum_tracker.check_phase_switch(encounter)
+        if switch is not None:
+            old_phase, new_phase = switch
+            wr, n = self._curriculum_tracker.win_rate(encounter)
+            print(
+                f"[curriculum] encounter={encounter} phase {old_phase}->{new_phase} "
+                f"win_rate_128={wr:.3f} n={n} (phase=P{new_phase})",
+                flush=True,
+            )
+        # Periodic full-state dump so encounters that haven't crossed a phase
+        # boundary still surface in the operator log.  Every 200 terminal
+        # events feels right at ~3.6k steps/h × ~30 steps/ep �?120 ep/h �?
+        # i.e. a dump every ~1.7h, slightly more often than the hourly cron.
+        self._curriculum_episode_count += 1
+        if self._curriculum_episode_count % 200 == 0:
+            print(
+                f"[curriculum/state] dump @ episodes={self._curriculum_episode_count}\n"
+                + self._curriculum_tracker.dump_all_state(),
+                flush=True,
+            )
+
     def _enemy_hp_delta_reward(self, before_obs: dict[str, Any] | None, after_obs: dict[str, Any] | None) -> float:
         before_total = self._combat_enemy_total_hp(before_obs)
         after_total = self._combat_enemy_total_hp(after_obs)
@@ -500,7 +1224,7 @@ class CombatSandboxEnv(gym.Env):
 
         # Guard against bridge clearing enemies list at terminal step when the
         # player DIED. Both live bridge mod and sim drop `combat.enemies` to
-        # an empty list the moment the combat ends regardless of outcome —
+        # an empty list the moment the combat ends regardless of outcome �?
         # if we naively credit (before_total - 0) as "damage dealt", every
         # loss emits a positive shaping reward equal to the still-alive
         # enemies' total HP × 0.01. On a 566-HP terminal clear that's +5.66,
@@ -527,7 +1251,24 @@ class CombatSandboxEnv(gym.Env):
         ):
             return 0.0
 
-        raw = (before_total - after_total) * ENEMY_HP_DELTA_REWARD_SCALE
+        delta = before_total - after_total
+        # Boss tier: percent-of-boss-HP based shaping (H22 v3).  Per-step reward
+        # is the FRACTION of the boss's initial total HP killed this step times
+        # BOSS_ENEMY_HP_DELTA_PERCENT_SCALE (5.0), so a full-boss kill across
+        # the whole episode sums to +5.0 regardless of whether the boss is
+        # 200 HP or 900 HP across phase changes.  Negative deltas (boss heal)
+        # use the same percent-based scale.  Falls back to raw if we lost the
+        # initial-HP snapshot (defensive).
+        tier = self._current_encounter_tier()
+        if tier == "boss":
+            base_hp = float(getattr(self, "_episode_start_boss_total_hp", 0.0) or 0.0)
+            if base_hp > 0.0:
+                ratio = delta / base_hp
+                raw = ratio * float(BOSS_ENEMY_HP_DELTA_PERCENT_SCALE)
+            else:
+                raw = delta * ENEMY_HP_DELTA_REWARD_SCALE
+        else:
+            raw = delta * ENEMY_HP_DELTA_REWARD_SCALE
         if raw > ENEMY_HP_DELTA_REWARD_MAX_ABS:
             return ENEMY_HP_DELTA_REWARD_MAX_ABS
         if raw < -ENEMY_HP_DELTA_REWARD_MAX_ABS:
@@ -541,10 +1282,27 @@ class CombatSandboxEnv(gym.Env):
         after_hp = _float((after_player or {}).get("hp"))
         if before_hp <= 0.0 and after_hp <= 0.0:
             return 0.0
-        # Symmetric with env_v2.py: positive for HP gain (rest, heal, etc.),
-        # negative for HP loss. Asymmetric "loss-only" shaping left rest-site
-        # and heal-potion decisions without any immediate signal.
-        return (after_hp - before_hp) * PLAYER_HP_LOSS_REWARD_SCALE
+        delta = after_hp - before_hp
+        # Tier-aware loss multiplier (combat-reward-curriculum.md §3, §6).  Boss
+        # fights (non-A10) restore HP post-combat, so heavy HP-loss penalties
+        # distort boss play toward "turtle forever" instead of "win efficiently
+        # using mechanics".  HP *gain* keeps full weight in all tiers �?healing
+        # is equally valuable regardless of what encounter triggered it.
+        #
+        # Curriculum layer (§13.1): the tier scale is further multiplied by a
+        # progress-lerped weight from the CurriculumTracker so Phase 0 policies
+        # see minimal HP pressure (they just need to win first) and Phase 3
+        # policies see full pressure.
+        if delta < 0.0:
+            tier = self._current_encounter_tier()
+            tier_scale = float(PLAYER_HP_LOSS_TIER_SCALE.get(tier, 1.0))
+            progress_weight = self._curriculum_tracker.hp_weight(
+                self._current_encounter_id or "", tier
+            )
+            multiplier = tier_scale * progress_weight
+        else:
+            multiplier = 1.0
+        return delta * PLAYER_HP_LOSS_REWARD_SCALE * multiplier
 
     @staticmethod
     def _find_sentinel_enemy(obs: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -649,22 +1407,173 @@ class CombatSandboxEnv(gym.Env):
         except (TypeError, ValueError):
             return 0.0
 
-    def _is_positive_progress_action(self, action: dict[str, Any]) -> bool:
+    @staticmethod
+    def _card_cost(card: dict[str, Any] | None) -> float:
+        if not isinstance(card, dict):
+            return 0.0
+        for key in ("cost", "resolved_energy_cost", "canonical_energy_cost"):
+            value = card.get(key)
+            try:
+                return max(float(value), 0.0)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    @staticmethod
+    def _card_is_x_cost(card: dict[str, Any] | None) -> bool:
+        if not isinstance(card, dict):
+            return False
+        return bool(card.get("x_cost") or card.get("costs_x")) or str(card.get("cost") or card.get("canonical_energy_cost") or "").strip().upper() == "X"
+
+    def _action_modifier_semantics(self, action: dict[str, Any] | None) -> dict[str, float]:
+        if not isinstance(action, dict):
+            return {}
+        card = action.get("card")
+        if isinstance(card, dict):
+            return _aggregate_card_modifier_semantics(card)
+        return {}
+
+    def _action_positive_score(self, action: dict[str, Any]) -> float:
         kind = str(action.get("kind") or "").strip()
         if kind not in ("play_card", "use_potion"):
-            return False
-
+            return 0.0
         source = action.get("card") if kind == "play_card" else action.get("potion")
         if not isinstance(source, dict):
-            return False
-
+            return 0.0
         if kind == "play_card" and str(source.get("type") or "").strip().lower() == "power":
-            return True
+            return 4.0
+        score = 0.0
+        weights = {
+            "damage": 1.0,
+            "block": 0.8,
+            "draw": 3.0,
+            "weak": 4.0,
+            "vulnerable": 4.0,
+            "heal": 2.0,
+            "strength": 3.0,
+            "dexterity": 3.0,
+            "summon": 5.0,
+        }
+        for key, weight in weights.items():
+            score += self._source_preview_metric(source, key) * weight
+        if kind == "play_card":
+            sem = _aggregate_card_modifier_semantics(source)
+            score += sem.get("energy_gain", 0.0) * 3.0
+            score += sem.get("draw", 0.0) * 3.0
+            score += sem.get("block_add", 0.0) * 0.8 + sem.get("block_on_play", 0.0) * 0.8
+            score += sem.get("damage_add", 0.0)
+            score += sem.get("weak", 0.0) * 4.0
+            score -= sem.get("energy_loss_on_play", 0.0) * 2.0
+            score -= sem.get("self_damage", 0.0) * 2.5
+        return float(max(score, 0.0))
 
-        for key in ("damage", "block", "draw", "weak", "vulnerable", "heal", "strength", "dexterity", "summon"):
-            if self._source_preview_metric(source, key) > 0.0:
-                return True
+    def _is_positive_progress_action(self, action: dict[str, Any]) -> bool:
+        return self._action_positive_score(action) > 0.0
+
+    def _is_strategic_skip_candidate(
+        self,
+        action: dict[str, Any],
+        *,
+        energy: float,
+        legal_actions: list[dict[str, Any]],
+    ) -> bool:
+        if str(action.get("kind") or "").strip() != "play_card":
+            return False
+        card = action.get("card")
+        if not isinstance(card, dict):
+            return False
+        sem = _aggregate_card_modifier_semantics(card)
+        if self._card_is_x_cost(card) and energy <= 0.0:
+            return True
+        immediate = self._action_positive_score(action)
+        exhausts = bool(sem.get("adds_exhaust") or sem.get("removes_exhaust") < 0.0 or card.get("exhaust") or card.get("will_exhaust"))
+        retains = bool(sem.get("adds_retain") or card.get("retain"))
+        self_damage = sem.get("self_damage", 0.0)
+        energy_loss = sem.get("energy_loss_on_play", 0.0)
+        energy_gain = sem.get("energy_gain", 0.0)
+        cost = self._card_cost(card)
+        energy_after = max(0.0, energy - cost + energy_gain - energy_loss)
+        followups = 0
+        for other in legal_actions:
+            if other is action or not isinstance(other, dict) or other.get("kind") != "play_card":
+                continue
+            other_card = other.get("card")
+            if isinstance(other_card, dict) and self._card_cost(other_card) <= energy_after + 1e-6 and self._action_positive_score(other) > 0.0:
+                followups += 1
+        if energy_gain > 0.0 and followups <= 0 and immediate < max(6.0, energy_gain * 3.0):
+            return True
+        if (exhausts or retains) and immediate < 6.0 and not card.get("ethereal"):
+            return True
+        if (self_damage > 0.0 or energy_loss > 0.0) and immediate < (self_damage * 2.5 + energy_loss * 2.0 + 4.0):
+            return True
         return False
+
+    def _action_quality_diagnostics(
+        self,
+        obs: dict[str, Any] | None,
+        legal_actions: list[dict[str, Any]],
+        chosen_action: dict[str, Any] | None,
+    ) -> dict[str, float]:
+        combat = obs.get("combat") if isinstance(obs, dict) else None
+        energy = float((combat or {}).get("energy") or 0.0) if isinstance(combat, dict) else 0.0
+        selected_id = str((chosen_action or {}).get("action_id") or "")
+        selected_is_end_turn = float(selected_id == "end_turn")
+        positive_available = 0
+        mandatory_positive = 0
+        strategic_skip = 0
+        zero_x_available = 0
+        refund_no_followup_available = 0
+        enchantment_seen = 0
+        affliction_seen = 0
+        selected_zero_x = 0.0
+        selected_refund_no_followup = 0.0
+        selected_strategic_skip = 0.0
+        for action in legal_actions:
+            if not isinstance(action, dict) or str(action.get("action_id") or "") == "end_turn":
+                continue
+            card = action.get("card") if isinstance(action.get("card"), dict) else None
+            if isinstance(card, dict):
+                if isinstance(card.get("enchantments"), list) and card.get("enchantments"):
+                    enchantment_seen = 1
+                if isinstance(card.get("afflictions"), list) and card.get("afflictions"):
+                    affliction_seen = 1
+            is_positive = self._is_positive_progress_action(action)
+            if is_positive:
+                positive_available += 1
+            is_strategic = self._is_strategic_skip_candidate(action, energy=energy, legal_actions=legal_actions)
+            if is_strategic:
+                strategic_skip += 1
+            else:
+                if is_positive:
+                    mandatory_positive += 1
+            is_zero_x = isinstance(card, dict) and self._card_is_x_cost(card) and energy <= 0.0
+            if is_zero_x:
+                zero_x_available += 1
+            sem = _aggregate_card_modifier_semantics(card) if isinstance(card, dict) else {}
+            is_refund = sem.get("energy_gain", 0.0) > 0.0 and is_strategic
+            if is_refund:
+                refund_no_followup_available += 1
+            if chosen_action is action:
+                selected_zero_x = float(is_zero_x)
+                selected_refund_no_followup = float(is_refund)
+                selected_strategic_skip = float(is_strategic)
+        wasteful_available = float(mandatory_positive > 0 and energy > 0.0)
+        wasteful_selected = float(selected_is_end_turn > 0.5 and wasteful_available > 0.5)
+        return {
+            "energy": float(energy),
+            "positive_action_count": float(positive_available),
+            "mandatory_positive_action_count": float(mandatory_positive),
+            "strategic_skip_candidate_count": float(strategic_skip),
+            "wasteful_end_turn_available": wasteful_available,
+            "wasteful_end_turn_selected": wasteful_selected,
+            "zero_energy_x_cost_available": float(zero_x_available),
+            "zero_energy_x_cost_selected": selected_zero_x,
+            "refund_no_followup_available": float(refund_no_followup_available),
+            "refund_no_followup_selected": selected_refund_no_followup,
+            "strategic_skip_selected": selected_strategic_skip,
+            "enchantment_seen": float(enchantment_seen),
+            "affliction_seen": float(affliction_seen),
+        }
 
     def _end_turn_waste_penalty(
         self,
@@ -682,23 +1591,17 @@ class CombatSandboxEnv(gym.Env):
         if energy <= 0.0:
             return 0.0
 
-        positive_actions = 0
-        has_zero_cost_positive = False
-        for action in legal_actions:
-            if not isinstance(action, dict):
-                continue
-            if str(action.get("action_id") or "") == "end_turn":
-                continue
-            if not self._is_positive_progress_action(action):
-                continue
-            positive_actions += 1
-            card = action.get("card")
-            if isinstance(card, dict):
-                try:
-                    if float(card.get("cost") or 0.0) <= 0.0:
-                        has_zero_cost_positive = True
-                except (TypeError, ValueError):
-                    pass
+        diagnostics = self._action_quality_diagnostics(obs, legal_actions, chosen_action)
+        positive_actions = int(diagnostics.get("mandatory_positive_action_count", 0.0))
+        has_zero_cost_positive = any(
+            isinstance(action, dict)
+            and str(action.get("action_id") or "") != "end_turn"
+            and not self._is_strategic_skip_candidate(action, energy=energy, legal_actions=legal_actions)
+            and self._is_positive_progress_action(action)
+            and isinstance(action.get("card"), dict)
+            and self._card_cost(action.get("card")) <= 0.0
+            for action in legal_actions
+        )
 
         if positive_actions <= 0:
             return 0.0
@@ -708,6 +1611,23 @@ class CombatSandboxEnv(gym.Env):
         if has_zero_cost_positive:
             penalty += END_TURN_WASTE_ZERO_COST_BONUS_PENALTY
         penalty += END_TURN_WASTE_EXTRA_ACTION_PENALTY * min(max(positive_actions - 1, 0), 2)
+        # Tier multiplier (combat-reward-curriculum.md §9.1).  Base stack maxes
+        # at �?.10; tier multipliers (1.5/1.5/2.5/3.0) take it to the doc's
+        # �?.15/�?.25/�?.30 targets without altering the detector logic.
+        tier = self._current_encounter_tier()
+        tier_mult = float(WASTEFUL_END_TURN_TIER_MULTIPLIER.get(tier, 1.5))
+        penalty *= tier_mult
+        # Lightweight stdout breadcrumb so the operator can see waste actually
+        # happening between hourly tfevents reports.  Throttled to one print
+        # every WASTE_PRINT_INTERVAL events to avoid log spam.
+        self._wasteful_end_turn_count += 1
+        if self._wasteful_end_turn_count % 25 == 0:
+            print(
+                f"[combat_env] wasteful_end_turn count={self._wasteful_end_turn_count} "
+                f"tier={tier} energy={energy:.0f} positive_actions={positive_actions} "
+                f"penalty={penalty:.3f}",
+                flush=True,
+            )
         return float(penalty)
 
     def _decorate_bridge_info(self, bridge_info: Any) -> dict[str, Any]:
@@ -777,7 +1697,7 @@ class CombatSandboxEnv(gym.Env):
             "phase": (self._last_obs_raw or {}).get("phase", "unknown"),
             "episode_mode": "combat_sandbox",
             "potion_mechanics_available": self.sandbox_supports_potions,
-            # Combat sandbox has no map — floor is always 0. But Monitor's
+            # Combat sandbox has no map �?floor is always 0. But Monitor's
             # info_keywords=("max_floor_reached","current_floor") hard-reads
             # both keys at episode end, so they must exist or SB3 KeyErrors.
             "max_floor_reached": 0,

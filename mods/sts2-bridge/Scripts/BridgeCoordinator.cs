@@ -142,6 +142,25 @@ internal static class BridgeCoordinator
 
             _isAttached = true;
 
+            // Keep the game running at full speed when the window loses focus.
+            // By default Godot throttles unfocused windows (Engine.MaxFps is 0 but
+            // low_processor_usage_mode clamps to a long sleep, ~10-30fps), which
+            // balloons card-resolution / enemy-turn animation time from <1s to
+            // 8-25s and causes the combat sandbox after-wait budget to expire,
+            // killing combat with a reset during RL training.  Forcing high
+            // MaxFps + disabling low-processor mode keeps resolution realtime
+            // regardless of focus.
+            try
+            {
+                Godot.Engine.MaxFps = 120;
+                Godot.OS.LowProcessorUsageMode = false;
+                Log.Info($"[{BridgeRuntime.ModId}] Forced Engine.MaxFps=120 and LowProcessorUsageMode=false for unfocused training.");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"[{BridgeRuntime.ModId}] Failed to force high-fps unfocused mode: {ex.GetBaseException().Message}");
+            }
+
             Log.Info($"[{BridgeRuntime.ModId}] Attached bridge coordinator to NGame.");
             BridgeDebugTrace.Write("coordinator attached to NGame");
         }

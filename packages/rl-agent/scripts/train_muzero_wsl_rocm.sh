@@ -112,4 +112,5 @@ if torch.cuda.is_available():
 print("[wsl-rocm] " + json.dumps(payload, ensure_ascii=False))
 PY
 
-exec python "$REPO_ROOT/legacy/train_muzero.py" --device cuda "$@"
+cd "$REPO_ROOT"
+exec python -m muzero.train --device cuda "$@"

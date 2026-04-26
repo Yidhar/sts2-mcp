@@ -17,6 +17,17 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="..\..\packages\rl-agent\content\potions.timing.generated.json">
+      <LogicalName>Sts2McpBridge.Content.potions.timing.generated.json</LogicalName>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\..\packages\rl-agent\content\potions.timing.overrides.json">
+      <LogicalName>Sts2McpBridge.Content.potions.timing.overrides.json</LogicalName>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="sts2">
       <HintPath>$(Sts2DataDir)\sts2.dll</HintPath>
       <Private>false</Private>

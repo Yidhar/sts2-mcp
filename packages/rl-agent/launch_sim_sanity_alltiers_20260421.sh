@@ -51,7 +51,7 @@ echo "[sanity] starting 102400 combat-sandbox steps with clean pipeline..."
   --use-sim \
   --sim-exe-path '/mnt/e/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/Host/bin/Debug/net9.0/headless_sim_host_0991.exe' \
   --init-checkpoint "${INIT_CKPT}" \
-  --total-timesteps 102400 \
+  --total-timesteps 1423360 \
   --n-envs 8 \
   --encode-pool-workers 2 \
   --collector-mode async \

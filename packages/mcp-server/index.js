@@ -1657,6 +1657,57 @@ async function runCombatSequenceTool(args, options = {}) {
       );
     }
 
+    // Second-level dedup: reject sequences that reference the same physical
+    // card (card_ref) or potion slot (player_index + slot_index) more than
+    // once across different target suffixes. Both resources are single-use
+    // per sequence — after the first use the card lands in discard or the
+    // slot empties, so a later step with the same ref would either fail to
+    // resolve or be silently substituted by a same-type sibling via
+    // fingerprint rematching, spending resource the caller never intended.
+    const seenPlayCardRefs = new Map();
+    const seenPotionSlots = new Map();
+    for (let i = 0; i < actionIds.length; i += 1) {
+      const actionId = actionIds[i];
+      if (actionId.startsWith("play_card:")) {
+        const parsed = parseRequestedPlayCardActionId(actionId);
+        if (parsed && parsed.card_ref) {
+          const firstIndex = seenPlayCardRefs.get(parsed.card_ref);
+          if (firstIndex !== undefined) {
+            throw new ToolPayloadError(
+              "invalid_arguments",
+              `action_ids references the same card instance more than once (card_ref=${parsed.card_ref} at positions ${firstIndex} and ${i}). Each physical card can only be played once per sequence.`,
+              {
+                field: "action_ids",
+                duplicate_card_ref: parsed.card_ref,
+                first_index: firstIndex,
+                second_index: i
+              }
+            );
+          }
+          seenPlayCardRefs.set(parsed.card_ref, i);
+        }
+      } else if (actionId.startsWith("use_potion:")) {
+        const parsed = parseRequestedUsePotionActionId(actionId);
+        if (parsed && Number.isInteger(parsed.slot_index)) {
+          const slotKey = `${parsed.player_index}:${parsed.slot_index}`;
+          const firstIndex = seenPotionSlots.get(slotKey);
+          if (firstIndex !== undefined) {
+            throw new ToolPayloadError(
+              "invalid_arguments",
+              `action_ids references the same potion slot more than once (player=${parsed.player_index} slot=${parsed.slot_index} at positions ${firstIndex} and ${i}). Each potion slot can only be used once per sequence.`,
+              {
+                field: "action_ids",
+                duplicate_potion_slot: slotKey,
+                first_index: firstIndex,
+                second_index: i
+              }
+            );
+          }
+          seenPotionSlots.set(slotKey, i);
+        }
+      }
+    }
+
     const sequenceLabel =
       typeof options.sequenceLabel === "string" && options.sequenceLabel.trim()
         ? options.sequenceLabel.trim()

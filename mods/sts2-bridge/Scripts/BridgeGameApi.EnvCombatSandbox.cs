@@ -20,6 +20,18 @@ using MegaCrit.Sts2.Core.Saves;
 
 namespace Sts2McpBridge.Scripts;
 
+internal sealed class BridgeEnvCombatDeckModifierRequest
+{
+    [JsonPropertyName("id")]
+    public string? Id { get; set; }
+
+    [JsonPropertyName("amount")]
+    public int? Amount { get; set; }
+
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+}
+
 internal sealed class BridgeEnvCombatDeckEntryRequest
 {
     [JsonPropertyName("id")]
@@ -27,6 +39,42 @@ internal sealed class BridgeEnvCombatDeckEntryRequest
 
     [JsonPropertyName("upgrade_level")]
     public int? UpgradeLevel { get; set; }
+
+    /// <summary>
+    /// Pre-combat enchantments to attach to this deck card (e.g., "fire", "extra_card").
+    /// Only the `id` is required; `amount` defaults to 1.  Bridge resolves each via
+    /// <c>ModelDb.GetById&lt;EnchantmentModel&gt;</c> then mounts it on the freshly built
+    /// CardModel through reflection (game build varies the API surface).
+    /// </summary>
+    [JsonPropertyName("enchantments")]
+    public BridgeEnvCombatDeckModifierRequest[]? Enchantments { get; set; }
+
+    /// <summary>
+    /// Pre-combat afflictions / curses attached to this deck card (e.g., "binding",
+    /// "wound").  Same resolution path as <see cref="Enchantments"/>.
+    /// </summary>
+    [JsonPropertyName("afflictions")]
+    public BridgeEnvCombatDeckModifierRequest[]? Afflictions { get; set; }
+}
+
+internal readonly struct BridgeEnvDeckEntryResolved
+{
+    public BridgeEnvDeckEntryResolved(
+        string cardId,
+        int upgradeLevel,
+        IReadOnlyList<BridgeEnvCombatDeckModifierRequest> enchantments,
+        IReadOnlyList<BridgeEnvCombatDeckModifierRequest> afflictions)
+    {
+        CardId = cardId;
+        UpgradeLevel = upgradeLevel;
+        Enchantments = enchantments;
+        Afflictions = afflictions;
+    }
+
+    public string CardId { get; }
+    public int UpgradeLevel { get; }
+    public IReadOnlyList<BridgeEnvCombatDeckModifierRequest> Enchantments { get; }
+    public IReadOnlyList<BridgeEnvCombatDeckModifierRequest> Afflictions { get; }
 }
 
 internal sealed class BridgeEnvCombatResetRequest
@@ -72,16 +120,27 @@ internal static partial class BridgeGameApi
 {
     private const int DefaultCombatResetTimeoutMs = 30000;
 
-    private static IReadOnlyList<(string CardId, int UpgradeLevel)> ResolveRequestedDeckEntries(
+    private static IReadOnlyList<BridgeEnvDeckEntryResolved> ResolveRequestedDeckEntries(
         BridgeEnvCombatResetRequest request)
     {
+        static BridgeEnvCombatDeckModifierRequest[] FilterValid(BridgeEnvCombatDeckModifierRequest[]? src)
+        {
+            if (src is null || src.Length == 0)
+            {
+                return Array.Empty<BridgeEnvCombatDeckModifierRequest>();
+            }
+            return src.Where(static m => !string.IsNullOrWhiteSpace(m?.Id)).ToArray();
+        }
+
         if (request.DeckEntries is { Length: > 0 })
         {
             return request.DeckEntries
                 .Where(static entry => !string.IsNullOrWhiteSpace(entry?.Id))
-                .Select(static entry => (
+                .Select(entry => new BridgeEnvDeckEntryResolved(
                     entry!.Id!.Trim(),
-                    Math.Max(entry.UpgradeLevel ?? 0, 0)))
+                    Math.Max(entry.UpgradeLevel ?? 0, 0),
+                    FilterValid(entry.Enchantments),
+                    FilterValid(entry.Afflictions)))
                 .ToArray();
         }
 
@@ -89,11 +148,15 @@ internal static partial class BridgeGameApi
         {
             return request.Deck
                 .Where(static cardId => !string.IsNullOrWhiteSpace(cardId))
-                .Select(static cardId => (cardId.Trim(), 0))
+                .Select(cardId => new BridgeEnvDeckEntryResolved(
+                    cardId.Trim(),
+                    0,
+                    Array.Empty<BridgeEnvCombatDeckModifierRequest>(),
+                    Array.Empty<BridgeEnvCombatDeckModifierRequest>()))
                 .ToArray();
         }
 
-        return Array.Empty<(string CardId, int UpgradeLevel)>();
+        return Array.Empty<BridgeEnvDeckEntryResolved>();
     }
 
     private static CardModel? BuildMutableDeckCard(
@@ -131,6 +194,213 @@ internal static partial class BridgeGameApi
         }
 
         return mutableCard;
+    }
+
+    /// <summary>
+    /// Apply caller-supplied enchantments and afflictions onto a freshly built
+    /// deck card.  Mirror of the READ path: same candidate property/method names
+    /// since the game build varies the API surface.  Each modifier is resolved
+    /// via <c>ModelDb.GetById&lt;EnchantmentModel|AfflictionModel&gt;</c>, then the
+    /// reflective writer tries (in order):
+    ///   1. <c>card.AddEnchantment(model[, amount])</c> / <c>card.AddAffliction(...)</c>
+    ///   2. The same with <c>Add{Modifier|Buff|Debuff}</c> / <c>Enchant</c> / <c>Afflict</c>
+    ///   3. Direct collection mutation: locate <c>Enchantments</c> / <c>Afflictions</c>
+    ///      collection, construct an instance of its element type via
+    ///      <c>Activator.CreateInstance(elementType, model[, amount])</c>, then
+    ///      invoke <c>Add</c>.
+    /// All failures are reported into <paramref name="diagnostics"/>; the deck
+    /// card is left unchanged for that one modifier rather than aborting the
+    /// whole reset.
+    /// </summary>
+    private static void ApplyDeckCardModifiers(
+        CardModel mutableCard,
+        BridgeEnvDeckEntryResolved entry,
+        List<string> diagnostics)
+    {
+        if (mutableCard is null) return;
+        foreach (var ench in entry.Enchantments)
+        {
+            TryApplyCardModifier(mutableCard, ench, "enchantment", entry.CardId, diagnostics);
+        }
+        foreach (var aff in entry.Afflictions)
+        {
+            TryApplyCardModifier(mutableCard, aff, "affliction", entry.CardId, diagnostics);
+        }
+    }
+
+    private static void TryApplyCardModifier(
+        CardModel card,
+        BridgeEnvCombatDeckModifierRequest modifier,
+        string kind,
+        string cardId,
+        List<string> diagnostics)
+    {
+        if (string.IsNullOrWhiteSpace(modifier?.Id))
+        {
+            return;
+        }
+        var modifierId = modifier.Id!.Trim();
+        var amount = Math.Max(modifier.Amount ?? 1, 1);
+
+        // Resolve the modifier model template via ModelDb<T>.GetById.
+        var modelTypeName = kind == "enchantment" ? "EnchantmentModel" : "AfflictionModel";
+        var modelTemplate = TryModelDbGetById(modelTypeName, modifierId, diagnostics);
+        if (modelTemplate is null)
+        {
+            diagnostics.Add($"Deck modifier skipped: unknown {kind} '{modifierId}' for card '{cardId}'");
+            return;
+        }
+
+        // Method name candidates on CardModel.
+        var methodCandidates = kind == "enchantment"
+            ? new[] { "AddEnchantment", "ApplyEnchantment", "Enchant", "AddModifier", "AddBuff" }
+            : new[] { "AddAffliction", "ApplyAffliction", "Afflict", "AddDebuff", "AddStatus" };
+        if (TryInvokeModifierMethod(card, methodCandidates, modelTemplate, amount, diagnostics, kind, modifierId, cardId))
+        {
+            return;
+        }
+
+        // Fallback: collection mutation.
+        var collectionCandidates = kind == "enchantment"
+            ? new[] { "Enchantments", "EnchantmentModels", "CardEnchantments", "Modifiers", "CardModifiers" }
+            : new[] { "Afflictions", "AfflictionModels", "CardAfflictions", "Statuses", "StatusEffects" };
+        foreach (var memberName in collectionCandidates)
+        {
+            if (TryAppendModifierViaCollection(card, memberName, modelTemplate, amount, diagnostics, kind, modifierId, cardId))
+            {
+                return;
+            }
+        }
+
+        diagnostics.Add(
+            $"Deck modifier failed: no working API to apply {kind} '{modifierId}' to card '{cardId}' " +
+            "(no method match and no mutable collection found)");
+    }
+
+    private static bool TryInvokeModifierMethod(
+        CardModel card,
+        IReadOnlyList<string> methodNames,
+        object modelTemplate,
+        int amount,
+        List<string> diagnostics,
+        string kind,
+        string modifierId,
+        string cardId)
+    {
+        var cardType = card.GetType();
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        foreach (var methodName in methodNames)
+        {
+            foreach (var method in cardType.GetMethods(flags))
+            {
+                if (!method.Name.Equals(methodName, StringComparison.Ordinal)) continue;
+                var ps = method.GetParameters();
+                object?[]? args = null;
+                if (ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(modelTemplate))
+                {
+                    args = new object?[] { modelTemplate };
+                }
+                else if (ps.Length == 2
+                         && ps[0].ParameterType.IsInstanceOfType(modelTemplate)
+                         && ps[1].ParameterType == typeof(int))
+                {
+                    args = new object?[] { modelTemplate, amount };
+                }
+                else if (ps.Length == 2
+                         && ps[1].ParameterType.IsInstanceOfType(modelTemplate)
+                         && ps[0].ParameterType == typeof(int))
+                {
+                    args = new object?[] { amount, modelTemplate };
+                }
+                if (args is null) continue;
+                try
+                {
+                    method.Invoke(card, args);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add(
+                        $"Deck modifier {kind} '{modifierId}' on card '{cardId}': {method.Name} threw " +
+                        $"{ex.GetBaseException().GetType().Name}: {ex.GetBaseException().Message}");
+                    // try next candidate
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TryAppendModifierViaCollection(
+        CardModel card,
+        string memberName,
+        object modelTemplate,
+        int amount,
+        List<string> diagnostics,
+        string kind,
+        string modifierId,
+        string cardId)
+    {
+        object? collection = null;
+        try { collection = GetHiddenPropertyObjectValue(card, memberName); } catch { }
+        if (collection is null)
+        {
+            try { collection = GetHiddenFieldValue(card, memberName); } catch { }
+        }
+        if (collection is null) return false;
+
+        var collectionType = collection.GetType();
+        // Find element type — IList<T> / ICollection<T>.
+        Type? elementType = null;
+        foreach (var iface in collectionType.GetInterfaces())
+        {
+            if (iface.IsGenericType
+                && (iface.GetGenericTypeDefinition() == typeof(ICollection<>)
+                    || iface.GetGenericTypeDefinition() == typeof(IList<>)))
+            {
+                elementType = iface.GetGenericArguments()[0];
+                break;
+            }
+        }
+        if (elementType is null) return false;
+
+        // Construct an instance of elementType from the model template.
+        object? instance = null;
+        try
+        {
+            instance = Activator.CreateInstance(elementType, modelTemplate, amount);
+        }
+        catch
+        {
+            try
+            {
+                instance = Activator.CreateInstance(elementType, modelTemplate);
+            }
+            catch
+            {
+                instance = null;
+            }
+        }
+        if (instance is null && elementType.IsInstanceOfType(modelTemplate))
+        {
+            // Element type itself IS the model — push raw template.
+            instance = modelTemplate;
+        }
+        if (instance is null) return false;
+
+        var addMethod = collectionType.GetMethod("Add", new[] { elementType });
+        if (addMethod is null) return false;
+        try
+        {
+            addMethod.Invoke(collection, new[] { instance });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            diagnostics.Add(
+                $"Deck modifier {kind} '{modifierId}' on card '{cardId}': collection {memberName}.Add threw " +
+                $"{ex.GetBaseException().GetType().Name}: {ex.GetBaseException().Message}");
+            return false;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -272,6 +542,17 @@ internal static partial class BridgeGameApi
         }
 
         state = await ApplyEnvEpisodeAdjustmentsAsync(episode, state, timeoutMs, cancellationToken);
+
+        // Drain finalizers now, while the Godot scene is quiescent (new combat is set
+        // up and awaiting the first /env/step). This keeps GodotObject finalizers from
+        // firing mid-combat and racing the main thread's ObjectDB mutations — a known
+        // source of native AV at HashMapElement+0x10 under long runs.
+        DrainManagedFinalizersAfterReset(diagnostics);
+
+        // A fresh combat instance starts with zero self-inflicted HP loss; clear the
+        // tracker so the first observation in this combat does not inherit a counter
+        // left over from the previous sandbox episode.
+        ResetSelfInflictedHpLossTrackerForNewCombat(null);
 
         var executedActions = new List<object>
         {
@@ -696,9 +977,9 @@ internal static partial class BridgeGameApi
             }
 
             var added = 0;
-            foreach (var (cardId, upgradeLevel) in requestedDeckEntries)
+            foreach (var entry in requestedDeckEntries)
             {
-                if (BuildMutableDeckCard(cardId, upgradeLevel, diagnostics) is not CardModel mutableCard)
+                if (BuildMutableDeckCard(entry.CardId, entry.UpgradeLevel, diagnostics) is not CardModel mutableCard)
                 {
                     continue;
                 }
@@ -715,6 +996,13 @@ internal static partial class BridgeGameApi
                 }
 
                 mutableCard.AfterCreated();
+                // Apply pre-combat enchantments / afflictions AFTER the card has
+                // its owner + RunState wired so any modifier that touches owner
+                // state in its on-attach hook can find a valid context.
+                if (entry.Enchantments.Count > 0 || entry.Afflictions.Count > 0)
+                {
+                    ApplyDeckCardModifiers(mutableCard, entry, diagnostics);
+                }
                 added++;
             }
 
@@ -765,7 +1053,9 @@ internal static partial class BridgeGameApi
             {
                 if (potion is not null)
                 {
-                    player.DiscardPotionInternal(potion, silent: true);
+                    // silent=false fires PotionDiscarded so the UI removes the icon;
+                    // see Player.DiscardPotionInternal in the decompiled core.
+                    player.DiscardPotionInternal(potion, silent: false);
                 }
             }
 
@@ -784,7 +1074,10 @@ internal static partial class BridgeGameApi
                     continue;
                 }
 
-                player.AddPotionInternal(potion.ToMutable(), i, silent: true);
+                // silent=false fires PotionProcured so the UI renders the new potion.
+                // With silent=true the backing _potionSlots[i] is updated (bridge obs sees it)
+                // but the UI never refreshes, leaving the policy training on a deck of phantom potions.
+                player.AddPotionInternal(potion.ToMutable(), i, silent: false);
                 added++;
             }
 
@@ -1238,9 +1531,15 @@ internal static partial class BridgeGameApi
         else
         {
             var afterWaitStopwatch = Stopwatch.StartNew();
+            // Normal card resolution (card fly + effect apply + draw proc) completes in
+            // well under 1 second; anything past ~3s indicates either a pathological
+            // unfocused-fps stall or a real game hang. Capping here keeps the worst-case
+            // step round-trip at 3s + 5s salvage = 8s instead of the previous 20s + 5s
+            // = 25s, which was triggering combat truncation/reset during training.
+            const int CombatSandboxAfterWaitCapMs = 3000;
             var afterWaitTimeoutMs = IsCardSelectionSelectAction(selectedAction)
                 ? GetCardSelectionSelectFastFailTimeoutMs(timeoutMs)
-                : timeoutMs;
+                : Math.Min(timeoutMs, CombatSandboxAfterWaitCapMs);
             after = await WaitForCombatSandboxFastStateAsync(
                 before.LogicHash,
                 afterWaitTimeoutMs,
@@ -1429,25 +1728,18 @@ internal static partial class BridgeGameApi
             return snapshot;
         }
 
+        if (!snapshot.ActionLookup.TryGetValue("card_selection:confirm", out var confirmAction))
+        {
+            return snapshot;
+        }
+
         try
         {
-            await RunOnMainThreadGuardedAsync(
-                () =>
-                {
-                    InvokeCardSelectionConfirmAction(
-                        cardSelectionScreen,
-                        ResolveCardSelectionConfirmButton(cardSelectionScreen));
-                    return true;
-                },
-                "combat_sandbox.step.card_selection_confirm",
+            await ExecuteEnvActionAsync(
+                confirmAction,
                 timeoutMs,
-                cancellationToken);
-
-            await WaitForPumpTicksGuardedAsync(
-                1,
-                "combat_sandbox.step.card_selection_confirm.post_pump",
-                timeoutMs,
-                cancellationToken);
+                cancellationToken,
+                "combat_sandbox.step.card_selection_confirm");
         }
         catch (OperationCanceledException)
         {
@@ -2697,15 +2989,22 @@ internal static partial class BridgeGameApi
                     {
                         cardList.Clear();
                         var added = 0;
-                        foreach (var (cardId, upgradeLevel) in requestedDeckEntries)
+                        foreach (var entry in requestedDeckEntries)
                         {
-                            var mutableCard = BuildMutableDeckCard(cardId, upgradeLevel, diagnostics);
+                            var mutableCard = BuildMutableDeckCard(entry.CardId, entry.UpgradeLevel, diagnostics);
                             if (mutableCard is null)
                             {
                                 continue;
                             }
 
                             cardList.Add(mutableCard);
+                            // Modifiers applied after the card lands in the
+                            // deck collection so any modifier on-attach hook
+                            // sees a coherent owner context.
+                            if (entry.Enchantments.Count > 0 || entry.Afflictions.Count > 0)
+                            {
+                                ApplyDeckCardModifiers(mutableCard, entry, diagnostics);
+                            }
                             added++;
                         }
                         diagnostics.Add($"Deck override: added {added}/{requestedDeckEntries.Count} cards");
@@ -2947,5 +3246,49 @@ internal static partial class BridgeGameApi
         }
 
         return null;
+    }
+
+    private static void DrainManagedFinalizersAfterReset(List<string> diagnostics)
+    {
+        var summary = DrainManagedFinalizersInternal();
+        diagnostics.Add(summary);
+    }
+
+    /// <summary>
+    /// Shared GC drain used by every quiescent boundary (combat_sandbox reset,
+    /// full_run env/reset, combat→post-combat screen transition). Cheap when
+    /// the finalize queue is empty; expensive when it isn't — never call from
+    /// a hot mid-turn path. Logs to BridgeDebugTrace for non-sandbox call sites
+    /// that don't carry a diagnostics list.
+    /// </summary>
+    internal static string DrainManagedFinalizersInternal()
+    {
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var memBefore = GC.GetTotalMemory(forceFullCollection: false);
+            var gen2Before = GC.CollectionCount(2);
+
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+
+            sw.Stop();
+            var memAfter = GC.GetTotalMemory(forceFullCollection: false);
+            return
+                $"gc_drain: elapsed_ms={sw.Elapsed.TotalMilliseconds:F1} " +
+                $"reclaimed_kb={(memBefore - memAfter) / 1024} " +
+                $"gen2_delta={GC.CollectionCount(2) - gen2Before}";
+        }
+        catch (Exception ex)
+        {
+            return $"gc_drain_failed: {ex.GetBaseException().Message}";
+        }
+    }
+
+    internal static void DrainManagedFinalizersLogged(string callSite)
+    {
+        var summary = DrainManagedFinalizersInternal();
+        BridgeDebugTrace.Write($"[{callSite}] {summary}");
     }
 }

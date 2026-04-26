@@ -6,6 +6,7 @@ using Godot;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace Sts2McpBridge.Scripts;
@@ -53,9 +54,7 @@ internal static partial class BridgeGameApi
             Observation = observation,
             RunSummary = runSummary,
             LegalActions = legalActions.Select((action, index) => BuildEnvActionPayload(action, index)).ToArray(),
-            ActionLookup = legalActions
-                .GroupBy(static action => action.ActionId, StringComparer.Ordinal)
-                .ToDictionary(static g => g.Key, static g => g.First(), StringComparer.Ordinal),
+            ActionLookup = BuildEnvActionLookup(legalActions),
             ResolvedActions = legalActions,
             LogicHash = logicHash,
             SurfaceFingerprint = surfaceFingerprint,
@@ -100,6 +99,49 @@ internal static partial class BridgeGameApi
         }
 
         return builder.ToString();
+    }
+
+    private static Dictionary<string, BridgeResolvedAction> BuildEnvActionLookup(
+        IReadOnlyList<BridgeResolvedAction> legalActions)
+    {
+        // The lookup is used by /env/step to resolve a requested action_id. We
+        // must not silently drop later actions whose id collides with an
+        // earlier one (the old GroupBy+First form did this), because Python
+        // picks by index into the full LegalActions list and the bridge then
+        // executes via this lookup �?a collision would mean the caller's
+        // chosen entry silently gets replaced by the first entry with the
+        // same id. In normal play this cannot happen (card_ref is an identity
+        // hash and target suffixes are unique per target), so a collision
+        // indicates a game-state anomaly we want loud.
+        var lookup = new Dictionary<string, BridgeResolvedAction>(
+            legalActions.Count,
+            StringComparer.Ordinal);
+        for (var i = 0; i < legalActions.Count; i++)
+        {
+            var action = legalActions[i];
+            if (!lookup.TryAdd(action.ActionId, action))
+            {
+                BridgeDebugTrace.Write(
+                    $"[env.actions] duplicate action_id detected: '{action.ActionId}' " +
+                    $"at indices {IndexOfActionId(legalActions, action.ActionId)} and {i} " +
+                    $"(legal_actions count={legalActions.Count}). Keeping first; later duplicate is unreachable via action_id lookup.");
+            }
+        }
+        return lookup;
+    }
+
+    private static int IndexOfActionId(
+        IReadOnlyList<BridgeResolvedAction> legalActions,
+        string actionId)
+    {
+        for (var i = 0; i < legalActions.Count; i++)
+        {
+            if (string.Equals(legalActions[i].ActionId, actionId, StringComparison.Ordinal))
+            {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static List<BridgeResolvedAction> FilterEnvResolvedActions(
@@ -227,7 +269,47 @@ internal static partial class BridgeGameApi
         }
 
         var filtered = actions.Where(IsAllowed).ToList();
+        if (ShouldSuppressTransientCombatEndTurnOnly(context, filtered))
+        {
+            BridgeDebugTrace.Write("stable_surface suppress transient combat end_turn_only");
+            return filtered
+                .Where(static action => !action.ActionId.Equals("end_turn", StringComparison.Ordinal))
+                .ToList();
+        }
+        ResetTransientCombatEndTurnOnlyGateIfNeeded(context, filtered);
         return filtered.Count > 0 ? filtered : actions.ToList();
+    }
+
+    // Do not time-suppress real end_turn-only combat states. Transient action
+    // resolution is gated by direct CombatManager flags in BuildResolvedActions
+    // (IsPlayPhase && !PlayerActionsDisabled && !IsPaused) and by the fast
+    // direct-state frontier wait in BridgeGameApi.cs. If those flags say the
+    // player can act and only end_turn remains, exposing end_turn is correct.
+    private static bool ShouldSuppressTransientCombatEndTurnOnly(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> filtered)
+    {
+        ResetTransientCombatEndTurnOnlyGate();
+        return false;
+    }
+
+    private static void ResetTransientCombatEndTurnOnlyGateIfNeeded(
+        BridgeWorldContext context,
+        IReadOnlyList<BridgeResolvedAction> filtered)
+    {
+        if (context.CombatManager?.IsInProgress == true &&
+            filtered.Count == 1 &&
+            filtered[0].ActionId.Equals("end_turn", StringComparison.Ordinal))
+        {
+            return;
+        }
+        ResetTransientCombatEndTurnOnlyGate();
+    }
+
+    private static void ResetTransientCombatEndTurnOnlyGate()
+    {
+        // Historical timer gate removed; keep this no-op so older reset call
+        // sites remain harmless and the filter path stays simple.
     }
 
     private static bool ShouldSuppressTransientEventContinue(
@@ -490,13 +572,13 @@ internal static partial class BridgeGameApi
         try
         {
             var eventRoom = context.EventRoom;
-            if (eventRoom is null) return $"事件｜{context.EventOptionButtons.Count}个选项";
+            if (eventRoom is null) return $"event:{context.EventOptionButtons.Count} options";
             var eventTitle = TryGetTitle(eventRoom) ?? "";
-            return $"事件｜{NormalizeSemanticText(eventTitle)}｜{context.EventOptionButtons.Count}个选项";
+            return $"event:{NormalizeSemanticText(eventTitle)}:{context.EventOptionButtons.Count} options";
         }
         catch
         {
-            return $"事件｜{context.EventOptionButtons.Count}个选项";
+            return $"event:{context.EventOptionButtons.Count} options";
         }
     }
 
@@ -522,6 +604,7 @@ internal static partial class BridgeGameApi
         var player = GetPrimaryPlayer(context);
         var playerCombat = player?.PlayerCombatState;
         var playerCreature = player?.Creature;
+        var playerFacing = ResolvePlayerFacing(playerCreature);
 
         return new
         {
@@ -529,6 +612,10 @@ internal static partial class BridgeGameApi
             side = context.CombatState.CurrentSide.ToString(),
             play_phase = context.CombatManager.IsPlayPhase,
             can_act = !context.CombatManager.PlayerActionsDisabled,
+            self_inflicted_hp_loss_cumulative = ObserveSelfInflictedHpLossCumulative(
+                context.CombatState,
+                context.CombatState.RoundNumber),
+            facing = playerFacing,
             energy = playerCombat?.Energy,
             max_energy = playerCombat?.MaxEnergy,
             stars = playerCombat?.Stars,
@@ -543,16 +630,54 @@ internal static partial class BridgeGameApi
                 .ToArray(),
             enemies = context.CombatState.Creatures
                 .Where(static creature => creature.IsEnemy)
-                .Select(BuildEnvEnemyPayload)
+                .Select(creature => BuildEnvEnemyPayload(creature, playerFacing))
                 .ToArray(),
             player_powers = playerCreature?.Powers
                 .Select(static power => new
                 {
+                    id = power.Id.Entry,
                     title = TextOf(power.Title),
-                    amount = power.Amount
+                    amount = power.Amount,
+                    display_amount = power.DisplayAmount,
+                    stack_type = power.StackType.ToString()
                 })
                 .ToArray() ?? Array.Empty<object>()
         };
+    }
+
+    // Lowercase "right"/"left" if player carries SurroundedPower; null otherwise.
+    // The back-attack mechanic (Rocket / Crusher / Kaiser Crab Boss) keys off this.
+    private static string? ResolvePlayerFacing(Creature? playerCreature)
+    {
+        if (playerCreature is null) return null;
+        foreach (var power in playerCreature.Powers)
+        {
+            if (power is SurroundedPower surrounded)
+            {
+                return surrounded.Facing.ToString().ToLowerInvariant();
+            }
+        }
+        return null;
+    }
+
+    // Damage multiplier enemy -> player if the enemy attacks right now.
+    // Mirrors SurroundedPower.ModifyDamageMultiplicative: 1.5 on matched back
+    // attack (player facing Right + enemy has BackAttackLeft, or mirror),
+    // otherwise 1.0. Returns 1.0 when no SurroundedPower is present so the
+    // field stays meaningful across every combat.
+    private static decimal ComputeIncomingDamageMultiplier(Creature enemy, string? playerFacing)
+    {
+        if (playerFacing is null) return 1m;
+        bool hasBackAttackLeft = false;
+        bool hasBackAttackRight = false;
+        foreach (var power in enemy.Powers)
+        {
+            if (power is BackAttackLeftPower) hasBackAttackLeft = true;
+            else if (power is BackAttackRightPower) hasBackAttackRight = true;
+        }
+        if (playerFacing == "right" && hasBackAttackLeft) return 1.5m;
+        if (playerFacing == "left" && hasBackAttackRight) return 1.5m;
+        return 1m;
     }
 
     private static object BuildEnvCreaturePayload(Creature creature)
@@ -567,16 +692,20 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static object BuildEnvEnemyPayload(Creature creature)
+    private static object BuildEnvEnemyPayload(Creature creature, string? playerFacing)
     {
         var intent = JsonSerializer.SerializeToElement(BuildEnemyIntentPayload(creature));
         return new
         {
             id = creature.CombatId,
+            combat_id = creature.CombatId,
             name = creature.Name,
+            model_id = creature.ModelId.ToString(),
+            side = creature.Side.ToString(),
             hp = creature.CurrentHp,
             max_hp = creature.MaxHp,
             block = creature.Block,
+            incoming_damage_multiplier = ComputeIncomingDamageMultiplier(creature, playerFacing),
             intent = new
             {
                 intent_type = TryGetFirstIntentString(intent, "intent_type"),
@@ -587,8 +716,11 @@ internal static partial class BridgeGameApi
             },
             powers = creature.Powers.Select(static power => new
             {
+                id = power.Id.Entry,
                 title = TextOf(power.Title),
-                amount = power.Amount
+                amount = power.Amount,
+                display_amount = power.DisplayAmount,
+                stack_type = power.StackType.ToString()
             }).ToArray()
         };
     }
@@ -614,7 +746,7 @@ internal static partial class BridgeGameApi
                 proceed_only = context.RewardButtons.Count == 0 &&
                                context.RewardProceedButton is not null &&
                                IsNodeVisible(context.RewardProceedButton),
-                decision_text = $"奖励选择｜可领取{context.RewardButtons.Count}项奖励"
+                decision_text = $"reward choice: {context.RewardButtons.Count} claimable"
             },
             "card_reward" => new
             {
@@ -622,7 +754,7 @@ internal static partial class BridgeGameApi
                 can_skip = context.CardRewardSkipButton is not null &&
                            IsNodeVisible(context.CardRewardSkipButton) &&
                            IsButtonEnabled(context.CardRewardSkipButton),
-                decision_text = $"卡牌奖励｜{context.CardRewardOptions.Count}张卡牌可选"
+                decision_text = $"card reward: {context.CardRewardOptions.Count} options"
             },
             "event" => new
             {
@@ -647,7 +779,7 @@ internal static partial class BridgeGameApi
                 can_proceed = context.RestSiteProceedButton is not null &&
                               IsNodeVisible(context.RestSiteProceedButton) &&
                               IsButtonEnabled(context.RestSiteProceedButton),
-                decision_text = "营火｜选择休息或锻造"
+                decision_text = "rest site: choose rest or smith"
             },
             "deck_upgrade" => BuildEnvDeckUpgradeDecisionPayload(context),
             "card_selection" => BuildEnvCardSelectionDecisionPayload(context),
@@ -656,7 +788,7 @@ internal static partial class BridgeGameApi
                 is_open = context.MerchantInventory?.IsOpen ?? false,
                 gold = context.MerchantInventory?.Inventory?.Player?.Gold,
                 item_count = context.MerchantSlots.Count,
-                decision_text = $"商店｜{context.MerchantSlots.Count}件商品｜金币{context.MerchantInventory?.Inventory?.Player?.Gold ?? 0}"
+                decision_text = $"shop: {context.MerchantSlots.Count} items, gold {context.MerchantInventory?.Inventory?.Player?.Gold ?? 0}"
             },
             "treasure" => new
             {
@@ -743,6 +875,8 @@ internal static partial class BridgeGameApi
                       IsNodeVisible(context.CardSelectionSkipButton) &&
                       IsButtonEnabled(context.CardSelectionSkipButton);
         var selectionSemantics = ResolveCardSelectionSemantics(screen, prompt, texts);
+        var selectionDomain = ResolveCardSelectionDomain(context, selectionSemantics);
+        var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
 
         return new
         {
@@ -750,6 +884,9 @@ internal static partial class BridgeGameApi
             prompt,
             texts,
             selection_semantics = selectionSemantics,
+            selection_domain = selectionDomain,
+            source_effect_type = selectionSemantics,
+            remaining_select = remainingSelect,
             selected_count = selectedCount,
             min_select = minSelect,
             max_select = maxSelect,
@@ -774,14 +911,14 @@ internal static partial class BridgeGameApi
         int selectedCount,
         bool confirmReady)
     {
-        var prefix = useSingleSelection ? "锻造选牌" : "多重锻造选牌";
+        var prefix = useSingleSelection ? "smith card" : "multi smith card";
         var status = confirmReady
-            ? "可确认"
-            : useSingleSelection ? "等待选择" : "继续选择";
+            ? "ready_confirm"
+            : useSingleSelection ? "waiting_selection" : "continue_selection";
         var normalizedPrompt = NormalizeSemanticText(prompt ?? "");
         return string.IsNullOrWhiteSpace(normalizedPrompt)
-            ? $"{prefix}｜已选{selectedCount}张｜{status}"
-            : $"{prefix}｜{normalizedPrompt}｜已选{selectedCount}张｜{status}";
+            ? $"{prefix}: selected {selectedCount}; {status}"
+            : $"{prefix}: {normalizedPrompt}: selected {selectedCount}; {status}";
     }
 
     private static string BuildCardSelectionDecisionText(
@@ -793,18 +930,44 @@ internal static partial class BridgeGameApi
         bool confirmReady,
         bool canSkip)
     {
-        var prefix = $"{DescribeSelectionSemanticsLabel(selectionSemantics)}选牌";
+        var prefix = $"{DescribeSelectionSemanticsLabel(selectionSemantics)} card selection";
         var normalizedPrompt = NormalizeSemanticText(prompt ?? "");
         var targetCount = maxSelect ?? minSelect;
         var progress = targetCount is > 0
-            ? $"已选{selectedCount}/{targetCount}"
-            : $"已选{selectedCount}张";
+            ? $"selected {selectedCount}/{targetCount}"
+            : $"selected {selectedCount}";
         var status = confirmReady
-            ? "可确认"
-            : canSkip ? "可跳过" : "继续选择";
+            ? "ready_confirm"
+            : canSkip ? "can_skip" : "continue_selection";
         return string.IsNullOrWhiteSpace(normalizedPrompt)
-            ? $"{prefix}｜{progress}｜{status}"
-            : $"{prefix}｜{normalizedPrompt}｜{progress}｜{status}";
+            ? $"{prefix}: {progress}: {status}"
+            : $"{prefix}: {normalizedPrompt}: {progress}: {status}";
+    }
+
+
+    private static int? ResolveRemainingSelectCount(int selectedCount, int? minSelect, int? maxSelect)
+    {
+        var target = maxSelect ?? minSelect;
+        if (target is null || target <= 0)
+        {
+            return null;
+        }
+        return Math.Max(target.Value - selectedCount, 0);
+    }
+
+    private static string ResolveCardSelectionDomain(BridgeWorldContext context, string? selectionSemantics)
+    {
+        var semantic = (selectionSemantics ?? string.Empty).Trim().ToLowerInvariant();
+        var combatInProgress = context.CombatManager is not null || context.CombatState is not null || context.CombatRoom is not null;
+        if (combatInProgress)
+        {
+            return semantic is "remove" or "transform" or "upgrade" or "enchant" or "afflict"
+                ? "combat_card_mutation"
+                : "combat_card_selection";
+        }
+        return semantic is "remove" or "transform" or "upgrade" or "enchant" or "afflict" or "copy" or "add"
+            ? "build_card_mutation"
+            : "build_card_selection";
     }
 
     private static string ResolveCardSelectionSemantics(
@@ -865,7 +1028,7 @@ internal static partial class BridgeGameApi
         }
 
         if (combined.Contains("升级", StringComparison.Ordinal) ||
-            combined.Contains("锻造", StringComparison.Ordinal) ||
+            combined.Contains("smith", StringComparison.Ordinal) ||
             combined.Contains("upgrade", StringComparison.Ordinal) ||
             combined.Contains("smith", StringComparison.Ordinal))
         {

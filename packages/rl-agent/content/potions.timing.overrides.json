@@ -1,0 +1,541 @@
+{
+  "__meta__": {
+    "_doc": "Curated potion timing overrides — see docs/potion-timing-modeling-plan.md §4.3.",
+    "_loader": "packages/rl-agent/sts2_env/potion_profiles.py",
+    "_total_potions": 64,
+    "_schema_version": 1
+  },
+
+  "POTION.FIRE_POTION": {
+    "target_scope": "AnyEnemy",
+    "effect_family": ["damage", "single_target"],
+    "effect_profile": {
+      "damage": 20.0, "aoe": false, "single_target": true,
+      "target_required": true, "can_change_facing_if_targeted_enemy": true
+    },
+    "semantic_tags": ["attack", "damage", "single_target"],
+    "timing_tags": ["lethal_tool", "overkill_risk", "mechanism_answer_candidate"],
+    "training_tags": ["combat_immediate", "save_if_low_threat"]
+  },
+  "POTION.POTION_SHAPED_ROCK": {
+    "target_scope": "AnyEnemy", "rarity": "Token",
+    "effect_family": ["damage", "single_target", "token"],
+    "effect_profile": {
+      "damage": 15.0, "single_target": true, "target_required": true,
+      "can_change_facing_if_targeted_enemy": true
+    },
+    "semantic_tags": ["attack", "damage", "token"],
+    "timing_tags": ["lethal_tool", "mechanism_answer_candidate"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.EXPLOSIVE_AMPOULE": {
+    "target_scope": "AllEnemies",
+    "effect_family": ["damage", "aoe"],
+    "effect_profile": {"damage": 10.0, "aoe": true, "target_required": false},
+    "semantic_tags": ["attack", "damage", "aoe"],
+    "timing_tags": ["aoe_clear_tool", "lethal_tool"],
+    "training_tags": ["combat_immediate", "save_if_low_threat"]
+  },
+  "POTION.FOUL_POTION": {
+    "target_scope": "AllCreatures", "rarity": "Event",
+    "effect_family": ["damage", "aoe", "self_damage"],
+    "effect_profile": {"damage": 12.0, "aoe": true, "target_required": false},
+    "semantic_tags": ["attack", "damage", "aoe", "self_damage"],
+    "timing_tags": ["aoe_clear_tool", "self_damage_risk"],
+    "training_tags": ["combat_immediate", "save_if_low_threat"]
+  },
+
+  "POTION.BLOCK_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["block"],
+    "effect_profile": {"block": 12.0, "target_required": false},
+    "semantic_tags": ["block", "defense"],
+    "timing_tags": ["prevent_lethal_tool", "block_waste_risk"],
+    "training_tags": ["combat_immediate", "save_if_no_incoming"]
+  },
+  "POTION.SHIP_IN_A_BOTTLE": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["block", "delayed_block"],
+    "effect_profile": {"block": 10.0, "target_required": false},
+    "semantic_tags": ["block", "defense", "delayed"],
+    "timing_tags": ["prevent_lethal_tool", "block_waste_risk"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.HEART_OF_IRON": {
+    "target_scope": "Self",
+    "effect_family": ["block", "buff", "armor"],
+    "effect_profile": {"prevent_damage": 7.0, "target_required": false},
+    "semantic_tags": ["block", "defense", "scaling", "buff"],
+    "timing_tags": ["prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate", "save_if_no_incoming"]
+  },
+  "POTION.FORTIFIER": {
+    "target_scope": "Self",
+    "effect_family": ["block", "amplify_block"],
+    "effect_profile": {"block": 0.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["block", "defense", "amplify"],
+    "timing_tags": ["requires_block_in_play", "prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+
+  "POTION.BLOOD_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["heal"],
+    "effect_profile": {"heal": 0.20, "target_required": false},
+    "semantic_tags": ["heal", "survival"],
+    "timing_tags": ["prevent_lethal_tool", "save_if_full_hp"],
+    "training_tags": ["combat_immediate", "save_if_no_incoming"]
+  },
+  "POTION.FRUIT_JUICE": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["max_hp_gain", "long_term"],
+    "effect_profile": {"heal": 0.0, "target_required": false, "long_term_value": true},
+    "semantic_tags": ["heal", "max_hp", "long_term"],
+    "timing_tags": ["long_term_value", "post_combat_value"],
+    "training_tags": ["save_or_use_outside_combat"]
+  },
+
+  "POTION.SWIFT_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["draw"],
+    "effect_profile": {"draw": 3.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["draw", "resource"],
+    "timing_tags": ["requires_followup", "waste_if_no_playable_followup"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.CLARITY": {
+    "target_scope": "Self",
+    "effect_family": ["draw", "delayed_draw"],
+    "effect_profile": {"draw": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["draw", "resource", "delayed"],
+    "timing_tags": ["requires_followup", "scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+
+  "POTION.ENERGY_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["energy"],
+    "effect_profile": {"energy_gain": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["energy", "resource"],
+    "timing_tags": ["requires_followup", "waste_if_no_playable_followup"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.RADIANT_TINCTURE": {
+    "target_scope": "Self",
+    "effect_family": ["energy", "delayed_energy"],
+    "effect_profile": {"energy_gain": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["energy", "resource", "delayed"],
+    "timing_tags": ["requires_followup", "scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.CURE_ALL": {
+    "target_scope": "Self",
+    "effect_family": ["energy", "draw"],
+    "effect_profile": {"energy_gain": 2.0, "draw": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["energy", "draw", "resource"],
+    "timing_tags": ["requires_followup", "waste_if_no_playable_followup"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+
+  "POTION.STRENGTH_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "strength"],
+    "effect_profile": {"strength": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling", "strength"],
+    "timing_tags": ["scaling_tool", "requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.DEXTERITY_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "dexterity"],
+    "effect_profile": {"dexterity": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling", "dexterity"],
+    "timing_tags": ["scaling_tool", "requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.FOCUS_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "focus"],
+    "effect_profile": {"target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.FYSH_OIL": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "strength", "dexterity"],
+    "effect_profile": {"strength": 1.0, "dexterity": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.FLEX_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "strength", "self_debuff_end"],
+    "effect_profile": {"strength": 5.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling", "self_damage"],
+    "timing_tags": ["requires_followup", "single_turn_burst"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.SPEED_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "dexterity", "self_debuff_end"],
+    "effect_profile": {"dexterity": 5.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["buff", "scaling", "self_damage"],
+    "timing_tags": ["requires_followup", "single_turn_burst"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.LIQUID_BRONZE": {
+    "target_scope": "Self",
+    "effect_family": ["buff", "thorns"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["buff", "thorns", "defense"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.LUCKY_TONIC": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["buff", "buffer"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["buff", "defense"],
+    "timing_tags": ["prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.MAZALETHS_GIFT": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["buff", "ritual"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["buff", "scaling", "long_term"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+
+  "POTION.WEAK_POTION": {
+    "target_scope": "AnyEnemy",
+    "effect_family": ["debuff", "weak"],
+    "effect_profile": {"weak": 3.0, "single_target": true, "target_required": true, "can_change_facing_if_targeted_enemy": true},
+    "semantic_tags": ["debuff", "weak"],
+    "timing_tags": ["prevent_major_loss_tool", "mechanism_answer_candidate"],
+    "training_tags": ["combat_immediate", "save_if_no_incoming"]
+  },
+  "POTION.VULNERABLE_POTION": {
+    "target_scope": "AnyEnemy",
+    "effect_family": ["debuff", "vulnerable"],
+    "effect_profile": {"vulnerable": 3.0, "single_target": true, "target_required": true, "can_change_facing_if_targeted_enemy": true},
+    "semantic_tags": ["debuff", "vulnerable"],
+    "timing_tags": ["amplify_damage_tool", "mechanism_answer_candidate"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POISON_POTION": {
+    "target_scope": "AnyEnemy",
+    "effect_family": ["debuff", "poison"],
+    "effect_profile": {"poison": 6.0, "single_target": true, "target_required": true, "can_change_facing_if_targeted_enemy": true},
+    "semantic_tags": ["debuff", "poison", "damage_over_time"],
+    "timing_tags": ["scaling_tool", "mechanism_answer_candidate"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POTION_OF_DOOM": {
+    "target_scope": "AnyEnemy",
+    "effect_family": ["debuff", "doom"],
+    "effect_profile": {"single_target": true, "target_required": true, "can_change_facing_if_targeted_enemy": true},
+    "semantic_tags": ["debuff", "doom", "delayed"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POTION_OF_BINDING": {
+    "target_scope": "AllEnemies",
+    "effect_family": ["debuff", "weak", "vulnerable", "aoe"],
+    "effect_profile": {"weak": 1.0, "vulnerable": 1.0, "aoe": true, "target_required": false},
+    "semantic_tags": ["debuff", "aoe"],
+    "timing_tags": ["prevent_major_loss_tool", "amplify_damage_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.SHACKLING_POTION": {
+    "target_scope": "AllEnemies", "rarity": "Rare",
+    "effect_family": ["debuff", "strength_negative", "aoe"],
+    "effect_profile": {"aoe": true, "target_required": false},
+    "semantic_tags": ["debuff", "aoe", "prevent_damage"],
+    "timing_tags": ["prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POWDERED_DEMISE": {
+    "target_scope": "AllEnemies",
+    "effect_family": ["debuff", "damage_over_time", "aoe"],
+    "effect_profile": {"aoe": true, "target_required": false},
+    "semantic_tags": ["debuff", "damage_over_time", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.BEETLE_JUICE": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["damage_reduction"],
+    "effect_profile": {"prevent_damage": 0.30, "target_required": false},
+    "semantic_tags": ["defense", "damage_reduction"],
+    "timing_tags": ["prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate", "save_if_no_incoming"]
+  },
+
+  "POTION.DROPLET_OF_PRECOGNITION": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["draw_pile", "tutor"],
+    "effect_profile": {"retrieve_from_discard": 0.0, "target_required": false},
+    "semantic_tags": ["draw", "tutor", "resource"],
+    "timing_tags": ["requires_draw_pile_context"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.LIQUID_MEMORIES": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["discard_pile", "tutor"],
+    "effect_profile": {"retrieve_from_discard": 1.0, "target_required": false},
+    "semantic_tags": ["draw", "tutor", "resource"],
+    "timing_tags": ["requires_discard_context"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.DISTILLED_CHAOS": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["draw_pile", "auto_play"],
+    "effect_profile": {"target_required": false, "random_outcome": true},
+    "semantic_tags": ["resource", "auto_play", "random"],
+    "timing_tags": ["requires_draw_pile_context", "scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.BOTTLED_POTENTIAL": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["pile_reset", "draw"],
+    "effect_profile": {"draw": 5.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["draw", "resource", "shuffle"],
+    "timing_tags": ["requires_followup", "burst_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.GAMBLERS_BREW": {
+    "target_scope": "Self",
+    "effect_family": ["discard", "draw"],
+    "effect_profile": {"target_required": false, "requires_followup": true},
+    "semantic_tags": ["draw", "discard", "resource"],
+    "timing_tags": ["requires_hand_context", "requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.SNECKO_OIL": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["draw", "randomize_cost"],
+    "effect_profile": {"draw": 7.0, "target_required": false, "random_outcome": true, "requires_followup": true},
+    "semantic_tags": ["draw", "resource", "random"],
+    "timing_tags": ["burst_tool", "requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.GLOWWATER_POTION": {
+    "target_scope": "Self", "rarity": "Event",
+    "effect_family": ["exhaust_hand", "draw"],
+    "effect_profile": {"draw": 10.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["draw", "exhaust", "burst"],
+    "timing_tags": ["burst_tool", "requires_followup", "hand_loss_risk"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+
+  "POTION.ATTACK_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["generate_card", "discover", "free_play"],
+    "effect_profile": {"discover_count": 1.0, "generate_card_count": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "discover", "free_play"],
+    "timing_tags": ["requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.SKILL_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["generate_card", "discover", "free_play"],
+    "effect_profile": {"discover_count": 1.0, "generate_card_count": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "discover", "free_play"],
+    "timing_tags": ["requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POWER_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["generate_card", "discover", "free_play"],
+    "effect_profile": {"discover_count": 1.0, "generate_card_count": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "discover", "free_play", "scaling"],
+    "timing_tags": ["requires_followup", "scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.COLORLESS_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["generate_card", "discover", "free_play"],
+    "effect_profile": {"discover_count": 1.0, "generate_card_count": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "discover", "free_play"],
+    "timing_tags": ["requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.CUNNING_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["generate_card"],
+    "effect_profile": {"generate_card_count": 3.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "generate_card", "attack"],
+    "timing_tags": ["requires_followup", "burst_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.COSMIC_CONCOCTION": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["generate_card"],
+    "effect_profile": {"generate_card_count": 3.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "generate_card"],
+    "timing_tags": ["requires_followup", "burst_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.OROBIC_ACID": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["generate_card", "free_play"],
+    "effect_profile": {"generate_card_count": 3.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "generate_card", "free_play"],
+    "timing_tags": ["requires_followup", "burst_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.POT_OF_GHOULS": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["generate_card", "soul"],
+    "effect_profile": {"generate_card_count": 2.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["resource", "generate_card", "soul"],
+    "timing_tags": ["requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.DUPLICATOR": {
+    "target_scope": "Self",
+    "effect_family": ["duplicate_next"],
+    "effect_profile": {"duplicate_next": 1.0, "target_required": false, "requires_followup": true},
+    "semantic_tags": ["amplify", "duplicate", "setup"],
+    "timing_tags": ["requires_good_hand", "requires_followup", "setup_tool"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.GIGANTIFICATION_POTION": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["amplify_next_attack"],
+    "effect_profile": {"target_required": false, "requires_followup": true},
+    "semantic_tags": ["amplify", "setup", "attack"],
+    "timing_tags": ["requires_attack_card", "requires_followup", "setup_tool"],
+    "training_tags": ["combat_immediate", "requires_followup"]
+  },
+  "POTION.BLESSING_OF_THE_FORGE": {
+    "target_scope": "Self",
+    "effect_family": ["upgrade_hand"],
+    "effect_profile": {"upgrade_hand": 1.0, "target_required": false},
+    "semantic_tags": ["upgrade", "setup"],
+    "timing_tags": ["requires_good_hand", "scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.TOUCH_OF_INSANITY": {
+    "target_scope": "Self",
+    "effect_family": ["set_cost_zero", "free_play"],
+    "effect_profile": {"target_required": false, "requires_followup": true},
+    "semantic_tags": ["setup", "free_play"],
+    "timing_tags": ["requires_good_hand", "setup_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+
+  "POTION.FAIRY_IN_A_BOTTLE": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["passive", "revive"],
+    "effect_profile": {"target_required": false, "passive_or_triggered": true, "heal": 0.30},
+    "semantic_tags": ["heal", "revive", "passive"],
+    "timing_tags": ["passive_safety_net"],
+    "training_tags": ["save_or_use_outside_combat", "passive_no_active_use"]
+  },
+  "POTION.GHOST_IN_A_JAR": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["intangible"],
+    "effect_profile": {"intangible": 1.0, "target_required": false},
+    "semantic_tags": ["defense", "intangible", "prevent_damage"],
+    "timing_tags": ["prevent_lethal_tool", "prevent_major_loss_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.REGEN_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["heal", "regen"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["heal", "regen"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.STABLE_SERUM": {
+    "target_scope": "Self",
+    "effect_family": ["retain_hand"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["retain", "setup"],
+    "timing_tags": ["requires_good_hand", "setup_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.STAR_POTION": {
+    "target_scope": "Self",
+    "effect_family": ["stardust"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["resource", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.KINGS_COURAGE": {
+    "target_scope": "Self",
+    "effect_family": ["forge"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["resource", "forge"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.SOLDIERS_STEW": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["replay_strike"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["amplify", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.ASHWATER": {
+    "target_scope": "Self",
+    "effect_family": ["exhaust_select"],
+    "effect_profile": {"replace_or_transform_hand": 1.0, "target_required": false},
+    "semantic_tags": ["exhaust", "setup"],
+    "timing_tags": ["requires_hand_context"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.BONE_BREW": {
+    "target_scope": "Self",
+    "effect_family": ["summon"],
+    "effect_profile": {"target_required": false},
+    "semantic_tags": ["summon", "scaling"],
+    "timing_tags": ["scaling_tool"],
+    "training_tags": ["combat_immediate"]
+  },
+  "POTION.ESSENCE_OF_DARKNESS": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["orb", "scaling"],
+    "effect_profile": {"target_required": false, "requires_followup": true},
+    "semantic_tags": ["scaling", "orb"],
+    "timing_tags": ["scaling_tool", "requires_followup"],
+    "training_tags": ["combat_immediate"]
+  },
+
+  "POTION.POTION_OF_CAPACITY": {
+    "target_scope": "Self",
+    "effect_family": ["orb_slot", "long_term"],
+    "effect_profile": {"target_required": false, "long_term_value": true},
+    "semantic_tags": ["long_term", "scaling"],
+    "timing_tags": ["long_term_value", "post_combat_value"],
+    "training_tags": ["save_or_use_outside_combat"]
+  },
+  "POTION.ENTROPIC_BREW": {
+    "target_scope": "Self", "rarity": "Rare",
+    "effect_family": ["fill_potion_slots"],
+    "effect_profile": {"target_required": false, "long_term_value": true, "random_outcome": true},
+    "semantic_tags": ["resource", "long_term", "random"],
+    "timing_tags": ["long_term_value", "post_combat_value"],
+    "training_tags": ["save_or_use_outside_combat"]
+  },
+
+  "POTION.DEPRECATED_POTION": {
+    "target_scope": "Self",
+    "rarity": "None",
+    "enabled_for_training": false,
+    "deprecated": true,
+    "effect_family": ["deprecated"],
+    "effect_profile": {},
+    "semantic_tags": ["deprecated"],
+    "timing_tags": ["deprecated"],
+    "training_tags": ["disabled"]
+  }
+}

@@ -35,17 +35,18 @@ STATUS_FILE="${LOG_DIR}/async_status.json"
 ANALYSIS_DIR="/mnt/e/game/project/sts2_mcp/packages/rl-agent/analysis/training_curves"
 mkdir -p "${LOG_DIR}" "${CKPT_DIR}" "${ANALYSIS_DIR}"
 
-# UPDATE THIS to the latest best checkpoint before kicking off.
-INIT_CKPT='/mnt/e/game/project/sts2_mcp/packages/rl-agent/checkpoints_attention/sim_p0pp_losers_20260420_182657/step_001710080'
+# Latest live-trained clean checkpoint (post BUG-D fix, 4125-ep live sandbox).
+# Overall training WR 50.1%, boss WR 4.9% avg (5/11 bosses 5-9%, 3/11 still 0%).
+INIT_CKPT='/mnt/e/game/project/sts2_mcp/packages/rl-agent/checkpoints_attention/live_sanity_4envs_20260421_235123/step_001812480'
 
 SESSIONS='/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session_0.json,/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session_1.json,/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session_2.json,/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session_3.json'
 
-# 1710080 + 204800 = 1914880. Room for ~2k run-chain episodes.
+# 1812480 + 204800 = 2017280. Room for ~2k run-chain episodes.
 # Run-chain episodes are 3-28 sub-combats (mean ~3.85), ~100-800 env steps
 # each. With 4 envs x 64 n_steps = 256 env steps per rollout = 0.3-2.5
 # chain episodes per rollout. Much higher per-update signal density than
 # flat sandbox.
-TOTAL_STEPS=1914880
+TOTAL_STEPS=2017280
 
 echo "[runchain] RUN_NAME=${RUN_NAME}"
 echo "[runchain] INIT_CKPT=${INIT_CKPT}"

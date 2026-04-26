@@ -1,5 +1,8 @@
-"""Compatibility wrapper for the archived MuZero MCTS stack."""
+"""Compatibility wrapper for the MuZero MCTS stack.
+
+Prefer new imports from ``muzero.sts2_env.mcts``.
+"""
 
 from __future__ import annotations
 
-from legacy.sts2_env.mcts import *  # noqa: F401,F403
+from muzero.sts2_env.mcts import *  # noqa: F401,F403

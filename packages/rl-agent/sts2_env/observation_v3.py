@@ -1,4 +1,4 @@
-"""Token-world observation encoder for the omni-attention online policy."""
+﻿"""Token-world observation encoder for the omni-attention online policy."""
 
 from __future__ import annotations
 
@@ -14,18 +14,55 @@ from content_registry import (
 )
 
 from . import observation_common as obs_common
+from .boss_mechanics import build_boss_mechanics_context, enemy_mechanics_key
+from .hand_mutation import (
+    infer_hand_mutation,
+    mutation_summary_numeric,
+    mutation_target_numeric,
+    post_hand_preview_numeric,
+)
+from .potion_profiles import (
+    DEFAULT_EFFECT_PROFILE,
+    get_potion_profile as _get_potion_profile,
+    potion_is_enabled_for_training as _potion_enabled,
+)
 from .text_encoder import TEXT_DIM
+
+
+def _resolve_potion_effect(potion: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge bridge live effect_profile with the Python registry (bridge wins).
+
+    Returns (profile_entry, effect_profile_dict) — profile_entry includes
+    effect_family/timing_tags/etc; effect_profile_dict is the numeric slots.
+    """
+    if not isinstance(potion, dict):
+        return ({}, dict(DEFAULT_EFFECT_PROFILE))
+    pid = str(potion.get("id") or "").strip()
+    registry_entry = _get_potion_profile(pid) if pid else {}
+    base_effect = dict(DEFAULT_EFFECT_PROFILE)
+    base_effect.update(registry_entry.get("effect_profile") or {})
+    bridge_effect = potion.get("effect_profile")
+    if isinstance(bridge_effect, dict):
+        base_effect.update({k: v for k, v in bridge_effect.items() if v is not None})
+    merged_entry = dict(registry_entry)
+    for key in ("effect_family", "semantic_tags", "timing_tags", "training_tags", "target_scope"):
+        live_val = potion.get(key)
+        if live_val:
+            merged_entry[key] = live_val
+    if "enabled_for_training" in potion:
+        merged_entry["enabled_for_training"] = bool(potion["enabled_for_training"])
+    return (merged_entry, base_effect)
 
 MAX_ACTIONS = obs_common.MAX_ACTIONS
 # Phase 6 (attention_obs_v3): +64 tokens for dedicated POWER_SLOT /
 # CARD_KEYWORD tokens, split out of the entity numeric inlining. At typical
-# STS2 scale we see <= 35 active powers (player + 4 enemies × 5 powers) and
+# STS2 scale we see <= 35 active powers (player + 4 enemies 脳 5 powers) and
 # a handful of card-keyword tokens; 64 is comfortable headroom.
 # Phase 8 Tier 1 (attention_obs_v4): +28 HISTORY tokens (20 step-detail +
 # 8 turn-summary) so the policy can reason about "what did I just do"
 # without needing a recurrent architecture. See action_history.py.
 MAX_WORLD_TOKENS = 412
-MAX_CANDIDATE_LOCAL_TOKENS = 24
+MAX_CANDIDATE_LOCAL_TOKENS = 32
 TOKEN_NUMERIC_DIM = 96
 TOKEN_TEXT_DIM = 64
 TOKEN_FEAT_DIM = TOKEN_NUMERIC_DIM + TOKEN_TEXT_DIM
@@ -38,7 +75,7 @@ MAX_ORDER_ID = 63
 OBSERVATION_API_VERSION = "attention_obs_v4"
 
 # Maximum number of POWER_SLOT tokens emitted per step. Covers the typical
-# worst case (3-5 player buffs + 4 enemies × 5 powers each ≈ 25-30) with
+# worst case (3-5 player buffs + 4 enemies 脳 5 powers each 鈮?25-30) with
 # headroom. Anything beyond is dropped by emission order.
 MAX_POWER_SLOT_TOKENS = 40
 # Bucket space for power_id categorical embedding. STS2 has ~50 canonical
@@ -61,7 +98,7 @@ from .action_history import (
 # Phase 6.4: per-card keyword tokens (Retain/Ethereal/Exhaust/Innate/...).
 # Previously these were bitflags buried inside HAND_CARD numerics; breaking
 # them out lets attention learn per-keyword patterns like "Ethereal +
-# unplayed + end-of-turn approaching → penalty" directly.
+# unplayed + end-of-turn approaching 鈫?penalty" directly.
 MAX_CARD_KEYWORD_SLOTS = 16
 # Stable bucket ids for card-keyword categorical embedding. Source: the
 # content_registry semantic_tags vocabulary; only keywords that affect
@@ -79,6 +116,11 @@ _CARD_KEYWORD_BUCKETS: dict[str, int] = {
     "add_to_hand": 10,
     "upgrade_self": 11,
     "add_to_draw": 12,
+    "bound": 13,
+    "card_lock": 14,
+    "cost_lock": 15,
+    "forced_play": 16,
+    "temporary": 17,
 }
 
 OWNER_NONE = 0
@@ -93,7 +135,7 @@ OWNER_DECK = 45
 OWNER_RELIC = 50
 OWNER_POTION = 51
 # v3: distinguish power-owned slots from their host entity so attention
-# can route power→card edges without colliding with entity→card routing.
+# can route power鈫抍ard edges without colliding with entity鈫抍ard routing.
 OWNER_POWER = 52
 # Phase 8 Tier 1: dedicated owner id for HISTORY tokens so the
 # owner_pair_bias can learn "history-to-candidate" edges distinct from
@@ -191,6 +233,14 @@ TOKEN_TYPES = [
     # them cleanly without also sweeping in entity-hosted tokens.
     "HISTORY_STEP_DETAIL",
     "HISTORY_TURN_SUMMARY",
+    # v5: append-only so old token_type ids stay stable for warm-starts.
+    "HAND_MUTATION_LOCAL",
+    "HAND_MUTATION_TARGET_LOCAL",
+    "POST_HAND_PREVIEW_LOCAL",
+    # v6: action-local counterfactuals for loop-aware combat policy.
+    "CARD_FLOW_COUNTERFACTUAL_LOCAL",
+    "END_TURN_HAND_FLOW_LOCAL",
+    "ENERGY_CHAIN_LOCAL",
 ]
 TOKEN_TYPE_TO_ID = {name: idx for idx, name in enumerate(TOKEN_TYPES)}
 NUM_TOKEN_TYPES = len(TOKEN_TYPES)
@@ -273,7 +323,7 @@ TOKEN_ZONES = [
     "UPGRADE",
     "SELECTION",
     # v4: dedicated zone for HISTORY tokens. Lets the world_bank_router
-    # pick up history tokens via zone==HISTORY AND/OR role==HISTORY —
+    # pick up history tokens via zone==HISTORY AND/OR role==HISTORY 鈥?
     # the bank definition in omni_attention_policy uses role-only so
     # adding this zone entry doesn't sweep any existing tokens into the
     # history bank.
@@ -291,33 +341,33 @@ MAX_ZONE_ID = len(TOKEN_ZONES) - 1
 # damage dealt / damage taken / block / draw / energy / stacks. Encoding
 # those coefficients directly into each POWER_SLOT token's numeric
 # vector lets attention LEARN interactions (e.g. "this card's damage
-# input × target's incoming_dmg_mult") without having to memorize
+# input 脳 target's incoming_dmg_mult") without having to memorize
 # the combinatorial lookup table.
 #
 # All coefficients are *additive deltas from neutral 1.0/0.0*. Neutral
 # tokens (PAD, unknown) read zeros.
 #
 # Fields per power (indexed slot in the numeric vector):
-#   0:  damage_mult_given     — multiplier on damage THIS creature deals
+#   0:  damage_mult_given     鈥?multiplier on damage THIS creature deals
 #                                (e.g. Weak: -0.25; no effect: 0.0)
-#   1:  damage_flat_given     — additive damage per hit (Strength: +1/stack)
-#   2:  damage_mult_received  — multiplier on damage THIS creature receives
+#   1:  damage_flat_given     鈥?additive damage per hit (Strength: +1/stack)
+#   2:  damage_mult_received  鈥?multiplier on damage THIS creature receives
 #                                (Vulnerable: +0.5; Intangible: -0.75)
-#   3:  damage_flat_received  — additive damage reduction (Buffer: absorb)
-#   4:  block_mult_given      — multiplier on block THIS creature grants
+#   3:  damage_flat_received  鈥?additive damage reduction (Buffer: absorb)
+#   4:  block_mult_given      鈥?multiplier on block THIS creature grants
 #                                (Frail: -0.25)
-#   5:  block_flat_given      — additive block (Dexterity: +1/stack)
-#   6:  block_persistent      — 1.0 if block persists across turns
+#   5:  block_flat_given      鈥?additive block (Dexterity: +1/stack)
+#   6:  block_persistent      鈥?1.0 if block persists across turns
 #                                (Barricade)
-#   7:  end_of_turn_dmg_self  — self-damage at turn end (Poison on owner
-#                                → stacks dealt to self each enemy turn)
-#   8:  end_of_turn_dmg_given — damage dealt at turn end to attackers
+#   7:  end_of_turn_dmg_self  鈥?self-damage at turn end (Poison on owner
+#                                鈫?stacks dealt to self each enemy turn)
+#   8:  end_of_turn_dmg_given 鈥?damage dealt at turn end to attackers
 #                                (Thorns, Plated Armor)
-#   9:  stacks_on_applied     — counter (1=stacks accumulate, 0=duration)
-#   10: decays_each_turn      — 1 if Amount decreases each owner turn (most
+#   9:  stacks_on_applied     鈥?counter (1=stacks accumulate, 0=duration)
+#   10: decays_each_turn      鈥?1 if Amount decreases each owner turn (most
 #                                debuffs: Vulnerable, Weak, Frail, Poison)
-#   11: is_buff               — classification (1 buff, 0 debuff/neutral)
-#   12: is_debuff             — (1 debuff, 0 buff/neutral)
+#   11: is_buff               鈥?classification (1 buff, 0 debuff/neutral)
+#   12: is_debuff             鈥?(1 debuff, 0 buff/neutral)
 #
 # All unmentioned powers default to zeros (no algebraic effect
 # surfaced). Attention can still learn from their power_id bucket + text.
@@ -353,7 +403,7 @@ def _power_algebra(power_id: str) -> tuple[float, ...]:
     """Return the 13-dim effect-algebra vector for a canonical power id.
 
     Unknown/mod powers return all-zeros so attention falls back to the
-    power_id bucket + text features alone — safe degradation, no crash.
+    power_id bucket + text features alone 鈥?safe degradation, no crash.
     """
     if not power_id:
         return (0.0,) * _POWER_ALGEBRA_DIM
@@ -373,7 +423,7 @@ def _power_id_bucket(power_id: str) -> int:
     if not power_id:
         return 0
     pid = power_id.upper()
-    # Canonical powers occupy buckets 1..len(_POWER_ALGEBRA) — reserve 0
+    # Canonical powers occupy buckets 1..len(_POWER_ALGEBRA) 鈥?reserve 0
     # for PAD / unknown-collision.
     canonical_order = sorted(_POWER_ALGEBRA.keys())
     if pid in _POWER_ALGEBRA:
@@ -479,6 +529,12 @@ def _role_for_token(token_type: str) -> int:
         "ENEMY_REACTIVE_TRAIT": "ENEMY_TRAIT",
         "ENEMY_PHASE_RULE": "ENEMY_TRAIT",
         "TARGET_REACTION_LOCAL": "ENEMY_REACTION",
+        "HAND_MUTATION_LOCAL": "SOURCE_CARD",
+        "HAND_MUTATION_TARGET_LOCAL": "HAND_CARD",
+        "POST_HAND_PREVIEW_LOCAL": "PREVIEW_RESULT",
+        "CARD_FLOW_COUNTERFACTUAL_LOCAL": "CYCLE_PLAN",
+        "END_TURN_HAND_FLOW_LOCAL": "CYCLE_PLAN",
+        "ENERGY_CHAIN_LOCAL": "ENERGY_BUDGET",
         "COMBAT_CANDIDATE": "QUERY_COMBAT",
         "BUILD_CANDIDATE": "QUERY_BUILD",
         "SELECTION_CANDIDATE": "QUERY_SELECTION",
@@ -553,6 +609,12 @@ def _zone_for_token(token_type: str) -> int:
         "ENEMY_PHASE_RULE": "ENEMY",
         "TARGET_LOCAL": "ENEMY",
         "TARGET_REACTION_LOCAL": "ENEMY",
+        "HAND_MUTATION_LOCAL": "HAND",
+        "HAND_MUTATION_TARGET_LOCAL": "HAND",
+        "POST_HAND_PREVIEW_LOCAL": "HAND",
+        "CARD_FLOW_COUNTERFACTUAL_LOCAL": "HAND",
+        "END_TURN_HAND_FLOW_LOCAL": "HAND",
+        "ENERGY_CHAIN_LOCAL": "PLAYER",
         "COMBAT_CANDIDATE": "HAND",
         "BUILD_CANDIDATE": "REWARD",
         "SELECTION_CANDIDATE": "SELECTION",
@@ -596,6 +658,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         self._buf_candidate = self._alloc_flat_bufs(MAX_ACTIONS)
         self._buf_candidate_local = self._alloc_nested_bufs(MAX_ACTIONS, MAX_CANDIDATE_LOCAL_TOKENS)
         self._current_planner_context: dict[str, Any] | None = None
+        self._current_boss_context: dict[str, Any] | None = None
 
     @staticmethod
     def _alloc_flat_bufs(n):
@@ -679,6 +742,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             self._begin_text_registry()
             features = self._build_feature_view(obs_dict, action_list, planner_context)
             self._current_planner_context = planner_context
+            self._current_boss_context = build_boss_mechanics_context(obs_dict)
             self._append_global_tokens(world_entries, obs_dict, features, planner_context)
             self._append_entity_tokens(world_entries, obs_dict, features, planner_context)
             # v3: POWER_SLOT tokens split out of entity-inlined numerics.
@@ -762,12 +826,14 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "candidate_local_zone_ids": candidate_local_zone_ids,
                 "candidate_local_order_ids": candidate_local_order_ids,
                 "action_mask": action_mask,
+                "decision_domain": features["decision_domain"],
             }
         except Exception:
             self._clear_text_registry()
             raise
         finally:
             self._current_planner_context = None
+            self._current_boss_context = None
 
     def _build_feature_view(
         self,
@@ -1402,6 +1468,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             for enemy in enemies
             if isinstance(enemy, dict)
         )
+        boss_player_state = self._boss_player_state()
 
         player_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
         player_numeric[0] = min(hp / max(max_hp, 1.0), 1.0) if max_hp > 0 else 0.0
@@ -1410,6 +1477,28 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         player_numeric[3] = obs_common._log_norm(incoming, obs_common._LOG1P_200)
         player_numeric[4] = obs_common._signed_log_norm(hp + block - incoming, obs_common._LOG1P_200)
         player_numeric[5 : 5 + min(obs_common.POWER_DIM, TOKEN_NUMERIC_DIM - 5)] = features["player_powers"][: TOKEN_NUMERIC_DIM - 5]
+        player_numeric[29] = float(boss_player_state.get("facing_left", 0.0))
+        player_numeric[30] = float(boss_player_state.get("facing_right", 0.0))
+        player_numeric[31] = float(boss_player_state.get("sandpit_active", 0.0))
+        player_numeric[32] = float(boss_player_state.get("sandpit_turns_norm", 0.0))
+        player_numeric[33] = float(boss_player_state.get("ringing_active", 0.0))
+        player_numeric[34] = float(boss_player_state.get("ringing_amount_norm", 0.0))
+        player_numeric[35] = float(boss_player_state.get("chains_active", 0.0))
+        player_numeric[36] = float(boss_player_state.get("bound_active", 0.0))
+        player_numeric[37] = float(boss_player_state.get("hunger_active", 0.0))
+        player_numeric[38] = float(boss_player_state.get("scrutiny_active", 0.0))
+        player_numeric[39] = float(boss_player_state.get("grasp_active", 0.0))
+        player_numeric[40] = float(boss_player_state.get("frantic_escape_hand_norm", 0.0))
+        player_numeric[41] = float(boss_player_state.get("frantic_escape_draw_norm", 0.0))
+        player_numeric[42] = float(boss_player_state.get("frantic_escape_discard_norm", 0.0))
+        player_numeric[43] = float(boss_player_state.get("frantic_escape_total_norm", 0.0))
+        player_numeric[44] = float(boss_player_state.get("escape_card_available", 0.0))
+        player_numeric[45] = float(boss_player_state.get("play_budget_lock", 0.0))
+        player_numeric[46] = float(boss_player_state.get("doormaker_lock_pressure", 0.0))
+        player_numeric[47] = float(boss_player_state.get("back_attack_risk", 0.0))
+        player_numeric[48] = float(boss_player_state.get("linked_support_alive", 0.0))
+        player_numeric[49] = float(boss_player_state.get("countdown_active", 0.0))
+        player_numeric[50] = float(boss_player_state.get("escape_card_tax", 0.0))
         entries.append(self._entry("PLAYER_STATE_LOCAL", player_numeric, owner_id=OWNER_PLAYER, entity_id=0))
 
         energy_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
@@ -1431,6 +1520,19 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         energy_numeric[11] = min(obs_common._float(combat.get("stars")) / 10.0, 1.0)
         energy_numeric[12] = features["actions"][action_index, 39] if features["actions"].shape[1] > 39 else 0.0
         energy_numeric[13] = features["actions"][action_index, 48] if features["actions"].shape[1] > 48 else 0.0
+        energy_numeric[14] = float(boss_player_state.get("play_budget_lock", 0.0))
+        energy_numeric[15] = float(boss_player_state.get("doormaker_lock_pressure", 0.0))
+        energy_numeric[16] = float(boss_player_state.get("sandpit_active", 0.0))
+        energy_numeric[17] = float(boss_player_state.get("sandpit_turns_norm", 0.0))
+        energy_numeric[18] = float(boss_player_state.get("frantic_escape_hand_norm", 0.0))
+        energy_numeric[19] = float(boss_player_state.get("frantic_escape_total_norm", 0.0))
+        energy_numeric[20] = float(boss_player_state.get("escape_card_available", 0.0))
+        energy_numeric[21] = float(boss_player_state.get("back_attack_risk", 0.0))
+        energy_numeric[22] = float(boss_player_state.get("countdown_active", 0.0))
+        energy_numeric[23] = float(boss_player_state.get("escape_card_tax", 0.0))
+        energy_numeric[24] = float((boss_player_state.get("play_budget_lock", 0.0) > 0.0) and current_energy > 0.0)
+        energy_numeric[25] = float((boss_player_state.get("sandpit_active", 0.0) > 0.0) and (source_profile["damage"] > 0.0))
+        energy_numeric[26] = float((boss_player_state.get("escape_card_available", 0.0) > 0.0) and (source_profile["draw"] > 0.0 or source_profile["energy"] > 0.0))
         entries.append(self._entry("ENERGY_CONTEXT_LOCAL", energy_numeric, owner_id=OWNER_PLAYER, entity_id=0))
         energy_plan_entries: list[dict[str, Any]] = []
         self._append_energy_budget_local(energy_plan_entries, obs, features, action, source_profile)
@@ -1470,11 +1572,22 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "play",
         )
 
+
+        hand_mutation_entries: list[dict[str, Any]] = []
+        self._append_hand_mutation_locals(
+            hand_mutation_entries,
+            obs,
+            source_card,
+            current_energy=current_energy,
+        )
+
         binding_entries: list[dict[str, Any]] = []
         self._append_source_pile_binding_locals(binding_entries, obs, source_card)
 
         cycle_entries: list[dict[str, Any]] = []
         self._append_cycle_plan_local(cycle_entries, obs, action, source_card)
+        self._append_card_flow_counterfactual_local(cycle_entries, obs, action, source_card, source_profile, current_energy)
+        self._append_energy_chain_local(cycle_entries, obs, action, source_profile, current_energy)
 
         peek_entries: list[dict[str, Any]] = []
         self._append_pile_peek_locals(
@@ -1521,6 +1634,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         )
 
         self._extend_with_budget(entries, energy_plan_entries, limit=1)
+        self._extend_with_budget(entries, hand_mutation_entries, limit=5)
         self._extend_with_budget(entries, cycle_entries, limit=1)
         self._extend_with_budget(entries, pile_summary_entries, limit=4)
         self._extend_with_budget(
@@ -1542,6 +1656,195 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             scorer=lambda entry: float(entry["numeric"][0]),
         )
         self._extend_with_budget(entries, support_graph_entries, limit=1)
+
+
+    def _append_card_flow_counterfactual_local(
+        self,
+        entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+        action: dict[str, Any],
+        source_card: dict[str, Any] | None,
+        source_profile: dict[str, float],
+        current_energy: float,
+    ) -> None:
+        combat = obs.get("combat") or {}
+        hand_cards = self._runtime_cards(obs, "hand", "hand_cards")
+        draw_cards = self._runtime_cards(obs, "draw_pile", "draw_preview_cards")
+        discard_cards = self._runtime_cards(obs, "discard_pile", "discard_cards")
+        exhaust_cards = self._runtime_cards(obs, "exhaust_pile", "exhaust_cards")
+        if str(action.get("action_id") or "").lower() == "end_turn" or str((action.get("semantic") or {}).get("family") or "").lower() == "end_turn":
+            numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+            ethereal_count = 0.0
+            retain_count = 0.0
+            exhaust_count = 0.0
+            total_cost = 0.0
+            playable_cost = 0.0
+            for card in hand_cards:
+                profile = self._source_profile(card)
+                text = self._source_text(card)
+                ethereal_count += profile["ethereal"]
+                retain_count += profile["retain"]
+                exhaust_count += profile["exhaust"]
+                total_cost += profile["cost"]
+                playable_cost += float(profile["cost"] <= current_energy or profile["zero_cost"] > 0.5)
+            numeric[0] = min(len(hand_cards) / 10.0, 1.0)
+            numeric[1] = min(draw_cards.__len__() / 30.0, 1.0)
+            numeric[2] = min(discard_cards.__len__() / 30.0, 1.0)
+            numeric[3] = min(exhaust_cards.__len__() / 20.0, 1.0)
+            numeric[4] = min(ethereal_count / 5.0, 1.0)
+            numeric[5] = min(retain_count / 5.0, 1.0)
+            numeric[6] = min(exhaust_count / 5.0, 1.0)
+            numeric[7] = min(playable_cost / 10.0, 1.0)
+            numeric[8] = obs_common._log_norm(total_cost, obs_common._LOG1P_100)
+            numeric[9] = float(len(draw_cards) <= 3 and len(discard_cards) > 0)
+            numeric[10] = float(len(hand_cards) > 0 and current_energy > 0.0)
+            entries.append(self._entry("END_TURN_HAND_FLOW_LOCAL", numeric, owner_id=OWNER_PLAYER, entity_id=0, text="end_turn hand flow: unplayed non-ethereal cards move toward discard; retain stays; ethereal/exhaust leaves loop"))
+            return
+        if not isinstance(source_card, dict):
+            return
+        numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+        text = self._source_text(source_card)
+        exhausts = source_profile["exhaust"] > 0.5 or "exhaust" in text
+        ethereal = source_profile["ethereal"] > 0.5 or "ethereal" in text
+        retain = source_profile["retain"] > 0.5 or "retain" in text
+        power = source_profile["power"] > 0.5
+        cost = source_profile["cost"]
+        energy_after = current_energy - cost + source_profile["energy"] - source_profile.get("energy_loss", 0.0)
+        numeric[0] = float(exhausts)
+        numeric[1] = float(power)
+        numeric[2] = float(not exhausts and not power)
+        numeric[3] = float(retain)
+        numeric[4] = float(ethereal)
+        numeric[5] = min(len(draw_cards) / 30.0, 1.0)
+        numeric[6] = min(len(discard_cards) / 30.0, 1.0)
+        numeric[7] = min(len(exhaust_cards) / 20.0, 1.0)
+        numeric[8] = float(len(draw_cards) <= 3 and len(discard_cards) > 0)
+        numeric[9] = float(exhausts and not ethereal)
+        numeric[10] = float(exhausts and source_profile["draw"] <= 0.0 and source_profile["energy"] <= 0.0)
+        numeric[11] = obs_common._signed_log_norm(energy_after, obs_common._LOG1P_100)
+        numeric[12] = min(source_profile["damage"] / 80.0, 1.0)
+        numeric[13] = min(source_profile["block"] / 80.0, 1.0)
+        numeric[14] = min(source_profile["draw"] / 5.0, 1.0)
+        numeric[15] = min(source_profile["energy"] / 5.0, 1.0)
+        numeric[16] = min(source_profile.get("energy_loss", 0.0) / 5.0, 1.0)
+        numeric[17] = float(source_profile.get("strategic_skip_value", 0.0) > 0.5)
+        entries.append(self._entry("CARD_FLOW_COUNTERFACTUAL_LOCAL", numeric, owner_id=OWNER_HAND, entity_id=_stable_bucket((source_card.get("id") if isinstance(source_card, dict) else None) or (source_card.get("title") if isinstance(source_card, dict) else None) or "flow"), text="play_now destination vs skip/end_turn loop counterfactual"))
+
+    def _append_energy_chain_local(
+        self,
+        entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+        action: dict[str, Any],
+        source_profile: dict[str, float],
+        current_energy: float,
+    ) -> None:
+        if str(action.get("action_id") or "").lower() == "end_turn":
+            return
+        combat = obs.get("combat") or {}
+        hand_cards = self._runtime_cards(obs, "hand", "hand_cards")
+        cost = source_profile["cost"]
+        energy_gain = source_profile["energy"]
+        energy_loss = source_profile.get("energy_loss", 0.0)
+        energy_after = max(0.0, current_energy - cost + energy_gain - energy_loss)
+        followup_count = 0.0
+        followup_damage = 0.0
+        followup_block = 0.0
+        for card in hand_cards:
+            profile = self._source_profile(card)
+            if profile["cost"] <= energy_after + 1e-6 and card is not action.get("card"):
+                followup_count += 1.0
+                followup_damage = max(followup_damage, profile["damage"])
+                followup_block = max(followup_block, profile["block"])
+        numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
+        numeric[0] = min(current_energy / 10.0, 1.0)
+        numeric[1] = min(cost / 5.0, 1.0)
+        numeric[2] = min(energy_gain / 5.0, 1.0)
+        numeric[10] = min(energy_loss / 5.0, 1.0)
+        numeric[3] = obs_common._signed_log_norm(energy_after, obs_common._LOG1P_100)
+        numeric[4] = min(followup_count / 10.0, 1.0)
+        numeric[5] = min(followup_damage / 80.0, 1.0)
+        numeric[6] = min(followup_block / 80.0, 1.0)
+        numeric[7] = float(source_profile["x_cost"] > 0.5 and current_energy <= 0.0)
+        numeric[8] = float(energy_gain > 0.0 and followup_count <= 0.0)
+        numeric[9] = min(source_profile["hp_loss"] / 20.0, 1.0)
+        numeric[11] = float(source_profile.get("strategic_skip_value", 0.0) > 0.5)
+        entries.append(self._entry("ENERGY_CHAIN_LOCAL", numeric, owner_id=OWNER_PLAYER, entity_id=0, text="energy spend/gain follow-up chain and zero-energy x-cost affordance"))
+
+    def _append_hand_mutation_locals(
+        self,
+        entries: list[dict[str, Any]],
+        obs: dict[str, Any],
+        source_card: dict[str, Any] | None,
+        *,
+        current_energy: float = 0.0,
+    ) -> None:
+        """Expose generic action->hand mutation affordances as local tokens.
+
+        This is intentionally not card-name-specific: Armaments, cost reducers,
+        hand exhaust/discard/transform/copy/retain effects, draw/add/return-to-
+        hand effects all flow through the same summary/target/post-preview
+        structure.  The policy can cross-attend source action <-> current hand
+        cards <-> post-hand preview without requiring MCTS to discover the
+        intermediate hand state.
+        """
+        if not isinstance(source_card, dict):
+            return
+        hand_cards = self._runtime_cards(obs, "hand", "hand_cards")
+        combat = obs.get("combat") or {}
+        plan = infer_hand_mutation(
+            source_card,
+            hand_cards,
+            self._runtime_cards(obs, "draw_pile", "draw_preview_cards"),
+            self._runtime_cards(obs, "discard_pile", "discard_cards"),
+            self._runtime_cards(obs, "exhaust_pile", "exhaust_cards"),
+            current_energy=current_energy,
+        )
+        if not plan.will_mutate_hand:
+            return
+
+        source_key = source_card.get("id") or source_card.get("title") or "hand-mutation"
+        summary = np.asarray(mutation_summary_numeric(plan), dtype=np.float32)
+        entries.append(
+            self._entry(
+                "HAND_MUTATION_LOCAL",
+                summary,
+                owner_id=OWNER_HAND,
+                zone_id=TOKEN_ZONE_TO_ID["HAND"],
+                entity_id=_stable_bucket(f"hand-mut:{source_key}"),
+                order_id=1,
+                text=f"hand mutation | {self._build_live_card_text(source_card)}",
+            )
+        )
+
+        post = np.asarray(post_hand_preview_numeric(plan), dtype=np.float32)
+        entries.append(
+            self._entry(
+                "POST_HAND_PREVIEW_LOCAL",
+                post,
+                owner_id=OWNER_HAND,
+                zone_id=TOKEN_ZONE_TO_ID["HAND"],
+                entity_id=_stable_bucket(f"post-hand:{source_key}"),
+                order_id=2,
+                text=f"post hand preview | {self._build_live_card_text(source_card)}",
+            )
+        )
+
+        for rank, target in enumerate(plan.targets[:6], start=1):
+            if not target.affected and rank > 2:
+                continue
+            row = np.asarray(mutation_target_numeric(target), dtype=np.float32)
+            card = target.card
+            entries.append(
+                self._entry(
+                    "HAND_MUTATION_TARGET_LOCAL",
+                    row,
+                    owner_id=OWNER_HAND,
+                    zone_id=TOKEN_ZONE_TO_ID["HAND"],
+                    entity_id=_stable_bucket(card.get("id") or card.get("title") or f"hand-target:{target.index}"),
+                    order_id=min(target.index + 1, MAX_ORDER_ID),
+                    text=f"hand mutation target | {self._build_live_card_text(card)}",
+                )
+            )
 
     def _append_selection_candidate_context(
         self,
@@ -1704,7 +2007,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 hp_delta = obs_common._float(deltas.get("hp_delta"))
                 max_hp_delta = obs_common._float(deltas.get("max_hp_delta"))
                 gold_delta = obs_common._float(deltas.get("gold_delta"))
-                # Signed normalized — positive = gain, negative = loss.
+                # Signed normalized 鈥?positive = gain, negative = loss.
                 build_numeric[56] = max(-1.0, min(hp_delta / player_max_hp, 1.0))
                 build_numeric[57] = obs_common._signed_log_norm(max_hp_delta, obs_common._LOG1P_100)
                 build_numeric[58] = obs_common._signed_log_norm(gold_delta, obs_common._LOG1P_500)
@@ -2391,6 +2694,24 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         numeric[15] = max(reactions["artifact"], reactions["buffer"], reactions["intangible"])
         numeric[16] = float(source_profile["weak"] > 0.0 or source_profile["vulnerable"] > 0.0)
         numeric[17] = float(source_profile["aoe_target"] > 0.0)
+        numeric[18] = reactions["incoming_damage_multiplier"]
+        numeric[19] = reactions["back_attack"]
+        numeric[20] = reactions["damage_cap"]
+        numeric[21] = reactions["damage_cap_value"]
+        numeric[22] = reactions["deathburst"]
+        numeric[23] = reactions["deathburst_damage"]
+        numeric[24] = reactions["revive"]
+        numeric[25] = reactions["transform"]
+        numeric[26] = reactions["linked_support_alive"]
+        numeric[27] = reactions["special_phase"]
+        numeric[28] = reactions["one_card_lock"]
+        numeric[29] = reactions["skill_punish"]
+        numeric[30] = reactions["choice_debuffs"]
+        numeric[31] = reactions["escape_card_tax"]
+        numeric[32] = reactions["countdown"]
+        numeric[33] = reactions["stun_window"]
+        numeric[34] = reactions["binding_control"]
+        numeric[35] = reactions["wound_phase"]
         entries.append(
             self._entry(
                 "TARGET_REACTION_LOCAL",
@@ -2398,7 +2719,14 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 owner_id=self._enemy_owner_id(target_enemy_index),
                 entity_id=_stable_bucket(self._enemy_entity_key(target_enemy, target_enemy_index)),
                 order_id=24,
-                text=f"target reaction | thorns {reactions['thorns']:.0f} | threshold {reactions['threshold']:.0f}",
+                text=(
+                    "target reaction"
+                    f" | thorns {reactions['thorns']:.0f}"
+                    f" | threshold {reactions['threshold']:.0f}"
+                    f" | back {reactions['back_attack']:.0f}"
+                    f" | cap {reactions['damage_cap']:.0f}"
+                    f" | burst {reactions['deathburst']:.0f}"
+                ),
             )
         )
 
@@ -2514,12 +2842,12 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         into first-class tokens. Each token exposes the power's categorical
         id (via entity_id bucket) and its effect-algebra coefficients (via
         numeric vector) so that attention can learn interactions directly
-        (e.g. "this card's damage × target's damage_mult_received").
+        (e.g. "this card's damage 脳 target's damage_mult_received").
 
         The original inline power features in PLAYER_SURVIVAL / ENEMY tokens
         are preserved for back-compat; POWER_SLOT tokens add a richer
         per-power view on top. Phase 6.2/6.3 will wire a dedicated POWER
-        bank + effect_class × target_power_bucket relational bias that
+        bank + effect_class 脳 target_power_bucket relational bias that
         consumes these tokens exclusively.
         """
         emitted = 0
@@ -2582,17 +2910,87 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     )
                     emitted += 1
 
+    def _runtime_card_modifier_tags(self, card: dict[str, Any]) -> list[str]:
+        tags: list[str] = []
+        for field_name in ("afflictions", "enchantments", "modifiers", "card_modifiers"):
+            modifiers = card.get(field_name)
+            if not isinstance(modifiers, list):
+                continue
+            for modifier in modifiers[:8]:
+                if isinstance(modifier, dict):
+                    semantic_tags = modifier.get("semantic_tags")
+                    if isinstance(semantic_tags, list):
+                        for tag in semantic_tags:
+                            tag_text = str(tag or "").strip().lower()
+                            if tag_text in {"adds_retain", "retain"}:
+                                tags.append("retain")
+                            elif tag_text in {"adds_ethereal", "ethereal"}:
+                                tags.append("ethereal")
+                            elif tag_text in {"adds_exhaust", "exhaust", "exhaust_self"}:
+                                tags.append("exhaust_self")
+                            elif tag_text in {"removes_exhaust"}:
+                                tags.append("purge")
+                            elif tag_text in {"cost_randomizes_on_draw", "cost_reduction_until_played", "sets_cost_zero", "energy_loss_on_play"}:
+                                tags.append("cost_lock")
+                            elif tag_text in {"autoplay_round_1"}:
+                                tags.append("forced_play")
+                    semantic_values = modifier.get("semantic_values")
+                    if isinstance(semantic_values, dict):
+                        if semantic_values.get("adds_retain"):
+                            tags.append("retain")
+                        if semantic_values.get("adds_ethereal"):
+                            tags.append("ethereal")
+                        if semantic_values.get("adds_exhaust"):
+                            tags.append("exhaust_self")
+                        if semantic_values.get("removes_exhaust"):
+                            tags.append("purge")
+                        if semantic_values.get("autoplay_round_1"):
+                            tags.append("forced_play")
+                        if any(semantic_values.get(key) for key in ("energy_loss_on_play", "cost_randomizes_on_draw", "cost_reduction_until_played", "sets_cost_zero")):
+                            tags.append("cost_lock")
+                    joined = " ".join(
+                        str(modifier.get(key) or "")
+                        for key in ("id", "title", "type", "description", "kind")
+                    ).lower()
+                else:
+                    joined = str(modifier or "").lower()
+                if not joined.strip():
+                    continue
+                if any(token in joined for token in ("bind", "bound", "chain", "shackle")):
+                    tags.append("bound")
+                if any(token in joined for token in ("lock", "forbid", "disabled", "unplayable", "can't play", "cannot play")):
+                    tags.append("card_lock")
+                if any(token in joined for token in ("cost", "energy")) and any(token in joined for token in ("lock", "increase", "reduce", "set")):
+                    tags.append("cost_lock")
+                if any(token in joined for token in ("forced", "must play", "required")):
+                    tags.append("forced_play")
+                if any(token in joined for token in ("temporary", "this turn", "until", "expire")):
+                    tags.append("temporary")
+                if "retain" in joined:
+                    tags.append("retain")
+                if "ethereal" in joined:
+                    tags.append("ethereal")
+                if "exhaust" in joined:
+                    tags.append("exhaust_self")
+                if "purge" in joined or "remove" in joined:
+                    tags.append("purge")
+        deduped: list[str] = []
+        for tag in tags:
+            if tag in _CARD_KEYWORD_BUCKETS and tag not in deduped:
+                deduped.append(tag)
+        return deduped
+
     def _append_card_keyword_slot_tokens(
         self,
         world_entries: list[dict[str, Any]],
         obs: dict[str, Any],
     ) -> None:
-        """Emit one CARD_KEYWORD_SLOT token per (hand card × recognized
+        """Emit one CARD_KEYWORD_SLOT token per (hand card 脳 recognized
         keyword) pair.
 
         Looks up each hand card's semantic_tags in content_registry and
         emits a token per matched keyword. owner_id = OWNER_HAND + card
-        position so attention can route keyword → source card binding.
+        position so attention can route keyword 鈫?source card binding.
         entity_id = keyword bucket id (shared categorical space with the
         POWER_ID vocabulary via distinct low-end numbering).
         """
@@ -2615,23 +3013,22 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             if not isinstance(card, dict):
                 continue
             card_id = str(card.get("id") or "")
-            if not card_id:
-                continue
-            md = get_card_metadata(card_id)
-            if not isinstance(md, dict):
-                continue
-            tags = md.get("semantic_tags") or []
+            md = get_card_metadata(card_id) if card_id else None
+            tags = md.get("semantic_tags") if isinstance(md, dict) else []
             if not isinstance(tags, list):
-                continue
+                tags = []
 
-            # Also fold explicit card.keywords (from sim translator) in case
-            # some mod cards carry keywords but no content_registry entry.
+            # Also fold explicit card.keywords (from sim translator/live bridge)
+            # and runtime per-card modifier tags from boss/event effects.
             card_keywords = card.get("keywords") or []
+            modifier_tags = self._runtime_card_modifier_tags(card)
             all_tags: list[str] = []
-            for t in list(tags) + list(card_keywords if isinstance(card_keywords, list) else []):
+            for t in list(tags) + list(card_keywords if isinstance(card_keywords, list) else []) + modifier_tags:
                 t_norm = str(t).strip().lower()
                 if t_norm in _CARD_KEYWORD_BUCKETS and t_norm not in all_tags:
                     all_tags.append(t_norm)
+            if not all_tags:
+                continue
 
             # Bind this keyword slot to the hand card via owner_id so the
             # attention owner_pair_bias can learn "keyword-for-this-card"
@@ -2642,7 +3039,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     break
                 bucket = _CARD_KEYWORD_BUCKETS[kw]
                 numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-                # Minimal feature set — keywords are mostly categorical.
+                # Minimal feature set 鈥?keywords are mostly categorical.
                 numeric[0] = 1.0                               # active flag
                 numeric[1] = hand_index / 10.0                 # card position hint
                 numeric[2] = float(card.get("is_playable", True))
@@ -2655,8 +3052,14 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     numeric[5] = 1.0  # persists across turns
                 if kw in ("innate",):
                     numeric[6] = 1.0  # opening-hand guarantee
-                if kw in ("unplayable",):
-                    numeric[7] = 1.0  # curse/blank
+                if kw in ("unplayable", "bound", "card_lock", "forced_play"):
+                    numeric[7] = 1.0  # curse/blank/restricted
+                if kw in ("bound", "card_lock"):
+                    numeric[8] = 1.0  # boss/event per-card lock
+                if kw in ("cost_lock", "x_cost"):
+                    numeric[9] = 1.0  # energy/cost interaction
+                if kw in ("temporary", "forced_play"):
+                    numeric[10] = 1.0  # timing/obligation
                 world_entries.append(
                     self._entry(
                         "CARD_KEYWORD_SLOT",
@@ -2683,7 +3086,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
           [13]     amount clipped + log-normalized
           [14]     amount sign (positive/negative for reversible powers)
           [15]     amount ratio vs typical cap (amount/10, clipped to 1)
-          [16..95] unused — reserved for Phase 6.x extensions (duration,
+          [16..95] unused 鈥?reserved for Phase 6.x extensions (duration,
                             applier/target hints, etc.)
         """
         pid = str(power.get("id") or "").strip()
@@ -2718,7 +3121,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
 
         Always emits a fixed number of tokens (padded with is_empty=1 when
         the tracker is shorter) so MAX_WORLD_TOKENS stays invariant across
-        calls — rollout buffers and type_id arrays are fixed-shape.
+        calls 鈥?rollout buffers and type_id arrays are fixed-shape.
 
         Numeric layout is split between step-detail and turn-summary so a
         single shared HISTORY role / zone / owner still produces distinct
@@ -2779,18 +3182,18 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                     same_floor / phase_changed / combat_ended / rejected /
                     reward_nonzero
           [next]    reward scalars (2):   reward clipped [-1,1], abs(reward)
-          [next]    pre_state_vec  (STATE_SNAPSHOT_DIM = 8) — Tier 2
-          [next]    post_state_vec (STATE_SNAPSHOT_DIM = 8) — Tier 2
+          [next]    pre_state_vec  (STATE_SNAPSHOT_DIM = 8) 鈥?Tier 2
+          [next]    post_state_vec (STATE_SNAPSHOT_DIM = 8) 鈥?Tier 2
           [next]    step_offset_norm (1)
-          remainder zero (~11 spare slots — room for future additions)
+          remainder zero (~11 spare slots 鈥?room for future additions)
 
         The pre/post snapshot pair lets any downstream linear probe
         compute "delta = post - pre" on every dimension. The separate
         causality_delta tensor in the tracker is NOT packed here: it's
         delivered to the aux head's loss target path directly (via
-        env_v2 info → aux_maskable_ppo buffer), NOT through the obs
+        env_v2 info 鈫?aux_maskable_ppo buffer), NOT through the obs
         tensor. Keeping targets off the observation tensor avoids
-        teaching the policy to trivially shortcut — the policy sees
+        teaching the policy to trivially shortcut 鈥?the policy sees
         pre/post context but has to actively predict the delta.
         """
         from .semantic_action import SEMANTIC_ACTION_FAMILIES, SEMANTIC_TARGET_SCOPES
@@ -2861,7 +3264,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
 
         Layout (TOKEN_NUMERIC_DIM = 96):
           [0]       is_empty                (1 = padding)
-          [1]       is_step_detail          (0 — this is a turn summary)
+          [1]       is_step_detail          (0 鈥?this is a turn summary)
           [2..10]   turn_offset one-hot     (MAX_TURN_SUMMARY_TOKENS=8 slots, offset 1..8)
           [10..14]  action counts           (n_attacks/n_skills/n_powers/n_potions normalized)
           [14..17]  totals                  (damage/block/hp_lost normalized)
@@ -2871,7 +3274,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
           [24..40]  key_power_card_flags    (16 bits, one per slot)
           [40..44]  outcome flags           (enemy_killed / player_took_dmg /
                                              player_scaled / low_energy_waste)
-          remainder zero — Tier 2 can add cross-turn comparison scalars here.
+          remainder zero 鈥?Tier 2 can add cross-turn comparison scalars here.
         """
         numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
         # [1] = 0: this is NOT step_detail. Stays zero for turn summaries.
@@ -2887,7 +3290,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         numeric[cursor + turn_offset_slot] = 1.0
         cursor += MAX_TURN_SUMMARY_TOKENS
 
-        # Action counts (normalized by a generous ceiling — 8 cards/turn is a lot)
+        # Action counts (normalized by a generous ceiling 鈥?8 cards/turn is a lot)
         numeric[cursor + 0] = min(float(entry.get("n_attacks") or 0) / 8.0, 1.0)
         numeric[cursor + 1] = min(float(entry.get("n_skills") or 0) / 8.0, 1.0)
         numeric[cursor + 2] = min(float(entry.get("n_powers") or 0) / 4.0, 1.0)
@@ -3097,28 +3500,93 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
         potion_profile = self._source_profile(potion if isinstance(potion, dict) else None)
         text = self._potion_text(potion).lower()
+        merged_entry, effect = _resolve_potion_effect(potion)
+        effect_family = list(merged_entry.get("effect_family") or [])
+        timing_tags = list(merged_entry.get("timing_tags") or [])
+        training_tags = list(merged_entry.get("training_tags") or [])
+
+        damage_v = float(effect.get("damage") or potion_profile["damage"] or 0.0)
+        block_v = float(effect.get("block") or potion_profile["block"] or 0.0)
+        draw_v = float(effect.get("draw") or potion_profile["draw"] or 0.0)
+        energy_v = float(effect.get("energy_gain") or potion_profile["energy"] or 0.0)
+        heal_v = float(effect.get("heal") or potion_profile["heal"] or 0.0)
+        weak_v = float(effect.get("weak") or potion_profile["weak"] or 0.0)
+        vuln_v = float(effect.get("vulnerable") or potion_profile["vulnerable"] or 0.0)
+        poison_v = float(effect.get("poison") or 0.0)
+        str_v = float(effect.get("strength") or 0.0)
+        dex_v = float(effect.get("dexterity") or 0.0)
+        intang_v = float(effect.get("intangible") or 0.0)
+        prevent_v = float(effect.get("prevent_damage") or 0.0)
+        gen_card_v = float(effect.get("generate_card_count") or 0.0)
+        discover_v = float(effect.get("discover_count") or 0.0)
+        upgrade_v = float(effect.get("upgrade_hand") or 0.0)
+        dup_next_v = float(effect.get("duplicate_next") or 0.0)
+        retrieve_v = float(effect.get("retrieve_from_discard") or 0.0)
+        replace_v = float(effect.get("replace_or_transform_hand") or 0.0)
+        is_aoe = bool(effect.get("aoe"))
+        is_single = bool(effect.get("single_target")) or potion_profile["single_target"] > 0.5
+        is_random = bool(effect.get("random_target"))
+        target_required = bool(effect.get("target_required"))
+        can_change_facing = bool(effect.get("can_change_facing_if_targeted_enemy"))
+        requires_followup = bool(effect.get("requires_followup"))
+        long_term_value = bool(effect.get("long_term_value"))
+        passive_or_triggered = bool(effect.get("passive_or_triggered"))
+        enabled_training = bool(merged_entry.get("enabled_for_training", True))
 
         relevance = 0.0
         if source_profile is not None:
-            relevance += 0.20 * float(potion_profile["damage"] > 0.0) * max(source_profile["attack"], float(source_profile["damage"] > 0.0))
-            relevance += 0.20 * float(potion_profile["block"] > 0.0) * max(source_profile["skill"], float(source_profile["block"] > 0.0))
-            relevance += 0.20 * float(potion_profile["energy"] > 0.0) * float(source_profile["x_cost"] > 0.5 or source_profile["cost"] >= 2.0)
-            relevance += 0.15 * float(potion_profile["draw"] > 0.0) * max(source_profile["zero_cost"], float(source_profile["draw"] > 0.0))
-            relevance += 0.10 * float(potion_profile["heal"] > 0.0 or potion_profile["hp_loss"] < 0.0) * float(source_profile["hp_loss"] > 0.0)
-        relevance += 0.10 * float("attack" in text) * float(potion_profile["damage"] > 0.0)
+            relevance += 0.20 * float(damage_v > 0.0) * max(source_profile["attack"], float(source_profile["damage"] > 0.0))
+            relevance += 0.20 * float(block_v > 0.0) * max(source_profile["skill"], float(source_profile["block"] > 0.0))
+            relevance += 0.20 * float(energy_v > 0.0) * float(source_profile["x_cost"] > 0.5 or source_profile["cost"] >= 2.0)
+            relevance += 0.15 * float(draw_v > 0.0) * max(source_profile["zero_cost"], float(source_profile["draw"] > 0.0))
+            relevance += 0.10 * float(heal_v > 0.0 or potion_profile["hp_loss"] < 0.0) * float(source_profile["hp_loss"] > 0.0)
+        relevance += 0.10 * float("attack" in text) * float(damage_v > 0.0)
         relevance = float(np.clip(relevance, 0.0, 1.0))
 
         numeric[0] = relevance
-        numeric[1] = obs_common._log_norm(potion_profile["damage"], obs_common._LOG1P_200)
-        numeric[2] = obs_common._log_norm(potion_profile["block"], obs_common._LOG1P_200)
-        numeric[3] = min(potion_profile["draw"] / 5.0, 1.0)
-        numeric[4] = min(potion_profile["energy"] / 5.0, 1.0)
-        numeric[5] = obs_common._log_norm(potion_profile["heal"], obs_common._LOG1P_200)
-        numeric[6] = min(max(potion_profile["weak"], potion_profile["vulnerable"]) / 5.0, 1.0)
-        numeric[7] = potion_profile["single_target"]
-        numeric[8] = potion_profile["aoe_target"]
+        numeric[1] = obs_common._log_norm(damage_v, obs_common._LOG1P_200)
+        numeric[2] = obs_common._log_norm(block_v, obs_common._LOG1P_200)
+        numeric[3] = min(draw_v / 5.0, 1.0)
+        numeric[4] = min(energy_v / 5.0, 1.0)
+        numeric[5] = obs_common._log_norm(heal_v, obs_common._LOG1P_200)
+        numeric[6] = min(max(weak_v, vuln_v) / 5.0, 1.0)
+        numeric[7] = float(is_single)
+        numeric[8] = float(is_aoe)
         numeric[9] = min((slot_index + 1) / max(total_slots, 1), 1.0)
         numeric[10] = float("discard" not in text)
+
+        # Phase 3 (potion timing v1): structured slot expansion. Slots 11-38
+        # consume the bridge effect_profile / Python registry merge so the
+        # potion world token and use_potion action token observe identical
+        # capability signals. See docs/potion-timing-modeling-plan.md §7.3.
+        numeric[11] = min(poison_v / 10.0, 1.0)
+        numeric[12] = min(weak_v / 5.0, 1.0)
+        numeric[13] = min(vuln_v / 5.0, 1.0)
+        numeric[14] = min(str_v / 5.0, 1.0)
+        numeric[15] = min(dex_v / 5.0, 1.0)
+        numeric[16] = min(max(intang_v, prevent_v / 10.0), 1.0)
+        numeric[17] = min(gen_card_v / 5.0, 1.0)
+        numeric[18] = min(discover_v / 5.0, 1.0)
+        numeric[19] = min(upgrade_v, 1.0)
+        numeric[20] = min(dup_next_v, 1.0)
+        numeric[21] = min(retrieve_v, 1.0)
+        numeric[22] = min(replace_v, 1.0)
+        numeric[23] = float(is_random)
+        numeric[24] = float(requires_followup)
+        numeric[25] = float("save_if_low_threat" in training_tags)
+        numeric[26] = float(long_term_value or "long_term_value" in timing_tags)
+        numeric[27] = float(passive_or_triggered)
+        numeric[28] = float(can_change_facing)
+        numeric[29] = float(target_required)
+        numeric[30] = min((slot_index + 1) / max(total_slots, 1), 1.0)
+        numeric[31] = float(not enabled_training)
+        numeric[32] = float(any(t in timing_tags for t in ("setup_tool", "scaling_setup")) or "setup" in effect_family)
+        numeric[33] = float(any(t in timing_tags for t in ("scaling_setup",)) or any(f in effect_family for f in ("strength", "dexterity", "focus", "scaling")))
+        numeric[34] = float("mechanism_answer_candidate" in timing_tags or can_change_facing)
+        numeric[35] = float("hand_context_dependency" in timing_tags or upgrade_v > 0.0 or dup_next_v > 0.0 or replace_v > 0.0)
+        numeric[36] = float(retrieve_v > 0.0 or "discard_context_dependency" in timing_tags)
+        numeric[37] = float(any(t in timing_tags for t in ("dig_for_answer", "draw_pile_context_dependency")) or draw_v > 0.0)
+        numeric[38] = float("exhaust_pile_context_dependency" in timing_tags)
         return numeric
 
     def _source_profile(self, source: dict[str, Any] | None) -> dict[str, float]:
@@ -3145,6 +3613,22 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "exhaust": 0.0,
             "ethereal": 0.0,
             "retain": 0.0,
+            "energy_loss": 0.0,
+            "self_damage": 0.0,
+            "play_count_bonus": 0.0,
+            "damage_add": 0.0,
+            "damage_mult": 1.0,
+            "block_add": 0.0,
+            "adds_exhaust": 0.0,
+            "removes_exhaust": 0.0,
+            "adds_retain": 0.0,
+            "adds_ethereal": 0.0,
+            "once_per_combat": 0.0,
+            "disabled_after_play": 0.0,
+            "cost_randomizes_on_draw": 0.0,
+            "sets_cost_zero": 0.0,
+            "shuffle_top": 0.0,
+            "strategic_skip_value": 0.0,
         }
         if not isinstance(source, dict):
             return profile
@@ -3152,25 +3636,31 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         preview = obs_common._build_card_preview_bundle(source)
         strength, dexterity, energy, hits = obs_common._get_card_extra_metrics(source)
         kw_flags, _ = obs_common._get_card_keywords(source)
+        modifier_sem = obs_common._aggregate_card_modifier_semantics(source)
         card_type = str(source.get("type") or "").capitalize()
-        target = str(source.get("target") or "").lower()
+        target = str(source.get("target_type") or source.get("target") or "").lower()
         cost = obs_common._float(source.get("cost"))
 
         profile.update(
             {
                 "cost": max(cost, 0.0),
-                "x_cost": float(bool(source.get("x_cost"))),
+                "x_cost": float(
+                    bool(source.get("x_cost") or source.get("costs_x"))
+                    or str(source.get("cost") or source.get("canonical_energy_cost") or "").strip().upper() == "X"
+                ),
                 "attack": 1.0 if card_type == "Attack" else 0.0,
                 "skill": 1.0 if card_type == "Skill" else 0.0,
                 "power": 1.0 if card_type == "Power" else 0.0,
                 "zero_cost": 1.0 if cost == 0 else 0.0,
                 "damage": preview["preview_damage"],
                 "block": preview["preview_block"],
-                "draw": obs_common._preview_metric(source, "draw"),
+                "draw": obs_common._preview_metric(source, "draw") + modifier_sem.get("draw", 0.0),
                 "energy": energy,
                 "heal": obs_common._preview_metric(source, "heal"),
-                "hp_loss": obs_common._preview_metric(source, "hp_loss"),
-                "weak": obs_common._preview_metric(source, "weak"),
+                "hp_loss": obs_common._preview_metric(source, "hp_loss") + modifier_sem.get("self_damage", 0.0),
+                "energy_loss": modifier_sem.get("energy_loss_on_play", 0.0),
+                "self_damage": modifier_sem.get("self_damage", 0.0),
+                "weak": obs_common._preview_metric(source, "weak") + modifier_sem.get("weak", 0.0),
                 "vulnerable": obs_common._preview_metric(source, "vulnerable"),
                 "hits": hits,
                 "single_target": 1.0 if "single" in target or "anyenemy" in target else 0.0,
@@ -3178,10 +3668,29 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "exhaust": 1.0 if kw_flags[0] else 0.0,
                 "ethereal": 1.0 if kw_flags[1] else 0.0,
                 "retain": 1.0 if kw_flags[2] else 0.0,
+                "play_count_bonus": modifier_sem.get("play_count_bonus", 0.0),
+                "damage_add": modifier_sem.get("damage_add", 0.0),
+                "damage_mult": modifier_sem.get("damage_mult", 1.0),
+                "block_add": modifier_sem.get("block_add", 0.0) + modifier_sem.get("block_on_play", 0.0),
+                "adds_exhaust": modifier_sem.get("adds_exhaust", 0.0),
+                "removes_exhaust": modifier_sem.get("removes_exhaust", 0.0),
+                "adds_retain": modifier_sem.get("adds_retain", 0.0),
+                "adds_ethereal": modifier_sem.get("adds_ethereal", 0.0),
+                "once_per_combat": modifier_sem.get("once_per_combat", 0.0),
+                "disabled_after_play": modifier_sem.get("disabled_after_play", 0.0),
+                "cost_randomizes_on_draw": modifier_sem.get("cost_randomizes_on_draw", 0.0),
+                "sets_cost_zero": modifier_sem.get("sets_cost_zero", 0.0),
+                "shuffle_top": modifier_sem.get("shuffle_top", 0.0),
             }
         )
         profile["strength"] = strength
         profile["dexterity"] = dexterity
+        profile["strategic_skip_value"] = float(
+            profile["exhaust"] > 0.5
+            or profile["retain"] > 0.5
+            or profile["energy_loss"] > 0.0
+            or profile["self_damage"] > 0.0
+        )
         return profile
 
     def _source_text(self, source: dict[str, Any] | None) -> str:
@@ -3454,6 +3963,45 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "text": str(text or "").strip(),
         }
 
+    def _boss_player_state(self) -> dict[str, float]:
+        context = self._current_boss_context
+        if isinstance(context, dict):
+            player_state = context.get("player_state")
+            if isinstance(player_state, dict):
+                return player_state
+        return {}
+
+    def _boss_enemy_state(self, enemy: dict[str, Any] | None) -> dict[str, float]:
+        if not isinstance(enemy, dict):
+            return {}
+        context = self._current_boss_context
+        if not isinstance(context, dict):
+            return {}
+        enemy_states_by_key = context.get("enemy_states_by_key")
+        if not isinstance(enemy_states_by_key, dict):
+            return {}
+        state = enemy_states_by_key.get(enemy_mechanics_key(enemy, ""))
+        return state if isinstance(state, dict) else {}
+
+    def _boss_enemy_traits(self, enemy: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not isinstance(enemy, dict):
+            return [], []
+        context = self._current_boss_context
+        if not isinstance(context, dict):
+            return [], []
+        enemy_traits_by_key = context.get("enemy_traits_by_key")
+        if not isinstance(enemy_traits_by_key, dict):
+            return [], []
+        payload = enemy_traits_by_key.get(enemy_mechanics_key(enemy, ""))
+        if not isinstance(payload, dict):
+            return [], []
+        reactive_traits = payload.get("reactive_traits")
+        phase_rules = payload.get("phase_rules")
+        return (
+            reactive_traits if isinstance(reactive_traits, list) else [],
+            phase_rules if isinstance(phase_rules, list) else [],
+        )
+
     def _infer_enemy_traits(self, enemy: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         reactive_traits: list[dict[str, Any]] = []
         phase_rules: list[dict[str, Any]] = []
@@ -3514,6 +4062,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 _add({"category": "reactive", "trait": "contact_retaliate", "effect_amount": power.get("amount"), "description": power.get("title")})
             if "intang" in title:
                 _add({"category": "phase", "trait": "gain_intangible", "description": power.get("title")})
+        boss_reactive_traits, boss_phase_rules = self._boss_enemy_traits(enemy)
+        for item in boss_reactive_traits:
+            _add(item)
+        for item in boss_phase_rules:
+            _add(item)
         return reactive_traits, phase_rules
 
     def _enemy_reaction_flags(self, enemy: dict[str, Any] | None) -> dict[str, float]:
@@ -3527,9 +4080,28 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "artifact": 0.0,
                 "buffer": 0.0,
                 "intangible": 0.0,
+                "incoming_damage_multiplier": 0.0,
+                "back_attack": 0.0,
+                "damage_cap": 0.0,
+                "damage_cap_value": 0.0,
+                "deathburst": 0.0,
+                "deathburst_damage": 0.0,
+                "revive": 0.0,
+                "transform": 0.0,
+                "linked_support_alive": 0.0,
+                "special_phase": 0.0,
+                "one_card_lock": 0.0,
+                "skill_punish": 0.0,
+                "choice_debuffs": 0.0,
+                "escape_card_tax": 0.0,
+                "countdown": 0.0,
+                "stun_window": 0.0,
+                "binding_control": 0.0,
+                "wound_phase": 0.0,
             }
 
         reactive_traits, phase_rules = self._infer_enemy_traits(enemy)
+        boss_state = self._boss_enemy_state(enemy)
         texts: list[str] = [build_live_enemy_semantic_text(enemy).lower()]
         threshold_value = 0.0
         for collection_name in ("powers", "static_traits", "reactive_triggers", "phase_rules"):
@@ -3568,17 +4140,51 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "artifact": float("artifact" in joined),
             "buffer": float("buffer" in joined),
             "intangible": float("intang" in joined),
+            "incoming_damage_multiplier": float(boss_state.get("incoming_damage_multiplier_norm", 0.0)),
+            "back_attack": float(boss_state.get("back_attack_active", 0.0)),
+            "damage_cap": float(boss_state.get("damage_cap_active", 0.0)),
+            "damage_cap_value": float(boss_state.get("damage_cap_value_norm", 0.0)),
+            "deathburst": float(boss_state.get("deathburst", 0.0)),
+            "deathburst_damage": float(boss_state.get("deathburst_damage_norm", 0.0)),
+            "revive": float(boss_state.get("revive_once", 0.0)),
+            "transform": float(boss_state.get("transform_pending", 0.0)),
+            "linked_support_alive": float(boss_state.get("linked_support_alive", 0.0)),
+            "special_phase": float(boss_state.get("special_phase_active", 0.0)),
+            "one_card_lock": float(boss_state.get("one_card_lock", 0.0)),
+            "skill_punish": float(boss_state.get("skill_punish", 0.0)),
+            "choice_debuffs": float(boss_state.get("choice_debuffs", 0.0)),
+            "escape_card_tax": float(boss_state.get("escape_card_tax", 0.0)),
+            "countdown": float(boss_state.get("countdown_active", 0.0)),
+            "stun_window": float(boss_state.get("stun_window", 0.0)),
+            "binding_control": float(boss_state.get("binding_control", 0.0)),
+            "wound_phase": float(boss_state.get("wound_phase", 0.0)),
         }
 
     def _trait_numeric(self, trait: dict[str, Any]) -> np.ndarray:
         numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-        text = str(trait.get("trait") or trait.get("effect_type") or trait.get("description") or "").lower()
+        text = " | ".join(
+            str(trait.get(key) or "").lower()
+            for key in ("trait", "effect_type", "description", "condition", "state")
+            if str(trait.get(key) or "").strip()
+        )
         numeric[0] = float("thorn" in text)
         numeric[1] = float("contact" in text or "retali" in text)
         numeric[2] = float("split" in text)
         numeric[3] = float("phase" in text)
         numeric[4] = float("threshold" in text or "stun" in text)
         numeric[5] = min(abs(obs_common._float(trait.get("effect_amount") or trait.get("amount") or trait.get("threshold"))) / 10.0, 1.0)
+        numeric[6] = float("back_attack" in text or "matched_facing" in text or "damage_multiplier" in text)
+        numeric[7] = float("damage_cap" in text or "slippery" in text or "opening_cycle" in text)
+        numeric[8] = float("death_explosion" in text or "deathburst" in text or "steam eruption" in text)
+        numeric[9] = float("revive" in text or "reborn" in text or "resurrect" in text)
+        numeric[10] = float("binding" in text or "choice_debuffs" in text)
+        numeric[11] = float("linked_support" in text or "support_body" in text or "door_destroyed" in text)
+        numeric[12] = float("countdown" in text or "doom_clock" in text or "escape_card_tax" in text)
+        numeric[13] = float("skill_punish" in text or "on_play_skill" in text)
+        numeric[14] = float("intang" in text)
+        numeric[15] = float("one_card_lock" in text or "play_budget_locked" in text)
+        numeric[16] = float("wound_phase" in text or "chip_damage" in text)
+        numeric[17] = float("phase_three" in text or "opening" in text or "phase_two" in text)
         return numeric
 
     @staticmethod
@@ -3643,12 +4249,12 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             )
         ).lower()
         keyword_map = (
-            ("discard", ("discard", "弃牌", "弃置")),
-            ("draw", ("draw pile", "draw", "抽牌", "牌库")),
-            ("exhaust", ("exhaust", "消耗")),
-            ("hand", ("hand", "手牌")),
-            ("play", ("play pile", "played", "已打出")),
-            ("deck", ("deck", "牌组")),
+            ("discard", ("discard",)),
+            ("draw", ("draw pile", "draw")),
+            ("exhaust", ("exhaust",)),
+            ("hand", ("hand",)),
+            ("play", ("play pile", "played")),
+            ("deck", ("deck",)),
         )
         for pile_name, keywords in keyword_map:
             if any(keyword in prompt for keyword in keywords):

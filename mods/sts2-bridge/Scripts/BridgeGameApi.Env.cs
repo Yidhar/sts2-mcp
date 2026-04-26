@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Net;
 using System.Diagnostics;
 using System.Text.Json.Serialization;
@@ -57,6 +57,9 @@ internal static partial class BridgeGameApi
     private const int DefaultEnvStepTimeoutMs = 15000;
     private const int MaxEnvTimeoutMs = 120000;
     private const int EnvStableSampleTarget = 2;
+    // End-turn-only is not special here. Direct CombatManager flags already
+    // suppress transient locked frames before action generation; once those
+    // flags say the player can act, a one-action end_turn frontier is valid.
     private const int EnvResetTransitionLimit = 24;
 
     private static readonly object EnvEpisodeSync = new();
@@ -1059,6 +1062,7 @@ internal static partial class BridgeGameApi
         }
         return await CaptureEnvSnapshotAsync(timeoutMs, cancellationToken, "env.wait_stable.final_snapshot");
     }
+
 
     private static async Task<object?> TryRebindActiveRunAsync(
         BridgeEnvSnapshot state,

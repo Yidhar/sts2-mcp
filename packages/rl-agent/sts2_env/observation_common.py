@@ -243,7 +243,7 @@ def _runtime_spend_cost(card: dict | None) -> float:
     if not isinstance(card, dict):
         return 0.0
 
-    if card.get("x_cost"):
+    if card.get("x_cost") or card.get("costs_x") or str(card.get("cost") or card.get("canonical_energy_cost") or "").strip().upper() == "X":
         x_cost_value = _preview_metric(card, "x_cost_value")
         if x_cost_value > 0:
             return x_cost_value
@@ -345,6 +345,23 @@ def _iter_card_keyword_candidates(card: dict) -> list[str]:
     if isinstance(keywords, list):
         candidates.extend(str(keyword or "").strip() for keyword in keywords)
 
+    # Runtime per-card boss/event state (Queen binding/chains, cost locks,
+    # forced exhaust/retain, etc.) is surfaced by the bridge as modifier
+    # payloads. Treat their id/title/type/description as keyword candidates so
+    # both dense card numerics and v3 CARD_KEYWORD_SLOT tokens can attend to
+    # card-specific restrictions instead of only global player powers.
+    for modifier_field in ("afflictions", "enchantments", "modifiers", "card_modifiers"):
+        modifiers = card.get(modifier_field)
+        if isinstance(modifiers, list):
+            for modifier in modifiers:
+                if isinstance(modifier, dict):
+                    for key in ("id", "title", "type", "description", "kind"):
+                        value = modifier.get(key)
+                        if value not in (None, ""):
+                            candidates.append(str(value).strip())
+                elif modifier not in (None, ""):
+                    candidates.append(str(modifier).strip())
+
     metadata = _get_card_static_metadata(card)
     if isinstance(metadata, dict):
         static_keywords = metadata.get("keywords")
@@ -357,6 +374,130 @@ def _iter_card_keyword_candidates(card: dict) -> list[str]:
     return candidates
 
 
+
+def _iter_card_modifier_semantics(card: dict | None) -> list[dict]:
+    """Return structured runtime card modifier payloads from the bridge."""
+    if not isinstance(card, dict):
+        return []
+    out: list[dict] = []
+    for field in ("afflictions", "enchantments", "modifiers", "card_modifiers"):
+        modifiers = card.get(field)
+        if not isinstance(modifiers, list):
+            continue
+        for modifier in modifiers:
+            if isinstance(modifier, dict):
+                out.append(modifier)
+    return out
+
+
+def _aggregate_card_modifier_semantics(card: dict | None) -> dict[str, float]:
+    """Aggregate bridge modifier semantic_values/tags into stable numeric flags.
+
+    This lets every encoder path reuse the same understanding of enchantments,
+    afflictions, replay, retain/exhaust/ethereal, and energy refund/loss cards
+    instead of rediscovering it from free text each time.
+    """
+    result: dict[str, float] = {
+        "energy_gain": 0.0,
+        "energy_loss_on_play": 0.0,
+        "draw": 0.0,
+        "block_add": 0.0,
+        "block_on_play": 0.0,
+        "damage_add": 0.0,
+        "damage_mult": 1.0,
+        "weak": 0.0,
+        "self_damage": 0.0,
+        "play_count_bonus": 0.0,
+        "adds_exhaust": 0.0,
+        "removes_exhaust": 0.0,
+        "adds_retain": 0.0,
+        "adds_ethereal": 0.0,
+        "cost_randomizes_on_draw": 0.0,
+        "cost_reduction_until_played": 0.0,
+        "sets_cost_zero": 0.0,
+        "autoplay_round_1": 0.0,
+        "shuffle_top": 0.0,
+        "once_per_combat": 0.0,
+        "disabled_after_play": 0.0,
+        "currently_enabled": 1.0,
+        "grows_on_play": 0.0,
+        "eternal": 0.0,
+    }
+    if not isinstance(card, dict):
+        return result
+
+    def add_num(key: str, value: Any, *, mult: bool = False) -> None:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return
+        if mult:
+            result[key] = max(result.get(key, 1.0), val)
+        else:
+            result[key] = result.get(key, 0.0) + val
+
+    def set_flag(key: str, value: Any = True) -> None:
+        if isinstance(value, bool):
+            if value:
+                result[key] = 1.0
+            return
+        try:
+            if float(value) != 0.0:
+                result[key] = 1.0
+        except (TypeError, ValueError):
+            if value:
+                result[key] = 1.0
+
+    for modifier in _iter_card_modifier_semantics(card):
+        values = modifier.get("semantic_values")
+        if isinstance(values, dict):
+            if values.get("currently_enabled") is False:
+                result["currently_enabled"] = 0.0
+            for key in (
+                "energy_gain", "energy_loss_on_play", "draw", "block_add", "block_on_play",
+                "damage_add", "weak", "self_damage", "play_count_bonus", "cost_reduction_until_played",
+            ):
+                if key in values:
+                    add_num(key, values.get(key))
+            if "damage_mult" in values:
+                add_num("damage_mult", values.get("damage_mult"), mult=True)
+            for key in (
+                "adds_exhaust", "removes_exhaust", "adds_retain", "adds_ethereal",
+                "cost_randomizes_on_draw", "sets_cost_zero", "autoplay_round_1", "shuffle_top",
+                "once_per_combat", "disabled_after_play", "grows_on_play", "eternal",
+            ):
+                if key in values:
+                    set_flag(key, values.get(key))
+        tags = modifier.get("semantic_tags")
+        if isinstance(tags, list):
+            joined = " ".join(str(tag).lower() for tag in tags)
+            for key in (
+                "adds_exhaust", "removes_exhaust", "adds_retain", "adds_ethereal",
+                "cost_randomizes_on_draw", "sets_cost_zero", "autoplay_round_1", "shuffle_top",
+                "once_per_combat", "disabled_after_play", "grows_on_play", "eternal",
+            ):
+                if key in joined:
+                    result[key] = 1.0
+
+    summary = card.get("modifier_summary")
+    if isinstance(summary, dict):
+        for key, value in summary.items():
+            if key in result:
+                if isinstance(value, bool):
+                    if value:
+                        result[key] = 1.0
+                elif key == "damage_mult":
+                    try:
+                        result[key] = max(result[key], float(value))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    try:
+                        result[key] = max(result[key], float(value))
+                    except (TypeError, ValueError):
+                        pass
+    return result
+
 def _get_card_keywords(card: dict) -> tuple[list[bool], float]:
     flags = [False, False, False, False]
     rarity_val = 0.0
@@ -366,6 +507,16 @@ def _get_card_keywords(card: dict) -> tuple[list[bool], float]:
         for key, index in _CARD_KEYWORDS.items():
             if key in kw_lower:
                 flags[index] = True
+
+    modifier_sem = _aggregate_card_modifier_semantics(card)
+    if modifier_sem.get("adds_exhaust", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["exhaust"]] = True
+    if modifier_sem.get("removes_exhaust", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["exhaust"]] = False
+    if modifier_sem.get("adds_ethereal", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["ethereal"]] = True
+    if modifier_sem.get("adds_retain", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["retain"]] = True
 
     rarity = str(card.get("rarity") or "").strip()
     if not rarity:
@@ -479,6 +630,9 @@ def _get_card_extra_metrics(card: dict) -> tuple[float, float, float, float]:
         if hits <= 1.0:
             hits = _float(signals.get("hits"), 1.0)
 
+    modifier_sem = _aggregate_card_modifier_semantics(card)
+    energy += modifier_sem.get("energy_gain", 0.0)
+    hits += modifier_sem.get("play_count_bonus", 0.0)
     return strength, dexterity, energy, hits
 
 
@@ -491,6 +645,18 @@ def _build_card_preview_bundle(card: dict) -> dict[str, float]:
     preview_damage = _preview_metric(card, "damage")
     preview_block = _preview_metric(card, "block")
     preview_damage_per_hit = _preview_metric(card, "damage_per_hit")
+    if preview_damage_per_hit <= 0 and preview_damage > 0:
+        preview_damage_per_hit = preview_damage / max(hits, 1.0)
+
+    modifier_sem = _aggregate_card_modifier_semantics(card)
+    damage_mult = max(modifier_sem.get("damage_mult", 1.0), 1.0)
+    if preview_damage > 0:
+        preview_damage = preview_damage * damage_mult + modifier_sem.get("damage_add", 0.0)
+    else:
+        preview_damage += modifier_sem.get("damage_add", 0.0)
+    if modifier_sem.get("play_count_bonus", 0.0) > 0.0 and preview_damage > 0:
+        preview_damage *= 1.0 + modifier_sem.get("play_count_bonus", 0.0)
+    preview_block += modifier_sem.get("block_add", 0.0) + modifier_sem.get("block_on_play", 0.0)
     if preview_damage_per_hit <= 0 and preview_damage > 0:
         preview_damage_per_hit = preview_damage / max(hits, 1.0)
 
@@ -988,7 +1154,7 @@ class DenseObservationEncoder:
             row[4] = _bool(card.get("x_cost"))
             row[5] = min(_float(card.get("star")) / 5.0, 1.0) if card.get("star") is not None else 0.0
             row[6] = _bool(card.get("star_x"))
-            target = (card.get("target") or "").lower()
+            target = (card.get("target_type") or card.get("target") or "").lower()
             row[7] = 1.0 if "single" in target or "anyenemy" in target else 0.0
             row[8] = 1.0 if "all" in target else 0.0
             row[9] = 1.0 if "self" in target else 0.0
@@ -1545,21 +1711,28 @@ class DenseObservationEncoder:
         row[base + 4] = _bool(node.get("is_leaf"))
 
     def _resolve_domain(self, obs: dict) -> str:
+        phase = str(obs.get("phase", "") or "").strip()
+        combat = obs.get("combat")
+        combat_active = isinstance(combat, dict) and bool(combat)
+        if phase == "map":
+            return "route"
+        # The live bridge commonly exposes combat decisions as phase="actions".
+        # If a combat payload is present, treat actions/card-selection/settling
+        # as combat so token-memory and direct MuZero policy heads are routed to
+        # the combat domain instead of being mislabeled as build.
+        if combat_active and phase in {"combat", "actions", "card_selection", "settling", ""}:
+            return "combat"
+
         decision_domain = obs.get("decision_domain")
         if isinstance(decision_domain, str) and decision_domain in DOMAIN_TO_IDX:
             return decision_domain
 
-        phase = obs.get("phase", "")
         if phase == "combat":
             return "combat"
-        if phase == "map":
-            return "route"
         if phase == "card_selection":
-            combat = obs.get("combat")
-            return "combat" if combat else "build"
+            return "combat" if combat_active else "build"
         if phase == "settling":
-            combat = obs.get("combat")
-            return "combat" if combat else "build"
+            return "combat" if combat_active else "build"
         return "build"
 
     @staticmethod
