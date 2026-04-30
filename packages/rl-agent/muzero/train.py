@@ -68,6 +68,7 @@ from sts2_env.objective_heads import (
     compute_transition_objective_rewards,
 )
 from sts2_env.observation_v2 import DECISION_DOMAINS, DictObservationEncoder, MAX_ACTIONS, NUM_PHASES
+from sts2_env.card_effect_profile import aggregate_card_effect_profile_semantics
 from sts2_env.semantic_action import SEMANTIC_ACTION_FAMILIES, SEMANTIC_ROLE_NAMES
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
 from sts2_env.potion_profiles import DEFAULT_EFFECT_PROFILE as _POTION_EFFECT_DEFAULT, get_potion_profile as _get_potion_profile
@@ -615,10 +616,17 @@ def load_resume_checkpoint(
     buffer: MuZeroReplayBuffer,
     device: str,
     load_buffer: bool = True,
+    load_optimizer: bool = True,
     token_target_encoder: nn.Module | None = None,
     amp_grad_scaler: torch.amp.GradScaler | None = None,
 ) -> dict[str, Any]:
-    """Load network/optimizer/(optional) replay buffer from a MuZero checkpoint directory."""
+    """Load network/optimizer/(optional) replay buffer from a MuZero checkpoint directory.
+
+    Set ``load_optimizer=False`` to warm-start weights only and re-initialize
+    the optimizer (Adam moments, etc.) — useful when the aux-target schema
+    changed and the old momentum is steering the loss landscape away from
+    the new objective.
+    """
     checkpoint_path = Path(resume_from)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Resume checkpoint path not found: {checkpoint_path}")
@@ -669,11 +677,15 @@ def load_resume_checkpoint(
 
     allow_exact_resume = not (skipped_keys or missing_keys)
 
-    if allow_exact_resume:
+    if allow_exact_resume and load_optimizer:
         try:
             optimizer.load_state_dict(optimizer_state)
         except Exception as exc:
             print(f"[resume] Optimizer state not loaded ({exc}); starting with fresh optimizer.")
+    elif allow_exact_resume and not load_optimizer:
+        print(
+            "[resume] Skipping optimizer warm-start by request; starting with fresh optimizer."
+        )
     else:
         print(
             "[resume] Skipping optimizer warm-start because network state was only partially restored; "
@@ -712,6 +724,7 @@ def load_resume_checkpoint(
             token_target_encoder.load_state_dict(network.token_encoder.state_dict())
     if (
         allow_exact_resume
+        and load_optimizer
         and amp_grad_scaler is not None
         and amp_scaler_path.exists()
         and bool(amp_grad_scaler.is_enabled())
@@ -933,6 +946,30 @@ class MuZeroTrainer:
         self.last_episode_metrics: dict[str, Any] = {}
         self._kaiser_facing_debug_dump_count = 0
         self._end_turn_debug_dump_count = 0
+        self._end_turn_context_dump_count = 0
+        try:
+            self._end_turn_context_dump_max = int(os.environ.get("MUZERO_END_TURN_CONTEXT_DUMP_MAX", "50000"))
+        except (TypeError, ValueError):
+            self._end_turn_context_dump_max = 50000
+        self._end_turn_context_dump_disabled = (
+            os.environ.get("MUZERO_END_TURN_CONTEXT_DUMP", "1").strip() == "0"
+        )
+        self._action_offender_dump_count = 0
+        try:
+            self._action_offender_dump_max = int(os.environ.get("MUZERO_ACTION_OFFENDER_DUMP_MAX", "100000"))
+        except (TypeError, ValueError):
+            self._action_offender_dump_max = 100000
+        self._action_offender_dump_disabled = (
+            os.environ.get("MUZERO_ACTION_OFFENDER_DUMP", "1").strip() == "0"
+        )
+        self._potion_transition_dump_count = 0
+        try:
+            self._potion_transition_dump_max = int(os.environ.get("MUZERO_POTION_TRANSITION_DUMP_MAX", "200000"))
+        except (TypeError, ValueError):
+            self._potion_transition_dump_max = 200000
+        self._potion_transition_dump_disabled = (
+            os.environ.get("MUZERO_POTION_TRANSITION_DUMP", "1").strip() == "0"
+        )
         self.recent_combat_monitor = RecentCombatMonitor(
             windows=self.recent_tail_windows,
             tracked_encounters=self.recent_tail_tracked_encounters,
@@ -1243,14 +1280,64 @@ class MuZeroTrainer:
     def _action_metric(action: Any, key: str) -> float:
         if not isinstance(action, dict):
             return 0.0
+        aliases = {
+            # Keep amount fields before boolean typed flags.  Compact semantic
+            # actions may expose ``typed_gain_energy`` as an amount, while the
+            # full aggregate profile uses it as a flag plus
+            # ``typed_gain_energy_amount``.
+            "energy": ("energy", "energy_gain", "typed_gain_energy_amount", "typed_gain_energy"),
+            "energy_gain": ("energy_gain", "energy", "typed_gain_energy_amount", "typed_gain_energy"),
+            "draw": ("draw", "cards_drawn", "typed_draw_amount", "typed_draw_cards"),
+            "hp_loss": ("hp_loss", "hp_cost", "typed_hp_loss"),
+            "hp_cost": ("hp_cost", "hp_loss", "typed_hp_loss"),
+            "damage": ("damage", "total_damage"),
+            "block": ("block", "total_block"),
+        }
+        keys = aliases.get(key, (key,))
         semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
-        for source in (semantic, action):
-            try:
-                if key in source:
-                    return float(source.get(key) or 0.0)
-            except (TypeError, ValueError):
-                pass
-        return 0.0
+        semantic_profile = semantic.get("card_effect_profile") if isinstance(semantic.get("card_effect_profile"), dict) else {}
+        source: dict[str, Any] = {}
+        for source_key in ("card", "potion", "relic", "reward"):
+            candidate = action.get(source_key)
+            if isinstance(candidate, dict):
+                source = candidate
+                break
+        source_profile = source.get("card_effect_profile") if isinstance(source.get("card_effect_profile"), dict) else {}
+        action_profile = action.get("card_effect_profile") if isinstance(action.get("card_effect_profile"), dict) else {}
+        typed_effects: dict[str, float] = {}
+        try:
+            if isinstance(action.get("card"), dict):
+                typed_effects = aggregate_card_effect_profile_semantics(action.get("card"))
+            elif isinstance(source, dict) and ("card_effect_profile" in source or "operations" in source):
+                typed_effects = aggregate_card_effect_profile_semantics(source)
+            elif "card_effect_profile" in action or "operations" in action:
+                typed_effects = aggregate_card_effect_profile_semantics(action)
+        except Exception:
+            typed_effects = {}
+        containers = (
+            typed_effects,
+            semantic_profile,
+            semantic,
+            action_profile,
+            action,
+            source_profile,
+            source,
+        )
+        best = 0.0
+        for source_obj in containers:
+            if not isinstance(source_obj, dict):
+                continue
+            for candidate_key in keys:
+                if candidate_key not in source_obj:
+                    continue
+                value = source_obj.get(candidate_key)
+                if isinstance(value, (list, dict)):
+                    continue
+                try:
+                    best = max(best, float(value or 0.0))
+                except (TypeError, ValueError):
+                    pass
+        return float(best)
 
     @classmethod
     def _action_immediate_impact(cls, action: Any) -> float:
@@ -1258,12 +1345,18 @@ class MuZeroTrainer:
         damage = cls._action_metric(action, "damage")
         block = cls._action_metric(action, "block")
         hits = max(cls._action_metric(action, "hits"), 1.0 if damage > 0.0 else 0.0)
+        draw = cls._action_metric(action, "draw")
+        energy_gain = max(cls._action_metric(action, "energy"), cls._action_metric(action, "energy_gain"))
+        hp_loss = max(cls._action_metric(action, "hp_loss"), cls._action_metric(action, "hp_cost"))
         return float(
             damage
             + 0.75 * block
             + 1.5 * max(hits - 1.0, 0.0)
+            + 2.0 * min(max(draw, 0.0), 3.0)
+            + 2.0 * min(max(energy_gain, 0.0), 3.0)
+            - 0.5 * min(max(hp_loss, 0.0), 6.0)
             + (8.0 if roles.intersection({"debuff", "weak", "vulnerable", "poison", "exhaust", "discard"}) else 0.0)
-            + (6.0 if roles.intersection({"scaling", "power", "draw", "energy", "retain"}) else 0.0)
+            + (6.0 if roles.intersection({"scaling", "power", "draw", "energy", "resource", "retain"}) else 0.0)
         )
 
     @staticmethod
@@ -1408,6 +1501,11 @@ class MuZeroTrainer:
         roles = self._action_roles(action)
         if "exhaust" in roles:
             return True
+        if (
+            self._action_metric(action, "typed_exhaust_cards") > 0.0
+            or self._action_metric(action, "typed_once_or_exhaust_self") > 0.0
+        ):
+            return True
         source = self._action_source(action)
         for key in ("exhaust", "exhaust_self", "will_exhaust"):
             if bool(action.get(key) or source.get(key)):
@@ -1431,6 +1529,8 @@ class MuZeroTrainer:
             return False
         roles = self._action_roles(action)
         if "retain" in roles:
+            return True
+        if self._action_metric(action, "typed_retain_cards") > 0.0:
             return True
         source = self._action_source(action)
         for key in ("retain", "self_retain", "is_retained"):
@@ -1627,7 +1727,15 @@ class MuZeroTrainer:
                 return True
         return False
 
-    def _has_resource_followup(self, action_index: int, legal_actions: list[Any] | None, energy_after: float, mask_np: np.ndarray) -> bool:
+    def _has_resource_followup(
+        self,
+        action_index: int,
+        legal_actions: list[Any] | None,
+        energy_after: float,
+        mask_np: np.ndarray,
+        *,
+        allow_cost_reduction: bool = False,
+    ) -> bool:
         """Whether a resource/draw/energy potion can be converted this turn.
 
         We intentionally look for follow-up *cards*, not another potion.  The
@@ -1647,7 +1755,7 @@ class MuZeroTrainer:
                     continue
                 return True
             cost = self._action_cost_value(other)
-            if cost > energy_after + 1e-6:
+            if cost > energy_after + 1e-6 and not allow_cost_reduction:
                 continue
             roles = self._action_roles(other)
             if (
@@ -2063,11 +2171,43 @@ class MuZeroTrainer:
         block = max(self._action_metric(action, "block"), self._action_metric(action, "total_block"))
         energy_gain = max(self._action_metric(action, "energy"), self._action_metric(action, "energy_gain"))
         hp_loss = max(self._action_metric(action, "hp_loss"), self._action_metric(action, "hp_cost"))
+        typed_requires_followup = self._action_metric(action, "typed_requires_followup") > 0.0
+        typed_strategic_skip_if_no_followup = self._action_metric(action, "typed_strategic_skip_if_no_followup") > 0.0
+        typed_modify_cost = self._action_metric(action, "typed_modify_cost") > 0.0
+        typed_no_draw = self._action_metric(action, "typed_no_draw") > 0.0
+        typed_future_penalty = self._action_metric(action, "typed_future_penalty") > 0.0
+        typed_consumes_future_resource = self._action_metric(action, "typed_consumes_future_resource") > 0.0
+        typed_card_state_mutation = self._action_metric(action, "typed_card_state_mutation") > 0.0
+        typed_modifies_hand = self._action_metric(action, "typed_modifies_hand") > 0.0
+        setup_followup_dependent = bool(
+            family == "play_card"
+            and (
+                typed_requires_followup
+                or typed_strategic_skip_if_no_followup
+                or typed_modify_cost
+                or typed_no_draw
+                or typed_future_penalty
+                or typed_consumes_future_resource
+            )
+        )
+        future_or_no_draw = bool(typed_no_draw or typed_future_penalty or typed_consumes_future_resource)
+        card_state_setup = bool(typed_card_state_mutation or typed_modifies_hand)
         incoming, current_block, _hp = self._incoming_damage_pressure(raw_obs)
         threat_gap = max(0.0, incoming - current_block)
         impact = self._action_immediate_impact(action)
-        energy_after = max(0.0, energy - max(self._safe_float(self._action_source(action).get("cost")), 0.0) + energy_gain)
+        energy_after = max(0.0, energy - self._action_cost_value(action) + energy_gain)
         energy_without_followup = bool(family == "play_card" and energy_gain > 0.0 and not self._has_energy_followup(index, legal_actions, energy_after, mask_np))
+        setup_followup_available = bool(
+            setup_followup_dependent
+            and self._has_resource_followup(
+                index,
+                legal_actions,
+                energy_after,
+                mask_np,
+                allow_cost_reduction=typed_modify_cost,
+            )
+        )
+        followup_missing = bool(setup_followup_dependent and not setup_followup_available)
 
         mechanism_urgent = False
         try:
@@ -2087,7 +2227,20 @@ class MuZeroTrainer:
                 or (block > 0.0 and threat_gap > 0.0)
                 or (damage >= 12.0)
                 or (roles.intersection({"weak", "vulnerable", "debuff"}) and incoming > 0.0)
-                or (not exhausting and not energy_without_followup and not retain and impact >= 3.0)
+                or (
+                    setup_followup_dependent
+                    and setup_followup_available
+                    and not energy_without_followup
+                    and (energy_gain > 0.0 or typed_modify_cost or self._action_metric(action, "draw") > 0.0)
+                )
+                or (
+                    not exhausting
+                    and not energy_without_followup
+                    and not followup_missing
+                    and not retain
+                    and not (future_or_no_draw and impact < 8.0)
+                    and impact >= 3.0
+                )
             )
         )
         deferable = bool(
@@ -2099,6 +2252,9 @@ class MuZeroTrainer:
                 or retain
                 or x_cost_zero
                 or energy_without_followup
+                or followup_missing
+                or (future_or_no_draw and not setup_followup_available)
+                or (card_state_setup and not setup_followup_available and impact < 6.0)
                 or (hp_loss > 0.0 and energy_without_followup)
             )
         )
@@ -2111,6 +2267,17 @@ class MuZeroTrainer:
             "ethereal_urgent": bool(urgent and ethereal),
             "energy_without_followup": bool(energy_without_followup),
             "x_cost_zero": bool(x_cost_zero),
+            "typed_requires_followup": bool(typed_requires_followup),
+            "typed_strategic_skip_if_no_followup": bool(typed_strategic_skip_if_no_followup),
+            "typed_modify_cost": bool(typed_modify_cost),
+            "typed_no_draw": bool(typed_no_draw),
+            "typed_future_penalty": bool(typed_future_penalty),
+            "typed_consumes_future_resource": bool(typed_consumes_future_resource),
+            "typed_card_state_mutation": bool(typed_card_state_mutation),
+            "typed_modifies_hand": bool(typed_modifies_hand),
+            "setup_followup_dependent": bool(setup_followup_dependent),
+            "setup_followup_available": bool(setup_followup_available),
+            "followup_missing": bool(followup_missing),
         }
 
     def _is_facing_change_action(self, action: Any) -> bool:
@@ -2457,6 +2624,528 @@ class MuZeroTrainer:
         except Exception:
             return
 
+    @staticmethod
+    def _classify_end_turn_action(
+        context: dict[str, Any],
+        action_diagnostics: dict[str, Any] | None = None,
+        boss_signals: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, bool]]:
+        """Single classifier for selected end_turn actions.
+
+        Used by both the bias-side stats and the selected-action JSONL dumper so
+        ``bad_end_turn``/``forced_end_turn``/``strategic_defer_end_turn`` rates
+        cannot drift between detector and tracker.  Priority is strict:
+        ``bad > transient(forced) > forced > strategic_defer > unknown``.
+
+        ``boss_signals`` carries already-computed mechanism flags (Kaiser back
+        attack + facing candidate, Ceremonial stun window, etc.) so end_turn
+        chosen *under* those windows is upgraded to ``bad_end_turn`` even when
+        the static positive/urgent counters say nothing was urgently playable.
+        """
+
+        end_turn_indices = list(context.get("end_turn_indices") or [])
+        wasteful = bool(context.get("wasteful", False))
+        strategic_defer_available = bool(context.get("strategic_defer_available", False))
+        positive_count = int(context.get("positive_progress_count", 0) or 0)
+        urgent_count = int(context.get("urgent_positive_count", 0) or 0)
+        deferable_count = int(context.get("deferable_positive_count", 0) or 0)
+        energy = float(context.get("energy", 0.0) or 0.0)
+        diag = action_diagnostics if isinstance(action_diagnostics, dict) else {}
+        transient = bool(diag.get("transient_only_end_turn", False))
+        boss = boss_signals if isinstance(boss_signals, dict) else {}
+        kaiser_risk = float(boss.get("kaiser_back_attack_risk", 0.0) or 0.0)
+        kaiser_facing_cands = float(boss.get("kaiser_facing_change_candidate_count", 0.0) or 0.0)
+        kaiser_defense_cands = float(boss.get("kaiser_defense_candidate_count", 0.0) or 0.0)
+        ceremonial_stun = float(boss.get("ceremonial_stun_window", 0.0) or 0.0)
+        ceremonial_high_impact = float(boss.get("ceremonial_high_impact_count", 0.0) or 0.0)
+        kaiser_pressure_window = (
+            kaiser_risk > 0.05 and (kaiser_facing_cands >= 1.0 or kaiser_defense_cands >= 1.0)
+        )
+        ceremonial_open_window = ceremonial_stun > 0.05 and ceremonial_high_impact >= 1.0
+        boss_window_open = bool(kaiser_pressure_window or ceremonial_open_window)
+        flags = {
+            "no_legal_positive_action": positive_count == 0,
+            "transient_only_end_turn": transient,
+            "has_energy_and_positive_action": energy > 0.05 and positive_count > 0,
+            "has_urgent_or_mandatory_action": urgent_count > 0,
+            "has_strategic_defer_reason": strategic_defer_available,
+            "has_deferable_action": deferable_count > 0,
+            "kaiser_pressure_window_open": kaiser_pressure_window,
+            "ceremonial_open_window": ceremonial_open_window,
+            "boss_window_open": boss_window_open,
+        }
+        if not end_turn_indices:
+            return "unknown", flags
+        # Transient (bridge handed us only end_turn this frame) is treated as a
+        # forced selection, not bad — boss-window override does not apply.
+        if transient:
+            return "forced_end_turn", flags
+        if wasteful or boss_window_open:
+            return "bad_end_turn", flags
+        if positive_count == 0:
+            return "forced_end_turn", flags
+        if strategic_defer_available:
+            return "strategic_defer_end_turn", flags
+        return "unknown", flags
+
+    def _dump_selected_end_turn_context(
+        self,
+        encoded_obs: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None,
+        action_mask: np.ndarray,
+        legal_actions: list[Any] | None,
+        chosen_idx: int,
+        context: dict[str, Any],
+        search_policy: np.ndarray | None,
+        search_stats: dict[str, Any] | None,
+        action_diagnostics: dict[str, Any] | None,
+        encounter: str,
+        tier: str,
+    ) -> None:
+        """Append one JSONL entry per selected end_turn action.
+
+        Designed to stay cheap: reuses precomputed ``context`` indices and
+        existing search probabilities; does not loop legality classifiers again.
+        """
+
+        if getattr(self, "_end_turn_context_dump_disabled", False):
+            return
+        cap = int(getattr(self, "_end_turn_context_dump_max", 50000))
+        if cap > 0 and self._end_turn_context_dump_count >= cap:
+            return
+        try:
+            mask_np = np.asarray(action_mask, dtype=np.float32).reshape(-1)
+            class_name, reason_flags = self._classify_end_turn_action(context, action_diagnostics)
+
+            raw_combat = raw_obs.get("combat") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("combat"), dict) else {}
+            raw_player = raw_obs.get("player") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("player"), dict) else {}
+            if not raw_player and isinstance(raw_combat.get("player"), dict):
+                raw_player = raw_combat.get("player")
+            incoming, block, hp = self._incoming_damage_pressure(raw_obs)
+            energy_val = float(context.get("energy", 0.0) or 0.0)
+            try:
+                hand_count = len(raw_combat.get("hand") or []) if isinstance(raw_combat.get("hand"), list) else 0
+                draw_count = len(raw_combat.get("draw_pile") or []) if isinstance(raw_combat.get("draw_pile"), list) else 0
+                discard_count = len(raw_combat.get("discard_pile") or []) if isinstance(raw_combat.get("discard_pile"), list) else 0
+                exhaust_count = len(raw_combat.get("exhaust_pile") or []) if isinstance(raw_combat.get("exhaust_pile"), list) else 0
+            except Exception:
+                hand_count = draw_count = discard_count = exhaust_count = 0
+
+            x_cost_count = 0
+            zero_x_count = 0
+            try:
+                legal_count = min(len(legal_actions or []), MAX_ACTIONS, mask_np.shape[0])
+                for idx in range(legal_count):
+                    if mask_np[idx] <= 0:
+                        continue
+                    action = (legal_actions or [])[idx]
+                    if self._semantic_family(action) == "play_card" and self._is_x_cost_action(encoded_obs, idx, action):
+                        x_cost_count += 1
+                        if energy_val <= 0.05:
+                            zero_x_count += 1
+            except Exception:
+                pass
+
+            boss_context: dict[str, Any] = {}
+            try:
+                if isinstance(raw_obs, dict):
+                    boss_ctx = build_boss_mechanics_context(raw_obs)
+                    boss_context = {
+                        "kaiser_back_attack_risk": float(self._boss_context_max(boss_ctx, "back_attack_risk")),
+                        "kaiser_back_attack_active": float(self._boss_context_max(boss_ctx, "back_attack_active")),
+                        "incoming_damage_multiplier_norm": float(self._boss_context_max(boss_ctx, "incoming_damage_multiplier_norm")),
+                        "kaiser_facing_change_candidate_count": int(float(
+                            (search_stats or {}).get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0
+                        )),
+                        "ceremonial_one_card_lock": float(self._boss_context_max(boss_ctx, "one_card_lock")),
+                        "ceremonial_stun_window": float(self._boss_context_max(boss_ctx, "stun_window")),
+                    }
+            except Exception:
+                boss_context = {}
+
+            top_actions: list[dict[str, Any]] = []
+            try:
+                policy_np = (
+                    np.asarray(search_policy, dtype=np.float32).reshape(-1)
+                    if search_policy is not None
+                    else np.zeros(MAX_ACTIONS, dtype=np.float32)
+                )
+                # Rank legal actions by search_policy probability; fall back to mask order.
+                legal_count = min(len(legal_actions or []), MAX_ACTIONS, mask_np.shape[0], policy_np.shape[0])
+                ranked: list[tuple[int, float]] = []
+                for idx in range(legal_count):
+                    if mask_np[idx] <= 0:
+                        continue
+                    score = float(policy_np[idx]) if idx < policy_np.shape[0] else 0.0
+                    ranked.append((idx, score))
+                ranked.sort(key=lambda kv: kv[1], reverse=True)
+                for rank, (idx, score) in enumerate(ranked[:6], start=1):
+                    action = (legal_actions or [])[idx]
+                    family = self._semantic_family(action) if isinstance(action, dict) else ""
+                    card = action.get("card") if isinstance(action, dict) and isinstance(action.get("card"), dict) else {}
+                    target = action.get("target") if isinstance(action, dict) and isinstance(action.get("target"), dict) else {}
+                    tags: list[str] = []
+                    if isinstance(action, dict):
+                        if int(idx) in {int(i) for i in context.get("urgent_positive_indices") or []}:
+                            tags.append("urgent_positive")
+                        if int(idx) in {int(i) for i in context.get("deferable_positive_indices") or []}:
+                            tags.append("deferable")
+                        if int(idx) in {int(i) for i in context.get("setup_scaling_indices") or []}:
+                            tags.append("setup_scaling")
+                        if family == "end_turn":
+                            tags.append("end_turn")
+                        if family == "play_card" and self._is_x_cost_action(encoded_obs, idx, action):
+                            tags.append("x_cost")
+                            if energy_val <= 0.05:
+                                tags.append("zero_energy_x_cost")
+                        if self._is_kaiser_facing_change_action(action, raw_obs):
+                            tags.append("kaiser_facing_change")
+                    top_actions.append({
+                        "rank": rank,
+                        "action_idx": int(idx),
+                        "is_chosen": int(idx) == int(chosen_idx),
+                        "family": family,
+                        "card_id": card.get("id") if isinstance(card, dict) else None,
+                        "title": (action.get("title") if isinstance(action, dict) else None) or (card.get("title") if isinstance(card, dict) else None),
+                        "target": target.get("name") if isinstance(target, dict) else None,
+                        "score": float(score),
+                        "tags": tags,
+                    })
+            except Exception:
+                top_actions = []
+
+            payload = {
+                "time": time.time(),
+                "global_step": int(getattr(self, "total_steps", 0)),
+                "episode_id": int(getattr(self, "episode_count", 0)),
+                "encounter_id": str(encounter or ""),
+                "tier": str(tier or ""),
+                "turn": raw_combat.get("round"),
+                "selected_action_idx": int(chosen_idx),
+                "selected_family": "end_turn",
+                "end_turn_class": class_name,
+                "reason_flags": reason_flags,
+                "player": {
+                    "hp": float(hp),
+                    "max_hp": float(self._safe_float(raw_player.get("max_hp"))) if isinstance(raw_player, dict) else 0.0,
+                    "block": float(block),
+                    "energy": float(energy_val),
+                },
+                "combat": {
+                    "incoming_damage": float(incoming),
+                    "hand_count": int(hand_count),
+                    "draw_count": int(draw_count),
+                    "discard_count": int(discard_count),
+                    "exhaust_count": int(exhaust_count),
+                },
+                "counts": {
+                    "legal_action_count": int(np.sum(mask_np > 0)),
+                    "playable_cards_left": int(len(context.get("positive_indices") or [])),
+                    "positive_action_count": int(context.get("positive_progress_count", 0) or 0),
+                    "urgent_action_count": int(context.get("urgent_positive_count", 0) or 0),
+                    "deferable_action_count": int(context.get("deferable_positive_count", 0) or 0),
+                    "deferable_exhaust_count": int(context.get("deferable_exhaust_count", 0) or 0),
+                    "x_cost_candidate_count": int(x_cost_count),
+                    "zero_energy_x_cost_candidate_count": int(zero_x_count),
+                    "potion_available_count": int(context.get("potion_available_count", 0) or 0),
+                    "potion_urgent_count": int(context.get("potion_urgent_count", 0) or 0),
+                },
+                "boss_context": boss_context,
+                "top_legal_actions": top_actions,
+            }
+            path = Path(self.log_dir) / "diagnostics" / "end_turn_contexts.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._end_turn_context_dump_count += 1
+        except Exception:
+            return
+
+    def _dump_potion_transition(self, record: dict[str, Any] | None) -> None:
+        """Append one JSONL line per use_potion transition emitted by combat_env."""
+
+        if not isinstance(record, dict):
+            return
+        if getattr(self, "_potion_transition_dump_disabled", False):
+            return
+        cap = int(getattr(self, "_potion_transition_dump_max", 200000))
+        if cap > 0 and getattr(self, "_potion_transition_dump_count", 0) >= cap:
+            return
+        try:
+            payload = {
+                "time": time.time(),
+                "global_step": int(getattr(self, "total_steps", 0)),
+                "episode_id": int(getattr(self, "episode_count", 0)),
+                **record,
+            }
+            path = Path(self.log_dir) / "diagnostics" / "potion_transitions.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._potion_transition_dump_count += 1
+        except Exception:
+            return
+
+    def _dump_death_final_potions(
+        self,
+        *,
+        loss: bool,
+        final_potion_count: int,
+        used_potion_count: int,
+        adjusted_unused: int,
+        encounter: str,
+        tier: str,
+        potion_dump: list[dict[str, Any]] | None,
+    ) -> None:
+        """Append a death-final potion accounting line to the same JSONL.
+
+        Lets post-mortem confirm whether ``potion_unused_on_death`` flipped
+        because of a missing transition record vs a real hoarded potion.
+        """
+
+        if getattr(self, "_potion_transition_dump_disabled", False):
+            return
+        cap = int(getattr(self, "_potion_transition_dump_max", 200000))
+        if cap > 0 and getattr(self, "_potion_transition_dump_count", 0) >= cap:
+            return
+        try:
+            payload = {
+                "time": time.time(),
+                "global_step": int(getattr(self, "total_steps", 0)),
+                "episode_id": int(getattr(self, "episode_count", 0)),
+                "event": "death_final_potions",
+                "loss": bool(loss),
+                "encounter_id": str(encounter or ""),
+                "tier": str(tier or ""),
+                "final_potion_count": int(final_potion_count),
+                "used_potion_count": int(used_potion_count),
+                "adjusted_unused": int(adjusted_unused),
+                "potion_dump": list(potion_dump or []),
+            }
+            path = Path(self.log_dir) / "diagnostics" / "potion_transitions.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._potion_transition_dump_count += 1
+        except Exception:
+            return
+
+    @staticmethod
+    def _classify_action_offenders(
+        *,
+        search_stats: dict[str, Any] | None,
+        encounter: str,
+        family: str,
+    ) -> list[str]:
+        """Return the offender types triggered by the selected action's stats.
+
+        Pure function over stats already populated by ``_combat_action_quality_bias``
+        and ``_selected_combat_quality_stats``.  Boss-specific offenders are gated
+        by ``encounter`` so e.g. ``kaiser_*`` will never fire on a Construct fight.
+        """
+
+        s = search_stats if isinstance(search_stats, dict) else {}
+        encounter_l = str(encounter or "").lower()
+        family_l = str(family or "").lower()
+
+        def gt(key: str, threshold: float = 0.5) -> bool:
+            try:
+                return float(s.get(key, 0.0) or 0.0) > threshold
+            except (TypeError, ValueError):
+                return False
+
+        out: list[str] = []
+        if gt("combat_quality_wasteful_end_turn_selected"):
+            out.append("bad_end_turn")
+        if gt("combat_quality_strategic_defer_end_turn_selected"):
+            out.append("strategic_defer_end_turn")
+        if gt("combat_quality_strategic_skip_selected"):
+            out.append("strategic_skip_selected")
+        if gt("combat_quality_refund_no_followup_selected"):
+            out.append("refund_no_followup_selected")
+        if gt("combat_quality_zero_energy_x_cost_selected"):
+            out.append("zero_energy_x_cost_selected")
+        if gt("combat_quality_x_cost_bad_selected"):
+            out.append("x_cost_low_value_selected")
+        if family_l in {"use_potion", "potion"}:
+            if (
+                gt("combat_quality_potion_low_urgency_selected")
+                or gt("combat_quality_potion_save_recommended_selected")
+                or gt("combat_quality_potion_no_followup_selected")
+                or gt("combat_quality_potion_block_waste_selected")
+                or gt("combat_quality_potion_overkill_selected")
+            ):
+                out.append("low_quality_potion_selected")
+        # End-turn while save-value-recommended potions exist.
+        if family_l == "end_turn":
+            try:
+                save_value = float(s.get("combat_quality_potion_save_value_mean", 0.0) or 0.0)
+                save_recommended = float(s.get("combat_quality_potion_save_recommended_count", 0.0) or 0.0)
+                if save_value >= 0.6 and save_recommended >= 1.0:
+                    out.append("high_save_value_potion_unused")
+            except (TypeError, ValueError):
+                pass
+
+        is_kaiser = "kaiser" in encounter_l
+        if is_kaiser:
+            risk = float(s.get("combat_quality_kaiser_back_attack_risk", 0.0) or 0.0)
+            if risk > 0.05:
+                if gt("combat_quality_kaiser_risky_end_turn_selected"):
+                    out.append("kaiser_risky_end_turn")
+                facing_cands = float(s.get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0)
+                facing_sel = float(s.get("combat_quality_kaiser_facing_change_selected", 0.0) or 0.0)
+                if facing_cands >= 1.0 and facing_sel < 0.5 and family_l != "end_turn":
+                    out.append("kaiser_facing_missed")
+
+        if "ceremonial" in encounter_l:
+            if gt("combat_quality_ceremonial_low_impact_selected"):
+                out.append("ceremonial_low_impact_under_lock")
+            stun_window = float(s.get("combat_quality_ceremonial_stun_window", 0.0) or 0.0)
+            high_impact_sel = float(s.get("combat_quality_ceremonial_high_impact_selected", 0.0) or 0.0)
+            if stun_window > 0.05 and high_impact_sel < 0.5:
+                out.append("ceremonial_missed_stun_window")
+
+        if "insatiable" in encounter_l:
+            if gt("combat_quality_strategic_skip_selected"):
+                out.append("insatiable_strategic_skip")
+            if gt("combat_quality_refund_no_followup_selected"):
+                out.append("insatiable_strategic_skip")
+            if gt("combat_quality_wasteful_end_turn_selected"):
+                out.append("insatiable_strategic_skip")
+
+        # Preserve insertion order on dedup so primary offenders rank first.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in out:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _dump_action_offender(
+        self,
+        *,
+        encoded_obs: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None,
+        action_mask: np.ndarray,
+        legal_actions: list[Any] | None,
+        chosen_idx: int,
+        chosen_action: Any,
+        offender_types: list[str],
+        search_stats: dict[str, Any] | None,
+        encounter: str,
+        tier: str,
+    ) -> None:
+        """Append one JSONL entry per (step, offender_type) pair."""
+
+        if not offender_types:
+            return
+        if getattr(self, "_action_offender_dump_disabled", False):
+            return
+        cap = int(getattr(self, "_action_offender_dump_max", 100000))
+        if cap > 0 and getattr(self, "_action_offender_dump_count", 0) >= cap:
+            return
+        try:
+            mask_np = np.asarray(action_mask, dtype=np.float32).reshape(-1)
+            raw_combat = raw_obs.get("combat") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("combat"), dict) else {}
+            raw_player = raw_obs.get("player") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("player"), dict) else {}
+            if not raw_player and isinstance(raw_combat.get("player"), dict):
+                raw_player = raw_combat.get("player")
+            incoming, block, hp = self._incoming_damage_pressure(raw_obs)
+            family = self._semantic_family(chosen_action) if isinstance(chosen_action, dict) else ""
+            card = chosen_action.get("card") if isinstance(chosen_action, dict) and isinstance(chosen_action.get("card"), dict) else {}
+            potion = chosen_action.get("potion") if isinstance(chosen_action, dict) and isinstance(chosen_action.get("potion"), dict) else {}
+            target = chosen_action.get("target") if isinstance(chosen_action, dict) and isinstance(chosen_action.get("target"), dict) else {}
+            stats = search_stats if isinstance(search_stats, dict) else {}
+            state_summary = {
+                "energy": float(stats.get("combat_quality_energy", 0.0) or 0.0),
+                "incoming_damage": float(incoming),
+                "block": float(block),
+                "hp": float(hp),
+                "max_hp": float(self._safe_float(raw_player.get("max_hp"))) if isinstance(raw_player, dict) else 0.0,
+                "legal_action_count": int(np.sum(mask_np > 0)),
+                "positive_action_count": float(stats.get("combat_quality_positive_action_count", 0.0) or 0.0),
+                "urgent_positive_action_count": float(stats.get("combat_quality_urgent_positive_action_count", 0.0) or 0.0),
+                "deferable_positive_action_count": float(stats.get("combat_quality_deferable_positive_action_count", 0.0) or 0.0),
+                "x_cost_available_count": float(stats.get("combat_quality_x_cost_available_count", 0.0) or 0.0),
+                "zero_energy_x_cost_count": float(stats.get("combat_quality_zero_energy_x_cost_count", 0.0) or 0.0),
+                "kaiser_back_attack_risk": float(stats.get("combat_quality_kaiser_back_attack_risk", 0.0) or 0.0),
+                "kaiser_facing_change_candidate_count": float(stats.get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0),
+                "ceremonial_one_card_lock": float(stats.get("combat_quality_ceremonial_one_card_lock", 0.0) or 0.0),
+                "ceremonial_stun_window": float(stats.get("combat_quality_ceremonial_stun_window", 0.0) or 0.0),
+            }
+            reason_flags = {
+                key: float(stats.get(f"combat_quality_{key}", 0.0) or 0.0) > 0.5
+                for key in (
+                    "wasteful_end_turn_selected",
+                    "strategic_defer_end_turn_selected",
+                    "strategic_skip_selected",
+                    "refund_no_followup_selected",
+                    "zero_energy_x_cost_selected",
+                    "potion_low_urgency_selected",
+                    "potion_save_recommended_selected",
+                    "potion_no_followup_selected",
+                    "potion_block_waste_selected",
+                    "potion_overkill_selected",
+                    "kaiser_facing_change_selected",
+                    "kaiser_pressure_selected",
+                    "kaiser_risky_end_turn_selected",
+                    "ceremonial_low_impact_selected",
+                    "ceremonial_high_impact_selected",
+                )
+            }
+            alternatives: list[dict[str, Any]] = []
+            try:
+                count = min(len(legal_actions or []), MAX_ACTIONS, mask_np.shape[0])
+                for idx in range(count):
+                    if idx == int(chosen_idx) or mask_np[idx] <= 0:
+                        continue
+                    cand = (legal_actions or [])[idx]
+                    if not isinstance(cand, dict):
+                        continue
+                    cand_card = cand.get("card") if isinstance(cand.get("card"), dict) else {}
+                    alternatives.append({
+                        "action_idx": int(idx),
+                        "family": self._semantic_family(cand),
+                        "card_id": cand_card.get("id") if isinstance(cand_card, dict) else None,
+                        "title": cand.get("title") or (cand_card.get("title") if isinstance(cand_card, dict) else None),
+                    })
+                    if len(alternatives) >= 5:
+                        break
+            except Exception:
+                alternatives = []
+            path = Path(self.log_dir) / "diagnostics" / "action_offenders.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for offender_type in offender_types:
+                payload = {
+                    "time": time.time(),
+                    "global_step": int(getattr(self, "total_steps", 0)),
+                    "episode_id": int(getattr(self, "episode_count", 0)),
+                    "encounter_id": str(encounter or ""),
+                    "tier": str(tier or ""),
+                    "turn": raw_combat.get("round"),
+                    "offender_type": offender_type,
+                    "selected_action_idx": int(chosen_idx),
+                    "selected_family": family,
+                    "selected_card_id": card.get("id") if isinstance(card, dict) else None,
+                    "selected_potion_id": potion.get("id") if isinstance(potion, dict) else None,
+                    "selected_title": (chosen_action.get("title") if isinstance(chosen_action, dict) else None)
+                        or (card.get("title") if isinstance(card, dict) else None)
+                        or (potion.get("title") if isinstance(potion, dict) else None),
+                    "selected_target": target.get("name") if isinstance(target, dict) else None,
+                    "reason_flags": reason_flags,
+                    "state_summary": state_summary,
+                    "alternative_actions": alternatives,
+                }
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+                self._action_offender_dump_count = int(getattr(self, "_action_offender_dump_count", 0)) + 1
+                if cap > 0 and self._action_offender_dump_count >= cap:
+                    return
+        except Exception:
+            return
+
     def _is_kaiser_risk_handling_action(self, action: Any, raw_obs: Any | None = None) -> bool:
         """Actions that can directly answer Kaiser/Rocket/Crusher back-attack risk.
 
@@ -2531,6 +3220,12 @@ class MuZeroTrainer:
         deferable_exhaust_indices: list[int] = []
         ethereal_urgent_indices: list[int] = []
         energy_gain_without_followup_indices: list[int] = []
+        typed_followup_missing_indices: list[int] = []
+        typed_future_penalty_indices: list[int] = []
+        typed_no_draw_indices: list[int] = []
+        typed_card_state_mutation_indices: list[int] = []
+        setup_followup_dependent_indices: list[int] = []
+        setup_followup_available_indices: list[int] = []
         potion_available_indices: list[int] = []
         potion_urgent_indices: list[int] = []
         potion_low_urgency_indices: list[int] = []
@@ -2629,6 +3324,18 @@ class MuZeroTrainer:
                     ethereal_urgent_indices.append(int(idx))
                 if classification["energy_without_followup"]:
                     energy_gain_without_followup_indices.append(int(idx))
+                if bool(classification.get("followup_missing", False)):
+                    typed_followup_missing_indices.append(int(idx))
+                if bool(classification.get("typed_future_penalty", False)):
+                    typed_future_penalty_indices.append(int(idx))
+                if bool(classification.get("typed_no_draw", False)):
+                    typed_no_draw_indices.append(int(idx))
+                if bool(classification.get("typed_card_state_mutation", False)):
+                    typed_card_state_mutation_indices.append(int(idx))
+                if bool(classification.get("setup_followup_dependent", False)):
+                    setup_followup_dependent_indices.append(int(idx))
+                if bool(classification.get("setup_followup_available", False)):
+                    setup_followup_available_indices.append(int(idx))
         positive_progress_count = len(positive_indices)
         urgent_positive_count = len(urgent_positive_indices)
         deferable_positive_count = len(deferable_positive_indices)
@@ -2659,6 +3366,12 @@ class MuZeroTrainer:
             "deferable_exhaust_indices": deferable_exhaust_indices,
             "ethereal_urgent_indices": ethereal_urgent_indices,
             "energy_gain_without_followup_indices": energy_gain_without_followup_indices,
+            "typed_followup_missing_indices": typed_followup_missing_indices,
+            "typed_future_penalty_indices": typed_future_penalty_indices,
+            "typed_no_draw_indices": typed_no_draw_indices,
+            "typed_card_state_mutation_indices": typed_card_state_mutation_indices,
+            "setup_followup_dependent_indices": setup_followup_dependent_indices,
+            "setup_followup_available_indices": setup_followup_available_indices,
             "potion_available_indices": potion_available_indices,
             "potion_urgent_indices": potion_urgent_indices,
             "potion_low_urgency_indices": potion_low_urgency_indices,
@@ -2676,6 +3389,12 @@ class MuZeroTrainer:
             "deferable_exhaust_count": len(deferable_exhaust_indices),
             "ethereal_urgent_count": len(ethereal_urgent_indices),
             "energy_gain_without_followup_count": len(energy_gain_without_followup_indices),
+            "typed_followup_missing_count": len(typed_followup_missing_indices),
+            "typed_future_penalty_count": len(typed_future_penalty_indices),
+            "typed_no_draw_count": len(typed_no_draw_indices),
+            "typed_card_state_mutation_count": len(typed_card_state_mutation_indices),
+            "setup_followup_dependent_count": len(setup_followup_dependent_indices),
+            "setup_followup_available_count": len(setup_followup_available_indices),
             "potion_available_count": len(potion_available_indices),
             "potion_urgent_count": len(potion_urgent_indices),
             "potion_low_urgency_count": len(potion_low_urgency_indices),
@@ -2743,6 +3462,80 @@ class MuZeroTrainer:
         cost = action.get("card_cost", card.get("cost"))
         return str(cost).strip().upper() == "X"
 
+    @classmethod
+    def _x_cost_has_non_energy_effect(cls, action: Any) -> bool:
+        """Whether an X-cost play produces value independent of current energy.
+
+        StS2 X-cost cards usually scale with the energy spent, so a 0-energy X
+        play is dominated.  But X-cost pile-manipulation/exhaust/transform/
+        retain/keyword cards still mutate state at 0 energy — those plays must
+        not be flagged as ``zero_energy_x_cost_selected`` offenders.
+        """
+
+        if not isinstance(action, dict):
+            return False
+        semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+        if bool(semantic.get("x_cost_has_non_energy_effect", False)):
+            return True
+        for key in (
+            "typed_modifies_hand",
+            "typed_upgrade_hand",
+            "typed_exhaust_cards",
+            "typed_discard_cards",
+            "typed_transform_cards",
+            "typed_copy_cards",
+            "typed_add_modifier",
+            "typed_add_keyword",
+            "typed_set_replay",
+            "typed_retain_cards",
+            "typed_card_state_mutation",
+        ):
+            if bool(semantic.get(key, False)):
+                return True
+        if cls._action_roles(action).intersection(
+            {"facing_change", "stun", "artifact_strip", "lock", "mechanism"}
+        ):
+            return True
+        return False
+
+    @classmethod
+    def _x_cost_diagnostic(cls, action: Any, current_energy: float) -> dict[str, float]:
+        """Static-state X-cost view for diagnostics: effective energy + non-energy effect."""
+
+        is_x = False
+        if isinstance(action, dict):
+            semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+            card = action.get("card") if isinstance(action.get("card"), dict) else {}
+            try:
+                if float(semantic.get("x_cost_value") or 0.0) > 0.0:
+                    is_x = True
+            except (TypeError, ValueError):
+                pass
+            if not is_x:
+                if bool(semantic.get("is_x_cost") or card.get("x_cost") or card.get("costs_x")
+                        or action.get("x_cost") or action.get("costs_x")):
+                    is_x = True
+            if not is_x:
+                cost_text = str(action.get("card_cost") or card.get("cost") or "").strip().upper()
+                if cost_text == "X":
+                    is_x = True
+        if not is_x:
+            return {
+                "is_x_cost": 0.0,
+                "x_cost_effective_energy": 0.0,
+                "x_cost_has_non_energy_effect": 0.0,
+                "x_cost_bad": 0.0,
+            }
+        effective_energy = max(float(current_energy), 0.0)
+        non_energy = cls._x_cost_has_non_energy_effect(action)
+        bad = effective_energy <= 0.05 and not non_energy
+        return {
+            "is_x_cost": 1.0,
+            "x_cost_effective_energy": effective_energy,
+            "x_cost_has_non_energy_effect": 1.0 if non_energy else 0.0,
+            "x_cost_bad": 1.0 if bad else 0.0,
+        }
+
     def _combat_action_quality_bias(
         self,
         obs: dict[str, Any],
@@ -2764,6 +3557,9 @@ class MuZeroTrainer:
         zero_energy_x_indices: set[int] = set()
         playable_indices: set[int] = set()
         end_turn_indices: set[int] = set()
+        x_cost_indices: set[int] = set()
+        x_cost_bad_indices: set[int] = set()
+        x_cost_effective_energy_sum = 0.0
 
         legal_count = min(len(legal_actions or []), MAX_ACTIONS, mask_np.shape[0])
         for idx in range(legal_count):
@@ -2775,8 +3571,14 @@ class MuZeroTrainer:
                 end_turn_indices.add(idx)
             elif family == "play_card":
                 playable_indices.add(idx)
-            if family == "play_card" and self._is_x_cost_action(obs, idx, action) and energy <= 0.05:
-                zero_energy_x_indices.add(idx)
+            if family == "play_card" and self._is_x_cost_action(obs, idx, action):
+                x_cost_indices.add(idx)
+                x_diag = self._x_cost_diagnostic(action, float(energy))
+                x_cost_effective_energy_sum += float(x_diag.get("x_cost_effective_energy", 0.0))
+                if energy <= 0.05:
+                    zero_energy_x_indices.add(idx)
+                if float(x_diag.get("x_cost_bad", 0.0)) > 0.5:
+                    x_cost_bad_indices.add(idx)
 
         context: dict[str, Any]
         try:
@@ -2789,6 +3591,12 @@ class MuZeroTrainer:
         deferable_positive_indices = {int(i) for i in context.get("deferable_positive_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         deferable_exhaust_indices = {int(i) for i in context.get("deferable_exhaust_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         energy_gain_without_followup_indices = {int(i) for i in context.get("energy_gain_without_followup_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        typed_followup_missing_indices = {int(i) for i in context.get("typed_followup_missing_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        typed_future_penalty_indices = {int(i) for i in context.get("typed_future_penalty_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        typed_no_draw_indices = {int(i) for i in context.get("typed_no_draw_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        typed_card_state_mutation_indices = {int(i) for i in context.get("typed_card_state_mutation_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        setup_followup_dependent_indices = {int(i) for i in context.get("setup_followup_dependent_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        setup_followup_available_indices = {int(i) for i in context.get("setup_followup_available_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         potion_available_indices = {int(i) for i in context.get("potion_available_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         potion_urgent_indices = {int(i) for i in context.get("potion_urgent_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         potion_low_urgency_indices = {int(i) for i in context.get("potion_low_urgency_indices", []) if 0 <= int(i) < MAX_ACTIONS}
@@ -2828,6 +3636,18 @@ class MuZeroTrainer:
             for idx in zero_energy_x_indices:
                 if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
                     bias[idx] -= 4.5
+
+        for idx in typed_followup_missing_indices:
+            if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
+                # Production/Bloodletting/Bullet-Time-like cards are legal but
+                # dominated when the current hand cannot convert the generated
+                # energy/cost rule/no-draw tradeoff this turn.  Keep this softer
+                # than zero-energy X, because sometimes retaining/setting up a
+                # card-state mutation is still a legitimate long-horizon choice.
+                bias[idx] -= 0.65
+        for idx in typed_future_penalty_indices | typed_no_draw_indices:
+            if idx not in setup_followup_available_indices and 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
+                bias[idx] -= 0.25
 
         for idx in potion_urgent_indices:
             if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
@@ -2962,6 +3782,12 @@ class MuZeroTrainer:
             "combat_quality_deferable_positive_action_count": float(len(deferable_positive_indices)),
             "combat_quality_deferable_exhaust_card_count": float(len(deferable_exhaust_indices)),
             "combat_quality_energy_gain_without_followup_count": float(len(energy_gain_without_followup_indices)),
+            "combat_quality_typed_followup_missing_count": float(len(typed_followup_missing_indices)),
+            "combat_quality_typed_future_penalty_count": float(len(typed_future_penalty_indices)),
+            "combat_quality_typed_no_draw_count": float(len(typed_no_draw_indices)),
+            "combat_quality_typed_card_state_mutation_count": float(len(typed_card_state_mutation_indices)),
+            "combat_quality_setup_followup_dependent_count": float(len(setup_followup_dependent_indices)),
+            "combat_quality_setup_followup_available_count": float(len(setup_followup_available_indices)),
             "combat_quality_potion_available_count": float(len(potion_available_indices)),
             "combat_quality_potion_urgent_count": float(len(potion_urgent_indices)),
             "combat_quality_potion_low_urgency_count": float(len(potion_low_urgency_indices)),
@@ -2981,6 +3807,13 @@ class MuZeroTrainer:
             "combat_quality_potion_requires_followup_count": float(context.get("potion_requires_followup_count", 0) or 0),
             "combat_quality_strategic_defer_available": 1.0 if bool(context.get("strategic_defer_available", False)) and bool(end_turn_indices) else 0.0,
             "combat_quality_true_wasteful_end_turn_available": 1.0 if wasteful and bool(end_turn_indices) else 0.0,
+            "combat_quality_bad_end_turn_available": 1.0 if (wasteful or (
+                bool(end_turn_indices)
+                and (kaiser_back_attack_risk > 0.05 and kaiser_facing_change_candidate_count >= 1)
+            )) else 0.0,
+            "combat_quality_forced_end_turn_available": 1.0 if (
+                bool(end_turn_indices) and not wasteful and len(positive_indices) == 0
+            ) else 0.0,
             "combat_quality_playable_action_count": float(len(playable_indices)),
             "combat_quality_end_turn_severity": float(severity),
             "combat_quality_x_cost_available_count": float(sum(
@@ -2989,6 +3822,13 @@ class MuZeroTrainer:
                 if mask_np[_idx] > 0 and self._semantic_family(legal_actions[_idx]) == "play_card" and self._is_x_cost_action(obs, _idx, legal_actions[_idx])
             )),
             "combat_quality_zero_energy_x_cost_count": float(len(zero_energy_x_indices)),
+            "combat_quality_x_cost_bad_count": float(len(x_cost_bad_indices)),
+            "combat_quality_x_cost_effective_energy_sum": float(x_cost_effective_energy_sum),
+            "combat_quality_x_cost_effective_energy_mean": (
+                float(x_cost_effective_energy_sum / max(len(x_cost_indices), 1))
+                if x_cost_indices
+                else 0.0
+            ),
             "combat_quality_kaiser_back_attack_risk": float(kaiser_back_attack_risk),
             "combat_quality_kaiser_defense_candidate_count": float(kaiser_defense_candidate_count),
             "combat_quality_kaiser_facing_change_candidate_count": float(kaiser_facing_change_candidate_count),
@@ -3068,6 +3908,9 @@ class MuZeroTrainer:
         end_turn_selected = family == "end_turn"
         x_selected = bool(family == "play_card" and self._is_x_cost_action(obs, action_idx, action))
         zero_x_selected = bool(x_selected and energy <= 0.05)
+        x_diag = self._x_cost_diagnostic(action, float(energy)) if x_selected else {}
+        x_has_non_energy = float(x_diag.get("x_cost_has_non_energy_effect", 0.0) or 0.0) > 0.5
+        x_bad_selected = bool(x_selected and float(x_diag.get("x_cost_bad", 0.0) or 0.0) > 0.5)
         true_waste_available = float(stats.get("combat_quality_true_wasteful_end_turn_available", stats.get("combat_quality_wasteful_end_turn_available", 0.0)) or 0.0) > 0.5
         strategic_defer_available = float(stats.get("combat_quality_strategic_defer_available", 0.0) or 0.0) > 0.5
         potion_selected = family in {"use_potion", "potion"}
@@ -3076,15 +3919,59 @@ class MuZeroTrainer:
         if potion_selected:
             mask_np = np.ones(MAX_ACTIONS, dtype=np.float32)
             potion_profile = self._potion_timing_profile(action, action_idx, obs, raw_obs, legal_actions, mask_np, energy)
+        # TASK-B1: re-classify the selected end_turn through the central
+        # taxonomy so the selected-side rate uses the same priority as the
+        # bias-side context.  Reconstruct a minimal context dict from the
+        # already-computed bias stats — avoids re-walking legal_actions and
+        # keeps the taxonomy frame-consistent with the bias judgment.
+        end_turn_class = "unknown"
+        end_turn_class_flags: dict[str, bool] = {}
+        if end_turn_selected:
+            taxonomy_context = {
+                "end_turn_indices": [int(action_idx)],
+                "wasteful": bool(true_waste_available),
+                "strategic_defer_available": bool(strategic_defer_available),
+                "positive_progress_count": int(float(stats.get("combat_quality_positive_action_count", 0.0) or 0.0)),
+                "urgent_positive_count": int(float(stats.get("combat_quality_urgent_positive_action_count", 0.0) or 0.0)),
+                "deferable_positive_count": int(float(stats.get("combat_quality_deferable_positive_action_count", 0.0) or 0.0)),
+                "energy": float(stats.get("combat_quality_energy", energy) or energy),
+            }
+            boss_signals = {
+                "kaiser_back_attack_risk": float(stats.get("combat_quality_kaiser_back_attack_risk", 0.0) or 0.0),
+                "kaiser_facing_change_candidate_count": float(stats.get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0),
+                "kaiser_defense_candidate_count": float(stats.get("combat_quality_kaiser_defense_candidate_count", 0.0) or 0.0),
+                "ceremonial_stun_window": float(stats.get("combat_quality_ceremonial_stun_window", 0.0) or 0.0),
+                "ceremonial_high_impact_count": float(stats.get("combat_quality_ceremonial_high_impact_count", 0.0) or 0.0),
+            }
+            end_turn_class, end_turn_class_flags = self._classify_end_turn_action(
+                taxonomy_context,
+                None,
+                boss_signals,
+            )
+        bad_selected = end_turn_selected and end_turn_class == "bad_end_turn"
+        forced_selected = end_turn_selected and end_turn_class == "forced_end_turn"
+        defer_selected_taxonomy = end_turn_selected and end_turn_class == "strategic_defer_end_turn"
+        unknown_selected = end_turn_selected and end_turn_class == "unknown"
         result = {
             "combat_quality_x_cost_selected": 1.0 if x_selected else 0.0,
             "combat_quality_x_cost_selected_energy": float(energy) if x_selected else 0.0,
             "combat_quality_x_cost_zero_energy_selected": 1.0 if zero_x_selected else 0.0,
             "combat_quality_zero_energy_x_cost_selected": 1.0 if zero_x_selected else 0.0,
+            "combat_quality_x_cost_selected_effective_energy": float(x_diag.get("x_cost_effective_energy", 0.0) or 0.0) if x_selected else 0.0,
+            "combat_quality_x_cost_has_non_energy_effect_selected": 1.0 if (x_selected and x_has_non_energy) else 0.0,
+            "combat_quality_x_cost_bad_selected": 1.0 if x_bad_selected else 0.0,
             "combat_quality_end_turn_selected": 1.0 if end_turn_selected else 0.0,
+            # Legacy alias kept so existing dashboards stay readable.  The
+            # taxonomy view (bad/forced/strategic_defer) is the new source of
+            # truth — bad_selected is wider than wasteful because it folds in
+            # boss-pressure windows.
             "combat_quality_true_wasteful_end_turn_selected": 1.0 if (end_turn_selected and true_waste_available) else 0.0,
-            "combat_quality_wasteful_end_turn_selected": 1.0 if (end_turn_selected and true_waste_available) else 0.0,
-            "combat_quality_strategic_defer_end_turn_selected": 1.0 if (end_turn_selected and strategic_defer_available) else 0.0,
+            "combat_quality_wasteful_end_turn_selected": 1.0 if bad_selected else (1.0 if (end_turn_selected and true_waste_available) else 0.0),
+            "combat_quality_bad_end_turn_selected": 1.0 if bad_selected else 0.0,
+            "combat_quality_forced_end_turn_selected": 1.0 if forced_selected else 0.0,
+            "combat_quality_strategic_defer_end_turn_selected": 1.0 if (defer_selected_taxonomy or (end_turn_selected and strategic_defer_available and not bad_selected)) else 0.0,
+            "combat_quality_end_turn_unknown_selected": 1.0 if unknown_selected else 0.0,
+            "combat_quality_end_turn_class": end_turn_class,
         }
         result.update(
             {
@@ -3185,6 +4072,12 @@ class MuZeroTrainer:
             "combat_quality_deferable_positive_action_count",
             "combat_quality_deferable_exhaust_card_count",
             "combat_quality_energy_gain_without_followup_count",
+            "combat_quality_typed_followup_missing_count",
+            "combat_quality_typed_future_penalty_count",
+            "combat_quality_typed_no_draw_count",
+            "combat_quality_typed_card_state_mutation_count",
+            "combat_quality_setup_followup_dependent_count",
+            "combat_quality_setup_followup_available_count",
             "combat_quality_potion_available_count",
             "combat_quality_potion_urgent_count",
             "combat_quality_potion_low_urgency_count",
@@ -3237,6 +4130,17 @@ class MuZeroTrainer:
             "combat_quality_x_cost_zero_energy_selected",
             "combat_quality_zero_energy_x_cost_count",
             "combat_quality_zero_energy_x_cost_selected",
+            "combat_quality_x_cost_bad_count",
+            "combat_quality_x_cost_effective_energy_sum",
+            "combat_quality_x_cost_effective_energy_mean",
+            "combat_quality_x_cost_selected_effective_energy",
+            "combat_quality_x_cost_has_non_energy_effect_selected",
+            "combat_quality_x_cost_bad_selected",
+            "combat_quality_bad_end_turn_available",
+            "combat_quality_bad_end_turn_selected",
+            "combat_quality_forced_end_turn_available",
+            "combat_quality_forced_end_turn_selected",
+            "combat_quality_end_turn_unknown_selected",
             "combat_quality_end_turn_selected",
         ):
             value = search_stats.get(key)
@@ -3541,6 +4445,12 @@ class MuZeroTrainer:
                 "combat_quality_deferable_positive_action_count",
                 "combat_quality_deferable_exhaust_card_count",
                 "combat_quality_energy_gain_without_followup_count",
+                "combat_quality_typed_followup_missing_count",
+                "combat_quality_typed_future_penalty_count",
+                "combat_quality_typed_no_draw_count",
+                "combat_quality_typed_card_state_mutation_count",
+                "combat_quality_setup_followup_dependent_count",
+                "combat_quality_setup_followup_available_count",
                 "combat_quality_potion_available_count",
                 "combat_quality_potion_urgent_count",
                 "combat_quality_potion_low_urgency_count",
@@ -3577,6 +4487,17 @@ class MuZeroTrainer:
                 "combat_quality_x_cost_zero_energy_selected",
                 "combat_quality_zero_energy_x_cost_count",
                 "combat_quality_zero_energy_x_cost_selected",
+                "combat_quality_x_cost_bad_count",
+                "combat_quality_x_cost_effective_energy_sum",
+                "combat_quality_x_cost_effective_energy_mean",
+                "combat_quality_x_cost_selected_effective_energy",
+                "combat_quality_x_cost_has_non_energy_effect_selected",
+                "combat_quality_x_cost_bad_selected",
+                "combat_quality_bad_end_turn_available",
+                "combat_quality_bad_end_turn_selected",
+                "combat_quality_forced_end_turn_available",
+                "combat_quality_forced_end_turn_selected",
+                "combat_quality_end_turn_unknown_selected",
                 "combat_quality_end_turn_selected",
                 "combat_quality_energy",
                 "combat_quality_positive_action_count",
@@ -3611,7 +4532,25 @@ class MuZeroTrainer:
         loss = (death_floor > 0.0) or (not terminated and not truncated)
         win = terminated and not truncated and death_floor <= 0.0
         entry = boss_entry if isinstance(boss_entry, dict) else {}
-        potion_unused_on_death = 1.0 if loss and int(final_potion_count) > 0 else 0.0
+        # TASK-A4: subtract used-this-combat from raw final count so a use_potion
+        # that succeeded but left a stale slot in the death frame does not falsely
+        # inflate potion_unused_on_death.  Diagnostic JSONL captures the raw
+        # transition so root-cause analysis can still see it.
+        used_potion_count = int(metadata.get("used_potion_count_this_combat", 0) or 0)
+        adjusted_unused = max(int(final_potion_count) - used_potion_count, 0)
+        potion_unused_on_death = 1.0 if loss and adjusted_unused > 0 else 0.0
+        try:
+            self._dump_death_final_potions(
+                loss=loss,
+                final_potion_count=int(final_potion_count),
+                used_potion_count=int(used_potion_count),
+                adjusted_unused=int(adjusted_unused),
+                encounter=encounter_id,
+                tier=encounter_tier,
+                potion_dump=metadata.get("final_potion_dump") if isinstance(metadata.get("final_potion_dump"), list) else None,
+            )
+        except Exception:
+            pass
 
         metrics = {
             "boss/attempt_count": 1.0,
@@ -3626,6 +4565,9 @@ class MuZeroTrainer:
             "boss_combat/family_potion_rate": self._safe_rate(use_potion_count, total_steps),
             "boss_combat/wasteful_end_turn_rate": self._safe_rate(wasteful_end_turn_count, total_steps),
             "boss_combat/potion_unused_on_death_rate": potion_unused_on_death,
+            "boss_combat/potion_unused_on_death_raw_rate": 1.0 if loss and int(final_potion_count) > 0 else 0.0,
+            "boss_combat/used_potion_count_this_combat_mean": float(used_potion_count),
+            "boss_combat/final_potion_count_mean": float(int(final_potion_count)),
             "boss_combat/playable_cards_left_mean": float(np.mean(search_values.get("mean_predicted_legal_count", [0.0]))),
             "boss_combat/direct_policy_used_rate": float(np.mean(search_values.get("search_mode_direct_policy", [0.0]))),
             "boss_combat/search_mode_direct_rollout_planner": float(np.mean(search_values.get("search_mode_direct_rollout_planner", [0.0]))),
@@ -3643,10 +4585,21 @@ class MuZeroTrainer:
             "boss_combat/true_wasteful_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_true_wasteful_end_turn_selected", [0.0]))),
             "boss_combat/strategic_defer_available_rate": float(np.mean(search_values.get("combat_quality_strategic_defer_available", [0.0]))),
             "boss_combat/strategic_defer_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_strategic_defer_end_turn_selected", [0.0]))),
+            "boss_combat/bad_end_turn_available_rate": float(np.mean(search_values.get("combat_quality_bad_end_turn_available", [0.0]))),
+            "boss_combat/bad_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_bad_end_turn_selected", [0.0]))),
+            "boss_combat/forced_end_turn_available_rate": float(np.mean(search_values.get("combat_quality_forced_end_turn_available", [0.0]))),
+            "boss_combat/forced_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_forced_end_turn_selected", [0.0]))),
+            "boss_combat/end_turn_unknown_selected_rate": float(np.mean(search_values.get("combat_quality_end_turn_unknown_selected", [0.0]))),
             "boss_combat/urgent_positive_action_count_mean": float(np.mean(search_values.get("combat_quality_urgent_positive_action_count", [0.0]))),
             "boss_combat/deferable_positive_action_count_mean": float(np.mean(search_values.get("combat_quality_deferable_positive_action_count", [0.0]))),
             "boss_combat/deferable_exhaust_card_count_mean": float(np.mean(search_values.get("combat_quality_deferable_exhaust_card_count", [0.0]))),
             "boss_combat/energy_gain_without_followup_count_mean": float(np.mean(search_values.get("combat_quality_energy_gain_without_followup_count", [0.0]))),
+            "boss_combat/typed_followup_missing_count_mean": float(np.mean(search_values.get("combat_quality_typed_followup_missing_count", [0.0]))),
+            "boss_combat/typed_future_penalty_count_mean": float(np.mean(search_values.get("combat_quality_typed_future_penalty_count", [0.0]))),
+            "boss_combat/typed_no_draw_count_mean": float(np.mean(search_values.get("combat_quality_typed_no_draw_count", [0.0]))),
+            "boss_combat/typed_card_state_mutation_count_mean": float(np.mean(search_values.get("combat_quality_typed_card_state_mutation_count", [0.0]))),
+            "boss_combat/setup_followup_dependent_count_mean": float(np.mean(search_values.get("combat_quality_setup_followup_dependent_count", [0.0]))),
+            "boss_combat/setup_followup_available_count_mean": float(np.mean(search_values.get("combat_quality_setup_followup_available_count", [0.0]))),
             "boss_combat/potion_available_count_mean": float(np.mean(search_values.get("combat_quality_potion_available_count", [0.0]))),
             "boss_combat/potion_urgent_available_mean": float(np.mean(search_values.get("combat_quality_potion_urgent_count", [0.0]))),
             "boss_combat/potion_low_urgency_available_mean": float(np.mean(search_values.get("combat_quality_potion_low_urgency_count", [0.0]))),
@@ -3695,6 +4648,11 @@ class MuZeroTrainer:
             "boss_combat/x_cost_zero_energy_selected_rate": float(np.mean(search_values.get("combat_quality_x_cost_zero_energy_selected", [0.0]))),
             "boss_combat/zero_energy_x_cost_available_mean": float(np.mean(search_values.get("combat_quality_zero_energy_x_cost_count", [0.0]))),
             "boss_combat/zero_energy_x_cost_selected_rate": float(np.mean(search_values.get("combat_quality_zero_energy_x_cost_selected", [0.0]))),
+            "boss_combat/x_cost_bad_available_count_mean": float(np.mean(search_values.get("combat_quality_x_cost_bad_count", [0.0]))),
+            "boss_combat/x_cost_effective_energy_mean": float(np.mean(search_values.get("combat_quality_x_cost_effective_energy_mean", [0.0]))),
+            "boss_combat/x_cost_selected_effective_energy_mean": float(np.mean(search_values.get("combat_quality_x_cost_selected_effective_energy", [0.0]))),
+            "boss_combat/x_cost_has_non_energy_effect_selected_rate": float(np.mean(search_values.get("combat_quality_x_cost_has_non_energy_effect_selected", [0.0]))),
+            "boss_combat/x_cost_bad_selected_rate": float(np.mean(search_values.get("combat_quality_x_cost_bad_selected", [0.0]))),
             "boss_combat/direct_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_end_turn_selected", [0.0]))),
             "boss_combat/energy_mean": float(np.mean(search_values.get("combat_quality_energy", [0.0]))),
             "boss_combat/positive_action_count_mean": float(np.mean(search_values.get("combat_quality_positive_action_count", [0.0]))),
@@ -3728,16 +4686,45 @@ class MuZeroTrainer:
         # Ceremonial diagnosis gets diluted by other bosses.  Mirror every
         # boss_combat/* scalar under boss_combat/<encounter_id>/* so TensorBoard can
         # answer mechanism-specific questions without post-processing.
-        encounter_base = re.sub(r"^encounter[\._:/-]+", "", encounter_id.strip().lower())
-        safe_encounter = re.sub(r"[^0-9a-zA-Z]+", "_", encounter_base).strip("_")
-        raw_safe_encounter = re.sub(r"[^0-9a-zA-Z]+", "_", encounter_id.strip().lower()).strip("_")
-        for namespace in tuple(dict.fromkeys(x for x in (safe_encounter, raw_safe_encounter) if x)):
-            for tag, value in list(metrics.items()):
-                if tag.startswith("boss_combat/"):
-                    metrics[f"boss_combat/{namespace}/{tag.split('/', 1)[1]}"] = value
+        self._mirror_metrics_per_encounter(metrics, encounter_id, prefix="boss_combat/")
 
         for tag, value in metrics.items():
             self.writer.add_scalar(tag, float(value), self.episode_count)
+        return metrics
+
+    @staticmethod
+    def _safe_encounter_namespaces(encounter_id: str) -> list[str]:
+        """Map an encounter id to TensorBoard-safe namespace token(s)."""
+        raw = str(encounter_id or "").strip().lower()
+        if not raw:
+            return []
+        encounter_base = re.sub(r"^encounter[\._:/-]+", "", raw)
+        safe = re.sub(r"[^0-9a-zA-Z]+", "_", encounter_base).strip("_")
+        raw_safe = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_")
+        return list(dict.fromkeys(x for x in (safe, raw_safe) if x))
+
+    @classmethod
+    def _mirror_metrics_per_encounter(
+        cls,
+        metrics: dict[str, float],
+        encounter_id: str,
+        *,
+        prefix: str = "boss_combat/",
+    ) -> dict[str, float]:
+        """Mirror every ``<prefix><metric>`` scalar under ``<prefix><encounter>/<metric>``.
+
+        Without this mirror, an aggregate boss metric averaged across encounters
+        hides per-boss regressions (e.g. Kaiser facing failures averaged with
+        Construct Menagerie wins).  Mutates ``metrics`` in place and also returns it.
+        """
+        for namespace in cls._safe_encounter_namespaces(encounter_id):
+            for tag, value in list(metrics.items()):
+                if tag.startswith(prefix):
+                    rest = tag[len(prefix):]
+                    if "/" in rest and rest.split("/", 1)[0] == namespace:
+                        # Already mirrored.
+                        continue
+                    metrics[f"{prefix}{namespace}/{rest}"] = value
         return metrics
 
     @staticmethod
@@ -4571,21 +5558,43 @@ class MuZeroTrainer:
                 if action_family:
                     selected_family_counts[decision_domain][action_family] += 1
             if action_family == "end_turn":
+                end_turn_context: dict[str, Any] = {}
                 try:
-                    wasteful_end_turn = bool(
-                        self._raw_end_turn_context(
-                            obs,
-                            np.asarray(action_mask, dtype=np.float32).reshape(-1),
-                            legal_actions,
-                        ).get("wasteful")
+                    end_turn_context = self._raw_end_turn_context(
+                        obs,
+                        np.asarray(action_mask, dtype=np.float32).reshape(-1),
+                        legal_actions,
                     )
+                    wasteful_end_turn = bool(end_turn_context.get("wasteful"))
                 except Exception:
+                    end_turn_context = {}
                     wasteful_end_turn = False
-                # Rolled back per-step end_turn diagnostic dump — it added
-                # synchronous disk I/O + _is_positive_combat_action loop to
-                # every end_turn decision, visibly slowing env.reset cadence.
-                # _dump_end_turn_diagnostic helper is retained for ad-hoc use
-                # (e.g. gated behind a CLI flag in a future run).
+                if decision_domain == "combat":
+                    try:
+                        raw_obs_for_dump = self._current_raw_combat_obs()
+                        encounter_for_dump = ""
+                        if isinstance(raw_obs_for_dump, dict):
+                            try:
+                                boss_ctx_dump = build_boss_mechanics_context(raw_obs_for_dump)
+                                encounter_for_dump = str(boss_ctx_dump.get("encounter_key") or "").lower()
+                            except Exception:
+                                encounter_for_dump = ""
+                        action_diag_pre = info.get("action_diagnostics") if isinstance(info, dict) else None
+                        self._dump_selected_end_turn_context(
+                            encoded_obs=obs,
+                            raw_obs=raw_obs_for_dump,
+                            action_mask=np.asarray(action_mask, dtype=np.float32),
+                            legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                            chosen_idx=int(action_idx),
+                            context=end_turn_context,
+                            search_policy=search_policy,
+                            search_stats=search_stats if isinstance(search_stats, dict) else None,
+                            action_diagnostics=action_diag_pre if isinstance(action_diag_pre, dict) else None,
+                            encounter=encounter_for_dump,
+                            tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+                        )
+                    except Exception:
+                        pass
             wasteful_proceed = self._wasteful_proceed_flag(
                 chosen_signature,
                 decision_domain=decision_domain,
@@ -4601,6 +5610,38 @@ class MuZeroTrainer:
                         search_stats,
                     )
                 )
+                try:
+                    raw_obs_off = self._current_raw_combat_obs()
+                    encounter_off = ""
+                    if isinstance(raw_obs_off, dict):
+                        try:
+                            boss_ctx_off = build_boss_mechanics_context(raw_obs_off)
+                            encounter_off = str(boss_ctx_off.get("encounter_key") or "").lower()
+                        except Exception:
+                            encounter_off = ""
+                    offender_types = self._classify_action_offenders(
+                        search_stats=search_stats,
+                        encounter=encounter_off,
+                        family=action_family,
+                    )
+                    for offender_type in offender_types:
+                        global_key = f"boss_combat/{offender_type}_count"
+                        search_stats[f"offender/{offender_type}"] = 1.0
+                    if offender_types:
+                        self._dump_action_offender(
+                            encoded_obs=obs,
+                            raw_obs=raw_obs_off,
+                            action_mask=np.asarray(action_mask, dtype=np.float32),
+                            legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                            chosen_idx=int(action_idx),
+                            chosen_action=chosen_action,
+                            offender_types=offender_types,
+                            search_stats=search_stats,
+                            encounter=encounter_off,
+                            tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+                        )
+                except Exception:
+                    pass
 
             # Store transition
             trajectory.add_step(
@@ -4632,6 +5673,9 @@ class MuZeroTrainer:
 
             # Take action in environment
             obs, reward, terminated, truncated, info = self.env.step(int(action_idx))
+            potion_transition_record = info.get("potion_transition") if isinstance(info, dict) else None
+            if isinstance(potion_transition_record, dict):
+                self._dump_potion_transition(potion_transition_record)
             action_diagnostics = info.get("action_diagnostics") if isinstance(info, dict) else None
             if isinstance(action_diagnostics, dict) and trajectory.steps:
                 diag_stats = trajectory.steps[-1].setdefault("search_stats", {})
@@ -4647,6 +5691,12 @@ class MuZeroTrainer:
                     "refund_no_followup_available": "combat_quality_refund_no_followup_available",
                     "refund_no_followup_selected": "combat_quality_refund_no_followup_selected",
                     "strategic_skip_selected": "combat_quality_strategic_skip_selected",
+                    "typed_followup_missing_count": "combat_quality_typed_followup_missing_count",
+                    "typed_future_penalty_count": "combat_quality_typed_future_penalty_count",
+                    "typed_no_draw_count": "combat_quality_typed_no_draw_count",
+                    "typed_card_state_mutation_count": "combat_quality_typed_card_state_mutation_count",
+                    "setup_followup_dependent_count": "combat_quality_setup_followup_dependent_count",
+                    "setup_followup_available_count": "combat_quality_setup_followup_available_count",
                     "enchantment_seen": "combat_quality_enchantment_seen",
                     "affliction_seen": "combat_quality_affliction_seen",
                     "wasteful_end_turn_penalty_applied": "combat_quality_wasteful_end_turn_penalty_applied",
@@ -4713,6 +5763,7 @@ class MuZeroTrainer:
             encounter_tier=encounter_tier,
         )
         final_potion_count = self._potion_count_from_info(final_info)
+        used_potion_count = int((final_info or {}).get("used_potion_count_this_combat", 0) or 0)
         trajectory.metadata = {
             "episode_mode": initial_info.get("episode_mode"),
             "encounter_id": encounter_id,
@@ -4742,6 +5793,7 @@ class MuZeroTrainer:
             "boss_entry_max_hp": float(boss_entry_snapshot.get("max_hp", 0.0)) if boss_entry_snapshot else 0.0,
             "boss_entry_hp_ratio": float(boss_entry_snapshot.get("hp_ratio", 0.0)) if boss_entry_snapshot else 0.0,
             "final_potion_count": int(final_potion_count),
+            "used_potion_count_this_combat": int(used_potion_count),
             "act1_boss_seen": bool(act1_boss_seen),
             "act1_clear": bool(act1_clear),
             "decision_counts": {domain: int(count) for domain, count in decision_counts.items()},
@@ -6899,6 +7951,10 @@ def main():
                         help="Resume MuZero training from a checkpoint directory")
     parser.add_argument("--resume-without-buffer", action="store_true", default=False,
                         help="Resume weights/optimizer from checkpoint but start with an empty replay buffer.")
+    parser.add_argument("--resume-without-optimizer", action="store_true", default=False,
+                        help="Resume model weights only; re-initialize the optimizer (Adam moments). "
+                             "Use this when the aux-target schema changed mid-run and the old momentum "
+                             "is steering away from the new objective.")
     parser.add_argument("--latent-policy-distill-weight", type=float, default=0.25,
                         help="Distill latent search policy toward observation-conditioned policy.")
     parser.add_argument("--latent-policy-target-weight", type=float, default=0.5,
@@ -7488,6 +8544,7 @@ def main():
             buffer=buffer,
             device=args.device,
             load_buffer=not args.resume_without_buffer,
+            load_optimizer=not args.resume_without_optimizer,
             token_target_encoder=trainer.token_target_encoder,
             amp_grad_scaler=trainer.amp_grad_scaler,
         )

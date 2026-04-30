@@ -17,6 +17,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="..\..\packages\rl-agent\content\card_effect_profiles.generated.json">
+      <LogicalName>Sts2McpBridge.Content.card_effect_profiles.generated.json</LogicalName>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
     <EmbeddedResource Include="..\..\packages\rl-agent\content\potions.timing.generated.json">
       <LogicalName>Sts2McpBridge.Content.potions.timing.generated.json</LogicalName>
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>

@@ -30,6 +30,13 @@ from content_registry import (
     get_relic_metadata,
 )
 
+from .card_effect_profile import (
+    aggregate_card_effect_profile_semantics as _aggregate_card_effect_profile_semantics,
+    card_effect_operation_names as _card_effect_operation_names,
+    card_effect_operations as _card_effect_operations,
+    card_effect_profile as _card_effect_profile,
+    compact_card_effect_profile_signature as _compact_card_effect_profile_signature,
+)
 from .run_memory import OBJECTIVE_CONTEXT_DIM as _OBJECTIVE_CONTEXT_DIM, RUN_MEMORY_DIM as _RUN_MEMORY_DIM
 from .semantic_action import (
     SEMANTIC_ACTION_DIM,
@@ -518,6 +525,12 @@ def _get_card_keywords(card: dict) -> tuple[list[bool], float]:
     if modifier_sem.get("adds_retain", 0.0) > 0.0:
         flags[_CARD_KEYWORDS["retain"]] = True
 
+    effect_sem = _aggregate_card_effect_profile_semantics(card)
+    if effect_sem.get("typed_once_or_exhaust_self", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["exhaust"]] = True
+    if effect_sem.get("typed_retain_cards", 0.0) > 0.0:
+        flags[_CARD_KEYWORDS["retain"]] = True
+
     rarity = str(card.get("rarity") or "").strip()
     if not rarity:
         metadata = _get_card_static_metadata(card)
@@ -633,6 +646,16 @@ def _get_card_extra_metrics(card: dict) -> tuple[float, float, float, float]:
     modifier_sem = _aggregate_card_modifier_semantics(card)
     energy += modifier_sem.get("energy_gain", 0.0)
     hits += modifier_sem.get("play_count_bonus", 0.0)
+
+    # Typed card-effect profiles are generated from internal ids/source facts
+    # and attached by the bridge.  Use them as a structured fallback for
+    # Production/Borrowed Time/Bloodletting-like cards whose live preview may
+    # not expose an ``energyGain`` scalar yet.  Keep this as max(), not +=, so
+    # bridge previews and typed profiles do not double-count the same gain.
+    effect_sem = _aggregate_card_effect_profile_semantics(card)
+    typed_energy = effect_sem.get("typed_gain_energy_amount", 0.0)
+    if typed_energy:
+        energy = max(energy, typed_energy)
     return strength, dexterity, energy, hits
 
 

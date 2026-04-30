@@ -7,8 +7,9 @@ raw observation trees unless explicitly requested by debug/eval callers.
 
 from __future__ import annotations
 
+import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 import gymnasium as gym
 import numpy as np
@@ -19,8 +20,10 @@ from .action_compact import compact_legal_actions
 from .boss_mechanics import build_boss_mechanics_context
 from .aux_targets import build_aux_targets
 from .bridge_client import BridgeClient, BridgeError
+from .card_effect_profile import aggregate_card_effect_profile_semantics
 from .observation_common import DenseObservationEncoder, MAX_ACTIONS, _aggregate_card_modifier_semantics
 from .observation_v3 import WorldTokenObservationEncoder
+from .potion_timing import compute_potion_timing
 from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
 
@@ -47,6 +50,11 @@ from .reward_constants import (
     KAISER_BACK_ATTACK_RISK_REDUCTION_BONUS,
     KAISER_BACK_ATTACK_END_TURN_PENALTY,
     KAISER_FACING_CHANGE_BONUS,
+    KAISER_FACING_CHANGE_BONUS_BASE,
+    KAISER_FACING_INTENT_DMG_REF,
+    KAISER_FACING_INTENT_DMG_SCALE_MAX,
+    KAISER_BACK_ATTACK_HI_THREAT_DMG,
+    KAISER_BACK_ATTACK_HI_THREAT_EXTRA,
     KAISER_PRESSURE_KILL_BONUS,
     KAISER_NO_RESPONSE_PENALTY_SOFTEN,
     KNOWLEDGE_DEMON_GOOD_CURSE_PICK_BONUS,
@@ -73,6 +81,15 @@ from .reward_constants import (
     POTION_USE_ELITE_BONUS,
     POTION_USE_MONSTER_BONUS,
     POTION_USE_MONSTER_PENALTY,
+    POTION_TIMING_QUALITY_SCALE,
+    POTION_TIMING_WASTE_SCALE,
+    SELECTION_LOOP_PENALTY,
+    SELECTION_EARLY_CONFIRM_BONUS,
+    SELECTION_DESELECT_PENALTY,
+    SELECTION_PICK_CAP,
+    SELECTION_OVER_CAP_PENALTY,
+    SELECTION_REENTRY_BUDGET,
+    SELECTION_REENTRY_PENALTY,
     SENTINEL_COMBAT_LOSS_PENALTY_BASE,
     SENTINEL_COMBAT_LOSS_PENALTY_SCALE,
     SENTINEL_COMBAT_WIN_BONUS_BASE,
@@ -331,6 +348,51 @@ class CombatSandboxEnv(gym.Env):
         # confirm the new signals are reaching the policy.
         self._kaiser_facing_change_count: int = 0
         self._kaiser_pressure_kill_count: int = 0
+        # Card-selection anti-loop state: tracks the most recently picked
+        # card id and consecutive flip count. See §4 of
+        # docs/kaiser-and-potion-fixes-todo.md and reward_constants.py.
+        self._selection_last_picked_id: str = ""
+        self._selection_flip_count: int = 0
+        self._selection_pick_count: int = 0
+        self._selection_loop_events: int = 0
+        self._selection_early_confirm_events: int = 0
+        # §4 v2: oscillation detection across multiple cards.
+        self._selection_deselect_count: int = 0
+        self._selection_over_cap_events: int = 0
+        # §4 v3: per-episode selection-screen re-entry tracker (resets in reset()).
+        self._selection_screen_entries: int = 0
+        self._selection_screen_active: bool = False
+        self._selection_reentry_events: int = 0
+        # Phase 4b counters: how many potion uses incurred timing reward
+        # adjustment (positive vs negative). Surfaced for hourly cron debug.
+        self._potion_timing_quality_events: int = 0
+        self._potion_timing_waste_events: int = 0
+        # TASK-A4: track potions whose use_potion action returned ok so the
+        # episode-final unused-on-death calculation can subtract them, even if
+        # the bridge slot fails to clear before the death frame is captured.
+        self._used_potion_count_this_combat: int = 0
+        self._potion_transition_records: list[dict[str, Any]] = []
+        # TASK-C2: short-poll knobs for transient only-end-turn frontiers.
+        # Defaults are conservative (small budget, short interval) so combat
+        # sandbox throughput cannot be tanked by waiting on the bridge.
+        try:
+            self._fast_step_max_wait_ms: int = int(os.environ.get("MUZERO_FAST_STEP_MAX_WAIT_MS", "100"))
+        except (TypeError, ValueError):
+            self._fast_step_max_wait_ms = 100
+        try:
+            self._fast_step_poll_interval_ms: int = int(os.environ.get("MUZERO_FAST_STEP_POLL_INTERVAL_MS", "10"))
+        except (TypeError, ValueError):
+            self._fast_step_poll_interval_ms = 10
+        self._fast_step_disabled: bool = (
+            os.environ.get("MUZERO_FAST_STEP", "1").strip() == "0"
+        )
+        self._fast_step_metrics_total = {
+            "transient_only_end_turn_count": 0,
+            "transient_resolved_count": 0,
+            "transient_leaked_count": 0,
+            "wait_timeout_count": 0,
+            "stable_no_actions_count": 0,
+        }
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -339,6 +401,16 @@ class CombatSandboxEnv(gym.Env):
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
         started = time.perf_counter()
+
+        # §4 v3: reset per-episode selection-screen re-entry tracker.
+        # Other selection state (last_picked_id / pick_count / deselect_count /
+        # flip_count) self-resets on family transition; only the per-episode
+        # entry counter and active edge need explicit episode reset.
+        self._selection_screen_entries = 0
+        self._selection_screen_active = False
+        # TASK-A4: reset per-combat potion-use accounting.
+        self._used_potion_count_this_combat = 0
+        self._potion_transition_records = []
 
         # Allow per-reset overrides via options dict
         opts = options or {}
@@ -537,6 +609,11 @@ class CombatSandboxEnv(gym.Env):
         # --- R_resource_quality: all potion shaping zeroed in v4 (constants=0) ---
         reward += self._encounter_potion_use_reward(legal_action)
         reward += self._potion_hoarding_terminal_reward(self._last_obs_raw, terminated, truncated)
+        # --- R_potion_timing (Phase 4b): use_quality - waste_risk shaping. ---
+        reward += self._potion_timing_step_reward(action, prev_obs, legal_actions_before)
+        # --- R_selection_quality: anti-loop + early-confirm for multi-pick
+        # burn cards (§4 of kaiser-and-potion-fixes-todo.md). ---
+        reward += self._card_selection_step_reward(legal_action)
         # --- R_outcome: tier-weighted symmetric win/loss for non-boss tiers ---
         reward += self._tier_outcome_reward(self._last_obs_raw, terminated, truncated)
         # --- R_hp_efficiency §6.2: HP preserve bonus on non-boss win ---
@@ -572,11 +649,57 @@ class CombatSandboxEnv(gym.Env):
         info_started = time.perf_counter()
         action_diagnostics = dict(pre_action_diagnostics)
         action_diagnostics["wasteful_end_turn_penalty_applied"] = float(end_turn_penalty < 0.0)
+        potion_transition_record = self._build_potion_transition_record(
+            action=legal_action,
+            prev_obs=prev_obs,
+            after_obs=self._last_obs_raw,
+            bridge_result=result,
+            bridge_error=None,
+        )
+        if potion_transition_record is not None:
+            self._potion_transition_records.append(potion_transition_record)
+            if bool(potion_transition_record.get("execute_ok")):
+                self._used_potion_count_this_combat += 1
+        # TASK-C2: read C1 actionability and surface flags into action_diagnostics.
+        # Fast-step short polling is intentionally NOT executed on the live path
+        # here yet because we have no env-shaped /env/observe endpoint; the
+        # diagnostic flags below let the train-side classifier mark a chosen
+        # end_turn as forced (transient) rather than bad.  The pure helper
+        # `wait_for_stable_actionability` is unit-tested with a fake bridge so
+        # the polling contract is proven before wiring it to production.
+        bridge_info = result.get("info") if isinstance(result.get("info"), dict) else {}
+        actionability = bridge_info.get("actionability") if isinstance(bridge_info.get("actionability"), dict) else None
+        transient_flag = bool((actionability or {}).get("transient_only_end_turn", False))
+        if transient_flag:
+            self._fast_step_metrics_total["transient_only_end_turn_count"] += 1
+            action_diagnostics["transient_only_end_turn"] = True
+        elif (
+            isinstance(actionability, dict)
+            and int(actionability.get("legal_non_end_turn_count", 0) or 0) == 0
+        ):
+            self._fast_step_metrics_total["stable_no_actions_count"] += 1
+            action_diagnostics["transient_only_end_turn"] = False
+        from .boss_mechanics import build_boss_mechanics_block, classify_action_boss_mechanism
+        boss_mechanics_block = build_boss_mechanics_block(self._last_obs_raw)
+        boss_action_mechanism = classify_action_boss_mechanism(
+            prev_obs, legal_action, action_diagnostics=action_diagnostics
+        )
+        extra: dict[str, Any] = {
+            "action_diagnostics": action_diagnostics,
+            "aux_targets": aux_targets,
+            "used_potion_count_this_combat": int(self._used_potion_count_this_combat),
+            "boss_mechanics": boss_mechanics_block,
+            "boss_action_mechanism": boss_action_mechanism,
+        }
+        if actionability is not None:
+            extra["actionability"] = actionability
+            extra["bridge_fast_step_metrics_cumulative"] = dict(self._fast_step_metrics_total)
+        if potion_transition_record is not None:
+            extra["potion_transition"] = potion_transition_record
         info = self._build_info(
             result.get("info", {}),
             extra={
-                "action_diagnostics": action_diagnostics,
-                "aux_targets": aux_targets,
+                **extra,
                 "python_timing_ms": self._python_timing(
                     bridge_roundtrip=bridge_elapsed_ms,
                     run_memory_update=run_memory_elapsed_ms,
@@ -763,6 +886,188 @@ class CombatSandboxEnv(gym.Env):
         return ""
 
     @staticmethod
+    def _is_stable_actionability(actionability: dict[str, Any] | None) -> bool:
+        """Frontier is stable when bridge says non-end-turn actions exist OR
+        the only-end-turn frame is genuinely settled (not transient).
+
+        Mirrors the C1 bridge payload contract: returning True means the
+        Python side can stop short-polling and accept the current frontier.
+        """
+        if not isinstance(actionability, dict):
+            return True  # No actionability info → assume stable to avoid hangs.
+        if int(actionability.get("legal_non_end_turn_count", 0) or 0) > 0:
+            return True
+        if bool(actionability.get("transient_only_end_turn", False)):
+            return False
+        # Only end_turn AND not transient → ``stable_no_actions``.
+        return bool(actionability.get("frontier_stable", True))
+
+    @staticmethod
+    def wait_for_stable_actionability(
+        initial_result: dict[str, Any],
+        observe_fn: Callable[[], dict[str, Any]],
+        *,
+        max_wait_ms: int = 100,
+        poll_interval_ms: int = 10,
+        sleep_fn: Callable[[float], None] | None = None,
+        clock_fn: Callable[[], float] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Short-poll the bridge until the post-step frontier is stable.
+
+        Pure helper so a fake bridge can drive it in tests.  The function
+        returns ``(final_result, fast_step_metrics)`` where metrics contains
+        ``wait_ms``, ``poll_count``, ``timeout``, ``transient_resolved``,
+        ``transient_leaked``, ``stable_no_actions``.
+        """
+
+        sleep = sleep_fn if sleep_fn is not None else time.sleep
+        clock = clock_fn if clock_fn is not None else time.perf_counter
+        info0 = initial_result.get("info") if isinstance(initial_result.get("info"), dict) else {}
+        actionability0 = info0.get("actionability") if isinstance(info0.get("actionability"), dict) else None
+        # Stable on first frame: no waiting at all.
+        metrics: dict[str, Any] = {
+            "wait_ms": 0.0,
+            "poll_count": 0,
+            "timeout": False,
+            "transient_resolved": False,
+            "transient_leaked": False,
+            "stable_no_actions": False,
+        }
+        if not bool((actionability0 or {}).get("transient_only_end_turn", False)):
+            if (
+                isinstance(actionability0, dict)
+                and int(actionability0.get("legal_non_end_turn_count", 0) or 0) == 0
+                and not bool(actionability0.get("transient_only_end_turn", False))
+            ):
+                metrics["stable_no_actions"] = True
+            return initial_result, metrics
+
+        deadline = clock() + (max_wait_ms / 1000.0)
+        interval_s = max(poll_interval_ms / 1000.0, 0.001)
+        current = initial_result
+        while clock() < deadline:
+            sleep(interval_s)
+            metrics["poll_count"] += 1
+            try:
+                observed = observe_fn()
+            except Exception:
+                break
+            if not isinstance(observed, dict):
+                continue
+            current = observed
+            obs_info = observed.get("info") if isinstance(observed.get("info"), dict) else {}
+            obs_actionability = obs_info.get("actionability") if isinstance(obs_info.get("actionability"), dict) else None
+            if CombatSandboxEnv._is_stable_actionability(obs_actionability):
+                metrics["wait_ms"] = max((max_wait_ms / 1000.0 - max(deadline - clock(), 0.0)) * 1000.0, 0.0)
+                metrics["transient_resolved"] = (
+                    int((obs_actionability or {}).get("legal_non_end_turn_count", 0) or 0) > 0
+                )
+                metrics["stable_no_actions"] = not metrics["transient_resolved"]
+                return current, metrics
+        metrics["wait_ms"] = float(max_wait_ms)
+        metrics["timeout"] = True
+        metrics["transient_leaked"] = True
+        return current, metrics
+
+    @staticmethod
+    def _potion_slots_dump(obs: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Return a normalised view of every potion slot for diagnostic dumps."""
+        player = (obs or {}).get("player") if isinstance(obs, dict) else {}
+        potions = player.get("potions") if isinstance(player, dict) else None
+        if not isinstance(potions, list):
+            return []
+        EMPTY_NAMES = {"empty", "[empty]", "none", "null", ""}
+        out: list[dict[str, Any]] = []
+        for idx, potion in enumerate(potions):
+            if isinstance(potion, dict):
+                name = str(potion.get("name") or potion.get("id") or potion.get("title") or "").strip().lower()
+                empty = bool(potion.get("empty")) or (not name) or (name in EMPTY_NAMES)
+                out.append({
+                    "slot": idx,
+                    "id": potion.get("id"),
+                    "title": potion.get("title") or potion.get("name"),
+                    "empty": empty,
+                    "is_usable": bool(potion.get("is_usable", not empty)),
+                    "is_queued": bool(potion.get("is_queued", False)),
+                })
+            else:
+                name = str(potion or "").strip().lower()
+                out.append({
+                    "slot": idx,
+                    "id": None,
+                    "title": str(potion) if potion is not None else None,
+                    "empty": (not name) or (name in EMPTY_NAMES),
+                    "is_usable": False,
+                    "is_queued": False,
+                })
+        return out
+
+    def _build_potion_transition_record(
+        self,
+        *,
+        action: dict[str, Any] | None,
+        prev_obs: dict[str, Any] | None,
+        after_obs: dict[str, Any] | None,
+        bridge_result: dict[str, Any] | None,
+        bridge_error: str | None,
+    ) -> dict[str, Any] | None:
+        """Assemble a use_potion transition record for the diagnostics JSONL.
+
+        Returns None for non-potion actions.  When ``bridge_error`` is set the
+        record is still returned so we can post-mortem failed potion uses.
+        """
+        if self._action_family(action) not in {"use_potion", "potion"}:
+            return None
+        result = bridge_result if isinstance(bridge_result, dict) else {}
+        info_block = result.get("info") if isinstance(result.get("info"), dict) else {}
+        execute_ok = bridge_error is None and not bool(info_block.get("error"))
+        # State versions: bridge serialises an integer state version per result; if
+        # missing, fall back to obs.state_version from the raw frame.
+        def _state_version(obs: dict[str, Any] | None) -> int:
+            if not isinstance(obs, dict):
+                return 0
+            for container in (obs.get("meta"), obs):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("state_version", "stateVersion"):
+                    if key in container:
+                        try:
+                            return int(container.get(key) or 0)
+                        except (TypeError, ValueError):
+                            return 0
+            return 0
+        slot_index = -1
+        target_block = action.get("target") if isinstance(action.get("target"), dict) else {}
+        for key in ("slot_index", "potion_slot", "slot"):
+            for source in (action, target_block, action.get("potion") if isinstance(action.get("potion"), dict) else {}):
+                if isinstance(source, dict) and key in source:
+                    try:
+                        slot_index = int(source.get(key))
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if slot_index >= 0:
+                break
+        potion_block = action.get("potion") if isinstance(action.get("potion"), dict) else {}
+        before_dump = self._potion_slots_dump(prev_obs)
+        after_dump = self._potion_slots_dump(after_obs)
+        before_slot = next((slot for slot in before_dump if slot.get("slot") == slot_index), None)
+        after_slot = next((slot for slot in after_dump if slot.get("slot") == slot_index), None)
+        return {
+            "event": "use_potion_transition",
+            "action_id": action.get("action_id"),
+            "potion_slot": slot_index,
+            "potion_id_before": (before_slot or {}).get("id") if before_slot else potion_block.get("id"),
+            "potion_title_before": (before_slot or {}).get("title") if before_slot else potion_block.get("title"),
+            "execute_ok": bool(execute_ok),
+            "bridge_error": bridge_error,
+            "state_version_before": _state_version(prev_obs),
+            "state_version_after": _state_version(after_obs),
+            "potion_slot_after": after_slot,
+            "potion_slots_after": after_dump,
+        }
+
+    @staticmethod
     def _nonempty_potion_count(obs: dict[str, Any] | None) -> int:
         player = (obs or {}).get("player") if isinstance(obs, dict) else {}
         potions = player.get("potions") if isinstance(player, dict) else None
@@ -808,6 +1113,165 @@ class CombatSandboxEnv(gym.Env):
             return 0.0
         raw = float(POTION_HOARDING_PENALTY_PER_POTION) * float(unused)
         return float(np.clip(raw, -abs(float(POTION_HOARDING_MAX_PENALTY_ABS)), abs(float(POTION_HOARDING_MAX_PENALTY_ABS))))
+
+    def _potion_timing_step_reward(
+        self,
+        action: dict[str, Any] | None,
+        before_obs: dict[str, Any] | None,
+        legal_actions: list[Any] | None,
+    ) -> float:
+        """Phase 4b of docs/potion-timing-modeling-plan.md (§2).
+
+        Convert the timing profile (use_quality / waste_risk) into per-step
+        reward shaping so the policy gradient actually learns "don't dump
+        potions turn 1".  Penalty > bonus by design — model should prefer
+        hoarding over bad use.
+        """
+        if self._action_family(action) not in {"use_potion", "potion"}:
+            return 0.0
+        if not isinstance(before_obs, dict):
+            return 0.0
+        try:
+            energy = float(((before_obs.get("player") or {}).get("energy")) or 0.0)
+        except (TypeError, ValueError):
+            energy = 0.0
+        encounter_tier = self._current_encounter_tier()
+        try:
+            profile = compute_potion_timing(
+                action,
+                before_obs,
+                legal_actions,
+                None,
+                energy,
+                encounter_tier=encounter_tier,
+            )
+        except Exception:
+            return 0.0
+        if not profile.get("is_potion"):
+            return 0.0
+        use_q = float(profile.get("use_quality") or 0.0)
+        waste = float(profile.get("waste_risk") or 0.0)
+        reward = 0.0
+        if use_q > 0.0:
+            reward += float(POTION_TIMING_QUALITY_SCALE) * use_q
+            self._potion_timing_quality_events += 1
+        if waste > 0.0:
+            reward -= float(POTION_TIMING_WASTE_SCALE) * waste
+            self._potion_timing_waste_events += 1
+        return reward
+
+    def _card_selection_step_reward(self, action: dict[str, Any] | None) -> float:
+        """Anti-loop + early-confirm shaping for multi-pick burn cards.
+
+        See §4 of docs/kaiser-and-potion-fixes-todo.md.
+
+        Detects three failure modes:
+          * Pick→replace cycle on SAME card (A→A): SELECTION_LOOP_PENALTY.
+          * Oscillation across multiple cards (A→B→C→A): caught by
+            SELECTION_DESELECT_PENALTY — each pick whose `is_selected=True`
+            is a deselect, every deselect after the first pays the penalty.
+          * Total-picks death loop: SELECTION_PICK_CAP=12 caps a single
+            selection round; each pick beyond pays SELECTION_OVER_CAP_PENALTY.
+
+        Tracks per-selection state in self._selection_last_picked_id /
+        self._selection_flip_count / self._selection_pick_count /
+        self._selection_deselect_count, which reset when the family
+        transitions away from card_selection or on confirm/cancel/skip.
+        """
+        if not isinstance(action, dict):
+            return 0.0
+        family = self._action_family(action)
+        sel_action = str(action.get("selection_action") or "").strip().lower()
+        action_id = str(action.get("action_id") or "")
+
+        def _reset_state() -> None:
+            self._selection_last_picked_id = ""
+            self._selection_flip_count = 0
+            self._selection_pick_count = 0
+            self._selection_deselect_count = 0
+
+        # §4 v3: detect selection-screen entry/exit edges. Pay re-entry penalty
+        # when the model bounces in and out of selection screens within the
+        # same episode (the_insatiable frantic_escape pattern).
+        reentry_penalty = 0.0
+        if family == "card_selection" and not self._selection_screen_active:
+            self._selection_screen_active = True
+            self._selection_screen_entries += 1
+            budget = int(SELECTION_REENTRY_BUDGET)
+            if self._selection_screen_entries > budget:
+                excess = self._selection_screen_entries - budget
+                reentry_penalty = -float(SELECTION_REENTRY_PENALTY) * float(excess)
+                self._selection_reentry_events += 1
+        elif family != "card_selection" and self._selection_screen_active:
+            self._selection_screen_active = False
+
+        if family != "card_selection":
+            if (self._selection_pick_count > 0
+                or self._selection_flip_count > 0
+                or self._selection_deselect_count > 0):
+                _reset_state()
+            return 0.0
+
+        if sel_action == "confirm":
+            picked = max(int(self._selection_pick_count), 0)
+            max_picks = int(action.get("max_pick") or action.get("selection_max")
+                            or action.get("max") or 0)
+            if max_picks <= 0:
+                max_picks = int(action.get("selection_pick_limit") or 0)
+            reward = reentry_penalty
+            if max_picks > 0 and picked < max_picks:
+                ratio = float(max_picks - picked) / float(max_picks)
+                reward += float(SELECTION_EARLY_CONFIRM_BONUS) * ratio
+                self._selection_early_confirm_events += 1
+            _reset_state()
+            return reward
+
+        if sel_action in {"cancel", "close", "skip"}:
+            _reset_state()
+            return reentry_penalty
+
+        # Pick path: detect repeat-same, deselect-pattern, and over-cap.
+        picked_id = ""
+        card = action.get("card") if isinstance(action.get("card"), dict) else None
+        if isinstance(card, dict):
+            picked_id = str(card.get("id") or card.get("title") or "")
+        if not picked_id and ":" in action_id:
+            picked_id = action_id
+
+        # Bridge marks `is_selected=True` on actions that toggle a card OFF
+        # (the click would deselect it). Counting these directly catches
+        # the A→B→A→B oscillation pattern that the legacy id-equality check
+        # missed.
+        is_deselect = bool(action.get("is_selected"))
+
+        reward = reentry_penalty
+        # 1) Same-id repeat (legacy A→A→A check).
+        if picked_id:
+            if picked_id == self._selection_last_picked_id:
+                self._selection_flip_count += 1
+                if self._selection_flip_count >= 2:
+                    reward -= float(SELECTION_LOOP_PENALTY) * float(self._selection_flip_count)
+                    self._selection_loop_events += 1
+            else:
+                self._selection_flip_count = 0
+            self._selection_last_picked_id = picked_id
+
+        # 2) Deselect detection (oscillation across cards).
+        if is_deselect:
+            self._selection_deselect_count += 1
+            if self._selection_deselect_count >= 2:
+                # Linear escalation: 2nd deselect = -0.40, 3rd = -0.80, 4th = -1.20...
+                reward -= float(SELECTION_DESELECT_PENALTY) * float(self._selection_deselect_count - 1)
+                self._selection_loop_events += 1
+
+        self._selection_pick_count += 1
+
+        # 3) Hard pick-cap (kills the 1700-step death loop).
+        if self._selection_pick_count > int(SELECTION_PICK_CAP):
+            reward -= float(SELECTION_OVER_CAP_PENALTY)
+            self._selection_over_cap_events += 1
+
+        return reward
 
 
     @staticmethod
@@ -918,8 +1382,23 @@ class CombatSandboxEnv(gym.Env):
             )
             soften = float(KAISER_NO_RESPONSE_PENALTY_SOFTEN) if no_response_avail else 1.0
 
+            # 2026-04-28 §1C: surface the *primary* (highest-intent-damage)
+            # threat damage so we can scale facing bonus and high-threat
+            # back-attack penalty by intent magnitude.
+            primary_intent_dmg = self._boss_context_max(before_ctx, "primary_threat_intent_damage")
+
             if before_risk > 0.05:
                 reward -= hp_loss * float(KAISER_BACK_ATTACK_HP_LOSS_PENALTY_SCALE) * (1.0 + before_risk) * soften
+                # §1C: extra penalty if the threat we ignored was a HIGH-damage
+                # attacker (≥ KAISER_BACK_ATTACK_HI_THREAT_DMG). Scaled by hp_loss/max_hp
+                # so it stays balanced across boss HP variance.
+                _, max_hp_back = self._player_hp_and_max(before_obs)
+                if (
+                    primary_intent_dmg >= float(KAISER_BACK_ATTACK_HI_THREAT_DMG)
+                    and hp_loss > 0.0
+                    and max_hp_back > 0.0
+                ):
+                    reward -= float(KAISER_BACK_ATTACK_HI_THREAT_EXTRA) * (hp_loss / max_hp_back) * soften
                 if family == "end_turn":
                     reward += float(KAISER_BACK_ATTACK_END_TURN_PENALTY) * min(1.0, before_risk) * soften
                 if family in {"play_card", "use_potion", "potion"} and (
@@ -939,7 +1418,21 @@ class CombatSandboxEnv(gym.Env):
             # detects "now correctly facing the high-damage attacker".
             facing_changed = before_primary > 0.5 and after_primary <= 0.5
             if facing_changed and family in {"play_card", "use_potion", "potion"}:
-                reward += float(KAISER_FACING_CHANGE_BONUS)
+                # 2026-04-28 §1A: scale the facing bonus by the threat magnitude
+                # the agent just faced. Refacing toward a 30 dmg attacker pays
+                # 1.5x; refacing toward a 10 dmg one pays ~0.5x.  This kills
+                # the failure mode where model would target the cheap claw
+                # for "free" facing bonus.
+                ref = max(float(KAISER_FACING_INTENT_DMG_REF), 1.0)
+                threat_scale = float(np.clip(
+                    primary_intent_dmg / ref, 0.0,
+                    float(KAISER_FACING_INTENT_DMG_SCALE_MAX),
+                ))
+                bonus = float(KAISER_FACING_CHANGE_BONUS_BASE) * threat_scale
+                # Cap with the legacy flat bonus to avoid over-shooting prior
+                # calibration on tiny-intent dummy fights.
+                bonus = min(bonus, float(KAISER_FACING_CHANGE_BONUS) * float(KAISER_FACING_INTENT_DMG_SCALE_MAX))
+                reward += bonus
                 self._kaiser_facing_change_count += 1
 
             # Pressure kill: dealt damage AND back-attack risk dropped
@@ -1433,6 +1926,21 @@ class CombatSandboxEnv(gym.Env):
             return _aggregate_card_modifier_semantics(card)
         return {}
 
+    def _action_effect_semantics(self, action: dict[str, Any] | None) -> dict[str, float]:
+        """Typed card-effect semantics for one legal action.
+
+        This intentionally reads the bridge/registry ``card_effect_profile``
+        instead of card text.  Potion timing has its own typed profile path;
+        combat card quality needs card-side facts such as gain-energy,
+        modify-cost, no-draw, retain/exhaust, replay, and hand mutation.
+        """
+        if not isinstance(action, dict):
+            return {}
+        card = action.get("card")
+        if isinstance(card, dict):
+            return aggregate_card_effect_profile_semantics(card)
+        return {}
+
     def _action_positive_score(self, action: dict[str, Any]) -> float:
         kind = str(action.get("kind") or "").strip()
         if kind not in ("play_card", "use_potion"):
@@ -1465,10 +1973,130 @@ class CombatSandboxEnv(gym.Env):
             score += sem.get("weak", 0.0) * 4.0
             score -= sem.get("energy_loss_on_play", 0.0) * 2.0
             score -= sem.get("self_damage", 0.0) * 2.5
+            typed = aggregate_card_effect_profile_semantics(source)
+            score += typed.get("typed_gain_energy_amount", 0.0) * 3.0
+            score += typed.get("typed_draw_amount", 0.0) * 3.0
+            score -= typed.get("typed_hp_loss", 0.0) * 2.5
+            # Hand/card-state mutation is real progress, but it is setup-like
+            # progress.  Keep the value modest so follow-up-dependent cards
+            # (cost reducers, no-draw/future-penalty cards, energy refunds)
+            # can be classified as deferable rather than mandatory.
+            if any(
+                typed.get(key, 0.0) > 0.0
+                for key in (
+                    "typed_upgrade_hand",
+                    "typed_modify_cost",
+                    "typed_set_replay",
+                    "typed_retain_cards",
+                    "typed_add_modifier",
+                    "typed_add_keyword",
+                    "typed_add_generated_card",
+                    "typed_card_state_mutation",
+                )
+            ):
+                score += 2.0
         return float(max(score, 0.0))
 
     def _is_positive_progress_action(self, action: dict[str, Any]) -> bool:
         return self._action_positive_score(action) > 0.0
+
+    def _classify_refund_followup(
+        self,
+        action: dict[str, Any],
+        *,
+        energy: float,
+        legal_actions: list[dict[str, Any]],
+        raw_obs: dict[str, Any] | None = None,
+    ) -> str:
+        """B3: classify a refund (energy_gain) play by its after-action prospects.
+
+        Returns one of ``refund_good_followup``, ``refund_no_followup_but_intrinsic_value``,
+        ``refund_no_followup_low_value``, or ``refund_unknown`` (non-refund).
+
+        Intent: avoid penalising a refund played without a *static* followup
+        when the card itself draws/creates new cards, reduces costs, or has
+        intrinsic block/lethal/mechanism value (Kaiser facing change, etc.).
+        """
+
+        if str(action.get("kind") or "").strip() != "play_card":
+            return "refund_unknown"
+        card = action.get("card") if isinstance(action.get("card"), dict) else None
+        if not isinstance(card, dict):
+            return "refund_unknown"
+        sem = _aggregate_card_modifier_semantics(card)
+        typed = aggregate_card_effect_profile_semantics(card)
+        energy_gain = max(
+            float(sem.get("energy_gain", 0.0) or 0.0),
+            float(typed.get("typed_gain_energy_amount", 0.0) or 0.0),
+        )
+        if energy_gain <= 0.0:
+            return "refund_unknown"
+
+        # After-action energy estimate.
+        cost = self._card_cost(card)
+        energy_loss = float(sem.get("energy_loss_on_play", 0.0) or 0.0)
+        energy_after = max(0.0, float(energy) - float(cost) + energy_gain - energy_loss)
+
+        # Followup signals derived from the *card's own* expected effects.
+        expected_draw = float(typed.get("typed_draw_amount", 0.0) or 0.0) + float(sem.get("draw", 0.0) or 0.0)
+        expected_create = bool(typed.get("typed_add_generated_card", 0.0) > 0.0)
+        cost_reduction = bool(typed.get("typed_modify_cost", 0.0) > 0.0)
+        replay_or_duplicate = bool(
+            typed.get("typed_set_replay", 0.0) > 0.0
+            or typed.get("typed_copy_cards", 0.0) > 0.0
+        )
+        if expected_draw >= 1.0 or expected_create or cost_reduction or replay_or_duplicate:
+            return "refund_good_followup"
+
+        # Static followup on the *current* hand.
+        for other in legal_actions:
+            if other is action or not isinstance(other, dict) or other.get("kind") != "play_card":
+                continue
+            other_card = other.get("card")
+            if not isinstance(other_card, dict) or self._card_is_x_cost(other_card):
+                continue
+            other_cost = self._card_cost(other_card)
+            if other_cost <= energy_after + 1e-6 and self._action_positive_score(other) >= 3.0:
+                return "refund_good_followup"
+
+        # Intrinsic value: block-lethal / mechanism / large-impact even without
+        # a chained followup.
+        block_value = max(
+            float(self._source_preview_metric(card, "block")),
+            float(sem.get("block_add", 0.0) or 0.0) + float(sem.get("block_on_play", 0.0) or 0.0),
+        )
+        incoming = self._refund_incoming_damage(raw_obs)
+        if block_value > 0.0 and block_value + float((((raw_obs or {}).get("player") or {}).get("block")) or 0.0) >= incoming and incoming >= 8.0:
+            return "refund_no_followup_but_intrinsic_value"
+        damage_value = float(self._source_preview_metric(card, "damage"))
+        if damage_value >= 12.0:
+            return "refund_no_followup_but_intrinsic_value"
+        # Mechanism: refund that targets the back-attack side counts as facing-change intrinsic.
+        target = action.get("target") if isinstance(action.get("target"), dict) else {}
+        if isinstance(target, dict) and (target.get("side") or "").strip().lower() in {"left", "right"}:
+            facing = ((raw_obs or {}).get("combat") or {}).get("facing") if isinstance(raw_obs, dict) else None
+            if isinstance(facing, str) and facing.strip().lower() and facing.strip().lower() != target.get("side").strip().lower():
+                return "refund_no_followup_but_intrinsic_value"
+        return "refund_no_followup_low_value"
+
+    @staticmethod
+    def _refund_incoming_damage(raw_obs: dict[str, Any] | None) -> float:
+        if not isinstance(raw_obs, dict):
+            return 0.0
+        combat = raw_obs.get("combat") if isinstance(raw_obs.get("combat"), dict) else {}
+        enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
+        total = 0.0
+        for enemy in enemies:
+            if not isinstance(enemy, dict):
+                continue
+            intent = enemy.get("intent") if isinstance(enemy.get("intent"), dict) else {}
+            for key in ("total_damage", "damage", "intent_damage", "attack_damage"):
+                v = intent.get(key) if intent else enemy.get(key)
+                try:
+                    total = max(total, float(v or 0.0))
+                except (TypeError, ValueError):
+                    pass
+        return total
 
     def _is_strategic_skip_candidate(
         self,
@@ -1483,14 +2111,38 @@ class CombatSandboxEnv(gym.Env):
         if not isinstance(card, dict):
             return False
         sem = _aggregate_card_modifier_semantics(card)
-        if self._card_is_x_cost(card) and energy <= 0.0:
+        typed = aggregate_card_effect_profile_semantics(card)
+        if self._card_is_x_cost(card) and energy <= 0.05:
             return True
         immediate = self._action_positive_score(action)
-        exhausts = bool(sem.get("adds_exhaust") or sem.get("removes_exhaust") < 0.0 or card.get("exhaust") or card.get("will_exhaust"))
-        retains = bool(sem.get("adds_retain") or card.get("retain"))
-        self_damage = sem.get("self_damage", 0.0)
+        exhausts = bool(
+            sem.get("adds_exhaust")
+            or sem.get("removes_exhaust") < 0.0
+            or card.get("exhaust")
+            or card.get("will_exhaust")
+            or typed.get("typed_once_or_exhaust_self", 0.0) > 0.0
+            or typed.get("typed_exhaust_cards", 0.0) > 0.0
+        )
+        retains = bool(sem.get("adds_retain") or card.get("retain") or typed.get("typed_retain_cards", 0.0) > 0.0)
+        self_damage = max(float(sem.get("self_damage", 0.0) or 0.0), float(typed.get("typed_hp_loss", 0.0) or 0.0))
         energy_loss = sem.get("energy_loss_on_play", 0.0)
-        energy_gain = sem.get("energy_gain", 0.0)
+        energy_gain = max(float(sem.get("energy_gain", 0.0) or 0.0), float(typed.get("typed_gain_energy_amount", 0.0) or 0.0))
+        requires_followup = bool(
+            typed.get("typed_requires_followup", 0.0) > 0.0
+            or typed.get("typed_strategic_skip_if_no_followup", 0.0) > 0.0
+            or typed.get("typed_modify_cost", 0.0) > 0.0
+            or typed.get("typed_no_draw", 0.0) > 0.0
+            or typed.get("typed_future_penalty", 0.0) > 0.0
+        )
+        future_penalty = bool(
+            typed.get("typed_no_draw", 0.0) > 0.0
+            or typed.get("typed_future_penalty", 0.0) > 0.0
+            or typed.get("typed_consumes_future_resource", 0.0) > 0.0
+        )
+        card_state_setup = bool(
+            typed.get("typed_card_state_mutation", 0.0) > 0.0
+            or typed.get("typed_modifies_hand", 0.0) > 0.0
+        )
         cost = self._card_cost(card)
         energy_after = max(0.0, energy - cost + energy_gain - energy_loss)
         followups = 0
@@ -1502,7 +2154,31 @@ class CombatSandboxEnv(gym.Env):
                 followups += 1
         if energy_gain > 0.0 and followups <= 0 and immediate < max(6.0, energy_gain * 3.0):
             return True
-        if (exhausts or retains) and immediate < 6.0 and not card.get("ethereal"):
+        if requires_followup and followups <= 0 and immediate < max(6.0, energy_gain * 3.0 + 2.0):
+            return True
+        if future_penalty and followups <= 0 and immediate < 8.0:
+            return True
+        # B2 narrowing: pure exhaust/retain alone is no longer a strategic skip
+        # candidate.  Without a future-reason signal (hand mutation, replay, deck
+        # cycling, upgrade-hand) the model would otherwise be trained to fear any
+        # consume card.  Lethal/high-impact exhausts have immediate >> 4 and so
+        # already fall through; the threshold drop from 6 to 4 also drops the
+        # mid-range "exhaust 5 damage" cases that were being mislabelled.
+        has_future_setup_signal = bool(
+            typed.get("typed_card_state_mutation", 0.0) > 0.0
+            or typed.get("typed_modifies_hand", 0.0) > 0.0
+            or typed.get("typed_set_replay", 0.0) > 0.0
+            or typed.get("typed_upgrade_hand", 0.0) > 0.0
+            or typed.get("typed_consumes_future_resource", 0.0) > 0.0
+        )
+        if (
+            (exhausts or retains)
+            and has_future_setup_signal
+            and immediate < 4.0
+            and not card.get("ethereal")
+        ):
+            return True
+        if card_state_setup and followups <= 0 and immediate < 4.0:
             return True
         if (self_damage > 0.0 or energy_loss > 0.0) and immediate < (self_damage * 2.5 + energy_loss * 2.0 + 4.0):
             return True
@@ -1523,6 +2199,12 @@ class CombatSandboxEnv(gym.Env):
         strategic_skip = 0
         zero_x_available = 0
         refund_no_followup_available = 0
+        typed_followup_missing = 0
+        typed_future_penalty_count = 0
+        typed_no_draw_count = 0
+        typed_card_state_mutation_count = 0
+        setup_followup_dependent_count = 0
+        setup_followup_available_count = 0
         enchantment_seen = 0
         affliction_seen = 0
         selected_zero_x = 0.0
@@ -1532,8 +2214,15 @@ class CombatSandboxEnv(gym.Env):
             if not isinstance(action, dict) or str(action.get("action_id") or "") == "end_turn":
                 continue
             card = action.get("card") if isinstance(action.get("card"), dict) else None
+            typed = aggregate_card_effect_profile_semantics(card) if isinstance(card, dict) else {}
+            sem = _aggregate_card_modifier_semantics(card) if isinstance(card, dict) else {}
             if isinstance(card, dict):
-                if isinstance(card.get("enchantments"), list) and card.get("enchantments"):
+                if (
+                    isinstance(card.get("enchantments"), list)
+                    and card.get("enchantments")
+                    or typed.get("typed_add_modifier", 0.0) > 0.0
+                    or typed.get("typed_card_rule_modifier", 0.0) > 0.0
+                ):
                     enchantment_seen = 1
                 if isinstance(card.get("afflictions"), list) and card.get("afflictions"):
                     affliction_seen = 1
@@ -1549,8 +2238,52 @@ class CombatSandboxEnv(gym.Env):
             is_zero_x = isinstance(card, dict) and self._card_is_x_cost(card) and energy <= 0.0
             if is_zero_x:
                 zero_x_available += 1
-            sem = _aggregate_card_modifier_semantics(card) if isinstance(card, dict) else {}
-            is_refund = sem.get("energy_gain", 0.0) > 0.0 and is_strategic
+            typed_energy_gain = float(typed.get("typed_gain_energy_amount", 0.0) or 0.0)
+            typed_modify_cost = typed.get("typed_modify_cost", 0.0) > 0.0
+            typed_no_draw = typed.get("typed_no_draw", 0.0) > 0.0
+            typed_future_penalty = typed.get("typed_future_penalty", 0.0) > 0.0
+            typed_consumes_future_resource = typed.get("typed_consumes_future_resource", 0.0) > 0.0
+            typed_card_state_mutation = typed.get("typed_card_state_mutation", 0.0) > 0.0 or typed.get("typed_modifies_hand", 0.0) > 0.0
+            setup_followup_dependent = bool(
+                typed.get("typed_requires_followup", 0.0) > 0.0
+                or typed.get("typed_strategic_skip_if_no_followup", 0.0) > 0.0
+                or typed_modify_cost
+                or typed_no_draw
+                or typed_future_penalty
+                or typed_consumes_future_resource
+            )
+            setup_followup_available = False
+            if isinstance(card, dict) and setup_followup_dependent:
+                energy_after = max(
+                    0.0,
+                    energy
+                    - self._card_cost(card)
+                    + max(float(sem.get("energy_gain", 0.0) or 0.0), typed_energy_gain)
+                    - float(sem.get("energy_loss_on_play", 0.0) or 0.0),
+                )
+                for other in legal_actions:
+                    if other is action or not isinstance(other, dict) or other.get("kind") != "play_card":
+                        continue
+                    other_card = other.get("card")
+                    if not isinstance(other_card, dict) or self._card_is_x_cost(other_card):
+                        continue
+                    other_cost = self._card_cost(other_card)
+                    if (other_cost <= energy_after + 1e-6 or typed_modify_cost) and self._action_positive_score(other) >= 3.0:
+                        setup_followup_available = True
+                        break
+            if setup_followup_dependent:
+                setup_followup_dependent_count += 1
+                if setup_followup_available:
+                    setup_followup_available_count += 1
+                else:
+                    typed_followup_missing += 1
+            if typed_future_penalty:
+                typed_future_penalty_count += 1
+            if typed_no_draw:
+                typed_no_draw_count += 1
+            if typed_card_state_mutation:
+                typed_card_state_mutation_count += 1
+            is_refund = max(float(sem.get("energy_gain", 0.0) or 0.0), typed_energy_gain) > 0.0 and is_strategic
             if is_refund:
                 refund_no_followup_available += 1
             if chosen_action is action:
@@ -1571,6 +2304,12 @@ class CombatSandboxEnv(gym.Env):
             "refund_no_followup_available": float(refund_no_followup_available),
             "refund_no_followup_selected": selected_refund_no_followup,
             "strategic_skip_selected": selected_strategic_skip,
+            "typed_followup_missing_count": float(typed_followup_missing),
+            "typed_future_penalty_count": float(typed_future_penalty_count),
+            "typed_no_draw_count": float(typed_no_draw_count),
+            "typed_card_state_mutation_count": float(typed_card_state_mutation_count),
+            "setup_followup_dependent_count": float(setup_followup_dependent_count),
+            "setup_followup_available_count": float(setup_followup_available_count),
             "enchantment_seen": float(enchantment_seen),
             "affliction_seen": float(affliction_seen),
         }

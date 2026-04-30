@@ -536,6 +536,7 @@ internal static partial class BridgeGameApi
         var actionDiagnostics = BuildEnvActionDiagnostics(before, selectedAction, actionError);
         var cardSelectionBefore = BuildEnvCardSelectionStepInfoPayload(before);
         var cardSelectionAfter = BuildEnvCardSelectionStepInfoPayload(after);
+        var actionability = BuildEnvActionabilityPayload(after, episode);
         var done = forceDone || after.Done;
         SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
@@ -578,8 +579,88 @@ internal static partial class BridgeGameApi
                 step_timing_ms = timing?.ToTimingPayload(),
                 step_timing_counts = timing?.ToCountPayload(),
                 action_diagnostics = actionDiagnostics,
-                reward_breakdown = rewardBreakdown
+                reward_breakdown = rewardBreakdown,
+                actionability = actionability
             }
+        };
+    }
+
+    /// <summary>
+    /// TASK-C1: Expose enough state for Python to distinguish a transient
+    /// only-end_turn frontier (animation/queue/draw-shuffle pending) from a
+    /// genuinely stable no-action turn end.  Python short-polls on transient
+    /// rather than long-sleeping in the bridge — see TASK-C2.
+    /// </summary>
+    private static object BuildEnvActionabilityPayload(BridgeEnvSnapshot snapshot, BridgeEnvEpisode episode)
+    {
+        var nonEndTurnCount = 0;
+        if (snapshot.LegalActions != null)
+        {
+            foreach (var action in snapshot.LegalActions)
+            {
+                if (action is null)
+                {
+                    continue;
+                }
+                // Snapshot legal actions are anonymous payload objects; the
+                // ActionId surfaces via the resolved-actions array.  Use that
+                // for a robust Equals(string) comparison.
+            }
+        }
+        if (snapshot.ResolvedActions != null)
+        {
+            foreach (var resolved in snapshot.ResolvedActions)
+            {
+                if (resolved is null)
+                {
+                    continue;
+                }
+                if (!string.Equals(resolved.ActionId, "end_turn", StringComparison.Ordinal))
+                {
+                    nonEndTurnCount++;
+                }
+            }
+        }
+        var totalActions = snapshot.ResolvedActions?.Count ?? snapshot.LegalActions?.Length ?? 0;
+        var hasOnlyEndTurn = nonEndTurnCount == 0 && totalActions >= 1;
+        var phaseSettling = string.Equals(snapshot.Phase, "settling", StringComparison.Ordinal);
+        // Conservative pending detection: when phase=="settling" the bridge is
+        // mid-dispatch (animation/queue/shuffle in flight).  We do not split
+        // animation vs queue vs draw_shuffle here because the underlying game
+        // state machine collapses them into the settling phase; a future
+        // refinement can break them apart.
+        var anyPending = phaseSettling;
+        var transientOnlyEndTurn = hasOnlyEndTurn && anyPending && snapshot.CombatInProgress;
+        var frontierStable = !anyPending && !transientOnlyEndTurn;
+        string reason;
+        if (nonEndTurnCount > 0)
+        {
+            reason = "has_non_end_turn_actions";
+        }
+        else if (transientOnlyEndTurn)
+        {
+            reason = phaseSettling ? "queue_pending" : "unknown";
+        }
+        else if (hasOnlyEndTurn)
+        {
+            reason = "stable_no_actions";
+        }
+        else
+        {
+            reason = "unknown";
+        }
+        return new
+        {
+            frontier_stable = frontierStable,
+            transient_only_end_turn = transientOnlyEndTurn,
+            only_end_turn_reason = reason,
+            state_version = episode.StepIndex,
+            state_hash = snapshot.LogicHash,
+            queue_pending = anyPending,
+            animation_pending = phaseSettling,
+            draw_shuffle_pending = phaseSettling && snapshot.CombatInProgress,
+            legal_non_end_turn_count = nonEndTurnCount,
+            legal_action_count = totalActions
         };
     }
 

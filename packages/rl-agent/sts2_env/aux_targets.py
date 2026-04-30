@@ -93,6 +93,35 @@ from .action_history import (
 )
 
 
+# Phase 3 TASK-D3: future-world card-lifecycle targets.  Self-supervised from
+# (prev_obs, action, next_obs) tuples — no labels needed.  The aux head learns
+# to predict next-state pile/hand/energy/block/incoming-damage and the
+# action-conditioned card-destination probabilities so the search-free planner
+# can perform approximate lookahead even when MCTS is disabled.
+FUTURE_LIFECYCLE_HEAD_NAMES = (
+    "next_hand_count_ratio",
+    "next_draw_count_ratio",
+    "next_discard_count_ratio",
+    "next_exhaust_count_ratio",
+    "next_energy_ratio",
+    "next_block_ratio",
+    "next_incoming_damage_ratio",
+    "card_moved_to_exhaust_prob",
+    "card_moved_to_discard_prob",
+    "card_retained_prob",
+    "hand_upgraded_count",
+    "hand_transformed_count",
+    "hand_copied_count",
+    "cost_reduced_count",
+    "created_card_count",
+    "drawn_card_count",
+    "next_kaiser_facing",
+    "next_back_attack_risk",
+    "next_ceremonial_lock_state",
+)
+NUM_FUTURE_LIFECYCLE_HEADS = len(FUTURE_LIFECYCLE_HEAD_NAMES)
+
+
 SELECTION_HEAD_NAMES = (
     "source_hand",
     "source_draw",
@@ -1026,6 +1055,187 @@ def compute_route_targets(
     return target
 
 
+def _card_identity_key(card: dict[str, Any] | None) -> str:
+    if not isinstance(card, dict):
+        return ""
+    for key in ("uid", "instance_id", "combat_uuid", "id"):
+        value = card.get(key)
+        if value not in (None, ""):
+            return str(value)
+    title = str(card.get("title") or card.get("name") or "").strip()
+    return title
+
+
+def _is_upgraded(card: dict[str, Any] | None) -> bool:
+    if not isinstance(card, dict):
+        return False
+    for key in ("is_upgraded", "upgraded"):
+        if card.get(key):
+            return True
+    for key in ("upgrade_level", "current_upgrade_level", "level"):
+        try:
+            if float(card.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    title = str(card.get("title") or card.get("name") or "").strip()
+    return title.endswith("+")
+
+
+def _hand_upgrade_count(obs: dict[str, Any] | None) -> int:
+    return sum(1 for card in _runtime_cards(obs, "hand") if _is_upgraded(card))
+
+
+def _all_pile_cards(obs: dict[str, Any] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for pile_name in ("hand", "draw_pile", "discard_pile"):
+        out.extend(_runtime_cards(obs, pile_name))
+    return out
+
+
+def _played_card_payload(action: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(action, dict):
+        return {}
+    card = action.get("card")
+    return card if isinstance(card, dict) else {}
+
+
+def _first_enemy_field(obs: dict[str, Any] | None, *fields: str) -> float:
+    enemies = _combat_enemies(obs)
+    if not enemies:
+        return 0.0
+    enemy = enemies[0]
+    cursor: Any = enemy
+    for field in fields:
+        if not isinstance(cursor, dict):
+            return 0.0
+        cursor = cursor.get(field)
+    try:
+        return float(cursor or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _enemy_facing_metric(obs: dict[str, Any] | None) -> float:
+    """Normalized "looking at player" signal in [0, 1].
+
+    The bridge surfaces ``facing`` either as a string (``"front"`` /
+    ``"back"`` / ``"side"``) or a numeric ``facing_player`` boolean.  We
+    collapse to a probability the first enemy is currently facing the player.
+    """
+    enemies = _combat_enemies(obs)
+    if not enemies:
+        return 0.0
+    enemy = enemies[0]
+    facing = enemy.get("facing")
+    if isinstance(facing, str):
+        token = facing.strip().lower()
+        if token in {"player", "front"}:
+            return 1.0
+        if token in {"back", "away"}:
+            return 0.0
+        if token == "side":
+            return 0.5
+    if isinstance(facing, dict):
+        towards_player = facing.get("towards_player")
+        if isinstance(towards_player, bool):
+            return 1.0 if towards_player else 0.0
+        if isinstance(towards_player, (int, float)):
+            return 1.0 if float(towards_player) > 0 else 0.0
+    fp = enemy.get("facing_player")
+    if isinstance(fp, bool):
+        return 1.0 if fp else 0.0
+    if isinstance(fp, (int, float)):
+        return 1.0 if float(fp) > 0 else 0.0
+    return 0.5
+
+
+def _ceremonial_lock_metric(obs: dict[str, Any] | None) -> float:
+    """1.0 if any enemy power name signals a Ceremonial one-card lock."""
+    for enemy in _combat_enemies(obs):
+        powers = enemy.get("powers") if isinstance(enemy, dict) else None
+        if not isinstance(powers, list):
+            continue
+        for power in powers:
+            if isinstance(power, dict):
+                pid = str(power.get("id") or power.get("power_id") or power.get("name") or "").lower()
+            else:
+                pid = str(power or "").lower()
+            if "ceremonial" in pid or "one_card_lock" in pid:
+                return 1.0
+    return 0.0
+
+
+def compute_future_lifecycle_targets(
+    prev_obs: dict[str, Any] | None,
+    action: dict[str, Any] | None,
+    next_obs: dict[str, Any] | None,
+) -> np.ndarray:
+    """19-d future-world target vector (TASK-D3).
+
+    Self-supervised from observed transitions.  Pile / energy / block / damage
+    fields are normalized to [0, 1] in the same fashion as
+    :func:`compute_transition_targets`.  Card destination probabilities are
+    Bernoulli targets in {0, 1} derived from the played card's identity:
+    if the played card now appears in exhaust / discard / hand it scores 1.0
+    on the matching head.
+    """
+    target = np.zeros(NUM_FUTURE_LIFECYCLE_HEADS, dtype=np.float32)
+
+    # Counts (ratio-normalized to keep loss in a stable scale).
+    target[0] = min(len(_runtime_cards(next_obs, "hand")) / 12.0, 1.0)
+    target[1] = min(len(_runtime_cards(next_obs, "draw_pile")) / 30.0, 1.0)
+    target[2] = min(len(_runtime_cards(next_obs, "discard_pile")) / 30.0, 1.0)
+    target[3] = min(len(_runtime_cards(next_obs, "exhaust_pile")) / 30.0, 1.0)
+    if _in_combat(next_obs):
+        target[4] = min(_combat_energy(next_obs) / max(_combat_max_energy(next_obs), 1.0), 1.0)
+    target[5] = min(_player_block(next_obs) / 60.0, 1.0)
+    target[6] = min(_combat_total_intent_damage(next_obs) / 200.0, 1.0)
+
+    # Card destination probabilities — only meaningful for play_card actions.
+    played = _played_card_payload(action)
+    played_key = _card_identity_key(played)
+    if played_key:
+        in_next_hand = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "hand"))
+        in_next_discard = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "discard_pile"))
+        in_next_exhaust = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "exhaust_pile"))
+        target[7] = 1.0 if in_next_exhaust else 0.0
+        target[8] = 1.0 if in_next_discard else 0.0
+        target[9] = 1.0 if in_next_hand else 0.0
+
+    # Hand mutation counts — derived from before/after diffs across runtime piles.
+    prev_upgrades = _hand_upgrade_count(prev_obs)
+    next_upgrades = _hand_upgrade_count(next_obs)
+    target[10] = float(max(0, next_upgrades - prev_upgrades))
+
+    prev_titles = [str(c.get("title") or c.get("name") or "").strip() for c in _all_pile_cards(prev_obs)]
+    next_titles = [str(c.get("title") or c.get("name") or "").strip() for c in _all_pile_cards(next_obs)]
+    prev_unique = len(set(t for t in prev_titles if t))
+    next_unique = len(set(t for t in next_titles if t))
+    target[11] = float(max(0, abs(next_unique - prev_unique) - 1))  # transformations grow unique-titles minus the played card delta
+
+    target[12] = float(max(0, len(next_titles) - len(prev_titles) - max(0, len(_runtime_cards(next_obs, "hand")) - len(_runtime_cards(prev_obs, "hand")))))
+    target[13] = float(max(0, sum(
+        1 for c in _runtime_cards(next_obs, "hand")
+        if isinstance(c.get("current_cost"), (int, float))
+        and isinstance(c.get("cost"), (int, float))
+        and float(c["current_cost"]) < float(c["cost"])
+    )))
+    target[14] = float(max(0, len(next_titles) - len(prev_titles)))
+    drawn_proxy = max(0, len(_runtime_cards(next_obs, "hand")) - (len(_runtime_cards(prev_obs, "hand")) - 1))
+    target[15] = float(drawn_proxy)
+
+    # Boss-mechanic next-state metrics.
+    target[16] = _enemy_facing_metric(next_obs)
+    # Back-attack risk: 1.0 if enemy now facing back AND has an attack intent next.
+    facing_metric = _enemy_facing_metric(next_obs)
+    intent_damage = _combat_total_intent_damage(next_obs)
+    target[17] = 1.0 if (facing_metric < 0.5 and intent_damage > 0) else 0.0
+    target[18] = _ceremonial_lock_metric(next_obs)
+
+    return target
+
+
 def compute_transition_targets(
     prev_obs: dict[str, Any] | None,
     action: dict[str, Any] | None,
@@ -1243,6 +1453,8 @@ def build_aux_targets(
     # at the chosen-candidate row (action index) and a scalar mask=1;
     # all other rows zero and masked out.
     causality_delta = np.asarray(_build_causality_delta(prev_obs, next_obs), dtype=np.float32)
+    future_lifecycle = compute_future_lifecycle_targets(prev_obs, action, next_obs)
+    future_lifecycle_mask = 1.0 if (_in_combat(prev_obs) or _in_combat(next_obs) or family in _COMBAT_ACTION_FAMILIES) else 0.0
     # Mask the causality target in the same cases where no combat
     # advancement can happen (truncation with rebind, recovery step).
     # We still credit non-combat actions because their effect on the
@@ -1268,6 +1480,8 @@ def build_aux_targets(
         "enemy_state_mask": enemy_state_mask,
         "causality": causality_delta,
         "causality_mask": float(causality_mask),
+        "future_lifecycle": future_lifecycle,
+        "future_lifecycle_mask": float(future_lifecycle_mask),
         "objective_names": OBJECTIVE_HEAD_NAMES,
         "transition_names": TRANSITION_HEAD_NAMES,
         "trait_names": TRAIT_HEAD_NAMES,
@@ -1276,7 +1490,8 @@ def build_aux_targets(
         "route_names": ROUTE_HEAD_NAMES,
         "enemy_state_field_names": ENEMY_STATE_FIELD_NAMES,
         "causality_names": CAUSALITY_HEAD_NAMES,
-        "version": 4,
+        "future_lifecycle_names": FUTURE_LIFECYCLE_HEAD_NAMES,
+        "version": 5,
     }
 
 
@@ -1295,6 +1510,9 @@ __all__ = [
     "NUM_ROUTE_HEADS",
     "CAUSALITY_HEAD_NAMES",
     "NUM_CAUSALITY_HEADS",
+    "FUTURE_LIFECYCLE_HEAD_NAMES",
+    "NUM_FUTURE_LIFECYCLE_HEADS",
+    "compute_future_lifecycle_targets",
     "build_aux_targets",
     "compute_build_targets",
     "compute_selection_targets",

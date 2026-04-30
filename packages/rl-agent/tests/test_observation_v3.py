@@ -244,9 +244,9 @@ class ObservationV3ContractTest(unittest.TestCase):
         ):
             encoded = encoder.encode(obs, legal_actions=legal_actions)
 
-        self.assertEqual(encoded["candidate_local_tokens"].shape[1], 24)
-        self.assertEqual(obs_v3.MAX_CANDIDATE_LOCAL_TOKENS, 24)
-        self.assertEqual(obs_v3.OBSERVATION_API_VERSION, "attention_obs_v2")
+        self.assertEqual(encoded["candidate_local_tokens"].shape[1], obs_v3.MAX_CANDIDATE_LOCAL_TOKENS)
+        self.assertEqual(obs_v3.MAX_CANDIDATE_LOCAL_TOKENS, 32)
+        self.assertEqual(obs_v3.OBSERVATION_API_VERSION, "attention_obs_v4")
 
     def test_structured_enemy_traits_and_runtime_piles_become_world_tokens(self) -> None:
         obs_v3 = self.observation_v3

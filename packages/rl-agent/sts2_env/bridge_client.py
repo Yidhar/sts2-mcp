@@ -85,6 +85,16 @@ class BridgeClient:
     RETRY_DELAY_S = 1.0
     HTTP_TIMEOUT_GRACE_MS = 10_000
 
+    # 2026-04-27: bridge-outage recovery loop. When the burst-retry path
+    # (MAX_RETRIES quick attempts) exhausts on ConnectionError/Timeout, the
+    # game is likely fully crashed and the watchdog is restarting it. The
+    # watchdog needs ~30-60s to relaunch + emit a fresh session.json, so the
+    # 3x1s burst is far too short to ride that out. Poll for session-file
+    # rotation + retry the request every BRIDGE_OUTAGE_POLL_S until the
+    # total outage exceeds MAX_BRIDGE_OUTAGE_S, only then give up.
+    MAX_BRIDGE_OUTAGE_S = 180.0
+    BRIDGE_OUTAGE_POLL_S = 5.0
+
     def __init__(self, session_path: str | Path | None = None):
         normalized = normalize_path(session_path) if session_path else None
         path = normalized if normalized is not None else _resolve_session_path()
@@ -213,7 +223,13 @@ class BridgeClient:
         )
 
         last_exc: Exception | None = None
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        quick_attempts_left = self.MAX_RETRIES
+        outage_deadline: float | None = None
+        outage_announced = False
+        total_attempts = 0
+
+        while True:
+            total_attempts += 1
             # Recompute per attempt so a rebind during the retry loop picks
             # up the new base_url. Token lives in self._session.headers
             # which _load_session() updated.
@@ -231,7 +247,7 @@ class BridgeClient:
                         resp_body = resp.json()
                     except Exception:
                         resp_body = resp.text
-                    if resp.status_code == 401 and attempt < self.MAX_RETRIES:
+                    if resp.status_code == 401 and quick_attempts_left > 1:
                         # Widened from the narrow "missing_or_invalid_token"
                         # match: ANY 401 may indicate a stale token after a
                         # launcher-side restart. Try a fresh session reload
@@ -251,6 +267,7 @@ class BridgeClient:
                             and str(resp_body.get("error") or "").strip()
                             == "missing_or_invalid_token"
                         ):
+                            quick_attempts_left -= 1
                             time.sleep(self.RETRY_DELAY_S)
                             continue
                     raise BridgeError(
@@ -261,6 +278,12 @@ class BridgeClient:
                     )
 
                 self._is_connected = True
+                if outage_announced:
+                    print(
+                        f"[bridge-client] outage recovered for {method} /{endpoint} "
+                        f"after {total_attempts} attempts",
+                        flush=True,
+                    )
                 return resp.json()
 
             except BridgeError:
@@ -269,22 +292,45 @@ class BridgeClient:
             except requests.ConnectionError as exc:
                 self._is_connected = False
                 last_exc = exc
-                # Launcher may have just killed the process mid-request and
-                # is writing a fresh session_N.json — try to pick that up on
-                # the next retry.
-                if attempt < self.MAX_RETRIES:
-                    self._maybe_rebind_session(reason=f"ConnectionError on {method} /{endpoint}")
+                self._maybe_rebind_session(
+                    reason=f"ConnectionError on {method} /{endpoint}",
+                )
             except requests.Timeout as exc:
                 self._is_connected = False
                 last_exc = exc
-                if attempt < self.MAX_RETRIES:
-                    self._maybe_rebind_session(reason=f"Timeout on {method} /{endpoint}")
+                self._maybe_rebind_session(
+                    reason=f"Timeout on {method} /{endpoint}",
+                )
 
-            if attempt < self.MAX_RETRIES:
+            # Burst-retry phase: 3 attempts at 1s spacing for transient blips.
+            if quick_attempts_left > 1:
+                quick_attempts_left -= 1
                 time.sleep(self.RETRY_DELAY_S)
+                continue
+            quick_attempts_left = 0
+
+            # Outage-recovery phase: game likely crashed, watchdog needs
+            # 30-60s to relaunch + emit fresh session.json. Poll until
+            # MAX_BRIDGE_OUTAGE_S elapses, only then surface the failure.
+            if outage_deadline is None:
+                outage_deadline = time.monotonic() + self.MAX_BRIDGE_OUTAGE_S
+                outage_announced = True
+                print(
+                    f"[bridge-client] burst-retry exhausted for {method} /{endpoint}; "
+                    f"entering outage-recovery wait (up to {self.MAX_BRIDGE_OUTAGE_S:.0f}s) "
+                    f"polling for watchdog to restart bridge...",
+                    flush=True,
+                )
+
+            if time.monotonic() >= outage_deadline:
+                break
+
+            time.sleep(self.BRIDGE_OUTAGE_POLL_S)
+            # Continue the while loop — next iteration will retry the request
+            # against whatever base_url/token _maybe_rebind_session pulled in.
 
         raise BridgeError(
-            f"Bridge unreachable after {self.MAX_RETRIES} attempts "
+            f"Bridge unreachable after {total_attempts} attempts "
             f"({method} /{endpoint}) via {self._base_url}: {last_exc}"
             + (
                 " (WSL note: if session.json still points at http://127.0.0.1:<port>/, "

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
@@ -121,6 +122,11 @@ internal static partial class BridgeGameApi
         AppendCompactPreviewFields(payload, element.Value);
         AppendCompactCardModifiers(payload, element.Value, "afflictions");
         AppendCompactCardModifiers(payload, element.Value, "enchantments");
+        var cardEffectProfile = CompactCardEffectProfile(TryGetNestedElement(element.Value, "card_effect_profile"));
+        if (cardEffectProfile is not null)
+        {
+            payload["card_effect_profile"] = cardEffectProfile;
+        }
 
         return payload;
     }
@@ -195,6 +201,33 @@ internal static partial class BridgeGameApi
         {
             payload[fieldName] = compact.ToArray();
         }
+    }
+
+    private static object? CompactCardEffectProfile(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var key in new[]
+        {
+            "schema_version",
+            "normalized_id",
+            "class_name",
+            "operations",
+            "semantic_tags",
+            "training_tags"
+        })
+        {
+            if (element.Value.TryGetProperty(key, out var prop))
+            {
+                payload[key] = JsonElementToObject(prop);
+            }
+        }
+
+        return payload.Count > 0 ? payload : null;
     }
 
 

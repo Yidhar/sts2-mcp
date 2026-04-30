@@ -218,10 +218,33 @@ KAISER_BACK_ATTACK_END_TURN_PENALTY = -0.45        # was -0.30
 # the facing change is roughly the magnitude of a single boss-card hit, making
 # it MCTS-attractive even when the immediate damage option scores higher.
 KAISER_FACING_CHANGE_BONUS = 0.80
+# 2026-04-28 §1A: split the flat facing bonus into a base + intent-scaled
+# component so refacing toward a HIGH-damage threat pays substantially more
+# than refacing toward a LOW-damage threat (which the user observed the
+# model exploit by mono-attacking the cheap claw).
+# threat_dmg=20 ⇒ scale=1.0 (baseline); threat_dmg=40 ⇒ scale=2.0 (cap).
+# 2026-04-28 v2: kaiser_crab WR stuck at 0.10-0.15, facing_change_sel only 3.2%
+# vs pressure_sel 43%. The 0.60 base was a regression from the legacy 0.80
+# flat bonus — for typical kaiser intent (~10-15 dmg) scale ≈ 0.5-0.75 gave
+# a smaller bonus than before. Restore base to 0.80 so low-intent fights
+# match legacy and high-intent (≥20) get up to 1.6x.
+KAISER_FACING_CHANGE_BONUS_BASE = 0.80
+KAISER_FACING_INTENT_DMG_REF = 20.0
+KAISER_FACING_INTENT_DMG_SCALE_MAX = 2.0
 # NEW (doc §12 missing): if instead of refacing the player kills the back
 # enemy/part this turn (back side enemy_hp_delta > 0 AND its hp ends ≤ 0),
 # reward them too — bypasses the need to reface.
-KAISER_PRESSURE_KILL_BONUS = 0.20
+# 2026-04-28 v2: pressure_kill at 0.20 was the dominant kaiser strategy
+# (43% selection rate, vs facing 3.2%) because cumulative +0.20/turn
+# beats one-shot facing bonus on the buffer scale. Cut to 0.05 so it's
+# still a small "you killed something" reward but no longer competes
+# with facing as the primary kaiser-response strategy.
+KAISER_PRESSURE_KILL_BONUS = 0.05
+# 2026-04-28 §1C: extra penalty when standing in a HIGH-damage back-attack
+# (intent_dmg ≥ KAISER_BACK_ATTACK_HI_THREAT_DMG) and taking HP loss.
+# Scaled by hp_loss / max_hp so it stays balanced across boss HP variance.
+KAISER_BACK_ATTACK_HI_THREAT_DMG = 15.0
+KAISER_BACK_ATTACK_HI_THREAT_EXTRA = 1.50
 # Soften factor when no defense candidate AND no facing-change candidate is
 # legal: in that frame the model has no mechanically-correct response, so
 # applying the full risk-end_turn penalty would be punishing the policy for
@@ -304,6 +327,53 @@ POTION_USE_MONSTER_PENALTY = 0.0
 
 POTION_HOARDING_PENALTY_PER_POTION = 0.0
 POTION_HOARDING_MAX_PENALTY_ABS = 0.0
+
+# 2026-04-27: card_selection (multi-pick burn cards like POTION.GLOWWATER /
+# 净化效果) anti-loop shaping. Symptom: model picks max-N every time, never
+# proactively confirms at K<N, oscillates between picking + replacing the
+# last card. Two new rewards correct the imbalance:
+#   - SELECTION_LOOP_PENALTY:    each detected pick→replace flip ≥ 2 in a row
+#                                gives a per-event negative reward.  Stops the
+#                                "select + change-mind + select-same" cycle.
+#   - SELECTION_EARLY_CONFIRM_BONUS: confirming with K < max picks gets a small
+#                                positive scaled by (max-K)/max.  Earlier
+#                                confirms on smaller pick sets pay more.
+SELECTION_LOOP_PENALTY = 0.30
+SELECTION_EARLY_CONFIRM_BONUS = 0.40
+
+# 2026-04-28 §4 v2: the original SELECTION_LOOP_PENALTY only caught
+# A→A→A repeats (same id picked twice in a row). Real failure mode the
+# user reported is A→B→C→A→B oscillation across multiple cards, which
+# my id-equality check misses. Two new signals close the gap:
+#   - SELECTION_DESELECT_PENALTY: any pick on a card whose is_selected=True
+#     (i.e. deselecting it). Each such event after the first 1 pays this.
+#   - SELECTION_PICK_CAP: total picks per round; beyond this each pick
+#     pays SELECTION_OVER_CAP_PENALTY. Hard-stops the 1700-step death loop.
+SELECTION_DESELECT_PENALTY = 0.40
+SELECTION_PICK_CAP = 12
+SELECTION_OVER_CAP_PENALTY = 1.20
+
+# 2026-04-29 §4 v3: the_insatiable_boss (沙虫) hit family_card_selection_rate
+# = 0.9962 — 99.6% of decisions in that boss were selection actions. The
+# v2 SELECTION_PICK_CAP (12 picks per round) only caps a SINGLE selection
+# round; if the model keeps RE-ENTERING the selection screen (frantic_escape
+# triggers it once per turn), each round resets and the cap never trips.
+# Track per-episode selection-screen re-entries: first 2 are free (legit
+# multi-turn selection), each entry beyond pays SELECTION_REENTRY_PENALTY.
+SELECTION_REENTRY_BUDGET = 2
+SELECTION_REENTRY_PENALTY = 1.50
+
+# 2026-04-28 Phase 4b of docs/potion-timing-modeling-plan.md (§2 of
+# kaiser-and-potion-fixes-todo.md).  The Phase 1-5 timing profile produced
+# use_quality / waste_risk / save_value but only the planner bias consumed
+# them — none of those signals reached the value/return triple, so the
+# model never learned "don't dump potions turn 1".  These two constants
+# wire the timing profile into per-step reward shaping:
+#   reward += POTION_TIMING_QUALITY_SCALE * use_quality
+#   reward -= POTION_TIMING_WASTE_SCALE   * waste_risk
+# Penalty > bonus by design: the trainer should prefer hoarding over bad use.
+POTION_TIMING_QUALITY_SCALE = 0.40
+POTION_TIMING_WASTE_SCALE = 0.60
 
 # Enemies reporting hp above this are treated as sentinel-invulnerable (e.g.
 # WATERFALL_GIANT_BOSS has hp ≈ 1e9 until a kill condition triggers). Without

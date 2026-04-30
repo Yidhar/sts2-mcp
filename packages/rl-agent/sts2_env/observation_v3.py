@@ -1875,6 +1875,11 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         operator_numeric[11] = min(max(float(action_order_id), 0.0) / max(MAX_ORDER_ID, 1), 1.0)
         operator_numeric[12] = features["actions"][action_index, 12] if features["actions"].shape[1] > 12 else 0.0
         operator_numeric[13] = features["actions"][action_index, 13] if features["actions"].shape[1] > 13 else 0.0
+        # §4C: surface "this card is already selected in the current pick set".
+        # Bridge emits is_selected on each card_selection:select action so the
+        # model can directly see pick→deselect oscillations on multi-pick burn
+        # cards (POTION.GLOWWATER, 净化, etc.) instead of inferring from history.
+        operator_numeric[14] = float(bool(action.get("is_selected"))) if isinstance(action.get("is_selected"), (bool, int)) else 0.0
         entries.append(
             self._entry(
                 "SELECTION_OPERATOR_LOCAL",
@@ -3628,6 +3633,43 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             "cost_randomizes_on_draw": 0.0,
             "sets_cost_zero": 0.0,
             "shuffle_top": 0.0,
+            "typed_ops_count": 0.0,
+            "typed_modifies_hand": 0.0,
+            "typed_upgrade_hand": 0.0,
+            "typed_exhaust_cards": 0.0,
+            "typed_discard_cards": 0.0,
+            "typed_transform_cards": 0.0,
+            "typed_copy_cards": 0.0,
+            "typed_modify_cost": 0.0,
+            "typed_set_replay": 0.0,
+            "typed_retain_cards": 0.0,
+            "typed_add_modifier": 0.0,
+            "typed_add_keyword": 0.0,
+            "typed_add_generated_card": 0.0,
+            "typed_draw_cards": 0.0,
+            "typed_draw_amount": 0.0,
+            "typed_gain_energy": 0.0,
+            "typed_gain_energy_amount": 0.0,
+            "typed_hp_loss": 0.0,
+            "typed_apply_power": 0.0,
+            "typed_no_draw": 0.0,
+            "typed_future_penalty": 0.0,
+            "typed_requires_followup": 0.0,
+            "typed_strategic_skip_if_no_followup": 0.0,
+            "typed_not_x_cost_filter": 0.0,
+            "typed_x_cost_filter": 0.0,
+            "typed_hand_context_dependency": 0.0,
+            "typed_discard_context_dependency": 0.0,
+            "typed_exhaust_context_dependency": 0.0,
+            "typed_draw_context_dependency": 0.0,
+            "typed_deck_context_dependency": 0.0,
+            "typed_consumes_future_resource": 0.0,
+            "typed_once_or_exhaust_self": 0.0,
+            "typed_selection_required": 0.0,
+            "typed_all_scope": 0.0,
+            "typed_card_rule_modifier": 0.0,
+            "typed_card_state_mutation": 0.0,
+            "typed_hand_context_needed": 0.0,
             "strategic_skip_value": 0.0,
         }
         if not isinstance(source, dict):
@@ -3637,6 +3679,10 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         strength, dexterity, energy, hits = obs_common._get_card_extra_metrics(source)
         kw_flags, _ = obs_common._get_card_keywords(source)
         modifier_sem = obs_common._aggregate_card_modifier_semantics(source)
+        effect_sem = obs_common._aggregate_card_effect_profile_semantics(source)
+        typed_energy = effect_sem.get("typed_gain_energy_amount", 0.0)
+        typed_draw = effect_sem.get("typed_draw_amount", 0.0)
+        typed_hp_loss = effect_sem.get("typed_hp_loss", 0.0)
         card_type = str(source.get("type") or "").capitalize()
         target = str(source.get("target_type") or source.get("target") or "").lower()
         cost = obs_common._float(source.get("cost"))
@@ -3654,10 +3700,10 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "zero_cost": 1.0 if cost == 0 else 0.0,
                 "damage": preview["preview_damage"],
                 "block": preview["preview_block"],
-                "draw": obs_common._preview_metric(source, "draw") + modifier_sem.get("draw", 0.0),
-                "energy": energy,
+                "draw": max(obs_common._preview_metric(source, "draw") + modifier_sem.get("draw", 0.0), typed_draw),
+                "energy": max(energy, typed_energy),
                 "heal": obs_common._preview_metric(source, "heal"),
-                "hp_loss": obs_common._preview_metric(source, "hp_loss") + modifier_sem.get("self_damage", 0.0),
+                "hp_loss": max(obs_common._preview_metric(source, "hp_loss") + modifier_sem.get("self_damage", 0.0), typed_hp_loss),
                 "energy_loss": modifier_sem.get("energy_loss_on_play", 0.0),
                 "self_damage": modifier_sem.get("self_damage", 0.0),
                 "weak": obs_common._preview_metric(source, "weak") + modifier_sem.get("weak", 0.0),
@@ -3665,9 +3711,9 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "hits": hits,
                 "single_target": 1.0 if "single" in target or "anyenemy" in target else 0.0,
                 "aoe_target": 1.0 if "all" in target else 0.0,
-                "exhaust": 1.0 if kw_flags[0] else 0.0,
+                "exhaust": 1.0 if kw_flags[0] or effect_sem.get("typed_once_or_exhaust_self", 0.0) > 0.0 else 0.0,
                 "ethereal": 1.0 if kw_flags[1] else 0.0,
-                "retain": 1.0 if kw_flags[2] else 0.0,
+                "retain": 1.0 if kw_flags[2] or effect_sem.get("typed_retain_cards", 0.0) > 0.0 else 0.0,
                 "play_count_bonus": modifier_sem.get("play_count_bonus", 0.0),
                 "damage_add": modifier_sem.get("damage_add", 0.0),
                 "damage_mult": modifier_sem.get("damage_mult", 1.0),
@@ -3683,13 +3729,28 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 "shuffle_top": modifier_sem.get("shuffle_top", 0.0),
             }
         )
+        profile.update(effect_sem)
         profile["strength"] = strength
         profile["dexterity"] = dexterity
+        profile["draw"] = max(profile["draw"], typed_draw)
+        profile["energy"] = max(profile["energy"], typed_energy)
+        profile["hp_loss"] = max(profile["hp_loss"], typed_hp_loss)
+        profile["exhaust"] = max(profile["exhaust"], effect_sem.get("typed_once_or_exhaust_self", 0.0))
+        profile["retain"] = max(profile["retain"], effect_sem.get("typed_retain_cards", 0.0))
         profile["strategic_skip_value"] = float(
             profile["exhaust"] > 0.5
             or profile["retain"] > 0.5
             or profile["energy_loss"] > 0.0
             or profile["self_damage"] > 0.0
+            or profile.get("typed_strategic_skip_if_no_followup", 0.0) > 0.5
+            or profile.get("typed_requires_followup", 0.0) > 0.5
+            or profile.get("typed_no_draw", 0.0) > 0.5
+            or profile.get("typed_future_penalty", 0.0) > 0.5
+            or profile.get("typed_consumes_future_resource", 0.0) > 0.5
+            or profile.get("typed_exhaust_cards", 0.0) > 0.5
+            or profile.get("typed_transform_cards", 0.0) > 0.5
+            or profile.get("typed_modify_cost", 0.0) > 0.5
+            or profile.get("typed_set_replay", 0.0) > 0.5
         )
         return profile
 

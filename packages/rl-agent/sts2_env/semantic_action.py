@@ -14,6 +14,11 @@ from typing import Any
 import numpy as np
 
 from content_registry import get_card_metadata, get_potion_metadata, get_relic_metadata
+from .card_effect_profile import (
+    aggregate_card_effect_profile_semantics as _aggregate_card_effect_profile_semantics,
+    card_effect_operation_names as _card_effect_operation_names,
+    compact_card_effect_profile_signature as _compact_card_effect_profile_signature,
+)
 
 SEMANTIC_ACTION_FAMILIES = [
     "play_card",
@@ -248,10 +253,11 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
         source = action["card"]
     elif isinstance(action.get("potion"), dict):
         source = action["potion"]
+    effect_sem = _aggregate_card_effect_profile_semantics(source) if isinstance(source, dict) else {}
 
     damage = _preview_metric(source, "damage")
     block = _preview_metric(source, "block")
-    draw = _preview_metric(source, "draw")
+    draw = max(_preview_metric(source, "draw"), effect_sem.get("typed_draw_amount", 0.0))
     heal = _preview_metric(source, "heal")
     weak = _preview_metric(source, "weak")
     vulnerable = _preview_metric(source, "vulnerable")
@@ -286,6 +292,40 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
             roles.add("scaling")
         if _preview_metric(source, "draw") > 0 and damage <= 0 and block <= 0:
             roles.add("setup")
+
+    # Typed card-effect operations are generated from card ids/source facts.
+    # Map them onto the existing role vocabulary so checkpoints/replay buffers
+    # keep the same fixed action-vector shape while the policy can still see
+    # hand mutation, cost mutation, replay/retain/exhaust, no-draw, and
+    # same-turn resource conversion semantics.
+    if effect_sem.get("typed_gain_energy", 0.0) > 0.0 or effect_sem.get("typed_hp_loss", 0.0) > 0.0:
+        roles.add("resource")
+    if effect_sem.get("typed_draw_cards", 0.0) > 0.0:
+        roles.add("draw")
+    if any(
+        effect_sem.get(key, 0.0) > 0.0
+        for key in (
+            "typed_modifies_hand",
+            "typed_upgrade_hand",
+            "typed_modify_cost",
+            "typed_set_replay",
+            "typed_retain_cards",
+            "typed_exhaust_cards",
+            "typed_discard_cards",
+            "typed_transform_cards",
+            "typed_copy_cards",
+            "typed_add_modifier",
+            "typed_add_keyword",
+            "typed_card_state_mutation",
+            "typed_no_draw",
+            "typed_future_penalty",
+            "typed_requires_followup",
+        )
+    ):
+        roles.add("setup")
+    if effect_sem.get("typed_apply_power", 0.0) > 0.0:
+        roles.add("setup")
+        roles.add("scaling")
 
     tags = metadata.get("semantic_tags") if isinstance(metadata, dict) else None
     if isinstance(tags, list):
@@ -398,6 +438,11 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         or (source or {}).get("effect")
         or (source or {}).get("description")
     )
+    effect_sem = _aggregate_card_effect_profile_semantics(source) if isinstance(source, dict) else {}
+    card_ops = _card_effect_operation_names(source) if isinstance(source, dict) else []
+    effect_compact = _compact_card_effect_profile_signature(source) if isinstance(source, dict) else {}
+    draw_value = max(_preview_metric(source, "draw"), effect_sem.get("typed_draw_amount", 0.0))
+    hp_loss_value = max(_preview_metric(source, "hp_loss"), effect_sem.get("typed_hp_loss", 0.0))
     semantic_key = "|".join(
         part
         for part in (
@@ -441,9 +486,9 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         "price": price,
         "damage": _preview_metric(source, "damage"),
         "block": _preview_metric(source, "block"),
-        "draw": _preview_metric(source, "draw"),
+        "draw": draw_value,
         "heal": _preview_metric(source, "heal"),
-        "hp_loss": _preview_metric(source, "hp_loss"),
+        "hp_loss": hp_loss_value,
         "weak": _preview_metric(source, "weak"),
         "vulnerable": _preview_metric(source, "vulnerable"),
         "hits": _preview_metric(source, "hits"),
@@ -458,12 +503,71 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
                 or _safe_text(source.get("canonical_energy_cost")).strip().upper() == "X"
             )
         ),
+        # Static cost view: -1 sentinel for X-cost, raw int otherwise.  Diagnostic
+        # fields below let the trainer detect "X-cost played at 0 energy without a
+        # non-energy effect" without reparsing the bridge payload.
+        "base_cost": (
+            -1.0
+            if isinstance(source, dict)
+            and (
+                source.get("x_cost")
+                or source.get("costs_x")
+                or _safe_text(source.get("cost")).strip().upper() == "X"
+                or _safe_text(source.get("canonical_energy_cost")).strip().upper() == "X"
+            )
+            else _float((source or {}).get("cost"))
+        ),
+        # Non-energy effect: any structural side-effect that fires regardless of
+        # energy spent (hand/pile/card-state mutation, retain, etc.).  Used to
+        # gate the zero_energy_x_cost_selected offender so X-cost cards used as
+        # pile-manipulation tools are not flagged as "wasted".
+        "x_cost_has_non_energy_effect": bool(
+            effect_sem.get("typed_modifies_hand", 0.0) > 0.0
+            or effect_sem.get("typed_upgrade_hand", 0.0) > 0.0
+            or effect_sem.get("typed_exhaust_cards", 0.0) > 0.0
+            or effect_sem.get("typed_discard_cards", 0.0) > 0.0
+            or effect_sem.get("typed_transform_cards", 0.0) > 0.0
+            or effect_sem.get("typed_copy_cards", 0.0) > 0.0
+            or effect_sem.get("typed_add_modifier", 0.0) > 0.0
+            or effect_sem.get("typed_add_keyword", 0.0) > 0.0
+            or effect_sem.get("typed_set_replay", 0.0) > 0.0
+            or effect_sem.get("typed_retain_cards", 0.0) > 0.0
+            or effect_sem.get("typed_card_state_mutation", 0.0) > 0.0
+        ),
         "is_attack": card_type.lower() == "attack",
         "is_skill": card_type.lower() == "skill",
         "is_power": card_type.lower() == "power",
         "is_zero_cost": _float((source or {}).get("cost")) == 0.0 if isinstance(source, dict) else False,
         "is_terminal": family in {"end_turn", "proceed"},
         "effect_summary": effect_summary,
+        "card_ops": card_ops,
+        "typed_modifies_hand": bool(effect_sem.get("typed_modifies_hand", 0.0) > 0.0),
+        "typed_upgrade_hand": bool(effect_sem.get("typed_upgrade_hand", 0.0) > 0.0),
+        "typed_modify_cost": bool(effect_sem.get("typed_modify_cost", 0.0) > 0.0),
+        "typed_set_replay": bool(effect_sem.get("typed_set_replay", 0.0) > 0.0),
+        "typed_retain_cards": bool(effect_sem.get("typed_retain_cards", 0.0) > 0.0),
+        "typed_exhaust_cards": bool(effect_sem.get("typed_exhaust_cards", 0.0) > 0.0),
+        "typed_discard_cards": bool(effect_sem.get("typed_discard_cards", 0.0) > 0.0),
+        "typed_transform_cards": bool(effect_sem.get("typed_transform_cards", 0.0) > 0.0),
+        "typed_copy_cards": bool(effect_sem.get("typed_copy_cards", 0.0) > 0.0),
+        "typed_add_modifier": bool(effect_sem.get("typed_add_modifier", 0.0) > 0.0),
+        "typed_add_keyword": bool(effect_sem.get("typed_add_keyword", 0.0) > 0.0),
+        "typed_gain_energy": effect_sem.get("typed_gain_energy_amount", 0.0),
+        "typed_hp_loss": effect_sem.get("typed_hp_loss", 0.0),
+        "typed_no_draw": bool(effect_sem.get("typed_no_draw", 0.0) > 0.0),
+        "typed_future_penalty": bool(effect_sem.get("typed_future_penalty", 0.0) > 0.0),
+        "typed_requires_followup": bool(effect_sem.get("typed_requires_followup", 0.0) > 0.0),
+        "typed_strategic_skip_if_no_followup": bool(effect_sem.get("typed_strategic_skip_if_no_followup", 0.0) > 0.0),
+        "typed_not_x_cost_filter": bool(effect_sem.get("typed_not_x_cost_filter", 0.0) > 0.0),
+        "typed_x_cost_filter": bool(effect_sem.get("typed_x_cost_filter", 0.0) > 0.0),
+        "typed_hand_context_dependency": bool(effect_sem.get("typed_hand_context_dependency", 0.0) > 0.0),
+        "typed_discard_context_dependency": bool(effect_sem.get("typed_discard_context_dependency", 0.0) > 0.0),
+        "typed_exhaust_context_dependency": bool(effect_sem.get("typed_exhaust_context_dependency", 0.0) > 0.0),
+        "typed_draw_context_dependency": bool(effect_sem.get("typed_draw_context_dependency", 0.0) > 0.0),
+        "typed_deck_context_dependency": bool(effect_sem.get("typed_deck_context_dependency", 0.0) > 0.0),
+        "typed_consumes_future_resource": bool(effect_sem.get("typed_consumes_future_resource", 0.0) > 0.0),
+        "typed_card_state_mutation": bool(effect_sem.get("typed_card_state_mutation", 0.0) > 0.0),
+        "card_effect_profile": effect_compact,
     }
 
 
@@ -495,6 +599,42 @@ def semantic_action_text(signature: dict[str, Any] | None) -> str:
                 metrics.append(f"{key}={int(numeric) if float(numeric).is_integer() else round(numeric, 2)}")
     if metrics:
         parts.append("sig=" + ",".join(metrics))
+    card_ops = signature.get("card_ops") if isinstance(signature.get("card_ops"), list) else []
+    if card_ops:
+        joined_ops = ",".join(_safe_text(op) for op in card_ops if _safe_text(op))
+        if joined_ops:
+            parts.append(f"ops={joined_ops}")
+    typed_flags: list[str] = []
+    for key, label in (
+        ("typed_requires_followup", "requires_followup"),
+        ("typed_strategic_skip_if_no_followup", "skip_without_followup"),
+        ("typed_modifies_hand", "hand_mutation"),
+        ("typed_upgrade_hand", "upgrade_hand"),
+        ("typed_modify_cost", "modify_cost"),
+        ("typed_set_replay", "replay"),
+        ("typed_retain_cards", "retain"),
+        ("typed_exhaust_cards", "exhaust_cards"),
+        ("typed_discard_cards", "discard_cards"),
+        ("typed_transform_cards", "transform_cards"),
+        ("typed_copy_cards", "copy_cards"),
+        ("typed_add_modifier", "modifier"),
+        ("typed_add_keyword", "keyword"),
+        ("typed_no_draw", "no_draw"),
+        ("typed_future_penalty", "future_penalty"),
+        ("typed_not_x_cost_filter", "not_x_cost"),
+        ("typed_x_cost_filter", "x_cost_filter"),
+        ("typed_consumes_future_resource", "future_resource"),
+    ):
+        if signature.get(key):
+            typed_flags.append(label)
+    if typed_flags:
+        parts.append("typed=" + ",".join(typed_flags))
+    typed_energy = _float(signature.get("typed_gain_energy"), 0.0)
+    if typed_energy > 0:
+        parts.append(f"typed_energy={int(typed_energy) if typed_energy.is_integer() else round(typed_energy, 2)}")
+    typed_hp_loss = _float(signature.get("typed_hp_loss"), 0.0)
+    if typed_hp_loss > 0:
+        parts.append(f"typed_hp_loss={int(typed_hp_loss) if typed_hp_loss.is_integer() else round(typed_hp_loss, 2)}")
     return " | ".join(parts)
 
 
@@ -553,10 +693,40 @@ def compact_semantic_signature(signature: dict[str, Any] | None) -> dict[str, An
         "roles": signature.get("roles"),
         "damage": signature.get("damage"),
         "block": signature.get("block"),
+        "draw": signature.get("draw"),
+        "hp_loss": signature.get("hp_loss"),
         "hits": signature.get("hits"),
         "damage_per_hit": signature.get("damage_per_hit"),
         "x_cost_value": signature.get("x_cost_value"),
         "price": signature.get("price"),
+        "card_ops": signature.get("card_ops"),
+        "typed_modifies_hand": signature.get("typed_modifies_hand"),
+        "typed_upgrade_hand": signature.get("typed_upgrade_hand"),
+        "typed_modify_cost": signature.get("typed_modify_cost"),
+        "typed_set_replay": signature.get("typed_set_replay"),
+        "typed_retain_cards": signature.get("typed_retain_cards"),
+        "typed_exhaust_cards": signature.get("typed_exhaust_cards"),
+        "typed_discard_cards": signature.get("typed_discard_cards"),
+        "typed_transform_cards": signature.get("typed_transform_cards"),
+        "typed_copy_cards": signature.get("typed_copy_cards"),
+        "typed_add_modifier": signature.get("typed_add_modifier"),
+        "typed_add_keyword": signature.get("typed_add_keyword"),
+        "typed_gain_energy": signature.get("typed_gain_energy"),
+        "typed_hp_loss": signature.get("typed_hp_loss"),
+        "typed_no_draw": signature.get("typed_no_draw"),
+        "typed_future_penalty": signature.get("typed_future_penalty"),
+        "typed_requires_followup": signature.get("typed_requires_followup"),
+        "typed_strategic_skip_if_no_followup": signature.get("typed_strategic_skip_if_no_followup"),
+        "typed_not_x_cost_filter": signature.get("typed_not_x_cost_filter"),
+        "typed_x_cost_filter": signature.get("typed_x_cost_filter"),
+        "typed_hand_context_dependency": signature.get("typed_hand_context_dependency"),
+        "typed_discard_context_dependency": signature.get("typed_discard_context_dependency"),
+        "typed_exhaust_context_dependency": signature.get("typed_exhaust_context_dependency"),
+        "typed_draw_context_dependency": signature.get("typed_draw_context_dependency"),
+        "typed_deck_context_dependency": signature.get("typed_deck_context_dependency"),
+        "typed_consumes_future_resource": signature.get("typed_consumes_future_resource"),
+        "typed_card_state_mutation": signature.get("typed_card_state_mutation"),
+        "card_effect_profile": signature.get("card_effect_profile"),
     }
     return {key: value for key, value in compact.items() if value not in (None, "", [], False)}
 

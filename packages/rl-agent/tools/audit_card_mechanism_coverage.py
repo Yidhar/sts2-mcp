@@ -489,11 +489,63 @@ def _classify_categories(
     if "remove_card" in tags or _has_any(text, ("移除", "删除", "remove")):
         add("remove_card")
 
-    # Localized gaps: these are not "the model cannot see it"; they mean our
-    # deterministic typed hand/constraint profile is not robust enough for the
-    # exported Chinese descriptions.
-    if "手牌" in text and _has_any(text, ("升级", "消耗", "变化", "复制", "耗能", "费用", "保留", "替换", "放到", "重放", "虚无")):
-        add("localized_hand_mutation_gap")
+    # Goal-state gap: the source/static layer can usually tell us *which*
+    # internal command family exists (Upgrade/Exhaust/Transform/EnergyCost/...),
+    # but the runtime model contract still needs typed operation parameters:
+    # zone, scope, filter, selection, count, destination, duration, modifier.
+    # This replaces the old "localized hand mutation regex" framing.  Text can
+    # warn us during offline audit, but it must not become the training contract.
+    profile_sensitive = {
+        "upgrade_card",
+        "transform_card",
+        "copy_card",
+        "cost_modify",
+        "exhaust_other_or_hand",
+        "whole_hand_state",
+        "pile_fetch_reorder",
+        "next_card_modifier",
+        "card_modifier_or_enchantment",
+        "add_or_generate_card",
+        "play_top_or_autoplay",
+    }
+    if cats & profile_sensitive:
+        add("effect_profile_granularity_gap")
+
+    text_sensitive = "手牌" in text and _has_any(
+        text,
+        ("升级", "消耗", "变化", "复制", "耗能", "费用", "保留", "替换", "放到", "重放", "虚无"),
+    )
+    semantic_or_source_sensitive = bool(
+        tags
+        & {
+            "upgrade_card",
+            "upgrade_all",
+            "transform_card",
+            "exhaust_other",
+            "add_to_hand",
+            "generate_card",
+            "retain",
+        }
+        or source_commands
+        & {
+            "upgrade",
+            "transform",
+            "exhaust",
+            "addgeneratedcardtocombat",
+            "addgeneratedcardstocombat",
+            "draw",
+            "discard",
+        }
+        or facts.get("uses_hand_pile")
+        or facts.get("uses_draw_pile")
+        or facts.get("uses_discard_pile")
+        or facts.get("sets_energy_cost")
+        or facts.get("creates_clone")
+        or facts.get("sets_replay")
+        or facts.get("adds_keyword_or_modifier")
+    )
+    if text_sensitive and not semantic_or_source_sensitive:
+        add("text_only_mechanism_warning")
     if "unplayable" in tags or "unplayable" in keywords or _has_any(text, ("不能被打出", "必须优先", "不能再打牌", "最多打出", "unplayable", "must be played", "cannot play")):
         add("hard_rule_constraint_gap")
     if card_type in {"curse", "status"} or rarity in {"curse", "status"}:
@@ -521,8 +573,13 @@ def _compact_desc(card: dict[str, Any], limit: int = 180) -> str:
     return desc
 
 
-def _card_record(card: dict[str, Any], upgrade_entries: list[dict[str, Any]]) -> dict[str, Any]:
-    categories = _classify_categories(card, upgrade_entries)
+def _card_record(
+    card: dict[str, Any],
+    upgrade_entries: list[dict[str, Any]],
+    catalog_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_profile = _source_facts(catalog_entry)
+    categories = _classify_categories(card, upgrade_entries, catalog_entry)
     category_statuses = {
         cat: COVERAGE_DEFS[cat].status
         for cat in categories
@@ -552,6 +609,7 @@ def _card_record(card: dict[str, Any], upgrade_entries: list[dict[str, Any]]) ->
         "semanticSignals": card.get("semanticSignals") or {},
         "description": card.get("description") or "",
         "canonicalText": card.get("canonicalText") or "",
+        "internal_source_profile": source_profile,
         "upgrade_descriptions": upgrade_descriptions,
         "mechanism_categories": categories,
         "category_statuses": category_statuses,
@@ -587,6 +645,7 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
         "keywords",
         "semanticTags",
         "semanticSignals",
+        "internal_source_profile",
         "description",
         "upgrade_descriptions",
         "coverage_notes",
@@ -612,6 +671,11 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
                 "keywords": "|".join(rec.get("keywords") or []),
                 "semanticTags": "|".join(rec.get("semanticTags") or []),
                 "semanticSignals": json.dumps(rec.get("semanticSignals") or {}, ensure_ascii=False, sort_keys=True),
+                "internal_source_profile": json.dumps(
+                    rec.get("internal_source_profile") or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 "description": rec.get("description") or "",
                 "upgrade_descriptions": json.dumps(rec.get("upgrade_descriptions") or [], ensure_ascii=False),
                 "coverage_notes": " || ".join(rec.get("coverage_notes") or []),
@@ -739,12 +803,16 @@ def _write_report(
             ", ".join(partial_cats[:8]),
         ])
 
+    catalog_loaded = int(summary.get("catalog_cards_loaded") or 0)
+    catalog_available = int(summary.get("catalog_source_available_for_audited_cards") or 0)
     count_rows = [
         ["Ironclad base cards", len(ironclad_records)],
         ["Colorless base cards", len(colorless_records)],
         ["Colorless playable non Status/Curse/Quest/Token", summary["colorless_playable_non_status_curse_quest_token"]],
         ["Colorless Uncommon/Rare", summary["colorless_uncommon_rare"]],
         ["Total audited base cards", len(all_records)],
+        ["Internal catalog cards loaded", catalog_loaded],
+        ["Audited cards with source profile", catalog_available],
     ]
 
     status_rows = []
@@ -779,7 +847,7 @@ Source: `{source_path}`
 1. 本地游戏导出的 **Ironclad 基础牌是 {len(ironclad_records)} 张**，不是 88 张。这里没有强行丢牌：`Ancient`/`Event`/`Basic` 也一起导出。若后续要严格对齐“奖励池 88 张”，需要再按奖励池/掉落池规则过滤。
 2. 本地游戏导出的 **Colorless 基础牌是 {len(colorless_records)} 张**；其中剔除 Status/Curse/Quest/Token 后的可主动使用无色牌为 **{summary['colorless_playable_non_status_curse_quest_token']} 张**，Uncommon/Rare 常规无色牌为 **{summary['colorless_uncommon_rare']} 张**。
 3. 基础伤害/格挡/抽牌/回费/生命代价/X 费/消耗/虚无/保留/运行时附魔，已经有明确 bridge + observation 特征路径。
-4. 最大风险不是“模型完全看不到”，而是若只依赖当前 typed detector，**中文手牌变更文本、牌堆定向变更、下一张牌/未来规则、Status/Curse 硬约束** 仍然是 partial/gap；它们需要 effect-profile / transition-token，而不是继续靠自由文本让模型硬学。
+4. 最大风险不是“模型完全看不到”，而是当前 `semanticTags/semanticSignals` 和 source catalog 只能给粗粒度内部族群（例如 `Upgrade`/`Exhaust`/`Transform`/`AddGeneratedCardToCombat`/`EnergyCost.Set*`），还缺 **zone/scope/filter/selection/count/destination/duration/modifier/result_card** 等 typed operation 参数。文本匹配只保留离线告警，不能作为训练主契约。
 
 ## 输出文件
 
@@ -789,6 +857,8 @@ Source: `{source_path}`
 - `docs/generated/ironclad-card-roster.md`：Ironclad 全表。
 - `docs/generated/colorless-card-roster.md`：Colorless 全表。
 - `packages/rl-agent/tools/audit_card_mechanism_coverage.py`：可重复生成脚本。
+
+Internal source catalog: `{summary.get('source_catalog_path') or 'not found'}`；本次审计中有 source profile 的卡：**{catalog_available}/{len(all_records)}**。
 
 ## 牌数与分布
 
@@ -804,7 +874,7 @@ Source: `{source_path}`
 
 ## 覆盖状态汇总
 
-这里的 `gap` 指“typed 机制特征/确定性 detector 存在缺口”，不是说 transformer 完全没有文本 token 可看。
+这里的 `gap` 指“typed effect profile / operation 参数还没进入稳定契约”，不是说 transformer 完全没有文本 token 可看；也不是要求继续堆中文/英文正则。
 
 {_md_table(["颜色", "covered", "partial", "gap", "unclassified"], status_rows)}
 
@@ -829,14 +899,14 @@ Source: `{source_path}`
 
 ### 仍然不够硬的部分
 
-1. **中文手牌变更检测缺口**  
-   `hand_mutation.py` 的核心触发词仍偏英文：`hand/upgrade/discard/exhaust/transform/copy/cost 0`。本地导出文本是中文：`手牌/升级/消耗/变化/复制/耗能降低/保留`。这会让“武装、开悟、净化、原始力量、双持、深谋远虑、隐藏宝石”等效果在 typed hand-mutation local 上不稳定。
+1. **内部 ID 已经存在，但粒度还不够**  
+   `third_party/sts2-ai/.../cards.jsonl` 与 C# 源码能提供 `commands`、`powers`、`PileType.Hand/Draw/Discard/Exhaust`、`CardSelectCmd.FromHand*`、`CardCmd.Upgrade/Exhaust/Transform`、`CardPileCmd.AddGeneratedCardToCombat`、`EnergyCost.Set*`、`CreateClone`、`Replay`、`AddKeyword/AddEnchantment/AddAffliction` 等内部事实。这比文本正则可靠得多。当前缺口不是“识别不到升级/消耗/变化这些词”，而是还没把这些内部调用编译成可训练的 `card_effect_profile.operations`。
 
 2. **action -> pile transition 还不够结构化**  
-   头槌、破灭、倾泻、秘密武器/技法、探寻打击、战鼓、好勇斗狠、怀旧等会读/写抽牌堆或弃牌堆。现在模型可以通过 pile tokens 和文本理解，但缺少统一的 `draw_pile_delta/discard_pile_delta/topdeck_target/play_top_count`。
+   头槌、破灭、倾泻、秘密武器/技法、探寻打击、战鼓、好勇斗狠、怀旧等会读/写抽牌堆或弃牌堆。现在模型可以通过 pile tokens 和 source facts 知道访问了哪些 pile，但缺少统一的 `source_zone/destination_zone/topdeck_target/play_top_count/fetch_filter`。
 
 3. **消耗牌堆依赖需要显式条件特征**  
-   灰烬打击、契约终结、被遗忘的仪式、邪眼、黑暗之拥、腐化、恶魔之焰、添柴、重振精神等都要求模型理解“当前消耗堆数量 / 本回合是否消耗过 / 消耗后触发”。现在有消耗堆 token，但每张牌的条件依赖还没有变成 typed feature。
+   灰烬打击、契约终结、被遗忘的仪式、邪眼、黑暗之拥、腐化、恶魔之焰、添柴、重振精神等都要求模型理解“当前消耗堆数量 / 本回合是否消耗过 / 消耗后触发”。现在有消耗堆 token 和 `PileType.Exhaust` 访问事实，但每张牌的条件依赖还没有变成 typed feature。
 
 4. **未来规则 / 下一张牌修饰需要 temporal rule token**  
    腐化、无情猛攻、连环拳、怀旧、神气制胜、自动化/地狱狂徒等会改变后续出牌规则。search-free planner 要可靠，需要把“下一张攻击免费/重放/技能 0 费并消耗/每回合第一张置顶”等规则从文本提升为 rule token。
@@ -846,11 +916,12 @@ Source: `{source_path}`
 
 ## 建议的目标态补齐顺序
 
-1. **先补中文 hand mutation detector**：把 `手牌/升级/消耗/变化/复制/耗能/保留/放到抽牌堆顶/重放/虚无` 直接接入 `infer_hand_mutation()`，并加中文单测。
-2. **新增 card effect profile schema**：对每张卡输出 `hand_delta`、`draw_pile_delta`、`discard_pile_delta`、`exhaust_pile_delta`、`future_rule_delta`、`status_constraint`，Bridge 静态/动态都可以填。
-3. **把 pile transition 做成 token**：例如 `PLAY_TOP_X`、`TOPDECK_FROM_DISCARD`、`FETCH_FROM_DRAW_SKILL/ATTACK`、`EXHAUST_HAND_ALL_NON_ATTACK`、`EXHAUST_COUNT_SCALING`。
-4. **给 resource/exhaust deferability 加目标监督**：继续保留“合法但不该打”的策略空间，特别是回费牌没有后续动作、一次性消耗牌当前收益低、保留/虚无/end-turn 去向变化等场景。
-5. **Status/Curse/硬约束单独做 aux head**：预测本回合/下回合由状态牌导致的 HP/energy/play-limit 风险，避免只从 reward 后验学习。
+1. **生成 `card_effect_profile.operations`**：从 `cards.jsonl` + C# source facts 编译 typed operations。每个 operation 至少包含 `op/source_zone/destination_zone/scope/selection/count/min_count/max_count/target_filter/duration/modifier/power_id/result_card/created_card/upgraded_override/per_card_scaling`。
+2. **Bridge `BuildCardPayload` 暴露 profile**：和 potion `effect_profile` 一样，把卡牌内部 profile 放进 runtime payload；`EnvCompact` / `observation_v3` 只保留压缩后的关键 operation token。
+3. **`hand_mutation.py` 主路径改读 operations**：`upgrade_card/exhaust_card/transform_card/copy_card/modify_cost/move_card/add_modifier/add_keyword/set_replay` 等先读 typed op；文本只作为 `text_only_mechanism_warning` 与离线审计 fallback。
+4. **把 pile transition / future rule 做成 token**：例如 `FETCH_FROM_DRAW_SKILL`、`TOPDECK_FROM_HAND`、`EXHAUST_HAND_ALL_NON_ATTACK`、`COPY_HAND_ATTACK_OR_POWER`、`NEXT_ATTACK_COST_ZERO`、`SKILL_COST_ZERO_AND_EXHAUST_ON_PLAY`。
+5. **给 resource/exhaust deferability 加目标监督**：继续保留“合法但不该打”的策略空间，特别是回费牌没有后续动作、一次性消耗牌当前收益低、保留/虚无/end-turn 去向变化等场景。
+6. **Status/Curse/硬约束单独做 aux head**：预测本回合/下回合由状态牌导致的 HP/energy/play-limit 风险，避免只从 reward 后验学习。
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -868,6 +939,8 @@ def main() -> None:
     raw_cards = payload.get("cards")
     if not isinstance(raw_cards, list):
         raise ValueError(f"Expected cards list in {source_path}")
+    catalog = _load_catalog()
+    catalog_path = next((entry.get("_catalog_path") for entry in catalog.values() if entry.get("_catalog_path")), None)
 
     by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for card in raw_cards:
@@ -886,7 +959,14 @@ def main() -> None:
     ]
     base_cards.sort(key=lambda c: (str(c.get("color")), str(c.get("rarity")), str(c.get("type")), str(c.get("id"))))
 
-    all_records = [_card_record(card, by_id[str(card.get("id"))]) for card in base_cards]
+    all_records = [
+        _card_record(
+            card,
+            by_id[str(card.get("id"))],
+            catalog.get(_normalize_card_id(card.get("id"))),
+        )
+        for card in base_cards
+    ]
     ironclad_records = [rec for rec in all_records if rec.get("color") == "ironclad"]
     colorless_records = [rec for rec in all_records if rec.get("color") == "colorless"]
 
@@ -908,6 +988,13 @@ def main() -> None:
     summary = {
         "generated_at_utc": _utc_now(),
         "source_items_json": str(source_path),
+        "source_catalog_path": str(catalog_path or ""),
+        "catalog_cards_loaded": len(catalog),
+        "catalog_source_available_for_audited_cards": sum(
+            1
+            for rec in all_records
+            if (rec.get("internal_source_profile") or {}).get("source_available")
+        ),
         "ironclad_base_count": len(ironclad_records),
         "colorless_base_count": len(colorless_records),
         "colorless_playable_non_status_curse_quest_token": len(colorless_playable),
@@ -955,6 +1042,7 @@ def main() -> None:
                 "colorless_base_count": len(colorless_records),
                 "colorless_playable_non_status_curse_quest_token": len(colorless_playable),
                 "colorless_uncommon_rare": len(colorless_uncommon_rare),
+                "catalog_cards_loaded": len(catalog),
                 "out_dir": str(out_dir),
                 "report": str(Path(args.report)),
             },

@@ -43,6 +43,9 @@ _load("content_registry", RL_AGENT_ROOT / "content_registry.py")
 
 
 # Stub torch just enough for objective_heads' isinstance(x, torch.Tensor) check.
+# Preserve any real torch already in sys.modules so we can restore it after the
+# pure-python aux modules load — otherwise a sibling test that loads
+# attention_blocks (which imports torch.nn) will fail because the stub has no nn.
 class _TorchTensorStub:  # pragma: no cover
     pass
 
@@ -51,6 +54,7 @@ class _TorchDtypeStub:  # pragma: no cover
     pass
 
 
+_real_torch = sys.modules.get("torch")
 _stub(
     "torch",
     Tensor=_TorchTensorStub,
@@ -60,7 +64,8 @@ _stub(
     bool=_TorchDtypeStub(),
 )
 
-# Stub text_encoder
+# Stub text_encoder; preserve the real one if a sibling test already loaded it.
+_real_text_encoder = sys.modules.get("sts2_env.text_encoder")
 _stub("sts2_env.text_encoder", TEXT_DIM=512)
 
 # Load semantic_action for real (pure python)
@@ -73,6 +78,18 @@ _load("sts2_env.observation_common", RL_AGENT_ROOT / "sts2_env" / "observation_c
 _load("sts2_env.objective_heads", RL_AGENT_ROOT / "sts2_env" / "objective_heads.py")
 # Now aux_targets
 aux_targets = _load("sts2_env.aux_targets", RL_AGENT_ROOT / "sts2_env" / "aux_targets.py")
+
+# Restore the real torch / text_encoder modules (if they were present) so other
+# test modules in the same discovery run can import torch.nn and the live text
+# encoder cleanly.
+if _real_torch is not None:
+    sys.modules["torch"] = _real_torch
+else:
+    sys.modules.pop("torch", None)
+if _real_text_encoder is not None:
+    sys.modules["sts2_env.text_encoder"] = _real_text_encoder
+else:
+    sys.modules.pop("sts2_env.text_encoder", None)
 
 
 def _make_obs(player_hp, enemies, *, self_inflicted_cum=0.0):
@@ -182,7 +199,7 @@ class EnemyStateAuxTargetTest(unittest.TestCase):
         self.assertIn("enemy_state_mask", result)
         self.assertEqual(result["enemy_state"].shape, (5, 3))
         self.assertEqual(result["enemy_state_mask"].shape, (5,))
-        self.assertEqual(result["version"], 3)
+        self.assertEqual(result["version"], 5)
 
 
 if __name__ == "__main__":

@@ -2700,6 +2700,7 @@ internal static partial class BridgeGameApi
                 var actionId = selectionId is not null
                     ? $"card_selection:select:{selectionId}"
                     : $"card_selection:select:{optionIndex}";
+                var isSelected = IsCardSelectionCardSelected(context.CardSelectionScreen, cardHolder.CardModel);
                 actions.Add(new BridgeResolvedAction
                 {
                     ActionId = actionId,
@@ -2712,6 +2713,11 @@ internal static partial class BridgeGameApi
                         selection_prompt = selectionPrompt,
                         index = optionIndex,
                         selection_id = selectionId,
+                        // 2026-04-27: surface is_selected on the per-card select
+                        // action payload (already on the options summary, but
+                        // the model needs it on the action token to detect
+                        // pick→deselect→pick loops in multi-pick burn cards).
+                        is_selected = isSelected,
                         label = $"Select card {optionIndex}: {cardHolder.CardModel?.Title ?? "<missing>"}",
                         card = BuildCardPayload(cardHolder.CardModel),
                         screen = context.Screen,
@@ -4373,6 +4379,7 @@ internal static partial class BridgeGameApi
             afflictions,
             enchantments,
             modifier_summary = modifierSummary,
+            card_effect_profile = BuildCardEffectProfilePayload(card),
             card_flow = cardFlow
         };
     }

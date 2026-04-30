@@ -815,3 +815,73 @@ def _norm(value: float, denom: float) -> float:
     if denom <= 0.0:
         return 0.0
     return float(max(0.0, min(value / denom, 1.0)))
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 consolidated boss-mechanics block (TASK-E1/E2/E3 wiring).
+#
+# Single entry-point used by ``CombatSandboxEnv.step`` to surface the
+# Kaiser / Ceremonial / Insatiable state and per-action mechanism flags
+# on every step's ``info`` dict.  The trainer reads this to populate the
+# ``boss_combat/<encounter>/*`` metric mirrors.
+# ---------------------------------------------------------------------------
+
+from .boss_ceremonial import (  # noqa: E402  (intentional late import to avoid cycles)
+    build_ceremonial_state,
+    classify_ceremonial_action_mechanism,
+)
+from .boss_insatiable import (  # noqa: E402
+    build_insatiable_state,
+    classify_insatiable_action_offenders,
+)
+from .boss_kaiser import (  # noqa: E402
+    build_kaiser_state,
+    classify_kaiser_action_mechanism,
+)
+
+
+def _boss_combat_state(obs: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(obs, dict):
+        return {}
+    combat = obs.get("combat")
+    return combat if isinstance(combat, dict) else {}
+
+
+def _boss_player_state(obs: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(obs, dict):
+        return {}
+    player = obs.get("player")
+    return player if isinstance(player, dict) else {}
+
+
+def build_boss_mechanics_block(obs: dict[str, Any] | None) -> dict[str, Any]:
+    """Return ``boss_mechanics`` block for the trainer to consume.
+
+    Stable shape: every key is always present with ``active=False`` defaults
+    so downstream code can index without conditional guards.
+    """
+    combat = _boss_combat_state(obs)
+    player = _boss_player_state(obs)
+    return {
+        "kaiser": build_kaiser_state(combat, player_obs=player),
+        "ceremonial": build_ceremonial_state(combat),
+        "insatiable": build_insatiable_state(combat),
+    }
+
+
+def classify_action_boss_mechanism(
+    obs: dict[str, Any] | None,
+    action: dict[str, Any] | None,
+    *,
+    action_diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Per-action mechanism dict combining the three Phase 4 helpers."""
+    combat = _boss_combat_state(obs)
+    player = _boss_player_state(obs)
+    return {
+        "kaiser": classify_kaiser_action_mechanism(combat, action, player_obs=player),
+        "ceremonial": classify_ceremonial_action_mechanism(combat, action, player_obs=player),
+        "insatiable": classify_insatiable_action_offenders(
+            combat, action, player_obs=player, action_diagnostics=action_diagnostics
+        ),
+    }

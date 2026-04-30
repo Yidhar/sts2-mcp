@@ -205,6 +205,8 @@ class BridgeClientRebindTest(unittest.TestCase):
         still eventually raise BridgeError (don't retry forever).
         """
         client = BridgeClient(session_path=self._session_path)
+        # Disable outage-recovery wait so the test doesn't block for 180s.
+        client.MAX_BRIDGE_OUTAGE_S = 0.0
 
         def always_fail(method, url, json=None, timeout=None):
             raise requests.ConnectionError("permanent")
@@ -213,6 +215,47 @@ class BridgeClientRebindTest(unittest.TestCase):
             with patch.object(bridge_client.time, "sleep", lambda *_: None):
                 with self.assertRaises(BridgeError):
                     client._request("GET", "health")
+
+    def test_outage_recovery_retries_past_max_retries_when_bridge_down(self) -> None:
+        """2026-04-27: when the game crashes mid-training, watchdog needs
+        ~30-60s to relaunch + write a new session.json. The 3x1s burst is
+        too short to ride that out, so _request enters an outage-recovery
+        wait that polls + retries until MAX_BRIDGE_OUTAGE_S elapses.
+        """
+        client = BridgeClient(session_path=self._session_path)
+        client.MAX_BRIDGE_OUTAGE_S = 30.0  # cap test wall-clock cost
+        client.BRIDGE_OUTAGE_POLL_S = 0.0  # no real sleep, advance via fake monotonic
+
+        # Simulate: bridge down for first 6 attempts, then watchdog rewrites
+        # session.json and bridge comes back. With burst=3, the only way to
+        # reach attempt 7 is via the outage-recovery loop.
+        call_count = {"n": 0}
+
+        def fake_request(method, url, json=None, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] < 7:
+                if call_count["n"] == 6:
+                    # Watchdog finishes restart on attempt 6 — new session emitted.
+                    _write_session(self._session_path, token="NEW_TOKEN", port=27200)
+                    self._force_mtime_bump()
+                raise requests.ConnectionError("connection refused")
+            self.assertIn("27200", url)
+            return _FakeResponse(status_code=200, payload={"ok": True})
+
+        # monotonic_time advances 1s per call so deadline math reaches 30s
+        # in finite iterations even with sleep stubbed out.
+        fake_clock = {"t": 0.0}
+        def fake_monotonic():
+            fake_clock["t"] += 1.0
+            return fake_clock["t"]
+
+        with patch.object(client._session, "request", side_effect=fake_request):
+            with patch.object(bridge_client.time, "sleep", lambda *_: None):
+                with patch.object(bridge_client.time, "monotonic", fake_monotonic):
+                    result = client._request("GET", "health")
+        self.assertEqual(result, {"ok": True})
+        self.assertGreaterEqual(call_count["n"], 7)
+        self.assertEqual(client._token, "NEW_TOKEN")
 
 
 if __name__ == "__main__":

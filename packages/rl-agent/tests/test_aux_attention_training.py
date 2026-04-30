@@ -397,13 +397,17 @@ class AuxAttentionTrainingContractTest(unittest.TestCase):
         self.assertEqual(tuple(aux_outputs["candidate_route"].shape), (1, obs_v3.MAX_ACTIONS, 8))
         arch_spec = policy.architecture_spec()
         self.assertEqual(str(arch_spec["architecture_version"]), "omni_attention_v1_frozen")
-        self.assertEqual(list(arch_spec["world_banks"]), ["runtime", "support", "enemy", "build", "route"])
+        self.assertEqual(
+            list(arch_spec["world_banks"]),
+            ["runtime", "support", "enemy", "build", "route", "powers", "history"],
+        )
         self.assertEqual(int(arch_spec["world_bank_top_k"]), 3)
         bank_debug = policy.forward_world_bank_routing(batched_obs)
         self.assertEqual(str(bank_debug["architecture_version"]), "omni_attention_v1_frozen")
-        self.assertEqual(tuple(bank_debug["bank_weights"].shape), (1, obs_v3.MAX_ACTIONS, 5))
-        self.assertEqual(tuple(bank_debug["bank_selected"].shape), (1, obs_v3.MAX_ACTIONS, 5))
-        self.assertEqual(tuple(bank_debug["bank_available"].shape), (1, 5))
+        num_world_banks = len(arch_spec["world_banks"])
+        self.assertEqual(tuple(bank_debug["bank_weights"].shape), (1, obs_v3.MAX_ACTIONS, num_world_banks))
+        self.assertEqual(tuple(bank_debug["bank_selected"].shape), (1, obs_v3.MAX_ACTIONS, num_world_banks))
+        self.assertEqual(tuple(bank_debug["bank_available"].shape), (1, num_world_banks))
         selected_per_candidate = bank_debug["bank_selected"].sum(dim=-1)
         self.assertLessEqual(int(selected_per_candidate.max().item()), 3)
         self.assertEqual(int(encoded["candidate_query_target_owner_ids"][0]), obs_v3.OWNER_ENEMY_BASE)
@@ -594,6 +598,8 @@ class AuxAttentionTrainingContractTest(unittest.TestCase):
             _stack_aux_targets = aux_buffer_mod.AuxMaskablePPO._stack_aux_targets
             _extract_target = staticmethod(aux_buffer_mod.AuxMaskablePPO._extract_target)
             _extract_scalar = staticmethod(aux_buffer_mod.AuxMaskablePPO._extract_scalar)
+            _extract_enemy_state_target = staticmethod(aux_buffer_mod.AuxMaskablePPO._extract_enemy_state_target)
+            _extract_enemy_state_mask = staticmethod(aux_buffer_mod.AuxMaskablePPO._extract_enemy_state_mask)
             _summarize_timing_samples_ms = staticmethod(aux_buffer_mod.AuxMaskablePPO._summarize_timing_samples_ms)
             _summarize_scalar_samples = staticmethod(aux_buffer_mod.AuxMaskablePPO._summarize_scalar_samples)
 
@@ -667,9 +673,9 @@ class AuxAttentionTrainingContractTest(unittest.TestCase):
         finally:
             collector.close()
 
-    def test_checkpoint_validation_rejects_pre_v2_attention_metadata(self) -> None:
+    def test_checkpoint_validation_rejects_pre_v4_attention_metadata(self) -> None:
         checkpoint_mod = self.checkpoint
-        with self.assertRaisesRegex(ValueError, "attention_obs_v2"):
+        with self.assertRaisesRegex(ValueError, "attention_obs_v4"):
             checkpoint_mod.validate_attention_checkpoint_metadata(
                 {
                     "observation_api_version": "attention_obs_v1",
