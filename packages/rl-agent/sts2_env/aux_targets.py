@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from . import observation_common as obs_common
+from .card_identity import card_identity
 from .objective_heads import (
     OBJECTIVE_HEAD_NAMES,
     NUM_OBJECTIVE_HEADS,
@@ -1193,15 +1194,23 @@ def compute_future_lifecycle_targets(
     target[6] = min(_combat_total_intent_damage(next_obs) / 200.0, 1.0)
 
     # Card destination probabilities — only meaningful for play_card actions.
+    # P0-6: only emit hard Bernoulli targets when the played card carries a
+    # stable runtime instance UUID.  Without it, ``id``/``title`` collisions
+    # (two copies of Strike, transform-renamed cards, etc.) produce false-
+    # confidence targets that train the future-world head on noise.
     played = _played_card_payload(action)
-    played_key = _card_identity_key(played)
-    if played_key:
-        in_next_hand = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "hand"))
-        in_next_discard = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "discard_pile"))
-        in_next_exhaust = any(_card_identity_key(c) == played_key for c in _runtime_cards(next_obs, "exhaust_pile"))
+    played_id = card_identity(played)
+    if played_id.get("confidence") == "runtime_internal":
+        played_key = played_id.get("key", "")
+        in_next_hand = any(card_identity(c).get("key") == played_key for c in _runtime_cards(next_obs, "hand"))
+        in_next_discard = any(card_identity(c).get("key") == played_key for c in _runtime_cards(next_obs, "discard_pile"))
+        in_next_exhaust = any(card_identity(c).get("key") == played_key for c in _runtime_cards(next_obs, "exhaust_pile"))
         target[7] = 1.0 if in_next_exhaust else 0.0
         target[8] = 1.0 if in_next_discard else 0.0
         target[9] = 1.0 if in_next_hand else 0.0
+    # else: targets remain zero — the head will not be supervised on this
+    # transition's card destination, which is the correct behaviour when
+    # identity is ambiguous.
 
     # Hand mutation counts — derived from before/after diffs across runtime piles.
     prev_upgrades = _hand_upgrade_count(prev_obs)

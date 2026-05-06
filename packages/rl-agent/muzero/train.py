@@ -1381,6 +1381,68 @@ class MuZeroTrainer:
         return max(vals) if vals else 0.0
 
     @staticmethod
+    def _boss_context_encounter_key(context: dict[str, Any] | None, raw_obs: dict[str, Any] | None = None) -> str:
+        """Return normalized encounter key from boss context/raw obs.
+
+        Keep this separate from generic back-attack mechanics: several non-Kaiser
+        enemies can expose incoming-damage multipliers or back-attack-like state.
+        Metrics under the ``kaiser_*`` namespace must only be emitted for the
+        Kaiser Crab encounter.
+        """
+        if isinstance(context, dict):
+            value = context.get("encounter_key") or context.get("encounter_id") or context.get("encounter")
+            if value:
+                return str(value).strip().lower()
+        if isinstance(raw_obs, dict):
+            value = raw_obs.get("encounter_id") or raw_obs.get("encounter")
+            if value:
+                return str(value).strip().lower()
+            combat = raw_obs.get("combat")
+            if isinstance(combat, dict):
+                value = combat.get("encounter_id") or combat.get("encounter")
+                if value:
+                    return str(value).strip().lower()
+        return ""
+
+    @classmethod
+    def _is_kaiser_encounter_context(
+        cls,
+        context: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None = None,
+    ) -> bool:
+        return "kaiser" in cls._boss_context_encounter_key(context, raw_obs)
+
+    @classmethod
+    def _is_insatiable_encounter_context(
+        cls,
+        context: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None = None,
+    ) -> bool:
+        return "insatiable" in cls._boss_context_encounter_key(context, raw_obs)
+
+    @classmethod
+    def _kaiser_back_attack_risk_from_context(
+        cls,
+        context: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None = None,
+    ) -> float:
+        """Kaiser-only back-attack risk for metrics/bias.
+
+        Do not include ``incoming_damage_multiplier_norm`` here: the bridge/boss
+        context normalizes the default multiplier 1.0 to 0.5, which polluted every
+        non-Kaiser encounter as ``kaiser_back_attack_risk=0.5``.  The Kaiser signal
+        should be gated by encounter and derived from explicit back-attack fields.
+        """
+        if not isinstance(context, dict) or not cls._is_kaiser_encounter_context(context, raw_obs):
+            return 0.0
+        return max(
+            cls._boss_context_max(context, "primary_back_attack_risk"),
+            cls._boss_context_max(context, "primary_back_attack_active"),
+            cls._boss_context_max(context, "back_attack_risk"),
+            cls._boss_context_max(context, "back_attack_active"),
+        )
+
+    @staticmethod
     def _obs_energy(obs: dict[str, Any] | None) -> float:
         if not isinstance(obs, dict):
             return 0.0
@@ -1689,6 +1751,114 @@ class MuZeroTrainer:
         vals = self._alive_enemy_hp_values(raw_obs)
         return min(vals) if vals else 0.0
 
+    def _is_frantic_escape_action(self, action: Any) -> bool:
+        """Return true for the real Frantic Escape card/action id.
+
+        Local generated source facts identify:
+        - card id: ``CARD.FRANTIC_ESCAPE``
+        - normalized id: ``frantic_escape``
+        - power applied by the card: ``POWER.SANDPIT_POWER`` /
+          ``SandpitPower``
+
+        The Chinese title fallback is kept only for older bridge payloads that
+        expose localized titles before typed ids.
+        """
+        if not isinstance(action, dict):
+            return False
+
+        source = self._action_source(action)
+        card = action.get("card") if isinstance(action.get("card"), dict) else {}
+        profile = card.get("card_effect_profile") if isinstance(card.get("card_effect_profile"), dict) else {}
+        derived = profile.get("derived_view") if isinstance(profile.get("derived_view"), dict) else {}
+
+        candidates: list[str] = []
+        for container in (action, source, card, profile, derived):
+            if not isinstance(container, dict):
+                continue
+            for key in (
+                "id",
+                "card_id",
+                "model_id",
+                "normalized_id",
+                "title",
+                "name",
+                "title_en",
+                "title_zhs",
+                "class_name",
+                "kind",
+                "action_id",
+                "label",
+            ):
+                value = container.get(key)
+                if value not in (None, ""):
+                    candidates.append(str(value))
+
+        joined = " | ".join(candidates).strip().lower()
+        compact = joined.replace(" ", "_")
+        compact_no_underscore = compact.replace("_", "")
+        return (
+            "card.frantic_escape" in compact
+            or "frantic_escape" in compact
+            or "franticescape" in compact_no_underscore
+            or "狂乱逃离" in joined
+        )
+
+    def _insatiable_sandpit_turns_from_context(
+        self,
+        boss_ctx: dict[str, Any] | None,
+        raw_obs: dict[str, Any] | None = None,
+    ) -> float:
+        # Prefer the raw amount emitted by boss_mechanics; fall back to the
+        # dense-observation normalized value for replay/back-compat frames.
+        raw = self._boss_context_max(boss_ctx or {}, "sandpit_turns")
+        if raw > 0.0:
+            return float(raw)
+        norm = self._boss_context_max(boss_ctx or {}, "sandpit_turns_norm")
+        if norm > 0.0:
+            return float(norm * 10.0)
+        return 0.0
+
+    def _is_action_confirmed_lethal(self, action: Any, raw_obs: dict[str, Any] | None) -> bool:
+        if not isinstance(action, dict):
+            return False
+        damage = max(
+            self._action_metric(action, "damage"),
+            self._action_metric(action, "total_damage"),
+            self._action_numeric_value(
+                action,
+                ("damage", "total_damage", "attack_damage", "preview_damage", "expected_damage"),
+            ),
+        )
+        target_hp = self._target_enemy_hp(action, raw_obs)
+        return bool(damage > 0.0 and target_hp > 0.0 and damage >= target_hp)
+
+    @staticmethod
+    def _insatiable_escape_cycle_risk(
+        sandpit_turns: float,
+        hand_count: float,
+        draw_count: float,
+        discard_count: float,
+        total_count: float,
+    ) -> float:
+        """Approximate risk that Frantic Escape will miss the lethal countdown.
+
+        At Sandpit 0 the player is already dead; at 1 the escape card must be
+        played now if it is available.  For 2-3 we bias harder when the card is
+        not in draw/hand because cycling may not expose it before the clock hits
+        zero.
+        """
+        if sandpit_turns <= 0.0 or total_count <= 0.0:
+            return 0.0
+        if hand_count > 0.0:
+            return 0.0
+        if sandpit_turns <= 1.0:
+            return 1.0
+        if sandpit_turns < 3.0:
+            return 0.85 if draw_count <= 0.0 else 0.45
+        if sandpit_turns < 4.0:
+            return 0.60 if discard_count > 0.0 else 0.35
+        return 0.15
+
     def _combat_encounter_tier_from_raw(self, raw_obs: dict[str, Any] | None) -> str:
         encounter_id = ""
         if isinstance(raw_obs, dict):
@@ -1943,11 +2113,7 @@ class MuZeroTrainer:
         try:
             facing_change = bool(self._is_kaiser_facing_change_action(action, raw_obs))
             boss_ctx = build_boss_mechanics_context(raw_obs) if isinstance(raw_obs, dict) else {}
-            kaiser_risk = max(
-                self._boss_context_max(boss_ctx, "back_attack_risk"),
-                self._boss_context_max(boss_ctx, "back_attack_active"),
-                self._boss_context_max(boss_ctx, "incoming_damage_multiplier_norm"),
-            )
+            kaiser_risk = self._kaiser_back_attack_risk_from_context(boss_ctx, raw_obs)
         except Exception:
             kaiser_risk = 0.0
         if facing_change:
@@ -2402,41 +2568,25 @@ class MuZeroTrainer:
         return ""
 
     def _action_target_side(self, action: Any, raw_obs: Any | None = None) -> str:
+        """Return the Kaiser/back-attack body position (``"left"`` / ``"right"``)
+        of the action's target enemy, or empty string when not resolvable.
+
+        Bridge ``Creature.Side`` is faction (Player / Enemy) and MUST NOT be
+        treated as a left/right axis (P0-3 spec).  The only authoritative
+        cue is ``BACK_ATTACK_LEFT_POWER`` / ``BACK_ATTACK_RIGHT_POWER`` on
+        the enemy's powers list.  We accept ``target.target_side`` only when
+        it normalizes to ``"left"`` / ``"right"`` AND the BACK_ATTACK lookup
+        yields the same value (i.e. it is a redundant typed echo, not a
+        faction string in disguise).
+        """
         if not isinstance(action, dict):
             return ""
         back_attack_pos = self._action_target_back_attack_position(action, raw_obs)
         if back_attack_pos:
             return back_attack_pos
-        candidates: list[Any] = [action.get("target_side"), action.get("side")]
-        target = action.get("target")
-        if isinstance(target, dict):
-            candidates.extend([target.get("side"), target.get("target_side")])
-        target_mapping = action.get("target_mapping")
-        if isinstance(target_mapping, dict):
-            candidates.extend([target_mapping.get("side"), target_mapping.get("target_side")])
-        for value in candidates:
-            side = self._normalize_side(value)
-            if side:
-                return side
-
-        target_id = self._action_target_combat_id(action)
-        if target_id is None:
-            return ""
-        raw_obs = raw_obs if isinstance(raw_obs, dict) else self._current_raw_combat_obs()
-        combat = raw_obs.get("combat") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("combat"), dict) else {}
-        for key in ("enemies", "monsters", "creatures"):
-            entries = combat.get(key)
-            if not isinstance(entries, list):
-                continue
-            for enemy in entries:
-                if not isinstance(enemy, dict):
-                    continue
-                try:
-                    enemy_id = int(enemy.get("combat_id", enemy.get("id")))
-                except (TypeError, ValueError):
-                    continue
-                if enemy_id == target_id:
-                    return self._normalize_side(enemy.get("side") or enemy.get("target_side"))
+        # No BACK_ATTACK power present — return empty rather than fall back
+        # to faction ``side``.  Callers that need a stable string can still
+        # treat "" as "unknown".
         return ""
 
     def _is_targeted_enemy_action(self, action: Any) -> bool:
@@ -2750,9 +2900,15 @@ class MuZeroTrainer:
             try:
                 if isinstance(raw_obs, dict):
                     boss_ctx = build_boss_mechanics_context(raw_obs)
+                    kaiser_back_attack_risk = self._kaiser_back_attack_risk_from_context(boss_ctx, raw_obs)
+                    kaiser_back_attack_active = (
+                        float(self._boss_context_max(boss_ctx, "back_attack_active"))
+                        if self._is_kaiser_encounter_context(boss_ctx, raw_obs)
+                        else 0.0
+                    )
                     boss_context = {
-                        "kaiser_back_attack_risk": float(self._boss_context_max(boss_ctx, "back_attack_risk")),
-                        "kaiser_back_attack_active": float(self._boss_context_max(boss_ctx, "back_attack_active")),
+                        "kaiser_back_attack_risk": float(kaiser_back_attack_risk),
+                        "kaiser_back_attack_active": float(kaiser_back_attack_active),
                         "incoming_damage_multiplier_norm": float(self._boss_context_max(boss_ctx, "incoming_damage_multiplier_norm")),
                         "kaiser_facing_change_candidate_count": int(float(
                             (search_stats or {}).get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0
@@ -2858,6 +3014,158 @@ class MuZeroTrainer:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
             self._end_turn_context_dump_count += 1
+        except Exception:
+            return
+
+    def _dump_loss_spike(
+        self,
+        *,
+        step_k: int,
+        future_world_aux_value: float,
+        future_bank_state_value: float,
+        future_bank_delta_value: float,
+        batch_size: int | None,
+        threshold: float = 100.0,
+        max_dumps: int = 200,
+        extra_losses: dict[str, float] | None = None,
+        action_indices: Any = None,
+        sample_tier_flags: dict[str, Any] | None = None,
+    ) -> None:
+        """Dump a loss-spike record to ``diagnostics/loss_spikes.jsonl``.
+
+        Triggered when any of the future_world / future_bank loss components
+        exceeds ``threshold`` (default 100).  Capped at ``max_dumps`` per run
+        so a runaway divergent batch cannot fill the disk.
+
+        Per the P0-7 hardening spec the dump now also carries:
+
+        * ``losses``: all related loss values (the three primary heads plus
+          any extras the caller passes in).
+        * ``trigger``: which loss component(s) crossed the threshold and the
+          dominant component's name + value.
+        * ``finite_guard``: NaN / Inf detection — when any value is
+          non-finite the record is still written (with the offending values
+          serialized as strings) and a ``quarantine_reason`` is set so the
+          downstream offline analysis knows to discard the polluted update.
+        * ``action_index_dist``: top action-index frequencies inside the
+          batch — coarse handle on which action mix the offending batch was
+          dominated by, available even before per-sample buffer metadata
+          lands (deferred to a follow-up).
+        * ``sample_tier``: tier-flag means (boss / elite / normal / weak)
+          when the caller forwards the buffer's sample-tier flags so we can
+          tell which encounter category is over-represented in spike batches.
+        """
+        try:
+            primary_values = {
+                "future_world_aux_loss": float(future_world_aux_value),
+                "future_bank_state_loss": float(future_bank_state_value),
+                "future_bank_delta_loss": float(future_bank_delta_value),
+            }
+            losses_block: dict[str, float] = dict(primary_values)
+            if extra_losses:
+                for key, val in extra_losses.items():
+                    try:
+                        losses_block[str(key)] = float(val)
+                    except (TypeError, ValueError):
+                        losses_block[str(key)] = float("nan")
+
+            non_finite: dict[str, float] = {}
+            for key, val in losses_block.items():
+                if not math.isfinite(val):
+                    non_finite[key] = val
+            crossed = [k for k, v in primary_values.items() if math.isfinite(v) and v > threshold]
+            if not crossed and not non_finite:
+                return
+            count = getattr(self, "_loss_spike_dump_count", 0)
+            if count >= max_dumps:
+                return
+
+            dominant_key = ""
+            dominant_val = 0.0
+            for k, v in primary_values.items():
+                if math.isfinite(v) and v > dominant_val:
+                    dominant_val = v
+                    dominant_key = k
+
+            quarantine_reason: list[str] = []
+            if non_finite:
+                quarantine_reason.append("non_finite_loss")
+            if crossed:
+                quarantine_reason.append("loss_above_threshold")
+
+            action_index_dist: list[dict[str, int]] = []
+            try:
+                if action_indices is not None:
+                    arr = action_indices.detach().cpu().tolist() if hasattr(action_indices, "detach") else list(action_indices)
+                    counter: dict[int, int] = {}
+                    for idx in arr:
+                        try:
+                            ki = int(idx)
+                        except (TypeError, ValueError):
+                            continue
+                        counter[ki] = counter.get(ki, 0) + 1
+                    top = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    action_index_dist = [{"action_index": k, "count": v} for k, v in top]
+            except Exception:
+                action_index_dist = []
+
+            tier_summary: dict[str, float] = {}
+            if isinstance(sample_tier_flags, dict):
+                for tier_name, tensor in sample_tier_flags.items():
+                    try:
+                        if hasattr(tensor, "detach"):
+                            tier_summary[tier_name] = float(tensor.detach().mean().item())
+                        else:
+                            tier_summary[tier_name] = float(sum(float(v) for v in tensor) / max(len(tensor), 1))
+                    except Exception:
+                        continue
+
+            def _serialize(value: float) -> Any:
+                return value if math.isfinite(value) else str(value)
+
+            payload: dict[str, Any] = {
+                "kind": "loss_spike",
+                "schema_version": 2,
+                "total_steps": int(getattr(self, "total_steps", 0)),
+                "step_k": int(step_k),
+                "batch_size": batch_size,
+                "threshold": float(threshold),
+                "wall_time": time.time(),
+                "losses": {k: _serialize(v) for k, v in losses_block.items()},
+                "trigger": {
+                    "crossed_keys": crossed,
+                    "dominant_key": dominant_key,
+                    "dominant_value": _serialize(dominant_val),
+                    "non_finite_keys": list(non_finite.keys()),
+                },
+                "finite_guard": {
+                    "all_finite": not non_finite,
+                    "non_finite_count": len(non_finite),
+                },
+                "quarantine_reason": quarantine_reason,
+                # Legacy top-level fields kept for back-compat with existing
+                # offline tooling reading v1 dumps.
+                "future_world_aux_loss": _serialize(future_world_aux_value),
+                "future_bank_state_loss": _serialize(future_bank_state_value),
+                "future_bank_delta_loss": _serialize(future_bank_delta_value),
+            }
+            if action_index_dist:
+                payload["action_index_dist"] = action_index_dist
+            if tier_summary:
+                payload["sample_tier"] = tier_summary
+
+            path = Path(self.log_dir) / "diagnostics" / "loss_spikes.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._loss_spike_dump_count = count + 1
+            tag = "non_finite" if non_finite else dominant_key.replace("_loss", "")
+            print(
+                f"[loss_spike] dump #{self._loss_spike_dump_count} step={payload['total_steps']} "
+                f"step_k={step_k} dominant={tag} value={_serialize(dominant_val)} "
+                f"reasons={quarantine_reason}",
+                flush=True,
+            )
         except Exception:
             return
 
@@ -3006,6 +3314,12 @@ class MuZeroTrainer:
                 out.append("ceremonial_missed_stun_window")
 
         if "insatiable" in encounter_l:
+            if gt("combat_quality_insatiable_frantic_escape_missed_at_1"):
+                out.append("insatiable_frantic_escape_missed_at_1")
+            elif gt("combat_quality_insatiable_frantic_escape_missed_lt3"):
+                out.append("insatiable_frantic_escape_missed_lt3")
+            if gt("combat_quality_insatiable_non_escape_at_1_selected"):
+                out.append("insatiable_non_escape_at_1_nonlethal")
             if gt("combat_quality_strategic_skip_selected"):
                 out.append("insatiable_strategic_skip")
             if gt("combat_quality_refund_no_followup_selected"):
@@ -3074,6 +3388,9 @@ class MuZeroTrainer:
                 "kaiser_facing_change_candidate_count": float(stats.get("combat_quality_kaiser_facing_change_candidate_count", 0.0) or 0.0),
                 "ceremonial_one_card_lock": float(stats.get("combat_quality_ceremonial_one_card_lock", 0.0) or 0.0),
                 "ceremonial_stun_window": float(stats.get("combat_quality_ceremonial_stun_window", 0.0) or 0.0),
+                "insatiable_sandpit_countdown": float(stats.get("combat_quality_insatiable_sandpit_countdown", 0.0) or 0.0),
+                "insatiable_frantic_escape_available": float(stats.get("combat_quality_insatiable_frantic_escape_available", 0.0) or 0.0),
+                "insatiable_escape_cycle_risk": float(stats.get("combat_quality_insatiable_escape_cycle_risk", 0.0) or 0.0),
             }
             reason_flags = {
                 key: float(stats.get(f"combat_quality_{key}", 0.0) or 0.0) > 0.5
@@ -3093,6 +3410,10 @@ class MuZeroTrainer:
                     "kaiser_risky_end_turn_selected",
                     "ceremonial_low_impact_selected",
                     "ceremonial_high_impact_selected",
+                    "insatiable_frantic_escape_selected",
+                    "insatiable_frantic_escape_missed_lt3",
+                    "insatiable_frantic_escape_missed_at_1",
+                    "insatiable_non_escape_at_1_selected",
                 )
             }
             alternatives: list[dict[str, Any]] = []
@@ -3560,6 +3881,21 @@ class MuZeroTrainer:
         x_cost_indices: set[int] = set()
         x_cost_bad_indices: set[int] = set()
         x_cost_effective_energy_sum = 0.0
+        card_selection_confirm_ready_available = False
+        card_selection_confirm_ready_confirm_count = 0
+        card_selection_confirm_ready_select_count = 0
+        card_selection_deselect_candidate_count = 0
+        card_selection_remaining_zero_select_count = 0
+        card_selection_not_ready_select_count = 0
+
+        def _action_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return float(value) != 0.0
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return False
 
         legal_count = min(len(legal_actions or []), MAX_ACTIONS, mask_np.shape[0])
         for idx in range(legal_count):
@@ -3674,6 +4010,72 @@ class MuZeroTrainer:
             if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
                 bias[idx] -= 0.45
 
+        for idx in range(legal_count):
+            if mask_np[idx] <= 0:
+                continue
+            action = legal_actions[idx]
+            if self._semantic_family(action) != "card_selection":
+                continue
+            selection = str(action.get("selection_action") or action.get("selection") or "").strip().lower()
+            confirm_ready = _action_bool(action.get("confirm_ready"))
+            is_selected = _action_bool(action.get("is_selected"))
+            selection_ready = True if action.get("selection_ready") is None else _action_bool(action.get("selection_ready"))
+            remaining_select: int | None = None
+            try:
+                if action.get("remaining_select") is not None:
+                    remaining_select = int(action.get("remaining_select"))
+            except (TypeError, ValueError):
+                remaining_select = None
+            selected_count: int | None = None
+            try:
+                if action.get("selected_count") is not None:
+                    selected_count = int(action.get("selected_count"))
+            except (TypeError, ValueError):
+                selected_count = None
+            should_close_selection = bool(confirm_ready) and (
+                # New bridge contract: after at least one selected card, stop
+                # toggling and prefer the terminal confirm.  When an optional
+                # screen first opens with selected_count=0 and confirm already
+                # enabled, do NOT force a zero-pick confirm; allow the policy to
+                # select a useful card first.
+                (selected_count is not None and selected_count > 0)
+                or remaining_select == 0
+                # Back-compat for old replay / old bridge payloads that lack
+                # selected_count/remaining_select: keep the old confirm-ready
+                # closeout behavior rather than leaving loops unguarded.
+                or (selected_count is None and remaining_select is None)
+            )
+
+            if confirm_ready:
+                card_selection_confirm_ready_available = True
+
+            if selection in {"confirm", "confirm_selection"} and should_close_selection:
+                # State-driven closeout for multi-pick card-selection screens:
+                # once the UI says confirmation is legal *and* at least one
+                # card has been selected (or max picks are exhausted), favor the
+                # terminal action instead of continuing to toggle cards.
+                bias[idx] += 2.25
+                card_selection_confirm_ready_confirm_count += 1
+            elif selection == "select":
+                if should_close_selection:
+                    bias[idx] -= 1.10
+                    card_selection_confirm_ready_select_count += 1
+                if not selection_ready:
+                    # Diagnostic/light guard only.  The bridge fast-forwards
+                    # the NChooseACard open guard before executing a select,
+                    # so this should be rare; if it rises, we know the model is
+                    # still seeing a transient selection surface.
+                    bias[idx] -= 0.20
+                    card_selection_not_ready_select_count += 1
+                if is_selected:
+                    # Clicking an already-selected card is a deselect toggle.
+                    # This is exactly the Purity/净化 loop failure mode.
+                    bias[idx] -= 2.75
+                    card_selection_deselect_candidate_count += 1
+                if remaining_select == 0:
+                    bias[idx] -= 2.00
+                    card_selection_remaining_zero_select_count += 1
+
         kaiser_back_attack_risk = 0.0
         ceremonial_one_card_lock = 0.0
         ceremonial_stun_window = 0.0
@@ -3683,21 +4085,102 @@ class MuZeroTrainer:
         kaiser_facing_change_candidate_count = 0
         kaiser_pressure_candidate_count = 0
         encounter = ""
+        is_kaiser_encounter = False
+        is_insatiable_encounter = False
+        boss_ctx: dict[str, Any] = {}
+        insatiable_sandpit_turns = 0.0
+        insatiable_frantic_hand_count = 0.0
+        insatiable_frantic_draw_count = 0.0
+        insatiable_frantic_discard_count = 0.0
+        insatiable_frantic_exhaust_count = 0.0
+        insatiable_frantic_total_count = 0.0
+        insatiable_escape_cycle_risk = 0.0
+        insatiable_frantic_escape_candidate_count = 0
+        insatiable_frantic_escape_bonus_applied = False
+        insatiable_frantic_escape_urgency = 0.0
+        insatiable_lethal_candidate_count = 0
+        insatiable_non_escape_at1_penalty_count = 0
         if isinstance(raw_obs, dict):
             try:
                 boss_ctx = build_boss_mechanics_context(raw_obs)
                 encounter = str(boss_ctx.get("encounter_key") or "").lower()
-                kaiser_back_attack_risk = max(
-                    self._boss_context_max(boss_ctx, "back_attack_risk"),
-                    self._boss_context_max(boss_ctx, "back_attack_active"),
-                    self._boss_context_max(boss_ctx, "incoming_damage_multiplier_norm"),
-                )
+                is_kaiser_encounter = self._is_kaiser_encounter_context(boss_ctx, raw_obs)
+                is_insatiable_encounter = self._is_insatiable_encounter_context(boss_ctx, raw_obs)
+                kaiser_back_attack_risk = self._kaiser_back_attack_risk_from_context(boss_ctx, raw_obs)
                 ceremonial_one_card_lock = self._boss_context_max(boss_ctx, "one_card_lock")
                 ceremonial_stun_window = self._boss_context_max(boss_ctx, "stun_window")
+                if is_insatiable_encounter:
+                    insatiable_sandpit_turns = self._insatiable_sandpit_turns_from_context(boss_ctx, raw_obs)
+                    insatiable_frantic_hand_count = self._boss_context_max(boss_ctx, "frantic_escape_hand_count")
+                    insatiable_frantic_draw_count = self._boss_context_max(boss_ctx, "frantic_escape_draw_count")
+                    insatiable_frantic_discard_count = self._boss_context_max(boss_ctx, "frantic_escape_discard_count")
+                    insatiable_frantic_exhaust_count = self._boss_context_max(boss_ctx, "frantic_escape_exhaust_count")
+                    insatiable_frantic_total_count = self._boss_context_max(boss_ctx, "frantic_escape_total_count")
+                    insatiable_escape_cycle_risk = self._insatiable_escape_cycle_risk(
+                        insatiable_sandpit_turns,
+                        insatiable_frantic_hand_count,
+                        insatiable_frantic_draw_count,
+                        insatiable_frantic_discard_count,
+                        insatiable_frantic_total_count,
+                    )
             except Exception:
                 encounter = ""
+                is_kaiser_encounter = False
+                is_insatiable_encounter = False
 
-        if kaiser_back_attack_risk > 0.05 and ("kaiser" in encounter or not encounter):
+        if is_insatiable_encounter and insatiable_sandpit_turns > 0.0:
+            sandpit = float(insatiable_sandpit_turns)
+            if sandpit <= 1.0:
+                insatiable_frantic_escape_urgency = 1.0
+            elif sandpit < 3.0:
+                insatiable_frantic_escape_urgency = 0.85
+            elif sandpit < 4.0:
+                insatiable_frantic_escape_urgency = min(1.0, 0.35 + 0.25 * insatiable_escape_cycle_risk)
+            else:
+                insatiable_frantic_escape_urgency = 0.0
+
+            lethal_candidate_indices: set[int] = set()
+            frantic_indices: set[int] = set()
+            for idx in range(legal_count):
+                if mask_np[idx] <= 0:
+                    continue
+                action = legal_actions[idx]
+                family = self._semantic_family(action)
+                if family in {"play_card", "use_potion", "potion"} and self._is_action_confirmed_lethal(action, raw_obs):
+                    lethal_candidate_indices.add(idx)
+                if family == "play_card" and self._is_frantic_escape_action(action):
+                    frantic_indices.add(idx)
+
+            insatiable_lethal_candidate_count = len(lethal_candidate_indices)
+            insatiable_frantic_escape_candidate_count = len(frantic_indices)
+
+            for idx in frantic_indices:
+                if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
+                    if sandpit <= 1.0:
+                        bias[idx] += 5.0
+                    elif sandpit < 3.0:
+                        bias[idx] += 3.25
+                    elif insatiable_frantic_escape_urgency > 0.0:
+                        bias[idx] += 0.75 * insatiable_frantic_escape_urgency
+                    insatiable_frantic_escape_bonus_applied = True
+
+            if sandpit <= 1.0 and frantic_indices:
+                for idx in range(legal_count):
+                    if mask_np[idx] <= 0 or idx in frantic_indices or idx in lethal_candidate_indices:
+                        continue
+                    # Sandpit 0 is terminal; at 1 the only non-lethal priority
+                    # should be Frantic Escape when the action is legal.
+                    bias[idx] -= 3.75
+                    insatiable_non_escape_at1_penalty_count += 1
+                for idx in end_turn_indices:
+                    if idx not in frantic_indices and idx not in lethal_candidate_indices:
+                        bias[idx] -= 5.0
+            elif sandpit < 3.0 and frantic_indices:
+                for idx in end_turn_indices:
+                    if idx not in lethal_candidate_indices:
+                        bias[idx] -= 1.10
+
+        if is_kaiser_encounter and kaiser_back_attack_risk > 0.05:
             risk = min(1.0, float(kaiser_back_attack_risk))
             for idx in range(legal_count):
                 if mask_np[idx] <= 0:
@@ -3805,11 +4288,17 @@ class MuZeroTrainer:
             "combat_quality_potion_hand_context_bad_count": float(context.get("potion_hand_context_bad_count", 0) or 0),
             "combat_quality_potion_long_term_count": float(context.get("potion_long_term_count", 0) or 0),
             "combat_quality_potion_requires_followup_count": float(context.get("potion_requires_followup_count", 0) or 0),
+            "combat_quality_card_selection_confirm_ready_available": 1.0 if card_selection_confirm_ready_available else 0.0,
+            "combat_quality_card_selection_confirm_ready_confirm_count": float(card_selection_confirm_ready_confirm_count),
+            "combat_quality_card_selection_confirm_ready_select_count": float(card_selection_confirm_ready_select_count),
+            "combat_quality_card_selection_deselect_candidate_count": float(card_selection_deselect_candidate_count),
+            "combat_quality_card_selection_remaining_zero_select_count": float(card_selection_remaining_zero_select_count),
+            "combat_quality_card_selection_not_ready_select_count": float(card_selection_not_ready_select_count),
             "combat_quality_strategic_defer_available": 1.0 if bool(context.get("strategic_defer_available", False)) and bool(end_turn_indices) else 0.0,
             "combat_quality_true_wasteful_end_turn_available": 1.0 if wasteful and bool(end_turn_indices) else 0.0,
             "combat_quality_bad_end_turn_available": 1.0 if (wasteful or (
                 bool(end_turn_indices)
-                and (kaiser_back_attack_risk > 0.05 and kaiser_facing_change_candidate_count >= 1)
+                and (is_kaiser_encounter and kaiser_back_attack_risk > 0.05 and kaiser_facing_change_candidate_count >= 1)
             )) else 0.0,
             "combat_quality_forced_end_turn_available": 1.0 if (
                 bool(end_turn_indices) and not wasteful and len(positive_indices) == 0
@@ -3837,6 +4326,22 @@ class MuZeroTrainer:
             "combat_quality_ceremonial_stun_window": float(ceremonial_stun_window),
             "combat_quality_ceremonial_low_impact_count": float(ceremonial_low_impact_count),
             "combat_quality_ceremonial_high_impact_count": float(ceremonial_high_impact_count),
+            "combat_quality_insatiable_sandpit_countdown": float(insatiable_sandpit_turns),
+            "combat_quality_insatiable_sandpit_active": 1.0 if insatiable_sandpit_turns > 0.0 else 0.0,
+            "combat_quality_insatiable_sandpit_lt3": 1.0 if 0.0 < insatiable_sandpit_turns < 3.0 else 0.0,
+            "combat_quality_insatiable_sandpit_1": 1.0 if 0.0 < insatiable_sandpit_turns <= 1.0 else 0.0,
+            "combat_quality_insatiable_frantic_escape_hand_count": float(insatiable_frantic_hand_count),
+            "combat_quality_insatiable_frantic_escape_draw_count": float(insatiable_frantic_draw_count),
+            "combat_quality_insatiable_frantic_escape_discard_count": float(insatiable_frantic_discard_count),
+            "combat_quality_insatiable_frantic_escape_exhaust_count": float(insatiable_frantic_exhaust_count),
+            "combat_quality_insatiable_frantic_escape_total_count": float(insatiable_frantic_total_count),
+            "combat_quality_insatiable_frantic_escape_candidate_count": float(insatiable_frantic_escape_candidate_count),
+            "combat_quality_insatiable_frantic_escape_available": 1.0 if insatiable_frantic_escape_candidate_count > 0 else 0.0,
+            "combat_quality_insatiable_frantic_escape_urgency": float(insatiable_frantic_escape_urgency),
+            "combat_quality_insatiable_frantic_escape_bonus_applied": 1.0 if insatiable_frantic_escape_bonus_applied else 0.0,
+            "combat_quality_insatiable_non_escape_at1_penalty_count": float(insatiable_non_escape_at1_penalty_count),
+            "combat_quality_insatiable_escape_cycle_risk": float(insatiable_escape_cycle_risk),
+            "combat_quality_insatiable_lethal_candidate_count": float(insatiable_lethal_candidate_count),
         }
         return bias, stats, zero_energy_x_indices
 
@@ -3915,6 +4420,11 @@ class MuZeroTrainer:
         strategic_defer_available = float(stats.get("combat_quality_strategic_defer_available", 0.0) or 0.0) > 0.5
         potion_selected = family in {"use_potion", "potion"}
         potion_available = float(stats.get("combat_quality_potion_available_count", 0.0) or 0.0) > 0.0
+        is_frantic_selected = bool(family == "play_card" and self._is_frantic_escape_action(action))
+        insat_available = float(stats.get("combat_quality_insatiable_frantic_escape_available", 0.0) or 0.0) > 0.5
+        sandpit_lt3 = float(stats.get("combat_quality_insatiable_sandpit_lt3", 0.0) or 0.0) > 0.5
+        sandpit_at1 = float(stats.get("combat_quality_insatiable_sandpit_1", 0.0) or 0.0) > 0.5
+        lethal_selected = self._is_action_confirmed_lethal(action, raw_obs)
         potion_profile: dict[str, Any] = {}
         if potion_selected:
             mask_np = np.ones(MAX_ACTIONS, dtype=np.float32)
@@ -3990,6 +4500,20 @@ class MuZeroTrainer:
                 "combat_quality_potion_waste_risk_selected": float(potion_profile.get("waste_risk", 0.0) or 0.0) if potion_selected else 0.0,
             }
         )
+        result.update(
+            {
+                "combat_quality_insatiable_frantic_escape_selected": 1.0 if is_frantic_selected else 0.0,
+                "combat_quality_insatiable_frantic_escape_missed_lt3": 1.0 if (
+                    insat_available and sandpit_lt3 and not is_frantic_selected and not lethal_selected
+                ) else 0.0,
+                "combat_quality_insatiable_frantic_escape_missed_at_1": 1.0 if (
+                    insat_available and sandpit_at1 and not is_frantic_selected and not lethal_selected
+                ) else 0.0,
+                "combat_quality_insatiable_non_escape_at_1_selected": 1.0 if (
+                    insat_available and sandpit_at1 and not is_frantic_selected and not lethal_selected
+                ) else 0.0,
+            }
+        )
         return result
 
     @staticmethod
@@ -4023,6 +4547,13 @@ class MuZeroTrainer:
             "objective_weight_resource",
             "root_objective_value",
             "root_bias_scale",
+            "root_bias_nonzero",
+            "root_bias_abs_mean",
+            "root_bias_max_abs",
+            "root_bias_changed_top1",
+            "root_bias_selected_action_delta",
+            "root_bias_suppressed_by_gate",
+            "root_bias_scale_effective",
             "semantic_switch_depth",
             "semantic_rollout_enabled",
             "semantic_expansion_rate",
@@ -4122,6 +4653,26 @@ class MuZeroTrainer:
             "combat_quality_kaiser_defense_selected",
             "combat_quality_ceremonial_low_impact_selected",
             "combat_quality_ceremonial_high_impact_selected",
+            "combat_quality_insatiable_sandpit_countdown",
+            "combat_quality_insatiable_sandpit_active",
+            "combat_quality_insatiable_sandpit_lt3",
+            "combat_quality_insatiable_sandpit_1",
+            "combat_quality_insatiable_frantic_escape_hand_count",
+            "combat_quality_insatiable_frantic_escape_draw_count",
+            "combat_quality_insatiable_frantic_escape_discard_count",
+            "combat_quality_insatiable_frantic_escape_exhaust_count",
+            "combat_quality_insatiable_frantic_escape_total_count",
+            "combat_quality_insatiable_frantic_escape_candidate_count",
+            "combat_quality_insatiable_frantic_escape_available",
+            "combat_quality_insatiable_frantic_escape_urgency",
+            "combat_quality_insatiable_frantic_escape_bonus_applied",
+            "combat_quality_insatiable_non_escape_at1_penalty_count",
+            "combat_quality_insatiable_escape_cycle_risk",
+            "combat_quality_insatiable_lethal_candidate_count",
+            "combat_quality_insatiable_frantic_escape_selected",
+            "combat_quality_insatiable_frantic_escape_missed_lt3",
+            "combat_quality_insatiable_frantic_escape_missed_at_1",
+            "combat_quality_insatiable_non_escape_at_1_selected",
             "combat_quality_playable_action_count",
             "combat_quality_end_turn_severity",
             "combat_quality_x_cost_available_count",
@@ -4432,8 +4983,17 @@ class MuZeroTrainer:
                 "direct_rollout_uncertainty_bias_abs_mean",
                 "direct_rollout_branch_disagreement_mean",
                 "direct_rollout_risk_q_mean",
+                "root_bias_scale",
+                "root_bias_nonzero",
+                "root_bias_abs_mean",
+                "root_bias_max_abs",
+                "root_bias_changed_top1",
+                "root_bias_selected_action_delta",
+                "root_bias_suppressed_by_gate",
+                "root_bias_scale_effective",
                 "mean_predicted_legal_count",
                 "combat_quality_bias_applied",
+                "combat_quality_bias_abs_mean",
                 "combat_quality_wasteful_end_turn_bias_applied",
                 "combat_quality_wasteful_end_turn_available",
                 "combat_quality_wasteful_end_turn_selected",
@@ -4522,6 +5082,43 @@ class MuZeroTrainer:
                 "combat_quality_kaiser_defense_selected",
                 "combat_quality_ceremonial_low_impact_selected",
                 "combat_quality_ceremonial_high_impact_selected",
+                "combat_quality_insatiable_sandpit_countdown",
+                "combat_quality_insatiable_sandpit_active",
+                "combat_quality_insatiable_sandpit_lt3",
+                "combat_quality_insatiable_sandpit_1",
+                "combat_quality_insatiable_frantic_escape_hand_count",
+                "combat_quality_insatiable_frantic_escape_draw_count",
+                "combat_quality_insatiable_frantic_escape_discard_count",
+                "combat_quality_insatiable_frantic_escape_exhaust_count",
+                "combat_quality_insatiable_frantic_escape_total_count",
+                "combat_quality_insatiable_frantic_escape_candidate_count",
+                "combat_quality_insatiable_frantic_escape_available",
+                "combat_quality_insatiable_frantic_escape_urgency",
+                "combat_quality_insatiable_frantic_escape_bonus_applied",
+                "combat_quality_insatiable_non_escape_at1_penalty_count",
+                "combat_quality_insatiable_escape_cycle_risk",
+                "combat_quality_insatiable_lethal_candidate_count",
+                "combat_quality_insatiable_frantic_escape_selected",
+                "combat_quality_insatiable_frantic_escape_missed_lt3",
+                "combat_quality_insatiable_frantic_escape_missed_at_1",
+                "combat_quality_insatiable_non_escape_at_1_selected",
+                # P0 hardening hooks: HP-cost / X-cost / selection / identity /
+                # transient leak — sourced from typed helper outputs in
+                # combat_env.step diagnostics via diag_key_map.
+                "combat_quality_hp_cost_self_lethal_selected",
+                "combat_quality_hp_cost_low_margin_selected",
+                "combat_quality_hp_cost_unblockable_value",
+                "combat_quality_x_cost_zero_bad_selected",
+                "combat_quality_x_cost_zero_selected",
+                "combat_quality_x_cost_energy_value",
+                "combat_quality_x_cost_star_value",
+                "combat_quality_star_x_selected",
+                "combat_quality_selection_text_fallback_selected",
+                "combat_quality_selection_runtime_internal_selected",
+                "combat_quality_card_identity_text_fallback_selected",
+                "combat_quality_card_identity_runtime_internal_selected",
+                "combat_quality_transient_leaked_selected",
+                "combat_quality_prior_transient_only_end_turn",
             ):
                 if key in search_stats:
                     search_values[key].append(self._safe_float(search_stats.get(key)))
@@ -4578,6 +5175,15 @@ class MuZeroTrainer:
             "boss_combat/direct_rollout_branch_disagreement_mean": float(np.mean(search_values.get("direct_rollout_branch_disagreement_mean", [0.0]))),
             "boss_combat/direct_rollout_risk_q_mean": float(np.mean(search_values.get("direct_rollout_risk_q_mean", [0.0]))),
             "boss_combat/quality_bias_applied_rate": float(np.mean(search_values.get("combat_quality_bias_applied", [0.0]))),
+            "boss_combat/quality_bias_abs_mean": float(np.mean(search_values.get("combat_quality_bias_abs_mean", [0.0]))),
+            "boss_combat/root_bias_scale_mean": float(np.mean(search_values.get("root_bias_scale", [0.0]))),
+            "boss_combat/root_bias_nonzero_rate": float(np.mean(search_values.get("root_bias_nonzero", [0.0]))),
+            "boss_combat/root_bias_abs_mean": float(np.mean(search_values.get("root_bias_abs_mean", [0.0]))),
+            "boss_combat/root_bias_max_abs": float(np.max(search_values.get("root_bias_max_abs", [0.0]))),
+            "boss_combat/root_bias_changed_top1_rate": float(np.mean(search_values.get("root_bias_changed_top1", [0.0]))),
+            "boss_combat/root_bias_selected_action_delta_mean": float(np.mean(search_values.get("root_bias_selected_action_delta", [0.0]))),
+            "boss_combat/root_bias_suppressed_by_gate_rate": float(np.mean(search_values.get("root_bias_suppressed_by_gate", [0.0]))),
+            "boss_combat/root_bias_scale_effective_mean": float(np.mean(search_values.get("root_bias_scale_effective", [0.0]))),
             "boss_combat/wasteful_end_turn_bias_applied_rate": float(np.mean(search_values.get("combat_quality_wasteful_end_turn_bias_applied", [0.0]))),
             "boss_combat/wasteful_end_turn_available_rate": float(np.mean(search_values.get("combat_quality_wasteful_end_turn_available", [0.0]))),
             "boss_combat/wasteful_end_turn_selected_rate": float(np.mean(search_values.get("combat_quality_wasteful_end_turn_selected", [0.0]))),
@@ -4677,6 +5283,44 @@ class MuZeroTrainer:
             "boss_combat/kaiser_defense_selected_rate": float(np.mean(search_values.get("combat_quality_kaiser_defense_selected", [0.0]))),
             "boss_combat/ceremonial_low_impact_selected_rate": float(np.mean(search_values.get("combat_quality_ceremonial_low_impact_selected", [0.0]))),
             "boss_combat/ceremonial_high_impact_selected_rate": float(np.mean(search_values.get("combat_quality_ceremonial_high_impact_selected", [0.0]))),
+            "boss_combat/insatiable_sandpit_countdown_mean": float(np.mean(search_values.get("combat_quality_insatiable_sandpit_countdown", [0.0]))),
+            "boss_combat/insatiable_sandpit_active_rate": float(np.mean(search_values.get("combat_quality_insatiable_sandpit_active", [0.0]))),
+            "boss_combat/insatiable_sandpit_lt3_rate": float(np.mean(search_values.get("combat_quality_insatiable_sandpit_lt3", [0.0]))),
+            "boss_combat/insatiable_sandpit_1_rate": float(np.mean(search_values.get("combat_quality_insatiable_sandpit_1", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_hand_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_hand_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_draw_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_draw_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_discard_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_discard_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_exhaust_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_exhaust_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_total_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_total_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_available_rate": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_available", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_candidate_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_candidate_count", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_selected_rate": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_selected", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_missed_lt3_rate": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_missed_lt3", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_missed_at_1_rate": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_missed_at_1", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_urgency_mean": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_urgency", [0.0]))),
+            "boss_combat/insatiable_frantic_escape_bonus_applied_rate": float(np.mean(search_values.get("combat_quality_insatiable_frantic_escape_bonus_applied", [0.0]))),
+            "boss_combat/insatiable_non_escape_at1_penalty_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_non_escape_at1_penalty_count", [0.0]))),
+            "boss_combat/insatiable_escape_cycle_risk_mean": float(np.mean(search_values.get("combat_quality_insatiable_escape_cycle_risk", [0.0]))),
+            "boss_combat/insatiable_lethal_candidate_count_mean": float(np.mean(search_values.get("combat_quality_insatiable_lethal_candidate_count", [0.0]))),
+            # P0 hardening metrics — sourced from combat_env P0 helper
+            # diagnostics (HP-cost safety, X-cost / Star-X, selection
+            # typed contract, card identity, transient end_turn leak).
+            # All are episode-level rate / mean averages for the §11
+            # smoke gate.
+            "boss_combat/hp_cost_self_lethal_selected_rate": float(np.mean(search_values.get("combat_quality_hp_cost_self_lethal_selected", [0.0]))),
+            "boss_combat/hp_cost_low_margin_selected_rate": float(np.mean(search_values.get("combat_quality_hp_cost_low_margin_selected", [0.0]))),
+            "boss_combat/hp_cost_unblockable_value_mean": float(np.mean(search_values.get("combat_quality_hp_cost_unblockable_value", [0.0]))),
+            "boss_combat/x_cost_zero_bad_selected_rate_p0": float(np.mean(search_values.get("combat_quality_x_cost_zero_bad_selected", [0.0]))),
+            "boss_combat/x_cost_zero_selected_rate_p0": float(np.mean(search_values.get("combat_quality_x_cost_zero_selected", [0.0]))),
+            "boss_combat/x_cost_energy_value_mean_p0": float(np.mean(search_values.get("combat_quality_x_cost_energy_value", [0.0]))),
+            "boss_combat/x_cost_star_value_mean_p0": float(np.mean(search_values.get("combat_quality_x_cost_star_value", [0.0]))),
+            "boss_combat/star_x_selected_rate": float(np.mean(search_values.get("combat_quality_star_x_selected", [0.0]))),
+            "boss_combat/selection_text_fallback_selected_rate": float(np.mean(search_values.get("combat_quality_selection_text_fallback_selected", [0.0]))),
+            "boss_combat/selection_runtime_internal_selected_rate": float(np.mean(search_values.get("combat_quality_selection_runtime_internal_selected", [0.0]))),
+            "boss_combat/card_identity_text_fallback_selected_rate": float(np.mean(search_values.get("combat_quality_card_identity_text_fallback_selected", [0.0]))),
+            "boss_combat/card_identity_runtime_internal_selected_rate": float(np.mean(search_values.get("combat_quality_card_identity_runtime_internal_selected", [0.0]))),
+            "boss_combat/transient_leaked_selected_rate": float(np.mean(search_values.get("combat_quality_transient_leaked_selected", [0.0]))),
+            "boss_combat/prior_transient_only_end_turn_rate": float(np.mean(search_values.get("combat_quality_prior_transient_only_end_turn", [0.0]))),
         }
         for family, count in sorted(family_counts.items()):
             safe_family = family.replace("/", "_").replace(" ", "_") or "unknown"
@@ -5157,6 +5801,13 @@ class MuZeroTrainer:
         search_root_visit_entropy: list[float] = []
         search_num_simulations: list[float] = []
         search_root_bias_scale: list[float] = []
+        search_root_bias_nonzero: list[float] = []
+        search_root_bias_abs_mean: list[float] = []
+        search_root_bias_max_abs: list[float] = []
+        search_root_bias_changed_top1: list[float] = []
+        search_root_bias_selected_delta: list[float] = []
+        search_root_bias_suppressed_by_gate: list[float] = []
+        search_root_bias_scale_effective: list[float] = []
         search_end_turn_guard_applied: list[float] = []
         search_end_turn_guard_forced_alt: list[float] = []
         domain_search_stats: dict[str, dict[str, list[float]]] = {
@@ -5305,6 +5956,11 @@ class MuZeroTrainer:
                     + self.combat_rollout_risk_blend * rollout_risk_q_bias
                     - self.combat_rollout_uncertainty_blend * rollout_uncertainty_bias
                 )
+                # Root-quality bias instrumentation: keep the exact pre-bias
+                # root logits so TensorBoard can prove whether the hard
+                # mechanism prior (Kaiser facing, end_turn, X-cost, potion
+                # timing, HP-cost, etc.) actually changes the root ordering.
+                pre_quality_masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
                 quality_bias_np, quality_stats, zero_energy_x_indices = self._combat_action_quality_bias(
                     obs,
                     np.asarray(action_mask, dtype=np.float32),
@@ -5317,6 +5973,21 @@ class MuZeroTrainer:
                 )
                 masked_logits = masked_logits + quality_bias
                 masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
+                legal_root_bias = quality_bias.masked_select(action_mask_tensor > 0)
+                root_bias_nonzero = (
+                    1.0
+                    if legal_root_bias.numel() > 0 and bool(torch.any(legal_root_bias.abs() > 1e-6).item())
+                    else 0.0
+                )
+                if bool((action_mask_tensor > 0).any().item()):
+                    pre_quality_top1 = int(pre_quality_masked_logits.argmax().item())
+                    post_quality_top1 = int(masked_logits.argmax().item())
+                else:
+                    pre_quality_top1 = -1
+                    post_quality_top1 = -1
+                root_bias_abs_mean = float(legal_root_bias.abs().mean().item()) if legal_root_bias.numel() > 0 else 0.0
+                root_bias_max_abs = float(legal_root_bias.abs().max().item()) if legal_root_bias.numel() > 0 else 0.0
+                root_bias_changed_top1 = 1.0 if pre_quality_top1 >= 0 and pre_quality_top1 != post_quality_top1 else 0.0
                 safe_temperature = max(float(temperature), 1e-3)
                 direct_probs = torch.softmax(masked_logits / safe_temperature, dim=0)
                 if not torch.isfinite(direct_probs).all() or float(direct_probs.sum().item()) <= 0.0:
@@ -5382,6 +6053,16 @@ class MuZeroTrainer:
                     )
                     selected_ceremonial_low_impact = 1.0 if low_impact else 0.0
                     selected_ceremonial_high_impact = 1.0 if high_impact else 0.0
+                raw_for_selected = self._current_raw_combat_obs()
+                selected_is_kaiser_encounter = False
+                try:
+                    if isinstance(raw_for_selected, dict):
+                        selected_is_kaiser_encounter = self._is_kaiser_encounter_context(
+                            build_boss_mechanics_context(raw_for_selected),
+                            raw_for_selected,
+                        )
+                except Exception:
+                    selected_is_kaiser_encounter = False
                 search_stats = {
                     "num_simulations": 0.0,
                     "root_top1_visit_share": float(direct_probs.max().item()),
@@ -5405,6 +6086,24 @@ class MuZeroTrainer:
                     "direct_rollout_bucket_padding_ratio": float(rollout.rollout_bucket_padding_ratio),
                     "direct_rollout_max_branch_bucket_size": float(rollout.rollout_max_branch_bucket_size),
                     "direct_rollout_branch_padding_ratio": float(rollout.rollout_branch_padding_ratio),
+                    # Direct-rollout mode does not go through MCTS
+                    # ``_objective_prior_bias``; the equivalent root prior is
+                    # ``_combat_action_quality_bias``.  Report it under the
+                    # root_bias namespace too, otherwise search/root_bias_scale
+                    # looks permanently zero in search-free training even when
+                    # the prior is actively changing logits.
+                    "root_bias_scale": 1.0,
+                    "root_bias_nonzero": float(root_bias_nonzero),
+                    "root_bias_abs_mean": float(root_bias_abs_mean),
+                    "root_bias_max_abs": float(root_bias_max_abs),
+                    "root_bias_changed_top1": float(root_bias_changed_top1),
+                    "root_bias_selected_action_delta": float(
+                        quality_bias_np[int(action_idx)]
+                        if 0 <= int(action_idx) < min(len(quality_bias_np), MAX_ACTIONS)
+                        else 0.0
+                    ),
+                    "root_bias_suppressed_by_gate": 0.0,
+                    "root_bias_scale_effective": 1.0,
                     **quality_stats,
                     "combat_quality_zero_energy_x_cost_selected": 1.0 if int(action_idx) in zero_energy_x_indices else 0.0,
                     "combat_quality_end_turn_selected": 1.0 if self._semantic_family(legal_actions[int(action_idx)] if isinstance(legal_actions, list) and 0 <= int(action_idx) < len(legal_actions) else {}) == "end_turn" else 0.0,
@@ -5419,26 +6118,32 @@ class MuZeroTrainer:
                     "combat_quality_kaiser_defense_selected": (
                         1.0
                         if (
+                            selected_is_kaiser_encounter
+                            and
                             isinstance(legal_actions, list)
                             and 0 <= int(action_idx) < len(legal_actions)
                             and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
-                            and self._is_kaiser_risk_handling_action(legal_actions[int(action_idx)], self._current_raw_combat_obs())
+                            and self._is_kaiser_risk_handling_action(legal_actions[int(action_idx)], raw_for_selected)
                         )
                         else 0.0
                     ),
                     "combat_quality_kaiser_facing_change_selected": (
                         1.0
                         if (
+                            selected_is_kaiser_encounter
+                            and
                             isinstance(legal_actions, list)
                             and 0 <= int(action_idx) < len(legal_actions)
                             and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
-                            and self._is_kaiser_facing_change_action(legal_actions[int(action_idx)], self._current_raw_combat_obs())
+                            and self._is_kaiser_facing_change_action(legal_actions[int(action_idx)], raw_for_selected)
                         )
                         else 0.0
                     ),
                     "combat_quality_kaiser_pressure_selected": (
                         1.0
                         if (
+                            selected_is_kaiser_encounter
+                            and
                             isinstance(legal_actions, list)
                             and 0 <= int(action_idx) < len(legal_actions)
                             and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
@@ -5449,6 +6154,8 @@ class MuZeroTrainer:
                     "combat_quality_kaiser_risky_end_turn_selected": (
                         1.0
                         if (
+                            selected_is_kaiser_encounter
+                            and
                             isinstance(legal_actions, list)
                             and 0 <= int(action_idx) < len(legal_actions)
                             and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
@@ -5493,6 +6200,13 @@ class MuZeroTrainer:
                 search_root_top1_visit_share.append(float(search_stats.get("root_top1_visit_share", 0.0)))
                 search_root_visit_entropy.append(float(search_stats.get("root_visit_entropy", 0.0)))
                 search_root_bias_scale.append(float(search_stats.get("root_bias_scale", 0.0)))
+                search_root_bias_nonzero.append(float(search_stats.get("root_bias_nonzero", 0.0)))
+                search_root_bias_abs_mean.append(float(search_stats.get("root_bias_abs_mean", 0.0)))
+                search_root_bias_max_abs.append(float(search_stats.get("root_bias_max_abs", 0.0)))
+                search_root_bias_changed_top1.append(float(search_stats.get("root_bias_changed_top1", 0.0)))
+                search_root_bias_selected_delta.append(float(search_stats.get("root_bias_selected_action_delta", 0.0)))
+                search_root_bias_suppressed_by_gate.append(float(search_stats.get("root_bias_suppressed_by_gate", 0.0)))
+                search_root_bias_scale_effective.append(float(search_stats.get("root_bias_scale_effective", 0.0)))
                 search_end_turn_guard_applied.append(float(search_stats.get("end_turn_guard_applied", 0.0)))
                 search_end_turn_guard_forced_alt.append(float(search_stats.get("end_turn_guard_forced_alternative", 0.0)))
                 for metric_key, metric_value in search_stats.items():
@@ -5700,6 +6414,24 @@ class MuZeroTrainer:
                     "enchantment_seen": "combat_quality_enchantment_seen",
                     "affliction_seen": "combat_quality_affliction_seen",
                     "wasteful_end_turn_penalty_applied": "combat_quality_wasteful_end_turn_penalty_applied",
+                    # P0 hardening hooks: HP-cost / X-cost / selection /
+                    # identity / transient leak — sourced from the typed
+                    # helper outputs in combat_env.step diagnostics.
+                    "hp_cost_self_lethal_selected": "combat_quality_hp_cost_self_lethal_selected",
+                    "hp_cost_low_margin_selected": "combat_quality_hp_cost_low_margin_selected",
+                    "hp_cost_unblockable_value": "combat_quality_hp_cost_unblockable_value",
+                    "x_cost_selected": "combat_quality_x_cost_selected",
+                    "x_cost_zero_bad_selected": "combat_quality_x_cost_zero_bad_selected",
+                    "x_cost_zero_selected": "combat_quality_x_cost_zero_selected",
+                    "x_cost_energy_value": "combat_quality_x_cost_energy_value",
+                    "x_cost_star_value": "combat_quality_x_cost_star_value",
+                    "star_x_selected": "combat_quality_star_x_selected",
+                    "selection_text_fallback_selected": "combat_quality_selection_text_fallback_selected",
+                    "selection_runtime_internal_selected": "combat_quality_selection_runtime_internal_selected",
+                    "card_identity_text_fallback_selected": "combat_quality_card_identity_text_fallback_selected",
+                    "card_identity_runtime_internal_selected": "combat_quality_card_identity_runtime_internal_selected",
+                    "transient_leaked": "combat_quality_transient_leaked_selected",
+                    "prior_transient_only_end_turn": "combat_quality_prior_transient_only_end_turn",
                 }
                 for diag_key, stat_key in diag_key_map.items():
                     if diag_key not in action_diagnostics:
@@ -5925,6 +6657,41 @@ class MuZeroTrainer:
                 self.episode_count,
             )
             self.writer.add_scalar(
+                "search/root_bias_nonzero_rate",
+                float(np.mean(search_root_bias_nonzero)) if search_root_bias_nonzero else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_abs_mean",
+                float(np.mean(search_root_bias_abs_mean)) if search_root_bias_abs_mean else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_max_abs",
+                float(np.max(search_root_bias_max_abs)) if search_root_bias_max_abs else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_changed_top1_rate",
+                float(np.mean(search_root_bias_changed_top1)) if search_root_bias_changed_top1 else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_selected_action_delta_mean",
+                float(np.mean(search_root_bias_selected_delta)) if search_root_bias_selected_delta else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_suppressed_by_gate_rate",
+                float(np.mean(search_root_bias_suppressed_by_gate)) if search_root_bias_suppressed_by_gate else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_scale_effective_mean",
+                float(np.mean(search_root_bias_scale_effective)) if search_root_bias_scale_effective else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
                 "search/end_turn_guard_applied",
                 float(np.mean(search_end_turn_guard_applied)) if search_end_turn_guard_applied else 0.0,
                 self.episode_count,
@@ -6034,6 +6801,13 @@ class MuZeroTrainer:
                 "semantic_chain_steps_mean": "semantic_chain_steps_mean",
                 "semantic_drill_rate": "semantic_drill_rate",
                 "root_bias_scale": "root_bias_scale",
+                "root_bias_nonzero": "root_bias_nonzero_rate",
+                "root_bias_abs_mean": "root_bias_abs_mean",
+                "root_bias_max_abs": "root_bias_max_abs",
+                "root_bias_changed_top1": "root_bias_changed_top1_rate",
+                "root_bias_selected_action_delta": "root_bias_selected_action_delta_mean",
+                "root_bias_suppressed_by_gate": "root_bias_suppressed_by_gate_rate",
+                "root_bias_scale_effective": "root_bias_scale_effective_mean",
                 "objective_weight_survival": "objective_weight_survival",
                 "objective_weight_hp": "objective_weight_hp",
                 "objective_weight_build": "objective_weight_build",
@@ -6771,9 +7545,42 @@ class MuZeroTrainer:
                 surprise_pred_mean_sum += surprise_pred_mean
                 surprise_mae_sum += surprise_mae
                 surprise_target_offset_sum += surprise_target_offset
-                future_world_aux_loss_sum += future_world_aux_loss.item()
-                future_bank_state_loss_sum += future_bank_state_loss.item()
-                future_bank_delta_loss_sum += future_bank_delta_loss.item()
+                _future_world_aux_value = future_world_aux_loss.item()
+                _future_bank_state_value = future_bank_state_loss.item()
+                _future_bank_delta_value = future_bank_delta_loss.item()
+                future_world_aux_loss_sum += _future_world_aux_value
+                future_bank_state_loss_sum += _future_bank_state_value
+                future_bank_delta_loss_sum += _future_bank_delta_value
+                _spike_extra_losses = {
+                    "future_bank_occupancy_loss": float(future_bank_occupancy_loss.item()),
+                    "future_bank_token_presence_loss": float(future_bank_token_presence_loss.item()),
+                    "future_bank_token_distribution_loss": float(future_bank_token_distribution_loss.item()),
+                    "future_bank_token_slot_state_loss": float(future_bank_token_slot_state_loss.item()),
+                    "future_bank_token_slot_mask_loss": float(future_bank_token_slot_mask_loss.item()),
+                    "future_bank_token_slot_type_loss": float(future_bank_token_slot_type_loss.item()),
+                    "future_bank_token_slot_zone_loss": float(future_bank_token_slot_zone_loss.item()),
+                    "future_bank_token_slot_source_loss": float(future_bank_token_slot_source_loss.item()),
+                    "policy_loss": float(policy_loss.item()) if torch.is_tensor(policy_loss) else float(policy_loss),
+                    "value_loss": float(value_loss.item()) if torch.is_tensor(value_loss) else float(value_loss),
+                    "reward_loss": float(reward_loss.item()) if torch.is_tensor(reward_loss) else float(reward_loss),
+                    "surprise_loss": float(surprise_loss.item()) if torch.is_tensor(surprise_loss) else float(surprise_loss),
+                }
+                _spike_tier_flags = {
+                    "weak": batch.get("sample_weak_flag"),
+                    "normal": batch.get("sample_normal_flag"),
+                    "elite": batch.get("sample_elite_flag"),
+                    "boss": batch.get("sample_boss_flag"),
+                }
+                self._dump_loss_spike(
+                    step_k=step_k,
+                    future_world_aux_value=_future_world_aux_value,
+                    future_bank_state_value=_future_bank_state_value,
+                    future_bank_delta_value=_future_bank_delta_value,
+                    batch_size=int(action_indices.shape[0]) if hasattr(action_indices, "shape") else None,
+                    extra_losses=_spike_extra_losses,
+                    action_indices=action_indices,
+                    sample_tier_flags=_spike_tier_flags,
+                )
                 future_bank_occupancy_loss_sum += future_bank_occupancy_loss.item()
                 surface_mask_loss_sum += surface_mask_loss.item()
                 surface_count_loss_sum += surface_count_loss.item()
@@ -8337,6 +9144,7 @@ def main():
             curated_subset=args.combat_curated_subset,
             split=args.combat_snapshot_split or None,
             character=args.combat_snapshot_character,
+            encounter_ids=encounter_pool or None,
             encounter_tiers=encounter_tiers or None,
             sample_mode=args.combat_snapshot_sample_mode,
             tier_weights=tier_weights or None,
@@ -9149,11 +9957,38 @@ def main():
             "combat_quality_ceremonial_high_impact_count": "combat_quality_ceremonial_high_impact_count",
             "combat_quality_ceremonial_low_impact_selected": "combat_quality_ceremonial_low_impact_selected",
             "combat_quality_ceremonial_high_impact_selected": "combat_quality_ceremonial_high_impact_selected",
+            "combat_quality_insatiable_sandpit_countdown": "combat_quality_insatiable_sandpit_countdown",
+            "combat_quality_insatiable_sandpit_active": "combat_quality_insatiable_sandpit_active",
+            "combat_quality_insatiable_sandpit_lt3": "combat_quality_insatiable_sandpit_lt3",
+            "combat_quality_insatiable_sandpit_1": "combat_quality_insatiable_sandpit_1",
+            "combat_quality_insatiable_frantic_escape_hand_count": "combat_quality_insatiable_frantic_escape_hand_count",
+            "combat_quality_insatiable_frantic_escape_draw_count": "combat_quality_insatiable_frantic_escape_draw_count",
+            "combat_quality_insatiable_frantic_escape_discard_count": "combat_quality_insatiable_frantic_escape_discard_count",
+            "combat_quality_insatiable_frantic_escape_exhaust_count": "combat_quality_insatiable_frantic_escape_exhaust_count",
+            "combat_quality_insatiable_frantic_escape_total_count": "combat_quality_insatiable_frantic_escape_total_count",
+            "combat_quality_insatiable_frantic_escape_candidate_count": "combat_quality_insatiable_frantic_escape_candidate_count",
+            "combat_quality_insatiable_frantic_escape_available": "combat_quality_insatiable_frantic_escape_available",
+            "combat_quality_insatiable_frantic_escape_urgency": "combat_quality_insatiable_frantic_escape_urgency",
+            "combat_quality_insatiable_frantic_escape_bonus_applied": "combat_quality_insatiable_frantic_escape_bonus_applied",
+            "combat_quality_insatiable_non_escape_at1_penalty_count": "combat_quality_insatiable_non_escape_at1_penalty_count",
+            "combat_quality_insatiable_escape_cycle_risk": "combat_quality_insatiable_escape_cycle_risk",
+            "combat_quality_insatiable_lethal_candidate_count": "combat_quality_insatiable_lethal_candidate_count",
+            "combat_quality_insatiable_frantic_escape_selected": "combat_quality_insatiable_frantic_escape_selected",
+            "combat_quality_insatiable_frantic_escape_missed_lt3": "combat_quality_insatiable_frantic_escape_missed_lt3",
+            "combat_quality_insatiable_frantic_escape_missed_at_1": "combat_quality_insatiable_frantic_escape_missed_at_1",
+            "combat_quality_insatiable_non_escape_at_1_selected": "combat_quality_insatiable_non_escape_at_1_selected",
             "semantic_switch_rate": "semantic_switch_rate",
             "semantic_expansion_rate": "semantic_expansion_rate",
             "semantic_chain_steps_mean": "semantic_chain_steps_mean",
             "semantic_drill_rate": "semantic_drill_rate",
             "root_bias_scale": "root_bias_scale",
+            "root_bias_nonzero": "root_bias_nonzero_rate",
+            "root_bias_abs_mean": "root_bias_abs_mean",
+            "root_bias_max_abs": "root_bias_max_abs",
+            "root_bias_changed_top1": "root_bias_changed_top1_rate",
+            "root_bias_selected_action_delta": "root_bias_selected_action_delta_mean",
+            "root_bias_suppressed_by_gate": "root_bias_suppressed_by_gate_rate",
+            "root_bias_scale_effective": "root_bias_scale_effective_mean",
             "objective_weight_survival": "objective_weight_survival",
             "objective_weight_hp": "objective_weight_hp",
             "objective_weight_build": "objective_weight_build",

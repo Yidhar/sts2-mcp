@@ -393,6 +393,11 @@ class CombatSandboxEnv(gym.Env):
             "wait_timeout_count": 0,
             "stable_no_actions_count": 0,
         }
+        # P0-2: actionability snapshot from the previous bridge result, used
+        # to detect ``transient_only_end_turn`` leaks — when the policy chose
+        # ``end_turn`` after seeing a transient-only-end_turn frontier we
+        # refund the wasteful-end-turn penalty and tag the sample.
+        self._last_actionability: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -411,6 +416,9 @@ class CombatSandboxEnv(gym.Env):
         # TASK-A4: reset per-combat potion-use accounting.
         self._used_potion_count_this_combat = 0
         self._potion_transition_records = []
+        # P0-2: clear actionability cache between combats so a leftover
+        # transient flag from a previous combat does not leak into the next.
+        self._last_actionability = None
 
         # Allow per-reset overrides via options dict
         opts = options or {}
@@ -555,6 +563,20 @@ class CombatSandboxEnv(gym.Env):
         prev_planner_context = self._planner_context()
         pre_action_diagnostics = self._action_quality_diagnostics(prev_obs, self._legal_actions, legal_action)
         end_turn_penalty = self._end_turn_waste_penalty(prev_obs, self._legal_actions, legal_action)
+        # P0-2: when the policy was forced into ``end_turn`` because the
+        # frontier it saw was transient-only-end_turn (draw / shuffle /
+        # animation / queue still resolving), refund the wasteful-end-turn
+        # penalty and tag this transition for the trainer to drop / down-
+        # weight.  ``self._last_actionability`` is the bridge actionability
+        # block from the PRIOR step (the one whose legal actions we are now
+        # consuming).
+        prior_actionability = self._last_actionability if isinstance(self._last_actionability, dict) else None
+        prior_transient_only_end_turn = bool((prior_actionability or {}).get("transient_only_end_turn", False))
+        action_id = str(legal_action.get("action_id") or "") if isinstance(legal_action, dict) else ""
+        transient_leaked_now = bool(prior_transient_only_end_turn and action_id == "end_turn")
+        if transient_leaked_now and end_turn_penalty < 0.0:
+            end_turn_penalty = 0.0
+            self._fast_step_metrics_total["transient_leaked_count"] += 1
 
         bridge_started = time.perf_counter()
         try:
@@ -679,6 +701,52 @@ class CombatSandboxEnv(gym.Env):
         ):
             self._fast_step_metrics_total["stable_no_actions_count"] += 1
             action_diagnostics["transient_only_end_turn"] = False
+        # P0-2: tag the transition with leak status so the trainer can drop
+        # or down-weight it.  ``transient_leaked`` here means: the policy
+        # selected ``end_turn`` while the prior frontier was reported as
+        # transient-only-end_turn — i.e. the policy was effectively forced.
+        action_diagnostics["transient_leaked"] = transient_leaked_now
+        action_diagnostics["prior_transient_only_end_turn"] = prior_transient_only_end_turn
+        # P0-1/4/5/6: surface typed safety / x-cost / selection / identity views
+        # so the trainer-side aggregator picks them up without re-reading the
+        # raw action.  Each block is a small JSON-able dict; nothing on the
+        # GPU path uses them, so wrap in try/except to avoid env-side crashes.
+        try:
+            from .hp_cost_safety import hp_cost_safety_view  # noqa: WPS433
+            from .x_cost_dynamic import x_cost_view  # noqa: WPS433
+            from .selection_typed import selection_view  # noqa: WPS433
+            from .card_identity import card_identity  # noqa: WPS433
+            played_card = legal_action.get("card") if isinstance(legal_action, dict) else None
+            hp_safety = hp_cost_safety_view(legal_action, prev_obs)
+            xcost = x_cost_view(legal_action, prev_obs)
+            sel = selection_view(legal_action)
+            ident = card_identity(played_card)
+            # Rich dicts (offline analysis / future-world aux)
+            action_diagnostics["hp_cost_safety"] = hp_safety
+            action_diagnostics["x_cost"] = xcost
+            action_diagnostics["selection"] = sel
+            action_diagnostics["card_identity"] = ident
+            # Flat scalars (fed into the trainer-side diag_key_map → TB metric
+            # aggregation path; mirrored under combat_quality_* by train.py).
+            action_diagnostics["hp_cost_self_lethal_selected"] = 1.0 if hp_safety.get("self_lethal_now") else 0.0
+            action_diagnostics["hp_cost_low_margin_selected"] = 1.0 if hp_safety.get("low_hp_margin_after_cost") else 0.0
+            action_diagnostics["hp_cost_unblockable_value"] = float(hp_safety.get("hp_loss_unblockable") or 0.0)
+            xres = str(xcost.get("resource") or "none")
+            xcv = float(xcost.get("current_value") or 0.0)
+            action_diagnostics["x_cost_selected"] = 1.0 if xcost.get("has_x_cost") else 0.0
+            action_diagnostics["x_cost_zero_bad_selected"] = 1.0 if xcost.get("zero_x_bad") else 0.0
+            action_diagnostics["x_cost_zero_selected"] = 1.0 if (xcost.get("is_zero") and xcost.get("has_x_cost")) else 0.0
+            action_diagnostics["x_cost_energy_value"] = xcv if xres == "energy" else 0.0
+            action_diagnostics["x_cost_star_value"] = xcv if xres == "stars" else 0.0
+            action_diagnostics["star_x_selected"] = 1.0 if (xcost.get("has_x_cost") and xres == "stars") else 0.0
+            action_diagnostics["selection_text_fallback_selected"] = 1.0 if sel.get("confidence") == "text_fallback" else 0.0
+            action_diagnostics["selection_runtime_internal_selected"] = 1.0 if sel.get("confidence") == "runtime_internal" else 0.0
+            action_diagnostics["card_identity_text_fallback_selected"] = 1.0 if ident.get("confidence") == "text_fallback" else 0.0
+            action_diagnostics["card_identity_runtime_internal_selected"] = 1.0 if ident.get("confidence") == "runtime_internal" else 0.0
+        except Exception:
+            pass
+        # Cache the post-step actionability for the NEXT step's leak check.
+        self._last_actionability = actionability if isinstance(actionability, dict) else None
         from .boss_mechanics import build_boss_mechanics_block, classify_action_boss_mechanism
         boss_mechanics_block = build_boss_mechanics_block(self._last_obs_raw)
         boss_action_mechanism = classify_action_boss_mechanism(
@@ -719,10 +787,20 @@ class CombatSandboxEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> np.ndarray:
+        from .hp_cost_safety import is_self_lethal_action  # noqa: WPS433
+
         mask = np.zeros(MAX_ACTIONS, dtype=bool)
+        raw_obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else None
         for i, action in enumerate(self._legal_actions[:MAX_ACTIONS]):
-            if isinstance(action, dict):
-                mask[i] = True
+            if not isinstance(action, dict):
+                continue
+            # P0-1: hard-mask any action whose unblockable HP cost would
+            # kill the player at resolve time.  Block does not soak
+            # ``cardHpLoss`` / ``nonCardHpLoss`` per STS2 source so the
+            # mask never relies on current block to "save" the action.
+            if is_self_lethal_action(action, raw_obs):
+                continue
+            mask[i] = True
         return mask
 
     def _make_terminal(self):
@@ -1181,7 +1259,7 @@ class CombatSandboxEnv(gym.Env):
         if not isinstance(action, dict):
             return 0.0
         family = self._action_family(action)
-        sel_action = str(action.get("selection_action") or "").strip().lower()
+        sel_action = str(action.get("selection_action") or action.get("selection") or "").strip().lower()
         action_id = str(action.get("action_id") or "")
 
         def _reset_state() -> None:
@@ -1214,8 +1292,13 @@ class CombatSandboxEnv(gym.Env):
 
         if sel_action == "confirm":
             picked = max(int(self._selection_pick_count), 0)
-            max_picks = int(action.get("max_pick") or action.get("selection_max")
-                            or action.get("max") or 0)
+            max_picks = int(
+                action.get("max_pick")
+                or action.get("selection_max")
+                or action.get("max_select")
+                or action.get("max")
+                or 0
+            )
             if max_picks <= 0:
                 max_picks = int(action.get("selection_pick_limit") or 0)
             reward = reentry_penalty
@@ -1242,7 +1325,15 @@ class CombatSandboxEnv(gym.Env):
         # (the click would deselect it). Counting these directly catches
         # the A→B→A→B oscillation pattern that the legacy id-equality check
         # missed.
-        is_deselect = bool(action.get("is_selected"))
+        raw_is_selected = action.get("is_selected")
+        if isinstance(raw_is_selected, bool):
+            is_deselect = raw_is_selected
+        elif isinstance(raw_is_selected, (int, float)):
+            is_deselect = float(raw_is_selected) != 0.0
+        elif isinstance(raw_is_selected, str):
+            is_deselect = raw_is_selected.strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            is_deselect = False
 
         reward = reentry_penalty
         # 1) Same-id repeat (legacy A→A→A check).
@@ -1450,14 +1541,18 @@ class CombatSandboxEnv(gym.Env):
                 reward += float(KAISER_PRESSURE_KILL_BONUS)
                 self._kaiser_pressure_kill_count += 1
 
-            # Lightweight stdout breadcrumb for visibility (every 25 events).
-            if (self._kaiser_facing_change_count + self._kaiser_pressure_kill_count) > 0 and \
-               (self._kaiser_facing_change_count + self._kaiser_pressure_kill_count) % 25 == 0:
+            # Lightweight stdout breadcrumb for visibility (every 25 new events).
+            # Guard on count *change* — modulo would fire on every subsequent step
+            # once the sum lands on a multiple of 25 and falsely look like a hang.
+            current_total = self._kaiser_facing_change_count + self._kaiser_pressure_kill_count
+            last_printed = getattr(self, "_kaiser_response_last_print_total", 0)
+            if current_total > 0 and current_total != last_printed and current_total % 25 == 0:
                 print(
                     f"[combat_env] kaiser_response facing_change={self._kaiser_facing_change_count} "
                     f"pressure_kill={self._kaiser_pressure_kill_count}",
                     flush=True,
                 )
+                self._kaiser_response_last_print_total = current_total
 
         if "ceremonial" in encounter:
             before_one = self._boss_context_max(before_ctx, "one_card_lock")
@@ -2071,12 +2166,21 @@ class CombatSandboxEnv(gym.Env):
         damage_value = float(self._source_preview_metric(card, "damage"))
         if damage_value >= 12.0:
             return "refund_no_followup_but_intrinsic_value"
-        # Mechanism: refund that targets the back-attack side counts as facing-change intrinsic.
-        target = action.get("target") if isinstance(action.get("target"), dict) else {}
-        if isinstance(target, dict) and (target.get("side") or "").strip().lower() in {"left", "right"}:
-            facing = ((raw_obs or {}).get("combat") or {}).get("facing") if isinstance(raw_obs, dict) else None
-            if isinstance(facing, str) and facing.strip().lower() and facing.strip().lower() != target.get("side").strip().lower():
+        # Mechanism: refund that targets the back-attack side counts as
+        # facing-change intrinsic value.  Per P0-3 hardening spec, position
+        # (left/right) MUST come from BACK_ATTACK_{LEFT,RIGHT}_POWER on the
+        # target enemy, not from faction ``side`` strings on the target dict.
+        try:
+            from .boss_kaiser import classify_kaiser_action_mechanism  # noqa: WPS433
+            kaiser_mech = classify_kaiser_action_mechanism(
+                (raw_obs or {}).get("combat") if isinstance(raw_obs, dict) else None,
+                action,
+                player_obs=(raw_obs or {}).get("player") if isinstance(raw_obs, dict) else None,
+            )
+            if kaiser_mech.get("kaiser_changes_facing"):
                 return "refund_no_followup_but_intrinsic_value"
+        except Exception:
+            pass
         return "refund_no_followup_low_value"
 
     @staticmethod

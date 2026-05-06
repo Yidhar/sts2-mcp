@@ -62,6 +62,26 @@ def compact_action_signature(action: Any) -> dict[str, Any]:
         "relic_id": relic.get("id") or action.get("relic_id"),
         "choice_index": action.get("index") if action.get("index") is not None else action.get("choice_index"),
         "price": _coerce_float(action.get("price")),
+        # Combat card-selection surfaces (Purity/净化, retain/discard/transform
+        # choices, etc.) need the toggle state on the action token itself.  Without
+        # these fields replay diagnostics and observation encoders cannot
+        # distinguish "select a fresh card" from "click an already-selected card
+        # and deselect it", which creates pick/deselect loops.
+        "selection": action.get("selection") or action.get("selection_action"),
+        "selection_action": action.get("selection_action") or action.get("selection"),
+        "selection_semantics": action.get("selection_semantics"),
+        "selection_prompt": action.get("selection_prompt"),
+        "is_selected": action.get("is_selected"),
+        "selected_count": _coerce_float(action.get("selected_count")),
+        "min_select": _coerce_float(action.get("min_select")),
+        "max_select": _coerce_float(action.get("max_select")),
+        "remaining_select": _coerce_float(action.get("remaining_select")),
+        "confirm_ready": action.get("confirm_ready"),
+        "can_skip": action.get("can_skip"),
+        "requires_manual_confirmation": action.get("requires_manual_confirmation"),
+        "cancelable": action.get("cancelable"),
+        "selection_ready": action.get("selection_ready"),
+        "opened_age_ms": _coerce_float(action.get("opened_age_ms")),
     }
     result = {key: value for key, value in compact.items() if value is not None}
     semantic = compact_semantic_signature(semantic_action_signature(action))

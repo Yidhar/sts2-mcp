@@ -150,7 +150,29 @@ def infer_player_boss_state(obs: dict[str, Any] | None) -> dict[str, float]:
     discard_cards = _runtime_cards(obs, "discard_pile", "discard_cards")
     exhaust_cards = _runtime_cards(obs, "exhaust_pile", "exhaust_cards")
 
-    sandpit_amount = _power_amount(player_powers, ("sandpit",))
+    # Source-confirmed STS2 ids/classes for The Insatiable's lethal countdown:
+    #   PowerModel id  = POWER.SANDPIT_POWER
+    #   class name     = SandpitPower
+    #
+    # Important ownership detail from the game source:
+    #   TheInsatiable applies SandpitPower to *the enemy creature* and stores
+    #   the affected player/ally in SandpitPower.Target.  FranticEscape also
+    #   searches enemies for SandpitPower before extending the counter.  Older
+    #   synthetic tests and some translated payloads exposed it on the player,
+    #   so read both sides and take the visible countdown maximum.
+    #
+    # Bridge exposes both id/model_id and class_name/kind, but keep the broad
+    # "sandpit" fallback for older payloads that only had localized title text.
+    sandpit_power_needles = (
+        "power.sandpit_power",
+        "sandpitpower",
+        "sandpit_power",
+        "sandpit",
+    )
+    sandpit_amount = max(
+        _power_amount(player_powers, sandpit_power_needles),
+        _power_amount(_enemy_power_entries(obs), sandpit_power_needles),
+    )
     ringing_amount = _power_amount(player_powers, ("ringing",))
     chains_amount = _power_amount(player_powers, ("chains of binding", "chain of binding", "chains_of_binding", "chain_of_binding", "binding"))
     hunger_amount = _power_amount(player_powers, ("hunger",))
@@ -161,6 +183,7 @@ def infer_player_boss_state(obs: dict[str, Any] | None) -> dict[str, float]:
     state["facing_left"] = 1.0 if facing == "left" else 0.0
     state["facing_right"] = 1.0 if facing == "right" else 0.0
     state["sandpit_active"] = float(sandpit_amount > 0.0)
+    state["sandpit_turns"] = float(max(sandpit_amount, 0.0))
     state["sandpit_turns_norm"] = _norm(sandpit_amount, 10.0)
     state["ringing_active"] = float(ringing_amount > 0.0 or _has_power(player_powers, ("ringing",)))
     state["ringing_amount_norm"] = _norm(ringing_amount, 10.0)
@@ -179,6 +202,7 @@ def infer_player_boss_state(obs: dict[str, Any] | None) -> dict[str, float]:
     # Frantic Escape (沙虫/Insatiable 倒计时机制) — needles must cover the
     # actual card-data shape:
     #   id            "CARD.FRANTIC_ESCAPE" → underscore form
+    #   class_name    "FranticEscape"       (new bridge class metadata)
     #   title         "狂乱逃离"           (Chinese)
     #   description   contains "远离" / "沙坑"
     # Original needles tuple ("frantic escape",) only matched a bare-space
@@ -187,6 +211,7 @@ def infer_player_boss_state(obs: dict[str, Any] | None) -> dict[str, float]:
     _FRANTIC_NEEDLES = (
         "frantic_escape",
         "frantic escape",
+        "franticescape",
         "狂乱逃离",
         "card.frantic_escape",
     )
@@ -204,6 +229,14 @@ def infer_player_boss_state(obs: dict[str, Any] | None) -> dict[str, float]:
     state["frantic_escape_draw_norm"] = _norm(frantic_escape_draw, 5.0)
     state["frantic_escape_discard_norm"] = _norm(frantic_escape_discard, 5.0)
     state["frantic_escape_total_norm"] = _norm(frantic_escape_total, 8.0)
+    # Raw counters are intentionally kept out of the dense observation slots.
+    # Planner-side boss priors / diagnostics can consume the concrete countdown
+    # and pile counts without changing the trained network input shape.
+    state["frantic_escape_hand_count"] = float(frantic_escape_hand)
+    state["frantic_escape_draw_count"] = float(frantic_escape_draw)
+    state["frantic_escape_discard_count"] = float(frantic_escape_discard)
+    state["frantic_escape_exhaust_count"] = float(frantic_escape_exhaust)
+    state["frantic_escape_total_count"] = float(frantic_escape_total)
     state["escape_card_available"] = float(frantic_escape_hand > 0)
 
     state["play_budget_lock"] = max(
@@ -584,6 +617,7 @@ def _zero_player_state() -> dict[str, float]:
         "facing_left": 0.0,
         "facing_right": 0.0,
         "sandpit_active": 0.0,
+        "sandpit_turns": 0.0,
         "sandpit_turns_norm": 0.0,
         "ringing_active": 0.0,
         "ringing_amount_norm": 0.0,
@@ -600,6 +634,11 @@ def _zero_player_state() -> dict[str, float]:
         "frantic_escape_draw_norm": 0.0,
         "frantic_escape_discard_norm": 0.0,
         "frantic_escape_total_norm": 0.0,
+        "frantic_escape_hand_count": 0.0,
+        "frantic_escape_draw_count": 0.0,
+        "frantic_escape_discard_count": 0.0,
+        "frantic_escape_exhaust_count": 0.0,
+        "frantic_escape_total_count": 0.0,
         "escape_card_available": 0.0,
         "play_budget_lock": 0.0,
         "doormaker_lock_pressure": 0.0,
@@ -655,22 +694,153 @@ def _combat_enemies(obs: dict[str, Any]) -> list[dict[str, Any]]:
 def _player_power_entries(obs: dict[str, Any]) -> list[dict[str, Any]]:
     combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
     player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
-    for collection in (
+    collections: list[Any] = [
         combat.get("player_powers"),
         player.get("powers"),
         player.get("status"),
-    ):
+    ]
+    player_creature = player.get("creature") if isinstance(player.get("creature"), dict) else {}
+    collections.append(player_creature.get("powers"))
+    for creature in combat.get("player_creatures") if isinstance(combat.get("player_creatures"), list) else []:
+        if isinstance(creature, dict):
+            collections.append(creature.get("powers"))
+    for player_payload in obs.get("players") if isinstance(obs.get("players"), list) else []:
+        if not isinstance(player_payload, dict):
+            continue
+        collections.append(player_payload.get("powers"))
+        creature = player_payload.get("creature") if isinstance(player_payload.get("creature"), dict) else {}
+        collections.append(creature.get("powers"))
+    for player_payload in combat.get("players") if isinstance(combat.get("players"), list) else []:
+        if not isinstance(player_payload, dict):
+            continue
+        collections.append(player_payload.get("powers"))
+        creature = player_payload.get("creature") if isinstance(player_payload.get("creature"), dict) else {}
+        collections.append(creature.get("powers"))
+
+    powers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for collection in collections:
         if isinstance(collection, list):
-            return [power for power in collection if isinstance(power, dict)]
-    return []
+            for power in collection:
+                if not isinstance(power, dict):
+                    continue
+                ident = str(
+                    power.get("id")
+                    or power.get("model_id")
+                    or power.get("power_id")
+                    or power.get("class_name")
+                    or power.get("kind")
+                    or power.get("title")
+                    or power.get("name")
+                    or ""
+                )
+                amount = str(power.get("amount") if power.get("amount") is not None else "")
+                display_amount = str(
+                    power.get("display_amount") if power.get("display_amount") is not None else ""
+                )
+                key = (ident, amount, display_amount)
+                if key in seen:
+                    continue
+                seen.add(key)
+                powers.append(power)
+    return powers
+
+
+def _enemy_power_entries(obs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return all visible enemy-owned powers from live/sim payload shapes.
+
+    Most boss counters are enemy-owned in STS2.  In particular The
+    Insatiable's SandpitPower is applied to the boss creature while targeting
+    the player, so player-only power scans miss the lethal countdown entirely.
+    """
+
+    combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+    collections: list[Any] = []
+
+    def _append_enemy_collections(enemies: Any) -> None:
+        if not isinstance(enemies, list):
+            return
+        for enemy in enemies:
+            if not isinstance(enemy, dict):
+                continue
+            collections.append(enemy.get("powers"))
+            creature = enemy.get("creature") if isinstance(enemy.get("creature"), dict) else {}
+            collections.append(creature.get("powers"))
+
+    _append_enemy_collections(combat.get("enemies"))
+    _append_enemy_collections(combat.get("monsters"))
+    _append_enemy_collections(combat.get("enemy_creatures"))
+    _append_enemy_collections(obs.get("enemies"))
+    _append_enemy_collections(obs.get("monsters"))
+
+    powers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for collection in collections:
+        if isinstance(collection, list):
+            for power in collection:
+                if not isinstance(power, dict):
+                    continue
+                ident = str(
+                    power.get("id")
+                    or power.get("model_id")
+                    or power.get("power_id")
+                    or power.get("class_name")
+                    or power.get("kind")
+                    or power.get("title")
+                    or power.get("name")
+                    or ""
+                )
+                amount = str(power.get("amount") if power.get("amount") is not None else "")
+                display_amount = str(
+                    power.get("display_amount") if power.get("display_amount") is not None else ""
+                )
+                key = (ident, amount, display_amount)
+                if key in seen:
+                    continue
+                seen.add(key)
+                powers.append(power)
+    return powers
 
 
 def _runtime_cards(obs: dict[str, Any], primary_key: str, fallback_key: str) -> list[Any]:
     combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
-    cards = combat.get(primary_key)
-    if not isinstance(cards, list):
-        cards = combat.get(fallback_key)
-    return cards if isinstance(cards, list) else []
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+
+    def _cards_from_value(value: Any) -> tuple[bool, list[Any]]:
+        if isinstance(value, list):
+            return True, value
+        if isinstance(value, dict) and isinstance(value.get("cards"), list):
+            return True, value["cards"]
+        return False, []
+
+    candidates: list[Any] = [
+        combat.get(primary_key),
+        combat.get(fallback_key),
+        player.get(primary_key),
+        player.get(fallback_key),
+    ]
+    player_combat = player.get("combat") if isinstance(player.get("combat"), dict) else {}
+    candidates.extend((player_combat.get(primary_key), player_combat.get(fallback_key)))
+    for player_payload in obs.get("players") if isinstance(obs.get("players"), list) else []:
+        if not isinstance(player_payload, dict):
+            continue
+        combat_payload = player_payload.get("combat") if isinstance(player_payload.get("combat"), dict) else {}
+        candidates.extend((combat_payload.get(primary_key), combat_payload.get(fallback_key)))
+    for player_payload in combat.get("players") if isinstance(combat.get("players"), list) else []:
+        if not isinstance(player_payload, dict):
+            continue
+        combat_payload = player_payload.get("combat") if isinstance(player_payload.get("combat"), dict) else {}
+        candidates.extend((combat_payload.get(primary_key), combat_payload.get(fallback_key)))
+
+    saw_valid_empty = False
+    for candidate in candidates:
+        valid, cards = _cards_from_value(candidate)
+        if not valid:
+            continue
+        if cards:
+            return cards
+        saw_valid_empty = True
+    return [] if saw_valid_empty else []
 
 
 def _count_named_cards(cards: list[Any], needles: tuple[str, ...]) -> int:
@@ -680,7 +850,19 @@ def _count_named_cards(cards: list[Any], needles: tuple[str, ...]) -> int:
             continue
         text = " | ".join(
             str(card.get(key) or "").strip().lower()
-            for key in ("title", "name", "id", "canonical_text", "description", "text")
+            for key in (
+                "title",
+                "name",
+                "id",
+                "card_id",
+                "model_id",
+                "normalized_id",
+                "class_name",
+                "kind",
+                "canonical_text",
+                "description",
+                "text",
+            )
             if str(card.get(key) or "").strip()
         )
         if _matches_any(text, needles):
@@ -791,7 +973,20 @@ def _power_text(power: dict[str, Any] | None) -> str:
     if not isinstance(power, dict):
         return ""
     parts: list[str] = []
-    for key in ("id", "title", "description", "trait", "effect_type", "condition", "state"):
+    for key in (
+        "id",
+        "model_id",
+        "power_id",
+        "class_name",
+        "kind",
+        "title",
+        "name",
+        "description",
+        "trait",
+        "effect_type",
+        "condition",
+        "state",
+    ):
         value = str(power.get(key) or "").strip().lower()
         if value:
             parts.append(value)

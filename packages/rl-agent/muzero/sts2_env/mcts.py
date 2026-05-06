@@ -878,6 +878,16 @@ class MCTS:
                 "objective_weight_build": float(objective_weights[2]),
                 "objective_weight_resource": float(objective_weights[3]),
                 "root_bias_scale": float(self._current_root_bias_scale()),
+                "root_bias_nonzero": 0.0,
+                "root_bias_abs_mean": 0.0,
+                "root_bias_max_abs": 0.0,
+                "root_bias_changed_top1": 0.0,
+                "root_bias_selected_action_delta": 0.0,
+                "root_bias_suppressed_by_gate": 1.0 if (
+                    (not self._root_bias_enabled)
+                    and (self.objective_prior_blend > 0.0 or self.end_turn_prior_bias != 0.0)
+                ) else 0.0,
+                "root_bias_scale_effective": float(self._current_root_bias_scale()),
                 "semantic_switch_depth": float(self.semantic_switch_depth),
                 "semantic_rollout_enabled": 1.0 if self._active_semantic_rollout else 0.0,
                 "semantic_expansion_rate": 0.0,
@@ -926,6 +936,8 @@ class MCTS:
         zero_energy_x_cost_guard_applied = False
         zero_energy_x_cost_guard_forced_alternative = False
         root_bias_scale = self._current_root_bias_scale()
+        pre_root_bias_logits = policy_logits.clone()
+        root_bias_vector = np.zeros(MAX_ACTIONS, dtype=np.float32)
         objective_prior_bias = self._objective_prior_bias(obs, action_mask)
         objective_prior_applied = bool(np.abs(objective_prior_bias).max() > 1e-6)
         if objective_prior_applied:
@@ -935,6 +947,7 @@ class MCTS:
                 device=policy_logits.device,
                 dtype=policy_logits.dtype,
             )
+            root_bias_vector += np.asarray(objective_prior_bias, dtype=np.float32)
         dynamic_end_turn_bias = (
             self._end_turn_bias_value(obs, action_mask) * root_bias_scale
             if self.end_turn_prior_bias != 0.0
@@ -947,8 +960,27 @@ class MCTS:
                 policy_logits = policy_logits.clone()
                 for end_turn_idx in end_turn_indices:
                     policy_logits[end_turn_idx] += dynamic_end_turn_bias
+                    if 0 <= int(end_turn_idx) < MAX_ACTIONS:
+                        root_bias_vector[int(end_turn_idx)] += float(dynamic_end_turn_bias)
                 end_turn_bias_applied = True
         masked_logits = policy_logits - (1.0 - action_mask_tensor) * 1e9
+        pre_root_bias_masked_logits = pre_root_bias_logits - (1.0 - action_mask_tensor) * 1e9
+        legal_bias_mask = np.zeros(MAX_ACTIONS, dtype=bool)
+        action_mask_np = np.asarray(action_mask, dtype=np.float32).reshape(-1)
+        valid_bias_len = min(action_mask_np.size, MAX_ACTIONS)
+        if valid_bias_len > 0:
+            legal_bias_mask[:valid_bias_len] = action_mask_np[:valid_bias_len] > 0.0
+        legal_root_bias = root_bias_vector[legal_bias_mask] if bool(legal_bias_mask.any()) else np.zeros(0, dtype=np.float32)
+        root_bias_nonzero = bool(legal_root_bias.size > 0 and np.any(np.abs(legal_root_bias) > 1e-6))
+        root_bias_abs_mean = float(np.mean(np.abs(legal_root_bias))) if legal_root_bias.size else 0.0
+        root_bias_max_abs = float(np.max(np.abs(legal_root_bias))) if legal_root_bias.size else 0.0
+        if legal_actions:
+            pre_root_top1 = int(pre_root_bias_masked_logits.argmax().item())
+            post_root_top1 = int(masked_logits.argmax().item())
+        else:
+            pre_root_top1 = -1
+            post_root_top1 = -1
+        root_bias_changed_top1 = bool(pre_root_top1 >= 0 and pre_root_top1 != post_root_top1)
         priors = torch.softmax(masked_logits, dim=0).cpu().numpy()
 
         root_action_indices = self._select_candidate_indices(
@@ -1112,6 +1144,18 @@ class MCTS:
             "objective_weight_resource": float(objective_weights[3]),
             "root_objective_value": float(scalarize_objective_components_np(root_value_components, objective_context)),
             "root_bias_scale": float(root_bias_scale),
+            "root_bias_nonzero": 1.0 if root_bias_nonzero else 0.0,
+            "root_bias_abs_mean": float(root_bias_abs_mean),
+            "root_bias_max_abs": float(root_bias_max_abs),
+            "root_bias_changed_top1": 1.0 if root_bias_changed_top1 else 0.0,
+            "root_bias_selected_action_delta": float(
+                root_bias_vector[int(action_idx)] if 0 <= int(action_idx) < MAX_ACTIONS else 0.0
+            ),
+            "root_bias_suppressed_by_gate": 1.0 if (
+                (not self._root_bias_enabled)
+                and (self.objective_prior_blend > 0.0 or self.end_turn_prior_bias != 0.0)
+            ) else 0.0,
+            "root_bias_scale_effective": float(root_bias_scale),
             "semantic_switch_depth": float(self.semantic_switch_depth),
             "semantic_rollout_enabled": 1.0 if self._active_semantic_rollout else 0.0,
             "semantic_expansion_rate": float(np.mean(semantic_expansion_flags)) if semantic_expansion_flags else 0.0,

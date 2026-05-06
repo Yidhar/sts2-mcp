@@ -430,10 +430,17 @@ class SlayTheSpire2EnvV2(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> np.ndarray:
+        from .hp_cost_safety import is_self_lethal_action  # noqa: WPS433
+
         mask = np.zeros(MAX_ACTIONS, dtype=bool)
+        raw_obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else None
         for i, action in enumerate(self._legal_actions[:MAX_ACTIONS]):
-            if isinstance(action, dict):
-                mask[i] = True
+            if not isinstance(action, dict):
+                continue
+            # P0-1: hard-mask self-lethal HP-cost actions in the run-mode env too.
+            if is_self_lethal_action(action, raw_obs):
+                continue
+            mask[i] = True
         return mask
 
     def recover_actionable_state(self, timeout_ms: int | None = None):

@@ -1416,8 +1416,14 @@ internal static partial class BridgeGameApi
 
     private static object BuildPowerFrontierPayload(PowerModel power)
     {
+        var modelId = power.Id.ToString();
+        var className = power.GetType().Name;
         return new
         {
+            id = modelId,
+            model_id = modelId,
+            class_name = className,
+            kind = className,
             title = TextOf(power.Title),
             amount = power.Amount,
             display_amount = power.DisplayAmount
@@ -2528,12 +2534,71 @@ internal static partial class BridgeGameApi
         }
     }
 
+    private static string NormalizeSelectionOperationType(string? semantics)
+    {
+        return (semantics ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "discard" => "discard",
+            "retain" => "retain",
+            "exhaust" => "exhaust",
+            "remove" => "remove",
+            "transform" => "transform",
+            "upgrade" => "upgrade",
+            "copy" => "copy",
+            "add" => "add",
+            "replace" => "replace",
+            "enchant" => "enchant",
+            "afflict" => "afflict",
+            _ => "unknown"
+        };
+    }
+
+    private static object BuildRuntimeSelectionPayload(
+        string? screenType,
+        string? selectionSemantics,
+        int selectedCount,
+        int? minSelect,
+        int? maxSelect,
+        bool? requiresManualConfirmation,
+        string source,
+        string sourceZone,
+        string destinationZone)
+    {
+        var target = maxSelect ?? minSelect;
+        return new
+        {
+            screen_type = string.IsNullOrWhiteSpace(screenType) ? "card_selection" : screenType,
+            operation_type = NormalizeSelectionOperationType(selectionSemantics),
+            source = string.IsNullOrWhiteSpace(source) ? "card_selection" : source,
+            source_zone = sourceZone ?? string.Empty,
+            destination_zone = destinationZone ?? string.Empty,
+            selected_count = selectedCount,
+            min_count = minSelect ?? 0,
+            max_count = maxSelect ?? minSelect ?? 0,
+            selection_required = (target ?? 0) > 0 || requiresManualConfirmation == true,
+            modifier_id = string.Empty,
+            confidence = "runtime_internal"
+        };
+    }
+
     private static void AddDeckUpgradeActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
     {
         if (!IsDeckUpgradeSelectionVisible(context) || context.DeckUpgradeScreen is null)
         {
             return;
         }
+
+        var selectionPrompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen);
+        var typedSelection = BuildRuntimeSelectionPayload(
+            context.DeckUpgradeScreen.GetType().Name,
+            "upgrade",
+            selectedCount: 0,
+            minSelect: 1,
+            maxSelect: 1,
+            requiresManualConfirmation: true,
+            source: "deck_upgrade",
+            sourceZone: "deck",
+            destinationZone: "deck");
 
         for (var index = 0; index < context.DeckUpgradeOptions.Count; index++)
         {
@@ -2553,7 +2618,8 @@ internal static partial class BridgeGameApi
                     kind = "deck_upgrade",
                     upgrade_action = "select_card",
                     selection_semantics = "upgrade",
-                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
+                    selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
                     index,
                     label = $"Select upgrade card {index}: {cardHolder.CardModel.Title}",
                     card = BuildCardPayload(cardHolder.CardModel),
@@ -2576,7 +2642,8 @@ internal static partial class BridgeGameApi
                     kind = "deck_upgrade",
                     upgrade_action = "confirm",
                     selection_semantics = "upgrade",
-                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
+                    selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
                     label = "Confirm upgrade selection",
                     screen = context.Screen
                 },
@@ -2600,7 +2667,8 @@ internal static partial class BridgeGameApi
                     kind = "deck_upgrade",
                     upgrade_action = "cancel",
                     selection_semantics = "upgrade",
-                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
+                    selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
                     label = "Cancel upgrade selection",
                     screen = context.Screen
                 },
@@ -2624,7 +2692,8 @@ internal static partial class BridgeGameApi
                     kind = "deck_upgrade",
                     upgrade_action = "close",
                     selection_semantics = "upgrade",
-                    selection_prompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen),
+                    selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
                     label = "Close upgrade selection",
                     screen = context.Screen
                 },
@@ -2652,6 +2721,32 @@ internal static partial class BridgeGameApi
             context.CardSelectionCloseButton,
             context.CardSelectionSkipButton);
         var selectionSemantics = ResolveCardSelectionSemantics(context.CardSelectionScreen, selectionPrompt, selectionTexts);
+        var selectionState = CaptureCardSelectionUiState(context.CardSelectionScreen);
+        var selectedCount = selectionState.SelectedCount;
+        var minSelect = selectionState.MinSelect;
+        var maxSelect = selectionState.MaxSelect;
+        var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
+        var prefs = GetHiddenFieldValue(context.CardSelectionScreen, "_prefs");
+        var requiresManualConfirmation = GetHiddenPropertyValue<bool>(prefs, "RequireManualConfirmation");
+        var cancelable = GetHiddenPropertyValue<bool>(prefs, "Cancelable");
+        var confirmReady = context.CardSelectionConfirmButton is not null &&
+                           IsNodeVisible(context.CardSelectionConfirmButton) &&
+                           IsButtonEnabled(context.CardSelectionConfirmButton);
+        var canSkip = context.CardSelectionSkipButton is not null &&
+                      IsNodeVisible(context.CardSelectionSkipButton) &&
+                      IsButtonEnabled(context.CardSelectionSkipButton);
+        var selectionReady = selectionState.SelectionReady;
+        var openedAgeMs = selectionState.OpenedAgeMs;
+        var typedSelection = BuildRuntimeSelectionPayload(
+            context.CardSelectionScreen?.GetType().Name,
+            selectionSemantics,
+            selectedCount,
+            minSelect,
+            maxSelect,
+            requiresManualConfirmation,
+            source: "card_selection",
+            sourceZone: string.Empty,
+            destinationZone: string.Empty);
 
         if (context.CardSelectionScreen is NChooseABundleSelectionScreen)
         {
@@ -2675,6 +2770,17 @@ internal static partial class BridgeGameApi
                         selection_action = "select",
                         selection_semantics = selectionSemantics,
                         selection_prompt = selectionPrompt,
+                        typed_selection = typedSelection,
+                        selected_count = selectedCount,
+                        min_select = minSelect,
+                        max_select = maxSelect,
+                        remaining_select = remainingSelect,
+                        confirm_ready = confirmReady,
+                        can_skip = canSkip,
+                        requires_manual_confirmation = requiresManualConfirmation,
+                        cancelable = cancelable,
+                        selection_ready = selectionReady,
+                        opened_age_ms = openedAgeMs,
                         index,
                         label = $"Select bundle {index}",
                         bundle = bundle.Bundle.Select(card => BuildCardPayload(card)).ToArray(),
@@ -2711,6 +2817,17 @@ internal static partial class BridgeGameApi
                         selection_action = "select",
                         selection_semantics = selectionSemantics,
                         selection_prompt = selectionPrompt,
+                        typed_selection = typedSelection,
+                        selected_count = selectedCount,
+                        min_select = minSelect,
+                        max_select = maxSelect,
+                        remaining_select = remainingSelect,
+                        confirm_ready = confirmReady,
+                        can_skip = canSkip,
+                        requires_manual_confirmation = requiresManualConfirmation,
+                        cancelable = cancelable,
+                        selection_ready = selectionReady,
+                        opened_age_ms = openedAgeMs,
                         index = optionIndex,
                         selection_id = selectionId,
                         // 2026-04-27: surface is_selected on the per-card select
@@ -2742,6 +2859,17 @@ internal static partial class BridgeGameApi
                     selection_action = "confirm",
                     selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
+                    selected_count = selectedCount,
+                    min_select = minSelect,
+                    max_select = maxSelect,
+                    remaining_select = remainingSelect,
+                    confirm_ready = confirmReady,
+                    can_skip = canSkip,
+                    requires_manual_confirmation = requiresManualConfirmation,
+                    cancelable = cancelable,
+                    selection_ready = selectionReady,
+                    opened_age_ms = openedAgeMs,
                     label = "Confirm selected cards",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -2766,6 +2894,17 @@ internal static partial class BridgeGameApi
                     selection_action = "cancel",
                     selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
+                    selected_count = selectedCount,
+                    min_select = minSelect,
+                    max_select = maxSelect,
+                    remaining_select = remainingSelect,
+                    confirm_ready = confirmReady,
+                    can_skip = canSkip,
+                    requires_manual_confirmation = requiresManualConfirmation,
+                    cancelable = cancelable,
+                    selection_ready = selectionReady,
+                    opened_age_ms = openedAgeMs,
                     label = "Cancel card selection preview",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -2790,6 +2929,17 @@ internal static partial class BridgeGameApi
                     selection_action = "close",
                     selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
+                    selected_count = selectedCount,
+                    min_select = minSelect,
+                    max_select = maxSelect,
+                    remaining_select = remainingSelect,
+                    confirm_ready = confirmReady,
+                    can_skip = canSkip,
+                    requires_manual_confirmation = requiresManualConfirmation,
+                    cancelable = cancelable,
+                    selection_ready = selectionReady,
+                    opened_age_ms = openedAgeMs,
                     label = "Close card selection",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -2814,6 +2964,17 @@ internal static partial class BridgeGameApi
                     selection_action = "skip",
                     selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
+                    typed_selection = typedSelection,
+                    selected_count = selectedCount,
+                    min_select = minSelect,
+                    max_select = maxSelect,
+                    remaining_select = remainingSelect,
+                    confirm_ready = confirmReady,
+                    can_skip = canSkip,
+                    requires_manual_confirmation = requiresManualConfirmation,
+                    cancelable = cancelable,
+                    selection_ready = selectionReady,
+                    opened_age_ms = openedAgeMs,
                     label = "Skip card selection",
                     screen = context.Screen,
                     screen_type = context.CardSelectionScreen?.GetType().Name
@@ -4331,6 +4492,15 @@ internal static partial class BridgeGameApi
         return new
         {
             id = card.Id.ToString(),
+            model_id = card.Id.ToString(),
+            class_name = card.GetType().Name,
+            kind = card.GetType().Name,
+            // P0-6: stable per-instance handle.  CardModel instances persist
+            // for the lifetime of a card object across draw/discard/exhaust
+            // pile movement and replay/copy triggers, so the CLR's identity
+            // hash is a process-stable per-instance UUID for our purposes.
+            // Hex-formatted to make collisions visually obvious in logs.
+            instance_uuid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(card).ToString("X"),
             current_upgrade_level = card.CurrentUpgradeLevel,
             max_upgrade_level = card.MaxUpgradeLevel,
             title = string.IsNullOrWhiteSpace(card.Title)
@@ -4374,6 +4544,58 @@ internal static partial class BridgeGameApi
                 extra_damage = extraDamage,
                 x_cost_value = xCostValue,
                 x_cost_semantics = xCostSemantics
+            },
+            // P0-1: typed safety payload — Python ``hp_cost_safety_view``
+            // prefers this block over fallback ``effect_preview.hp_loss``.
+            // Block does NOT soak ``cardHpLoss`` / ``nonCardHpLoss`` per
+            // STS2 source, so ``hp_loss_unblockable`` is the canonical
+            // figure; we keep ``self_damage_blockable`` 0 here until the
+            // game exposes a blockable channel.
+            safety = new
+            {
+                hp_cost_kind = hpLossAmount.GetValueOrDefault(0) > 0 ? "unblockable_hp_loss" : "none",
+                hp_cost = hpLossAmount.GetValueOrDefault(0),
+                hp_loss_unblockable = hpLossAmount.GetValueOrDefault(0),
+                self_damage_blockable = 0,
+                max_hp_loss = 0,
+                source_confidence = "runtime_internal"
+            },
+            // P0-4: typed X-cost / Star-X block — Python ``x_cost_view``
+            // prefers this typed block over fallback inference.  Resource
+            // routing distinguishes energy-X (``CostsX``) from Star-X
+            // (``HasStarCostX``).  ``current_value`` is the resolved
+            // X resource at decision time (``xCostValue`` for energy,
+            // ``currentStarCost`` for stars).
+            x_cost = new
+            {
+                has_x_cost = card.EnergyCost.CostsX || card.HasStarCostX,
+                resource = card.EnergyCost.CostsX ? "energy" : (card.HasStarCostX ? "stars" : "none"),
+                current_value = card.EnergyCost.CostsX ? (xCostValue ?? 0) : (card.HasStarCostX ? (currentStarCost ?? 0) : 0),
+                is_zero = (card.EnergyCost.CostsX && (xCostValue ?? 0) == 0) || (card.HasStarCostX && (currentStarCost ?? 0) == 0),
+                effect_scaled = card.EnergyCost.CostsX || card.HasStarCostX,
+                preview_scale_source = card.EnergyCost.CostsX ? "energy_x" : (card.HasStarCostX ? "star_x" : "none"),
+                semantics = string.IsNullOrWhiteSpace(xCostSemantics) ? "unknown" : xCostSemantics
+            },
+            // P0-5: typed selection block — for ``play_card`` actions (i.e.
+            // anything emitted from this BuildCardPayload helper) the
+            // operation_type is "" because card play is not a card-selection
+            // operation.  Downstream Python ``selection_view`` then walks
+            // the typed card_effect_profile or text fallback.  When the
+            // bridge later wires ResolveCardSelectionSemantics through this
+            // block on actual card-selection screens, operation_type +
+            // source_zone + confidence will flip to runtime_internal.
+            selection = new
+            {
+                screen_type = "play_card",
+                operation_type = "",
+                source = "card",
+                source_zone = card.Pile?.Type.ToString() ?? "",
+                destination_zone = "",
+                min_count = 0,
+                max_count = 0,
+                selection_required = false,
+                modifier_id = "",
+                confidence = "runtime_internal"
             },
             dynamic_vars = BuildDynamicVarPayloads(previewVars),
             afflictions,
@@ -5855,8 +6077,14 @@ internal static partial class BridgeGameApi
 
     private static object BuildPowerPayload(PowerModel power)
     {
+        var modelId = power.Id.ToString();
+        var className = power.GetType().Name;
         return new
         {
+            id = modelId,
+            model_id = modelId,
+            class_name = className,
+            kind = className,
             title = TextOf(power.Title),
             description = TryGetDescription(power),
             amount = power.Amount,

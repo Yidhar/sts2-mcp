@@ -71,6 +71,19 @@ def _enemy(
     }
 
 
+def _sandpit_power(amount: int | float) -> dict[str, object]:
+    return {
+        "id": "POWER.SANDPIT_POWER",
+        "model_id": "POWER.SANDPIT_POWER",
+        "class_name": "SandpitPower",
+        "kind": "SandpitPower",
+        "title": "Sandpit",
+        "amount": amount,
+        "display_amount": amount,
+        "stack_type": "Counter",
+    }
+
+
 class BossMechanicsTest(unittest.TestCase):
     def test_kaiser_style_back_attack_and_vantom_damage_cap_detected(self) -> None:
         obs = {
@@ -139,10 +152,239 @@ class BossMechanicsTest(unittest.TestCase):
         enemy_state = context["enemy_states_by_index"][0]
 
         self.assertEqual(player_state["sandpit_active"], 1.0)
+        self.assertEqual(player_state["sandpit_turns"], 3.0)
         self.assertGreater(player_state["frantic_escape_hand_norm"], 0.0)
         self.assertGreater(player_state["frantic_escape_total_norm"], 0.0)
+        self.assertEqual(player_state["frantic_escape_hand_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_draw_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_discard_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_exhaust_count"], 0.0)
+        self.assertEqual(player_state["frantic_escape_total_count"], 3.0)
         self.assertEqual(enemy_state["countdown_active"], 1.0)
         self.assertEqual(enemy_state["escape_card_tax"], 1.0)
+
+    def test_insatiable_real_sandpit_power_id_detected(self) -> None:
+        obs = {
+            "encounter_id": "MONSTER.THE_INSATIABLE",
+            "combat": {
+                "round": 2,
+                "player_powers": [
+                    {
+                        "id": "POWER.SANDPIT_POWER",
+                        "model_id": "POWER.SANDPIT_POWER",
+                        "class_name": "SandpitPower",
+                        "kind": "SandpitPower",
+                        "title": "Sandpit",
+                        "amount": 2,
+                        "display_amount": 2,
+                    },
+                ],
+                "hand": [],
+                "draw_pile": [],
+                "discard_pile": [],
+                "exhaust_pile": [],
+                "enemies": [
+                    _enemy(
+                        enemy_id=22,
+                        model_id="MONSTER.THE_INSATIABLE",
+                        name="The Insatiable",
+                        hp=240,
+                        max_hp=340,
+                    )
+                ],
+            },
+        }
+
+        context = boss_mechanics.build_boss_mechanics_context(obs)
+        player_state = context["player_state"]
+
+        self.assertEqual(player_state["sandpit_active"], 1.0)
+        self.assertEqual(player_state["sandpit_turns"], 2.0)
+
+    def test_insatiable_real_sandpit_power_detected_from_enemy_owner(self) -> None:
+        """The live game owns SandpitPower on The Insatiable, not the player.
+
+        The power targets the player internally, but the bridge's enemy power
+        payload is where the countdown is visible.  This test guards against
+        regressing to player-only scans, which pins all sandpit metrics at 0.
+        """
+        obs = {
+            "encounter_id": "MONSTER.THE_INSATIABLE",
+            "combat": {
+                "round": 3,
+                "player_powers": [],
+                "hand": [
+                    {
+                        "id": "CARD.FRANTIC_ESCAPE",
+                        "model_id": "CARD.FRANTIC_ESCAPE",
+                        "normalized_id": "frantic_escape",
+                        "class_name": "FranticEscape",
+                        "title": "狂乱逃离",
+                    }
+                ],
+                "draw_pile": [],
+                "discard_pile": [],
+                "exhaust_pile": [],
+                "enemies": [
+                    _enemy(
+                        enemy_id=25,
+                        model_id="MONSTER.THE_INSATIABLE",
+                        name="The Insatiable",
+                        hp=240,
+                        max_hp=340,
+                        powers=[_sandpit_power(2)],
+                    )
+                ],
+            },
+        }
+
+        context = boss_mechanics.build_boss_mechanics_context(obs)
+        player_state = context["player_state"]
+        enemy_state = context["enemy_states_by_index"][0]
+
+        self.assertEqual(player_state["sandpit_active"], 1.0)
+        self.assertEqual(player_state["sandpit_turns"], 2.0)
+        self.assertEqual(player_state["frantic_escape_hand_count"], 1.0)
+        self.assertEqual(player_state["escape_card_available"], 1.0)
+        self.assertEqual(enemy_state["countdown_active"], 1.0)
+        self.assertEqual(enemy_state["escape_card_tax"], 1.0)
+
+    def test_insatiable_sandpit_detected_from_live_bridge_nested_player_payload(self) -> None:
+        obs = {
+            "encounter_id": "MONSTER.THE_INSATIABLE",
+            "combat": {
+                "round": 2,
+                # Empty top-level payloads must not mask the real live bridge
+                # creature/player payload.  This mirrors BuildPilePayload shape.
+                "player_powers": [],
+                "hand": [],
+                "draw_pile": [],
+                "discard_pile": [],
+                "exhaust_pile": [],
+                "player_creatures": [
+                    {
+                        "powers": [
+                            {
+                                "id": "POWER.SANDPIT_POWER",
+                                "model_id": "POWER.SANDPIT_POWER",
+                                "class_name": "SandpitPower",
+                                "kind": "SandpitPower",
+                                "title": "Sandpit",
+                                "amount": 1,
+                                "display_amount": 1,
+                            }
+                        ]
+                    }
+                ],
+                "enemies": [
+                    _enemy(
+                        enemy_id=23,
+                        model_id="MONSTER.THE_INSATIABLE",
+                        name="The Insatiable",
+                        hp=240,
+                        max_hp=340,
+                    )
+                ],
+            },
+            "players": [
+                {
+                    "creature": {
+                        "powers": [
+                            {
+                                "id": "POWER.SANDPIT_POWER",
+                                "model_id": "POWER.SANDPIT_POWER",
+                                "class_name": "SandpitPower",
+                                "kind": "SandpitPower",
+                                "title": "Sandpit",
+                                "amount": 1,
+                                "display_amount": 1,
+                            }
+                        ]
+                    },
+                    "combat": {
+                        "hand": {
+                            "pile_type": "Hand",
+                            "count": 1,
+                            "cards": [
+                                {
+                                    "id": "CARD.FRANTIC_ESCAPE",
+                                    "model_id": "CARD.FRANTIC_ESCAPE",
+                                    "normalized_id": "frantic_escape",
+                                    "class_name": "FranticEscape",
+                                    "title": "狂乱逃离",
+                                }
+                            ],
+                        },
+                        "draw_pile": {"pile_type": "Draw", "count": 0, "cards": []},
+                        "discard_pile": {
+                            "pile_type": "Discard",
+                            "count": 1,
+                            "cards": [
+                                {
+                                    "id": "CARD.FRANTIC_ESCAPE",
+                                    "model_id": "CARD.FRANTIC_ESCAPE",
+                                    "normalized_id": "frantic_escape",
+                                    "class_name": "FranticEscape",
+                                }
+                            ],
+                        },
+                        "exhaust_pile": {"pile_type": "Exhaust", "count": 0, "cards": []},
+                    },
+                }
+            ],
+        }
+
+        context = boss_mechanics.build_boss_mechanics_context(obs)
+        player_state = context["player_state"]
+
+        self.assertEqual(player_state["sandpit_active"], 1.0)
+        self.assertEqual(player_state["sandpit_turns"], 1.0)
+        self.assertEqual(player_state["frantic_escape_hand_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_draw_count"], 0.0)
+        self.assertEqual(player_state["frantic_escape_discard_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_exhaust_count"], 0.0)
+        self.assertEqual(player_state["frantic_escape_total_count"], 2.0)
+
+    def test_insatiable_frantic_escape_detected_from_class_metadata_only(self) -> None:
+        obs = {
+            "encounter_id": "MONSTER.THE_INSATIABLE",
+            "combat": {
+                "round": 2,
+                "player_powers": [
+                    {
+                        "id": "POWER.SANDPIT_POWER",
+                        "model_id": "POWER.SANDPIT_POWER",
+                        "class_name": "SandpitPower",
+                        "kind": "SandpitPower",
+                        "title": "Sandpit",
+                        "amount": 2,
+                        "display_amount": 2,
+                    }
+                ],
+                "hand": [{"class_name": "FranticEscape"}],
+                "draw_pile": {"pile_type": "Draw", "count": 1, "cards": [{"kind": "FranticEscape"}]},
+                "discard_pile": [],
+                "exhaust_pile": [],
+                "enemies": [
+                    _enemy(
+                        enemy_id=24,
+                        model_id="MONSTER.THE_INSATIABLE",
+                        name="The Insatiable",
+                        hp=240,
+                        max_hp=340,
+                    )
+                ],
+            },
+        }
+
+        context = boss_mechanics.build_boss_mechanics_context(obs)
+        player_state = context["player_state"]
+
+        self.assertEqual(player_state["sandpit_active"], 1.0)
+        self.assertEqual(player_state["sandpit_turns"], 2.0)
+        self.assertEqual(player_state["frantic_escape_hand_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_draw_count"], 1.0)
+        self.assertEqual(player_state["frantic_escape_total_count"], 2.0)
 
     def test_queen_binding_and_linked_support_detected(self) -> None:
         obs = {

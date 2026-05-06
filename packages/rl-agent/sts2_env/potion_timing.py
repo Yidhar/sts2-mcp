@@ -268,7 +268,10 @@ def compute_potion_timing(
     )
     no_followup = bool(resource_like and not followup_available)
 
-    # Kaiser facing detection — env-side approximation.
+    # Kaiser facing detection — P0-3 mandates the shared resolver instead
+    # of the previous permanent ``facing_change = False`` placeholder.
+    # Position (left/right) of any back-attack enemy comes from
+    # BACK_ATTACK_{LEFT,RIGHT}_POWER on enemy powers, never faction side.
     facing_change = False
     kaiser_risk = 0.0
     try:
@@ -281,6 +284,17 @@ def compute_potion_timing(
             )
     except Exception:
         kaiser_risk = 0.0
+    try:
+        from .boss_kaiser import classify_kaiser_action_mechanism  # noqa: WPS433
+        kaiser_mech = classify_kaiser_action_mechanism(
+            (raw_obs or {}).get("combat") if isinstance(raw_obs, dict) else None,
+            action,
+            player_obs=(raw_obs or {}).get("player") if isinstance(raw_obs, dict) else None,
+        )
+        if kaiser_mech.get("kaiser_changes_facing"):
+            facing_change = True
+    except Exception:
+        pass
 
     mechanism_answer = False
     if facing_change:

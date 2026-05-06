@@ -247,29 +247,48 @@ class BridgeClient:
                         resp_body = resp.json()
                     except Exception:
                         resp_body = resp.text
-                    if resp.status_code == 401 and quick_attempts_left > 1:
-                        # Widened from the narrow "missing_or_invalid_token"
-                        # match: ANY 401 may indicate a stale token after a
-                        # launcher-side restart. Try a fresh session reload
-                        # first, fall back to same credentials if unchanged.
+                    if resp.status_code == 401:
+                        # ANY 401 may indicate a stale token after a
+                        # launcher/watchdog-side game restart that rotated
+                        # the bridge token.  Try a fresh session reload first,
+                        # fall back to forced reload on the canonical
+                        # "missing_or_invalid_token" error code even if the
+                        # session file mtime did not advance.  This handler
+                        # MUST run during both the burst-retry phase AND the
+                        # outage-recovery polling loop — if we only rebound
+                        # during burst-retry, then a watchdog restart that
+                        # happens after burst-retry is exhausted would leave
+                        # us holding the stale token and dying on the next
+                        # outage-recovery probe.
                         rebound = self._maybe_rebind_session(
                             reason=f"401 on {method} /{endpoint}",
                         )
-                        if not rebound and isinstance(resp_body, dict) and str(
-                            resp_body.get("error") or ""
-                        ).strip() == "missing_or_invalid_token":
+                        is_token_error = (
+                            isinstance(resp_body, dict)
+                            and str(resp_body.get("error") or "").strip()
+                            == "missing_or_invalid_token"
+                        )
+                        if not rebound and is_token_error:
                             # Legacy narrow path: re-read even without mtime
                             # change to preserve prior behavior on the one
                             # error code we know means "token rejected".
                             self._load_session()
-                        if rebound or (
-                            isinstance(resp_body, dict)
-                            and str(resp_body.get("error") or "").strip()
-                            == "missing_or_invalid_token"
-                        ):
-                            quick_attempts_left -= 1
-                            time.sleep(self.RETRY_DELAY_S)
-                            continue
+                            rebound = True
+                        if rebound:
+                            if quick_attempts_left > 1:
+                                quick_attempts_left -= 1
+                                time.sleep(self.RETRY_DELAY_S)
+                                continue
+                            # Burst-retry exhausted.  If we are inside the
+                            # outage-recovery polling window, treat the 401 as
+                            # a continuation of the outage (bridge alive but
+                            # token-rotated mid-restart) and keep polling.
+                            if (
+                                outage_deadline is not None
+                                and time.monotonic() < outage_deadline
+                            ):
+                                time.sleep(self.BRIDGE_OUTAGE_POLL_S)
+                                continue
                     raise BridgeError(
                         f"Bridge returned HTTP {resp.status_code} for {method} /{endpoint}: "
                         f"{resp_body}",

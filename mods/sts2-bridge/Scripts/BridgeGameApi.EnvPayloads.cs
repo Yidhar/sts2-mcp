@@ -1014,6 +1014,18 @@ internal static partial class BridgeGameApi
             return "transform";
         }
 
+        if (combined.Contains("消耗", StringComparison.Ordinal) ||
+            combined.Contains("耗尽", StringComparison.Ordinal) ||
+            combined.Contains("exhaust", StringComparison.Ordinal) ||
+            combined.Contains("净化", StringComparison.Ordinal) ||
+            combined.Contains("purity", StringComparison.Ordinal))
+        {
+            // Purity/净化 is a combat-only exhaust selection, not a permanent
+            // remove/purge mutation.  Keep it distinct so RL can treat it as a
+            // hand-state/card-selection mechanism instead of deck removal.
+            return "exhaust";
+        }
+
         if (combined.Contains("弃牌", StringComparison.Ordinal) ||
             combined.Contains("弃置", StringComparison.Ordinal) ||
             combined.Contains("discard", StringComparison.Ordinal))

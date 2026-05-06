@@ -37,6 +37,28 @@ internal static partial class BridgeGameApi
             payload["id"] = cardId;
         }
 
+        // Runtime per-card identity must survive env compaction.  Python-side
+        // lifecycle/selection heads require `runtime_internal` confidence and
+        // deliberately refuse to treat a static card id/title as a concrete
+        // in-combat instance.  Keep all known aliases in case future bridge
+        // payloads rename the field.
+        foreach (var identityKey in new[]
+                 {
+                     "instance_uuid",
+                     "combat_uuid",
+                     "uuid",
+                     "uid",
+                     "instance_id",
+                     "card_instance_id"
+                 })
+        {
+            var identityValue = TryGetNestedString(element.Value, identityKey);
+            if (!string.IsNullOrWhiteSpace(identityValue))
+            {
+                payload[identityKey] = identityValue;
+            }
+        }
+
         var upgradeLevel = TryGetNestedInt(element.Value, "current_upgrade_level");
         if (upgradeLevel.HasValue)
         {
@@ -128,7 +150,57 @@ internal static partial class BridgeGameApi
             payload["card_effect_profile"] = cardEffectProfile;
         }
 
+        var typedSelection = CompactSelectionPayload(TryGetNestedElement(element.Value, "selection"));
+        if (typedSelection is not null)
+        {
+            payload["selection"] = typedSelection;
+        }
+
         return payload;
+    }
+
+    private static object? CompactSelectionPayload(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var key in new[]
+                 {
+                     "screen_type",
+                     "operation_type",
+                     "source",
+                     "source_zone",
+                     "destination_zone",
+                     "modifier_id",
+                     "confidence"
+                 })
+        {
+            var value = TryGetNestedString(element.Value, key);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                payload[key] = value;
+            }
+        }
+
+        foreach (var key in new[] { "min_count", "max_count" })
+        {
+            var value = TryGetNestedInt(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        var required = TryGetNestedBool(element.Value, "selection_required");
+        if (required.HasValue)
+        {
+            payload["selection_required"] = required.Value;
+        }
+
+        return payload.Count > 0 ? payload : null;
     }
 
     private static void AppendCompactCardKeywordsAndFlags(Dictionary<string, object?> payload, JsonElement element)

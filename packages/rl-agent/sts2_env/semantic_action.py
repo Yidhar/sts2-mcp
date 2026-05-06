@@ -171,7 +171,11 @@ def _infer_family(action: dict[str, Any]) -> str:
         return "use_potion"
     if kind == "discard_potion":
         return "discard_potion"
-    if kind in {"card_selection", "combat_select_card", "combat_select"} or action_id.startswith("combat_select"):
+    if (
+        kind in {"card_selection", "combat_select_card", "combat_select"}
+        or action_id.startswith("combat_select")
+        or action_id.startswith("card_selection:")
+    ):
         return "card_selection"
     if action_id == "end_turn":
         return "end_turn"
@@ -433,6 +437,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         target_index = action["target"].get("index")
 
     card_type = _safe_text((source or {}).get("type"))
+    selection_value = _safe_text(action.get("selection") or action.get("selection_action"))
     effect_summary = _safe_text(
         _nested_value(source, "effect_preview", "summary")
         or (source or {}).get("effect")
@@ -450,7 +455,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
             stable_id,
             target_scope,
             _safe_text(action.get("surface")),
-            _safe_text(action.get("selection")),
+            selection_value,
             _safe_text(action.get("selection_semantics")),
             _safe_text(action.get("shop_action")),
             _safe_text((action.get("reward") or {}).get("type")),
@@ -465,6 +470,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
         "stable_id": stable_id,
         "kind": _safe_text(action.get("kind")),
         "action_id": _safe_text(action.get("action_id")),
+        "selection": selection_value,
         "domain": (
             "route" if family in {"map"} else
             "selection" if family in {"card_selection"} else

@@ -140,6 +140,30 @@ class ClassifyActionOffendersTests(unittest.TestCase):
         self.assertIn("strategic_skip_selected", other)
         self.assertNotIn("insatiable_strategic_skip", other)
 
+    def test_insatiable_frantic_escape_missed_at_1_offender(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_insatiable_frantic_escape_missed_at_1=1.0),
+            encounter="the_insatiable_boss",
+            family="play_card",
+        )
+        self.assertIn("insatiable_frantic_escape_missed_at_1", offenders)
+
+    def test_insatiable_frantic_escape_missed_lt3_offender(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_insatiable_frantic_escape_missed_lt3=1.0),
+            encounter="the_insatiable_boss",
+            family="play_card",
+        )
+        self.assertIn("insatiable_frantic_escape_missed_lt3", offenders)
+
+    def test_insatiable_frantic_escape_missed_does_not_fire_on_other_encounter(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_insatiable_frantic_escape_missed_at_1=1.0),
+            encounter="kaiser_crab_boss",
+            family="play_card",
+        )
+        self.assertNotIn("insatiable_frantic_escape_missed_at_1", offenders)
+
     def test_low_quality_potion_selected_only_for_potion_family(self):
         stats = _stats(combat_quality_potion_low_urgency_selected=1.0)
         potion = MuZeroTrainer._classify_action_offenders(

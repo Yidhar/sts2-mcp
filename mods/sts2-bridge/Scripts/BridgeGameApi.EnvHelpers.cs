@@ -139,6 +139,7 @@ internal static partial class BridgeGameApi
 
             case "deck_upgrade":
                 entry["selection"] = TryGetNestedString(payload, "upgrade_action");
+                entry["typed_selection"] = CompactSelectionPayload(TryGetNestedElement(payload, "typed_selection"));
                 entry["index"] = TryGetNestedInt(payload, "index");
                 entry["selection_semantics"] = TryGetNestedString(payload, "selection_semantics");
                 entry["card"] = CompactCardPayload(TryGetNestedElement(payload, "card"));
@@ -147,9 +148,23 @@ internal static partial class BridgeGameApi
 
             case "card_selection":
                 entry["selection"] = TryGetNestedString(payload, "selection_action");
+                entry["typed_selection"] = CompactSelectionPayload(TryGetNestedElement(payload, "typed_selection"));
                 entry["index"] = TryGetNestedInt(payload, "index");
                 entry["selection_id"] = TryGetNestedString(payload, "selection_id");
                 entry["selection_semantics"] = TryGetNestedString(payload, "selection_semantics");
+                entry["selection_prompt"] = TryGetNestedString(payload, "selection_prompt");
+                entry["screen_type"] = TryGetNestedString(payload, "screen_type");
+                entry["is_selected"] = TryGetNestedBool(payload, "is_selected");
+                entry["selected_count"] = TryGetNestedInt(payload, "selected_count");
+                entry["min_select"] = TryGetNestedInt(payload, "min_select");
+                entry["max_select"] = TryGetNestedInt(payload, "max_select");
+                entry["remaining_select"] = TryGetNestedInt(payload, "remaining_select");
+                entry["confirm_ready"] = TryGetNestedBool(payload, "confirm_ready");
+                entry["can_skip"] = TryGetNestedBool(payload, "can_skip");
+                entry["requires_manual_confirmation"] = TryGetNestedBool(payload, "requires_manual_confirmation");
+                entry["cancelable"] = TryGetNestedBool(payload, "cancelable");
+                entry["selection_ready"] = TryGetNestedBool(payload, "selection_ready");
+                entry["opened_age_ms"] = TryGetNestedInt(payload, "opened_age_ms");
                 entry["card"] = CompactCardPayload(TryGetNestedElement(payload, "card"));
                 break;
 
@@ -591,6 +606,13 @@ internal static partial class BridgeGameApi
     /// genuinely stable no-action turn end.  Python short-polls on transient
     /// rather than long-sleeping in the bridge — see TASK-C2.
     /// </summary>
+    // P0-2 actionability payload — additive enrichment of the C1 block.
+    // The Python short-poll budget defaults to 100ms (matches the in-process
+    // helper ``CombatSandboxEnv._fast_step_max_wait_ms``); operators can
+    // override via the ``MUZERO_FAST_STEP_MAX_WAIT_MS`` env var on the
+    // Python side.
+    private const int DefaultActionabilityWaitBudgetMs = 100;
+
     private static object BuildEnvActionabilityPayload(BridgeEnvSnapshot snapshot, BridgeEnvEpisode episode)
     {
         var nonEndTurnCount = 0;
@@ -624,12 +646,28 @@ internal static partial class BridgeGameApi
         var totalActions = snapshot.ResolvedActions?.Count ?? snapshot.LegalActions?.Length ?? 0;
         var hasOnlyEndTurn = nonEndTurnCount == 0 && totalActions >= 1;
         var phaseSettling = string.Equals(snapshot.Phase, "settling", StringComparison.Ordinal);
-        // Conservative pending detection: when phase=="settling" the bridge is
-        // mid-dispatch (animation/queue/shuffle in flight).  We do not split
-        // animation vs queue vs draw_shuffle here because the underlying game
-        // state machine collapses them into the settling phase; a future
-        // refinement can break them apart.
-        var anyPending = phaseSettling;
+        // P0-2: enumerate every direct-state pending reason we can resolve
+        // from the snapshot.  Python's ``wait_for_stable_actionability`` /
+        // transient-leak detector reads this list to label the leak source
+        // without needing to re-derive from ``Phase`` alone.
+        var pendingReasons = new List<string>();
+        if (phaseSettling)
+        {
+            pendingReasons.Add("phase_settling");
+            // The settling phase collapses queue / animation / draw-shuffle /
+            // hand-not-ready signals.  Until the game state machine surfaces
+            // them separately we emit the canonical names so downstream code
+            // can already consume the schema and bridge-side refinements
+            // come through with no Python change.
+            pendingReasons.Add("animation_pending");
+            pendingReasons.Add("queue_pending");
+            if (snapshot.CombatInProgress)
+            {
+                pendingReasons.Add("draw_pending");
+                pendingReasons.Add("hand_not_ready");
+            }
+        }
+        var anyPending = pendingReasons.Count > 0;
         var transientOnlyEndTurn = hasOnlyEndTurn && anyPending && snapshot.CombatInProgress;
         var frontierStable = !anyPending && !transientOnlyEndTurn;
         string reason;
@@ -660,7 +698,11 @@ internal static partial class BridgeGameApi
             animation_pending = phaseSettling,
             draw_shuffle_pending = phaseSettling && snapshot.CombatInProgress,
             legal_non_end_turn_count = nonEndTurnCount,
-            legal_action_count = totalActions
+            legal_action_count = totalActions,
+            // P0-2 additions — direct-state pending reasons + wait budget.
+            pending_reasons = pendingReasons,
+            wait_budget_ms = DefaultActionabilityWaitBudgetMs,
+            schema_version = 2
         };
     }
 
