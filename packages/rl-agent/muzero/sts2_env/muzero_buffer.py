@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
+from combat_snapshot_dataset import normalize_encounter_id
 from sts2_env.objective_heads import (
     HEAD_BUILD_PROGRESS,
     HEAD_HP_PRESERVATION,
@@ -59,6 +60,42 @@ from sts2_env.text_encoder import TEXT_DIM
 
 
 _PACKED_OBS_MARKER = "__packed_obs_v1__"
+MUZERO_REPLAY_SCHEMA_VERSION = "muzero_replay_v2_token_v3_pass_large_caps"
+MUZERO_OBS_SCHEMA_VERSION = "token_v3_attention_obs_v5_pass_large"
+MUZERO_CHECKPOINT_COMPATIBILITY_VERSION = 2
+
+
+def observation_shape_caps() -> Dict[str, int]:
+    """Runtime observation caps that affect packed replay tensor shapes.
+
+    These values are schema-defining: changing any of them makes old packed
+    replay buffers unsafe to mix into a new run even when Python can technically
+    pad/trim arrays.  Checkpoints persist this payload so resume can refuse
+    replay warm-starts after shape-cap upgrades.
+    """
+
+    return {
+        "max_hand": int(MAX_HAND),
+        "max_deck": int(MAX_DECK),
+        "max_enemies": int(MAX_ENEMIES),
+        "max_relics": int(MAX_RELICS),
+        "max_potions": int(MAX_POTIONS),
+        "max_actions": int(MAX_ACTIONS),
+        "max_route_nodes": int(MAX_ROUTE_NODES),
+        "max_world_tokens": int(MAX_WORLD_TOKENS),
+        "max_candidate_local_tokens": int(MAX_CANDIDATE_LOCAL_TOKENS),
+    }
+
+
+def replay_schema_metadata() -> Dict[str, Any]:
+    """Replay/checkpoint schema metadata for compatibility guards."""
+
+    return {
+        "obs_schema_version": MUZERO_OBS_SCHEMA_VERSION,
+        "replay_schema_version": MUZERO_REPLAY_SCHEMA_VERSION,
+        "checkpoint_compatibility_version": int(MUZERO_CHECKPOINT_COMPATIBILITY_VERSION),
+        "observation_shape_caps": observation_shape_caps(),
+    }
 
 _BUILD_ROUTE_DECISION_DOMAINS = frozenset({"build", "route"})
 _BUILD_ROUTE_ACTION_FAMILIES = frozenset({
@@ -225,6 +262,13 @@ def _safe_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _step_action_info(step: Dict[str, Any]) -> Dict[str, Any]:
     info = step.get("action_info")
     return info if isinstance(info, dict) else {}
@@ -314,7 +358,7 @@ def _infer_encounter_tier_from_metadata(metadata: Dict[str, Any] | None) -> str:
 def _encounter_id_from_metadata(metadata: Dict[str, Any] | None) -> str:
     if not isinstance(metadata, dict):
         return ""
-    return _safe_text(metadata.get("encounter_id"))
+    return normalize_encounter_id(metadata.get("encounter_id"))
 
 
 def _is_packed_observation(obs: Dict[str, Any] | None) -> bool:
@@ -452,6 +496,11 @@ class GameTrajectory:
     - semantic_policy: np.ndarray [SEMANTIC_ROLLOUT_SIZE] aggregated semantic policy
     - action_info: compact logical action signature for postmortem analysis
     - search_stats: compact MCTS summary for this decision
+    - decision_diagnostics: compact pre-step legal-action / inventory facts for
+      postmortem analysis.  This must stay small because trajectories can enter
+      replay; large raw observations belong in JSONL diagnostics only.
+    - room_type / encounter_id / encounter_tier / floor / act_id:
+      decision-time progress metadata for tier-specific diagnostics
     """
 
     def __len__(self) -> int:
@@ -473,6 +522,7 @@ class GameTrajectory:
         semantic_policy: np.ndarray | list[float] | None = None,
         action_info: Dict[str, Any] | None = None,
         search_stats: Dict[str, Any] | None = None,
+        decision_diagnostics: Dict[str, Any] | None = None,
         decision_domain: str | None = None,
         phase: str | None = None,
         action_family: str | None = None,
@@ -481,6 +531,11 @@ class GameTrajectory:
         selection: str | None = None,
         wasteful_end_turn: bool = False,
         wasteful_proceed: bool = False,
+        room_type: str | None = None,
+        encounter_id: str | None = None,
+        encounter_tier: str | None = None,
+        floor: float | int | str | None = None,
+        act_id: float | int | str | None = None,
     ) -> None:
         """Add a step to the trajectory.
 
@@ -498,6 +553,7 @@ class GameTrajectory:
             semantic_policy: Aggregated semantic policy target.
             action_info: Compact action signature for debugging / replay analysis.
             search_stats: Compact search summary for this step.
+            decision_diagnostics: Compact pre-step diagnostics for death slices.
         """
         reward_components_arr = np.zeros(NUM_OBJECTIVE_HEADS, dtype=np.float32)
         if reward_components is not None:
@@ -531,6 +587,7 @@ class GameTrajectory:
             "semantic_policy": semantic_policy_arr.astype(np.float32, copy=False),
             "action_info": dict(action_info or {}),
             "search_stats": dict(search_stats or {}),
+            "decision_diagnostics": dict(decision_diagnostics or {}),
             "decision_domain": _safe_text(decision_domain).lower(),
             "phase": _safe_text(phase).lower(),
             "action_family": _safe_text(action_family).lower(),
@@ -539,6 +596,11 @@ class GameTrajectory:
             "selection": _safe_text(selection).lower(),
             "wasteful_end_turn": bool(wasteful_end_turn),
             "wasteful_proceed": bool(wasteful_proceed),
+            "room_type": _safe_text(room_type).lower(),
+            "encounter_id": _safe_text(encounter_id),
+            "encounter_tier": _safe_text(encounter_tier).lower(),
+            "floor": _safe_float_value(floor),
+            "act_id": _safe_float_value(act_id),
             "settlement_bonus": 0.0,
         })
 
@@ -720,11 +782,16 @@ class MuZeroReplayBuffer:
         wasteful_proceed_scale: float = 0.55,
         encounter_tier_weights: Dict[str, float] | None = None,
         encounter_priority_weights: Dict[str, float] | None = None,
+        tier_quota_config: Any = None,
     ):
         """Initialize replay buffer.
 
         Args:
             capacity: Maximum total transitions to store.
+            tier_quota_config: Optional ``TierQuotaConfig`` (see
+                ``muzero.replay_scheduler``) that activates the P0-2 hard
+                batch-level quota path. When ``None``, sample_batch falls
+                back to the legacy soft-weight path.
         """
         self.capacity = max(int(capacity), 1)
         self.trajectories: List[GameTrajectory] = []
@@ -742,10 +809,15 @@ class MuZeroReplayBuffer:
             if str(tier).strip().lower() in _VALID_ENCOUNTER_TIERS and float(weight) >= 0.0
         }
         self.encounter_priority_weights = {
-            str(encounter_id).strip(): max(float(weight), 0.0)
+            normalize_encounter_id(encounter_id): max(float(weight), 0.0)
             for encounter_id, weight in (encounter_priority_weights or {}).items()
-            if str(encounter_id).strip() and float(weight) >= 0.0
+            if normalize_encounter_id(encounter_id) and float(weight) >= 0.0
         }
+        # P0-2 (recovery 2026-05-06): hard per-batch tier quotas. When set,
+        # ``sample_batch`` allocates fixed slot counts per tier and only
+        # falls back to the global priority pool for "flex" slots that no
+        # tier could fill.
+        self.tier_quota_config = tier_quota_config
 
     def _trajectory_priority_multiplier(self, metadata: Dict[str, Any] | None) -> float:
         if not isinstance(metadata, dict) or self.trajectory_quality_bonus <= 0.0:
@@ -995,9 +1067,65 @@ class MuZeroReplayBuffer:
         batch_sample_encounter_weight = []
         batch_sample_sampling_scale = []
 
-        for _ in range(batch_size):
-            # Sample trajectory by priority
-            traj_idx = int(rng.choice(len(self.trajectories), p=priorities_array))
+        # P0-2: when a TierQuotaConfig is set, group trajectories by tier
+        # once and decide a per-slot tier plan up front. The legacy soft
+        # path (``slot_tier_plan is None``) is preserved for backward
+        # compatibility and for any caller that has not yet opted in.
+        slot_tier_plan: list[str] | None = None
+        tier_indices: dict[str, list[int]] = {}
+        tier_priority_arrays: dict[str, np.ndarray] = {}
+        quota_info: dict[str, Any] | None = None
+        if self.tier_quota_config is not None:
+            from muzero.replay_scheduler import allocate_tier_quotas  # local import avoids cycle
+
+            for idx, trajectory in enumerate(self.trajectories):
+                info = self._trajectory_sampling_info(getattr(trajectory, "metadata", None))
+                t = str(info.get("encounter_tier") or "normal").strip().lower()
+                if t not in {"boss", "elite", "normal", "weak"}:
+                    t = "normal"
+                tier_indices.setdefault(t, []).append(idx)
+            for t, idxs in tier_indices.items():
+                pri_slice = np.asarray([priorities_array[i] for i in idxs], dtype=np.float64)
+                pri_sum = float(pri_slice.sum())
+                if not np.isfinite(pri_sum) or pri_sum <= 1e-9:
+                    pri_slice = np.full((len(idxs),), 1.0 / max(1, len(idxs)), dtype=np.float64)
+                else:
+                    pri_slice = pri_slice / pri_sum
+                tier_priority_arrays[t] = pri_slice
+            pool_sizes = {t: len(tier_indices.get(t, [])) for t in ("boss", "elite", "normal", "weak")}
+            allocation = allocate_tier_quotas(
+                batch_size=batch_size,
+                pool_sizes=pool_sizes,
+                config=self.tier_quota_config,
+            )
+            slot_tier_plan = []
+            for tier, count in allocation.quotas.items():
+                slot_tier_plan.extend([tier] * int(count))
+            # Stochastic order so position-related batch-level statistics
+            # (e.g. boundary rate) do not become tier-correlated.
+            rng.shuffle(slot_tier_plan)
+            quota_info = {
+                "quotas": dict(allocation.quotas),
+                "target_counts": dict(allocation.target_counts),
+                "boss_cap_hit": bool(allocation.boss_cap_hit),
+                "normal_min_unfilled": bool(allocation.normal_min_unfilled),
+                "elite_min_unfilled": bool(allocation.elite_min_unfilled),
+                "fallback_count": int(allocation.quotas.get("flex", 0)),
+                "pool_sizes": dict(pool_sizes),
+            }
+
+        for slot in range(batch_size):
+            # Sample trajectory by priority, optionally restricted to a
+            # tier pool when the P0-2 quota plan is active.
+            if slot_tier_plan is not None:
+                tier = slot_tier_plan[slot]
+                if tier == "flex" or not tier_indices.get(tier):
+                    traj_idx = int(rng.choice(len(self.trajectories), p=priorities_array))
+                else:
+                    local = int(rng.choice(len(tier_indices[tier]), p=tier_priority_arrays[tier]))
+                    traj_idx = int(tier_indices[tier][local])
+            else:
+                traj_idx = int(rng.choice(len(self.trajectories), p=priorities_array))
             trajectory = self.trajectories[traj_idx]
             sampling_info = self._trajectory_sampling_info(getattr(trajectory, "metadata", None))
             scalar_targets = trajectory.compute_target_values(discount=discount, n_steps=n_step_return)
@@ -1180,6 +1308,7 @@ class MuZeroReplayBuffer:
             "sample_tier_weight": sample_tier_weight_batch,
             "sample_encounter_weight": sample_encounter_weight_batch,
             "sample_sampling_scale": sample_sampling_scale_batch,
+            "tier_quota_info": quota_info,  # None when quota config is not set
         }
 
     def update_priorities(self, indices: List[int], new_priorities: List[float]) -> None:
@@ -1196,6 +1325,9 @@ class MuZeroReplayBuffer:
     def state_dict(self) -> Dict[str, Any]:
         """Serialize replay buffer contents for checkpointing."""
         return {
+            "schema_version": MUZERO_REPLAY_SCHEMA_VERSION,
+            "checkpoint_compatibility_version": int(MUZERO_CHECKPOINT_COMPATIBILITY_VERSION),
+            "observation_shape_caps": observation_shape_caps(),
             "capacity": int(self.capacity),
             "trajectories": self.trajectories,
             "priorities": list(self.priorities),
@@ -1225,9 +1357,9 @@ class MuZeroReplayBuffer:
             if str(tier).strip().lower() in _VALID_ENCOUNTER_TIERS and float(weight) >= 0.0
         }
         self.encounter_priority_weights = {
-            str(encounter_id).strip(): max(float(weight), 0.0)
+            normalize_encounter_id(encounter_id): max(float(weight), 0.0)
             for encounter_id, weight in (state.get("encounter_priority_weights") or self.encounter_priority_weights).items()
-            if str(encounter_id).strip() and float(weight) >= 0.0
+            if normalize_encounter_id(encounter_id) and float(weight) >= 0.0
         }
         self.trajectories = list(state.get("trajectories") or [])
         self.priorities = [max(float(priority), 1e-6) for priority in (state.get("priorities") or [])]
@@ -1279,6 +1411,26 @@ class MuZeroReplayBuffer:
                     step["wasteful_end_turn"] = False
                 if "wasteful_proceed" not in step or step["wasteful_proceed"] is None:
                     step["wasteful_proceed"] = False
+                if "room_type" not in step or step["room_type"] is None:
+                    step["room_type"] = ""
+                else:
+                    step["room_type"] = _safe_text(step.get("room_type")).lower()
+                if "encounter_id" not in step or step["encounter_id"] is None:
+                    step["encounter_id"] = ""
+                else:
+                    step["encounter_id"] = _safe_text(step.get("encounter_id"))
+                if "encounter_tier" not in step or step["encounter_tier"] is None:
+                    step["encounter_tier"] = ""
+                else:
+                    step["encounter_tier"] = _safe_text(step.get("encounter_tier")).lower()
+                if "floor" not in step or step["floor"] is None:
+                    step["floor"] = 0.0
+                else:
+                    step["floor"] = _safe_float_value(step.get("floor"))
+                if "act_id" not in step or step["act_id"] is None:
+                    step["act_id"] = 0.0
+                else:
+                    step["act_id"] = _safe_float_value(step.get("act_id"))
                 if "settlement_bonus" not in step or step["settlement_bonus"] is None:
                     step["settlement_bonus"] = 0.0
 

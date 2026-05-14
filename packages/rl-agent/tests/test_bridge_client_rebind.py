@@ -257,6 +257,46 @@ class BridgeClientRebindTest(unittest.TestCase):
         self.assertGreaterEqual(call_count["n"], 7)
         self.assertEqual(client._token, "NEW_TOKEN")
 
+    def test_http_502_then_success_is_retried(self) -> None:
+        """Combat sandbox resets can transiently return an empty HTTP 502.
+        The trainer should ride out the blip instead of exiting.
+        """
+        client = BridgeClient(session_path=self._session_path)
+        call_count = {"n": 0}
+
+        def fake_request(method, url, json=None, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _FakeResponse(status_code=502, payload=None, text="")
+            return _FakeResponse(status_code=200, payload={"ok": True})
+
+        with patch.object(client._session, "request", side_effect=fake_request):
+            with patch.object(bridge_client.time, "sleep", lambda *_: None):
+                result = client._request("POST", "env/combat_reset", body={"timeout_ms": 1})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(call_count["n"], 2)
+
+    def test_repeated_http_502_eventually_raises_bridge_error(self) -> None:
+        """Transient HTTP retry must be bounded; repeated gateway errors
+        should raise BridgeError instead of spinning forever.
+        """
+        client = BridgeClient(session_path=self._session_path)
+        client.MAX_BRIDGE_OUTAGE_S = 0.0
+        call_count = {"n": 0}
+
+        def always_502(method, url, json=None, timeout=None):
+            call_count["n"] += 1
+            return _FakeResponse(status_code=502, payload=None, text="bad gateway")
+
+        with patch.object(client._session, "request", side_effect=always_502):
+            with patch.object(bridge_client.time, "sleep", lambda *_: None):
+                with self.assertRaises(BridgeError) as ctx:
+                    client._request("POST", "env/combat_reset", body={"timeout_ms": 1})
+
+        self.assertIn("Bridge unreachable", str(ctx.exception))
+        self.assertGreaterEqual(call_count["n"], 13)
+
 
 if __name__ == "__main__":
     unittest.main()

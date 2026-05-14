@@ -23,6 +23,7 @@ from sts2_env.card_identity import card_identity
 from sts2_env.hp_cost_safety import hp_cost_safety_view
 from sts2_env.selection_typed import selection_view
 from sts2_env.x_cost_dynamic import x_cost_view
+from muzero.training.action_diagnostics_merge import ACTION_DIAGNOSTIC_STAT_KEYS
 
 
 P0_FLAT_KEYS = {
@@ -145,19 +146,18 @@ class FlatDiagKeysContract(unittest.TestCase):
 
 
 class TrainerDiagKeyMapAlignment(unittest.TestCase):
-    """Verify the train.py diag_key_map knows about every P0 flat key.
-
-    Reads train.py source rather than importing it (importing pulls torch).
-    """
+    """Verify the trainer-side action diagnostic merge knows every P0 flat key."""
 
     def test_diag_key_map_contains_p0_keys(self):
-        train_path = RL_AGENT_ROOT / "muzero" / "train.py"
-        text = train_path.read_text(encoding="utf-8-sig")
         for key in P0_FLAT_KEYS:
             with self.subTest(key=key):
-                self.assertIn(f'"{key}":', text, f"diag_key_map missing entry for '{key}'")
+                self.assertIn(
+                    key,
+                    ACTION_DIAGNOSTIC_STAT_KEYS,
+                    f"ACTION_DIAGNOSTIC_STAT_KEYS missing entry for '{key}'",
+                )
         # transient_leaked has its own flat key from P0-2.
-        self.assertIn('"transient_leaked":', text)
+        self.assertIn("transient_leaked", ACTION_DIAGNOSTIC_STAT_KEYS)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,601 @@
+{
+  "run_dir": "logs_muzero/muzero_act1_sandbox_hallway_cq_xcostguard_20260511_201009",
+  "scalar_tag_count": 620,
+  "tail": 20,
+  "metrics": {
+    "buffer/size": {
+      "n": 307,
+      "step": 113669,
+      "last": 13310.0,
+      "avg_tail": 13113.2,
+      "min_tail": 12910.0,
+      "max_tail": 13310.0
+    },
+    "episode/reward": {
+      "n": 307,
+      "step": 2970,
+      "last": 2.6081089973449707,
+      "avg_tail": 0.7388827562332153,
+      "min_tail": -14.159069061279297,
+      "max_tail": 2.990518093109131
+    },
+    "episode/length": {
+      "n": 307,
+      "step": 2970,
+      "last": 20.0,
+      "avg_tail": 21.0,
+      "min_tail": 10.0,
+      "max_tail": 48.0
+    },
+    "episode/death_floor": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.1,
+      "min_tail": 0.0,
+      "max_tail": 1.0
+    },
+    "recent_tail/64/win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.90625,
+      "avg_tail": 0.9140625,
+      "min_tail": 0.90625,
+      "max_tail": 0.9375
+    },
+    "recent_tail/64/weak_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.9090909361839294,
+      "avg_tail": 0.9161130726337433,
+      "min_tail": 0.9090909361839294,
+      "max_tail": 0.9230769276618958
+    },
+    "recent_tail/64/normal_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.9056603908538818,
+      "avg_tail": 0.9134878605604172,
+      "min_tail": 0.9019607901573181,
+      "max_tail": 0.9433962106704712
+    },
+    "recent_tail/64/hard_normal_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.7142857313156128,
+      "avg_tail": 0.771190482378006,
+      "min_tail": 0.7142857313156128,
+      "max_tail": 1.0
+    },
+    "recent_tail/256/win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.9375,
+      "avg_tail": 0.9341796875,
+      "min_tail": 0.9296875,
+      "max_tail": 0.9375
+    },
+    "recent_tail/256/weak_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.9534883499145508,
+      "avg_tail": 0.9550436049699783,
+      "min_tail": 0.9534883499145508,
+      "max_tail": 0.95652174949646
+    },
+    "recent_tail/256/normal_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.934272289276123,
+      "avg_tail": 0.929783609509468,
+      "min_tail": 0.9241706132888794,
+      "max_tail": 0.934272289276123
+    },
+    "recent_tail/256/hard_normal_win_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.7368420958518982,
+      "avg_tail": 0.7637641966342926,
+      "min_tail": 0.7368420958518982,
+      "max_tail": 0.8235294222831726
+    },
+    "combat_quality/bad_pure_block_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/card_block_waste_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.010681818425655364,
+      "min_tail": 0.0,
+      "max_tail": 0.10000000149011612
+    },
+    "combat_quality/card_block_waste_with_progress_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/card_no_damage_pressure_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.010681818425655364,
+      "min_tail": 0.0,
+      "max_tail": 0.10000000149011612
+    },
+    "combat_quality/card_no_damage_pressure_with_progress_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/wasteful_end_turn_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "loss/total": {
+      "n": 123,
+      "step": 113649,
+      "last": 10.010766983032227,
+      "avg_tail": 9.855010557174683,
+      "min_tail": 8.413496017456055,
+      "max_tail": 11.512931823730469
+    },
+    "loss/future_world_aux": {
+      "n": 123,
+      "step": 113649,
+      "last": 0.17617247998714447,
+      "avg_tail": 0.18931883126497268,
+      "min_tail": 0.17105357348918915,
+      "max_tail": 0.21764925122261047
+    },
+    "loss/future_bank_state": {
+      "n": 123,
+      "step": 113649,
+      "last": 0.13359449803829193,
+      "avg_tail": 0.14568088985979558,
+      "min_tail": 0.10307852923870087,
+      "max_tail": 0.21270297467708588
+    },
+    "loss/future_bank_delta": {
+      "n": 123,
+      "step": 113649,
+      "last": 0.06877611577510834,
+      "avg_tail": 0.07132670134305955,
+      "min_tail": 0.06301023066043854,
+      "max_tail": 0.0806681290268898
+    },
+    "loss/future_bank_token_slot_source": {
+      "n": 123,
+      "step": 113649,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/zero_energy_x_cost_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/hp_cost_low_margin_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.009090909361839294,
+      "min_tail": 0.0,
+      "max_tail": 0.1818181872367859
+    },
+    "combat_quality/hp_cost_self_lethal_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/refund_no_followup_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.15000000596046448,
+      "avg_tail": 0.035443724133074284,
+      "min_tail": 0.0,
+      "max_tail": 0.15000000596046448
+    },
+    "combat_quality/refund_no_followup_with_progress_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/refund_no_followup_progress_alternative_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/refund_no_followup_no_alternative_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.05000000074505806,
+      "avg_tail": 0.054712969623506066,
+      "min_tail": 0.0,
+      "max_tail": 0.20000000298023224
+    },
+    "combat_quality/refund_no_followup_progress_alternative_count_mean": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/refund_no_followup_guard_available_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.15000000596046448,
+      "avg_tail": 0.0630463033914566,
+      "min_tail": 0.0,
+      "max_tail": 0.20000000298023224
+    },
+    "combat_quality/refund_no_followup_guard_applied_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.10000000149011612,
+      "avg_tail": 0.005000000074505806,
+      "min_tail": 0.0,
+      "max_tail": 0.10000000149011612
+    },
+    "combat_quality/refund_no_followup_guard_override_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.10000000149011612,
+      "avg_tail": 0.005000000074505806,
+      "min_tail": 0.0,
+      "max_tail": 0.10000000149011612
+    },
+    "combat_quality/refund_no_followup_guard_no_alternative_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.05000000074505806,
+      "avg_tail": 0.054712969623506066,
+      "min_tail": 0.0,
+      "max_tail": 0.20000000298023224
+    },
+    "combat_quality/refund_no_followup_guard_candidate_count_mean": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.15000000596046448,
+      "avg_tail": 0.007500000298023224,
+      "min_tail": 0.0,
+      "max_tail": 0.15000000596046448
+    },
+    "combat_quality/strategic_defer_end_turn_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/potion_low_urgency_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/potion_save_recommended_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/x_cost_zero_guard_applied_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "combat_quality/hp_cost_margin_guard_applied_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/zero_energy_x_cost_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/hp_cost_low_margin_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.009090909361839294,
+      "min_tail": 0.0,
+      "max_tail": 0.1818181872367859
+    },
+    "normal_combat/hp_cost_self_lethal_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/refund_no_followup_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.15000000596046448,
+      "avg_tail": 0.035443724133074284,
+      "min_tail": 0.0,
+      "max_tail": 0.15000000596046448
+    },
+    "normal_combat/refund_no_followup_with_progress_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/refund_no_followup_progress_alternative_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/refund_no_followup_no_alternative_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.05000000074505806,
+      "avg_tail": 0.054712969623506066,
+      "min_tail": 0.0,
+      "max_tail": 0.20000000298023224
+    },
+    "normal_combat/refund_no_followup_guard_applied_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.10000000149011612,
+      "avg_tail": 0.005000000074505806,
+      "min_tail": 0.0,
+      "max_tail": 0.10000000149011612
+    },
+    "normal_combat/strategic_defer_end_turn_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    },
+    "normal_combat/potion_low_urgency_selected_rate": {
+      "n": 307,
+      "step": 2970,
+      "last": 0.0,
+      "avg_tail": 0.0,
+      "min_tail": 0.0,
+      "max_tail": 0.0
+    }
+  },
+  "missing_core_tags": [],
+  "missing_tactical_tags": [
+    "weak_combat/zero_energy_x_cost_selected_rate",
+    "weak_combat/hp_cost_low_margin_selected_rate",
+    "weak_combat/hp_cost_self_lethal_selected_rate",
+    "weak_combat/refund_no_followup_selected_rate",
+    "weak_combat/refund_no_followup_with_progress_selected_rate",
+    "weak_combat/refund_no_followup_progress_alternative_selected_rate",
+    "weak_combat/refund_no_followup_no_alternative_selected_rate",
+    "weak_combat/refund_no_followup_guard_applied_rate",
+    "weak_combat/strategic_defer_end_turn_selected_rate",
+    "weak_combat/potion_low_urgency_selected_rate"
+  ],
+  "gate": {
+    "verdict": "FAIL",
+    "checks": [
+      {
+        "tag": "buffer/size",
+        "field": "last",
+        "op": ">=",
+        "threshold": 3000.0,
+        "actual": 13310.0,
+        "status": "pass"
+      },
+      {
+        "tag": "recent_tail/64/win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.95,
+        "actual": 0.90625,
+        "status": "fail"
+      },
+      {
+        "tag": "recent_tail/64/weak_win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.95,
+        "actual": 0.9090909361839294,
+        "status": "fail"
+      },
+      {
+        "tag": "recent_tail/64/normal_win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.9,
+        "actual": 0.9056603908538818,
+        "status": "pass"
+      },
+      {
+        "tag": "recent_tail/64/hard_normal_win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.75,
+        "actual": 0.7142857313156128,
+        "status": "fail"
+      },
+      {
+        "tag": "recent_tail/256/normal_win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.88,
+        "actual": 0.934272289276123,
+        "status": "pass"
+      },
+      {
+        "tag": "recent_tail/256/hard_normal_win_rate",
+        "field": "last",
+        "op": ">=",
+        "threshold": 0.7,
+        "actual": 0.7368420958518982,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/bad_pure_block_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.002,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/card_block_waste_with_progress_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.005,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/card_no_damage_pressure_with_progress_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.005,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/wasteful_end_turn_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.0,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/zero_energy_x_cost_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.005,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/hp_cost_self_lethal_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.0,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/hp_cost_low_margin_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.005,
+        "actual": 0.009090909361839294,
+        "status": "fail"
+      },
+      {
+        "tag": "combat_quality/refund_no_followup_with_progress_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.005,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "combat_quality/potion_low_urgency_selected_rate",
+        "field": "avg_tail",
+        "op": "<=",
+        "threshold": 0.01,
+        "actual": 0.0,
+        "status": "pass"
+      },
+      {
+        "tag": "loss/total",
+        "field": "max_tail",
+        "op": "<=",
+        "threshold": 100.0,
+        "actual": 11.512931823730469,
+        "status": "pass"
+      },
+      {
+        "tag": "loss/future_world_aux",
+        "field": "max_tail",
+        "op": "<=",
+        "threshold": 10.0,
+        "actual": 0.21764925122261047,
+        "status": "pass"
+      },
+      {
+        "tag": "loss/future_bank_state",
+        "field": "max_tail",
+        "op": "<=",
+        "threshold": 10.0,
+        "actual": 0.21270297467708588,
+        "status": "pass"
+      },
+      {
+        "tag": "loss/future_bank_delta",
+        "field": "max_tail",
+        "op": "<=",
+        "threshold": 5.0,
+        "actual": 0.0806681290268898,
+        "status": "pass"
+      },
+      {
+        "tag": "loss/future_bank_token_slot_source",
+        "field": "max_tail",
+        "op": "<=",
+        "threshold": 0.0,
+        "actual": 0.0,
+        "status": "pass"
+      }
+    ]
+  }
+}

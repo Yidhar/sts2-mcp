@@ -36,13 +36,74 @@ def _stats(**overrides) -> dict[str, float]:
 
 
 class ClassifyActionOffendersTests(unittest.TestCase):
-    def test_bad_end_turn_offender(self):
+    def test_strict_bad_end_turn_offender(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_bad_end_turn_selected=1.0),
+            encounter="construct_menagerie_normal",
+            family="end_turn",
+        )
+        self.assertIn("bad_end_turn", offenders)
+
+    def test_legacy_wasteful_end_turn_is_soft_not_strict_bad(self):
         offenders = MuZeroTrainer._classify_action_offenders(
             search_stats=_stats(combat_quality_wasteful_end_turn_selected=1.0),
             encounter="construct_menagerie_normal",
             family="end_turn",
         )
-        self.assertIn("bad_end_turn", offenders)
+        self.assertIn("soft_or_ambiguous_end_turn", offenders)
+        self.assertNotIn("bad_end_turn", offenders)
+
+    def test_pure_block_and_no_damage_pressure_offenders(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(
+                combat_quality_card_pure_block_selected=1.0,
+                combat_quality_card_no_damage_pressure_selected=1.0,
+            ),
+            encounter="construct_menagerie_normal",
+            family="play_card",
+        )
+        self.assertIn("card_pure_block_selected", offenders)
+        self.assertIn("card_no_damage_pressure_selected", offenders)
+
+    def test_narrow_pure_block_offenders_precede_broad(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(
+                combat_quality_bad_pure_block_selected=1.0,
+                combat_quality_insufficient_block_selected=1.0,
+                combat_quality_pure_block_progress_alternative_selected=1.0,
+                combat_quality_card_pure_block_selected=1.0,
+            ),
+            encounter="frog_knight_normal",
+            family="play_card",
+        )
+        self.assertIn("bad_pure_block_selected", offenders)
+        self.assertIn("insufficient_block_selected", offenders)
+        self.assertIn("pure_block_progress_alternative_selected", offenders)
+        self.assertIn("card_pure_block_selected", offenders)
+        self.assertLess(
+            offenders.index("bad_pure_block_selected"),
+            offenders.index("card_pure_block_selected"),
+        )
+        self.assertLess(
+            offenders.index("insufficient_block_selected"),
+            offenders.index("card_pure_block_selected"),
+        )
+
+    def test_refund_no_followup_with_progress_gets_narrow_offender(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(
+                combat_quality_refund_no_followup_selected=1.0,
+                combat_quality_refund_no_followup_with_progress_selected=1.0,
+            ),
+            encounter="construct_menagerie_normal",
+            family="play_card",
+        )
+        self.assertIn("refund_no_followup_with_progress_selected", offenders)
+        self.assertIn("refund_no_followup_selected", offenders)
+        self.assertLess(
+            offenders.index("refund_no_followup_with_progress_selected"),
+            offenders.index("refund_no_followup_selected"),
+        )
 
     def test_zero_energy_x_cost_emits_low_value_when_no_non_energy_effect(self):
         # zero_energy_x_cost flag alone marks the slot; x_cost_bad_selected (set
@@ -71,6 +132,18 @@ class ClassifyActionOffendersTests(unittest.TestCase):
         )
         self.assertIn("zero_energy_x_cost_selected", offenders)
         self.assertNotIn("x_cost_low_value_selected", offenders)
+
+    def test_hp_cost_selected_offenders(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(
+                combat_quality_hp_cost_self_lethal_selected=1.0,
+                combat_quality_hp_cost_low_margin_selected=1.0,
+            ),
+            encounter="construct_menagerie_normal",
+            family="play_card",
+        )
+        self.assertIn("hp_cost_self_lethal_selected", offenders)
+        self.assertIn("hp_cost_low_margin_selected", offenders)
 
     def test_kaiser_offenders_only_on_kaiser_encounter(self):
         stats = _stats(
@@ -175,6 +248,37 @@ class ClassifyActionOffendersTests(unittest.TestCase):
         )
         self.assertNotIn("low_quality_potion_selected", play_card)
 
+    def test_save_recommended_potion_is_not_unused_offender(self):
+        # ``potion_save_recommended`` means "hold it for later"; the offender
+        # classifier must not invert that semantic and mark a safe end turn as a
+        # missed potion-use opportunity.
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(
+                combat_quality_potion_save_value_mean=0.95,
+                combat_quality_potion_save_recommended_count=2.0,
+            ),
+            encounter="construct_menagerie_normal",
+            family="end_turn",
+        )
+        self.assertNotIn("high_save_value_potion_unused", offenders)
+        self.assertNotIn("urgent_potion_unused", offenders)
+
+    def test_urgent_potion_available_on_end_turn_is_unused_offender(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_potion_prevent_lethal_count=1.0),
+            encounter="construct_menagerie_normal",
+            family="end_turn",
+        )
+        self.assertIn("urgent_potion_unused", offenders)
+
+    def test_urgent_potion_unused_only_on_end_turn(self):
+        offenders = MuZeroTrainer._classify_action_offenders(
+            search_stats=_stats(combat_quality_potion_urgent_count=1.0),
+            encounter="construct_menagerie_normal",
+            family="play_card",
+        )
+        self.assertNotIn("urgent_potion_unused", offenders)
+
     def test_dedup_preserves_first_occurrence_order(self):
         stats = _stats(
             combat_quality_strategic_skip_selected=1.0,
@@ -246,7 +350,7 @@ class DumpActionOffenderTests(unittest.TestCase):
                     ],
                     chosen_idx=2,
                     chosen_action=chosen,
-                    offender_types=["bad_end_turn", "high_save_value_potion_unused"],
+                    offender_types=["bad_end_turn", "urgent_potion_unused"],
                     search_stats=stats,
                     encounter="kaiser_crab_boss",
                     tier="boss",
@@ -258,8 +362,42 @@ class DumpActionOffenderTests(unittest.TestCase):
             payload0 = json.loads(lines[0])
             self.assertEqual(payload0["encounter_id"], "kaiser_crab_boss")
             self.assertEqual(payload0["selected_family"], "end_turn")
-            self.assertIn(payload0["offender_type"], {"bad_end_turn", "high_save_value_potion_unused"})
+            self.assertIn(payload0["offender_type"], {"bad_end_turn", "urgent_potion_unused"})
             self.assertGreaterEqual(len(payload0["alternative_actions"]), 1)
+            self.assertIn("selected_action_detail", payload0)
+            self.assertIn("profile_flags", payload0["alternative_actions"][0])
+
+    def test_hp_cost_fields_in_dump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer = self._stub(Path(tmp))
+            chosen = {
+                "semantic": {"family": "play_card"},
+                "title": "Bloodletting",
+                "card": {"id": "CARD.BLOODLETTING", "title": "Bloodletting"},
+            }
+            stats = _stats(
+                combat_quality_hp_cost_unblockable_value=2.0,
+                combat_quality_hp_cost_low_margin_selected=1.0,
+            )
+            with mock.patch.object(MuZeroTrainer, "_incoming_damage_pressure", return_value=(0.0, 0.0, 3.0)), \
+                 mock.patch.object(MuZeroTrainer, "_semantic_family", return_value="play_card"):
+                trainer._dump_action_offender(
+                    encoded_obs={},
+                    raw_obs={"combat": {"round": 2}, "player": {"max_hp": 80}},
+                    action_mask=np.array([1.0], dtype=np.float32),
+                    legal_actions=[chosen],
+                    chosen_idx=0,
+                    chosen_action=chosen,
+                    offender_types=["hp_cost_low_margin_selected"],
+                    search_stats=stats,
+                    encounter="construct_menagerie_normal",
+                    tier="normal",
+                )
+            payload = json.loads((Path(tmp) / "diagnostics" / "action_offenders.jsonl").read_text(encoding="utf-8").strip())
+            self.assertTrue(payload["reason_flags"]["hp_cost_low_margin_selected"])
+            self.assertEqual(payload["state_summary"]["hp_cost_unblockable_value"], 2.0)
+            self.assertEqual(payload["state_summary"]["hp_cost_low_margin_selected"], 1.0)
+            self.assertIn("hp_loss_unblockable", payload["selected_action_detail"])
 
     def test_no_write_when_no_offenders(self):
         with tempfile.TemporaryDirectory() as tmp:

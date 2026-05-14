@@ -1,0 +1,1859 @@
+"""Self-play episode orchestration for MuZeroTrainer.
+
+This module owns rollout collection only.  Tactical policy heuristics, route
+heuristics, diagnostics, and checkpoint/loss code live in sibling packages so the
+legacy ``muzero.train`` entrypoint does not grow again.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+import time
+from typing import Any
+
+import gymnasium as gym
+import numpy as np
+import torch
+
+from combat_snapshot_dataset import infer_encounter_tier
+from muzero.diagnostics.deck_build_metrics import (
+    CARD_REWARD_TB_KEYS,
+    DEATH_DECK_QUALITY_TB_KEYS,
+    FINAL_DECK_QUALITY_TB_KEYS,
+    CardRewardEpisodeTracker,
+    compact_deck_cards,
+    compute_deck_quality_summary,
+    extract_deck_cards_from_obs_like,
+)
+from muzero.sts2_env.muzero_buffer import GameTrajectory, MuZeroReplayBuffer
+from muzero.training.action_hard_guard_dispatch import ActionHardGuardDispatchMixin
+from muzero.training.checkpointing import dict_obs_to_torch
+from muzero.training.card_reward_guard import CARD_REWARD_GUARD_SEARCH_SUFFIXES
+from muzero.training.decision_constants import TRIVIAL_BUILD_FAST_PATH_REASONS
+from muzero.training.route_heuristic_telemetry import RouteHeuristicTelemetryMixin
+from sts2_env.action_compact import compact_action_signature
+from sts2_env.boss_mechanics import build_boss_mechanics_context
+from sts2_env.objective_heads import NUM_OBJECTIVE_HEADS, compute_transition_objective_rewards
+from sts2_env.observation_v2 import DECISION_DOMAINS, MAX_ACTIONS
+from muzero.sts2_env.semantic_rollout import aggregate_concrete_policy_to_semantic, semantic_rollout_index
+from muzero.training.action_diagnostics_merge import merge_action_diagnostics_into_search_stats
+
+
+class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
+    """Self-play rollout methods mixed into MuZeroTrainer."""
+
+    @staticmethod
+    def _diag_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _diag_nonempty_potion(potion: Any) -> bool:
+        if isinstance(potion, dict):
+            text = str(
+                potion.get("id")
+                or potion.get("potion_id")
+                or potion.get("potionId")
+                or potion.get("model_id")
+                or potion.get("modelId")
+                or potion.get("normalized_id")
+                or potion.get("normalizedId")
+                or potion.get("title")
+                or potion.get("name")
+                or potion.get("label")
+                or potion.get("display_name")
+                or potion.get("displayName")
+                or potion.get("localized_title")
+                or potion.get("localizedTitle")
+                or ""
+            ).strip().lower()
+        else:
+            text = str(potion or "").strip().lower()
+        return text not in {"", "[empty]", "empty", "none", "null"}
+
+    @classmethod
+    def _compact_raw_potion_inventory(cls, raw_obs: dict[str, Any] | None, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Return compact live potion slots for boss/elite death forensics.
+
+        Death slices previously only recorded the selected action.  That made it
+        impossible to prove whether a visually observed potion was actually
+        present in the bridge observation, whether the bridge exposed a legal
+        ``use_potion`` action, or whether the tactical guard missed it.  Keep the
+        payload tiny so storing it on the trajectory does not inflate replay.
+        """
+
+        if not isinstance(raw_obs, dict):
+            return []
+
+        containers: list[tuple[str, Any]] = [("$", raw_obs)]
+        for key in ("state", "raw_obs", "transition_state", "observation", "obs"):
+            payload = raw_obs.get(key)
+            if isinstance(payload, dict):
+                containers.append((f"$.{key}", payload))
+
+        def _candidate_lists(obs: dict[str, Any], prefix: str) -> list[tuple[str, Any]]:
+            candidates: list[tuple[str, Any]] = [(f"{prefix}.potions", obs.get("potions"))]
+            player = obs.get("player")
+            if isinstance(player, dict):
+                candidates.append((f"{prefix}.player.potions", player.get("potions")))
+            run = obs.get("run")
+            if isinstance(run, dict):
+                candidates.append((f"{prefix}.run.potions", run.get("potions")))
+            combat = obs.get("combat")
+            if isinstance(combat, dict):
+                candidates.append((f"{prefix}.combat.potions", combat.get("potions")))
+                combat_player = combat.get("player")
+                if isinstance(combat_player, dict):
+                    candidates.append((f"{prefix}.combat.player.potions", combat_player.get("potions")))
+            return candidates
+
+        for prefix, obs in containers:
+            if not isinstance(obs, dict):
+                continue
+            for source, potions in _candidate_lists(obs, prefix):
+                if not isinstance(potions, list):
+                    continue
+                compact: list[dict[str, Any]] = []
+                for slot, potion in enumerate(potions[: max(1, int(limit))]):
+                    if not cls._diag_nonempty_potion(potion):
+                        continue
+                    if isinstance(potion, dict):
+                        item: dict[str, Any] = {
+                            "slot": int(slot),
+                            "id": (
+                                potion.get("id")
+                                or potion.get("potion_id")
+                                or potion.get("potionId")
+                                or potion.get("model_id")
+                                or potion.get("modelId")
+                                or potion.get("normalized_id")
+                                or potion.get("normalizedId")
+                            ),
+                            "title": (
+                                potion.get("title")
+                                or potion.get("name")
+                                or potion.get("label")
+                                or potion.get("display_name")
+                                or potion.get("displayName")
+                                or potion.get("localized_title")
+                                or potion.get("localizedTitle")
+                            ),
+                            "rarity": potion.get("rarity"),
+                            "empty": bool(potion.get("empty", False)),
+                            "is_usable": potion.get("is_usable", potion.get("usable")),
+                            "is_queued": potion.get("is_queued"),
+                            "has_been_removed_from_state": potion.get("has_been_removed_from_state"),
+                            "source": source,
+                        }
+                        compact.append({k: v for k, v in item.items() if v not in (None, "")})
+                    else:
+                        compact.append({"slot": int(slot), "title": str(potion), "source": source})
+                if compact:
+                    return compact
+        return []
+
+    def _compact_pre_step_combat_diagnostics(
+        self,
+        *,
+        encoded_obs: dict[str, Any],
+        raw_obs: dict[str, Any] | None,
+        legal_actions: list[Any],
+        action_mask: Any,
+        selected_idx: int,
+        encounter_tier: str,
+        action_family: str,
+    ) -> dict[str, Any]:
+        """Small pre-step diagnostics embedded in death slices.
+
+        This is intentionally narrower than raw observation dumps.  The primary
+        regression it catches is: "boss death while a survival potion (Lucky
+        Tonic/幸运药剂) was visible but not selected."  It records both sides of
+        the question:
+
+        * current potion inventory from the raw bridge state;
+        * legal potion actions and their timing classification before env.step.
+        """
+
+        if not isinstance(legal_actions, list):
+            legal_actions = []
+        try:
+            mask_np = np.asarray(action_mask, dtype=np.float32).reshape(-1)
+        except Exception:
+            mask_np = np.zeros(0, dtype=np.float32)
+        legal_count = min(len(legal_actions), int(mask_np.shape[0]) if mask_np.ndim == 1 else 0, MAX_ACTIONS)
+        if legal_count <= 0:
+            return {}
+
+        inventory = self._compact_raw_potion_inventory(raw_obs, limit=5)
+        potion_actions: list[dict[str, Any]] = []
+        current_energy = self._diag_float(self._combat_energy(encoded_obs, raw_obs), 0.0)
+
+        for idx in range(legal_count):
+            if idx >= int(mask_np.shape[0]) or float(mask_np[idx]) <= 0.0:
+                continue
+            action = legal_actions[idx]
+            if not isinstance(action, dict):
+                continue
+            family = self._semantic_family(action)
+            if family not in {"use_potion", "potion"}:
+                continue
+            signature = compact_action_signature(action)
+            timing: dict[str, Any] = {}
+            try:
+                profile = self._potion_timing_profile(
+                    action,
+                    int(idx),
+                    None,
+                    raw_obs,
+                    legal_actions,
+                    mask_np,
+                    current_energy,
+                )
+            except Exception:
+                profile = {}
+            if isinstance(profile, dict):
+                for key in (
+                    "potion_id",
+                    "urgent",
+                    "prevent_lethal",
+                    "prevent_major_loss",
+                    "buffer_like",
+                    "critical_hp_survival_tool",
+                    "resource_survival_tool",
+                    "low_urgency",
+                    "save_recommended",
+                    "lethal",
+                    "damage",
+                    "block",
+                    "heal",
+                    "prevent_damage",
+                    "incoming",
+                    "current_block",
+                    "hp",
+                    "max_hp",
+                    "threat_gap",
+                    "use_quality",
+                    "waste_risk",
+                    "save_value",
+                ):
+                    value = profile.get(key)
+                    if isinstance(value, (bool, int, float, str)):
+                        timing[key] = value
+            potion_actions.append(
+                {
+                    "index": int(idx),
+                    "action_id": signature.get("action_id"),
+                    "title": signature.get("title"),
+                    "potion_id": signature.get("potion_id") or timing.get("potion_id"),
+                    "target_index": signature.get("target_index"),
+                    "timing": {k: v for k, v in timing.items() if v not in (None, "")},
+                }
+            )
+
+        selected_signature: dict[str, Any] = {}
+        if 0 <= int(selected_idx) < len(legal_actions):
+            selected_signature = compact_action_signature(legal_actions[int(selected_idx)])
+
+        # Store boss/elite combat decisions even if potion_actions is empty: that
+        # is how we can later distinguish "potion existed but no legal action"
+        # from "no potion in the bridge state".  For hallway fights, keep only
+        # potion-bearing decisions to avoid replay bloat.
+        tier = str(encounter_tier or "").strip().lower()
+        if tier not in {"elite", "boss"} and not potion_actions and not inventory:
+            return {}
+
+        incoming = current_block = hp = max_hp = threat_gap = 0.0
+        hp_valid = False
+        try:
+            incoming, current_block, hp = self._incoming_damage_pressure(raw_obs)
+            hp, max_hp, hp_valid = self._player_hp_values(raw_obs)
+            threat_gap = max(0.0, float(incoming) - float(current_block))
+        except Exception:
+            pass
+
+        return {
+            "schema": "combat_pre_step_v1",
+            "legal_action_count": int(legal_count),
+            "legal_potion_action_count": int(len(potion_actions)),
+            "raw_potion_count": int(len(inventory)),
+            "raw_potions": inventory,
+            "legal_potion_actions": potion_actions[:5],
+            "selected": {
+                "index": int(selected_idx),
+                "family": str(action_family or ""),
+                "action_id": selected_signature.get("action_id"),
+                "title": selected_signature.get("title"),
+                "potion_id": selected_signature.get("potion_id"),
+            },
+            "combat": {
+                "hp": float(hp),
+                "max_hp": float(max_hp),
+                "hp_valid": bool(hp_valid),
+                "incoming": float(incoming),
+                "current_block": float(current_block),
+                "threat_gap": float(threat_gap),
+                "energy": float(current_energy),
+            },
+        }
+
+    @staticmethod
+    def _diag_is_lucky_potion_payload(payload: Any) -> bool:
+        """Best-effort Lucky Tonic / 幸运药剂 detector for diagnostics payloads."""
+
+        parts: list[str] = []
+
+        def _collect(obj: Any, depth: int = 0) -> None:
+            if depth > 4:
+                return
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(key, str):
+                        parts.append(key)
+                    if isinstance(value, (dict, list, tuple)):
+                        _collect(value, depth + 1)
+                    elif value is not None:
+                        parts.append(str(value))
+            elif isinstance(obj, (list, tuple)):
+                for value in obj[:16]:
+                    _collect(value, depth + 1)
+            elif obj is not None:
+                parts.append(str(obj))
+
+        _collect(payload)
+        text = " ".join(parts).lower()
+        return bool(
+            "lucky_tonic" in text
+            or "lucky tonic" in text
+            or ("lucky" in text and "tonic" in text)
+            or "幸运补剂" in text
+            or "幸运药剂" in text
+            or "幸運補劑" in text
+            or "幸運藥劑" in text
+        )
+
+    @classmethod
+    def _episode_potion_history_from_steps(
+        cls,
+        steps: list[dict[str, Any]],
+        *,
+        encounter_id: str = "",
+        tail_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Aggregate compact potion visibility/legality/selection for death slices.
+
+        ``final_potion_dump`` alone is not enough to debug "died with Lucky
+        unused": the potion might have appeared earlier, been legal only on some
+        turns, been selected, or disappeared after a state-sync-delayed use.  This
+        helper reconstructs a tiny, replay-safe history from the per-step
+        ``decision_diagnostics`` stored before ``env.step``.
+        """
+
+        encounter_upper = str(encounter_id or "").strip().upper()
+        max_tail = max(1, int(tail_limit))
+        last_seen_potions: list[dict[str, Any]] = []
+        last_seen_legal_potion_actions: list[dict[str, Any]] = []
+        selected_potion_actions: list[dict[str, Any]] = []
+        lucky_seen = False
+        lucky_legal = False
+        lucky_selected = False
+        matched_steps = 0
+
+        for step_index, step in enumerate(steps or []):
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("decision_domain") or "").strip().lower() != "combat":
+                continue
+            step_encounter = str(step.get("encounter_id") or "").strip().upper()
+            if encounter_upper and step_encounter and step_encounter != encounter_upper:
+                continue
+            diagnostics = step.get("decision_diagnostics")
+            if not isinstance(diagnostics, dict):
+                continue
+            matched_steps += 1
+
+            raw_potions = diagnostics.get("raw_potions")
+            if isinstance(raw_potions, list) and raw_potions:
+                compact_raw = [p for p in raw_potions[:5] if isinstance(p, dict)]
+                if compact_raw:
+                    last_seen_potions = compact_raw
+                    lucky_seen = lucky_seen or any(cls._diag_is_lucky_potion_payload(p) for p in compact_raw)
+
+            legal_potions = diagnostics.get("legal_potion_actions")
+            if isinstance(legal_potions, list) and legal_potions:
+                compact_legal = [p for p in legal_potions[:5] if isinstance(p, dict)]
+                if compact_legal:
+                    last_seen_legal_potion_actions = compact_legal
+                    lucky_legal = lucky_legal or any(cls._diag_is_lucky_potion_payload(p) for p in compact_legal)
+
+            selected = diagnostics.get("selected")
+            if isinstance(selected, dict):
+                selected_family = str(selected.get("family") or "").strip().lower()
+                selected_action_id = str(selected.get("action_id") or "").strip().lower()
+                selected_is_potion = bool(
+                    selected_family in {"use_potion", "potion"}
+                    or selected_action_id.startswith("use_potion")
+                    or selected.get("potion_id")
+                )
+                if selected_is_potion:
+                    selected_record = {
+                        "step_index": int(step_index),
+                        "index": selected.get("index"),
+                        "family": selected.get("family"),
+                        "action_id": selected.get("action_id"),
+                        "title": selected.get("title"),
+                        "potion_id": selected.get("potion_id"),
+                    }
+                    selected_potion_actions.append(
+                        {k: v for k, v in selected_record.items() if v not in (None, "")}
+                    )
+                    lucky_selected = lucky_selected or cls._diag_is_lucky_potion_payload(selected)
+
+        return {
+            "potion_history_schema": "episode_potion_history_v1",
+            "potion_history_steps_this_combat": int(matched_steps),
+            "last_seen_potions_this_combat": list(last_seen_potions[-5:]),
+            "last_seen_legal_potion_actions_this_combat": list(last_seen_legal_potion_actions[-5:]),
+            "selected_potion_actions_this_combat": list(selected_potion_actions[-max_tail:]),
+            "lucky_seen_this_combat": bool(lucky_seen),
+            "lucky_legal_this_combat": bool(lucky_legal),
+            "lucky_selected_this_combat": bool(lucky_selected),
+        }
+
+    def _obs_list_to_torch(self, obs_list: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """Convert a list of dict observations into a batched torch dict."""
+        obs_torch_batch: dict[str, torch.Tensor] = {}
+        obs_numpy_batch = MuZeroReplayBuffer.batch_observations(obs_list)
+        for key, value in obs_numpy_batch.items():
+            obs_torch_batch[key] = torch.from_numpy(value).to(self.device)
+        return obs_torch_batch
+
+    def compute_temperature(self, step: int, total_steps: int) -> float:
+        """Compute temperature schedule: linear decay from 1.0 to 0.1."""
+        progress = min(step / max(total_steps, 1), 1.0)
+        return 1.0 - progress * 0.9
+
+    def self_play_episode_on_env(self, env: gym.Env, *, temperature: float = 1.0) -> tuple[float, int]:
+        """Run one self-play episode on the provided environment.
+
+        This is used by the combat-sandbox multi-env harness so the trainer can
+        round-robin across multiple live bridge sessions without changing the
+        full-run single-env path.
+        """
+        previous_env = self.env
+        self.env = env
+        try:
+            return self.self_play_episode(temperature=temperature)
+        finally:
+            self.env = previous_env
+
+    def self_play_episode(self, temperature: float = 1.0) -> tuple[float, int]:
+        """Run one self-play episode using MCTS action selection.
+
+        Args:
+            temperature: Temperature for action selection.
+
+        Returns:
+            (episode_reward, episode_length)
+        """
+        obs, info = self.env.reset()
+        initial_info = dict(info)
+        trajectory = GameTrajectory()
+
+        episode_reward = 0.0
+        episode_length = 0
+        progress_snapshots: list[dict[str, Any]] = []
+        seen_floors: set[int] = set()
+        elite_floors: set[int] = set()
+        boss_floors: set[int] = set()
+        death_floor = 0.0
+        used_potion_count_episode = 0
+        used_potion_count_by_encounter: defaultdict[str, int] = defaultdict(int)
+        used_potion_count_by_room: defaultdict[str, int] = defaultdict(int)
+        potion_transition_records_episode: list[dict[str, Any]] = []
+        search_root_candidates: list[float] = []
+        search_root_selectable_children: list[float] = []
+        search_expanded_children: list[float] = []
+        search_predicted_legal: list[float] = []
+        search_surface_keep: list[float] = []
+        search_max_depths: list[float] = []
+        search_depths: list[float] = []
+        search_concrete_depths: list[float] = []
+        search_depth_ge_2: list[float] = []
+        search_depth_ge_3: list[float] = []
+        search_semantic_expansion: list[float] = []
+        search_semantic_switch: list[float] = []
+        search_semantic_chain_steps: list[float] = []
+        search_semantic_drill: list[float] = []
+        search_root_top1_visit_share: list[float] = []
+        search_root_visit_entropy: list[float] = []
+        search_num_simulations: list[float] = []
+        search_root_bias_scale: list[float] = []
+        search_root_bias_nonzero: list[float] = []
+        search_root_bias_abs_mean: list[float] = []
+        search_root_bias_max_abs: list[float] = []
+        search_root_bias_changed_top1: list[float] = []
+        search_root_bias_selected_delta: list[float] = []
+        search_root_bias_suppressed_by_gate: list[float] = []
+        search_root_bias_scale_effective: list[float] = []
+        search_end_turn_guard_applied: list[float] = []
+        search_end_turn_guard_forced_alt: list[float] = []
+        domain_search_stats: dict[str, dict[str, list[float]]] = {
+            domain: defaultdict(list) for domain in DECISION_DOMAINS
+        }
+        decision_counts: dict[str, int] = {domain: 0 for domain in DECISION_DOMAINS}
+        fast_path_counts: dict[str, int] = {domain: 0 for domain in DECISION_DOMAINS}
+        fast_path_reason_counts: dict[str, int] = defaultdict(int)
+        selected_family_counts: dict[str, dict[str, int]] = {
+            domain: defaultdict(int) for domain in DECISION_DOMAINS
+        }
+        domain_override_counts: dict[str, int] = defaultdict(int)
+        combat_like_decision_count = 0
+        direct_policy_eligible_count = 0
+        direct_policy_used_count = 0
+        card_reward_tracker = CardRewardEpisodeTracker()
+        route_dry_run_records: list[dict[str, Any]] = []
+        route_dry_run_error_count = 0
+        terminated = False
+        truncated = False
+        initial_progress = self._episode_progress_snapshot(initial_info)
+        if initial_progress:
+            progress_snapshots.append(initial_progress)
+
+        while True:
+            prev_info = dict(info)
+            action_mask = info.get("action_mask", np.ones(MAX_ACTIONS, dtype=bool))
+            legal_actions = (
+                info.get("legal_actions_compact")
+                or info.get("legal_actions")
+                or getattr(self.env.unwrapped, "get_compact_legal_actions", lambda: [])()
+            )
+            planner_context = prev_info.get("planner_context") if isinstance(prev_info.get("planner_context"), dict) else {}
+            semantic_actions = planner_context.get("semantic_actions") if isinstance(planner_context.get("semantic_actions"), list) else []
+            decision_domain, encoded_decision_domain, domain_overridden = self._resolve_acting_decision_domain(
+                obs,
+                legal_actions,
+                prev_info,
+            )
+            if decision_domain not in decision_counts:
+                decision_domain = "build"
+            if decision_domain == "combat":
+                combat_like_decision_count += 1
+                obs = self._with_decision_domain(obs, "combat") or obs
+            if domain_overridden:
+                domain_override_counts[f"{encoded_decision_domain}->{decision_domain}"] += 1
+            decision_counts[decision_domain] += 1
+            num_simulations = self._num_simulations_for_domain(decision_domain)
+            _lat_legal_count = int((np.asarray(action_mask, dtype=np.float32) > 0).sum())
+            _lat_t0 = time.perf_counter()
+            obs_batch = dict_obs_to_torch(obs, device=self.device)
+            _lat_obs_ms = (time.perf_counter() - _lat_t0) * 1000.0
+            _lat_t0 = time.perf_counter()
+            with torch.no_grad(), self._amp_autocast():
+                initial = self.network.initial_inference(obs_batch)
+                root_value = initial.value.squeeze(0).item()
+                root_value_components = initial.value_components.squeeze(0).detach().cpu().numpy()
+            _lat_initial_ms = (time.perf_counter() - _lat_t0) * 1000.0
+            if self.combat_direct_policy and decision_domain == "combat":
+                direct_policy_eligible_count += 1
+
+            fast_path_choice = self._trivial_build_fast_path_choice(
+                decision_domain=decision_domain,
+                action_mask=np.asarray(action_mask, dtype=np.float32),
+                legal_actions=legal_actions,
+            )
+            if fast_path_choice is None:
+                fast_path_choice = self._combat_card_selection_fast_path_choice(
+                    decision_domain=decision_domain,
+                    action_mask=np.asarray(action_mask, dtype=np.float32),
+                    legal_actions=legal_actions,
+                    policy_logits=initial.policy_logits.squeeze(0),
+                )
+            fast_path_reason = ""
+            if fast_path_choice is not None:
+                action_idx = int(fast_path_choice["action_idx"])
+                fast_path_reason = str(fast_path_choice.get("reason") or "").strip().lower()
+                search_policy = np.zeros(MAX_ACTIONS, dtype=np.float32)
+                if 0 <= action_idx < MAX_ACTIONS:
+                    search_policy[action_idx] = 1.0
+                fast_path_counts[decision_domain] = fast_path_counts.get(decision_domain, 0) + 1
+                if fast_path_reason:
+                    fast_path_reason_counts[fast_path_reason] += 1
+                search_stats: dict[str, Any] = {}
+            elif self.combat_direct_policy and decision_domain == "combat":
+                action_mask_tensor = torch.as_tensor(
+                    action_mask,
+                    device=initial.policy_logits.device,
+                    dtype=initial.policy_logits.dtype,
+                )
+                masked_logits = initial.policy_logits.squeeze(0).detach().clone()
+                rollout_action_mask = action_mask_tensor.unsqueeze(0) > 0
+                direct_policy_used_count += 1
+                with torch.no_grad(), self._amp_autocast():
+                    rollout = self.network.action_rollout_planner(
+                        initial.hidden_state,
+                        initial.action_embeddings,
+                        action_mask=rollout_action_mask,
+                        objective_context=obs_batch.get("objective_context"),
+                        decision_domain=obs_batch.get("decision_domain"),
+                        discount=self.discount,
+                        rollout_steps=self.combat_rollout_steps,
+                        continuation_beam_width=self.combat_rollout_beam_width,
+                        continuation_legal_logit_scale=self.combat_rollout_legal_logit_scale,
+                        uncertainty_surprise_weight=self.combat_rollout_uncertainty_surprise_weight,
+                        uncertainty_surface_entropy_weight=self.combat_rollout_uncertainty_surface_weight,
+                        uncertainty_latent_drift_weight=self.combat_rollout_uncertainty_latent_weight,
+                        uncertainty_branch_disagreement_weight=self.combat_rollout_uncertainty_disagreement_weight,
+                        continuation_uncertainty_penalty=self.combat_rollout_continuation_uncertainty_penalty,
+                    )
+                rollout_q = rollout.planner_q.squeeze(0).detach()
+                rollout_objective_q = rollout.planner_objective_q.squeeze(0).detach()
+                rollout_risk_q = rollout.planner_risk_q.squeeze(0).detach()
+                rollout_uncertainty = rollout.planner_uncertainty.squeeze(0).detach()
+                rollout_surprise = rollout.planner_surprise.squeeze(0).detach()
+                rollout_surface_entropy = rollout.planner_surface_entropy.squeeze(0).detach()
+                rollout_latent_drift = rollout.planner_latent_drift.squeeze(0).detach()
+                rollout_branch_disagreement = rollout.planner_branch_disagreement.squeeze(0).detach()
+                rollout_mask = rollout.action_mask.squeeze(0)
+                rollout_q_bias = self._normalize_action_values(
+                    rollout_q.unsqueeze(0),
+                    rollout_mask.unsqueeze(0),
+                ).squeeze(0)
+                rollout_objective_q_bias = self._normalize_action_values(
+                    rollout_objective_q.unsqueeze(0),
+                    rollout_mask.unsqueeze(0),
+                ).squeeze(0)
+                rollout_risk_q_bias = self._normalize_action_values(
+                    rollout_risk_q.unsqueeze(0),
+                    rollout_mask.unsqueeze(0),
+                ).squeeze(0)
+                rollout_uncertainty_bias = self._normalize_action_values(
+                    rollout_uncertainty.unsqueeze(0),
+                    rollout_mask.unsqueeze(0),
+                ).squeeze(0)
+                # The supervised surprise/uncertainty heads are raw-scale signals; in boss fights
+                # their absolute values can sit around 50+ while Q is around [-3, 1].  We only
+                # want uncertainty to rank actions relative to siblings, not dominate policy logits
+                # through an outlier z-score, so all rollout side-channel biases are clipped to
+                # a bounded logit prior range before blending.
+                rollout_q_bias = rollout_q_bias.clamp(-2.5, 2.5)
+                rollout_objective_q_bias = rollout_objective_q_bias.clamp(-2.5, 2.5)
+                rollout_risk_q_bias = rollout_risk_q_bias.clamp(-2.5, 2.5)
+                rollout_uncertainty_bias = rollout_uncertainty_bias.clamp(-2.0, 2.0)
+                masked_logits = (
+                    masked_logits
+                    + self.combat_rollout_q_blend * rollout_q_bias
+                    + self.combat_rollout_objective_q_blend * rollout_objective_q_bias
+                    + self.combat_rollout_risk_blend * rollout_risk_q_bias
+                    - self.combat_rollout_uncertainty_blend * rollout_uncertainty_bias
+                )
+                # Root-quality bias instrumentation: keep the exact pre-bias
+                # root logits so TensorBoard can prove whether the hard
+                # mechanism prior (Kaiser facing, end_turn, X-cost, potion
+                # timing, HP-cost, etc.) actually changes the root ordering.
+                pre_quality_masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
+                quality_bias_np, quality_stats, zero_energy_x_indices = self._combat_action_quality_bias(
+                    obs,
+                    np.asarray(action_mask, dtype=np.float32),
+                    legal_actions if isinstance(legal_actions, list) else [],
+                )
+                quality_bias = torch.as_tensor(
+                    quality_bias_np,
+                    device=masked_logits.device,
+                    dtype=masked_logits.dtype,
+                )
+                masked_logits = masked_logits + quality_bias
+                masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
+                legal_root_bias = quality_bias.masked_select(action_mask_tensor > 0)
+                root_bias_nonzero = (
+                    1.0
+                    if legal_root_bias.numel() > 0 and bool(torch.any(legal_root_bias.abs() > 1e-6).item())
+                    else 0.0
+                )
+                if bool((action_mask_tensor > 0).any().item()):
+                    pre_quality_top1 = int(pre_quality_masked_logits.argmax().item())
+                    post_quality_top1 = int(masked_logits.argmax().item())
+                else:
+                    pre_quality_top1 = -1
+                    post_quality_top1 = -1
+                root_bias_abs_mean = float(legal_root_bias.abs().mean().item()) if legal_root_bias.numel() > 0 else 0.0
+                root_bias_max_abs = float(legal_root_bias.abs().max().item()) if legal_root_bias.numel() > 0 else 0.0
+                root_bias_changed_top1 = 1.0 if pre_quality_top1 >= 0 and pre_quality_top1 != post_quality_top1 else 0.0
+                safe_temperature = max(float(temperature), 1e-3)
+                direct_probs = torch.softmax(masked_logits / safe_temperature, dim=0)
+                if not torch.isfinite(direct_probs).all() or float(direct_probs.sum().item()) <= 0.0:
+                    legal_mask = action_mask_tensor > 0
+                    direct_probs = legal_mask.float()
+                    direct_probs = direct_probs / direct_probs.sum().clamp(min=1.0)
+                direct_probs = direct_probs / direct_probs.sum().clamp(min=1e-8)
+                if safe_temperature <= 0.05:
+                    action_idx = int(direct_probs.argmax().item())
+                else:
+                    action_idx = int(torch.multinomial(direct_probs, 1).item())
+                search_policy = direct_probs.detach().cpu().numpy().astype(np.float32)
+                entropy = -(direct_probs.clamp(min=1e-8) * direct_probs.clamp(min=1e-8).log()).sum().item()
+                rollout_valid_count = rollout_mask.float().sum().clamp(min=1.0)
+                rollout_q_mean = torch.where(rollout_mask, rollout_q, torch.zeros_like(rollout_q)).sum() / rollout_valid_count
+                rollout_objective_q_mean = (
+                    torch.where(rollout_mask, rollout_objective_q, torch.zeros_like(rollout_objective_q)).sum()
+                    / rollout_valid_count
+                )
+                rollout_risk_q_mean = (
+                    torch.where(rollout_mask, rollout_risk_q, torch.zeros_like(rollout_risk_q)).sum()
+                    / rollout_valid_count
+                )
+                rollout_uncertainty_mean = (
+                    torch.where(rollout_mask, rollout_uncertainty, torch.zeros_like(rollout_uncertainty)).sum()
+                    / rollout_valid_count
+                )
+                rollout_surprise_mean = (
+                    torch.where(rollout_mask, rollout_surprise, torch.zeros_like(rollout_surprise)).sum()
+                    / rollout_valid_count
+                )
+                rollout_surface_entropy_mean = (
+                    torch.where(rollout_mask, rollout_surface_entropy, torch.zeros_like(rollout_surface_entropy)).sum()
+                    / rollout_valid_count
+                )
+                rollout_latent_drift_mean = (
+                    torch.where(rollout_mask, rollout_latent_drift, torch.zeros_like(rollout_latent_drift)).sum()
+                    / rollout_valid_count
+                )
+                rollout_branch_disagreement_mean = (
+                    torch.where(rollout_mask, rollout_branch_disagreement, torch.zeros_like(rollout_branch_disagreement)).sum()
+                    / rollout_valid_count
+                )
+                rollout_uncertainty_bias_abs_mean = (
+                    torch.where(rollout_mask, rollout_uncertainty_bias.abs(), torch.zeros_like(rollout_uncertainty_bias)).sum()
+                    / rollout_valid_count
+                )
+                selected_ceremonial_low_impact = 0.0
+                selected_ceremonial_high_impact = 0.0
+                if (
+                    isinstance(legal_actions, list)
+                    and 0 <= int(action_idx) < len(legal_actions)
+                    and quality_stats.get("combat_quality_ceremonial_one_card_lock", 0.0) > 0.05
+                ):
+                    low_impact, high_impact = self._ceremonial_action_timing_flags(
+                        legal_actions[int(action_idx)],
+                        int(action_idx),
+                        obs,
+                        self._current_raw_combat_obs(),
+                        legal_actions,
+                        np.asarray(action_mask, dtype=np.float32).reshape(-1),
+                        self._combat_energy(obs, self._current_raw_combat_obs()),
+                    )
+                    selected_ceremonial_low_impact = 1.0 if low_impact else 0.0
+                    selected_ceremonial_high_impact = 1.0 if high_impact else 0.0
+                raw_for_selected = self._current_raw_combat_obs()
+                selected_is_kaiser_encounter = False
+                try:
+                    if isinstance(raw_for_selected, dict):
+                        selected_is_kaiser_encounter = self._is_kaiser_encounter_context(
+                            build_boss_mechanics_context(raw_for_selected),
+                            raw_for_selected,
+                        )
+                except Exception:
+                    selected_is_kaiser_encounter = False
+                search_stats = {
+                    "num_simulations": 0.0,
+                    "root_top1_visit_share": float(direct_probs.max().item()),
+                    "root_visit_entropy": float(entropy),
+                    "mean_predicted_legal_count": float((action_mask_tensor > 0).float().sum().item()),
+                    "search_mode_direct_policy": 1.0,
+                    "search_mode_direct_rollout_planner": 1.0,
+                    "direct_rollout_q_mean": float(rollout_q_mean.item()),
+                    "direct_rollout_objective_q_mean": float(rollout_objective_q_mean.item()),
+                    "direct_rollout_risk_q_mean": float(rollout_risk_q_mean.item()),
+                    "direct_rollout_uncertainty_mean": float(rollout_uncertainty_mean.item()),
+                    "direct_rollout_uncertainty_bias_abs_mean": float(rollout_uncertainty_bias_abs_mean.item()),
+                    "direct_rollout_surprise_mean": float(rollout_surprise_mean.item()),
+                    "direct_rollout_surface_entropy_mean": float(rollout_surface_entropy_mean.item()),
+                    "direct_rollout_latent_drift_mean": float(rollout_latent_drift_mean.item()),
+                    "direct_rollout_branch_disagreement_mean": float(rollout_branch_disagreement_mean.item()),
+                    "direct_rollout_steps_used": float(rollout.rollout_steps_used),
+                    "direct_rollout_branch_count_mean": float(rollout.rollout_branch_count_mean),
+                    "direct_rollout_root_valid_count": float(rollout.rollout_root_valid_count),
+                    "direct_rollout_root_bucket_size": float(rollout.rollout_root_bucket_size),
+                    "direct_rollout_bucket_padding_ratio": float(rollout.rollout_bucket_padding_ratio),
+                    "direct_rollout_max_branch_bucket_size": float(rollout.rollout_max_branch_bucket_size),
+                    "direct_rollout_branch_padding_ratio": float(rollout.rollout_branch_padding_ratio),
+                    # Direct-rollout mode does not go through MCTS
+                    # ``_objective_prior_bias``; the equivalent root prior is
+                    # ``_combat_action_quality_bias``.  Report it under the
+                    # root_bias namespace too, otherwise search/root_bias_scale
+                    # looks permanently zero in search-free training even when
+                    # the prior is actively changing logits.
+                    "root_bias_scale": 1.0,
+                    "root_bias_nonzero": float(root_bias_nonzero),
+                    "root_bias_abs_mean": float(root_bias_abs_mean),
+                    "root_bias_max_abs": float(root_bias_max_abs),
+                    "root_bias_changed_top1": float(root_bias_changed_top1),
+                    "root_bias_selected_action_delta": float(
+                        quality_bias_np[int(action_idx)]
+                        if 0 <= int(action_idx) < min(len(quality_bias_np), MAX_ACTIONS)
+                        else 0.0
+                    ),
+                    "root_bias_suppressed_by_gate": 0.0,
+                    "root_bias_scale_effective": 1.0,
+                    **quality_stats,
+                    "combat_quality_zero_energy_x_cost_selected": 1.0 if int(action_idx) in zero_energy_x_indices else 0.0,
+                    "combat_quality_end_turn_selected": 1.0 if self._semantic_family(legal_actions[int(action_idx)] if isinstance(legal_actions, list) and 0 <= int(action_idx) < len(legal_actions) else {}) == "end_turn" else 0.0,
+                    "combat_quality_wasteful_end_turn_selected": (
+                        1.0
+                        if (
+                            self._semantic_family(legal_actions[int(action_idx)] if isinstance(legal_actions, list) and 0 <= int(action_idx) < len(legal_actions) else {}) == "end_turn"
+                            and bool(quality_stats.get("combat_quality_wasteful_end_turn_available", 0.0) > 0.5)
+                        )
+                        else 0.0
+                    ),
+                    "combat_quality_kaiser_defense_selected": (
+                        1.0
+                        if (
+                            selected_is_kaiser_encounter
+                            and
+                            isinstance(legal_actions, list)
+                            and 0 <= int(action_idx) < len(legal_actions)
+                            and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+                            and self._is_kaiser_risk_handling_action(legal_actions[int(action_idx)], raw_for_selected)
+                        )
+                        else 0.0
+                    ),
+                    "combat_quality_kaiser_facing_change_selected": (
+                        1.0
+                        if (
+                            selected_is_kaiser_encounter
+                            and
+                            isinstance(legal_actions, list)
+                            and 0 <= int(action_idx) < len(legal_actions)
+                            and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+                            and self._is_kaiser_facing_change_action(legal_actions[int(action_idx)], raw_for_selected)
+                        )
+                        else 0.0
+                    ),
+                    "combat_quality_kaiser_pressure_selected": (
+                        1.0
+                        if (
+                            selected_is_kaiser_encounter
+                            and
+                            isinstance(legal_actions, list)
+                            and 0 <= int(action_idx) < len(legal_actions)
+                            and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+                            and self._is_kaiser_pressure_action(legal_actions[int(action_idx)])
+                        )
+                        else 0.0
+                    ),
+                    "combat_quality_kaiser_risky_end_turn_selected": (
+                        1.0
+                        if (
+                            selected_is_kaiser_encounter
+                            and
+                            isinstance(legal_actions, list)
+                            and 0 <= int(action_idx) < len(legal_actions)
+                            and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+                            and self._semantic_family(legal_actions[int(action_idx)]) == "end_turn"
+                        )
+                        else 0.0
+                    ),
+                    "combat_quality_ceremonial_low_impact_selected": selected_ceremonial_low_impact,
+                    "combat_quality_ceremonial_high_impact_selected": selected_ceremonial_high_impact,
+                }
+            else:
+                # Run MCTS to get action and policy
+                with torch.no_grad():
+                    self.mcts.set_training_step(self.total_steps)
+                    self.mcts.set_root_bias_enabled(True)
+                    self.mcts.set_semantic_rollout_enabled(self.mcts._semantic_rollout_enabled)
+                    phase3_bias_vec = self._compute_route_heuristic_bias_vector(
+                        decision_domain=decision_domain,
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else None,
+                    )
+                    if hasattr(self.mcts, "set_route_heuristic_bias"):
+                        self.mcts.set_route_heuristic_bias(phase3_bias_vec)
+                    action_idx, search_policy = self.mcts.run(
+                        self.network,
+                        obs,
+                        action_mask,
+                        num_simulations=num_simulations,
+                        temperature=temperature,
+                        decision_domain=decision_domain,
+                    )
+                search_stats = getattr(self.mcts, "last_run_stats", {}) or {}
+            action_idx = self._apply_post_search_action_hard_guards(
+                decision_domain=decision_domain,
+                action_idx=int(action_idx),
+                legal_actions=legal_actions if isinstance(legal_actions, list) else None,
+                action_mask=action_mask,
+                obs=obs if isinstance(obs, dict) else None,
+                info=prev_info if isinstance(prev_info, dict) else None,
+                search_stats=search_stats if isinstance(search_stats, dict) else {},
+            )
+            if decision_domain == "route":
+                route_dry_run_error_count = self._record_route_heuristic_dry_run(
+                    records=route_dry_run_records,
+                    error_count=route_dry_run_error_count,
+                    action_idx=int(action_idx),
+                    legal_actions=legal_actions if isinstance(legal_actions, list) else None,
+                )
+
+            if search_stats:
+                search_num_simulations.append(float(search_stats.get("num_simulations", num_simulations)))
+                search_root_candidates.append(float(search_stats.get("root_candidates", 0.0)))
+                search_root_selectable_children.append(float(search_stats.get("root_selectable_children_mean", 0.0)))
+                search_expanded_children.append(float(search_stats.get("mean_expanded_children", 0.0)))
+                search_predicted_legal.append(float(search_stats.get("mean_predicted_legal_count", 0.0)))
+                search_surface_keep.append(float(search_stats.get("mean_surface_keep_count", 0.0)))
+                search_max_depths.append(float(search_stats.get("max_search_depth", 0.0)))
+                search_depths.append(float(search_stats.get("mean_leaf_depth", 0.0)))
+                search_concrete_depths.append(float(search_stats.get("mean_concrete_leaf_depth", 0.0)))
+                search_depth_ge_2.append(float(search_stats.get("depth_ge_2_rate", 0.0)))
+                search_depth_ge_3.append(float(search_stats.get("depth_ge_3_rate", 0.0)))
+                search_semantic_expansion.append(float(search_stats.get("semantic_expansion_rate", 0.0)))
+                search_semantic_switch.append(float(search_stats.get("semantic_switch_rate", 0.0)))
+                search_semantic_chain_steps.append(float(search_stats.get("semantic_chain_steps_mean", 0.0)))
+                search_semantic_drill.append(float(search_stats.get("semantic_drill_rate", 0.0)))
+                search_root_top1_visit_share.append(float(search_stats.get("root_top1_visit_share", 0.0)))
+                search_root_visit_entropy.append(float(search_stats.get("root_visit_entropy", 0.0)))
+                search_root_bias_scale.append(float(search_stats.get("root_bias_scale", 0.0)))
+                search_root_bias_nonzero.append(float(search_stats.get("root_bias_nonzero", 0.0)))
+                search_root_bias_abs_mean.append(float(search_stats.get("root_bias_abs_mean", 0.0)))
+                search_root_bias_max_abs.append(float(search_stats.get("root_bias_max_abs", 0.0)))
+                search_root_bias_changed_top1.append(float(search_stats.get("root_bias_changed_top1", 0.0)))
+                search_root_bias_selected_delta.append(float(search_stats.get("root_bias_selected_action_delta", 0.0)))
+                search_root_bias_suppressed_by_gate.append(float(search_stats.get("root_bias_suppressed_by_gate", 0.0)))
+                search_root_bias_scale_effective.append(float(search_stats.get("root_bias_scale_effective", 0.0)))
+                search_end_turn_guard_applied.append(float(search_stats.get("end_turn_guard_applied", 0.0)))
+                search_end_turn_guard_forced_alt.append(float(search_stats.get("end_turn_guard_forced_alternative", 0.0)))
+                for metric_key, metric_value in search_stats.items():
+                    try:
+                        domain_search_stats[decision_domain][metric_key].append(float(metric_value))
+                    except (TypeError, ValueError):
+                        continue
+
+            chosen_action = legal_actions[action_idx] if action_idx < len(legal_actions) else None
+            chosen_semantic = (
+                semantic_actions[action_idx]
+                if action_idx < len(semantic_actions) and isinstance(semantic_actions[action_idx], dict)
+                else None
+            )
+            semantic_candidate_indices = [
+                semantic_rollout_index(signature)
+                for signature in semantic_actions[:MAX_ACTIONS]
+            ]
+            semantic_policy = aggregate_concrete_policy_to_semantic(
+                search_policy,
+                semantic_candidate_indices,
+            )
+            semantic_action = semantic_rollout_index(chosen_semantic or chosen_action)
+            chosen_signature = compact_action_signature(chosen_action)
+            action_family = ""
+            semantic_domain = ""
+            phase = str(info.get("phase") or "").strip().lower()
+            surface = ""
+            selection = ""
+            wasteful_end_turn = False
+            wasteful_proceed = False
+            if chosen_signature:
+                chosen_signature = {
+                    **chosen_signature,
+                    "selected_index": int(action_idx),
+                    "phase": info.get("phase"),
+                    "legal_action_count": int(info.get("legal_action_count", 0) or 0),
+                    "selection": chosen_action.get("selection") if isinstance(chosen_action, dict) else None,
+                    "fast_path_applied": bool(fast_path_reason),
+                    "fast_path_reason": fast_path_reason or None,
+                    "reward_type": (
+                        (chosen_action.get("reward") or {}).get("type")
+                        if isinstance(chosen_action, dict) and isinstance(chosen_action.get("reward"), dict)
+                        else None
+                    ),
+                    "shop_action": (
+                        chosen_action.get("shop_action")
+                        if isinstance(chosen_action, dict)
+                        else None
+                    ),
+                }
+                surface = str(chosen_signature.get("surface") or "").strip().lower()
+                selection = str(chosen_signature.get("selection") or "").strip().lower()
+                semantic_compact = chosen_signature.get("semantic")
+                if isinstance(semantic_compact, dict):
+                    family = str(semantic_compact.get("family") or "").strip().lower()
+                    action_family = family
+                    semantic_domain = str(semantic_compact.get("domain") or "").strip().lower()
+                    if family:
+                        selected_family_counts[decision_domain][family] += 1
+            if not action_family and isinstance(chosen_action, dict):
+                action_family = self._semantic_family(chosen_action)
+                if action_family:
+                    selected_family_counts[decision_domain][action_family] += 1
+            if action_family == "end_turn":
+                end_turn_context: dict[str, Any] = {}
+                try:
+                    end_turn_context = self._raw_end_turn_context(
+                        obs,
+                        np.asarray(action_mask, dtype=np.float32).reshape(-1),
+                        legal_actions,
+                    )
+                    wasteful_end_turn = bool(end_turn_context.get("wasteful"))
+                except Exception:
+                    end_turn_context = {}
+                    wasteful_end_turn = False
+                if decision_domain == "combat":
+                    try:
+                        raw_obs_for_dump = self._current_raw_combat_obs()
+                        encounter_for_dump = ""
+                        if isinstance(raw_obs_for_dump, dict):
+                            try:
+                                boss_ctx_dump = build_boss_mechanics_context(raw_obs_for_dump)
+                                encounter_for_dump = str(boss_ctx_dump.get("encounter_key") or "").lower()
+                            except Exception:
+                                encounter_for_dump = ""
+                        action_diag_pre = info.get("action_diagnostics") if isinstance(info, dict) else None
+                        self._dump_selected_end_turn_context(
+                            encoded_obs=obs,
+                            raw_obs=raw_obs_for_dump,
+                            action_mask=np.asarray(action_mask, dtype=np.float32),
+                            legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                            chosen_idx=int(action_idx),
+                            context=end_turn_context,
+                            search_policy=search_policy,
+                            search_stats=search_stats if isinstance(search_stats, dict) else None,
+                            action_diagnostics=action_diag_pre if isinstance(action_diag_pre, dict) else None,
+                            encounter=encounter_for_dump,
+                            tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+                        )
+                    except Exception:
+                        pass
+            wasteful_proceed = self._wasteful_proceed_flag(
+                chosen_signature,
+                decision_domain=decision_domain,
+                phase=phase,
+            )
+            card_reward_tracker.update(
+                decision_domain=decision_domain,
+                phase=phase,
+                legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                chosen_action=chosen_action if isinstance(chosen_action, dict) else None,
+                chosen_signature=chosen_signature if isinstance(chosen_signature, dict) else None,
+                selected_family=action_family,
+                selection=selection,
+            )
+            if isinstance(search_stats, dict):
+                payload = search_stats.get("_card_reward_choice_diagnostic")
+                if isinstance(payload, dict):
+                    try:
+                        payload.setdefault("final_action_idx", int(action_idx))
+                        payload.setdefault("final_action", {})
+                        if isinstance(chosen_action, dict):
+                            final_action = {
+                                "kind": chosen_action.get("kind"),
+                                "surface": chosen_action.get("surface"),
+                                "selection": chosen_action.get("selection"),
+                                "action_id": chosen_action.get("action_id"),
+                                "label": chosen_action.get("label"),
+                            }
+                            card = chosen_action.get("card") if isinstance(chosen_action.get("card"), dict) else {}
+                            if card:
+                                final_action["card"] = {
+                                    "id": card.get("id") or card.get("card_id"),
+                                    "title": card.get("title") or card.get("name"),
+                                    "type": card.get("type") or card.get("card_type"),
+                                    "cost": card.get("cost")
+                                    if card.get("cost") is not None
+                                    else card.get("energy_cost"),
+                                }
+                            payload["final_action"] = {
+                                key: value for key, value in final_action.items() if value not in (None, "")
+                            }
+                        payload.setdefault("final_selected_family", action_family)
+                        payload.setdefault("phase", phase)
+                        payload.setdefault("decision_domain", decision_domain)
+                        self._dump_card_reward_choice_diagnostic(payload)
+                    except Exception:
+                        pass
+
+            pre_step_raw_combat_obs = None
+            pre_step_encounter_off = ""
+            pre_step_tier_off = str((info.get("tier") if isinstance(info, dict) else "") or "")
+            pre_step_offender_types: set[str] = set()
+
+            if decision_domain == "combat" and isinstance(search_stats, dict):
+                search_stats.update(
+                    self._selected_combat_quality_stats(
+                        obs,
+                        int(action_idx),
+                        legal_actions if isinstance(legal_actions, list) else [],
+                        search_stats,
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                    )
+                )
+                try:
+                    pre_step_raw_combat_obs = self._current_raw_combat_obs()
+                    if isinstance(pre_step_raw_combat_obs, dict):
+                        try:
+                            boss_ctx_off = build_boss_mechanics_context(pre_step_raw_combat_obs)
+                            pre_step_encounter_off = str(boss_ctx_off.get("encounter_key") or "").lower()
+                        except Exception:
+                            pre_step_encounter_off = ""
+                    offender_types = self._classify_action_offenders(
+                        search_stats=search_stats,
+                        encounter=pre_step_encounter_off,
+                        family=action_family,
+                    )
+                    pre_step_offender_types = set(offender_types)
+                    for offender_type in offender_types:
+                        global_key = f"boss_combat/{offender_type}_count"
+                        search_stats[f"offender/{offender_type}"] = 1.0
+                    if offender_types:
+                        self._dump_action_offender(
+                            encoded_obs=obs,
+                            raw_obs=pre_step_raw_combat_obs,
+                            action_mask=np.asarray(action_mask, dtype=np.float32),
+                            legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                            chosen_idx=int(action_idx),
+                            chosen_action=chosen_action,
+                            offender_types=offender_types,
+                            search_stats=search_stats,
+                            encounter=pre_step_encounter_off,
+                            tier=pre_step_tier_off,
+                        )
+                except Exception:
+                    pass
+
+            # Store transition
+            decision_progress = self._episode_progress_snapshot(prev_info)
+            decision_room_type = str(decision_progress.get("room_type") or "")
+            decision_encounter_id = str(decision_progress.get("encounter_id") or "")
+            decision_encounter_tier = str(
+                infer_encounter_tier(decision_encounter_id, room_type=decision_room_type) or ""
+            ).strip().lower()
+            decision_floor = decision_progress.get("floor", 0.0)
+            decision_act_id = decision_progress.get("act_id", 0.0)
+            decision_diagnostics: dict[str, Any] = {}
+            if decision_domain == "combat":
+                try:
+                    raw_obs_for_pre_step = pre_step_raw_combat_obs
+                    if raw_obs_for_pre_step is None:
+                        raw_obs_for_pre_step = self._current_raw_combat_obs()
+                    decision_diagnostics = self._compact_pre_step_combat_diagnostics(
+                        encoded_obs=obs,
+                        raw_obs=raw_obs_for_pre_step if isinstance(raw_obs_for_pre_step, dict) else None,
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                        selected_idx=int(action_idx),
+                        encounter_tier=decision_encounter_tier,
+                        action_family=action_family,
+                    )
+                except Exception:
+                    decision_diagnostics = {}
+            trajectory.add_step(
+                obs=obs,
+                action=action_idx,
+                reward=0.0,  # Reward is assigned after step
+                reward_components=np.zeros(NUM_OBJECTIVE_HEADS, dtype=np.float32),
+                action_mask=action_mask,
+                search_policy=search_policy,
+                root_value=root_value,
+                root_value_components=root_value_components,
+                objective_context=obs.get("objective_context"),
+                semantic_action=semantic_action,
+                semantic_policy=semantic_policy,
+                action_info=chosen_signature,
+                search_stats={
+                    **self._compact_search_stats(search_stats),
+                    "combat_quality_wasteful_end_turn_selected": 1.0 if wasteful_end_turn else float((search_stats or {}).get("combat_quality_wasteful_end_turn_selected", 0.0) or 0.0),
+                },
+                decision_diagnostics=decision_diagnostics,
+                decision_domain=decision_domain,
+                phase=phase,
+                action_family=action_family,
+                semantic_domain=semantic_domain,
+                surface=surface,
+                selection=selection,
+                wasteful_end_turn=wasteful_end_turn,
+                wasteful_proceed=wasteful_proceed,
+                room_type=decision_room_type,
+                encounter_id=decision_encounter_id,
+                encounter_tier=decision_encounter_tier,
+                floor=decision_floor,
+                act_id=decision_act_id,
+            )
+
+            # Take action in environment
+            obs, reward, terminated, truncated, info = self.env.step(int(action_idx))
+            potion_transition_record = info.get("potion_transition") if isinstance(info, dict) else None
+            if isinstance(potion_transition_record, dict):
+                self._dump_potion_transition(potion_transition_record)
+                compact_transition = {
+                    "event": potion_transition_record.get("event"),
+                    "action_id": potion_transition_record.get("action_id"),
+                    "potion_id_before": potion_transition_record.get("potion_id_before"),
+                    "potion_title_before": potion_transition_record.get("potion_title_before"),
+                    "potion_count_before": potion_transition_record.get("potion_count_before"),
+                    "potion_count_after": potion_transition_record.get("potion_count_after"),
+                    "execute_ok": potion_transition_record.get("execute_ok"),
+                    "state_version_before": potion_transition_record.get("state_version_before"),
+                    "state_version_after": potion_transition_record.get("state_version_after"),
+                    "floor": potion_transition_record.get("floor"),
+                    "room_type": potion_transition_record.get("room_type"),
+                    "room_model": potion_transition_record.get("room_model"),
+                    "encounter_id": potion_transition_record.get("encounter_id"),
+                }
+                potion_transition_records_episode.append(
+                    {k: v for k, v in compact_transition.items() if v not in (None, "")}
+                )
+                if bool(potion_transition_record.get("execute_ok", True)):
+                    used_potion_count_episode += 1
+                    encounter_key = str(
+                        potion_transition_record.get("room_model")
+                        or potion_transition_record.get("encounter_id")
+                        or potion_transition_record.get("encounter")
+                        or ""
+                    ).strip()
+                    room_type_key = str(potion_transition_record.get("room_type") or "").strip()
+                    if encounter_key:
+                        used_potion_count_by_encounter[encounter_key.upper()] += 1
+                    if room_type_key:
+                        used_potion_count_by_room[room_type_key.lower()] += 1
+            frontier_trace_record = info.get("frontier_trace") if isinstance(info, dict) else None
+            if isinstance(frontier_trace_record, dict):
+                self._dump_frontier_trace(frontier_trace_record)
+            action_diagnostics = info.get("action_diagnostics") if isinstance(info, dict) else None
+            if isinstance(action_diagnostics, dict) and trajectory.steps:
+                diag_stats = trajectory.steps[-1].setdefault("search_stats", {})
+                merge_action_diagnostics_into_search_stats(diag_stats, action_diagnostics)
+                # Bridge-only diagnostics (notably HP-cost runtime safety) are
+                # merged after the env step.  The primary offender dump above
+                # runs before ``env.step`` so it cannot see those selected-side
+                # flags.  Emit only newly-visible offenders here; this keeps the
+                # JSONL actionable without duplicating the richer pre-step
+                # trainer/search offenders.
+                if decision_domain == "combat":
+                    try:
+                        post_offender_types = self._classify_action_offenders(
+                            search_stats=diag_stats,
+                            encounter=pre_step_encounter_off,
+                            family=action_family,
+                        )
+                        post_offender_types = [
+                            offender_type
+                            for offender_type in post_offender_types
+                            if offender_type not in pre_step_offender_types
+                        ]
+                        for offender_type in post_offender_types:
+                            diag_stats[f"offender/{offender_type}"] = 1.0
+                        if post_offender_types:
+                            step_record = trajectory.steps[-1]
+                            self._dump_action_offender(
+                                encoded_obs=step_record.get("obs") if isinstance(step_record, dict) else obs,
+                                raw_obs=pre_step_raw_combat_obs,
+                                action_mask=np.asarray(
+                                    step_record.get("action_mask", action_mask) if isinstance(step_record, dict) else action_mask,
+                                    dtype=np.float32,
+                                ),
+                                legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                                chosen_idx=int(action_idx),
+                                chosen_action=chosen_action,
+                                offender_types=post_offender_types,
+                                search_stats=diag_stats,
+                                encounter=pre_step_encounter_off,
+                                tier=pre_step_tier_off,
+                            )
+                    except Exception:
+                        pass
+            episode_reward += reward
+            episode_length += 1
+            progress_snapshot = self._episode_progress_snapshot(info)
+            if progress_snapshot:
+                progress_snapshots.append(progress_snapshot)
+                floor_int = int(progress_snapshot["floor"])
+                if floor_int > 0:
+                    seen_floors.add(floor_int)
+                room_type_lower = str(progress_snapshot.get("room_type_lower") or "")
+                if "elite" in room_type_lower:
+                    elite_floors.add(floor_int)
+                if "boss" in room_type_lower:
+                    boss_floors.add(floor_int)
+                if progress_snapshot.get("hp", 0.0) <= 0.0:
+                    death_floor = max(death_floor, float(progress_snapshot.get("floor", 0.0)))
+
+            reward_components = compute_transition_objective_rewards(
+                prev_info.get("transition_state") if isinstance(prev_info.get("transition_state"), dict) else None,
+                chosen_semantic or chosen_action,
+                info.get("transition_state") if isinstance(info.get("transition_state"), dict) else None,
+                prev_planner_context=planner_context,
+                next_planner_context=info.get("planner_context") if isinstance(info.get("planner_context"), dict) else None,
+                terminated=terminated,
+                truncated=truncated,
+            )
+
+            # Update last step's reward
+            trajectory.steps[-1]["reward"] = reward
+            trajectory.steps[-1]["reward_components"] = reward_components.astype(np.float32, copy=False)
+
+            if terminated or truncated:
+                break
+
+        final_info = dict(info)
+        max_floor = max((float(snapshot.get("floor", 0.0)) for snapshot in progress_snapshots), default=0.0)
+        max_act_id = max((float(snapshot.get("act_id", 0.0)) for snapshot in progress_snapshots), default=0.0)
+        rooms_seen = len(seen_floors)
+        act1_boss_seen = any(
+            float(snapshot.get("act_id", 0.0)) <= 1.0 and "boss" in str(snapshot.get("room_type_lower") or "")
+            for snapshot in progress_snapshots
+        )
+        act1_clear = max_act_id >= 2.0
+        total_decisions = max(sum(decision_counts.values()), 1)
+        encounter_id = initial_info.get("encounter_id")
+        encounter_tier = infer_encounter_tier(encounter_id)
+        boss_entry_snapshot = self._boss_entry_snapshot_from_episode(
+            initial_info,
+            progress_snapshots,
+            encounter_tier=encounter_tier,
+        )
+        final_potion_count = self._potion_count_from_info(final_info)
+        final_potion_count_int = int(self._diag_float(final_potion_count, 0.0))
+        final_transition_state = final_info.get("transition_state") if isinstance(final_info, dict) else None
+        env_unwrapped = getattr(self.env, "unwrapped", self.env)
+        final_raw_obs = getattr(env_unwrapped, "_last_obs_raw", None)
+        final_deck_cards = (
+            extract_deck_cards_from_obs_like(final_transition_state)
+            or extract_deck_cards_from_obs_like(final_info)
+            or extract_deck_cards_from_obs_like(final_raw_obs)
+        )
+        final_deck_quality = compute_deck_quality_summary(final_deck_cards)
+        final_deck_compact = compact_deck_cards(final_deck_cards, limit=80)
+        card_reward_meta = card_reward_tracker.as_metadata()
+        final_potion_dump = (
+            self._compact_raw_potion_inventory(
+                final_transition_state if isinstance(final_transition_state, dict) else None,
+                limit=5,
+            )
+            or self._compact_raw_potion_inventory(
+                final_info if isinstance(final_info, dict) else None,
+                limit=5,
+            )
+        )
+        if not final_potion_dump and final_potion_count_int > 0:
+            final_potion_dump = [
+                {"slot": int(slot), "empty": False, "source": "count_only"}
+                for slot in range(min(final_potion_count_int, 5))
+            ]
+        used_potion_count_final_info = int((final_info or {}).get("used_potion_count_this_combat", 0) or 0)
+        final_progress = progress_snapshots[-1] if progress_snapshots else self._episode_progress_snapshot(final_info)
+        final_encounter_upper = str(final_progress.get("encounter_id_upper") or "").strip().upper()
+        final_room_type_lower = str(final_progress.get("room_type_lower") or "").strip().lower()
+        used_potion_count_transition_current = (
+            int(used_potion_count_by_encounter.get(final_encounter_upper, 0))
+            if final_encounter_upper
+            else 0
+        )
+        if used_potion_count_transition_current <= 0 and final_room_type_lower:
+            used_potion_count_transition_current = int(used_potion_count_by_room.get(final_room_type_lower, 0))
+        used_potion_count = max(used_potion_count_final_info, used_potion_count_transition_current)
+        potion_history = self._episode_potion_history_from_steps(
+            trajectory.steps,
+            encounter_id=final_encounter_upper,
+            tail_limit=8,
+        )
+        potion_transitions_this_combat: list[dict[str, Any]] = []
+        for record in potion_transition_records_episode:
+            rec_encounter = str(
+                record.get("room_model") or record.get("encounter_id") or ""
+            ).strip().upper()
+            rec_room = str(record.get("room_type") or "").strip().lower()
+            if (final_encounter_upper and rec_encounter == final_encounter_upper) or (
+                final_room_type_lower and rec_room == final_room_type_lower
+            ):
+                potion_transitions_this_combat.append(record)
+
+        def _transition_sync_suspect(record: dict[str, Any]) -> bool:
+            if not bool(record.get("execute_ok", True)):
+                return False
+            before_count = record.get("potion_count_before")
+            after_count = record.get("potion_count_after")
+            before_version = record.get("state_version_before")
+            after_version = record.get("state_version_after")
+            return bool(
+                (
+                    before_count is not None
+                    and after_count is not None
+                    and before_count == after_count
+                )
+                or (
+                    before_version is not None
+                    and after_version is not None
+                    and before_version == after_version
+                )
+            )
+
+        potion_transition_sync_suspect = any(
+            _transition_sync_suspect(record) for record in potion_transitions_this_combat
+        )
+        trajectory.metadata = {
+            "episode_mode": initial_info.get("episode_mode"),
+            "encounter_id": encounter_id,
+            "encounter_tier": encounter_tier,
+            "encounter_pool": list(initial_info.get("encounter_pool") or []),
+            "snapshot_sample_id": initial_info.get("snapshot_sample_id"),
+            "snapshot_run_id": initial_info.get("snapshot_run_id"),
+            "snapshot_floor_number": initial_info.get("snapshot_floor_number"),
+            "snapshot_build_id": initial_info.get("snapshot_build_id"),
+            "temperature": float(temperature),
+            "semantic_rollout_enabled": bool(self.mcts._semantic_rollout_enabled),
+            "semantic_switch_depth": int(self.mcts.semantic_switch_depth),
+            "episode_total_reward": float(episode_reward),
+            "episode_length": int(episode_length),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "initial_phase": initial_info.get("phase"),
+            "final_phase": final_info.get("phase"),
+            "negative_reward_episode": bool(episode_reward < 0.0),
+            "final_deck_cards_compact": final_deck_compact,
+            "final_deck_quality_v2": final_deck_quality,
+            **card_reward_meta,
+            "max_floor": float(max_floor),
+            "max_act_id": float(max_act_id),
+            "rooms_seen": int(rooms_seen),
+            "death_floor": float(death_floor),
+            "elite_rooms_seen": int(len(elite_floors)),
+            "boss_rooms_seen": int(len(boss_floors)),
+            "boss_entry_hp": float(boss_entry_snapshot.get("hp", 0.0)) if boss_entry_snapshot else 0.0,
+            "boss_entry_max_hp": float(boss_entry_snapshot.get("max_hp", 0.0)) if boss_entry_snapshot else 0.0,
+            "boss_entry_hp_ratio": float(boss_entry_snapshot.get("hp_ratio", 0.0)) if boss_entry_snapshot else 0.0,
+            "final_potion_count": int(final_potion_count_int),
+            "final_potion_dump": list(final_potion_dump),
+            "used_potion_count_this_combat": int(used_potion_count),
+            "used_potion_count_final_info": int(used_potion_count_final_info),
+            "used_potion_count_transition_current": int(used_potion_count_transition_current),
+            "used_potion_count_episode": int(used_potion_count_episode),
+            **potion_history,
+            "potion_use_transitions_this_combat": list(potion_transitions_this_combat[-8:]),
+            "potion_transition_sync_suspect_this_combat": bool(potion_transition_sync_suspect),
+            "act1_boss_seen": bool(act1_boss_seen),
+            "act1_clear": bool(act1_clear),
+            "decision_counts": {domain: int(count) for domain, count in decision_counts.items()},
+            "decision_domain_overrides": {key: int(value) for key, value in domain_override_counts.items()},
+            "combat_like_decision_count": int(combat_like_decision_count),
+            "direct_policy_eligible_count": int(direct_policy_eligible_count),
+            "direct_policy_used_count": int(direct_policy_used_count),
+        }
+
+        settlement_signal = self._episode_settlement_signal(
+            max_floor=max_floor,
+            death_floor=death_floor,
+            elite_rooms_seen=len(elite_floors),
+            act1_boss_seen=act1_boss_seen,
+            act1_clear=act1_clear,
+            terminated=terminated,
+        )
+        settlement_stats = trajectory.apply_light_episode_settlement(
+            settlement_signal,
+            settlement_weight=self.settlement_weight,
+            decay=self.settlement_decay,
+            max_steps=self.settlement_max_steps,
+        )
+        augmented_episode_reward = float(episode_reward + settlement_stats.get("total_bonus", 0.0))
+        trajectory.metadata.update({
+            "settlement_weight": float(self.settlement_weight),
+            "settlement_decay": float(self.settlement_decay),
+            "settlement_max_steps": int(self.settlement_max_steps),
+            "episode_augmented_total_reward": augmented_episode_reward,
+        })
+
+        self.buffer.save_episode(
+            trajectory,
+            discount=self.discount,
+            n_steps=self.n_step_return,
+        )
+        self.episode_count += 1
+        recent_tail_snapshot = self.record_recent_combat_episode(trajectory.metadata)
+
+        if search_root_candidates:
+            self.writer.add_scalar(
+                "search/max_depth_mean",
+                float(np.mean(search_max_depths)) if search_max_depths else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/num_simulations",
+                float(np.mean(search_num_simulations)) if search_num_simulations else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_candidates_mean",
+                float(np.mean(search_root_candidates)),
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_selectable_children_mean",
+                float(np.mean(search_root_selectable_children)) if search_root_selectable_children else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/expanded_children_mean",
+                float(np.mean(search_expanded_children)),
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/predicted_legal_mean",
+                float(np.mean(search_predicted_legal)),
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/surface_keep_mean",
+                float(np.mean(search_surface_keep)) if search_surface_keep else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/leaf_depth_mean",
+                float(np.mean(search_depths)),
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/concrete_leaf_depth_mean",
+                float(np.mean(search_concrete_depths)) if search_concrete_depths else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/depth_ge_2_rate",
+                float(np.mean(search_depth_ge_2)) if search_depth_ge_2 else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/depth_ge_3_rate",
+                float(np.mean(search_depth_ge_3)) if search_depth_ge_3 else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/semantic_expansion_rate",
+                float(np.mean(search_semantic_expansion)) if search_semantic_expansion else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/semantic_switch_rate",
+                float(np.mean(search_semantic_switch)) if search_semantic_switch else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/semantic_chain_steps_mean",
+                float(np.mean(search_semantic_chain_steps)) if search_semantic_chain_steps else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/semantic_drill_rate",
+                float(np.mean(search_semantic_drill)) if search_semantic_drill else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_top1_visit_share",
+                float(np.mean(search_root_top1_visit_share)) if search_root_top1_visit_share else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_visit_entropy",
+                float(np.mean(search_root_visit_entropy)) if search_root_visit_entropy else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_scale",
+                float(np.mean(search_root_bias_scale)) if search_root_bias_scale else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_nonzero_rate",
+                float(np.mean(search_root_bias_nonzero)) if search_root_bias_nonzero else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_abs_mean",
+                float(np.mean(search_root_bias_abs_mean)) if search_root_bias_abs_mean else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_max_abs",
+                float(np.max(search_root_bias_max_abs)) if search_root_bias_max_abs else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_changed_top1_rate",
+                float(np.mean(search_root_bias_changed_top1)) if search_root_bias_changed_top1 else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_selected_action_delta_mean",
+                float(np.mean(search_root_bias_selected_delta)) if search_root_bias_selected_delta else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_suppressed_by_gate_rate",
+                float(np.mean(search_root_bias_suppressed_by_gate)) if search_root_bias_suppressed_by_gate else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/root_bias_scale_effective_mean",
+                float(np.mean(search_root_bias_scale_effective)) if search_root_bias_scale_effective else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/end_turn_guard_applied",
+                float(np.mean(search_end_turn_guard_applied)) if search_end_turn_guard_applied else 0.0,
+                self.episode_count,
+            )
+            self.writer.add_scalar(
+                "search/end_turn_guard_forced_alternative",
+                float(np.mean(search_end_turn_guard_forced_alt)) if search_end_turn_guard_forced_alt else 0.0,
+                self.episode_count,
+            )
+            objective_weight_keys = (
+                ("search/objective_weight_survival", "objective_weight_survival"),
+                ("search/objective_weight_hp", "objective_weight_hp"),
+                ("search/objective_weight_build", "objective_weight_build"),
+                ("search/objective_weight_resource", "objective_weight_resource"),
+                ("search/root_objective_value", "root_objective_value"),
+                ("search/end_turn_bias_applied", "end_turn_bias_applied"),
+                ("search/objective_prior_applied", "objective_prior_applied"),
+            )
+            for writer_key, stat_key in objective_weight_keys:
+                values = [
+                    float(step.get("search_stats", {}).get(stat_key, 0.0))
+                    for step in trajectory.steps
+                    if isinstance(step.get("search_stats"), dict)
+                ]
+                if values:
+                    self.writer.add_scalar(writer_key, float(np.mean(values)), self.episode_count)
+
+        domain_search_means: dict[str, dict[str, float]] = {}
+        domain_family_rates: dict[str, dict[str, float]] = {}
+        total_fast_paths = int(sum(fast_path_counts.values()))
+
+        self.writer.add_scalar("decision/total_count", float(total_decisions), self.episode_count)
+        self.writer.add_scalar(
+            "decision/domain_override_count",
+            float(sum(domain_override_counts.values())),
+            self.episode_count,
+        )
+        self.writer.add_scalar("decision/combat_like_count", float(combat_like_decision_count), self.episode_count)
+        self.writer.add_scalar(
+            "decision/direct_policy_eligible_count",
+            float(direct_policy_eligible_count),
+            self.episode_count,
+        )
+        self.writer.add_scalar(
+            "decision/direct_policy_used_count",
+            float(direct_policy_used_count),
+            self.episode_count,
+        )
+        self.writer.add_scalar(
+            "decision/direct_policy_used_rate",
+            float(direct_policy_used_count) / float(max(direct_policy_eligible_count, 1)),
+            self.episode_count,
+        )
+        self.writer.add_scalar("decision/fast_path_count", float(total_fast_paths), self.episode_count)
+        self.writer.add_scalar(
+            "decision/fast_path_rate",
+            float(total_fast_paths) / float(total_decisions),
+            self.episode_count,
+        )
+        for domain in DECISION_DOMAINS:
+            domain_count = decision_counts.get(domain, 0)
+            self.writer.add_scalar(f"decision/{domain}_count", float(domain_count), self.episode_count)
+            self.writer.add_scalar(f"decision/{domain}_share", float(domain_count) / float(total_decisions), self.episode_count)
+            domain_fast_paths = fast_path_counts.get(domain, 0)
+            if domain_count > 0:
+                self.writer.add_scalar(
+                    f"decision/{domain}/fast_path_rate",
+                    float(domain_fast_paths) / float(domain_count),
+                    self.episode_count,
+                )
+            metric_lists = domain_search_stats.get(domain) or {}
+            if not metric_lists:
+                continue
+            metric_name_map = {
+                "root_candidates": "root_candidates_mean",
+                "root_selectable_children_mean": "root_selectable_children_mean",
+                "num_simulations": "num_simulations",
+                "mean_expanded_children": "expanded_children_mean",
+                "mean_predicted_legal_count": "predicted_legal_mean",
+                "mean_surface_keep_count": "surface_keep_mean",
+                "max_search_depth": "max_depth_mean",
+                "mean_leaf_depth": "leaf_depth_mean",
+                "mean_concrete_leaf_depth": "concrete_leaf_depth_mean",
+                "depth_ge_2_rate": "depth_ge_2_rate",
+                "depth_ge_3_rate": "depth_ge_3_rate",
+                "root_top1_visit_share": "root_top1_visit_share",
+                "root_visit_entropy": "root_visit_entropy",
+                "search_mode_direct_policy": "search_mode_direct_policy",
+                "search_mode_direct_rollout_planner": "search_mode_direct_rollout_planner",
+                "direct_rollout_q_mean": "direct_rollout_q_mean",
+                "direct_rollout_objective_q_mean": "direct_rollout_objective_q_mean",
+                "direct_rollout_risk_q_mean": "direct_rollout_risk_q_mean",
+                "direct_rollout_uncertainty_mean": "direct_rollout_uncertainty_mean",
+                "direct_rollout_surprise_mean": "direct_rollout_surprise_mean",
+                "direct_rollout_surface_entropy_mean": "direct_rollout_surface_entropy_mean",
+                "direct_rollout_latent_drift_mean": "direct_rollout_latent_drift_mean",
+                "direct_rollout_branch_disagreement_mean": "direct_rollout_branch_disagreement_mean",
+                "direct_rollout_steps_used": "direct_rollout_steps_used",
+                "direct_rollout_branch_count_mean": "direct_rollout_branch_count_mean",
+                "direct_rollout_root_valid_count": "direct_rollout_root_valid_count",
+                "direct_rollout_root_bucket_size": "direct_rollout_root_bucket_size",
+                "direct_rollout_bucket_padding_ratio": "direct_rollout_bucket_padding_ratio",
+                "direct_rollout_max_branch_bucket_size": "direct_rollout_max_branch_bucket_size",
+                "direct_rollout_branch_padding_ratio": "direct_rollout_branch_padding_ratio",
+                "semantic_switch_rate": "semantic_switch_rate",
+                "semantic_expansion_rate": "semantic_expansion_rate",
+                "semantic_chain_steps_mean": "semantic_chain_steps_mean",
+                "semantic_drill_rate": "semantic_drill_rate",
+                "root_bias_scale": "root_bias_scale",
+                "root_bias_nonzero": "root_bias_nonzero_rate",
+                "root_bias_abs_mean": "root_bias_abs_mean",
+                "root_bias_max_abs": "root_bias_max_abs",
+                "root_bias_changed_top1": "root_bias_changed_top1_rate",
+                "root_bias_selected_action_delta": "root_bias_selected_action_delta_mean",
+                "root_bias_suppressed_by_gate": "root_bias_suppressed_by_gate_rate",
+                "root_bias_scale_effective": "root_bias_scale_effective_mean",
+                # Phase 3 route-heuristic prior bias telemetry.  The bias is
+                # default-off, but both sync and async writers must expose the
+                # same keys when an experiment opts in.
+                "route_heuristic_bias_applied": "route_heuristic_bias_applied_rate",
+                "route_heuristic_bias_abs_mean": "route_heuristic_bias_abs_mean",
+                "route_heuristic_bias_max_abs": "route_heuristic_bias_max_abs",
+                # Route hard-guard telemetry.  Keep this synchronized with the
+                # async search_suffix_map in train.py while the async writer is
+                # still hosted there.
+                "route_safety_guard_enabled": "route_safety_guard_enabled",
+                "route_safety_guard_applicable": "route_safety_guard_applicable_rate",
+                "route_safety_guard_safe_available": "route_safety_guard_safe_available_rate",
+                "route_safety_guard_lower_risk_available": "route_safety_guard_lower_risk_available_rate",
+                "route_safety_guard_applied": "route_safety_guard_applied_rate",
+                "route_safety_guard_override": "route_safety_guard_override_rate",
+                "route_safety_guard_alignment_error": "route_safety_guard_alignment_error_rate",
+                "route_safety_guard_selected_risk_class": "route_safety_guard_selected_risk_class_mean",
+                "route_safety_guard_final_risk_class": "route_safety_guard_final_risk_class_mean",
+                "route_safety_guard_selected_forced_elite": "route_safety_guard_selected_forced_elite_rate",
+                "route_safety_guard_selected_immediate_elite": "route_safety_guard_selected_immediate_elite_rate",
+                "route_safety_guard_low_hp_forced": "route_safety_guard_low_hp_forced_rate",
+                "route_safety_guard_invalid_obs": "route_safety_guard_invalid_obs_rate",
+                "objective_weight_survival": "objective_weight_survival",
+                "objective_weight_hp": "objective_weight_hp",
+                "objective_weight_build": "objective_weight_build",
+                "objective_weight_resource": "objective_weight_resource",
+                "root_objective_value": "root_objective_value",
+                "end_turn_bias_applied": "end_turn_bias_applied",
+                "end_turn_guard_applied": "end_turn_guard_applied",
+                "end_turn_guard_forced_alternative": "end_turn_guard_forced_alternative",
+                "objective_prior_applied": "objective_prior_applied",
+                "combat_grounded_root_enabled": "combat_grounded_root_enabled",
+                "q_value_ucb_enabled": "q_value_ucb_enabled",
+            }
+            metric_name_map.update(CARD_REWARD_GUARD_SEARCH_SUFFIXES)
+            for stat_key, writer_suffix in metric_name_map.items():
+                values = metric_lists.get(stat_key)
+                if values:
+                    domain_search_means.setdefault(domain, {})[stat_key] = float(np.mean(values))
+                    self.writer.add_scalar(
+                        f"search/{domain}/{writer_suffix}",
+                        float(np.mean(values)),
+                        self.episode_count,
+                    )
+
+            family_counts = selected_family_counts.get(domain) or {}
+            if family_counts and domain_count > 0:
+                for family, count in sorted(family_counts.items()):
+                    safe_family = family.replace("/", "_").replace(" ", "_")
+                    domain_family_rates.setdefault(domain, {})[family] = float(count) / float(domain_count)
+                    self.writer.add_scalar(
+                        f"decision/{domain}/family_{safe_family}_rate",
+                        float(count) / float(domain_count),
+                        self.episode_count,
+                    )
+        if total_fast_paths > 0:
+            for reason in TRIVIAL_BUILD_FAST_PATH_REASONS:
+                safe_reason = reason.replace("/", "_").replace(" ", "_")
+                count = int(fast_path_reason_counts.get(reason, 0))
+                self.writer.add_scalar(
+                    f"decision/fast_path/reason_{safe_reason}_rate",
+                    float(count) / float(total_fast_paths),
+                    self.episode_count,
+                )
+
+        self.writer.add_scalar("episode/max_floor", float(max_floor), self.episode_count)
+        self.writer.add_scalar("episode/max_act_id", float(max_act_id), self.episode_count)
+        self.writer.add_scalar("episode/rooms_seen", float(rooms_seen), self.episode_count)
+        self.writer.add_scalar("episode/death_floor", float(death_floor), self.episode_count)
+        self.writer.add_scalar("episode/elite_rooms_seen", float(len(elite_floors)), self.episode_count)
+        self.writer.add_scalar("episode/act1_boss_seen", 1.0 if act1_boss_seen else 0.0, self.episode_count)
+        self.writer.add_scalar("episode/act1_clear", 1.0 if act1_clear else 0.0, self.episode_count)
+        self.writer.add_scalar("episode/settlement_signal", float(settlement_stats.get("signal", 0.0)), self.episode_count)
+        self.writer.add_scalar("episode/settlement_applied_steps", float(settlement_stats.get("applied_steps", 0.0)), self.episode_count)
+        self.writer.add_scalar("episode/settlement_total_bonus", float(settlement_stats.get("total_bonus", 0.0)), self.episode_count)
+        self.writer.add_scalar("episode/reward_augmented", float(augmented_episode_reward), self.episode_count)
+        for tag_suffix, quality_key in FINAL_DECK_QUALITY_TB_KEYS:
+            self.writer.add_scalar(
+                f"deck/final_{tag_suffix}",
+                float(final_deck_quality.get(quality_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in CARD_REWARD_TB_KEYS:
+            self.writer.add_scalar(
+                f"build/card_reward_{tag_suffix}",
+                float(card_reward_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        if float(death_floor) > 0.0:
+            for tag_suffix, quality_key in DEATH_DECK_QUALITY_TB_KEYS:
+                self.writer.add_scalar(
+                    f"death_deck/{tag_suffix}",
+                    float(final_deck_quality.get(quality_key, 0.0)),
+                    self.episode_count,
+                )
+        self._emit_route_heuristic_dry_run_metrics(
+            records=route_dry_run_records,
+            error_count=route_dry_run_error_count,
+        )
+        combat_quality_diagnostics = self._emit_combat_quality_episode_diagnostics(trajectory)
+        boss_diagnostics = self._emit_boss_episode_diagnostics(
+            trajectory,
+            boss_entry=boss_entry_snapshot,
+            final_potion_count=final_potion_count,
+        )
+
+        self.last_episode_metrics = {
+            "decision_counts": {domain: int(count) for domain, count in decision_counts.items()},
+            "decision_total": int(total_decisions),
+            "decision_domain_overrides": {key: int(value) for key, value in domain_override_counts.items()},
+            "combat_like_decision_count": int(combat_like_decision_count),
+            "direct_policy_eligible_count": int(direct_policy_eligible_count),
+            "direct_policy_used_count": int(direct_policy_used_count),
+            "fast_path_counts": {domain: int(count) for domain, count in fast_path_counts.items()},
+            "fast_path_total": int(total_fast_paths),
+            "fast_path_reason_counts": {
+                reason: int(fast_path_reason_counts.get(reason, 0))
+                for reason in TRIVIAL_BUILD_FAST_PATH_REASONS
+                if int(fast_path_reason_counts.get(reason, 0)) > 0
+            },
+            "domain_search_means": domain_search_means,
+            "domain_family_rates": domain_family_rates,
+            "combat_quality_diagnostics": combat_quality_diagnostics,
+            "deck_quality_v2": final_deck_quality,
+            "final_deck_cards_compact": final_deck_compact,
+            "card_reward_metrics": card_reward_meta,
+            "episode_reward": float(episode_reward),
+            "episode_length": int(episode_length),
+            "max_floor": float(max_floor),
+            "max_act_id": float(max_act_id),
+            "rooms_seen": int(rooms_seen),
+            "death_floor": float(death_floor),
+            "elite_rooms_seen": int(len(elite_floors)),
+            "act1_boss_seen": bool(act1_boss_seen),
+            "act1_clear": bool(act1_clear),
+            "settlement_signal": float(settlement_stats.get("signal", 0.0)),
+            "settlement_applied_steps": int(settlement_stats.get("applied_steps", 0.0)),
+            "settlement_total_bonus": float(settlement_stats.get("total_bonus", 0.0)),
+            "episode_reward_augmented": float(augmented_episode_reward),
+            "boss_diagnostics": boss_diagnostics,
+        }
+        if recent_tail_snapshot:
+            self.last_episode_metrics["recent_tail"] = recent_tail_snapshot
+
+        return episode_reward, episode_length

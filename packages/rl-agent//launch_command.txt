@@ -1,0 +1,63 @@
+cd /mnt/e/game/project/sts2_mcp/packages/rl-agent
+./.venv-wsl-rocm/bin/python -u -m muzero.train \
+  --device cuda \
+  --obs-mode token_v3 \
+  --model-arch token_memory_v1 \
+  --resume-from /mnt/e/game/project/sts2_mcp/packages/rl-agent/checkpoints_muzero/muzero_pass_large_fullrun_random_act1_survival_material_blockfix_from_100474_20260514_113603/muzero_step_00102474 \
+  --resume-without-buffer \
+  --resume-without-optimizer \
+  --total-timesteps 180000 \
+  --combat-policy-mode direct \
+  --planner-memory-profile train \
+  --build-num-simulations 8 \
+  --route-num-simulations 8 \
+  --combat-rollout-q-blend 0.75 \
+  --combat-rollout-objective-q-blend 0.50 \
+  --combat-rollout-risk-blend 0.35 \
+  --combat-rollout-uncertainty-blend 0.35 \
+  --future-world-rollout-steps 2 \
+  --future-world-rollout-weight 0.20 \
+  --future-world-aux-weight 0.25 \
+  --future-bank-state-weight 0.10 \
+  --future-bank-delta-weight 0.05 \
+  --future-bank-occupancy-weight 0.10 \
+  --future-bank-token-presence-weight 0.15 \
+  --future-bank-token-distribution-weight 0.15 \
+  --future-bank-token-slot-state-weight 0.15 \
+  --future-bank-token-slot-mask-weight 0.10 \
+  --future-bank-token-slot-type-weight 0.15 \
+  --future-bank-token-slot-zone-weight 0.10 \
+  --future-bank-token-slot-source-weight 0 \
+  --state-consistency-weight 1.0 \
+  --latent-gaussian-reg-weight 0.005 \
+  --surprise-loss-weight 0.20 \
+  --mixed-precision auto \
+  --batch-size 8 \
+  --updates-per-train 1 \
+  --unroll-steps 5 \
+  --n-envs 1 \
+  --recent-tail-min-samples 2 \
+  --route-heuristic-bias 0.0 \
+  --route-safety-guard \
+  --wasteful-proceed-replay-scale 1.0 \
+  --disable-potion-reward-fast-path \
+  --token-d-model 192 \
+  --token-memory-slots 24 \
+  --token-memory-slot-layout pass_large_v1 \
+  --token-n-heads 6 \
+  --token-ffn-dim 768 \
+  --token-world-layers 6 \
+  --token-local-layers 2 \
+  --token-decoder-layers 3 \
+  --token-candidate-set-layers 2 \
+  --token-world-bank-top-k 7 \
+  --token-bank-token-slots 8 \
+  --action-embed-dim 128 \
+  --dynamics-res-blocks 6 \
+  --support-size 31 \
+  --activation-checkpointing on \
+  --token-dropout 0.0 \
+  --session-files /mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session_0.json \
+  --character ironclad \
+  --log-dir "/mnt/e/game/project/sts2_mcp/packages/rl-agent/logs_muzero/muzero_pass_large_fullrun_random_act1_candidate_guard_from_102474_20260514_174658" \
+  --checkpoint-dir "/mnt/e/game/project/sts2_mcp/packages/rl-agent/checkpoints_muzero/muzero_pass_large_fullrun_random_act1_candidate_guard_from_102474_20260514_174658"

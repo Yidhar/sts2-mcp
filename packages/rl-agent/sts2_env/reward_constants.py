@@ -157,14 +157,14 @@ BOSS_DAMAGE_MULTIPLIER = 5.0
 #   per-step enemy_hp_delta × BOSS_DAMAGE_MULTIPLIER (5.0) ≈ +5.0 for a
 #   typical 100-hp boss damage delivered, vs only −2~−3 from the prior loss
 #   penalty (BASE 2.0 + missing-hp scale 1.0).  Net: +2 even on a loss.
-# Bumped LOSS_PENALTY_BASE 2.0 → 5.0 and MISSING_HP_SCALE 1.0 → 3.0 so a
-# full boss wipe costs −5~−8, comfortably overpowering the +5 damage
-# shaping; bumped WIN_BONUS_BASE 2.0 → 3.0 to keep the win/loss gap (and
-# avoid making "skip the boss" attractive).  Net boss outcome gap roughly
-# doubled while keeping per-step shaping unchanged.
+# Bumped LOSS_PENALTY_BASE 2.0 → 7.0 and MISSING_HP_SCALE 1.0 → 3.0 so a
+# full boss wipe costs −10 plus damage-undo, comfortably overpowering floor
+# ladder + boss-damage shaping; bumped WIN_BONUS_BASE 2.0 → 3.0 to keep the
+# win/loss gap (and avoid making "skip the boss" attractive).  Net boss
+# outcome gap roughly doubled while keeping per-step shaping bounded.
 BOSS_COMBAT_WIN_BONUS_BASE = 3.0
 BOSS_COMBAT_WIN_BONUS_HP_SCALE = 2.0
-BOSS_COMBAT_LOSS_PENALTY_BASE = 5.0
+BOSS_COMBAT_LOSS_PENALTY_BASE = 7.0
 BOSS_COMBAT_LOSS_PENALTY_MISSING_HP_SCALE = 3.0
 # H22 v3: percent-based boss damage shaping.
 # Old design used raw HP × 0.01 × BOSS_DAMAGE_MULTIPLIER (5.0), so a 200-HP
@@ -186,6 +186,22 @@ BOSS_COMBAT_LOSS_PENALTY_MISSING_HP_SCALE = 3.0
 # mildly negative even on a "deal everything but die" outcome.
 BOSS_ENEMY_HP_DELTA_PERCENT_SCALE = 5.0
 BOSS_COMBAT_LOSS_DAMAGE_UNDO_PERCENT_SCALE = 7.0
+
+# ---- Full-run terminal death shaping (non-boss) ----
+# Phase 8.2's floor-clear ladder made "reach floor 13/14 and die" remain
+# positive in full-run Act 1 training: +progress rewards outweighed the
+# ordinary HP-delta loss (91 HP × 0.03 ≈ -2.7).  That teaches the value head
+# that late-Act deaths are acceptable.  Boss deaths use the boss-specific
+# damage-undo penalty above; this block is only for non-boss terminal deaths.
+#
+# For a floor-14 wipe at 0 HP:
+#   -(6.0 + 2.0 * 1.0 + 3.0 * 14/17) ≈ -10.47
+# which turns the observed +6~7 "floor 14 death" episodes into clearly
+# negative samples while preserving positive reward for actually surviving
+# into / past the boss.
+FULL_RUN_DEATH_PENALTY_BASE = 6.0
+FULL_RUN_DEATH_PENALTY_MISSING_HP_SCALE = 2.0
+FULL_RUN_DEATH_PENALTY_LATE_ACT_SCALE = 3.0
 
 # ---- Boss-specific mechanic shaping ----
 # These are tactical, per-step shaping signals for boss mechanics that are too
@@ -291,11 +307,12 @@ CEREMONIAL_ONE_CARD_END_TURN_PENALTY = -0.22
 # HP ratio is below REST_SITE_SKIP_HEAL_HP_THRESHOLD. MUST stay smaller
 # in magnitude than FLOOR_CLEAR_BONUS_PER_FLOOR (0.30) — otherwise the
 # policy learns to AVOID campfire tiles on the map rather than use
-# them wisely. At -0.15 (half the floor-clear bonus) the per-campfire
-# net is still positive for the policy overall, just the within-rest-
-# site choice becomes biased toward HEAL when HP is low.
-REST_SITE_SKIP_HEAL_HP_THRESHOLD = 0.60
-REST_SITE_SKIP_HEAL_PENALTY = -0.15
+# them wisely. At -0.22 (still below the 0.30 floor-clear bonus) the
+# per-campfire net stays positive overall, but the within-rest-site
+# choice becomes strongly biased toward HEAL before boss-entry HP drops
+# into the danger zone.
+REST_SITE_SKIP_HEAL_HP_THRESHOLD = 0.65
+REST_SITE_SKIP_HEAL_PENALTY = -0.22
 
 # Potion-use bonus — encounter-scoped absolute values (NOT a base×mult)
 # with a hoarding penalty at episode end.

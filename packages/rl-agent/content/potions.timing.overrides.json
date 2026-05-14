@@ -195,10 +195,10 @@
   },
   "POTION.LUCKY_TONIC": {
     "target_scope": "Self", "rarity": "Rare",
-    "effect_family": ["buff", "buffer"],
-    "effect_profile": {"target_required": false},
-    "semantic_tags": ["buff", "defense"],
-    "timing_tags": ["prevent_major_loss_tool"],
+    "effect_family": ["buff", "buffer", "prevent_damage"],
+    "effect_profile": {"target_required": false, "prevent_damage": 1.0, "long_term_value": true},
+    "semantic_tags": ["buff", "defense", "survival", "buffer"],
+    "timing_tags": ["prevent_major_loss_tool", "survival_tool", "boss_survival_tool"],
     "training_tags": ["combat_immediate"]
   },
   "POTION.MAZALETHS_GIFT": {
@@ -285,9 +285,9 @@
   },
   "POTION.LIQUID_MEMORIES": {
     "target_scope": "Self", "rarity": "Rare",
-    "effect_family": ["discard_pile", "tutor"],
-    "effect_profile": {"retrieve_from_discard": 1.0, "target_required": false},
-    "semantic_tags": ["draw", "tutor", "resource"],
+    "effect_family": ["discard_pile", "tutor", "set_cost_zero"],
+    "effect_profile": {"retrieve_from_discard": 1.0, "target_required": false, "set_cost_zero": 1.0},
+    "semantic_tags": ["draw", "tutor", "resource", "free_play"],
     "timing_tags": ["requires_discard_context"],
     "training_tags": ["combat_immediate"]
   },

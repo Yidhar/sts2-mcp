@@ -193,3 +193,222 @@ def compute_sample_weights(
         weight = max(cfg.min_weight, min(cfg.max_weight, weight))
         out.append(float(weight))
     return out
+
+
+# ---------------------------------------------------------------------------
+# P0-2 (recovery 2026-05-06): batch-level hard tier quotas.
+#
+# Soft tier weights nudge the empirical distribution but cannot defend against
+# extreme skew when high-priority encounters dominate priority * encounter
+# weight products (in the latest run boss climbed to 95%+ while normal fell
+# below 1%). The recovery doc requires a *hard* per-batch quota: every batch
+# must contain at least N_normal normal trajectories, at least N_elite elite
+# trajectories, and at most N_boss_max boss trajectories. These quotas live
+# next to the existing soft scheduler so callers can opt in without touching
+# the priority computation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TierQuotaConfig:
+    """Hard per-batch tier quotas for the replay sampler.
+
+    ``targets`` are the desired share per tier (must sum to 1.0 over the
+    tiers actually present in the buffer; tiers absent from the dict are
+    treated as ``flex`` and only sampled when other tiers are exhausted).
+
+    ``min_caps`` is the minimum share per tier — the sampler will refuse to
+    drop below this when the tier pool is non-empty.
+
+    ``max_caps`` is the maximum share per tier — the sampler will refuse to
+    exceed this even if the tier pool dominates the priority budget.
+    """
+
+    targets: dict[str, float] = field(
+        default_factory=lambda: {"boss": 0.60, "elite": 0.25, "normal": 0.15, "weak": 0.0}
+    )
+    min_caps: dict[str, float] = field(
+        default_factory=lambda: {"elite": 0.18, "normal": 0.10}
+    )
+    max_caps: dict[str, float] = field(
+        default_factory=lambda: {"boss": 0.65}
+    )
+
+
+@dataclass(frozen=True)
+class TierQuotaAllocation:
+    quotas: dict[str, int]
+    target_counts: dict[str, int]
+    boss_cap_hit: bool
+    normal_min_unfilled: bool
+    elite_min_unfilled: bool
+
+
+def allocate_tier_quotas(
+    *,
+    batch_size: int,
+    pool_sizes: dict[str, int],
+    config: TierQuotaConfig | None = None,
+) -> TierQuotaAllocation:
+    """Pure function: turn ``batch_size`` and per-tier pool sizes into a
+    per-tier integer quota.
+
+    Algorithm (priority order, mirrors §P0-2 of the recovery doc):
+
+    1. **Floors first** — each tier with a ``min_caps`` entry whose pool is
+       non-empty receives ``ceil(min_share * batch_size)`` slots up front,
+       capped by the pool size and by ``max_caps`` if applicable.
+    2. **Caps as ceilings** — every tier with a ``max_caps`` entry can never
+       exceed ``floor(max_share * batch_size)``.
+    3. **Remaining slots** are distributed proportionally to ``targets`` for
+       tiers below their max cap and with non-empty pools. Any leftover
+       (because all eligible tiers hit their max cap, or pools are empty)
+       becomes ``flex`` slots that fall back to the global priority pool.
+    4. **Pool clamps** — finally, any per-tier quota that exceeds the
+       actual pool size is clamped down and the shortfall is added to
+       ``flex``.
+
+    Slots that cannot be filled by any tier become ``flex`` and the caller
+    falls back to the global priority pool. The allocation is deterministic
+    given the inputs so it is easy to unit-test and render in TensorBoard.
+    """
+    cfg = config or TierQuotaConfig()
+    bs = max(0, int(batch_size))
+    if bs == 0:
+        return TierQuotaAllocation(
+            quotas={},
+            target_counts={},
+            boss_cap_hit=False,
+            normal_min_unfilled=False,
+            elite_min_unfilled=False,
+        )
+
+    # Always carry weak in the quota dict so callers can rely on a stable
+    # tier-key vocabulary in their TensorBoard exports.
+    tier_keys = list(dict.fromkeys(["boss", "elite", "normal", "weak", *cfg.targets.keys()]))
+    quotas: dict[str, int] = {t: 0 for t in tier_keys}
+
+    # Pre-compute integer caps & target counts (used both for proportional
+    # distribution and by the caller for KL/L1 diagnostics).
+    max_caps_int: dict[str, int] = {
+        t: int(math.floor(max(0.0, float(s)) * bs)) for t, s in cfg.max_caps.items()
+    }
+    raw_target_counts: dict[str, int] = {
+        t: int(round(max(0.0, float(s)) * bs)) for t, s in cfg.targets.items()
+    }
+
+    def _tier_cap(tier: str) -> int:
+        return max_caps_int.get(tier, bs)
+
+    # Step 1: floors from min_caps (clamped to pool size and to max_cap).
+    boss_cap_hit = False
+    elite_min_unfilled = False
+    normal_min_unfilled = False
+    for tier, min_share in cfg.min_caps.items():
+        floor_count = int(math.ceil(max(0.0, float(min_share)) * bs))
+        pool = max(0, int(pool_sizes.get(tier, 0)))
+        give = min(floor_count, pool, _tier_cap(tier))
+        quotas[tier] = quotas.get(tier, 0) + give
+        if tier == "elite" and give < floor_count:
+            elite_min_unfilled = True
+        if tier == "normal" and give < floor_count:
+            normal_min_unfilled = True
+
+    # Step 2: distribute remaining slots proportional to targets, respecting
+    # both pool sizes and max_caps. Iterate until nothing more can be placed.
+    remaining = bs - sum(quotas.values())
+    safety_iterations = bs * 4 + 4  # bounded loop; protects against pathological configs
+    while remaining > 0 and safety_iterations > 0:
+        safety_iterations -= 1
+        # Active tiers: targets > 0, pool > 0, below max_cap, below pool size.
+        active = [
+            tier
+            for tier in tier_keys
+            if max(0.0, float(cfg.targets.get(tier, 0.0))) > 0
+            and pool_sizes.get(tier, 0) > 0
+            and quotas.get(tier, 0) < _tier_cap(tier)
+            and quotas.get(tier, 0) < pool_sizes.get(tier, 0)
+        ]
+        if not active:
+            break
+        weights = {t: max(0.0, float(cfg.targets.get(t, 0.0))) for t in active}
+        total_w = sum(weights.values())
+        if total_w <= 0:
+            break
+        # Allocate one batch of slots based on weight proportions, but never
+        # exceed each tier's slack-to-cap-or-pool. ``floor + leftovers``
+        # rounding keeps the loop deterministic.
+        slack_caps = {
+            t: min(_tier_cap(t) - quotas.get(t, 0), pool_sizes.get(t, 0) - quotas.get(t, 0))
+            for t in active
+        }
+        provisional_floats = {t: weights[t] / total_w * remaining for t in active}
+        floors = {t: int(math.floor(provisional_floats[t])) for t in active}
+        for t, slack in slack_caps.items():
+            if floors[t] > slack:
+                floors[t] = max(0, slack)
+        placed = sum(floors.values())
+        # Leftover slots → tier with largest fractional part still having
+        # slack. Stop when all eligible tiers are saturated.
+        leftover_pool = remaining - placed
+        if leftover_pool > 0:
+            fractional = sorted(
+                (
+                    (t, provisional_floats[t] - floors[t])
+                    for t in active
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            for t, _ in fractional:
+                if leftover_pool <= 0:
+                    break
+                slack = min(_tier_cap(t) - quotas.get(t, 0) - floors[t], pool_sizes.get(t, 0) - quotas.get(t, 0) - floors[t])
+                if slack <= 0:
+                    continue
+                floors[t] += 1
+                leftover_pool -= 1
+        for t, count in floors.items():
+            if count > 0:
+                quotas[t] = quotas.get(t, 0) + count
+        # If the proportional distribution placed nothing (every active
+        # tier had slack=0 after capping), break to avoid infinite loop.
+        if sum(floors.values()) == 0:
+            break
+        remaining = bs - sum(quotas.values())
+
+    # Step 3: any remaining slots become flex (caller falls back to global
+    # priority pool). Also: if a max_cap pushed a tier exactly to its cap
+    # and the boss tier was the one capped, record boss_cap_hit.
+    if quotas.get("boss", 0) >= max_caps_int.get("boss", bs) and "boss" in cfg.max_caps:
+        # Only flag cap hit if at least one slot of pressure was actually
+        # absorbed by the cap (i.e., the unconstrained allocation would
+        # have given boss > cap). When raw_target_counts["boss"] > cap,
+        # we know there was pressure.
+        if raw_target_counts.get("boss", 0) > max_caps_int.get("boss", bs):
+            boss_cap_hit = True
+
+    if remaining > 0:
+        quotas["flex"] = quotas.get("flex", 0) + remaining
+
+    # Step 4: final pool clamps (defensive — earlier steps already cap).
+    for tier in list(quotas.keys()):
+        if tier == "flex":
+            continue
+        pool = max(0, int(pool_sizes.get(tier, 0)))
+        if quotas[tier] > pool:
+            shortfall = quotas[tier] - pool
+            quotas[tier] = pool
+            quotas["flex"] = quotas.get("flex", 0) + shortfall
+
+    # Drop tiers that ended at zero so the returned dict stays compact, but
+    # keep boss/elite/normal/weak even at 0 so callers can render zeros.
+    canonical = {"boss", "elite", "normal", "weak"}
+    quotas = {t: int(v) for t, v in quotas.items() if v > 0 or t in canonical}
+
+    return TierQuotaAllocation(
+        quotas=quotas,
+        target_counts=raw_target_counts,
+        boss_cap_hit=boss_cap_hit,
+        normal_min_unfilled=normal_min_unfilled,
+        elite_min_unfilled=elite_min_unfilled,
+    )

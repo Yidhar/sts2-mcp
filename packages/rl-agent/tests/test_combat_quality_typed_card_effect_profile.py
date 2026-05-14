@@ -75,6 +75,44 @@ def _obs(*, energy: float) -> dict[str, object]:
     }
 
 
+def _raw_combat_obs(
+    *,
+    energy: float = 3.0,
+    incoming: float = 0.0,
+    intent_type: str = "Buff",
+    block: float = 0.0,
+) -> dict[str, object]:
+    """Raw combat snapshot with an explicit enemy intent for trainer guards."""
+
+    return {
+        "phase": "combat",
+        "player": {"hp": 50, "max_hp": 80, "block": block, "relics": [], "potions": []},
+        "combat": {
+            "energy": energy,
+            "max_energy": 3,
+            "round": 1,
+            "hand": [],
+            "draw_pile": [],
+            "discard_pile": [],
+            "exhaust_pile": [],
+            "enemies": [
+                {
+                    "id": "enemy.test",
+                    "combat_id": "enemy-1",
+                    "hp": 40,
+                    "max_hp": 40,
+                    "intent": {
+                        "intent_type": intent_type,
+                        "type": intent_type,
+                        "total_damage": incoming,
+                        "damage": incoming,
+                    },
+                }
+            ],
+        },
+    }
+
+
 class CombatQualityTypedCardEffectProfileTest(unittest.TestCase):
     def test_combat_env_marks_typed_energy_refund_without_followup_as_strategic_skip(self) -> None:
         env = CombatSandboxEnv.__new__(CombatSandboxEnv)
@@ -242,6 +280,170 @@ class CombatQualityTypedCardEffectProfileTest(unittest.TestCase):
         self.assertTrue(zero_energy["x_cost_zero"])
         self.assertTrue(zero_energy["deferable"])
         self.assertFalse(two_energy["x_cost_zero"])
+
+    def test_muzero_no_incoming_pure_block_is_deferable_not_urgent(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        defend = _play(_card("Defend", card_type="Skill", cost=1, block=5, semantic_tags=["block"]))
+        legal_actions = [defend, {"kind": "end_turn", "action_id": "end_turn"}]
+        raw = _raw_combat_obs(energy=3, incoming=0, intent_type="Buff", block=0)
+
+        result = trainer._classify_positive_combat_action(
+            defend,
+            0,
+            None,
+            raw,
+            legal_actions,
+            np.ones(2, dtype=np.float32),
+            3.0,
+        )
+
+        self.assertTrue(result["positive"])
+        self.assertFalse(result["urgent"])
+        self.assertTrue(result["deferable"])
+        self.assertTrue(result["card_block_waste"])
+        self.assertTrue(result["card_pure_block"])
+        self.assertTrue(result["card_no_damage_pressure"])
+        self.assertTrue(result["card_no_damage_pressure_context"])
+
+    def test_muzero_low_incoming_high_hp_pure_block_is_not_urgent(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        defend = _play(_card("Defend", card_type="Skill", cost=1, block=5, semantic_tags=["block"]))
+        legal_actions = [defend, {"kind": "end_turn", "action_id": "end_turn"}]
+        raw = _raw_combat_obs(energy=3, incoming=2, intent_type="Attack", block=0)
+
+        result = trainer._classify_positive_combat_action(
+            defend,
+            0,
+            None,
+            raw,
+            legal_actions,
+            np.ones(2, dtype=np.float32),
+            3.0,
+        )
+
+        self.assertTrue(result["positive"])
+        self.assertFalse(result["urgent"])
+        self.assertFalse(result["card_block_waste"])
+        self.assertTrue(result["card_pure_block"])
+        self.assertFalse(result["card_no_damage_pressure"])
+        self.assertFalse(result["card_no_damage_pressure_context"])
+
+    def test_muzero_incoming_pure_block_stays_urgent(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        defend = _play(_card("Defend", card_type="Skill", cost=1, block=5, semantic_tags=["block"]))
+        legal_actions = [defend, {"kind": "end_turn", "action_id": "end_turn"}]
+        raw = _raw_combat_obs(energy=3, incoming=10, intent_type="Attack", block=0)
+
+        result = trainer._classify_positive_combat_action(
+            defend,
+            0,
+            None,
+            raw,
+            legal_actions,
+            np.ones(2, dtype=np.float32),
+            3.0,
+        )
+
+        self.assertTrue(result["positive"])
+        self.assertTrue(result["urgent"])
+        self.assertFalse(result["deferable"])
+        self.assertFalse(result["card_block_waste"])
+        self.assertTrue(result["card_pure_block"])
+        self.assertFalse(result["card_no_damage_pressure"])
+        self.assertFalse(result["card_no_damage_pressure_context"])
+
+    def test_muzero_no_incoming_attack_is_not_no_damage_pressure_offender(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        strike = _play(_card("Strike", card_type="Attack", cost=1, damage=6, semantic_tags=["attack", "damage"]))
+        legal_actions = [strike, {"kind": "end_turn", "action_id": "end_turn"}]
+        raw = _raw_combat_obs(energy=3, incoming=0, intent_type="Buff", block=0)
+
+        result = trainer._classify_positive_combat_action(
+            strike,
+            0,
+            None,
+            raw,
+            legal_actions,
+            np.ones(2, dtype=np.float32),
+            3.0,
+        )
+
+        self.assertTrue(result["positive"])
+        self.assertFalse(result["card_block_waste"])
+        self.assertFalse(result["card_pure_block"])
+        self.assertFalse(result["card_no_damage_pressure"])
+        self.assertTrue(result["card_no_damage_pressure_context"])
+
+    def test_muzero_no_incoming_block_with_draw_is_not_penalized_as_pure_block(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        shrug = _play(
+            _card(
+                "Shrug Like",
+                card_type="Skill",
+                cost=1,
+                block=8,
+                operations=[{"op": "draw_card", "count": 1}],
+                semantic_tags=["block", "draw"],
+            )
+        )
+        legal_actions = [shrug, {"kind": "end_turn", "action_id": "end_turn"}]
+        raw = _raw_combat_obs(energy=3, incoming=0, intent_type="Buff", block=0)
+
+        result = trainer._classify_positive_combat_action(
+            shrug,
+            0,
+            None,
+            raw,
+            legal_actions,
+            np.ones(2, dtype=np.float32),
+            3.0,
+        )
+
+        self.assertTrue(result["positive"])
+        self.assertFalse(result["card_block_waste"])
+        self.assertFalse(result["card_pure_block"])
+        self.assertFalse(result["card_no_damage_pressure"])
+        self.assertTrue(result["card_no_damage_pressure_context"])
+
+    def test_muzero_only_no_incoming_defend_does_not_mark_end_turn_wasteful(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        raw = _raw_combat_obs(energy=3, incoming=0, intent_type="Buff", block=0)
+        trainer._current_raw_combat_obs = lambda: raw  # type: ignore[method-assign]
+        defend = _play(_card("Defend", card_type="Skill", cost=1, block=5, semantic_tags=["block"]))
+        legal_actions = [defend, {"kind": "end_turn", "action_id": "end_turn"}]
+        mask = np.ones(2, dtype=np.float32)
+
+        ctx = trainer._raw_end_turn_context(_obs(energy=3), mask, legal_actions)
+        self.assertFalse(ctx["wasteful"])
+        self.assertEqual(ctx["card_block_waste_count"], 1)
+
+        bias, stats, _ = trainer._combat_action_quality_bias(_obs(energy=3), mask, legal_actions)
+        self.assertEqual(stats["combat_quality_wasteful_end_turn_available"], 0.0)
+        self.assertEqual(stats["combat_quality_card_block_waste_count"], 1.0)
+        self.assertLess(float(bias[0]), 0.0)
+        self.assertEqual(float(bias[1]), 0.0)
+
+    def test_muzero_no_incoming_strike_keeps_end_turn_wasteful_and_defend_suppressed(self) -> None:
+        trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+        raw = _raw_combat_obs(energy=3, incoming=0, intent_type="Buff", block=0)
+        trainer._current_raw_combat_obs = lambda: raw  # type: ignore[method-assign]
+        strike = _play(_card("Strike", card_type="Attack", cost=1, damage=6, semantic_tags=["attack", "damage"]))
+        defend = _play(_card("Defend", card_type="Skill", cost=1, block=5, semantic_tags=["block"]))
+        legal_actions = [strike, defend, {"kind": "end_turn", "action_id": "end_turn"}]
+        mask = np.ones(3, dtype=np.float32)
+
+        ctx = trainer._raw_end_turn_context(_obs(energy=3), mask, legal_actions)
+        self.assertTrue(ctx["wasteful"])
+        self.assertEqual(ctx["card_block_waste_count"], 1)
+        self.assertIn(0, ctx["urgent_positive_indices"])
+        self.assertNotIn(1, ctx["urgent_positive_indices"])
+
+        bias, stats, _ = trainer._combat_action_quality_bias(_obs(energy=3), mask, legal_actions)
+        self.assertEqual(stats["combat_quality_wasteful_end_turn_available"], 1.0)
+        self.assertEqual(stats["combat_quality_card_block_waste_count"], 1.0)
+        self.assertGreater(float(bias[0]), float(bias[1]))
+        self.assertLess(float(bias[1]), 0.0)
+        self.assertLess(float(bias[2]), 0.0)
 
 
 if __name__ == "__main__":

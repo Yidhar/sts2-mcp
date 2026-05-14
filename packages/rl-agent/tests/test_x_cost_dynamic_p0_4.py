@@ -124,6 +124,26 @@ class EnergyXFallbackTests(unittest.TestCase):
         self.assertEqual(view["resource"], "none")
         self.assertFalse(view["zero_x_bad"])
 
+    def test_semantic_role_only_x_cost_detected(self):
+        # Compact bridge actions can expose X-cost only via semantic.roles while
+        # the card carries a temporary numeric runtime cost.  The canonical
+        # x_cost_view must still classify the action as energy-X.
+        action = {
+            "kind": "play_card",
+            "action_id": "play:whirlwind_runtime_cost",
+            "semantic": {"roles": ["attack", "aoe", "x_cost"]},
+            "card": {
+                "id": "CARD.WHIRLWIND",
+                "title": "Whirlwind+",
+                "type": "Attack",
+                "cost": 4,
+            },
+        }
+        view = x_cost_view(action, _obs(energy=0))
+        self.assertTrue(view["has_x_cost"])
+        self.assertEqual(view["resource"], "energy")
+        self.assertTrue(view["zero_x_bad"])
+
 
 class StarXFallbackTests(unittest.TestCase):
     def test_star_x_at_zero_stars_zero_x_bad(self):

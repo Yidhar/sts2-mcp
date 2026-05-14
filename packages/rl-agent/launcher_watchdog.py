@@ -76,7 +76,15 @@ _DEFAULT_IDLE_SCREENS: frozenset[str] = frozenset({
     "MAIN_MENU",
     "STARTUP_CHARACTER_SELECT",
     "CHARACTER_SELECT",
+    # 2026-05-08: bridge actually reports the long form (RUN_MODE_SELECTION,
+    # see BridgeGameApi.cs `case NSingleplayerSubmenu`). The original
+    # ``RUN_MODE_SELECT`` entry was a typo that left the screen NOT idle —
+    # so when the trainer paused on this screen for gradient updates the
+    # silent-hang guard would (incorrectly) restart the game after
+    # state_stall_threshold_s. Keep both spellings to stay safe across
+    # bridge versions.
     "RUN_MODE_SELECT",
+    "RUN_MODE_SELECTION",
     "GAME_OVER",
     "INTRO",
     "LOADING",

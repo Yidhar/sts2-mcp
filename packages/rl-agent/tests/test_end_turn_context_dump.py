@@ -179,6 +179,48 @@ class DumpSelectedEndTurnContextTests(unittest.TestCase):
             self.assertEqual(len(chosen_entries), 1)
             self.assertEqual(chosen_entries[0]["family"], "end_turn")
 
+    def test_leftover_energy_after_all_actions_exhausted_is_marked_benign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer = self._make_trainer_stub(Path(tmp))
+            ctx = _ctx(
+                end_turn_indices=[0],
+                energy=3.0,
+                positive_progress_count=0,
+                urgent_positive_count=0,
+            )
+            mask = np.ones(1, dtype=np.float32)
+            legal = [{"semantic": {"family": "end_turn"}, "title": "End Turn"}]
+            policy = np.array([1.0], dtype=np.float32)
+            with mock.patch.object(MuZeroTrainer, "_incoming_damage_pressure", return_value=(0.0, 0.0, 50.0)), \
+                 mock.patch.object(MuZeroTrainer, "_semantic_family", side_effect=lambda a: (a or {}).get("semantic", {}).get("family", "")), \
+                 mock.patch.object(MuZeroTrainer, "_is_x_cost_action", return_value=False), \
+                 mock.patch.object(MuZeroTrainer, "_is_kaiser_facing_change_action", return_value=False), \
+                 mock.patch.object(MuZeroTrainer, "_boss_context_max", return_value=0.0):
+                trainer._dump_selected_end_turn_context(
+                    encoded_obs={},
+                    raw_obs={"combat": {"round": 5, "hand": []}, "player": {"hp": 50, "max_hp": 80}},
+                    action_mask=mask,
+                    legal_actions=legal,
+                    chosen_idx=0,
+                    context=ctx,
+                    search_policy=policy,
+                    search_stats={},
+                    action_diagnostics=None,
+                    encounter="leftover_energy_fixture",
+                    tier="normal",
+                )
+
+            payload = json.loads((Path(tmp) / "diagnostics" / "end_turn_contexts.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(payload["end_turn_class"], "forced_end_turn")
+            self.assertTrue(payload["reason_flags"]["forced_no_non_end_turn_action"])
+            self.assertTrue(payload["reason_flags"]["benign_leftover_energy"])
+            self.assertFalse(payload["reason_flags"]["optional_only_nonurgent_action"])
+            self.assertEqual(payload["player"]["energy"], 3.0)
+            self.assertEqual(payload["counts"]["non_end_turn_action_count"], 0)
+            self.assertEqual(payload["counts"]["playable_card_action_count"], 0)
+            self.assertEqual(payload["counts"]["positive_action_count"], 0)
+            self.assertEqual(payload["counts"]["urgent_action_count"], 0)
+
     def test_disabled_via_env_skips_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             trainer = self._make_trainer_stub(Path(tmp))

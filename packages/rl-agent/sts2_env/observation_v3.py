@@ -61,8 +61,10 @@ MAX_ACTIONS = obs_common.MAX_ACTIONS
 # Phase 8 Tier 1 (attention_obs_v4): +28 HISTORY tokens (20 step-detail +
 # 8 turn-summary) so the policy can reason about "what did I just do"
 # without needing a recurrent architecture. See action_history.py.
-MAX_WORLD_TOKENS = 412
-MAX_CANDIDATE_LOCAL_TOKENS = 32
+# STS2-Pass-Large-v1: expand token and candidate-local caps to leave route /
+# build / history headroom for full-run training and avoid silent truncation.
+MAX_WORLD_TOKENS = 640
+MAX_CANDIDATE_LOCAL_TOKENS = 40
 TOKEN_NUMERIC_DIM = 96
 TOKEN_TEXT_DIM = 64
 TOKEN_FEAT_DIM = TOKEN_NUMERIC_DIM + TOKEN_TEXT_DIM
@@ -72,7 +74,7 @@ MAX_ORDER_ID = 63
 # v4: HISTORY_STEP_DETAIL / HISTORY_TURN_SUMMARY token types exist.
 # v3 checkpoints load with strict=False; new history-specific embeddings
 # zero-init. See _design_phase8_history.md for the migration plan.
-OBSERVATION_API_VERSION = "attention_obs_v4"
+OBSERVATION_API_VERSION = "attention_obs_v5_pass_large"
 
 # Maximum number of POWER_SLOT tokens emitted per step. Covers the typical
 # worst case (3-5 player buffs + 4 enemies 脳 5 powers each 鈮?25-30) with
@@ -865,6 +867,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         enemies_numeric, enemy_text, enemy_mask = self._encode_enemy_view(enemies)
         relic_text, relic_mask = self._encode_support_text_view(relics, obs_common.MAX_RELICS, "relics")
         potion_text, potion_mask = self._encode_support_text_view(potions, obs_common.MAX_POTIONS, "potions")
+        self._patch_body_slam_card_features(hand, hand_cards, obs)
         (
             actions,
             action_text,
@@ -875,6 +878,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             route_node_mask,
             action_mask,
         ) = self._encode_action_view(legal_actions, planner_context)
+        self._patch_body_slam_action_features(actions, legal_actions, obs)
 
         return {
             "scalars": scalars,
@@ -969,6 +973,152 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 planner_context,
             )
         return actions, action_text, semantic_actions, semantic_action_text, route_summary, route_nodes, route_node_mask, action_mask
+
+    @staticmethod
+    def _is_body_slam_card(source: dict[str, Any] | None) -> bool:
+        """Return True for Body Slam / 全身撞击 payloads across bridge variants.
+
+        Body Slam's play value is not a static card number: its damage equals
+        the player's *current block*.  Several bridge/static payload variants
+        only expose it as an Attack with zero damage, so the token encoder needs
+        a narrow card-identity fallback rather than relying on generic regex
+        text features during policy scoring.
+        """
+        if not isinstance(source, dict):
+            return False
+        id_values = []
+        for key in ("id", "card_id", "model_id", "internal_id", "class_name", "type_name"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                id_values.append(value)
+        id_blob = " ".join(id_values).lower().replace("-", "_").replace(".", "_").replace(" ", "_")
+        if "body_slam" in id_blob or "bodyslam" in id_blob:
+            return True
+        if "card_body_slam" in id_blob:
+            return True
+
+        text_parts: list[str] = []
+        for key in ("title", "name", "description", "text", "canonical_text"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                text_parts.append(value)
+        text_blob = " | ".join(text_parts).lower()
+        if "全身撞击" in text_blob or "全身撞擊" in text_blob:
+            return True
+        return ("body slam" in text_blob) or (
+            ("current block" in text_blob or "当前格挡" in text_blob or "目前格挡" in text_blob)
+            and ("damage" in text_blob or "伤害" in text_blob)
+        )
+
+    @staticmethod
+    def _player_current_block(obs: dict[str, Any] | None) -> float:
+        if not isinstance(obs, dict):
+            return 0.0
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+        candidates = (
+            player.get("block") if isinstance(player, dict) else None,
+            player.get("current_block") if isinstance(player, dict) else None,
+            (player.get("creature") or {}).get("block") if isinstance(player.get("creature"), dict) else None,
+            (combat.get("player") or {}).get("block") if isinstance(combat.get("player"), dict) else None,
+            (combat.get("player") or {}).get("current_block") if isinstance(combat.get("player"), dict) else None,
+        )
+        for value in candidates:
+            block = obs_common._float(value)
+            if block > 0.0:
+                return max(block, 0.0)
+        return 0.0
+
+    def _body_slam_dynamic_damage(self, source: dict[str, Any] | None, obs: dict[str, Any] | None) -> float:
+        if not self._is_body_slam_card(source):
+            return 0.0
+        return self._player_current_block(obs)
+
+    @staticmethod
+    def _is_combat_play_action(action: dict[str, Any]) -> bool:
+        kind = str(action.get("kind") or "").strip().lower()
+        if kind == "play_card":
+            return True
+        semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+        family = str(semantic.get("family") or semantic.get("kind") or "").strip().lower()
+        action_id = str(action.get("action_id") or "").strip().lower()
+        return (
+            kind == "combat"
+            and ("play" in family or "card" in family or "play_card" in action_id or "play:" in action_id)
+        )
+
+    def _patch_body_slam_card_features(
+        self,
+        rows: np.ndarray,
+        cards: list[Any],
+        obs: dict[str, Any],
+    ) -> None:
+        """Patch live hand-card numeric rows when Body Slam lacks preview damage.
+
+        CARD_FEAT_DIM columns mirror DenseObservationEncoder._enc_card_collection:
+        12/14 are base/preview damage, 25 is hit count, 31/32 are per-hit and
+        per-energy damage, 34 is damage delta.  We do not change shape/schema.
+        """
+        if rows.size == 0 or not isinstance(cards, list):
+            return
+        for index, card in enumerate(cards[: rows.shape[0]]):
+            if not isinstance(card, dict):
+                continue
+            damage = self._body_slam_dynamic_damage(card, obs)
+            if damage <= 0.0:
+                continue
+            if rows.shape[1] > 14 and rows[index, 14] > 1e-6:
+                continue
+            cost = max(obs_common._runtime_spend_cost(card), 0.0)
+            damage_per_energy = damage / obs_common._normalized_cost_for_efficiency(cost)
+            if rows.shape[1] > 14:
+                rows[index, 12] = max(rows[index, 12], obs_common._log_norm(damage, obs_common._LOG1P_200))
+                rows[index, 14] = max(rows[index, 14], obs_common._log_norm(damage, obs_common._LOG1P_200))
+            if rows.shape[1] > 25:
+                rows[index, 25] = max(rows[index, 25], min(1.0 / 10.0, 1.0))
+            if rows.shape[1] > 32:
+                rows[index, 31] = max(rows[index, 31], obs_common._log_norm(damage, obs_common._LOG1P_100))
+                rows[index, 32] = max(rows[index, 32], obs_common._log_norm(damage_per_energy, obs_common._LOG1P_100))
+            if rows.shape[1] > 34:
+                rows[index, 34] = max(rows[index, 34], 0.0)
+
+    def _patch_body_slam_action_features(
+        self,
+        actions: np.ndarray,
+        legal_actions: list[dict[str, Any]],
+        obs: dict[str, Any],
+    ) -> None:
+        """Patch play-card action rows for Body Slam dynamic damage = block.
+
+        This is intentionally observation-side as well as bridge-side: old
+        snapshots and stale bridge DLLs can still produce Body Slam with
+        effect_preview.damage=0.  The policy/action scorer must see the live
+        damage columns as at least current block.
+        """
+        if actions.size == 0:
+            return
+        for index, action in enumerate(legal_actions[: actions.shape[0]]):
+            if not isinstance(action, dict) or not self._is_combat_play_action(action):
+                continue
+            card = action.get("card") if isinstance(action.get("card"), dict) else None
+            damage = self._body_slam_dynamic_damage(card, obs)
+            if damage <= 0.0:
+                continue
+            row = actions[index]
+            if row.shape[0] > 22 and row[22] > 1e-6:
+                continue
+            cost = max(obs_common._runtime_spend_cost(card), 0.0)
+            damage_per_energy = damage / obs_common._normalized_cost_for_efficiency(cost)
+            if row.shape[0] > 22:
+                row[22] = max(row[22], obs_common._log_norm(damage, obs_common._LOG1P_200))
+            if row.shape[0] > 38:
+                row[38] = 1.0
+            if row.shape[0] > 40:
+                row[40] = max(row[40], obs_common._log_norm(damage, obs_common._LOG1P_200))
+            if row.shape[0] > 42:
+                row[42] = max(row[42], obs_common._log_norm(damage, obs_common._LOG1P_100))
+            if row.shape[0] > 43:
+                row[43] = max(row[43], obs_common._log_norm(damage_per_energy, obs_common._LOG1P_100))
 
     def _resolve_entry_text_embeddings(self, *entry_groups: list[Any]) -> None:
         def _iter_entries(group: list[Any]) -> Any:
@@ -1391,7 +1541,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             self._extend_with_budget(entries, target_context_entries, limit=3)
             source_for_target = action_card if action_card is not None else action_potion
             target_reaction_entries: list[dict[str, Any]] = []
-            self._append_target_reaction_local(target_reaction_entries, target_enemy_index, target_enemy, source_for_target)
+            self._append_target_reaction_local(target_reaction_entries, target_enemy_index, target_enemy, source_for_target, obs)
             self._extend_with_budget(entries, target_reaction_entries, limit=1)
 
         if action_domain == "combat":
@@ -1502,7 +1652,10 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         entries.append(self._entry("PLAYER_STATE_LOCAL", player_numeric, owner_id=OWNER_PLAYER, entity_id=0))
 
         energy_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-        source_profile = self._source_profile(action.get("card") if isinstance(action.get("card"), dict) else action.get("potion") if isinstance(action.get("potion"), dict) else None)
+        source_profile = self._source_profile_for_obs(
+            action.get("card") if isinstance(action.get("card"), dict) else action.get("potion") if isinstance(action.get("potion"), dict) else None,
+            obs,
+        )
         current_energy = obs_common._float(combat.get("energy"))
         max_energy = obs_common._float(combat.get("max_energy"))
         spend_cost = source_profile["cost"]
@@ -2671,8 +2824,9 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         target_enemy_index: int,
         target_enemy: dict[str, Any],
         source: dict[str, Any] | None,
+        obs: dict[str, Any] | None = None,
     ) -> None:
-        source_profile = self._source_profile(source)
+        source_profile = self._source_profile_for_obs(source, obs)
         reactions = self._enemy_reaction_flags(target_enemy)
         hp = obs_common._float(target_enemy.get("hp", target_enemy.get("current_hp")))
         block = obs_common._float(target_enemy.get("block"))
@@ -3753,6 +3907,27 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             or profile.get("typed_set_replay", 0.0) > 0.5
         )
         return profile
+
+    def _source_profile_for_obs(self, source: dict[str, Any] | None, obs: dict[str, Any] | None) -> dict[str, float]:
+        """Source profile with narrow dynamic fallbacks that require live obs.
+
+        Generic static card metadata cannot know Body Slam damage because it is
+        a function of *current player block*.  Use this method in obs-aware
+        candidate-local / target-reaction contexts; keep _source_profile()
+        static for reward/shop/deck contexts where current block is not the
+        right value.
+        """
+        profile = self._source_profile(source)
+        body_slam_damage = self._body_slam_dynamic_damage(source, obs)
+        if body_slam_damage <= 0.0 or profile.get("damage", 0.0) > 1e-6:
+            return profile
+        patched = dict(profile)
+        patched["damage"] = max(patched.get("damage", 0.0), body_slam_damage)
+        patched["hits"] = max(patched.get("hits", 0.0), 1.0)
+        patched["attack"] = max(patched.get("attack", 0.0), 1.0)
+        patched["single_target"] = max(patched.get("single_target", 0.0), 1.0)
+        patched["block_scaled_damage"] = 1.0
+        return patched
 
     def _source_text(self, source: dict[str, Any] | None) -> str:
         if not isinstance(source, dict):

@@ -18,7 +18,7 @@
   不支持 bf16 时用 fp16 + GradScaler；CPU auto 保持 fp32/off。token-memory 默认训练
   窗口改为 `--batch-size 32`、`--unroll-steps 3`；旧的 128×5 fp32 对当前结构激活显存太重。
 - **search-free rollout 已改成 bucketed tensor 路径**：`--action-rollout-buckets`
-  默认 `8,16,32,64,80`，root legal actions 和 latent beam branches 会先 pad 到稳定桶，
+  默认 `8,16,32,64,96`，root legal actions 和 latent beam branches 会先 pad 到稳定桶，
   再进入重的 dynamics/value heads；continuation 剪枝也改成 root-bucket grouped
   top-k，不再走 per-root `nonzero` / Python list / `cat` 循环。这是面向
   ROCm/HIP allocator 的方案 B，用来降低 reserved 远大于 allocated 的碎片化风险，
@@ -31,10 +31,38 @@ packages/rl-agent/muzero/
 ├── README.md
 ├── README.zh-CN.md
 ├── __init__.py
-├── train.py                    # 训练入口：combat sandbox / full run / direct combat policy
+├── train.py                    # 薄兼容入口；禁止继续堆策略
 ├── evaluate.py                 # checkpoint 评估
 ├── analyze_replay.py           # replay 分析
 ├── eval_latent_probes.py       # 线性 probe：检查 latent 是否编码 HP/能量/牌堆/敌人/路线等
+├── training/                   # 训练编排/路径/文件预算；不放战斗策略
+│   ├── paths.py                # RunPaths / StrategyModulePaths / HeuristicSearchModulePaths
+│   ├── file_budget.py          # 单文件 2000 行预算守卫
+│   ├── monitoring.py           # recent-tail monitor / Null writer / episode capture buffer
+│   ├── cli_parsing.py          # encounter/session/tier/weight/int-list CLI helper
+│   ├── env_factory.py          # train env/session/pool 构造
+│   ├── checkpointing.py        # checkpoint load/save/prune + obs tensor helper
+│   └── losses.py               # policy/value/reward/objective/future-bank/surface loss mixin
+├── strategy/                   # 战斗/选牌/药水/HP/X 费等策略特征与通用决策 helper
+│   └── encounters/             # boss/怪物特化机制，按 encounter 拆小文件
+│       ├── kaiser.py           # BACK_ATTACK 左右解析 / facing-change 候选
+│       └── insatiable.py       # Sandpit countdown / Frantic Escape 候选
+├── combat_quality/             # no-pressure pure-block、空过、hard guard、offender 指标
+│   ├── block_waste.py          # no-pressure pure-block waste 判断
+│   ├── action_bias.py          # pure-block root-prior bias
+│   ├── metrics.py              # combat-quality 聚合/metric helper
+│   ├── guard_metrics.py        # hard guard 默认 TB metric key 合约；禁止继续塞进 train.py
+│   ├── hard_guard_orchestrator.py      # combat hard guard 调度顺序与默认指标初始化
+│   ├── basic_hard_guards.py            # discard / Kaiser / Insatiable / X-cost / HP-cost / lethal EndTurn
+│   ├── boss_survival_hard_guards.py    # elite/boss 药水、生存格挡、race/setup 窄窗口
+│   ├── late_normal_hard_guards.py      # late-Act1 normal lethal/survival/race guard
+│   ├── survival_non_endturn_guard.py   # 非 EndTurn 动作在危险窗口的生存替换
+│   ├── potion_bad_use_guard.py         # 低时机药水使用拦截，含 fail-open 例外
+│   ├── selection_loop_guard.py         # 净化/选卡类重复选择死循环保护
+│   └── potion_guard.py                 # 药水 profile/trait 窄窗口 helper
+├── route_heuristics/           # route graph/path candidate/scoring/safety/bias
+├── search/                     # root prior/search glue；不写 STS2 卡牌策略
+├── diagnostics/                # 诊断 dump schema/聚合 helper；运行期文件仍写入 log_dir/diagnostics
 └── sts2_env/
     ├── __init__.py
     ├── mcts.py                 # 兼容 MCTS / 对照实验
@@ -44,6 +72,41 @@ packages/rl-agent/muzero/
     ├── latent_regularizers.py  # JEPA/SIGReg-style latent Gaussian regularizers
     └── semantic_rollout.py
 ```
+
+### 文件治理硬规则
+
+- 新代码默认不能再写进 `train.py`；`train.py` 现在只保留 CLI delegation + legacy import compatibility。
+- 新 Python 文件必须 `< 2000` 行；超过 1500 行时先拆子模块，再继续实现。
+- 运行期路径（log、checkpoint、diagnostics、replay buffer）统一走 `training.paths.RunPaths`。
+- 策略源码路径统一走 `training.paths.StrategyModulePaths`：
+  - 通用策略：`strategy_file(...)`
+  - 怪物/Boss 特化：`encounter_file(...)`
+  - 战斗质量/guard：`combat_quality_file(...)`
+- route/search 源码路径统一走 `training.paths.HeuristicSearchModulePaths`：
+  - route 候选/评分/安全守卫：`route_heuristic_file(...)`
+  - root prior/search adapter：`search_file(...)`
+- 过渡期需要一把拿全路径时才用 `PolicyModulePaths`。
+- 检查命令：
+
+```bash
+cd packages/rl-agent
+./.venv-wsl-rocm/bin/python scripts/check_muzero_file_budget.py --quiet-ok
+```
+
+当前只有历史债务文件在 allowlist 中；新超限文件会让检查失败。
+
+### 已拆出的策略模块
+
+- `combat_quality/block_waste.py` / `action_bias.py`：无伤害压力下纯格挡 waste 与 root-prior bias。
+- `combat_quality/guard_metrics.py`：hard guard 默认 TensorBoard metric key 合约。
+- `combat_quality/potion_guard.py`：药水不是“有就用”；只在 boss race、0 能量无非药水替代、真实压力/关键 HP、Lagavulin setup 等窄窗口放行。
+- `combat_quality/hard_guard_orchestrator.py` + `basic_hard_guards.py` / `boss_survival_hard_guards.py` / `late_normal_hard_guards.py` / `survival_non_endturn_guard.py` / `potion_bad_use_guard.py` / `selection_loop_guard.py`：把原 `train.py::_apply_combat_action_hard_guards` 的 2700+ 行拆成按职责分桶的 mixin；每个新文件均 `< 2000` 行。
+- `strategy/encounters/kaiser.py`：Kaiser/back-attack/facing-change 解析；左右只来自 `BACK_ATTACK_LEFT_POWER` / `BACK_ATTACK_RIGHT_POWER`，不能用 `enemy.side == "Enemy"`。
+- `strategy/encounters/insatiable.py`：Insatiable Sandpit countdown 与 `Frantic Escape` 候选识别；先用内部 id，再用中英文标题兜底。
+- `training/monitoring.py` / `cli_parsing.py` / `env_factory.py`：把监控、CLI 解析、环境构造移出 `train.py`。
+- `training/checkpointing.py` / `losses.py`：把 checkpoint save/load/prune 和 tensor loss helper 移出 `train.py`；`MuZeroTrainer` 只通过 mixin 继承。
+
+`train.py` 里对应方法只允许作为兼容 wrapper / adapter 存在，不能继续把策略阈值和机制判断写回去。
 
 ## 推荐入口
 
@@ -57,7 +120,7 @@ python -m muzero.train --obs-mode token_v3 --model-arch token_memory_v1 \
 # 显式启用战斗 search-free direct policy
 python -m muzero.train --combat-sandbox --combat-direct-policy \
   --combat-rollout-steps 3 --combat-rollout-beam-width 2 \
-  --action-rollout-buckets 8,16,32,64,80 ...
+  --action-rollout-buckets 8,16,32,64,96 ...
 
 # 当前 auto 模式下：token_memory_v1 + combat sandbox 会默认走 direct；
 # 如果要强制旧 MCTS 对照，用 --combat-policy-mode mcts。

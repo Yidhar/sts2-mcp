@@ -180,3 +180,37 @@ class TestCombatSnapshotPoolStarterEarlyBoost:
         assert summary["starter_early_row_count"] == 3
         assert summary["starter_early_encounter_count"] == 2
         assert summary["deck_stage_counts"] == {"starter_early": 3, "rest": 4}
+
+    def test_encounter_weights_accept_lowercase_and_bare_aliases(self) -> None:
+        rows = [
+            _row(
+                encounter_id="ENCOUNTER.OVICOPTER",
+                floor_number=5,
+                deck_size=16,
+                tier_suffix="_NORMAL",
+            ),
+            _row(
+                encounter_id="ENCOUNTER.FABRICATOR",
+                floor_number=5,
+                deck_size=16,
+                tier_suffix="_NORMAL",
+            ),
+        ]
+        pool = CombatSnapshotPool(
+            rows,
+            sample_mode="encounter_balanced",
+            encounter_weights={
+                "encounter.ovicopter_normal": 9.0,
+                "fabricator_normal": 1.0,
+            },
+        )
+
+        probs = pool._encounter_probabilities(
+            ["ENCOUNTER.OVICOPTER_NORMAL", "ENCOUNTER.FABRICATOR_NORMAL"]
+        )
+
+        assert np.allclose(probs, [0.9, 0.1])
+        assert pool.summary()["encounter_weight_overrides"] == {
+            "ENCOUNTER.FABRICATOR_NORMAL": 1.0,
+            "ENCOUNTER.OVICOPTER_NORMAL": 9.0,
+        }

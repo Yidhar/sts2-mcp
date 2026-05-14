@@ -24,6 +24,7 @@ from .card_effect_profile import aggregate_card_effect_profile_semantics
 from .observation_common import DenseObservationEncoder, MAX_ACTIONS, _aggregate_card_modifier_semantics
 from .observation_v3 import WorldTokenObservationEncoder
 from .potion_timing import compute_potion_timing
+from .end_turn_quality import strict_end_turn_waste_context
 from .combat_memory import CombatMemoryTracker
 from .run_memory import RunMemoryTracker
 
@@ -392,12 +393,32 @@ class CombatSandboxEnv(gym.Env):
             "transient_leaked_count": 0,
             "wait_timeout_count": 0,
             "stable_no_actions_count": 0,
+            "post_step_frontier_attempt_count": 0,
+            "post_step_frontier_resolved_count": 0,
+            "post_step_frontier_timeout_count": 0,
+            "post_step_frontier_leaked_count": 0,
+            "post_step_frontier_rebind_attempt_count": 0,
+            "post_step_frontier_rebind_success_count": 0,
+            "post_step_frontier_stable_no_actions_count": 0,
+            "post_step_frontier_suspicious_singleton_count": 0,
         }
         # P0-2: actionability snapshot from the previous bridge result, used
         # to detect ``transient_only_end_turn`` leaks — when the policy chose
         # ``end_turn`` after seeing a transient-only-end_turn frontier we
         # refund the wasteful-end-turn penalty and tag the sample.
         self._last_actionability: dict[str, Any] | None = None
+        # Optional human-demo recorder. Disabled by default; enable with
+        # STS2_HUMAN_DEMO_RECORD=1 when driving this env manually / via a
+        # human policy wrapper.  It records raw obs + legal actions +
+        # selected action ids in the schema consumed by muzero.demo_dataset.
+        self._human_demo_recorder = None
+        try:
+            from .human_demo_recorder import HumanDemoRecorder  # noqa: WPS433
+
+            self._human_demo_recorder = HumanDemoRecorder.from_env(default_source="human")
+        except Exception as exc:
+            if os.environ.get("STS2_HUMAN_DEMO_RECORD", "").strip():
+                print(f"[combat_env] human demo recorder disabled: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -546,6 +567,22 @@ class CombatSandboxEnv(gym.Env):
         )
         info["python_timing_ms"]["info_build"] = (time.perf_counter() - info_started) * 1000.0
         info["python_timing_ms"]["total"] = (time.perf_counter() - started) * 1000.0
+        if self._human_demo_recorder is not None:
+            try:
+                self._human_demo_recorder.start_episode(
+                    episode_id=self._episode_id,
+                    encounter_id=self._current_encounter_id,
+                    reset_kwargs=self._last_reset_kwargs,
+                    obs=self._last_obs_raw,
+                    legal_actions=self._legal_actions,
+                    metadata={
+                        "episode_mode": "combat_sandbox",
+                        "snapshot_sample_id": info.get("snapshot_sample_id"),
+                        "snapshot_run_id": info.get("snapshot_run_id"),
+                    },
+                )
+            except Exception as exc:
+                print(f"[combat_env] human demo episode_start failed: {exc}", flush=True)
         return obs, info
 
     def step(self, action: int):
@@ -607,6 +644,24 @@ class CombatSandboxEnv(gym.Env):
                 f"[combat_env] slow_bridge_step ms={bridge_elapsed_ms:.0f} action_id={action_id_diag}",
                 flush=True,
             )
+
+        post_step_frontier_recovery: dict[str, Any] | None = None
+        try:
+            result, post_step_frontier_recovery = self._recover_post_step_frontier(
+                result,
+                selected_action=legal_action if isinstance(legal_action, dict) else None,
+                legal_actions_before=legal_actions_before,
+            )
+        except Exception as exc:
+            # Never let diagnostics/recovery crash the collector.  If this
+            # trips, keep the original bridge result but surface a compact
+            # record so the run log can distinguish "no recovery attempted"
+            # from "recovery code failed".
+            post_step_frontier_recovery = {
+                "attempted": False,
+                "error": "post_step_frontier_recovery_exception",
+                "exception_type": type(exc).__name__,
+            }
 
         self._update_live_state(result)
         run_memory_started = time.perf_counter()
@@ -682,13 +737,12 @@ class CombatSandboxEnv(gym.Env):
             self._potion_transition_records.append(potion_transition_record)
             if bool(potion_transition_record.get("execute_ok")):
                 self._used_potion_count_this_combat += 1
-        # TASK-C2: read C1 actionability and surface flags into action_diagnostics.
-        # Fast-step short polling is intentionally NOT executed on the live path
-        # here yet because we have no env-shaped /env/observe endpoint; the
-        # diagnostic flags below let the train-side classifier mark a chosen
-        # end_turn as forced (transient) rather than bad.  The pure helper
-        # `wait_for_stable_actionability` is unit-tested with a fake bridge so
-        # the polling contract is proven before wiring it to production.
+        # TASK-C2/P0-2: read bridge actionability and surface post-step
+        # frontier recovery flags.  The recovery path is deliberately
+        # conservative: a singleton End Turn with leftover energy is only a
+        # suspicion; it becomes evidence of a transient leak only if a short
+        # /state poll rebounds into non-EndTurn actions or the bridge itself
+        # flagged the frame as transient/unstable.
         bridge_info = result.get("info") if isinstance(result.get("info"), dict) else {}
         actionability = bridge_info.get("actionability") if isinstance(bridge_info.get("actionability"), dict) else None
         transient_flag = bool((actionability or {}).get("transient_only_end_turn", False))
@@ -707,6 +761,25 @@ class CombatSandboxEnv(gym.Env):
         # transient-only-end_turn — i.e. the policy was effectively forced.
         action_diagnostics["transient_leaked"] = transient_leaked_now
         action_diagnostics["prior_transient_only_end_turn"] = prior_transient_only_end_turn
+        if isinstance(post_step_frontier_recovery, dict):
+            frontier_scalar_map = {
+                "attempted": "post_step_frontier_attempted",
+                "resolved": "post_step_frontier_resolved",
+                "timeout": "post_step_frontier_timeout",
+                "leaked": "post_step_frontier_leaked",
+                "stable_no_actions": "post_step_frontier_stable_no_actions",
+                "rebind_attempted": "post_step_frontier_rebind_attempted",
+                "rebind_succeeded": "post_step_frontier_rebind_succeeded",
+                "suspicious_singleton": "post_step_frontier_suspicious_singleton",
+            }
+            for src_key, dst_key in frontier_scalar_map.items():
+                action_diagnostics[dst_key] = 1.0 if post_step_frontier_recovery.get(src_key) else 0.0
+            action_diagnostics["post_step_frontier_wait_ms"] = float(
+                post_step_frontier_recovery.get("wait_ms") or 0.0
+            )
+            action_diagnostics["post_step_frontier_poll_count"] = float(
+                post_step_frontier_recovery.get("poll_count") or 0.0
+            )
         # P0-1/4/5/6: surface typed safety / x-cost / selection / identity views
         # so the trainer-side aggregator picks them up without re-reading the
         # raw action.  Each block is a small JSON-able dict; nothing on the
@@ -716,16 +789,23 @@ class CombatSandboxEnv(gym.Env):
             from .x_cost_dynamic import x_cost_view  # noqa: WPS433
             from .selection_typed import selection_view  # noqa: WPS433
             from .card_identity import card_identity  # noqa: WPS433
+            from .card_runtime_state import (  # noqa: WPS433
+                card_runtime_presence_flags,
+                card_runtime_state,
+            )
             played_card = legal_action.get("card") if isinstance(legal_action, dict) else None
             hp_safety = hp_cost_safety_view(legal_action, prev_obs)
             xcost = x_cost_view(legal_action, prev_obs)
             sel = selection_view(legal_action)
             ident = card_identity(played_card)
+            runtime_state = card_runtime_state(played_card)
+            runtime_presence = card_runtime_presence_flags(played_card)
             # Rich dicts (offline analysis / future-world aux)
             action_diagnostics["hp_cost_safety"] = hp_safety
             action_diagnostics["x_cost"] = xcost
             action_diagnostics["selection"] = sel
             action_diagnostics["card_identity"] = ident
+            action_diagnostics["card_runtime_state"] = runtime_state
             # Flat scalars (fed into the trainer-side diag_key_map → TB metric
             # aggregation path; mirrored under combat_quality_* by train.py).
             action_diagnostics["hp_cost_self_lethal_selected"] = 1.0 if hp_safety.get("self_lethal_now") else 0.0
@@ -743,6 +823,35 @@ class CombatSandboxEnv(gym.Env):
             action_diagnostics["selection_runtime_internal_selected"] = 1.0 if sel.get("confidence") == "runtime_internal" else 0.0
             action_diagnostics["card_identity_text_fallback_selected"] = 1.0 if ident.get("confidence") == "text_fallback" else 0.0
             action_diagnostics["card_identity_runtime_internal_selected"] = 1.0 if ident.get("confidence") == "runtime_internal" else 0.0
+            # P2-1 (recovery 2026-05-07): runtime card-state presence flags.
+            # Each is the per-decision indicator that the bridge exposed the
+            # corresponding runtime modifier on the chosen card. Absent =>
+            # bridge gap, not a model bug — surfaces in TB so we can see at
+            # a glance what fraction of cards even get the typed signal.
+            action_diagnostics["card_runtime_instance_uuid_present"] = float(
+                runtime_presence.get("instance_uuid_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_modified_cost_present"] = float(
+                runtime_presence.get("modified_cost_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_exhaust_flag_present"] = float(
+                runtime_presence.get("exhaust_flag_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_ethereal_flag_present"] = float(
+                runtime_presence.get("ethereal_flag_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_retain_flag_present"] = float(
+                runtime_presence.get("retain_flag_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_enchantment_present"] = float(
+                runtime_presence.get("enchantment_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_replay_flag_present"] = float(
+                runtime_presence.get("replay_flag_present", 0.0) or 0.0
+            )
+            action_diagnostics["card_runtime_selection_effect_present"] = float(
+                runtime_presence.get("selection_effect_present", 0.0) or 0.0
+            )
         except Exception:
             pass
         # Cache the post-step actionability for the NEXT step's leak check.
@@ -761,7 +870,16 @@ class CombatSandboxEnv(gym.Env):
         }
         if actionability is not None:
             extra["actionability"] = actionability
-            extra["bridge_fast_step_metrics_cumulative"] = dict(self._fast_step_metrics_total)
+        extra["bridge_fast_step_metrics_cumulative"] = dict(self._fast_step_metrics_total)
+        if isinstance(post_step_frontier_recovery, dict):
+            extra["post_step_frontier_recovery"] = {
+                k: v
+                for k, v in post_step_frontier_recovery.items()
+                if k != "trace"
+            }
+            frontier_trace = post_step_frontier_recovery.get("trace")
+            if isinstance(frontier_trace, dict):
+                extra["frontier_trace"] = frontier_trace
         if potion_transition_record is not None:
             extra["potion_transition"] = potion_transition_record
         info = self._build_info(
@@ -783,6 +901,22 @@ class CombatSandboxEnv(gym.Env):
 
         if self.render_mode == "human":
             self.render()
+
+        if self._human_demo_recorder is not None:
+            try:
+                self._human_demo_recorder.record_decision(
+                    obs=prev_obs,
+                    legal_actions=legal_actions_before,
+                    selected_action=legal_action,
+                    selected_action_index=int(normalized_action),
+                    next_obs=self._last_obs_raw,
+                    reward=float(reward),
+                    done=bool(terminated),
+                    truncated=bool(truncated),
+                    info=info,
+                )
+            except Exception as exc:
+                print(f"[combat_env] human demo decision record failed: {exc}", flush=True)
 
         return obs, reward, terminated, truncated, info
 
@@ -835,7 +969,11 @@ class CombatSandboxEnv(gym.Env):
         )
 
     def close(self) -> None:
-        pass
+        if self._human_demo_recorder is not None:
+            try:
+                self._human_demo_recorder.close()
+            except Exception:
+                pass
 
     def get_compact_legal_actions(self) -> list[dict[str, Any]]:
         return compact_legal_actions(self._legal_actions)
@@ -917,7 +1055,38 @@ class CombatSandboxEnv(gym.Env):
             self._legal_actions = []
         obs = result.get("obs", {})
         self._last_obs_raw = obs if isinstance(obs, dict) else {}
+        self._decorate_sandbox_raw_obs_context()
         self._last_action_overflow = max(len(self._legal_actions) - MAX_ACTIONS, 0)
+
+    def _decorate_sandbox_raw_obs_context(self) -> None:
+        """Expose injected combat-sandbox context without rewriting bridge state.
+
+        Combat sandbox episodes run from injected pre-combat snapshots.  The
+        live bridge observation may still report a synthetic/low ``run.floor``,
+        while the snapshot carries the real full-run floor and sample identity.
+        Tactical guards must be able to see that context, but other consumers
+        still need the raw bridge floor.  Therefore we only add explicit
+        ``snapshot_*`` fields and never overwrite ``run.floor``.
+        """
+
+        if not isinstance(self._last_obs_raw, dict):
+            return
+
+        if self._current_encounter_id:
+            self._last_obs_raw.setdefault("encounter_id", self._current_encounter_id)
+            self._last_obs_raw.setdefault("snapshot_encounter_id", self._current_encounter_id)
+
+        snap = self._current_snapshot if isinstance(self._current_snapshot, dict) else {}
+        floor = snap.get("floor_number")
+        if floor is not None:
+            self._last_obs_raw.setdefault("snapshot_floor_number", floor)
+            run = self._last_obs_raw.setdefault("run", {})
+            if isinstance(run, dict):
+                run.setdefault("snapshot_floor_number", floor)
+
+        sample_id = snap.get("sample_id")
+        if sample_id is not None:
+            self._last_obs_raw.setdefault("snapshot_sample_id", sample_id)
 
     def _combat_enemy_total_hp(self, obs: dict[str, Any] | None) -> float:
         if not isinstance(obs, dict):
@@ -1046,6 +1215,423 @@ class CombatSandboxEnv(gym.Env):
         metrics["timeout"] = True
         metrics["transient_leaked"] = True
         return current, metrics
+
+    def _fast_step_metric_inc(self, key: str, amount: int = 1) -> None:
+        metrics = getattr(self, "_fast_step_metrics_total", None)
+        if not isinstance(metrics, dict):
+            return
+        try:
+            metrics[key] = int(metrics.get(key, 0) or 0) + int(amount)
+        except Exception:
+            metrics[key] = int(amount)
+
+    @staticmethod
+    def _is_end_turn_action(action: dict[str, Any] | None) -> bool:
+        if not isinstance(action, dict):
+            return False
+        action_id = str(action.get("action_id") or "").strip().lower()
+        kind = str(action.get("kind") or "").strip().lower()
+        family = ""
+        semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+        if isinstance(semantic, dict):
+            family = str(semantic.get("family") or semantic.get("action_kind") or "").strip().lower()
+        return action_id == "end_turn" or kind == "end_turn" or family == "end_turn"
+
+    @staticmethod
+    def _result_obs(result: dict[str, Any] | None) -> dict[str, Any]:
+        obs = result.get("obs") if isinstance(result, dict) else None
+        return obs if isinstance(obs, dict) else {}
+
+    @staticmethod
+    def _result_actionability(result: dict[str, Any] | None) -> dict[str, Any] | None:
+        info = result.get("info") if isinstance(result, dict) and isinstance(result.get("info"), dict) else {}
+        actionability = info.get("actionability") if isinstance(info.get("actionability"), dict) else None
+        return actionability if isinstance(actionability, dict) else None
+
+    @staticmethod
+    def _filtered_result_legal_actions(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+        legal_actions = result.get("legal_actions") if isinstance(result, dict) else None
+        if not isinstance(legal_actions, list):
+            return []
+        return [
+            action
+            for action in legal_actions
+            if isinstance(action, dict)
+            and str(action.get("kind") or "").strip() not in BLOCKED_ACTION_KINDS
+        ]
+
+    def _result_is_singleton_end_turn(self, result: dict[str, Any] | None) -> bool:
+        actions = self._filtered_result_legal_actions(result)
+        return len(actions) == 1 and self._is_end_turn_action(actions[0])
+
+    @staticmethod
+    def _obs_energy_hand_summary(obs: dict[str, Any] | None) -> dict[str, Any]:
+        obs = obs if isinstance(obs, dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+
+        combat_active = bool(combat)
+        if isinstance(combat, dict) and combat.get("in_progress") is False:
+            combat_active = False
+
+        energy = _float(combat.get("energy") if isinstance(combat, dict) else None, -1.0)
+        if energy < 0.0:
+            energy = _float(player.get("energy") if isinstance(player, dict) else None, 0.0)
+        elif energy <= 0.0 and isinstance(player, dict):
+            # Some bridge payloads keep the authoritative energy on player.
+            energy = max(energy, _float(player.get("energy"), 0.0))
+
+        hand_missing = True
+        hand_count = 0
+        hand = combat.get("hand") if isinstance(combat, dict) else None
+        if not isinstance(hand, list) and isinstance(player, dict):
+            hand = player.get("hand")
+        if isinstance(hand, list):
+            hand_missing = False
+            hand_count = len(hand)
+        else:
+            for container in (combat, player):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("hand_count", "num_cards_in_hand", "cards_in_hand"):
+                    if key in container:
+                        hand_missing = False
+                        hand_count = int(max(_float(container.get(key), 0.0), 0.0))
+                        break
+                if not hand_missing:
+                    break
+
+        return {
+            "combat_active": bool(combat_active),
+            "energy": float(energy),
+            "hand_count": int(hand_count),
+            "hand_missing": bool(hand_missing),
+            "round": combat.get("round") if isinstance(combat, dict) else None,
+            "turn": combat.get("turn") if isinstance(combat, dict) else None,
+            "hp": player.get("hp") if isinstance(player, dict) else None,
+            "block": player.get("block") if isinstance(player, dict) else None,
+        }
+
+    def _result_needs_post_step_frontier_wait(self, result: dict[str, Any] | None) -> tuple[bool, str, dict[str, Any]]:
+        if getattr(self, "_fast_step_disabled", False):
+            return False, "disabled", {}
+        if not isinstance(result, dict):
+            return False, "non_dict_result", {}
+        if bool(result.get("done", False)) or bool(result.get("truncated", False)):
+            return False, "terminal_result", {}
+        if not self._result_is_singleton_end_turn(result):
+            return False, "not_singleton_end_turn", {}
+
+        obs_summary = self._obs_energy_hand_summary(self._result_obs(result))
+        actionability = self._result_actionability(result)
+        if isinstance(actionability, dict):
+            if bool(actionability.get("transient_only_end_turn", False)):
+                return True, "bridge_transient_only_end_turn", obs_summary
+            try:
+                non_end_turn = int(actionability.get("legal_non_end_turn_count", 0) or 0)
+            except (TypeError, ValueError):
+                non_end_turn = 0
+            if non_end_turn > 0:
+                return True, "bridge_non_end_turn_count_mismatch", obs_summary
+            if bool(actionability.get("frontier_stable", True)) is False:
+                return True, "bridge_frontier_unstable", obs_summary
+            # Bridge explicitly says: only EndTurn and stable.  This covers
+            # the user's counterexample: the player may have genuinely played
+            # all playable cards while retaining unused energy.
+            return False, "bridge_stable_singleton_end_turn", obs_summary
+
+        if (
+            bool(obs_summary.get("combat_active"))
+            and float(obs_summary.get("energy") or 0.0) > 0.0
+            and (
+                bool(obs_summary.get("hand_missing"))
+                or int(obs_summary.get("hand_count") or 0) == 0
+            )
+        ):
+            return True, "energy_positive_hand_empty_or_missing", obs_summary
+
+        return False, "ambiguous_singleton_end_turn", obs_summary
+
+    @staticmethod
+    def _compact_frontier_action(action: dict[str, Any], idx: int) -> dict[str, Any]:
+        card = action.get("card") if isinstance(action.get("card"), dict) else {}
+        potion = action.get("potion") if isinstance(action.get("potion"), dict) else {}
+        title = (
+            action.get("title")
+            or action.get("name")
+            or card.get("title")
+            or card.get("name")
+            or potion.get("title")
+            or potion.get("name")
+        )
+        return {
+            "idx": int(idx),
+            "action_id": action.get("action_id"),
+            "kind": action.get("kind"),
+            "title": title,
+        }
+
+    def _frontier_result_summary(self, result: dict[str, Any] | None, *, source: str) -> dict[str, Any]:
+        actions = self._filtered_result_legal_actions(result)
+        actionability = self._result_actionability(result)
+        obs_summary = self._obs_energy_hand_summary(self._result_obs(result))
+        return {
+            "source": source,
+            "legal_action_count": int(len(actions)),
+            "non_end_turn_count": int(sum(1 for action in actions if not self._is_end_turn_action(action))),
+            "singleton_end_turn": bool(len(actions) == 1 and self._is_end_turn_action(actions[0])),
+            "actions": [self._compact_frontier_action(action, idx) for idx, action in enumerate(actions[:6])],
+            "obs": obs_summary,
+            "actionability": {
+                "transient_only_end_turn": bool((actionability or {}).get("transient_only_end_turn", False)),
+                "frontier_stable": (actionability or {}).get("frontier_stable"),
+                "legal_non_end_turn_count": (actionability or {}).get("legal_non_end_turn_count"),
+            } if isinstance(actionability, dict) else None,
+        }
+
+    @staticmethod
+    def _state_available_actions(state: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(state, dict):
+            return []
+        actions = state.get("available_actions")
+        if not isinstance(actions, list):
+            actions = state.get("legal_actions")
+        if not isinstance(actions, list):
+            return []
+        return [action for action in actions if isinstance(action, dict)]
+
+    @staticmethod
+    def _state_action_is_blocked(action: dict[str, Any]) -> bool:
+        return str(action.get("kind") or "").strip() in BLOCKED_ACTION_KINDS
+
+    def _state_non_end_turn_unblocked_action_count(self, state: dict[str, Any] | None) -> int:
+        return sum(
+            1
+            for action in self._state_available_actions(state)
+            if not self._state_action_is_blocked(action) and not self._is_end_turn_action(action)
+        )
+
+    def _frontier_state_summary(self, state: dict[str, Any] | None, *, source: str) -> dict[str, Any]:
+        actions = [
+            action
+            for action in self._state_available_actions(state)
+            if not self._state_action_is_blocked(action)
+        ]
+        obs_summary = self._obs_energy_hand_summary(state if isinstance(state, dict) else None)
+        return {
+            "source": source,
+            "screen": state.get("screen") if isinstance(state, dict) else None,
+            "phase": state.get("phase") if isinstance(state, dict) else None,
+            "legal_action_count": int(len(actions)),
+            "non_end_turn_count": int(sum(1 for action in actions if not self._is_end_turn_action(action))),
+            "singleton_end_turn": bool(len(actions) == 1 and self._is_end_turn_action(actions[0])),
+            "actions": [self._compact_frontier_action(action, idx) for idx, action in enumerate(actions[:6])],
+            "obs": obs_summary,
+        }
+
+    def _safe_get_state(self) -> dict[str, Any] | None:
+        try:
+            state = self.bridge.get_state()
+        except Exception:
+            return None
+        return state if isinstance(state, dict) else None
+
+    @staticmethod
+    def _state_allows_soft_rebind(state: dict[str, Any] | None) -> bool:
+        if not isinstance(state, dict):
+            return False
+        phase = str(state.get("phase") or "").strip().lower()
+        if phase.startswith("startup_") or phase == "terminal":
+            return False
+        screen = str(state.get("screen") or "").strip().upper()
+        if screen in {"MAIN_MENU", "TITLE_SCREEN"}:
+            return False
+        run = state.get("run")
+        if isinstance(run, dict):
+            if run.get("game_over") is True or run.get("is_game_over") is True:
+                return False
+            active = run.get("active")
+            if active is not None:
+                return bool(active)
+        return True
+
+    def _safe_reset_into_current_run(self, timeout_ms: int) -> dict[str, Any] | None:
+        try:
+            result = self.bridge.reset(
+                rebind_active_run=True,
+                timeout_ms=max(1, int(timeout_ms)),
+            )
+        except Exception:
+            return None
+        return result if isinstance(result, dict) else None
+
+    def _merge_frontier_rebind_result(
+        self,
+        base_result: dict[str, Any],
+        rebound_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace only the post-action frontier, not the action outcome.
+
+        ``bridge.step`` owns reward/done/truncated for the executed action.
+        ``bridge.reset(rebind_active_run=True)`` is only used as an observe /
+        soft-rebind mechanism, so copying it wholesale would silently zero or
+        distort the transition reward.  Keep the step outcome and refresh only
+        obs/legal_actions/episode_id/info.
+        """
+
+        merged = dict(base_result)
+        for key in ("obs", "legal_actions", "episode_id"):
+            if key in rebound_result:
+                merged[key] = rebound_result[key]
+
+        base_info = base_result.get("info") if isinstance(base_result.get("info"), dict) else {}
+        rebound_info = rebound_result.get("info") if isinstance(rebound_result.get("info"), dict) else {}
+        info = dict(base_info)
+        if rebound_info:
+            info["frontier_rebind_info"] = rebound_info
+        rebound_actionability = rebound_info.get("actionability") if isinstance(rebound_info.get("actionability"), dict) else None
+        if isinstance(rebound_actionability, dict):
+            info["actionability"] = rebound_actionability
+        else:
+            refreshed_actions = self._filtered_result_legal_actions(rebound_result)
+            info["actionability"] = {
+                "transient_only_end_turn": False,
+                "frontier_stable": True,
+                "legal_non_end_turn_count": int(
+                    sum(1 for action in refreshed_actions if not self._is_end_turn_action(action))
+                ),
+                "source": "combat_env_post_step_rebind",
+            }
+        info["post_step_frontier_rebound"] = True
+        merged["info"] = info
+        return merged
+
+    def _recover_post_step_frontier(
+        self,
+        result: dict[str, Any],
+        *,
+        selected_action: dict[str, Any] | None = None,
+        legal_actions_before: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Short-poll singleton EndTurn frontiers after bridge.step.
+
+        This is the production version of the transient-only-EndTurn check.
+        It directly addresses the ambiguous case raised by the user:
+
+        * if short polling rebounds into non-EndTurn actions, the immediate
+          only-EndTurn frame was transient and we soft-rebind the frontier;
+        * if no rebound appears and bridge did not label the frame transient,
+          we classify it as stable/no-actions rather than a bug;
+        * if the policy had non-EndTurn actions before selecting End Turn,
+          that remains a separate policy-quality issue and is not conflated
+          with hand-draw/frontier settling.
+        """
+
+        attempted, reason, obs_summary = self._result_needs_post_step_frontier_wait(result)
+        metrics: dict[str, Any] = {
+            "attempted": bool(attempted),
+            "reason": str(reason),
+            "wait_ms": 0.0,
+            "poll_count": 0,
+            "resolved": False,
+            "timeout": False,
+            "leaked": False,
+            "stable_no_actions": False,
+            "rebind_attempted": False,
+            "rebind_succeeded": False,
+            "suspicious_singleton": bool(self._result_is_singleton_end_turn(result)),
+            "selected_action_id": selected_action.get("action_id") if isinstance(selected_action, dict) else None,
+            "selected_action_kind": selected_action.get("kind") if isinstance(selected_action, dict) else None,
+            "pre_legal_action_count": len(legal_actions_before) if isinstance(legal_actions_before, list) else None,
+            "obs_summary": obs_summary,
+        }
+        if not attempted:
+            if reason == "bridge_stable_singleton_end_turn":
+                metrics["stable_no_actions"] = True
+                self._fast_step_metric_inc("post_step_frontier_stable_no_actions_count")
+            return result, metrics
+
+        self._fast_step_metric_inc("post_step_frontier_attempt_count")
+        self._fast_step_metric_inc("post_step_frontier_suspicious_singleton_count")
+        trace: dict[str, Any] = {
+            "event": "post_step_frontier_trace",
+            "reason": str(reason),
+            "selected_action": self._compact_frontier_action(selected_action, -1)
+            if isinstance(selected_action, dict)
+            else None,
+            "pre_legal_action_count": len(legal_actions_before) if isinstance(legal_actions_before, list) else None,
+            "immediate": self._frontier_result_summary(result, source="immediate_step_result"),
+            "polls": [],
+        }
+        metrics["trace"] = trace
+
+        max_wait_ms = max(0, int(getattr(self, "_fast_step_max_wait_ms", 100) or 0))
+        poll_interval_ms = max(1, int(getattr(self, "_fast_step_poll_interval_ms", 10) or 10))
+        started = time.perf_counter()
+        deadline = started + (max_wait_ms / 1000.0)
+        hard_transient_reason = reason in {
+            "bridge_transient_only_end_turn",
+            "bridge_frontier_unstable",
+            "bridge_non_end_turn_count_mismatch",
+        }
+
+        while time.perf_counter() < deadline:
+            time.sleep(poll_interval_ms / 1000.0)
+            metrics["poll_count"] = int(metrics["poll_count"]) + 1
+            state = self._safe_get_state()
+            state_summary = self._frontier_state_summary(state, source="state_poll")
+            if len(trace["polls"]) < 8:
+                trace["polls"].append(state_summary)
+            non_end_turn_count = int(state_summary.get("non_end_turn_count") or 0)
+            if non_end_turn_count <= 0:
+                continue
+            if not self._state_allows_soft_rebind(state):
+                continue
+
+            metrics["rebind_attempted"] = True
+            self._fast_step_metric_inc("post_step_frontier_rebind_attempt_count")
+            remaining_ms = max(int((deadline - time.perf_counter()) * 1000.0), 1)
+            rebind_timeout_ms = max(
+                250,
+                min(remaining_ms, int(getattr(self, "reset_timeout_ms", 1000) or 1000)),
+            )
+            rebound = self._safe_reset_into_current_run(rebind_timeout_ms)
+            if not isinstance(rebound, dict):
+                continue
+            rebound_summary = self._frontier_result_summary(rebound, source="soft_rebind_result")
+            trace["rebind"] = rebound_summary
+            rebound_actions = self._filtered_result_legal_actions(rebound)
+            rebound_non_end_turn = sum(1 for action in rebound_actions if not self._is_end_turn_action(action))
+            if rebound_actions and rebound_non_end_turn > 0:
+                merged = self._merge_frontier_rebind_result(result, rebound)
+                if "episode_id" in rebound:
+                    self._episode_id = rebound.get("episode_id", getattr(self, "_episode_id", None))
+                metrics["wait_ms"] = max((time.perf_counter() - started) * 1000.0, 0.0)
+                metrics["resolved"] = True
+                metrics["rebind_succeeded"] = True
+                trace["final_status"] = "resolved_non_end_turn_rebound"
+                self._fast_step_metric_inc("post_step_frontier_resolved_count")
+                self._fast_step_metric_inc("post_step_frontier_rebind_success_count")
+                self._fast_step_metric_inc("transient_resolved_count")
+                return merged, metrics
+
+        metrics["wait_ms"] = max((time.perf_counter() - started) * 1000.0, float(max_wait_ms))
+        metrics["timeout"] = True
+        self._fast_step_metric_inc("post_step_frontier_timeout_count")
+        self._fast_step_metric_inc("wait_timeout_count")
+        if hard_transient_reason:
+            metrics["leaked"] = True
+            trace["final_status"] = "timeout_after_bridge_transient"
+            self._fast_step_metric_inc("post_step_frontier_leaked_count")
+        else:
+            # Important: leftover energy + empty/missing hand alone is not a
+            # proof of bug.  It may simply mean all playable cards were used
+            # and the player has unspent energy.  Without a rebound, mark it
+            # stable/no-actions so downstream analysis does not overclaim.
+            metrics["stable_no_actions"] = True
+            trace["final_status"] = "no_rebound_observed_stable_singleton"
+            self._fast_step_metric_inc("post_step_frontier_stable_no_actions_count")
+        return result, metrics
 
     @staticmethod
     def _potion_slots_dump(obs: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1229,11 +1815,33 @@ class CombatSandboxEnv(gym.Env):
             return 0.0
         use_q = float(profile.get("use_quality") or 0.0)
         waste = float(profile.get("waste_risk") or 0.0)
+        urgent = bool(
+            profile.get("urgent")
+            or profile.get("lethal")
+            or profile.get("prevent_lethal")
+            or profile.get("prevent_major_loss")
+            or profile.get("mechanism_answer")
+        )
+        bad_timing = bool(
+            profile.get("low_urgency")
+            or profile.get("save_recommended")
+            or profile.get("no_followup")
+            or profile.get("block_waste")
+            or profile.get("overkill")
+        )
         reward = 0.0
-        if use_q > 0.0:
+        # The shared timing model has a small baseline use_quality.  Treating
+        # any positive value as reward made the policy learn "use potion when
+        # legal".  Reward only urgent / genuinely high-quality timing; convert
+        # low-urgency, no-followup, overkill, or block-waste uses into waste.
+        if urgent or (use_q >= 0.45 and not bad_timing):
             reward += float(POTION_TIMING_QUALITY_SCALE) * use_q
             self._potion_timing_quality_events += 1
-        if waste > 0.0:
+        elif bad_timing:
+            effective_waste = max(float(waste), 0.35)
+            reward -= float(POTION_TIMING_WASTE_SCALE) * effective_waste
+            self._potion_timing_waste_events += 1
+        elif waste > 0.0:
             reward -= float(POTION_TIMING_WASTE_SCALE) * waste
             self._potion_timing_waste_events += 1
         return reward
@@ -2011,7 +2619,39 @@ class CombatSandboxEnv(gym.Env):
     def _card_is_x_cost(card: dict[str, Any] | None) -> bool:
         if not isinstance(card, dict):
             return False
-        return bool(card.get("x_cost") or card.get("costs_x")) or str(card.get("cost") or card.get("canonical_energy_cost") or "").strip().upper() == "X"
+        return bool(card.get("x_cost") or card.get("costs_x") or card.get("is_x_cost")) or str(card.get("cost") or card.get("canonical_energy_cost") or "").strip().upper() == "X"
+
+    @classmethod
+    def _action_is_x_cost(cls, action: dict[str, Any] | None) -> bool:
+        """Runtime action-level X-cost detector.
+
+        Do not rely only on the embedded card cost: live compact actions may
+        expose X-cost as ``semantic.roles=["x_cost"]`` while the card carries a
+        temporary numeric cost after runtime modifiers.  Combat diagnostics and
+        strategic-skip logic must use the action-level contract when available.
+        """
+
+        if not isinstance(action, dict):
+            return False
+        if "x_cost" in cls._action_roles(action):
+            return True
+        semantic = cls._action_semantic(action)
+        if bool(semantic.get("is_x_cost")):
+            return True
+        try:
+            if float(semantic.get("x_cost_value") or 0.0) > 0.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        action_x_cost = action.get("x_cost")
+        if not isinstance(action_x_cost, dict) and bool(action_x_cost):
+            return True
+        if bool(action.get("costs_x") or action.get("is_x_cost")):
+            return True
+        if str(action.get("card_cost") or "").strip().upper() == "X":
+            return True
+        card = action.get("card") if isinstance(action.get("card"), dict) else None
+        return cls._card_is_x_cost(card)
 
     def _action_modifier_semantics(self, action: dict[str, Any] | None) -> dict[str, float]:
         if not isinstance(action, dict):
@@ -2148,7 +2788,7 @@ class CombatSandboxEnv(gym.Env):
             if other is action or not isinstance(other, dict) or other.get("kind") != "play_card":
                 continue
             other_card = other.get("card")
-            if not isinstance(other_card, dict) or self._card_is_x_cost(other_card):
+            if not isinstance(other_card, dict) or self._action_is_x_cost(other):
                 continue
             other_cost = self._card_cost(other_card)
             if other_cost <= energy_after + 1e-6 and self._action_positive_score(other) >= 3.0:
@@ -2216,7 +2856,7 @@ class CombatSandboxEnv(gym.Env):
             return False
         sem = _aggregate_card_modifier_semantics(card)
         typed = aggregate_card_effect_profile_semantics(card)
-        if self._card_is_x_cost(card) and energy <= 0.05:
+        if self._action_is_x_cost(action) and energy <= 0.05:
             return True
         immediate = self._action_positive_score(action)
         exhausts = bool(
@@ -2339,7 +2979,7 @@ class CombatSandboxEnv(gym.Env):
             else:
                 if is_positive:
                     mandatory_positive += 1
-            is_zero_x = isinstance(card, dict) and self._card_is_x_cost(card) and energy <= 0.0
+            is_zero_x = isinstance(card, dict) and self._action_is_x_cost(action) and energy <= 0.0
             if is_zero_x:
                 zero_x_available += 1
             typed_energy_gain = float(typed.get("typed_gain_energy_amount", 0.0) or 0.0)
@@ -2369,7 +3009,7 @@ class CombatSandboxEnv(gym.Env):
                     if other is action or not isinstance(other, dict) or other.get("kind") != "play_card":
                         continue
                     other_card = other.get("card")
-                    if not isinstance(other_card, dict) or self._card_is_x_cost(other_card):
+                    if not isinstance(other_card, dict) or self._action_is_x_cost(other):
                         continue
                     other_cost = self._card_cost(other_card)
                     if (other_cost <= energy_after + 1e-6 or typed_modify_cost) and self._action_positive_score(other) >= 3.0:
@@ -2394,12 +3034,31 @@ class CombatSandboxEnv(gym.Env):
                 selected_zero_x = float(is_zero_x)
                 selected_refund_no_followup = float(is_refund)
                 selected_strategic_skip = float(is_strategic)
-        wasteful_available = float(mandatory_positive > 0 and energy > 0.0)
+        strict_end_turn = strict_end_turn_waste_context(
+            obs,
+            legal_actions,
+            chosen_action,
+            positive_score_fn=self._action_positive_score,
+            strategic_skip_fn=lambda action, current_energy, actions: self._is_strategic_skip_candidate(
+                dict(action),
+                energy=current_energy,
+                legal_actions=[dict(item) for item in actions],
+            ),
+        )
+        # Strict EndTurn semantics: leftover energy is not waste.  Waste is only
+        # when an urgent/safe non-EndTurn action exists on the stable frontier.
+        wasteful_available = float(bool(strict_end_turn.get("wasteful_end_turn_available", False)))
         wasteful_selected = float(selected_is_end_turn > 0.5 and wasteful_available > 0.5)
         return {
             "energy": float(energy),
             "positive_action_count": float(positive_available),
             "mandatory_positive_action_count": float(mandatory_positive),
+            "urgent_positive_action_count": float(strict_end_turn.get("urgent_positive_action_count", 0.0) or 0.0),
+            "non_end_turn_action_count": float(strict_end_turn.get("non_end_turn_action_count", 0.0) or 0.0),
+            "playable_card_count": float(strict_end_turn.get("playable_card_count", 0.0) or 0.0),
+            "incoming_damage": float(strict_end_turn.get("incoming_damage", 0.0) or 0.0),
+            "current_block": float(strict_end_turn.get("current_block", 0.0) or 0.0),
+            "benign_leftover_energy": float(bool(strict_end_turn.get("benign_leftover_energy", False))),
             "strategic_skip_candidate_count": float(strategic_skip),
             "wasteful_end_turn_available": wasteful_available,
             "wasteful_end_turn_selected": wasteful_selected,
@@ -2435,19 +3094,30 @@ class CombatSandboxEnv(gym.Env):
             return 0.0
 
         diagnostics = self._action_quality_diagnostics(obs, legal_actions, chosen_action)
-        positive_actions = int(diagnostics.get("mandatory_positive_action_count", 0.0))
-        has_zero_cost_positive = any(
-            isinstance(action, dict)
-            and str(action.get("action_id") or "") != "end_turn"
-            and not self._is_strategic_skip_candidate(action, energy=energy, legal_actions=legal_actions)
-            and self._is_positive_progress_action(action)
-            and isinstance(action.get("card"), dict)
-            and self._card_cost(action.get("card")) <= 0.0
-            for action in legal_actions
-        )
-
+        positive_actions = int(diagnostics.get("urgent_positive_action_count", 0.0))
         if positive_actions <= 0:
             return 0.0
+
+        strict_context = strict_end_turn_waste_context(
+            obs,
+            legal_actions,
+            chosen_action,
+            positive_score_fn=self._action_positive_score,
+            strategic_skip_fn=lambda action, current_energy, actions: self._is_strategic_skip_candidate(
+                dict(action),
+                energy=current_energy,
+                legal_actions=[dict(item) for item in actions],
+            ),
+        )
+        urgent_indices = {int(idx) for idx in strict_context.get("urgent_positive_indices", [])}
+        has_zero_cost_positive = any(
+            isinstance(action, dict)
+            and idx in urgent_indices
+            and str(action.get("action_id") or "") != "end_turn"
+            and isinstance(action.get("card"), dict)
+            and self._card_cost(action.get("card")) <= 0.0
+            for idx, action in enumerate(legal_actions)
+        )
 
         penalty = END_TURN_WASTE_BASE_PENALTY
         penalty += END_TURN_WASTE_ENERGY_PENALTY * min(energy, 3.0)
@@ -2517,6 +3187,7 @@ class CombatSandboxEnv(gym.Env):
             },
             "run": {
                 "floor": _float(run.get("floor")),
+                "snapshot_floor_number": _float(obs.get("snapshot_floor_number", run.get("snapshot_floor_number"))),
                 "act_id": _float(run.get("act_id")),
                 "room_type": run.get("room_type"),
             },

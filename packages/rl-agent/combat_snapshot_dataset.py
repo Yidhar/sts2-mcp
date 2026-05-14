@@ -88,6 +88,25 @@ _UNRESOLVED_CARD_TEMPLATE_MARKERS = (
 )
 
 
+def normalize_encounter_id(value: Any) -> str:
+    """Return the canonical encounter id used by snapshot rows.
+
+    Curated combat datasets store encounter ids as enum-like uppercase strings
+    such as ``ENCOUNTER.OVICOPTER_NORMAL``.  Launch scripts and hand-written
+    configs are easy to type as ``encounter.ovicopter_normal`` or bare
+    ``ovicopter_normal``.  Treat those spellings as the same id so weighting
+    and filtering configs do not silently become no-ops.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    if "." not in upper:
+        upper = f"ENCOUNTER.{upper}"
+    return upper
+
+
 def _resolve_card_max_upgrade_level(card_id: str) -> int | None:
     metadata = get_card_metadata(card_id)
     if not isinstance(metadata, dict):
@@ -747,9 +766,9 @@ class CombatSnapshotPool:
             if float(weight) > 0.0
         }
         self.encounter_weights = {
-            str(encounter_id).strip(): float(weight)
+            normalize_encounter_id(encounter_id): float(weight)
             for encounter_id, weight in (encounter_weights or {}).items()
-            if float(weight) > 0.0
+            if normalize_encounter_id(encounter_id) and float(weight) > 0.0
         }
         self._rows_by_encounter: dict[str, list[dict[str, Any]]] = {}
         self._rows_by_tier_encounter: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -943,7 +962,18 @@ class CombatSnapshotPool:
             return np.full(len(encounter_ids), 1.0 / float(len(encounter_ids)), dtype=np.float64)
 
         weights = np.asarray(
-            [max(float(self.encounter_weights.get(encounter_id, 1.0)), 0.0) for encounter_id in encounter_ids],
+            [
+                max(
+                    float(
+                        self.encounter_weights.get(
+                            normalize_encounter_id(encounter_id),
+                            self.encounter_weights.get(encounter_id, 1.0),
+                        )
+                    ),
+                    0.0,
+                )
+                for encounter_id in encounter_ids
+            ],
             dtype=np.float64,
         )
         total = float(weights.sum())

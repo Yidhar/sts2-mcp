@@ -240,8 +240,15 @@ def _act(obs: dict[str, Any] | None) -> int:
 
 def _build_quality_score(obs: dict[str, Any] | None) -> float:
     build = _build_profile(obs)
+    deck_size = float(build.get("deck_size", 0.0) or 0.0)
+    # Act1 recovery traces showed 16-18 card decks built mostly by repeatedly
+    # taking mediocre attacks.  The profile above is density-based, so adding
+    # one more attack can look neutral/positive even though it slows rotation.
+    # Keep the penalty small and only start it after the starter+early-pick
+    # range, so truly high-impact cards can still win via block/draw/scaling.
+    deck_bloat = float(np.clip((deck_size - 12.0) / 18.0, 0.0, 1.0))
     score = (
-        0.22 * build["frontload"]
+        0.14 * build["frontload"]
         + 0.24 * build["block"]
         + 0.16 * build["draw"]
         + 0.20 * build["scaling"]
@@ -251,6 +258,7 @@ def _build_quality_score(obs: dict[str, Any] | None) -> float:
         + 0.05 * build["x_cost_density"]
         - 0.12 * build["curse_density"]
         - 0.08 * build["high_cost_density"]
+        - 0.10 * deck_bloat
     )
     return float(min(max(score, -1.0), 1.5))
 

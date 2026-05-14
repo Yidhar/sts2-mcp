@@ -18,12 +18,21 @@ import torch
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from muzero.sts2_env.mcts import MCTS
 from muzero.sts2_env.muzero_model import MuZeroNetwork
+from muzero.sts2_env.planner_memory_profile import (
+    VALID_PLANNER_MEMORY_PROFILES,
+    apply_planner_memory_profile_to_network,
+)
 from sts2_env.observation_v2 import DictObservationEncoder
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
 from sts2_env.path_utils import normalize_path_str, resolve_torch_device, running_in_wsl
 
 
-def load_muzero_network(checkpoint_dir: str | Path, device: str) -> MuZeroNetwork:
+def load_muzero_network(
+    checkpoint_dir: str | Path,
+    device: str,
+    *,
+    planner_memory_profile: str = "eval",
+) -> tuple[MuZeroNetwork, dict[str, object]]:
     checkpoint_path = Path(checkpoint_dir)
     network_path = checkpoint_path / "network.pt"
     metadata_path = checkpoint_path / "metadata.json"
@@ -38,7 +47,16 @@ def load_muzero_network(checkpoint_dir: str | Path, device: str) -> MuZeroNetwor
     network.load_state_dict(torch.load(network_path, map_location=device))
     network.to(device)
     network.eval()
-    return network
+    profile_settings = apply_planner_memory_profile_to_network(
+        network,
+        planner_memory_profile,
+    )
+    profile_report: dict[str, object] = {
+        "planner_memory_profile": profile_settings.profile,
+        "action_rollout_buckets": tuple(int(bucket) for bucket in getattr(network, "action_rollout_buckets", ())),
+        "action_rollout_chunk_size": int(getattr(network, "action_rollout_chunk_size", 0) or 0),
+    }
+    return network, profile_report
 
 
 def evaluate_full_run(
@@ -54,8 +72,13 @@ def evaluate_full_run(
     disable_root_bias: bool,
     disable_semantic_rollout: bool,
     obs_mode: str | None,
+    planner_memory_profile: str,
 ) -> None:
-    network = load_muzero_network(checkpoint_dir, device=device)
+    network, profile_report = load_muzero_network(
+        checkpoint_dir,
+        device=device,
+        planner_memory_profile=planner_memory_profile,
+    )
     resolved_obs_mode = str(obs_mode or getattr(network, "obs_mode", "dense_v2")).strip().lower()
     if resolved_obs_mode == "token_v3":
         obs_encoder = WorldTokenObservationEncoder(use_text=False)
@@ -89,6 +112,7 @@ def evaluate_full_run(
                 "device": device,
                 "disable_root_bias": disable_root_bias,
                 "disable_semantic_rollout": disable_semantic_rollout,
+                **profile_report,
             },
             ensure_ascii=False,
         ),
@@ -190,6 +214,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-root-bias", action="store_true")
     parser.add_argument("--disable-semantic-rollout", action="store_true")
     parser.add_argument("--obs-mode", type=str, default=None, choices=["dense_v2", "token_v3"])
+    parser.add_argument(
+        "--planner-memory-profile",
+        type=str,
+        default="eval",
+        choices=VALID_PLANNER_MEMORY_PROFILES,
+        help=(
+            "Override checkpoint planner memory knobs after loading. "
+            "'eval' is the safe stronger default; use 'max' for full eval-time planning."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -225,6 +259,7 @@ def main() -> None:
         disable_root_bias=args.disable_root_bias,
         disable_semantic_rollout=args.disable_semantic_rollout,
         obs_mode=args.obs_mode,
+        planner_memory_profile=args.planner_memory_profile,
     )
 
 

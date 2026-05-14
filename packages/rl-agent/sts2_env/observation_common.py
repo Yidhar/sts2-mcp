@@ -68,14 +68,15 @@ ROOM_TYPE_TO_ORD = {room_type: index + 1 for index, room_type in enumerate(ROOM_
 NUM_ROOM_TYPES = len(ROOM_TYPES) + 1
 
 MAX_HAND = 12
-MAX_DECK = 40
+MAX_DECK = 64
 MAX_ENEMIES = 5
-MAX_RELICS = 20
+MAX_RELICS = 40
 MAX_POTIONS = 5
 # Single-source action cap for both env wrappers and the policy head.
-# 80 is large enough for dense combat turns without exploding tensor size.
-MAX_ACTIONS = 80
-MAX_ROUTE_NODES = 24
+# STS2-Pass-Large-v1 expands this to 96 so route/shop/reward surfaces and
+# token-local candidate context have headroom without action truncation.
+MAX_ACTIONS = 96
+MAX_ROUTE_NODES = 48
 
 SCALAR_DIM = 61
 CARD_FEAT_DIM = 41

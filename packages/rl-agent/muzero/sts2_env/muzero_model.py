@@ -1263,6 +1263,7 @@ class MuZeroNetwork(nn.Module):
         token_decoder_layers: int = 2,
         token_candidate_set_layers: int = 1,
         token_memory_slots: int = 8,
+        token_memory_slot_layout: str = "legacy",
         token_world_bank_top_k: int = 3,
         token_bank_token_slots: int = 4,
         token_slot_source_same_bank_bias: float = 0.35,
@@ -1275,6 +1276,7 @@ class MuZeroNetwork(nn.Module):
         token_internal_planner_risk_blend: float = 0.25,
         token_dropout: float = 0.0,
         action_rollout_buckets: str | tuple[int, ...] | list[int] | None = None,
+        action_rollout_chunk_size: int = 0,
         activation_checkpointing: bool = False,
     ):
         """Initialize MuZero network.
@@ -1300,6 +1302,7 @@ class MuZeroNetwork(nn.Module):
         self.action_embed_dim = action_embed_dim
         self.support_size = support_size
         self.action_rollout_buckets = self._normalize_action_rollout_buckets(action_rollout_buckets)
+        self.action_rollout_chunk_size = max(int(action_rollout_chunk_size or 0), 0)
         self.constructor_kwargs = {
             "hidden_dim": int(hidden_dim),
             "action_embed_dim": int(action_embed_dim),
@@ -1318,6 +1321,7 @@ class MuZeroNetwork(nn.Module):
             "token_decoder_layers": int(token_decoder_layers),
             "token_candidate_set_layers": int(token_candidate_set_layers),
             "token_memory_slots": int(token_memory_slots),
+            "token_memory_slot_layout": str(token_memory_slot_layout or "legacy").strip().lower(),
             "token_world_bank_top_k": int(token_world_bank_top_k),
             "token_bank_token_slots": int(token_bank_token_slots),
             "token_slot_source_same_bank_bias": float(token_slot_source_same_bank_bias),
@@ -1330,6 +1334,7 @@ class MuZeroNetwork(nn.Module):
             "token_internal_planner_risk_blend": float(token_internal_planner_risk_blend),
             "token_dropout": float(token_dropout),
             "action_rollout_buckets": tuple(int(bucket) for bucket in self.action_rollout_buckets),
+            "action_rollout_chunk_size": int(self.action_rollout_chunk_size),
             "activation_checkpointing": bool(activation_checkpointing),
         }
 
@@ -1346,6 +1351,7 @@ class MuZeroNetwork(nn.Module):
                 world_bank_top_k=token_world_bank_top_k,
                 bank_token_slots=token_bank_token_slots,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 action_embed_dim=action_embed_dim,
                 dropout=token_dropout,
                 activation_checkpointing=activation_checkpointing,
@@ -1357,6 +1363,7 @@ class MuZeroNetwork(nn.Module):
                 action_embed_dim=action_embed_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 support_size=support_size,
                 num_transition_layers=max(2, dynamics_res_blocks // 2),
                 dropout=token_dropout,
@@ -1367,6 +1374,7 @@ class MuZeroNetwork(nn.Module):
                 action_embed_dim=action_embed_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 support_size=support_size,
                 internal_planner_blend=token_internal_planner_blend,
                 internal_planner_q_blend=token_internal_planner_q_blend,
@@ -1376,20 +1384,24 @@ class MuZeroNetwork(nn.Module):
                 ffn_dim=token_ffn_dim,
                 dropout=token_dropout,
                 activation_checkpointing=activation_checkpointing,
+                planner_action_chunk_size=self.action_rollout_chunk_size,
             )
             self.transition_surface = TokenTransitionSurfaceHead(
                 hidden_dim=hidden_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 n_heads=token_n_heads,
                 ffn_dim=token_ffn_dim,
                 dropout=token_dropout,
                 activation_checkpointing=activation_checkpointing,
+                planner_action_chunk_size=self.action_rollout_chunk_size,
             )
             self.future_world_bank_head = TokenFutureWorldBankHead(
                 hidden_dim=hidden_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 bank_token_slots=token_bank_token_slots,
                 slot_source_same_bank_bias=token_slot_source_same_bank_bias,
                 slot_source_same_slot_bias=token_slot_source_same_slot_bias,
@@ -1404,6 +1416,7 @@ class MuZeroNetwork(nn.Module):
                 hidden_dim=hidden_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 n_heads=token_n_heads,
                 ffn_dim=token_ffn_dim,
                 num_layers=2,
@@ -1414,6 +1427,7 @@ class MuZeroNetwork(nn.Module):
                 hidden_dim=hidden_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 n_heads=token_n_heads,
                 ffn_dim=token_ffn_dim,
                 num_layers=2,
@@ -1469,9 +1483,11 @@ class MuZeroNetwork(nn.Module):
                 action_embed_dim=action_embed_dim,
                 d_model=token_d_model,
                 num_memory_slots=token_memory_slots,
+                memory_slot_layout=token_memory_slot_layout,
                 support_size=support_size,
                 num_transition_layers=max(2, dynamics_res_blocks // 2),
                 dropout=token_dropout,
+                activation_checkpointing=activation_checkpointing,
             )
         else:
             self.semantic_dynamics = DynamicsNetwork(
@@ -1960,6 +1976,148 @@ class MuZeroNetwork(nn.Module):
         padding = tensor.new_full(pad_shape, fill_value)
         return torch.cat([tensor, padding], dim=0)
 
+    def _planner_chunk_size(self, total_rows: int) -> int:
+        total_rows = max(int(total_rows), 0)
+        chunk = int(getattr(self, "action_rollout_chunk_size", 0) or 0)
+        if chunk <= 0 or total_rows <= chunk:
+            return max(total_rows, 1)
+        return max(chunk, 1)
+
+    def _planner_dynamics_surface_value(
+        self,
+        hidden: torch.Tensor,
+        actions: torch.Tensor,
+        *,
+        objective_context: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        total_rows = int(hidden.shape[0])
+        chunk_size = self._planner_chunk_size(total_rows)
+        if total_rows <= chunk_size:
+            (
+                next_hidden,
+                reward_logits,
+                reward,
+                reward_component_logits,
+                reward_components,
+                surprise_logits,
+                surprise,
+            ) = self.dynamics(hidden, actions)
+            (
+                action_mask_logits,
+                decision_domain_logits,
+                phase_logits,
+            ) = self.transition_surface(next_hidden)
+            decision_domain = torch.softmax(decision_domain_logits, dim=-1)
+            (
+                value_logits,
+                value,
+                value_component_logits,
+                value_components,
+                objective_value,
+            ) = self.prediction.value_only(
+                next_hidden,
+                decision_domain=decision_domain,
+                objective_context=objective_context,
+            )
+            return (
+                next_hidden,
+                reward_logits,
+                reward,
+                reward_component_logits,
+                reward_components,
+                surprise_logits,
+                surprise,
+                action_mask_logits,
+                decision_domain_logits,
+                phase_logits,
+                value_logits,
+                value,
+                value_component_logits,
+                value_components,
+                objective_value,
+            )
+
+        chunks: list[list[torch.Tensor]] = [[] for _ in range(15)]
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            context_chunk = None if objective_context is None else objective_context[start:end]
+            outputs = self._planner_dynamics_surface_value(
+                hidden[start:end],
+                actions[start:end],
+                objective_context=context_chunk,
+            )
+            for index, value in enumerate(outputs):
+                chunks[index].append(value)
+        return tuple(torch.cat(values, dim=0) for values in chunks)  # type: ignore[return-value]
+
+    def _planner_value_only(
+        self,
+        hidden: torch.Tensor,
+        *,
+        decision_domain: torch.Tensor | None = None,
+        objective_context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_rows = int(hidden.shape[0])
+        chunk_size = self._planner_chunk_size(total_rows)
+        if total_rows <= chunk_size:
+            return self.prediction.value_only(
+                hidden,
+                decision_domain=decision_domain,
+                objective_context=objective_context,
+            )
+        chunks: list[list[torch.Tensor]] = [[] for _ in range(5)]
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            decision_chunk = None if decision_domain is None else decision_domain[start:end]
+            context_chunk = None if objective_context is None else objective_context[start:end]
+            outputs = self.prediction.value_only(
+                hidden[start:end],
+                decision_domain=decision_chunk,
+                objective_context=context_chunk,
+            )
+            for index, value in enumerate(outputs):
+                chunks[index].append(value)
+        return tuple(torch.cat(values, dim=0) for values in chunks)  # type: ignore[return-value]
+
+    def _planner_latent_policy_only(
+        self,
+        hidden: torch.Tensor,
+        *,
+        decision_domain: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        total_rows = int(hidden.shape[0])
+        chunk_size = self._planner_chunk_size(total_rows)
+        if total_rows <= chunk_size:
+            return self.prediction.latent_policy_only(hidden, decision_domain=decision_domain)
+        logits_chunks: list[torch.Tensor] = []
+        embedding_chunks: list[torch.Tensor] = []
+        for start in range(0, total_rows, chunk_size):
+            end = min(start + chunk_size, total_rows)
+            decision_chunk = None if decision_domain is None else decision_domain[start:end]
+            logits, embeddings = self.prediction.latent_policy_only(
+                hidden[start:end],
+                decision_domain=decision_chunk,
+            )
+            logits_chunks.append(logits)
+            embedding_chunks.append(embeddings)
+        return torch.cat(logits_chunks, dim=0), torch.cat(embedding_chunks, dim=0)
+
     def action_rollout_planner(
         self,
         hidden_state: torch.Tensor,
@@ -2081,22 +2239,17 @@ class MuZeroNetwork(nn.Module):
             reward_components_valid,
             surprise_logits_valid,
             surprise_valid,
-        ) = self.dynamics(flat_hidden, flat_actions)
-        (
             next_action_mask_logits_valid,
             next_decision_domain_logits_valid,
             next_phase_logits_valid,
-        ) = self.transition_surface(next_hidden_valid)
-        next_decision_domain_valid = torch.softmax(next_decision_domain_logits_valid, dim=-1)
-        (
             next_value_logits_valid,
             next_value_valid,
             next_value_component_logits_valid,
             next_value_components_valid,
             next_objective_value_valid,
-        ) = self.prediction.value_only(
-            next_hidden_valid,
-            decision_domain=next_decision_domain_valid,
+        ) = self._planner_dynamics_surface_value(
+            flat_hidden,
+            flat_actions,
             objective_context=bucket_objective_context,
         )
         if reward_valid.dim() > 1 and reward_valid.shape[-1] == 1:
@@ -2183,7 +2336,7 @@ class MuZeroNetwork(nn.Module):
                     branch_bucket_size,
                 )
                 current_decision_domain = torch.softmax(branch_decision_domain_logits_bucket, dim=-1)
-                latent_policy_logits, latent_action_embeddings = self.prediction.latent_policy_only(
+                latent_policy_logits, latent_action_embeddings = self._planner_latent_policy_only(
                     branch_hidden_bucket,
                     decision_domain=current_decision_domain,
                 )
@@ -2279,22 +2432,17 @@ class MuZeroNetwork(nn.Module):
                     continued_reward_components,
                     _continued_surprise_logits,
                     continued_surprise,
-                ) = self.dynamics(expanded_hidden_bucket, expanded_actions_bucket)
-                (
                     continued_action_mask_logits,
                     continued_decision_domain_logits,
                     _continued_phase_logits,
-                ) = self.transition_surface(continued_hidden)
-                continued_decision_domain = torch.softmax(continued_decision_domain_logits, dim=-1)
-                (
                     _continued_value_logits,
                     continued_value,
                     _continued_value_component_logits,
                     continued_value_components,
                     _continued_objective_value,
-                ) = self.prediction.value_only(
-                    continued_hidden,
-                    decision_domain=continued_decision_domain,
+                ) = self._planner_dynamics_surface_value(
+                    expanded_hidden_bucket,
+                    expanded_actions_bucket,
                     objective_context=expanded_objective_context_bucket,
                 )
                 if continued_reward.dim() > 1 and continued_reward.shape[-1] == 1:
@@ -2426,7 +2574,7 @@ class MuZeroNetwork(nn.Module):
                     _final_value_component_logits,
                     final_branch_value_components,
                     _final_objective_value,
-                ) = self.prediction.value_only(
+                ) = self._planner_value_only(
                     branch_hidden_bucket,
                     decision_domain=branch_decision_domain,
                     objective_context=branch_objective_context,

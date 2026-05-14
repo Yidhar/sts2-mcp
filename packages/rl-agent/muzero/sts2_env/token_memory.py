@@ -19,6 +19,8 @@ does not need structural changes; internally we unflatten to
 from __future__ import annotations
 
 import math
+import os
+import time
 from typing import NamedTuple
 
 import torch
@@ -30,6 +32,7 @@ from sts2_env.attention_blocks import CrossAttentionBlock, EntityPooling, Relati
 from sts2_env.observation_v2 import MAX_ACTIONS, NUM_DOMAINS, NUM_PHASES
 from sts2_env.observation_v3 import (
     ENTITY_HASH_BUCKETS,
+    MAX_CANDIDATE_LOCAL_TOKENS,
     MAX_OWNER_ID,
     MAX_ORDER_ID,
     MAX_ROLE_ID,
@@ -119,7 +122,80 @@ WORLD_BANK_ZONE_IDS = {
 GLOBAL_MEMORY_BANK_NAME = "global"
 MEMORY_BANK_NAMES = WORLD_BANK_NAMES + (GLOBAL_MEMORY_BANK_NAME,)
 GLOBAL_MEMORY_BANK_INDEX = len(WORLD_BANK_NAMES)
+MEMORY_SLOT_LAYOUT_LEGACY = "legacy"
+MEMORY_SLOT_LAYOUT_QUOTA_V1 = "quota_v1"
+MEMORY_SLOT_LAYOUT_PASS_LARGE_V1 = "pass_large_v1"
+VALID_MEMORY_SLOT_LAYOUTS = (
+    MEMORY_SLOT_LAYOUT_LEGACY,
+    MEMORY_SLOT_LAYOUT_QUOTA_V1,
+    MEMORY_SLOT_LAYOUT_PASS_LARGE_V1,
+)
 RISK_OBJECTIVE_HEAD_INDICES = (HEAD_SURVIVAL, HEAD_HP_PRESERVATION)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _parse_length_buckets(raw: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
+    if raw is None or not raw.strip():
+        return default
+    buckets: list[int] = []
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if value > 0:
+            buckets.append(value)
+    if not buckets:
+        return default
+    return tuple(sorted(set(buckets)))
+
+
+def _bucket_effective_len(
+    active_len: int,
+    *,
+    full_len: int,
+    env_name: str,
+    default_buckets: tuple[int, ...],
+) -> int:
+    """Round dynamic token packing to stable bucket sizes.
+
+    Exact suffix trimming saves memory but creates many attention shapes during
+    live combat.  On ROCm that can trigger repeated backend/kernel
+    specialization and rare hard stalls.  Bucketing keeps the memory win while
+    constraining attention shapes to a small, predictable set.
+    """
+
+    active_len = max(int(active_len), 1)
+    full_len = max(int(full_len), active_len)
+    if not _env_flag("STS2_TOKEN_LENGTH_BUCKETING", True):
+        return min(active_len, full_len)
+    for bucket in _parse_length_buckets(os.environ.get(env_name), default_buckets):
+        if active_len <= bucket:
+            return min(max(bucket, active_len), full_len)
+    return full_len
+
+
+def _token_encoder_trace_enabled() -> bool:
+    return _env_flag("STS2_TOKEN_ENCODER_TRACE", False)
+
+
+def _token_encoder_trace(label: str) -> None:
+    if not _token_encoder_trace_enabled():
+        return
+    if torch.cuda.is_available() and _env_flag("STS2_TOKEN_ENCODER_TRACE_SYNC", True):
+        # Synchronize before printing so a missing "after <stage>" line points
+        # directly at the preceding queued kernel/stage.
+        torch.cuda.synchronize()
+    print(f"[token_encoder] {time.strftime('%H:%M:%S')} {label}", flush=True)
 
 
 def _should_activation_checkpoint(enabled: bool, *args: object) -> bool:
@@ -175,18 +251,117 @@ def _run_function_with_checkpoint(enabled: bool, fn, *args):
     return fn(*args)
 
 
-def build_memory_slot_bank_ids(num_memory_slots: int) -> list[int]:
+_QUOTA_V1_SLOT_BANK_NAMES = (
+    # One pass over every explicit bank plus a global slot keeps the 8-slot
+    # behavior readable and backward-like.
+    "runtime",
+    "support",
+    "enemy",
+    "build",
+    "route",
+    "powers",
+    "history",
+    "global",
+    # Extra capacity is deliberately spent on the long-horizon banks that were
+    # previously compressed into one 128-d vector each.
+    "build",
+    "route",
+    "history",
+    "enemy",
+    "build",
+    "route",
+    "build",
+    "global",
+)
+
+_PASS_LARGE_V1_SLOT_BANK_NAMES = (
+    # STS2-Pass-Large-v1 24-slot target:
+    # runtime=4, enemy=3, build=4, route=3, support=2,
+    # powers=2, history=2, global=4.
+    #
+    # The ordering keeps the first two passes balanced across all banks, then
+    # spends the final slots on runtime/build/route/enemy/global capacity.
+    "runtime",
+    "support",
+    "enemy",
+    "build",
+    "route",
+    "powers",
+    "history",
+    "global",
+    "runtime",
+    "support",
+    "enemy",
+    "build",
+    "route",
+    "powers",
+    "history",
+    "global",
+    "runtime",
+    "build",
+    "route",
+    "global",
+    "runtime",
+    "enemy",
+    "build",
+    "global",
+)
+
+
+def normalize_memory_slot_layout(layout: str | None) -> str:
+    normalized = str(layout or MEMORY_SLOT_LAYOUT_LEGACY).strip().lower()
+    if normalized not in VALID_MEMORY_SLOT_LAYOUTS:
+        valid = ", ".join(VALID_MEMORY_SLOT_LAYOUTS)
+        raise ValueError(f"Unknown token memory slot layout {layout!r}; expected one of: {valid}.")
+    return normalized
+
+
+def build_memory_slot_bank_ids(num_memory_slots: int, layout: str = MEMORY_SLOT_LAYOUT_LEGACY) -> list[int]:
     """Assign each latent slot to a persistent bank identity.
 
-    Preferred layout:
+    ``legacy`` preserves the original checkpoint-compatible behavior:
       - one reserved slot per explicit world bank
       - any extra slots become global/planning slots
 
     When the caller requests fewer slots than explicit banks, we compress the
     coverage by evenly subsampling bank identities. The default configuration
     should keep at least one slot per bank.
+
+    ``quota_v1`` is the first medium-capacity long-horizon layout.  It keeps the same
+    first 8 slots as the legacy/default profile, then spends additional slots on
+    the high-entropy STS2 banks:
+
+    - build: deck curve, card valuation, archetype, reward/shop/smith state
+    - route: future rest/shop/elite/event timing and risk
+    - history: run trajectory, recent losses, choices already made
+    - enemy: multi-enemy/boss mechanics context
+
+    At 16 slots the intended quota is:
+      runtime=1, support=1, enemy=2, build=4, route=3,
+      powers=1, history=2, global=2.
+
+    ``pass_large_v1`` is the STS2 pass-target layout.  At 24 slots it gives:
+      runtime=4, enemy=3, build=4, route=3, support=2,
+      powers=2, history=2, global=4.
     """
     slot_count = max(int(num_memory_slots), 1)
+    normalized_layout = normalize_memory_slot_layout(layout)
+    if normalized_layout in {MEMORY_SLOT_LAYOUT_QUOTA_V1, MEMORY_SLOT_LAYOUT_PASS_LARGE_V1}:
+        name_to_index = {
+            **{bank_name: bank_index for bank_index, bank_name in enumerate(WORLD_BANK_NAMES)},
+            GLOBAL_MEMORY_BANK_NAME: GLOBAL_MEMORY_BANK_INDEX,
+        }
+        template = (
+            _PASS_LARGE_V1_SLOT_BANK_NAMES
+            if normalized_layout == MEMORY_SLOT_LAYOUT_PASS_LARGE_V1
+            else _QUOTA_V1_SLOT_BANK_NAMES
+        )
+        if slot_count <= len(template):
+            slot_names = template[:slot_count]
+        else:
+            slot_names = template + (GLOBAL_MEMORY_BANK_NAME,) * (slot_count - len(template))
+        return [name_to_index[slot_name] for slot_name in slot_names]
+
     bank_count = len(WORLD_BANK_NAMES)
     if slot_count >= bank_count:
         return list(range(bank_count)) + [GLOBAL_MEMORY_BANK_INDEX] * (slot_count - bank_count)
@@ -442,6 +617,7 @@ class TokenMemoryEncoder(nn.Module):
         world_bank_top_k: int = 3,
         bank_token_slots: int = 4,
         num_memory_slots: int = 8,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         action_embed_dim: int = 64,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
@@ -457,6 +633,7 @@ class TokenMemoryEncoder(nn.Module):
         self.world_bank_top_k = max(1, min(int(world_bank_top_k), len(WORLD_BANK_NAMES)))
         self.bank_token_slots = max(1, min(int(bank_token_slots), MAX_WORLD_TOKENS))
         self.num_memory_slots = max(int(num_memory_slots), 1)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.action_embed_dim = int(action_embed_dim)
         self.hidden_dim = self.num_memory_slots * self.d_model
         self.activation_checkpointing = bool(activation_checkpointing)
@@ -550,7 +727,10 @@ class TokenMemoryEncoder(nn.Module):
 
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.memory_seed = nn.Parameter(torch.randn(1, self.num_memory_slots, self.d_model) * 0.02)
@@ -640,6 +820,31 @@ class TokenMemoryEncoder(nn.Module):
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(0)
         return tensor
+
+    @staticmethod
+    def _effective_mask_len(mask: torch.Tensor, *, dim: int, min_len: int = 1) -> int:
+        """Return max active length along ``dim`` for dynamic attention packing.
+
+        Observation tensors are padded to generous pass-large maxima.  Attention
+        cost is quadratic in sequence length, so trimming purely padded suffixes
+        before world/local attention substantially lowers peak memory while
+        preserving every masked token that can affect the encoder output.
+        """
+
+        if mask.numel() == 0:
+            return max(int(min_len), 1)
+        if dim < 0:
+            dim += mask.dim()
+        if dim < 0 or dim >= mask.dim():
+            raise ValueError(f"Invalid dim={dim} for mask shape={tuple(mask.shape)}")
+        active = mask.to(dtype=torch.bool)
+        reduce_dims = [axis for axis in range(active.dim()) if axis != dim]
+        for axis in sorted(reduce_dims, reverse=True):
+            active = active.any(dim=axis)
+        active_indices = torch.nonzero(active, as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            return max(int(min_len), 1)
+        return max(int(active_indices.max().item()) + 1, int(min_len), 1)
 
     def _build_world_bank_masks(self, world_role_ids, world_zone_ids, world_mask):
         world_mask = torch.as_tensor(world_mask, dtype=torch.bool, device=world_role_ids.device)
@@ -968,6 +1173,7 @@ class TokenMemoryEncoder(nn.Module):
         return memory_slots.reshape(memory_slots.shape[0], -1)
 
     def forward(self, obs: dict[str, torch.Tensor]) -> TokenMemoryEncoderOutput:
+        _token_encoder_trace("forward enter")
         device = None
         for value in obs.values():
             if isinstance(value, torch.Tensor):
@@ -990,6 +1196,25 @@ class TokenMemoryEncoder(nn.Module):
         world_entity_ids = world_entity_ids.clamp(min=0, max=ENTITY_HASH_BUCKETS - 1)
         world_zone_ids = world_zone_ids.clamp(min=0, max=MAX_ZONE_ID)
         world_order_ids = world_order_ids.clamp(min=0, max=MAX_ORDER_ID)
+        world_active_len = self._effective_mask_len(world_mask, dim=1, min_len=1)
+        world_len = _bucket_effective_len(
+            world_active_len,
+            full_len=int(world_tokens.shape[1]),
+            env_name="STS2_WORLD_TOKEN_LENGTH_BUCKETS",
+            default_buckets=(64, 96, 128, 160, 192, 256, 320, 384, 512, MAX_WORLD_TOKENS),
+        )
+        if world_len < int(world_tokens.shape[1]):
+            world_tokens = world_tokens[:, :world_len, :]
+            world_mask = world_mask[:, :world_len]
+            world_type_ids = world_type_ids[:, :world_len]
+            world_role_ids = world_role_ids[:, :world_len]
+            world_owner_ids = world_owner_ids[:, :world_len]
+            world_entity_ids = world_entity_ids[:, :world_len]
+            world_zone_ids = world_zone_ids[:, :world_len]
+            world_order_ids = world_order_ids[:, :world_len]
+        _token_encoder_trace(
+            f"world tensors ready active_len={world_active_len} packed_len={world_len} full_len={int(obs['world_tokens'].shape[-2])}"
+        )
 
         candidate_query_tokens = self._float_tensor(obs["candidate_query_tokens"], device=device)
         candidate_query_type_ids = self._long_tensor(obs["candidate_query_type_ids"], device=device)
@@ -1024,6 +1249,25 @@ class TokenMemoryEncoder(nn.Module):
         candidate_local_entity_ids = candidate_local_entity_ids.clamp(min=0, max=ENTITY_HASH_BUCKETS - 1)
         candidate_local_zone_ids = candidate_local_zone_ids.clamp(min=0, max=MAX_ZONE_ID)
         candidate_local_order_ids = candidate_local_order_ids.clamp(min=0, max=MAX_ORDER_ID)
+        local_active_len = self._effective_mask_len(candidate_local_masks, dim=2, min_len=1)
+        local_len = _bucket_effective_len(
+            local_active_len,
+            full_len=int(candidate_local_tokens.shape[2]),
+            env_name="STS2_CANDIDATE_LOCAL_LENGTH_BUCKETS",
+            default_buckets=(8, 16, 24, 32, MAX_CANDIDATE_LOCAL_TOKENS),
+        )
+        if local_len < int(candidate_local_tokens.shape[2]):
+            candidate_local_tokens = candidate_local_tokens[:, :, :local_len, :]
+            candidate_local_masks = candidate_local_masks[:, :, :local_len]
+            candidate_local_type_ids = candidate_local_type_ids[:, :, :local_len]
+            candidate_local_role_ids = candidate_local_role_ids[:, :, :local_len]
+            candidate_local_owner_ids = candidate_local_owner_ids[:, :, :local_len]
+            candidate_local_entity_ids = candidate_local_entity_ids[:, :, :local_len]
+            candidate_local_zone_ids = candidate_local_zone_ids[:, :, :local_len]
+            candidate_local_order_ids = candidate_local_order_ids[:, :, :local_len]
+        _token_encoder_trace(
+            f"local tensors ready active_len={local_active_len} packed_len={local_len} actions={int(candidate_mask.shape[-1])}"
+        )
 
         batch_size, action_count, local_count, _ = candidate_local_tokens.shape
         flat_local_tokens = candidate_local_tokens.reshape(batch_size * action_count, local_count, TOKEN_FEAT_DIM)
@@ -1037,6 +1281,7 @@ class TokenMemoryEncoder(nn.Module):
 
         numeric_slice = slice(0, TOKEN_NUMERIC_DIM)
         text_slice = slice(TOKEN_NUMERIC_DIM, TOKEN_NUMERIC_DIM + TOKEN_TEXT_DIM)
+        _token_encoder_trace("before shared_numeric_trunk")
         world_numeric, query_numeric, flat_local_numeric = self._project_shared_modal_trunk_with_reuse(
             self.shared_numeric_trunk,
             [
@@ -1046,6 +1291,8 @@ class TokenMemoryEncoder(nn.Module):
             ],
             output_dim=self.shared_numeric_width,
         )
+        _token_encoder_trace("after shared_numeric_trunk")
+        _token_encoder_trace("before shared_text_trunk")
         world_text, query_text, flat_local_text = self._project_shared_modal_trunk_with_reuse(
             self.shared_text_trunk,
             [
@@ -1055,7 +1302,9 @@ class TokenMemoryEncoder(nn.Module):
             ],
             output_dim=self.shared_text_width,
         )
+        _token_encoder_trace("after shared_text_trunk")
 
+        _token_encoder_trace("before world_embedder")
         world_x = self.world_embedder(
             world_tokens,
             world_type_ids,
@@ -1067,6 +1316,8 @@ class TokenMemoryEncoder(nn.Module):
             projected_numeric=world_numeric,
             projected_text=world_text,
         )
+        _token_encoder_trace("after world_embedder")
+        _token_encoder_trace("before world_relation_bias")
         world_bias = self.world_relation_bias(
             world_type_ids,
             world_type_ids,
@@ -1081,7 +1332,9 @@ class TokenMemoryEncoder(nn.Module):
             world_order_ids,
             world_order_ids,
         )
-        for block in self.world_blocks:
+        _token_encoder_trace("after world_relation_bias")
+        for block_index, block in enumerate(self.world_blocks):
+            _token_encoder_trace(f"before world_block[{block_index}]")
             world_x = _run_encoder_block(
                 self.activation_checkpointing,
                 block,
@@ -1089,8 +1342,12 @@ class TokenMemoryEncoder(nn.Module):
                 mask=world_mask,
                 attn_bias=world_bias,
             )
+            _token_encoder_trace(f"after world_block[{block_index}]")
+        _token_encoder_trace("before world_pool")
         world_pool = self.world_pool(world_x, mask=world_mask)
+        _token_encoder_trace("after world_pool")
 
+        _token_encoder_trace("before query_embedder")
         query_x = self.query_embedder(
             candidate_query_tokens,
             candidate_query_type_ids,
@@ -1104,6 +1361,8 @@ class TokenMemoryEncoder(nn.Module):
             projected_numeric=query_numeric,
             projected_text=query_text,
         )
+        _token_encoder_trace("after query_embedder")
+        _token_encoder_trace("before local_embedder")
         local_x = self.local_embedder(
             flat_local_tokens,
             flat_local_type_ids,
@@ -1115,6 +1374,8 @@ class TokenMemoryEncoder(nn.Module):
             projected_numeric=flat_local_numeric,
             projected_text=flat_local_text,
         )
+        _token_encoder_trace("after local_embedder")
+        _token_encoder_trace("before local_relation_bias")
         local_bias = self.local_relation_bias(
             flat_local_type_ids,
             flat_local_type_ids,
@@ -1129,7 +1390,9 @@ class TokenMemoryEncoder(nn.Module):
             flat_local_order_ids,
             flat_local_order_ids,
         )
-        for block in self.local_blocks:
+        _token_encoder_trace("after local_relation_bias")
+        for block_index, block in enumerate(self.local_blocks):
+            _token_encoder_trace(f"before local_block[{block_index}]")
             local_x = _run_encoder_block(
                 self.activation_checkpointing,
                 block,
@@ -1137,7 +1400,10 @@ class TokenMemoryEncoder(nn.Module):
                 mask=flat_local_masks,
                 attn_bias=local_bias,
             )
+            _token_encoder_trace(f"after local_block[{block_index}]")
+        _token_encoder_trace("before local_pool")
         local_pool = self.local_pool(local_x, mask=flat_local_masks).reshape(batch_size, action_count, self.d_model)
+        _token_encoder_trace("after local_pool")
 
         flat_query_x = query_x.reshape(batch_size * action_count, 1, self.d_model)
         flat_query_masks = candidate_mask.reshape(batch_size * action_count, 1)
@@ -1149,6 +1415,7 @@ class TokenMemoryEncoder(nn.Module):
         flat_query_order_ids = candidate_query_order_ids.reshape(batch_size * action_count, 1)
         flat_query_target_owner_ids = candidate_query_target_owner_ids.reshape(batch_size * action_count, 1)
         flat_query_target_entity_ids = candidate_query_target_entity_ids.reshape(batch_size * action_count, 1)
+        _token_encoder_trace("before query_local_relation_bias")
         query_local_bias = self.query_local_relation_bias(
             flat_query_type_ids,
             flat_local_type_ids,
@@ -1165,6 +1432,8 @@ class TokenMemoryEncoder(nn.Module):
             flat_query_target_owner_ids,
             flat_query_target_entity_ids,
         )
+        _token_encoder_trace("after query_local_relation_bias")
+        _token_encoder_trace("before query_local_bridge")
         bridged_query_x = _run_cross_block(
             self.activation_checkpointing,
             self.query_local_bridge,
@@ -1174,10 +1443,12 @@ class TokenMemoryEncoder(nn.Module):
             memory_mask=flat_local_masks,
             attn_bias=query_local_bias,
         )
+        _token_encoder_trace("after query_local_bridge")
         has_local_context = flat_local_masks.any(dim=1, keepdim=True).unsqueeze(-1)
         bridged_query_x = torch.where(has_local_context, bridged_query_x, flat_query_x)
         candidate_x = bridged_query_x.reshape(batch_size, action_count, self.d_model) + local_pool
 
+        _token_encoder_trace("before candidate_set_relation_bias")
         set_bias = self.candidate_set_relation_bias(
             candidate_query_type_ids,
             candidate_query_type_ids,
@@ -1192,8 +1463,14 @@ class TokenMemoryEncoder(nn.Module):
             candidate_query_order_ids,
             candidate_query_order_ids,
         )
+        _token_encoder_trace("after candidate_set_relation_bias")
+        _token_encoder_trace("before world_bank_masks")
         world_bank_masks = self._build_world_bank_masks(world_role_ids, world_zone_ids, world_mask)
+        _token_encoder_trace("after world_bank_masks")
+        _token_encoder_trace("before world_bank_summaries")
         world_bank_summaries = self._compute_world_bank_summaries(world_x, world_bank_masks)
+        _token_encoder_trace("after world_bank_summaries")
+        _token_encoder_trace("before world_bank_biases")
         world_bank_biases = self._build_world_bank_biases(
             candidate_query_type_ids=candidate_query_type_ids,
             candidate_query_role_ids=candidate_query_role_ids,
@@ -1210,7 +1487,9 @@ class TokenMemoryEncoder(nn.Module):
             world_zone_ids=world_zone_ids,
             world_order_ids=world_order_ids,
         )
+        _token_encoder_trace("after world_bank_biases")
         for layer_index in range(self.decoder_layers):
+            _token_encoder_trace(f"before decoder_self[{layer_index}]")
             candidate_x = _run_encoder_block(
                 self.activation_checkpointing,
                 self.decoder_self_blocks[layer_index],
@@ -1218,6 +1497,7 @@ class TokenMemoryEncoder(nn.Module):
                 mask=candidate_mask,
                 attn_bias=set_bias,
             )
+            _token_encoder_trace(f"after decoder_self[{layer_index}]")
             def _apply_bank_cross(
                 candidate_x_: torch.Tensor,
                 world_x_: torch.Tensor,
@@ -1233,13 +1513,16 @@ class TokenMemoryEncoder(nn.Module):
                     world_bank_biases=world_bank_biases,
                 )
 
+            _token_encoder_trace(f"before bank_cross[{layer_index}]")
             candidate_x = _run_function_with_checkpoint(
                 self.activation_checkpointing,
                 _apply_bank_cross,
                 candidate_x,
                 world_x,
             )
-        for block in self.candidate_set_blocks:
+            _token_encoder_trace(f"after bank_cross[{layer_index}]")
+        for block_index, block in enumerate(self.candidate_set_blocks):
+            _token_encoder_trace(f"before candidate_set_block[{block_index}]")
             candidate_x = _run_encoder_block(
                 self.activation_checkpointing,
                 block,
@@ -1247,12 +1530,16 @@ class TokenMemoryEncoder(nn.Module):
                 mask=candidate_mask,
                 attn_bias=set_bias,
             )
+            _token_encoder_trace(f"after candidate_set_block[{block_index}]")
 
+        _token_encoder_trace("before world_bank_token_signatures")
         world_bank_token_presence, world_bank_token_distribution = self._compute_world_bank_token_signatures(
             world_bank_masks=world_bank_masks,
             world_type_ids=world_type_ids,
             world_mask=world_mask,
         )
+        _token_encoder_trace("after world_bank_token_signatures")
+        _token_encoder_trace("before world_bank_token_slots")
         (
             world_bank_token_slot_states,
             world_bank_token_slot_mask,
@@ -1268,7 +1555,9 @@ class TokenMemoryEncoder(nn.Module):
             world_entity_ids=world_entity_ids,
             world_order_ids=world_order_ids,
         )
+        _token_encoder_trace("after world_bank_token_slots")
 
+        _token_encoder_trace("before memory_slots")
         memory_slots = self._memory_slots(
             world_x=world_x,
             world_mask=world_mask,
@@ -1278,12 +1567,14 @@ class TokenMemoryEncoder(nn.Module):
             candidate_mask=candidate_mask,
             world_pool=world_pool,
         )
+        _token_encoder_trace("after memory_slots")
         hidden_state = self._flatten_hidden(memory_slots)
         action_embeddings = self.action_out_proj(candidate_x) * candidate_mask.unsqueeze(-1).float()
         decision_domain = infer_token_decision_domain(obs, device=device)
         if decision_domain is None:
             domain_logits = self.domain_head(world_pool)
             decision_domain = torch.softmax(domain_logits, dim=-1)
+        _token_encoder_trace("forward exit")
         return TokenMemoryEncoderOutput(
             hidden_state=hidden_state,
             action_embeddings=action_embeddings,
@@ -1312,6 +1603,7 @@ class TokenDynamicsNetwork(nn.Module):
         action_embed_dim: int,
         d_model: int,
         num_memory_slots: int,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         support_size: int = 25,
         num_transition_layers: int = 2,
         dropout: float = 0.0,
@@ -1322,6 +1614,7 @@ class TokenDynamicsNetwork(nn.Module):
         self.action_embed_dim = int(action_embed_dim)
         self.d_model = int(d_model)
         self.num_memory_slots = int(num_memory_slots)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.support_size = int(support_size)
         self.num_bins = 2 * self.support_size + 1
         self.activation_checkpointing = bool(activation_checkpointing)
@@ -1335,7 +1628,10 @@ class TokenDynamicsNetwork(nn.Module):
         self.num_slot_banks = len(MEMORY_BANK_NAMES)
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.slot_index_embedding = nn.Embedding(self.num_memory_slots, self.d_model)
@@ -1475,6 +1771,7 @@ class TokenLatentProjector(nn.Module):
         hidden_dim: int,
         d_model: int,
         num_memory_slots: int,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         n_heads: int = 4,
         ffn_dim: int = 512,
         num_layers: int = 2,
@@ -1486,6 +1783,7 @@ class TokenLatentProjector(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.d_model = int(d_model)
         self.num_memory_slots = int(num_memory_slots)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.n_heads = max(1, int(n_heads))
         self.ffn_dim = int(ffn_dim)
         self.activation_checkpointing = bool(activation_checkpointing)
@@ -1498,7 +1796,10 @@ class TokenLatentProjector(nn.Module):
         self.num_slot_banks = len(MEMORY_BANK_NAMES)
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.slot_index_embedding = nn.Embedding(self.num_memory_slots, self.d_model)
@@ -1559,18 +1860,22 @@ class TokenTransitionSurfaceHead(nn.Module):
         hidden_dim: int,
         d_model: int,
         num_memory_slots: int,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         n_heads: int = 4,
         ffn_dim: int = 512,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
+        planner_action_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.d_model = int(d_model)
         self.num_memory_slots = int(num_memory_slots)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.n_heads = max(1, int(n_heads))
         self.ffn_dim = int(ffn_dim)
         self.activation_checkpointing = bool(activation_checkpointing)
+        self.planner_action_chunk_size = max(int(planner_action_chunk_size or 0), 0)
         if self.hidden_dim != self.d_model * self.num_memory_slots:
             raise ValueError(
                 f"TokenTransitionSurfaceHead expects hidden_dim == d_model * num_memory_slots, "
@@ -1580,7 +1885,10 @@ class TokenTransitionSurfaceHead(nn.Module):
         self.num_slot_banks = len(MEMORY_BANK_NAMES)
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.slot_index_embedding = nn.Embedding(self.num_memory_slots, self.d_model)
@@ -1639,20 +1947,46 @@ class TokenTransitionSurfaceHead(nn.Module):
             slots = _run_encoder_block(self.activation_checkpointing, block, slots, mask=slot_mask)
         return slots, slot_mask
 
+    def _planner_chunk_size(self, action_count: int) -> int:
+        action_count = max(int(action_count), 0)
+        if action_count <= 0:
+            return 1
+        chunk = max(int(getattr(self, "planner_action_chunk_size", 0) or 0), 0)
+        if chunk <= 0 or action_count <= chunk:
+            return action_count
+        return max(chunk, 1)
+
     def forward(self, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         slots, slot_mask = self._slot_states(hidden_state)
         batch_size = slots.shape[0]
         pooled = self.slot_pool(slots, mask=slot_mask)
         action_tokens = self.action_queries.expand(batch_size, -1, -1)
         action_mask = torch.ones((batch_size, MAX_ACTIONS), dtype=torch.bool, device=slots.device)
-        action_tokens = _run_cross_block(
-            self.activation_checkpointing,
-            self.action_cross,
-            action_tokens,
-            slots,
-            query_mask=action_mask,
-            memory_mask=slot_mask,
-        )
+        chunk_size = self._planner_chunk_size(MAX_ACTIONS)
+        if MAX_ACTIONS <= chunk_size:
+            action_tokens = _run_cross_block(
+                self.activation_checkpointing,
+                self.action_cross,
+                action_tokens,
+                slots,
+                query_mask=action_mask,
+                memory_mask=slot_mask,
+            )
+        else:
+            action_chunks = []
+            for start in range(0, MAX_ACTIONS, chunk_size):
+                end = min(start + chunk_size, MAX_ACTIONS)
+                action_chunks.append(
+                    _run_cross_block(
+                        self.activation_checkpointing,
+                        self.action_cross,
+                        action_tokens[:, start:end, :],
+                        slots,
+                        query_mask=action_mask[:, start:end],
+                        memory_mask=slot_mask,
+                    )
+                )
+            action_tokens = torch.cat(action_chunks, dim=1)
         action_tokens = _run_encoder_block(
             self.activation_checkpointing,
             self.action_refine,
@@ -1675,6 +2009,7 @@ class TokenFutureWorldBankHead(nn.Module):
         hidden_dim: int,
         d_model: int,
         num_memory_slots: int,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         bank_token_slots: int = 4,
         slot_source_same_bank_bias: float = 0.35,
         slot_source_same_slot_bias: float = 0.2,
@@ -1689,6 +2024,7 @@ class TokenFutureWorldBankHead(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.d_model = int(d_model)
         self.num_memory_slots = int(num_memory_slots)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.bank_token_slots = max(1, int(bank_token_slots))
         self.slot_source_same_bank_bias = float(slot_source_same_bank_bias)
         self.slot_source_same_slot_bias = float(slot_source_same_slot_bias)
@@ -1706,7 +2042,10 @@ class TokenFutureWorldBankHead(nn.Module):
 
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.register_buffer(
@@ -2097,6 +2436,7 @@ class TokenPredictionNetwork(nn.Module):
         action_embed_dim: int,
         d_model: int,
         num_memory_slots: int,
+        memory_slot_layout: str = MEMORY_SLOT_LAYOUT_LEGACY,
         support_size: int = 25,
         internal_planner_blend: float = 0.7,
         internal_planner_q_blend: float = 0.5,
@@ -2106,12 +2446,14 @@ class TokenPredictionNetwork(nn.Module):
         ffn_dim: int = 512,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
+        planner_action_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.action_embed_dim = int(action_embed_dim)
         self.d_model = int(d_model)
         self.num_memory_slots = int(num_memory_slots)
+        self.memory_slot_layout = normalize_memory_slot_layout(memory_slot_layout)
         self.support_size = int(support_size)
         self.num_bins = 2 * self.support_size + 1
         self.internal_planner_blend = float(internal_planner_blend)
@@ -2121,6 +2463,7 @@ class TokenPredictionNetwork(nn.Module):
         self.n_heads = max(1, int(n_heads))
         self.ffn_dim = int(ffn_dim)
         self.activation_checkpointing = bool(activation_checkpointing)
+        self.planner_action_chunk_size = max(int(planner_action_chunk_size or 0), 0)
         if self.hidden_dim != self.d_model * self.num_memory_slots:
             raise ValueError(
                 f"TokenPredictionNetwork expects hidden_dim == d_model * num_memory_slots, "
@@ -2130,7 +2473,10 @@ class TokenPredictionNetwork(nn.Module):
         self.num_slot_banks = len(MEMORY_BANK_NAMES)
         self.register_buffer(
             "_slot_bank_ids",
-            torch.as_tensor(build_memory_slot_bank_ids(self.num_memory_slots), dtype=torch.long),
+            torch.as_tensor(
+                build_memory_slot_bank_ids(self.num_memory_slots, layout=self.memory_slot_layout),
+                dtype=torch.long,
+            ),
             persistent=False,
         )
         self.slot_index_embedding = nn.Embedding(self.num_memory_slots, self.d_model)
@@ -2329,6 +2675,15 @@ class TokenPredictionNetwork(nn.Module):
         valid = routing_sum > 0
         return torch.where(valid, normalized, domain_weights)
 
+    def _planner_chunk_size(self, action_count: int) -> int:
+        action_count = max(int(action_count), 0)
+        if action_count <= 0:
+            return 1
+        chunk = max(int(getattr(self, "planner_action_chunk_size", 0) or 0), 0)
+        if chunk <= 0 or action_count <= chunk:
+            return action_count
+        return max(chunk, 1)
+
     def _domain_states(
         self,
         slots: torch.Tensor,
@@ -2388,6 +2743,76 @@ class TokenPredictionNetwork(nn.Module):
             query_mask=action_mask,
             memory_mask=bank_mask,
         )
+        candidate_x = _run_encoder_block(
+            self.activation_checkpointing,
+            self.candidate_refine,
+            candidate_x,
+            mask=action_mask,
+        )
+        return candidate_x * action_mask.unsqueeze(-1).float()
+
+    def _candidate_tokens_chunked(
+        self,
+        action_embeddings: torch.Tensor,
+        slots: torch.Tensor,
+        bank_states: torch.Tensor,
+        bank_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build candidate tokens with optional action-axis chunking.
+
+        The slot/bank cross-attention stages are independent for each action,
+        so chunking them preserves semantics while avoiding large ``B*A``
+        activation blocks.  The final candidate self-attention still runs over
+        the full action set to keep candidate-set ranking interactions intact.
+        """
+
+        batch_size, action_count, _ = action_embeddings.shape
+        if action_count <= 0:
+            return action_embeddings.new_zeros((batch_size, 0, self.d_model))
+
+        chunk_size = self._planner_chunk_size(action_count)
+        if action_count <= chunk_size:
+            return _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                lambda action_embeddings_, slots_, bank_states_, bank_mask_: self._candidate_tokens(
+                    action_embeddings_,
+                    slots_,
+                    bank_states_,
+                    bank_mask_,
+                ),
+                action_embeddings,
+                slots,
+                bank_states,
+                bank_mask,
+            )
+
+        slot_mask = self._slot_mask(batch_size, slots.device)
+        action_mask = action_embeddings.abs().sum(dim=-1) > 0
+        candidate_chunks: list[torch.Tensor] = []
+        for start in range(0, action_count, chunk_size):
+            end = min(start + chunk_size, action_count)
+            action_slice = action_embeddings[:, start:end, :]
+            mask_slice = action_mask[:, start:end]
+            candidate_x = self.candidate_in_proj(action_slice)
+            candidate_x = _run_cross_block(
+                self.activation_checkpointing,
+                self.candidate_cross,
+                candidate_x,
+                slots,
+                query_mask=mask_slice,
+                memory_mask=slot_mask,
+            )
+            candidate_x = _run_cross_block(
+                self.activation_checkpointing,
+                self.candidate_bank_cross,
+                candidate_x,
+                bank_states,
+                query_mask=mask_slice,
+                memory_mask=bank_mask,
+            )
+            candidate_chunks.append(candidate_x)
+
+        candidate_x = torch.cat(candidate_chunks, dim=1)
         candidate_x = _run_encoder_block(
             self.activation_checkpointing,
             self.candidate_refine,
@@ -2548,6 +2973,220 @@ class TokenPredictionNetwork(nn.Module):
         planner_q_components = planner_q_components * action_mask.unsqueeze(-1).float()
         planner_objective_q = planner_objective_q * action_mask.float()
         return mixed_component_logits, planner_q_components, planner_objective_q
+
+    def _planner_outputs_chunked(
+        self,
+        candidate_tokens: torch.Tensor,
+        slots: torch.Tensor,
+        bank_states: torch.Tensor,
+        bank_mask: torch.Tensor,
+        routing_weights: torch.Tensor,
+        domain_states: torch.Tensor,
+        *,
+        objective_context: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run action-conditioned planner heads with optional action chunking.
+
+        ``_planner_features`` expands slot/bank tensors across the action axis
+        before flattening to ``B * A`` rows.  That expansion is one of the
+        peak-memory hotspots for pass-large configs.  The planner feature and
+        Q/policy heads are action-local after ``candidate_tokens`` are formed,
+        so slicing the action axis preserves action order and tensor semantics
+        while bounding the largest intermediate to ``B * chunk_size`` rows.
+        """
+
+        batch_size, action_count, _ = candidate_tokens.shape
+        if action_count <= 0:
+            action_mask = torch.zeros((batch_size, 0), dtype=torch.bool, device=candidate_tokens.device)
+            q_logits = candidate_tokens.new_zeros((batch_size, 0, self.num_bins))
+            q = candidate_tokens.new_zeros((batch_size, 0))
+            component_logits = candidate_tokens.new_zeros((batch_size, 0, NUM_OBJECTIVE_HEADS, self.num_bins))
+            components = candidate_tokens.new_zeros((batch_size, 0, NUM_OBJECTIVE_HEADS))
+            return (
+                action_mask,
+                candidate_tokens.new_zeros((batch_size, 0)),
+                q_logits,
+                q,
+                component_logits,
+                components,
+                candidate_tokens.new_zeros((batch_size, 0)),
+                candidate_tokens.new_zeros((batch_size, 0, self.d_model)),
+            )
+
+        chunk_size = self._planner_chunk_size(action_count)
+
+        def _planner_feature_fn(candidate_tokens_: torch.Tensor, slots_: torch.Tensor, bank_states_: torch.Tensor, bank_mask_: torch.Tensor):
+            return self._planner_features(
+                candidate_tokens_,
+                slots_,
+                bank_states_,
+                bank_mask_,
+            )
+
+        def _planner_policy_fn(
+            planner_tokens_: torch.Tensor,
+            candidate_tokens_: torch.Tensor,
+            routing_weights_: torch.Tensor,
+            domain_states_: torch.Tensor,
+        ):
+            return self._planner_policy_logits(
+                planner_tokens_,
+                candidate_tokens_,
+                routing_weights_,
+                domain_states_,
+            )
+
+        def _planner_q_fn(
+            planner_tokens_: torch.Tensor,
+            candidate_tokens_: torch.Tensor,
+            routing_weights_: torch.Tensor,
+            domain_states_: torch.Tensor,
+        ):
+            return self._planner_q_outputs(
+                planner_tokens_,
+                candidate_tokens_,
+                routing_weights_,
+                domain_states_,
+            )
+
+        def _planner_objective_q_fn(
+            planner_tokens_: torch.Tensor,
+            candidate_tokens_: torch.Tensor,
+            routing_weights_: torch.Tensor,
+            domain_states_: torch.Tensor,
+        ):
+            return self._planner_objective_q_outputs(
+                planner_tokens_,
+                candidate_tokens_,
+                routing_weights_,
+                domain_states_,
+                objective_context=objective_context,
+            )
+
+        if action_count <= chunk_size:
+            planner_tokens, planner_action_mask = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_feature_fn,
+                candidate_tokens,
+                slots,
+                bank_states,
+                bank_mask,
+            )
+            planner_policy_logits = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_policy_fn,
+                planner_tokens,
+                candidate_tokens,
+                routing_weights,
+                domain_states,
+            )
+            planner_q_logits, planner_q = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_q_fn,
+                planner_tokens,
+                candidate_tokens,
+                routing_weights,
+                domain_states,
+            )
+            (
+                planner_q_component_logits,
+                planner_q_components,
+                planner_objective_q,
+            ) = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_objective_q_fn,
+                planner_tokens,
+                candidate_tokens,
+                routing_weights,
+                domain_states,
+            )
+            return (
+                planner_action_mask,
+                planner_policy_logits,
+                planner_q_logits,
+                planner_q,
+                planner_q_component_logits,
+                planner_q_components,
+                planner_objective_q,
+                planner_tokens,
+            )
+
+        planner_action_mask_chunks: list[torch.Tensor] = []
+        planner_policy_chunks: list[torch.Tensor] = []
+        planner_q_logits_chunks: list[torch.Tensor] = []
+        planner_q_chunks: list[torch.Tensor] = []
+        planner_q_component_logits_chunks: list[torch.Tensor] = []
+        planner_q_components_chunks: list[torch.Tensor] = []
+        planner_objective_q_chunks: list[torch.Tensor] = []
+        planner_token_chunks: list[torch.Tensor] = []
+
+        for start in range(0, action_count, chunk_size):
+            end = min(start + chunk_size, action_count)
+            candidate_slice = candidate_tokens[:, start:end, :]
+            planner_tokens, planner_action_mask = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_feature_fn,
+                candidate_slice,
+                slots,
+                bank_states,
+                bank_mask,
+            )
+            planner_policy_logits = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_policy_fn,
+                planner_tokens,
+                candidate_slice,
+                routing_weights,
+                domain_states,
+            )
+            planner_q_logits, planner_q = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_q_fn,
+                planner_tokens,
+                candidate_slice,
+                routing_weights,
+                domain_states,
+            )
+            (
+                planner_q_component_logits,
+                planner_q_components,
+                planner_objective_q,
+            ) = _run_function_with_checkpoint(
+                self.activation_checkpointing,
+                _planner_objective_q_fn,
+                planner_tokens,
+                candidate_slice,
+                routing_weights,
+                domain_states,
+            )
+            planner_action_mask_chunks.append(planner_action_mask)
+            planner_policy_chunks.append(planner_policy_logits)
+            planner_q_logits_chunks.append(planner_q_logits)
+            planner_q_chunks.append(planner_q)
+            planner_q_component_logits_chunks.append(planner_q_component_logits)
+            planner_q_components_chunks.append(planner_q_components)
+            planner_objective_q_chunks.append(planner_objective_q)
+            planner_token_chunks.append(planner_tokens)
+
+        return (
+            torch.cat(planner_action_mask_chunks, dim=1),
+            torch.cat(planner_policy_chunks, dim=1),
+            torch.cat(planner_q_logits_chunks, dim=1),
+            torch.cat(planner_q_chunks, dim=1),
+            torch.cat(planner_q_component_logits_chunks, dim=1),
+            torch.cat(planner_q_components_chunks, dim=1),
+            torch.cat(planner_objective_q_chunks, dim=1),
+            torch.cat(planner_token_chunks, dim=1),
+        )
 
     @staticmethod
     def _normalize_action_values(
@@ -2806,14 +3445,7 @@ class TokenPredictionNetwork(nn.Module):
             bank_mask,
         )
         policy_action_embeddings = action_embeddings if action_embeddings is not None else latent_action_embeddings
-        candidate_tokens = _run_function_with_checkpoint(
-            self.activation_checkpointing,
-            lambda action_embeddings_, slots_, bank_states_, bank_mask_: self._candidate_tokens(
-                action_embeddings_,
-                slots_,
-                bank_states_,
-                bank_mask_,
-            ),
+        candidate_tokens = self._candidate_tokens_chunked(
             policy_action_embeddings,
             slots,
             bank_states,
@@ -2830,62 +3462,23 @@ class TokenPredictionNetwork(nn.Module):
             routing_weights,
             domain_states,
         )
-        planner_tokens, planner_action_mask = _run_function_with_checkpoint(
-            self.activation_checkpointing,
-            lambda candidate_tokens_, slots_, bank_states_, bank_mask_: self._planner_features(
-                candidate_tokens_,
-                slots_,
-                bank_states_,
-                bank_mask_,
-            ),
+        (
+            planner_action_mask,
+            planner_policy_logits,
+            planner_q_logits,
+            planner_q,
+            planner_q_component_logits,
+            planner_q_components,
+            planner_objective_q,
+            planner_tokens,
+        ) = self._planner_outputs_chunked(
             candidate_tokens,
             slots,
             bank_states,
             bank_mask,
-        )
-        planner_policy_logits = _run_function_with_checkpoint(
-            self.activation_checkpointing,
-            lambda planner_tokens_, candidate_tokens_, routing_weights_, domain_states_: self._planner_policy_logits(
-                planner_tokens_,
-                candidate_tokens_,
-                routing_weights_,
-                domain_states_,
-            ),
-            planner_tokens,
-            candidate_tokens,
             routing_weights,
             domain_states,
-        )
-        planner_q_logits, planner_q = _run_function_with_checkpoint(
-            self.activation_checkpointing,
-            lambda planner_tokens_, candidate_tokens_, routing_weights_, domain_states_: self._planner_q_outputs(
-                planner_tokens_,
-                candidate_tokens_,
-                routing_weights_,
-                domain_states_,
-            ),
-            planner_tokens,
-            candidate_tokens,
-            routing_weights,
-            domain_states,
-        )
-        (
-            planner_q_component_logits,
-            planner_q_components,
-            planner_objective_q,
-        ) = _run_function_with_checkpoint(
-            self.activation_checkpointing,
-            lambda planner_tokens_, candidate_tokens_, routing_weights_, domain_states_: self._planner_objective_q_outputs(
-                planner_tokens_,
-                candidate_tokens_,
-                routing_weights_,
-                domain_states_,
-                objective_context=objective_context,
-            ),
-            planner_tokens,
-            candidate_tokens,
-            routing_weights,
-            domain_states,
+            objective_context=objective_context,
         )
         planner_q_bias = self._normalize_action_values(planner_q, planner_action_mask)
         planner_objective_q_bias = self._normalize_action_values(planner_objective_q, planner_action_mask)

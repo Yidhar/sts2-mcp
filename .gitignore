@@ -28,6 +28,7 @@ release-assets/
 # Python virtual environments
 **/venv/
 **/__pycache__/
+pytest-cache-files-*/
 *.pyc
 *.pyo
 *.egg-info/
@@ -64,5 +65,14 @@ packages/rl-agent/checkpoints_attention/
 *.sh
 packages/rl-agent/checkpoints_muzero/
 packages/rl-agent/logs_muzero/
+packages/rl-agent/cleanup_reports/
+packages/rl-agent/human_demos/
+packages/rl-agent/.trash_training_artifacts/
+packages/rl-agent/_tmp_*
+packages/rl-agent/sp_out.txt
+packages/rl-agent/sp_err.txt
+packages/rl-agent/startprocess_*_marker.txt
+packages/rl-agent/startprocess_marker*.txt
 
 tmp_audit_slices/
+packages/rl-agent/eval_reports/

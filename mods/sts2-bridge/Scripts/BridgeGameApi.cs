@@ -4361,6 +4361,13 @@ internal static partial class BridgeGameApi
         {
             totalDamage = damagePerHit.Value * repeats!.Value;
         }
+        var bodySlamDamage = SafeResolveBodySlamDamage(card);
+        if (bodySlamDamage is > 0 && (!totalDamage.HasValue || totalDamage.Value <= 0))
+        {
+            damagePerHit = bodySlamDamage;
+            totalDamage = bodySlamDamage;
+            repeats = Math.Max(repeats.GetValueOrDefault(1), 1);
+        }
         var totalBlock = GetDynamicVarInt(previewVars, "CalculatedBlock") ?? GetDynamicVarInt(previewVars, "Block");
         var drawCount = GetDynamicVarInt(previewVars, "Cards");
         var weakAmount = GetDynamicVarInt(previewVars, "Weak");
@@ -4379,6 +4386,7 @@ internal static partial class BridgeGameApi
         if (strengthAmount is > 0 || dexterityAmount is > 0) roles.Add("scaling");
         if (string.Equals(cardType, "Power", StringComparison.OrdinalIgnoreCase)) roles.Add("power");
         if (string.Equals(cardType, "Attack", StringComparison.OrdinalIgnoreCase) && totalDamage is > 0) roles.Add("attack");
+        if (bodySlamDamage.HasValue) roles.Add("block_scaled_damage");
 
         return new
         {
@@ -4386,6 +4394,8 @@ internal static partial class BridgeGameApi
             roles = roles.Distinct().ToArray(),
             damage = totalDamage ?? 0,
             damage_per_hit = damagePerHit ?? 0,
+            block_scaled_damage = bodySlamDamage.HasValue,
+            block_scaled_damage_source = bodySlamDamage.HasValue ? "player_current_block" : null,
             block = totalBlock ?? 0,
             hits = repeats ?? (totalDamage is > 0 ? 1 : 0),
             draw = drawCount ?? 0,
@@ -4461,6 +4471,13 @@ internal static partial class BridgeGameApi
             repeats,
             xCostValue,
             xCostSemantics);
+        var bodySlamDamage = SafeResolveBodySlamDamage(card);
+        if (bodySlamDamage is > 0 && (!totalDamage.HasValue || totalDamage.Value <= 0))
+        {
+            damagePerHit = bodySlamDamage;
+            totalDamage = bodySlamDamage;
+            repeats = Math.Max(repeats.GetValueOrDefault(1), 1);
+        }
         var effectSummary = BuildCardEffectSummary(
             totalDamage,
             damagePerHit,
@@ -4542,6 +4559,8 @@ internal static partial class BridgeGameApi
                 dexterity = dexterityAmount,
                 summon = summonCount,
                 extra_damage = extraDamage,
+                block_scaled_damage = bodySlamDamage.HasValue,
+                block_scaled_damage_source = bodySlamDamage.HasValue ? "player_current_block" : null,
                 x_cost_value = xCostValue,
                 x_cost_semantics = xCostSemantics
             },
@@ -5176,6 +5195,55 @@ internal static partial class BridgeGameApi
         return card.TargetType == TargetType.AllEnemies
             ? CardPreviewMode.MultiCreatureTargeting
             : CardPreviewMode.Normal;
+    }
+
+    private static bool IsBodySlamCard(CardModel card)
+    {
+        try
+        {
+            var id = card.Id.ToString();
+            if (string.Equals(id, "CARD.BODY_SLAM", StringComparison.OrdinalIgnoreCase) ||
+                id.Contains("BODY_SLAM", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var className = card.GetType().Name;
+            if (string.Equals(className, "BodySlam", StringComparison.OrdinalIgnoreCase) ||
+                className.Contains("BodySlam", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var title = string.IsNullOrWhiteSpace(card.Title)
+                ? DescribeText(card.TitleLocString, card)
+                : DescribeText(card.Title, card);
+            return title.Contains("全身撞击", StringComparison.OrdinalIgnoreCase) ||
+                   title.Contains("全身撞擊", StringComparison.OrdinalIgnoreCase) ||
+                   title.Contains("Body Slam", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static int? SafeResolveBodySlamDamage(CardModel card)
+    {
+        if (!IsBodySlamCard(card))
+        {
+            return null;
+        }
+
+        try
+        {
+            var currentBlock = card.Owner?.Creature?.Block;
+            return currentBlock.HasValue ? Math.Max(currentBlock.Value, 0) : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static int? SafeResolveCardEnergyXValue(CardModel card)

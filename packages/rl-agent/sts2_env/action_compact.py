@@ -19,6 +19,23 @@ def _coerce_float(value: Any) -> float | int | None:
     return numeric
 
 
+def _event_effect_deltas(action: dict[str, Any]) -> dict[str, Any]:
+    """Return event option effect_deltas from either live or nested payload."""
+    containers = [action]
+    payload = action.get("payload")
+    if isinstance(payload, dict):
+        containers.append(payload)
+    for container in containers:
+        deltas = container.get("effect_deltas")
+        if isinstance(deltas, dict):
+            return deltas
+        option = container.get("option") if isinstance(container.get("option"), dict) else {}
+        deltas = option.get("effect_deltas")
+        if isinstance(deltas, dict):
+            return deltas
+    return {}
+
+
 def compact_action_signature(action: Any) -> dict[str, Any]:
     """Return a compact, replay-friendly signature for one legal action."""
 
@@ -28,11 +45,14 @@ def compact_action_signature(action: Any) -> dict[str, Any]:
     card = action.get("card") if isinstance(action.get("card"), dict) else {}
     potion = action.get("potion") if isinstance(action.get("potion"), dict) else {}
     relic = action.get("relic") if isinstance(action.get("relic"), dict) else {}
+    option = action.get("option") if isinstance(action.get("option"), dict) else {}
+    event_deltas = _event_effect_deltas(action)
 
     title = (
         card.get("title")
         or potion.get("title")
         or relic.get("title")
+        or option.get("title")
         or action.get("title")
         or action.get("label")
         or action.get("name")
@@ -82,6 +102,19 @@ def compact_action_signature(action: Any) -> dict[str, Any]:
         "cancelable": action.get("cancelable"),
         "selection_ready": action.get("selection_ready"),
         "opened_age_ms": _coerce_float(action.get("opened_age_ms")),
+        # Event-option diagnostics.  These are compact, structured versions of
+        # effect_deltas so episode tails can explain dangerous event choices
+        # such as optional combat ("我能打两个") without dumping the full action.
+        "event_enter_combat": bool(event_deltas.get("enter_combat")) if event_deltas else None,
+        "event_hp_delta": _coerce_float(event_deltas.get("hp_delta")) if event_deltas else None,
+        "event_max_hp_delta": _coerce_float(event_deltas.get("max_hp_delta")) if event_deltas else None,
+        "event_gold_delta": _coerce_float(event_deltas.get("gold_delta")) if event_deltas else None,
+        "event_card_add_count": _coerce_float(event_deltas.get("card_add_count")) if event_deltas else None,
+        "event_card_remove_count": _coerce_float(event_deltas.get("card_remove_count")) if event_deltas else None,
+        "event_card_transform_count": _coerce_float(event_deltas.get("card_transform_count")) if event_deltas else None,
+        "event_card_upgrade_count": _coerce_float(event_deltas.get("card_upgrade_count")) if event_deltas else None,
+        "event_relic_gain": bool(event_deltas.get("relic_gain")) if event_deltas else None,
+        "event_potion_gain": bool(event_deltas.get("potion_gain")) if event_deltas else None,
     }
     result = {key: value for key, value in compact.items() if value is not None}
     semantic = compact_semantic_signature(semantic_action_signature(action))

@@ -14,8 +14,8 @@ from pathlib import Path
 
 
 def test_train_snapshot_pool_from_path_receives_encounter_pool_filter() -> None:
-    train_path = Path(__file__).resolve().parents[1] / "muzero" / "train.py"
-    # ``train.py`` may carry a UTF-8 BOM on Windows checkouts; use utf-8-sig
+    train_path = Path(__file__).resolve().parents[1] / "muzero" / "training" / "cli_main.py"
+    # Windows checkouts may carry a UTF-8 BOM; use utf-8-sig
     # so this guard remains about launcher wiring rather than file encoding.
     tree = ast.parse(train_path.read_text(encoding="utf-8-sig"))
 
@@ -32,7 +32,7 @@ def test_train_snapshot_pool_from_path_receives_encounter_pool_filter() -> None:
         ):
             calls.append(node)
 
-    assert calls, "expected train.py to construct CombatSnapshotPool.from_path(...)"
+    assert calls, "expected cli_main.py to construct CombatSnapshotPool.from_path(...)"
     keyword_values = {
         kw.arg: ast.unparse(kw.value)
         for call in calls

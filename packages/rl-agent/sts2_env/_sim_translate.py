@@ -1477,7 +1477,7 @@ def _extract_event_option_effect_deltas(title: str | None, description: str | No
 
     # Combat entry
     if (_re.search(r"\b(fight|enter\s*combat|start\s*combat|begin\s*battle)\b", lower)
-            or _re.search(r"(战斗|进入战斗|开始战斗|遭遇敌人)", original)):
+            or _re.search(r"(战斗|戰鬥|进入战斗|進入戰鬥|开始战斗|開始戰鬥|遭遇敌人|遭遇敵人|我能打|打两个|打兩個)", original)):
         deltas["enter_combat"] = True
 
     return deltas

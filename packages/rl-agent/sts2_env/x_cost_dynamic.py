@@ -66,6 +66,20 @@ def _action_card(action: Any) -> dict[str, Any]:
     return card if isinstance(card, dict) else {}
 
 
+def _action_semantic(action: Any) -> dict[str, Any]:
+    if not isinstance(action, dict):
+        return {}
+    semantic = action.get("semantic")
+    return semantic if isinstance(semantic, dict) else {}
+
+
+def _action_roles(action: Any) -> set[str]:
+    roles = _action_semantic(action).get("roles")
+    if not isinstance(roles, list):
+        return set()
+    return {str(role).strip().lower() for role in roles if str(role).strip()}
+
+
 def _typed_block(action: Any) -> dict[str, Any]:
     if not isinstance(action, dict):
         return {}
@@ -114,6 +128,38 @@ def _has_x_cost(card: dict[str, Any]) -> bool:
     if derived and bool(derived.get("is_x_cost")):
         return True
     return False
+
+
+def _has_action_energy_x(action: Any, card: dict[str, Any]) -> bool:
+    """Return True when the action contract exposes an energy-X card.
+
+    Some compact bridge payloads only carry the X-cost fact on
+    ``action.semantic.roles`` (for example ``roles=["attack", "x_cost"]``)
+    while the embedded card still has a temporary numeric runtime cost.  The
+    canonical reader must honor that runtime role; otherwise zero-energy X
+    guards and diagnostics disagree with the selected-action metrics.
+    """
+
+    if not isinstance(action, dict):
+        return False
+    semantic = _action_semantic(action)
+    if "x_cost" in _action_roles(action):
+        return True
+    if bool(semantic.get("is_x_cost")):
+        return True
+    try:
+        if float(semantic.get("x_cost_value") or 0.0) > 0.0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    action_x_cost = action.get("x_cost")
+    if not isinstance(action_x_cost, dict) and bool(action_x_cost):
+        return True
+    if bool(action.get("costs_x") or action.get("is_x_cost")):
+        return True
+    if _safe_text(action.get("card_cost")) == "x":
+        return True
+    return _has_x_cost(card)
 
 
 def _has_star_x(card: dict[str, Any]) -> bool:
@@ -217,7 +263,7 @@ def x_cost_view(action: Any, raw_obs: Any | None = None) -> dict[str, Any]:
             out["preview_scale_source"] = "star_x"
             out["current_value"] = _player_stars(raw_obs)
             out["source_confidence"] = "fallback"
-        elif _has_x_cost(card):
+        elif _has_action_energy_x(action, card):
             out["has_x_cost"] = True
             out["resource"] = "energy"
             out["preview_scale_source"] = "energy_x"

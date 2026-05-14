@@ -7,7 +7,15 @@ VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv-wsl-rocm}"
 BOOTSTRAP_SCRIPT="$SCRIPT_DIR/bootstrap_wsl_rocm.sh"
 RELAY_PS_SCRIPT="$SCRIPT_DIR/start_wsl_bridge_relay.ps1"
 
-DEFAULT_SESSION_FILE_WSL="/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session.json"
+DEFAULT_SESSION_DIR_WSL="/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge"
+# Prefer the indexed bridge session produced by the current multi-instance
+# bridge.  The unindexed session.json can be stale and has caused 401s during
+# long-running MuZero restarts; keep it only as a fallback for older setups.
+if [[ -f "$DEFAULT_SESSION_DIR_WSL/session_0.json" ]]; then
+  DEFAULT_SESSION_FILE_WSL="$DEFAULT_SESSION_DIR_WSL/session_0.json"
+else
+  DEFAULT_SESSION_FILE_WSL="$DEFAULT_SESSION_DIR_WSL/session.json"
+fi
 export STS2_BRIDGE_SESSION_FILE="${STS2_BRIDGE_SESSION_FILE:-$DEFAULT_SESSION_FILE_WSL}"
 
 if [[ ! -f "$STS2_BRIDGE_SESSION_FILE" ]]; then

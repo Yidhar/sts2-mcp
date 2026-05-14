@@ -29,6 +29,10 @@ import torch
 
 from muzero.sts2_env.muzero_buffer import _batched_observations_to_numpy
 from muzero.sts2_env.muzero_model import MuZeroNetwork
+from muzero.sts2_env.planner_memory_profile import (
+    VALID_PLANNER_MEMORY_PROFILES,
+    apply_planner_memory_profile_to_network,
+)
 from muzero.sts2_env.token_memory import MEMORY_BANK_NAMES, build_memory_slot_bank_ids
 from sts2_env.observation_common import MAX_ACTIONS, NUM_PHASES, SCALAR_DIM
 from sts2_env.observation_v3 import MAX_WORLD_TOKENS, TOKEN_ROLE_TO_ID, TOKEN_ZONE_TO_ID
@@ -148,6 +152,9 @@ def _load_network(args: argparse.Namespace) -> MuZeroNetwork:
         spec = {
             "obs_mode": args.obs_mode,
             "model_arch": args.model_arch,
+            "action_embed_dim": args.action_embed_dim,
+            "support_size": args.support_size,
+            "dynamics_res_blocks": args.dynamics_res_blocks,
             "token_d_model": args.token_d_model,
             "token_n_heads": args.token_n_heads,
             "token_ffn_dim": args.token_ffn_dim,
@@ -156,6 +163,7 @@ def _load_network(args: argparse.Namespace) -> MuZeroNetwork:
             "token_decoder_layers": args.token_decoder_layers,
             "token_candidate_set_layers": args.token_candidate_set_layers,
             "token_memory_slots": args.token_memory_slots,
+            "token_memory_slot_layout": args.token_memory_slot_layout,
             "token_bank_token_slots": args.token_bank_token_slots,
             "token_world_bank_top_k": args.token_world_bank_top_k,
         }
@@ -178,6 +186,15 @@ def _load_network(args: argparse.Namespace) -> MuZeroNetwork:
             print(f"[probe] Partial network load: loaded={len(compatible)} skipped={skipped} missing={missing}")
     else:
         print("[probe] No network state supplied; probing a freshly initialized network.")
+    profile_settings = apply_planner_memory_profile_to_network(
+        network,
+        args.planner_memory_profile,
+    )
+    print(
+        "[probe] planner_memory_profile="
+        f"{profile_settings.profile} buckets={getattr(network, 'action_rollout_buckets', None)} "
+        f"chunk={getattr(network, 'action_rollout_chunk_size', 0)}"
+    )
     network.eval()
     return network
 
@@ -391,6 +408,9 @@ def main() -> None:
     parser.add_argument("--replay-buffer", type=str, default=None, help="Optional explicit replay_buffer.pkl path.")
     parser.add_argument("--obs-mode", type=str, default="token_v3", choices=["dense_v2", "token_v3"])
     parser.add_argument("--model-arch", type=str, default="token_memory_v1", choices=["dense_v1", "token_memory_v1"])
+    parser.add_argument("--action-embed-dim", type=int, default=64)
+    parser.add_argument("--support-size", type=int, default=25)
+    parser.add_argument("--dynamics-res-blocks", type=int, default=4)
     parser.add_argument("--token-d-model", type=int, default=128)
     parser.add_argument("--token-n-heads", type=int, default=4)
     parser.add_argument("--token-ffn-dim", type=int, default=512)
@@ -399,8 +419,21 @@ def main() -> None:
     parser.add_argument("--token-decoder-layers", type=int, default=2)
     parser.add_argument("--token-candidate-set-layers", type=int, default=1)
     parser.add_argument("--token-memory-slots", type=int, default=8)
+    parser.add_argument(
+        "--token-memory-slot-layout",
+        type=str,
+        default="legacy",
+        choices=["legacy", "quota_v1", "pass_large_v1"],
+    )
     parser.add_argument("--token-bank-token-slots", type=int, default=4)
     parser.add_argument("--token-world-bank-top-k", type=int, default=3)
+    parser.add_argument(
+        "--planner-memory-profile",
+        type=str,
+        default="checkpoint",
+        choices=VALID_PLANNER_MEMORY_PROFILES,
+        help="Override checkpoint planner bucket/chunk knobs for probe inference.",
+    )
     parser.add_argument("--sample-limit", type=int, default=8192)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--ridge", type=float, default=10.0)
@@ -428,7 +461,8 @@ def main() -> None:
         slot_count = int(getattr(prediction, "num_memory_slots", 0) or args.token_memory_slots)
         d_model = int(getattr(prediction, "d_model", 0) or args.token_d_model)
         if slot_count > 0 and d_model > 0 and hidden.shape[-1] == slot_count * d_model:
-            slot_ids = build_memory_slot_bank_ids(slot_count)
+            slot_layout = str(getattr(prediction, "memory_slot_layout", args.token_memory_slot_layout))
+            slot_ids = build_memory_slot_bank_ids(slot_count, layout=slot_layout)
             slot_bank_names = [MEMORY_BANK_NAMES[idx] if 0 <= idx < len(MEMORY_BANK_NAMES) else "unknown" for idx in slot_ids]
             slots = hidden.reshape(hidden.shape[0], slot_count, d_model)
             slot_tensors = [slots[:, idx, :] for idx in range(slot_count)]

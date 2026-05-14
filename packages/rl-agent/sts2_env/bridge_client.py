@@ -224,6 +224,7 @@ class BridgeClient:
 
         last_exc: Exception | None = None
         quick_attempts_left = self.MAX_RETRIES
+        transient_http_attempts_left = 12
         outage_deadline: float | None = None
         outage_announced = False
         total_attempts = 0
@@ -289,6 +290,71 @@ class BridgeClient:
                             ):
                                 time.sleep(self.BRIDGE_OUTAGE_POLL_S)
                                 continue
+                    # 2026-05-08 (recovery): 503 with pump_stalled /
+                    # main_thread_stalled means the Godot main thread didn't
+                    # tick within the bridge's 5s window — usually a GC
+                    # pause, GPU-contention spike (training and rendering
+                    # share the same GPU), or combat/death transition. Not
+                    # a hard fault. Treat as transient and retry with a
+                    # generous budget: observed worst-case ms_since_last_pump
+                    # is ~18-20s under heavy GPU load, so we need ~30s of
+                    # retry slack.
+                    #
+                    # 2026-05-13 (combat sandbox stability): the bridge can
+                    # also transiently answer HTTP 502/504 during
+                    # /env/combat_reset after a game-side reset hiccup
+                    # (observed with an empty 502 body plus a Godot
+                    # SharedSignalPool leak warning).  Treat gateway-class
+                    # 5xx as bridge-outage candidates instead of killing the
+                    # long-running trainer.
+                    transient_5xx = False
+                    if resp.status_code in {502, 504}:
+                        transient_5xx = True
+                    elif (
+                        resp.status_code == 503
+                        and isinstance(resp_body, dict)
+                        and str(resp_body.get("error") or "").strip()
+                        in {"pump_stalled", "main_thread_stalled"}
+                    ):
+                        transient_5xx = True
+                    if transient_5xx:
+                        last_exc = BridgeError(
+                            f"Bridge returned HTTP {resp.status_code} for {method} /{endpoint}: "
+                            f"{resp_body}",
+                            status_code=resp.status_code,
+                            response_body=resp_body,
+                        )
+                        self._is_connected = False
+                        self._maybe_rebind_session(
+                            reason=f"HTTP {resp.status_code} on {method} /{endpoint}",
+                        )
+                        # Use a local per-request counter so a previous
+                        # request's transient-5xx budget cannot leak into
+                        # this one.  3s sleep × 12 attempts = ~36s quick
+                        # slack, enough for most render/GPU/reset stalls.
+                        if transient_http_attempts_left > 0:
+                            transient_http_attempts_left -= 1
+                            time.sleep(3.0)
+                            continue
+                        # Quick transient-HTTP budget exhausted.  Fall into
+                        # the same bounded outage-recovery window used by
+                        # ConnectionError/Timeout so watchdog restarts and
+                        # session-file rotations can be ridden out without an
+                        # infinite retry loop.
+                        if outage_deadline is None:
+                            outage_deadline = time.monotonic() + self.MAX_BRIDGE_OUTAGE_S
+                            outage_announced = True
+                            print(
+                                f"[bridge-client] transient HTTP {resp.status_code} retries "
+                                f"exhausted for {method} /{endpoint}; entering "
+                                f"outage-recovery wait (up to {self.MAX_BRIDGE_OUTAGE_S:.0f}s) "
+                                f"polling for watchdog to restart bridge...",
+                                flush=True,
+                            )
+                        if time.monotonic() < outage_deadline:
+                            time.sleep(self.BRIDGE_OUTAGE_POLL_S)
+                            continue
+                        break
                     raise BridgeError(
                         f"Bridge returned HTTP {resp.status_code} for {method} /{endpoint}: "
                         f"{resp_body}",

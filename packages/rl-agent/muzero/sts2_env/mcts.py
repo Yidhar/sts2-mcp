@@ -206,6 +206,10 @@ class MCTS:
         self.combat_full_root_frontier = bool(combat_full_root_frontier)
         self._root_bias_enabled = True
         self._training_step = 0
+        # Phase 3 (recovery 2026-05-09): per-decision route-heuristic prior
+        # bias vector pushed by the trainer. ``None`` means no Phase 3
+        # behaviour — the bias path is fully gated on this slot being set.
+        self._pending_route_heuristic_bias = None
         self.last_run_stats: Dict[str, float] = {}
         self._active_decision_domain = "build"
         self._active_combat_root_only = False
@@ -528,6 +532,26 @@ class MCTS:
 
     def set_semantic_rollout_enabled(self, enabled: bool) -> None:
         self._semantic_rollout_enabled = bool(enabled)
+
+    def set_route_heuristic_bias(self, bias_vector: Any) -> None:
+        """Phase 3 (recovery 2026-05-09): push a per-action prior-bias vector
+        from the trainer's route-heuristic dry-run output.
+
+        ``bias_vector`` is expected to be an ndarray of shape (MAX_ACTIONS,)
+        or None. Each entry should already be ``weight * score_normalized``
+        and clamped to ``[-weight, +weight]`` by the caller. The bias is
+        consumed and cleared at the start of the next ``run()`` invocation
+        so an outdated bias never leaks across decisions.
+
+        Pass ``None`` to clear the pending bias explicitly. Callers SHOULD
+        push a fresh value (or None) before every ``run()``; omitting the
+        call leaves the previous pending value untouched, which is not the
+        intended pattern and the dry-run trainer always pushes explicitly.
+        """
+        if bias_vector is None:
+            self._pending_route_heuristic_bias = None
+        else:
+            self._pending_route_heuristic_bias = np.asarray(bias_vector, dtype=np.float32)
 
     def _current_root_bias_scale(self) -> float:
         if not self._root_bias_enabled:
@@ -948,6 +972,50 @@ class MCTS:
                 dtype=policy_logits.dtype,
             )
             root_bias_vector += np.asarray(objective_prior_bias, dtype=np.float32)
+        # Phase 3 (recovery 2026-05-09): route-heuristic prior bias hook.
+        # Trainer pushes a per-action bias vector via
+        # ``set_route_heuristic_bias`` BEFORE this run() call. Each entry is
+        # ``weight * score_normalized`` for a map legal action (in
+        # ``[-weight, +weight]``). Non-route domains push None and the hook
+        # is a no-op. The bias respects ``root_bias_scale`` so the global
+        # decay schedule still applies.
+        # Consume + clear immediately so any early return below cannot
+        # leak the bias into the next run() call.
+        route_heuristic_bias_raw = getattr(self, "_pending_route_heuristic_bias", None)
+        self._pending_route_heuristic_bias = None
+        route_heuristic_applied = False
+        route_heuristic_bias_abs_mean = 0.0
+        route_heuristic_bias_max_abs = 0.0
+        if route_heuristic_bias_raw is not None and root_bias_scale > 0.0:
+            bias_arr = np.asarray(route_heuristic_bias_raw, dtype=np.float32).reshape(-1)
+            if bias_arr.size > MAX_ACTIONS:
+                bias_arr = bias_arr[:MAX_ACTIONS]
+            elif bias_arr.size < MAX_ACTIONS:
+                bias_arr = np.concatenate(
+                    [bias_arr, np.zeros(MAX_ACTIONS - bias_arr.size, dtype=np.float32)]
+                )
+            # Respect the same cumulative root_bias_scale that
+            # _objective_prior_bias reads from. This way every prior-bias
+            # source obeys the same global decay schedule.
+            bias_arr = bias_arr * root_bias_scale
+            # Hard clamp to a per-action range so a runaway weight cannot
+            # drown the network logits even if the caller misconfigures.
+            bias_arr = np.clip(bias_arr, -2.0, 2.0)
+            max_abs = float(np.abs(bias_arr).max()) if bias_arr.size else 0.0
+            if max_abs > 1e-6:
+                policy_logits = policy_logits.clone()
+                policy_logits += torch.as_tensor(
+                    bias_arr,
+                    device=policy_logits.device,
+                    dtype=policy_logits.dtype,
+                )
+                root_bias_vector += bias_arr
+                route_heuristic_applied = True
+                route_heuristic_bias_abs_mean = float(np.abs(bias_arr).mean())
+                route_heuristic_bias_max_abs = max_abs
+        # Always clear the slot — caller MUST push a fresh vector for the
+        # next decision so an outdated bias never leaks across steps.
+        self._pending_route_heuristic_bias = None
         dynamic_end_turn_bias = (
             self._end_turn_bias_value(obs, action_mask) * root_bias_scale
             if self.end_turn_prior_bias != 0.0
@@ -1138,6 +1206,9 @@ class MCTS:
             "end_turn_guard_applied": 1.0 if end_turn_guard_applied else 0.0,
             "end_turn_guard_forced_alternative": 1.0 if end_turn_guard_forced_alternative else 0.0,
             "objective_prior_applied": 1.0 if objective_prior_applied else 0.0,
+            "route_heuristic_bias_applied": 1.0 if route_heuristic_applied else 0.0,
+            "route_heuristic_bias_abs_mean": float(route_heuristic_bias_abs_mean),
+            "route_heuristic_bias_max_abs": float(route_heuristic_bias_max_abs),
             "objective_weight_survival": float(objective_weights[0]),
             "objective_weight_hp": float(objective_weights[1]),
             "objective_weight_build": float(objective_weights[2]),

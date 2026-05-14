@@ -81,6 +81,71 @@ class HpCostSafetyViewFallback(unittest.TestCase):
         self.assertFalse(view["self_lethal_now"])
         self.assertEqual(view["hp_cost_kind"], "max_hp_loss")
 
+    def test_static_metadata_camelcase_hp_loss_detected_by_card_id(self):
+        # Regression: content_registry exposes Bloodletting as semantic
+        # hpLoss (camelCase), while the trainer pre-step guard used to only
+        # read hp_loss/self_damage and therefore missed it.
+        action = {
+            "kind": "play_card",
+            "action_id": "play:bloodletting",
+            "card": {"id": "CARD.BLOODLETTING", "title": "放血+", "cost": 0},
+        }
+        view = hp_cost_safety_view(action, _obs(4))
+        self.assertEqual(view["hp_loss_unblockable"], 3.0)
+        self.assertFalse(view["self_lethal_now"])
+        self.assertTrue(view["low_hp_margin_after_cost"])
+
+    def test_title_only_bloodletting_fallback_detects_low_margin(self):
+        # Live bridge/action diagnostics can temporarily lack card id before
+        # post-step diagnostics merge.  Exact title fallback must still catch
+        # upgraded localized names such as 放血+.
+        action = {
+            "kind": "play_card",
+            "action_id": "play:title_only_bloodletting",
+            "card": {"title": "放血+", "cost": 0},
+        }
+        view = hp_cost_safety_view(action, _obs(4))
+        self.assertEqual(view["hp_loss_unblockable"], 3.0)
+        self.assertTrue(view["low_hp_margin_after_cost"])
+
+    def test_top_level_title_only_blood_wall_fallback_detects_hp_cost(self):
+        # Some selected-action payloads expose only the action title/label.
+        action = {
+            "kind": "play_card",
+            "action_id": "play:title_only_blood_wall",
+            "title": "血墙",
+        }
+        view = hp_cost_safety_view(action, _obs(3))
+        self.assertEqual(view["hp_loss_unblockable"], 2.0)
+        self.assertTrue(view["low_hp_margin_after_cost"])
+
+    def test_title_fallback_does_not_mark_normal_card(self):
+        action = {
+            "kind": "play_card",
+            "action_id": "play:strike",
+            "card": {"title": "打击+", "cost": 1},
+        }
+        view = hp_cost_safety_view(action, _obs(4))
+        self.assertEqual(view["hp_loss_unblockable"], 0.0)
+        self.assertFalse(view["self_lethal_now"])
+        self.assertFalse(view["low_hp_margin_after_cost"])
+
+    def test_low_current_hp_without_hp_cost_is_not_low_margin(self):
+        # Regression: low_hp_margin_after_cost must mean "this HP-cost action
+        # leaves us with little HP", not simply "the player is already low HP".
+        # Otherwise every normal action / end_turn at 1-3 HP pollutes the
+        # hp_cost_low_margin_selected metric and can trigger irrelevant guards.
+        view = hp_cost_safety_view(_action(), _obs(1))
+        self.assertEqual(view["hp_loss_unblockable"], 0.0)
+        self.assertFalse(view["self_lethal_now"])
+        self.assertFalse(view["low_hp_margin_after_cost"])
+
+    def test_end_turn_at_low_current_hp_is_not_hp_cost_low_margin(self):
+        action = {"kind": "combat", "family": "end_turn", "action_id": "end_turn"}
+        view = hp_cost_safety_view(action, _obs(1))
+        self.assertEqual(view["hp_loss_unblockable"], 0.0)
+        self.assertFalse(view["low_hp_margin_after_cost"])
+
 
 class HpCostSafetyViewBridgePayload(unittest.TestCase):
     def test_bridge_payload_marks_lethal_directly(self):
@@ -108,6 +173,19 @@ class HpCostSafetyViewBridgePayload(unittest.TestCase):
         view = hp_cost_safety_view(action, _obs(5, block=10))
         self.assertFalse(view["self_lethal_now"])
         self.assertEqual(view["hp_after_self_cost"], 5.0)
+
+    def test_bridge_low_hp_without_actual_cost_is_not_low_margin(self):
+        action = _action(safety={
+            "hp_cost_kind": "none",
+            "hp_loss_unblockable": 0.0,
+            "self_damage_blockable": 0.0,
+            "hp_before": 1.0,
+            "source_confidence": "runtime_internal",
+        })
+        view = hp_cost_safety_view(action, _obs(1))
+        self.assertFalse(view["self_lethal_now"])
+        self.assertEqual(view["hp_after_self_cost"], 1.0)
+        self.assertFalse(view["low_hp_margin_after_cost"])
 
 
 class IsSelfLethalActionGuard(unittest.TestCase):

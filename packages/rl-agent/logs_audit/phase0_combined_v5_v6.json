@@ -1,0 +1,197 @@
+{
+  "source": "offline_aggregator",
+  "audit_path": "logs_audit/phase0_v6_20260508/audit.jsonl",
+  "records": 2088,
+  "episodes": 21,
+  "rates": {
+    "deck/present_rate": 1.0,
+    "deck/metadata_hit_rate": 1.0,
+    "deck/cost_present_rate": 1.0,
+    "deck/type_present_rate": 1.0,
+    "deck/upgrade_present_rate": 1.0,
+    "route/summary_present_rate": 1.0,
+    "route/full_20_key_present_rate": 1.0,
+    "route/nodes_present_rate": 1.0,
+    "route/map_step_share": 0.04932950191570881,
+    "route/total_map_actions_observed": 151.0,
+    "route/total_map_steps_observed": 103.0,
+    "floor/current_floor_present_rate": 1.0,
+    "floor/act_id_present_rate": 1.0,
+    "floor/room_type_present_rate": 0.9985632183908046,
+    "floor/run_active_present_rate": 1.0,
+    "floor/episode_max_floor_reconstructable_rate": 1.0,
+    "floor/current_floor_monotonic_or_valid_rate": 1.0,
+    "floor/max_floor_reached_overall": 13.0,
+    "encoded/present_rate": 1.0,
+    "encoded/schema_match_rate": 1.0,
+    "encoded/action_mask_valid_rate": 0.9904214559386973,
+    "encoded/no_nan_rate": 1.0,
+    "encoded/no_inf_rate": 1.0
+  },
+  "thresholds": {
+    "deck/present_rate": 0.98,
+    "deck/metadata_hit_rate": 0.95,
+    "deck/cost_present_rate": 0.98,
+    "deck/type_present_rate": 0.98,
+    "deck/upgrade_present_rate": 0.95,
+    "route/summary_present_rate": 0.98,
+    "route/full_20_key_present_rate": 0.98,
+    "route/nodes_present_rate": 0.98,
+    "floor/current_floor_present_rate": 0.98,
+    "floor/act_id_present_rate": 0.98,
+    "floor/episode_max_floor_reconstructable_rate": 0.98,
+    "floor/current_floor_monotonic_or_valid_rate": 0.98,
+    "encoded/schema_match_rate": 0.98,
+    "encoded/action_mask_valid_rate": 0.98,
+    "encoded/no_nan_rate": 0.98,
+    "encoded/no_inf_rate": 0.98
+  },
+  "passes": {
+    "deck/present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "deck/metadata_hit_rate": {
+      "rate": 1.0,
+      "threshold": 0.95,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "deck/cost_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "deck/type_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "deck/upgrade_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.95,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "route/summary_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "route/full_20_key_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "route/nodes_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "floor/current_floor_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "floor/act_id_present_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "floor/episode_max_floor_reconstructable_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "floor/current_floor_monotonic_or_valid_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "encoded/schema_match_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "encoded/action_mask_valid_rate": {
+      "rate": 0.9904214559386973,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "encoded/no_nan_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    },
+    "encoded/no_inf_rate": {
+      "rate": 1.0,
+      "threshold": 0.98,
+      "threshold_met": true,
+      "sample_sufficient": true,
+      "pass": true,
+      "status": "PASS"
+    }
+  },
+  "all_pass": true,
+  "sample_sufficient": {
+    "route": true,
+    "deck_unique": false
+  },
+  "min_map_actions_for_pass": 150,
+  "min_map_steps_for_pass": 50,
+  "min_unique_cards_for_pass": 12,
+  "total_cards_observed_per_step": 24731,
+  "total_map_actions_observed": 151,
+  "total_map_steps_observed": 103,
+  "max_floor_reached_overall": 13,
+  "route_missing_key_counts": {},
+  "note": "Offline-rebuilt from audit.jsonl. Unique-card coverage (deck/unique_*) cannot be reconstructed without the live in-memory tracker; rerun phase0_audit.py end-to-end if needed.",
+  "audit_paths": [
+    "logs_audit/phase0_v5_20260508/audit.jsonl",
+    "logs_audit/phase0_v6_20260508/audit.jsonl"
+  ]
+}

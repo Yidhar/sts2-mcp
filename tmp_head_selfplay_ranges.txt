@@ -1,0 +1,1150 @@
+--- 5766-5900
+ 5766      def self_play_episode(self, temperature: float = 1.0) -> tuple[float, int]:
+ 5767          """Run one self-play episode using MCTS action selection.
+ 5768  
+ 5769          Args:
+ 5770              temperature: Temperature for action selection.
+ 5771  
+ 5772          Returns:
+ 5773              (episode_reward, episode_length)
+ 5774          """
+ 5775          obs, info = self.env.reset()
+ 5776          initial_info = dict(info)
+ 5777          trajectory = GameTrajectory()
+ 5778  
+ 5779          episode_reward = 0.0
+ 5780          episode_length = 0
+ 5781          progress_snapshots: list[dict[str, Any]] = []
+ 5782          seen_floors: set[int] = set()
+ 5783          elite_floors: set[int] = set()
+ 5784          boss_floors: set[int] = set()
+ 5785          death_floor = 0.0
+ 5786          search_root_candidates: list[float] = []
+ 5787          search_root_selectable_children: list[float] = []
+ 5788          search_expanded_children: list[float] = []
+ 5789          search_predicted_legal: list[float] = []
+ 5790          search_surface_keep: list[float] = []
+ 5791          search_max_depths: list[float] = []
+ 5792          search_depths: list[float] = []
+ 5793          search_concrete_depths: list[float] = []
+ 5794          search_depth_ge_2: list[float] = []
+ 5795          search_depth_ge_3: list[float] = []
+ 5796          search_semantic_expansion: list[float] = []
+ 5797          search_semantic_switch: list[float] = []
+ 5798          search_semantic_chain_steps: list[float] = []
+ 5799          search_semantic_drill: list[float] = []
+ 5800          search_root_top1_visit_share: list[float] = []
+ 5801          search_root_visit_entropy: list[float] = []
+ 5802          search_num_simulations: list[float] = []
+ 5803          search_root_bias_scale: list[float] = []
+ 5804          search_root_bias_nonzero: list[float] = []
+ 5805          search_root_bias_abs_mean: list[float] = []
+ 5806          search_root_bias_max_abs: list[float] = []
+ 5807          search_root_bias_changed_top1: list[float] = []
+ 5808          search_root_bias_selected_delta: list[float] = []
+ 5809          search_root_bias_suppressed_by_gate: list[float] = []
+ 5810          search_root_bias_scale_effective: list[float] = []
+ 5811          search_end_turn_guard_applied: list[float] = []
+ 5812          search_end_turn_guard_forced_alt: list[float] = []
+ 5813>>        domain_search_stats: dict[str, dict[str, list[float]]] = {
+ 5814              domain: defaultdict(list) for domain in DECISION_DOMAINS
+ 5815          }
+ 5816          decision_counts: dict[str, int] = {domain: 0 for domain in DECISION_DOMAINS}
+ 5817          fast_path_counts: dict[str, int] = {domain: 0 for domain in DECISION_DOMAINS}
+ 5818          fast_path_reason_counts: dict[str, int] = defaultdict(int)
+ 5819          selected_family_counts: dict[str, dict[str, int]] = {
+ 5820              domain: defaultdict(int) for domain in DECISION_DOMAINS
+ 5821          }
+ 5822          domain_override_counts: dict[str, int] = defaultdict(int)
+ 5823          combat_like_decision_count = 0
+ 5824          direct_policy_eligible_count = 0
+ 5825          direct_policy_used_count = 0
+ 5826          terminated = False
+ 5827          truncated = False
+ 5828          initial_progress = self._episode_progress_snapshot(initial_info)
+ 5829          if initial_progress:
+ 5830              progress_snapshots.append(initial_progress)
+ 5831  
+ 5832          while True:
+ 5833              prev_info = dict(info)
+ 5834              action_mask = info.get("action_mask", np.ones(MAX_ACTIONS, dtype=bool))
+ 5835              legal_actions = (
+ 5836                  info.get("legal_actions_compact")
+ 5837                  or info.get("legal_actions")
+ 5838                  or getattr(self.env.unwrapped, "get_compact_legal_actions", lambda: [])()
+ 5839              )
+ 5840              planner_context = prev_info.get("planner_context") if isinstance(prev_info.get("planner_context"), dict) else {}
+ 5841              semantic_actions = planner_context.get("semantic_actions") if isinstance(planner_context.get("semantic_actions"), list) else []
+ 5842              decision_domain, encoded_decision_domain, domain_overridden = self._resolve_acting_decision_domain(
+ 5843                  obs,
+ 5844                  legal_actions,
+ 5845                  prev_info,
+ 5846              )
+ 5847              if decision_domain not in decision_counts:
+ 5848                  decision_domain = "build"
+ 5849              if decision_domain == "combat":
+ 5850                  combat_like_decision_count += 1
+ 5851                  obs = self._with_decision_domain(obs, "combat") or obs
+ 5852              if domain_overridden:
+ 5853                  domain_override_counts[f"{encoded_decision_domain}->{decision_domain}"] += 1
+ 5854              decision_counts[decision_domain] += 1
+ 5855              num_simulations = self._num_simulations_for_domain(decision_domain)
+ 5856              _lat_legal_count = int((np.asarray(action_mask, dtype=np.float32) > 0).sum())
+ 5857              _lat_t0 = time.perf_counter()
+ 5858              obs_batch = dict_obs_to_torch(obs, device=self.device)
+ 5859              _lat_obs_ms = (time.perf_counter() - _lat_t0) * 1000.0
+ 5860              _lat_t0 = time.perf_counter()
+ 5861              with torch.no_grad(), self._amp_autocast():
+ 5862                  initial = self.network.initial_inference(obs_batch)
+ 5863                  root_value = initial.value.squeeze(0).item()
+ 5864                  root_value_components = initial.value_components.squeeze(0).detach().cpu().numpy()
+ 5865              _lat_initial_ms = (time.perf_counter() - _lat_t0) * 1000.0
+ 5866              if self.combat_direct_policy and decision_domain == "combat":
+ 5867                  direct_policy_eligible_count += 1
+ 5868  
+ 5869              fast_path_choice = self._trivial_build_fast_path_choice(
+ 5870                  decision_domain=decision_domain,
+ 5871                  action_mask=np.asarray(action_mask, dtype=np.float32),
+ 5872                  legal_actions=legal_actions,
+ 5873              )
+ 5874              if fast_path_choice is None:
+ 5875                  fast_path_choice = self._combat_card_selection_fast_path_choice(
+ 5876                      decision_domain=decision_domain,
+ 5877                      action_mask=np.asarray(action_mask, dtype=np.float32),
+ 5878                      legal_actions=legal_actions,
+ 5879                      policy_logits=initial.policy_logits.squeeze(0),
+ 5880                  )
+ 5881              fast_path_reason = ""
+ 5882              if fast_path_choice is not None:
+ 5883>>                action_idx = int(fast_path_choice["action_idx"])
+ 5884                  fast_path_reason = str(fast_path_choice.get("reason") or "").strip().lower()
+ 5885                  search_policy = np.zeros(MAX_ACTIONS, dtype=np.float32)
+ 5886>>                if 0 <= action_idx < MAX_ACTIONS:
+ 5887>>                    search_policy[action_idx] = 1.0
+ 5888                  fast_path_counts[decision_domain] = fast_path_counts.get(decision_domain, 0) + 1
+ 5889                  if fast_path_reason:
+ 5890                      fast_path_reason_counts[fast_path_reason] += 1
+ 5891>>                search_stats: dict[str, Any] = {}
+ 5892              elif self.combat_direct_policy and decision_domain == "combat":
+ 5893                  action_mask_tensor = torch.as_tensor(
+ 5894                      action_mask,
+ 5895                      device=initial.policy_logits.device,
+ 5896                      dtype=initial.policy_logits.dtype,
+ 5897                  )
+ 5898                  masked_logits = initial.policy_logits.squeeze(0).detach().clone()
+ 5899                  rollout_action_mask = action_mask_tensor.unsqueeze(0) > 0
+ 5900                  direct_policy_used_count += 1
+--- 5900-6100
+ 5900                  direct_policy_used_count += 1
+ 5901                  with torch.no_grad(), self._amp_autocast():
+ 5902                      rollout = self.network.action_rollout_planner(
+ 5903                          initial.hidden_state,
+ 5904                          initial.action_embeddings,
+ 5905                          action_mask=rollout_action_mask,
+ 5906                          objective_context=obs_batch.get("objective_context"),
+ 5907                          decision_domain=obs_batch.get("decision_domain"),
+ 5908                          discount=self.discount,
+ 5909                          rollout_steps=self.combat_rollout_steps,
+ 5910                          continuation_beam_width=self.combat_rollout_beam_width,
+ 5911                          continuation_legal_logit_scale=self.combat_rollout_legal_logit_scale,
+ 5912                          uncertainty_surprise_weight=self.combat_rollout_uncertainty_surprise_weight,
+ 5913                          uncertainty_surface_entropy_weight=self.combat_rollout_uncertainty_surface_weight,
+ 5914                          uncertainty_latent_drift_weight=self.combat_rollout_uncertainty_latent_weight,
+ 5915                          uncertainty_branch_disagreement_weight=self.combat_rollout_uncertainty_disagreement_weight,
+ 5916                          continuation_uncertainty_penalty=self.combat_rollout_continuation_uncertainty_penalty,
+ 5917                      )
+ 5918                  rollout_q = rollout.planner_q.squeeze(0).detach()
+ 5919                  rollout_objective_q = rollout.planner_objective_q.squeeze(0).detach()
+ 5920                  rollout_risk_q = rollout.planner_risk_q.squeeze(0).detach()
+ 5921                  rollout_uncertainty = rollout.planner_uncertainty.squeeze(0).detach()
+ 5922                  rollout_surprise = rollout.planner_surprise.squeeze(0).detach()
+ 5923                  rollout_surface_entropy = rollout.planner_surface_entropy.squeeze(0).detach()
+ 5924                  rollout_latent_drift = rollout.planner_latent_drift.squeeze(0).detach()
+ 5925                  rollout_branch_disagreement = rollout.planner_branch_disagreement.squeeze(0).detach()
+ 5926                  rollout_mask = rollout.action_mask.squeeze(0)
+ 5927                  rollout_q_bias = self._normalize_action_values(
+ 5928                      rollout_q.unsqueeze(0),
+ 5929                      rollout_mask.unsqueeze(0),
+ 5930                  ).squeeze(0)
+ 5931                  rollout_objective_q_bias = self._normalize_action_values(
+ 5932                      rollout_objective_q.unsqueeze(0),
+ 5933                      rollout_mask.unsqueeze(0),
+ 5934                  ).squeeze(0)
+ 5935                  rollout_risk_q_bias = self._normalize_action_values(
+ 5936                      rollout_risk_q.unsqueeze(0),
+ 5937                      rollout_mask.unsqueeze(0),
+ 5938                  ).squeeze(0)
+ 5939                  rollout_uncertainty_bias = self._normalize_action_values(
+ 5940                      rollout_uncertainty.unsqueeze(0),
+ 5941                      rollout_mask.unsqueeze(0),
+ 5942                  ).squeeze(0)
+ 5943                  # The supervised surprise/uncertainty heads are raw-scale signals; in boss fights
+ 5944                  # their absolute values can sit around 50+ while Q is around [-3, 1].  We only
+ 5945                  # want uncertainty to rank actions relative to siblings, not dominate policy logits
+ 5946                  # through an outlier z-score, so all rollout side-channel biases are clipped to
+ 5947                  # a bounded logit prior range before blending.
+ 5948                  rollout_q_bias = rollout_q_bias.clamp(-2.5, 2.5)
+ 5949                  rollout_objective_q_bias = rollout_objective_q_bias.clamp(-2.5, 2.5)
+ 5950                  rollout_risk_q_bias = rollout_risk_q_bias.clamp(-2.5, 2.5)
+ 5951                  rollout_uncertainty_bias = rollout_uncertainty_bias.clamp(-2.0, 2.0)
+ 5952                  masked_logits = (
+ 5953                      masked_logits
+ 5954                      + self.combat_rollout_q_blend * rollout_q_bias
+ 5955                      + self.combat_rollout_objective_q_blend * rollout_objective_q_bias
+ 5956                      + self.combat_rollout_risk_blend * rollout_risk_q_bias
+ 5957                      - self.combat_rollout_uncertainty_blend * rollout_uncertainty_bias
+ 5958                  )
+ 5959                  # Root-quality bias instrumentation: keep the exact pre-bias
+ 5960                  # root logits so TensorBoard can prove whether the hard
+ 5961                  # mechanism prior (Kaiser facing, end_turn, X-cost, potion
+ 5962                  # timing, HP-cost, etc.) actually changes the root ordering.
+ 5963                  pre_quality_masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
+ 5964                  quality_bias_np, quality_stats, zero_energy_x_indices = self._combat_action_quality_bias(
+ 5965                      obs,
+ 5966                      np.asarray(action_mask, dtype=np.float32),
+ 5967                      legal_actions if isinstance(legal_actions, list) else [],
+ 5968                  )
+ 5969                  quality_bias = torch.as_tensor(
+ 5970                      quality_bias_np,
+ 5971                      device=masked_logits.device,
+ 5972                      dtype=masked_logits.dtype,
+ 5973                  )
+ 5974                  masked_logits = masked_logits + quality_bias
+ 5975                  masked_logits = masked_logits.masked_fill(action_mask_tensor <= 0, -1e9)
+ 5976                  legal_root_bias = quality_bias.masked_select(action_mask_tensor > 0)
+ 5977                  root_bias_nonzero = (
+ 5978                      1.0
+ 5979                      if legal_root_bias.numel() > 0 and bool(torch.any(legal_root_bias.abs() > 1e-6).item())
+ 5980                      else 0.0
+ 5981                  )
+ 5982                  if bool((action_mask_tensor > 0).any().item()):
+ 5983                      pre_quality_top1 = int(pre_quality_masked_logits.argmax().item())
+ 5984                      post_quality_top1 = int(masked_logits.argmax().item())
+ 5985                  else:
+ 5986                      pre_quality_top1 = -1
+ 5987                      post_quality_top1 = -1
+ 5988                  root_bias_abs_mean = float(legal_root_bias.abs().mean().item()) if legal_root_bias.numel() > 0 else 0.0
+ 5989                  root_bias_max_abs = float(legal_root_bias.abs().max().item()) if legal_root_bias.numel() > 0 else 0.0
+ 5990                  root_bias_changed_top1 = 1.0 if pre_quality_top1 >= 0 and pre_quality_top1 != post_quality_top1 else 0.0
+ 5991                  safe_temperature = max(float(temperature), 1e-3)
+ 5992                  direct_probs = torch.softmax(masked_logits / safe_temperature, dim=0)
+ 5993                  if not torch.isfinite(direct_probs).all() or float(direct_probs.sum().item()) <= 0.0:
+ 5994                      legal_mask = action_mask_tensor > 0
+ 5995                      direct_probs = legal_mask.float()
+ 5996                      direct_probs = direct_probs / direct_probs.sum().clamp(min=1.0)
+ 5997                  direct_probs = direct_probs / direct_probs.sum().clamp(min=1e-8)
+ 5998                  if safe_temperature <= 0.05:
+ 5999>>                    action_idx = int(direct_probs.argmax().item())
+ 6000                  else:
+ 6001>>                    action_idx = int(torch.multinomial(direct_probs, 1).item())
+ 6002                  search_policy = direct_probs.detach().cpu().numpy().astype(np.float32)
+ 6003                  entropy = -(direct_probs.clamp(min=1e-8) * direct_probs.clamp(min=1e-8).log()).sum().item()
+ 6004                  rollout_valid_count = rollout_mask.float().sum().clamp(min=1.0)
+ 6005                  rollout_q_mean = torch.where(rollout_mask, rollout_q, torch.zeros_like(rollout_q)).sum() / rollout_valid_count
+ 6006                  rollout_objective_q_mean = (
+ 6007                      torch.where(rollout_mask, rollout_objective_q, torch.zeros_like(rollout_objective_q)).sum()
+ 6008                      / rollout_valid_count
+ 6009                  )
+ 6010                  rollout_risk_q_mean = (
+ 6011                      torch.where(rollout_mask, rollout_risk_q, torch.zeros_like(rollout_risk_q)).sum()
+ 6012                      / rollout_valid_count
+ 6013                  )
+ 6014                  rollout_uncertainty_mean = (
+ 6015                      torch.where(rollout_mask, rollout_uncertainty, torch.zeros_like(rollout_uncertainty)).sum()
+ 6016                      / rollout_valid_count
+ 6017                  )
+ 6018                  rollout_surprise_mean = (
+ 6019                      torch.where(rollout_mask, rollout_surprise, torch.zeros_like(rollout_surprise)).sum()
+ 6020                      / rollout_valid_count
+ 6021                  )
+ 6022                  rollout_surface_entropy_mean = (
+ 6023                      torch.where(rollout_mask, rollout_surface_entropy, torch.zeros_like(rollout_surface_entropy)).sum()
+ 6024                      / rollout_valid_count
+ 6025                  )
+ 6026                  rollout_latent_drift_mean = (
+ 6027                      torch.where(rollout_mask, rollout_latent_drift, torch.zeros_like(rollout_latent_drift)).sum()
+ 6028                      / rollout_valid_count
+ 6029                  )
+ 6030                  rollout_branch_disagreement_mean = (
+ 6031                      torch.where(rollout_mask, rollout_branch_disagreement, torch.zeros_like(rollout_branch_disagreement)).sum()
+ 6032                      / rollout_valid_count
+ 6033                  )
+ 6034                  rollout_uncertainty_bias_abs_mean = (
+ 6035                      torch.where(rollout_mask, rollout_uncertainty_bias.abs(), torch.zeros_like(rollout_uncertainty_bias)).sum()
+ 6036                      / rollout_valid_count
+ 6037                  )
+ 6038                  selected_ceremonial_low_impact = 0.0
+ 6039                  selected_ceremonial_high_impact = 0.0
+ 6040                  if (
+ 6041                      isinstance(legal_actions, list)
+ 6042>>                    and 0 <= int(action_idx) < len(legal_actions)
+ 6043                      and quality_stats.get("combat_quality_ceremonial_one_card_lock", 0.0) > 0.05
+ 6044                  ):
+ 6045                      low_impact, high_impact = self._ceremonial_action_timing_flags(
+ 6046>>                        legal_actions[int(action_idx)],
+ 6047>>                        int(action_idx),
+ 6048                          obs,
+ 6049                          self._current_raw_combat_obs(),
+ 6050                          legal_actions,
+ 6051                          np.asarray(action_mask, dtype=np.float32).reshape(-1),
+ 6052                          self._combat_energy(obs, self._current_raw_combat_obs()),
+ 6053                      )
+ 6054                      selected_ceremonial_low_impact = 1.0 if low_impact else 0.0
+ 6055                      selected_ceremonial_high_impact = 1.0 if high_impact else 0.0
+ 6056                  raw_for_selected = self._current_raw_combat_obs()
+ 6057                  selected_is_kaiser_encounter = False
+ 6058                  try:
+ 6059                      if isinstance(raw_for_selected, dict):
+ 6060                          selected_is_kaiser_encounter = self._is_kaiser_encounter_context(
+ 6061                              build_boss_mechanics_context(raw_for_selected),
+ 6062                              raw_for_selected,
+ 6063                          )
+ 6064                  except Exception:
+ 6065                      selected_is_kaiser_encounter = False
+ 6066>>                search_stats = {
+ 6067                      "num_simulations": 0.0,
+ 6068                      "root_top1_visit_share": float(direct_probs.max().item()),
+ 6069                      "root_visit_entropy": float(entropy),
+ 6070                      "mean_predicted_legal_count": float((action_mask_tensor > 0).float().sum().item()),
+ 6071                      "search_mode_direct_policy": 1.0,
+ 6072                      "search_mode_direct_rollout_planner": 1.0,
+ 6073                      "direct_rollout_q_mean": float(rollout_q_mean.item()),
+ 6074                      "direct_rollout_objective_q_mean": float(rollout_objective_q_mean.item()),
+ 6075                      "direct_rollout_risk_q_mean": float(rollout_risk_q_mean.item()),
+ 6076                      "direct_rollout_uncertainty_mean": float(rollout_uncertainty_mean.item()),
+ 6077                      "direct_rollout_uncertainty_bias_abs_mean": float(rollout_uncertainty_bias_abs_mean.item()),
+ 6078                      "direct_rollout_surprise_mean": float(rollout_surprise_mean.item()),
+ 6079                      "direct_rollout_surface_entropy_mean": float(rollout_surface_entropy_mean.item()),
+ 6080                      "direct_rollout_latent_drift_mean": float(rollout_latent_drift_mean.item()),
+ 6081                      "direct_rollout_branch_disagreement_mean": float(rollout_branch_disagreement_mean.item()),
+ 6082                      "direct_rollout_steps_used": float(rollout.rollout_steps_used),
+ 6083                      "direct_rollout_branch_count_mean": float(rollout.rollout_branch_count_mean),
+ 6084                      "direct_rollout_root_valid_count": float(rollout.rollout_root_valid_count),
+ 6085                      "direct_rollout_root_bucket_size": float(rollout.rollout_root_bucket_size),
+ 6086                      "direct_rollout_bucket_padding_ratio": float(rollout.rollout_bucket_padding_ratio),
+ 6087                      "direct_rollout_max_branch_bucket_size": float(rollout.rollout_max_branch_bucket_size),
+ 6088                      "direct_rollout_branch_padding_ratio": float(rollout.rollout_branch_padding_ratio),
+ 6089                      # Direct-rollout mode does not go through MCTS
+ 6090                      # ``_objective_prior_bias``; the equivalent root prior is
+ 6091                      # ``_combat_action_quality_bias``.  Report it under the
+ 6092                      # root_bias namespace too, otherwise search/root_bias_scale
+ 6093                      # looks permanently zero in search-free training even when
+ 6094                      # the prior is actively changing logits.
+ 6095                      "root_bias_scale": 1.0,
+ 6096                      "root_bias_nonzero": float(root_bias_nonzero),
+ 6097                      "root_bias_abs_mean": float(root_bias_abs_mean),
+ 6098                      "root_bias_max_abs": float(root_bias_max_abs),
+ 6099                      "root_bias_changed_top1": float(root_bias_changed_top1),
+ 6100                      "root_bias_selected_action_delta": float(
+--- 6100-6320
+ 6100                      "root_bias_selected_action_delta": float(
+ 6101>>                        quality_bias_np[int(action_idx)]
+ 6102>>                        if 0 <= int(action_idx) < min(len(quality_bias_np), MAX_ACTIONS)
+ 6103                          else 0.0
+ 6104                      ),
+ 6105                      "root_bias_suppressed_by_gate": 0.0,
+ 6106                      "root_bias_scale_effective": 1.0,
+ 6107                      **quality_stats,
+ 6108>>                    "combat_quality_zero_energy_x_cost_selected": 1.0 if int(action_idx) in zero_energy_x_indices else 0.0,
+ 6109>>                    "combat_quality_end_turn_selected": 1.0 if self._semantic_family(legal_actions[int(action_idx)] if isinstance(legal_actions, list) and 0 <= int(action_idx) < len(legal_actions) else {}) == "end_turn" else 0.0,
+ 6110                      "combat_quality_wasteful_end_turn_selected": (
+ 6111                          1.0
+ 6112                          if (
+ 6113>>                            self._semantic_family(legal_actions[int(action_idx)] if isinstance(legal_actions, list) and 0 <= int(action_idx) < len(legal_actions) else {}) == "end_turn"
+ 6114                              and bool(quality_stats.get("combat_quality_wasteful_end_turn_available", 0.0) > 0.5)
+ 6115                          )
+ 6116                          else 0.0
+ 6117                      ),
+ 6118                      "combat_quality_kaiser_defense_selected": (
+ 6119                          1.0
+ 6120                          if (
+ 6121                              selected_is_kaiser_encounter
+ 6122                              and
+ 6123                              isinstance(legal_actions, list)
+ 6124>>                            and 0 <= int(action_idx) < len(legal_actions)
+ 6125                              and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+ 6126>>                            and self._is_kaiser_risk_handling_action(legal_actions[int(action_idx)], raw_for_selected)
+ 6127                          )
+ 6128                          else 0.0
+ 6129                      ),
+ 6130                      "combat_quality_kaiser_facing_change_selected": (
+ 6131                          1.0
+ 6132                          if (
+ 6133                              selected_is_kaiser_encounter
+ 6134                              and
+ 6135                              isinstance(legal_actions, list)
+ 6136>>                            and 0 <= int(action_idx) < len(legal_actions)
+ 6137                              and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+ 6138>>                            and self._is_kaiser_facing_change_action(legal_actions[int(action_idx)], raw_for_selected)
+ 6139                          )
+ 6140                          else 0.0
+ 6141                      ),
+ 6142                      "combat_quality_kaiser_pressure_selected": (
+ 6143                          1.0
+ 6144                          if (
+ 6145                              selected_is_kaiser_encounter
+ 6146                              and
+ 6147                              isinstance(legal_actions, list)
+ 6148>>                            and 0 <= int(action_idx) < len(legal_actions)
+ 6149                              and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+ 6150>>                            and self._is_kaiser_pressure_action(legal_actions[int(action_idx)])
+ 6151                          )
+ 6152                          else 0.0
+ 6153                      ),
+ 6154                      "combat_quality_kaiser_risky_end_turn_selected": (
+ 6155                          1.0
+ 6156                          if (
+ 6157                              selected_is_kaiser_encounter
+ 6158                              and
+ 6159                              isinstance(legal_actions, list)
+ 6160>>                            and 0 <= int(action_idx) < len(legal_actions)
+ 6161                              and quality_stats.get("combat_quality_kaiser_back_attack_risk", 0.0) > 0.05
+ 6162>>                            and self._semantic_family(legal_actions[int(action_idx)]) == "end_turn"
+ 6163                          )
+ 6164                          else 0.0
+ 6165                      ),
+ 6166                      "combat_quality_ceremonial_low_impact_selected": selected_ceremonial_low_impact,
+ 6167                      "combat_quality_ceremonial_high_impact_selected": selected_ceremonial_high_impact,
+ 6168                  }
+ 6169              else:
+ 6170                  # Run MCTS to get action and policy
+ 6171                  with torch.no_grad():
+ 6172                      self.mcts.set_training_step(self.total_steps)
+ 6173                      self.mcts.set_root_bias_enabled(True)
+ 6174                      self.mcts.set_semantic_rollout_enabled(self.mcts._semantic_rollout_enabled)
+ 6175>>                    action_idx, search_policy = self.mcts.run(
+ 6176                          self.network,
+ 6177                          obs,
+ 6178                          action_mask,
+ 6179                          num_simulations=num_simulations,
+ 6180                          temperature=temperature,
+ 6181                          decision_domain=decision_domain,
+ 6182                      )
+ 6183>>                search_stats = getattr(self.mcts, "last_run_stats", {}) or {}
+ 6184>>            if search_stats:
+ 6185>>                search_num_simulations.append(float(search_stats.get("num_simulations", num_simulations)))
+ 6186>>                search_root_candidates.append(float(search_stats.get("root_candidates", 0.0)))
+ 6187>>                search_root_selectable_children.append(float(search_stats.get("root_selectable_children_mean", 0.0)))
+ 6188>>                search_expanded_children.append(float(search_stats.get("mean_expanded_children", 0.0)))
+ 6189>>                search_predicted_legal.append(float(search_stats.get("mean_predicted_legal_count", 0.0)))
+ 6190>>                search_surface_keep.append(float(search_stats.get("mean_surface_keep_count", 0.0)))
+ 6191>>                search_max_depths.append(float(search_stats.get("max_search_depth", 0.0)))
+ 6192>>                search_depths.append(float(search_stats.get("mean_leaf_depth", 0.0)))
+ 6193>>                search_concrete_depths.append(float(search_stats.get("mean_concrete_leaf_depth", 0.0)))
+ 6194>>                search_depth_ge_2.append(float(search_stats.get("depth_ge_2_rate", 0.0)))
+ 6195>>                search_depth_ge_3.append(float(search_stats.get("depth_ge_3_rate", 0.0)))
+ 6196>>                search_semantic_expansion.append(float(search_stats.get("semantic_expansion_rate", 0.0)))
+ 6197>>                search_semantic_switch.append(float(search_stats.get("semantic_switch_rate", 0.0)))
+ 6198>>                search_semantic_chain_steps.append(float(search_stats.get("semantic_chain_steps_mean", 0.0)))
+ 6199>>                search_semantic_drill.append(float(search_stats.get("semantic_drill_rate", 0.0)))
+ 6200>>                search_root_top1_visit_share.append(float(search_stats.get("root_top1_visit_share", 0.0)))
+ 6201>>                search_root_visit_entropy.append(float(search_stats.get("root_visit_entropy", 0.0)))
+ 6202>>                search_root_bias_scale.append(float(search_stats.get("root_bias_scale", 0.0)))
+ 6203>>                search_root_bias_nonzero.append(float(search_stats.get("root_bias_nonzero", 0.0)))
+ 6204>>                search_root_bias_abs_mean.append(float(search_stats.get("root_bias_abs_mean", 0.0)))
+ 6205>>                search_root_bias_max_abs.append(float(search_stats.get("root_bias_max_abs", 0.0)))
+ 6206>>                search_root_bias_changed_top1.append(float(search_stats.get("root_bias_changed_top1", 0.0)))
+ 6207>>                search_root_bias_selected_delta.append(float(search_stats.get("root_bias_selected_action_delta", 0.0)))
+ 6208>>                search_root_bias_suppressed_by_gate.append(float(search_stats.get("root_bias_suppressed_by_gate", 0.0)))
+ 6209>>                search_root_bias_scale_effective.append(float(search_stats.get("root_bias_scale_effective", 0.0)))
+ 6210>>                search_end_turn_guard_applied.append(float(search_stats.get("end_turn_guard_applied", 0.0)))
+ 6211>>                search_end_turn_guard_forced_alt.append(float(search_stats.get("end_turn_guard_forced_alternative", 0.0)))
+ 6212>>                for metric_key, metric_value in search_stats.items():
+ 6213                      try:
+ 6214>>                        domain_search_stats[decision_domain][metric_key].append(float(metric_value))
+ 6215                      except (TypeError, ValueError):
+ 6216                          continue
+ 6217  
+ 6218>>            chosen_action = legal_actions[action_idx] if action_idx < len(legal_actions) else None
+ 6219              chosen_semantic = (
+ 6220>>                semantic_actions[action_idx]
+ 6221>>                if action_idx < len(semantic_actions) and isinstance(semantic_actions[action_idx], dict)
+ 6222                  else None
+ 6223              )
+ 6224              semantic_candidate_indices = [
+ 6225                  semantic_rollout_index(signature)
+ 6226                  for signature in semantic_actions[:MAX_ACTIONS]
+ 6227              ]
+ 6228              semantic_policy = aggregate_concrete_policy_to_semantic(
+ 6229                  search_policy,
+ 6230                  semantic_candidate_indices,
+ 6231              )
+ 6232              semantic_action = semantic_rollout_index(chosen_semantic or chosen_action)
+ 6233              chosen_signature = compact_action_signature(chosen_action)
+ 6234              action_family = ""
+ 6235              semantic_domain = ""
+ 6236              phase = str(info.get("phase") or "").strip().lower()
+ 6237              surface = ""
+ 6238              selection = ""
+ 6239              wasteful_end_turn = False
+ 6240              wasteful_proceed = False
+ 6241              if chosen_signature:
+ 6242                  chosen_signature = {
+ 6243                      **chosen_signature,
+ 6244>>                    "selected_index": int(action_idx),
+ 6245                      "phase": info.get("phase"),
+ 6246                      "legal_action_count": int(info.get("legal_action_count", 0) or 0),
+ 6247                      "selection": chosen_action.get("selection") if isinstance(chosen_action, dict) else None,
+ 6248                      "fast_path_applied": bool(fast_path_reason),
+ 6249                      "fast_path_reason": fast_path_reason or None,
+ 6250                      "reward_type": (
+ 6251                          (chosen_action.get("reward") or {}).get("type")
+ 6252                          if isinstance(chosen_action, dict) and isinstance(chosen_action.get("reward"), dict)
+ 6253                          else None
+ 6254                      ),
+ 6255                      "shop_action": (
+ 6256                          chosen_action.get("shop_action")
+ 6257                          if isinstance(chosen_action, dict)
+ 6258                          else None
+ 6259                      ),
+ 6260                  }
+ 6261                  surface = str(chosen_signature.get("surface") or "").strip().lower()
+ 6262                  selection = str(chosen_signature.get("selection") or "").strip().lower()
+ 6263                  semantic_compact = chosen_signature.get("semantic")
+ 6264                  if isinstance(semantic_compact, dict):
+ 6265                      family = str(semantic_compact.get("family") or "").strip().lower()
+ 6266                      action_family = family
+ 6267                      semantic_domain = str(semantic_compact.get("domain") or "").strip().lower()
+ 6268                      if family:
+ 6269                          selected_family_counts[decision_domain][family] += 1
+ 6270              if not action_family and isinstance(chosen_action, dict):
+ 6271                  action_family = self._semantic_family(chosen_action)
+ 6272                  if action_family:
+ 6273                      selected_family_counts[decision_domain][action_family] += 1
+ 6274              if action_family == "end_turn":
+ 6275                  end_turn_context: dict[str, Any] = {}
+ 6276                  try:
+ 6277                      end_turn_context = self._raw_end_turn_context(
+ 6278                          obs,
+ 6279                          np.asarray(action_mask, dtype=np.float32).reshape(-1),
+ 6280                          legal_actions,
+ 6281                      )
+ 6282                      wasteful_end_turn = bool(end_turn_context.get("wasteful"))
+ 6283                  except Exception:
+ 6284                      end_turn_context = {}
+ 6285                      wasteful_end_turn = False
+ 6286                  if decision_domain == "combat":
+ 6287                      try:
+ 6288                          raw_obs_for_dump = self._current_raw_combat_obs()
+ 6289                          encounter_for_dump = ""
+ 6290                          if isinstance(raw_obs_for_dump, dict):
+ 6291                              try:
+ 6292                                  boss_ctx_dump = build_boss_mechanics_context(raw_obs_for_dump)
+ 6293                                  encounter_for_dump = str(boss_ctx_dump.get("encounter_key") or "").lower()
+ 6294                              except Exception:
+ 6295                                  encounter_for_dump = ""
+ 6296                          action_diag_pre = info.get("action_diagnostics") if isinstance(info, dict) else None
+ 6297                          self._dump_selected_end_turn_context(
+ 6298                              encoded_obs=obs,
+ 6299                              raw_obs=raw_obs_for_dump,
+ 6300                              action_mask=np.asarray(action_mask, dtype=np.float32),
+ 6301                              legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+ 6302>>                            chosen_idx=int(action_idx),
+ 6303                              context=end_turn_context,
+ 6304                              search_policy=search_policy,
+ 6305>>                            search_stats=search_stats if isinstance(search_stats, dict) else None,
+ 6306                              action_diagnostics=action_diag_pre if isinstance(action_diag_pre, dict) else None,
+ 6307                              encounter=encounter_for_dump,
+ 6308                              tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+ 6309                          )
+ 6310                      except Exception:
+ 6311                          pass
+ 6312              wasteful_proceed = self._wasteful_proceed_flag(
+ 6313                  chosen_signature,
+ 6314                  decision_domain=decision_domain,
+ 6315                  phase=phase,
+ 6316              )
+ 6317  
+ 6318>>            if decision_domain == "combat" and isinstance(search_stats, dict):
+ 6319>>                search_stats.update(
+ 6320                      self._selected_combat_quality_stats(
+--- 6320-6500
+ 6320                      self._selected_combat_quality_stats(
+ 6321                          obs,
+ 6322>>                        int(action_idx),
+ 6323                          legal_actions if isinstance(legal_actions, list) else [],
+ 6324>>                        search_stats,
+ 6325                      )
+ 6326                  )
+ 6327                  try:
+ 6328                      raw_obs_off = self._current_raw_combat_obs()
+ 6329                      encounter_off = ""
+ 6330                      if isinstance(raw_obs_off, dict):
+ 6331                          try:
+ 6332                              boss_ctx_off = build_boss_mechanics_context(raw_obs_off)
+ 6333                              encounter_off = str(boss_ctx_off.get("encounter_key") or "").lower()
+ 6334                          except Exception:
+ 6335                              encounter_off = ""
+ 6336                      offender_types = self._classify_action_offenders(
+ 6337>>                        search_stats=search_stats,
+ 6338                          encounter=encounter_off,
+ 6339                          family=action_family,
+ 6340                      )
+ 6341                      for offender_type in offender_types:
+ 6342                          global_key = f"boss_combat/{offender_type}_count"
+ 6343>>                        search_stats[f"offender/{offender_type}"] = 1.0
+ 6344                      if offender_types:
+ 6345                          self._dump_action_offender(
+ 6346                              encoded_obs=obs,
+ 6347                              raw_obs=raw_obs_off,
+ 6348                              action_mask=np.asarray(action_mask, dtype=np.float32),
+ 6349                              legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+ 6350>>                            chosen_idx=int(action_idx),
+ 6351                              chosen_action=chosen_action,
+ 6352                              offender_types=offender_types,
+ 6353>>                            search_stats=search_stats,
+ 6354                              encounter=encounter_off,
+ 6355                              tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+ 6356                          )
+ 6357                  except Exception:
+ 6358                      pass
+ 6359  
+ 6360              # Store transition
+ 6361>>            trajectory.add_step(
+ 6362                  obs=obs,
+ 6363>>                action=action_idx,
+ 6364                  reward=0.0,  # Reward is assigned after step
+ 6365                  reward_components=np.zeros(NUM_OBJECTIVE_HEADS, dtype=np.float32),
+ 6366                  action_mask=action_mask,
+ 6367                  search_policy=search_policy,
+ 6368                  root_value=root_value,
+ 6369                  root_value_components=root_value_components,
+ 6370                  objective_context=obs.get("objective_context"),
+ 6371                  semantic_action=semantic_action,
+ 6372                  semantic_policy=semantic_policy,
+ 6373                  action_info=chosen_signature,
+ 6374>>                search_stats={
+ 6375>>                    **self._compact_search_stats(search_stats),
+ 6376>>                    "combat_quality_wasteful_end_turn_selected": 1.0 if wasteful_end_turn else float((search_stats or {}).get("combat_quality_wasteful_end_turn_selected", 0.0) or 0.0),
+ 6377                  },
+ 6378                  decision_domain=decision_domain,
+ 6379                  phase=phase,
+ 6380                  action_family=action_family,
+ 6381                  semantic_domain=semantic_domain,
+ 6382                  surface=surface,
+ 6383                  selection=selection,
+ 6384                  wasteful_end_turn=wasteful_end_turn,
+ 6385                  wasteful_proceed=wasteful_proceed,
+ 6386              )
+ 6387  
+ 6388              # Take action in environment
+ 6389>>            obs, reward, terminated, truncated, info = self.env.step(int(action_idx))
+ 6390              potion_transition_record = info.get("potion_transition") if isinstance(info, dict) else None
+ 6391              if isinstance(potion_transition_record, dict):
+ 6392                  self._dump_potion_transition(potion_transition_record)
+ 6393              action_diagnostics = info.get("action_diagnostics") if isinstance(info, dict) else None
+ 6394              if isinstance(action_diagnostics, dict) and trajectory.steps:
+ 6395>>                diag_stats = trajectory.steps[-1].setdefault("search_stats", {})
+ 6396                  diag_key_map = {
+ 6397                      "energy": "combat_quality_energy",
+ 6398                      "positive_action_count": "combat_quality_positive_action_count",
+ 6399                      "mandatory_positive_action_count": "combat_quality_mandatory_positive_action_count",
+ 6400                      "strategic_skip_candidate_count": "combat_quality_strategic_skip_candidate_count",
+ 6401                      "wasteful_end_turn_available": "combat_quality_true_wasteful_end_turn_available",
+ 6402                      "wasteful_end_turn_selected": "combat_quality_true_wasteful_end_turn_selected",
+ 6403                      "zero_energy_x_cost_available": "combat_quality_zero_energy_x_cost_count",
+ 6404                      "zero_energy_x_cost_selected": "combat_quality_zero_energy_x_cost_selected",
+ 6405                      "refund_no_followup_available": "combat_quality_refund_no_followup_available",
+ 6406                      "refund_no_followup_selected": "combat_quality_refund_no_followup_selected",
+ 6407                      "strategic_skip_selected": "combat_quality_strategic_skip_selected",
+ 6408                      "typed_followup_missing_count": "combat_quality_typed_followup_missing_count",
+ 6409                      "typed_future_penalty_count": "combat_quality_typed_future_penalty_count",
+ 6410                      "typed_no_draw_count": "combat_quality_typed_no_draw_count",
+ 6411                      "typed_card_state_mutation_count": "combat_quality_typed_card_state_mutation_count",
+ 6412                      "setup_followup_dependent_count": "combat_quality_setup_followup_dependent_count",
+ 6413                      "setup_followup_available_count": "combat_quality_setup_followup_available_count",
+ 6414                      "enchantment_seen": "combat_quality_enchantment_seen",
+ 6415                      "affliction_seen": "combat_quality_affliction_seen",
+ 6416                      "wasteful_end_turn_penalty_applied": "combat_quality_wasteful_end_turn_penalty_applied",
+ 6417                      # P0 hardening hooks: HP-cost / X-cost / selection /
+ 6418                      # identity / transient leak ¡ª sourced from the typed
+ 6419>>                    # helper outputs in combat_env.step diagnostics.
+ 6420                      "hp_cost_self_lethal_selected": "combat_quality_hp_cost_self_lethal_selected",
+ 6421                      "hp_cost_low_margin_selected": "combat_quality_hp_cost_low_margin_selected",
+ 6422                      "hp_cost_unblockable_value": "combat_quality_hp_cost_unblockable_value",
+ 6423                      "x_cost_selected": "combat_quality_x_cost_selected",
+ 6424                      "x_cost_zero_bad_selected": "combat_quality_x_cost_zero_bad_selected",
+ 6425                      "x_cost_zero_selected": "combat_quality_x_cost_zero_selected",
+ 6426                      "x_cost_energy_value": "combat_quality_x_cost_energy_value",
+ 6427                      "x_cost_star_value": "combat_quality_x_cost_star_value",
+ 6428                      "star_x_selected": "combat_quality_star_x_selected",
+ 6429                      "selection_text_fallback_selected": "combat_quality_selection_text_fallback_selected",
+ 6430                      "selection_runtime_internal_selected": "combat_quality_selection_runtime_internal_selected",
+ 6431                      "card_identity_text_fallback_selected": "combat_quality_card_identity_text_fallback_selected",
+ 6432                      "card_identity_runtime_internal_selected": "combat_quality_card_identity_runtime_internal_selected",
+ 6433                      "transient_leaked": "combat_quality_transient_leaked_selected",
+ 6434                      "prior_transient_only_end_turn": "combat_quality_prior_transient_only_end_turn",
+ 6435                  }
+ 6436                  for diag_key, stat_key in diag_key_map.items():
+ 6437                      if diag_key not in action_diagnostics:
+ 6438                          continue
+ 6439                      try:
+ 6440                          diag_stats[stat_key] = float(action_diagnostics.get(diag_key) or 0.0)
+ 6441                      except (TypeError, ValueError):
+ 6442                          continue
+ 6443                  if float(diag_stats.get("combat_quality_true_wasteful_end_turn_available", 0.0) or 0.0) > 0.5:
+ 6444                      diag_stats["combat_quality_wasteful_end_turn_available"] = 1.0
+ 6445                  if float(diag_stats.get("combat_quality_true_wasteful_end_turn_selected", 0.0) or 0.0) > 0.5:
+ 6446                      diag_stats["combat_quality_wasteful_end_turn_selected"] = 1.0
+ 6447              episode_reward += reward
+ 6448              episode_length += 1
+ 6449              progress_snapshot = self._episode_progress_snapshot(info)
+ 6450              if progress_snapshot:
+ 6451                  progress_snapshots.append(progress_snapshot)
+ 6452                  floor_int = int(progress_snapshot["floor"])
+ 6453                  if floor_int > 0:
+ 6454                      seen_floors.add(floor_int)
+ 6455                  room_type_lower = str(progress_snapshot.get("room_type_lower") or "")
+ 6456                  if "elite" in room_type_lower:
+ 6457                      elite_floors.add(floor_int)
+ 6458                  if "boss" in room_type_lower:
+ 6459                      boss_floors.add(floor_int)
+ 6460                  if progress_snapshot.get("hp", 0.0) <= 0.0:
+ 6461                      death_floor = max(death_floor, float(progress_snapshot.get("floor", 0.0)))
+ 6462  
+ 6463              reward_components = compute_transition_objective_rewards(
+ 6464                  prev_info.get("transition_state") if isinstance(prev_info.get("transition_state"), dict) else None,
+ 6465                  chosen_semantic or chosen_action,
+ 6466                  info.get("transition_state") if isinstance(info.get("transition_state"), dict) else None,
+ 6467                  prev_planner_context=planner_context,
+ 6468                  next_planner_context=info.get("planner_context") if isinstance(info.get("planner_context"), dict) else None,
+ 6469                  terminated=terminated,
+ 6470                  truncated=truncated,
+ 6471              )
+ 6472  
+ 6473              # Update last step's reward
+ 6474              trajectory.steps[-1]["reward"] = reward
+ 6475              trajectory.steps[-1]["reward_components"] = reward_components.astype(np.float32, copy=False)
+ 6476  
+ 6477              if terminated or truncated:
+ 6478                  break
+ 6479  
+ 6480          final_info = dict(info)
+ 6481          max_floor = max((float(snapshot.get("floor", 0.0)) for snapshot in progress_snapshots), default=0.0)
+ 6482          max_act_id = max((float(snapshot.get("act_id", 0.0)) for snapshot in progress_snapshots), default=0.0)
+ 6483          rooms_seen = len(seen_floors)
+ 6484          act1_boss_seen = any(
+ 6485              float(snapshot.get("act_id", 0.0)) <= 1.0 and "boss" in str(snapshot.get("room_type_lower") or "")
+ 6486              for snapshot in progress_snapshots
+ 6487          )
+ 6488          act1_clear = max_act_id >= 2.0
+ 6489          total_decisions = max(sum(decision_counts.values()), 1)
+ 6490          encounter_id = initial_info.get("encounter_id")
+ 6491          encounter_tier = infer_encounter_tier(encounter_id)
+ 6492          boss_entry_snapshot = self._boss_entry_snapshot_from_episode(
+ 6493              initial_info,
+ 6494              progress_snapshots,
+ 6495              encounter_tier=encounter_tier,
+ 6496          )
+ 6497          final_potion_count = self._potion_count_from_info(final_info)
+ 6498          used_potion_count = int((final_info or {}).get("used_potion_count_this_combat", 0) or 0)
+ 6499          trajectory.metadata = {
+ 6500              "episode_mode": initial_info.get("episode_mode"),
+--- 6500-6700
+ 6500              "episode_mode": initial_info.get("episode_mode"),
+ 6501              "encounter_id": encounter_id,
+ 6502              "encounter_tier": encounter_tier,
+ 6503              "encounter_pool": list(initial_info.get("encounter_pool") or []),
+ 6504              "snapshot_sample_id": initial_info.get("snapshot_sample_id"),
+ 6505              "snapshot_run_id": initial_info.get("snapshot_run_id"),
+ 6506              "snapshot_floor_number": initial_info.get("snapshot_floor_number"),
+ 6507              "snapshot_build_id": initial_info.get("snapshot_build_id"),
+ 6508              "temperature": float(temperature),
+ 6509              "semantic_rollout_enabled": bool(self.mcts._semantic_rollout_enabled),
+ 6510              "semantic_switch_depth": int(self.mcts.semantic_switch_depth),
+ 6511              "episode_total_reward": float(episode_reward),
+ 6512              "episode_length": int(episode_length),
+ 6513              "terminated": bool(terminated),
+ 6514              "truncated": bool(truncated),
+ 6515              "initial_phase": initial_info.get("phase"),
+ 6516              "final_phase": final_info.get("phase"),
+ 6517              "negative_reward_episode": bool(episode_reward < 0.0),
+ 6518              "max_floor": float(max_floor),
+ 6519              "max_act_id": float(max_act_id),
+ 6520              "rooms_seen": int(rooms_seen),
+ 6521              "death_floor": float(death_floor),
+ 6522              "elite_rooms_seen": int(len(elite_floors)),
+ 6523              "boss_rooms_seen": int(len(boss_floors)),
+ 6524              "boss_entry_hp": float(boss_entry_snapshot.get("hp", 0.0)) if boss_entry_snapshot else 0.0,
+ 6525              "boss_entry_max_hp": float(boss_entry_snapshot.get("max_hp", 0.0)) if boss_entry_snapshot else 0.0,
+ 6526              "boss_entry_hp_ratio": float(boss_entry_snapshot.get("hp_ratio", 0.0)) if boss_entry_snapshot else 0.0,
+ 6527              "final_potion_count": int(final_potion_count),
+ 6528              "used_potion_count_this_combat": int(used_potion_count),
+ 6529              "act1_boss_seen": bool(act1_boss_seen),
+ 6530              "act1_clear": bool(act1_clear),
+ 6531              "decision_counts": {domain: int(count) for domain, count in decision_counts.items()},
+ 6532              "decision_domain_overrides": {key: int(value) for key, value in domain_override_counts.items()},
+ 6533              "combat_like_decision_count": int(combat_like_decision_count),
+ 6534              "direct_policy_eligible_count": int(direct_policy_eligible_count),
+ 6535              "direct_policy_used_count": int(direct_policy_used_count),
+ 6536          }
+ 6537  
+ 6538          settlement_signal = self._episode_settlement_signal(
+ 6539              max_floor=max_floor,
+ 6540              death_floor=death_floor,
+ 6541              elite_rooms_seen=len(elite_floors),
+ 6542              act1_boss_seen=act1_boss_seen,
+ 6543              act1_clear=act1_clear,
+ 6544              terminated=terminated,
+ 6545          )
+ 6546>>        settlement_stats = trajectory.apply_light_episode_settlement(
+ 6547              settlement_signal,
+ 6548              settlement_weight=self.settlement_weight,
+ 6549              decay=self.settlement_decay,
+ 6550              max_steps=self.settlement_max_steps,
+ 6551          )
+ 6552          augmented_episode_reward = float(episode_reward + settlement_stats.get("total_bonus", 0.0))
+ 6553          trajectory.metadata.update({
+ 6554              "settlement_weight": float(self.settlement_weight),
+ 6555              "settlement_decay": float(self.settlement_decay),
+ 6556              "settlement_max_steps": int(self.settlement_max_steps),
+ 6557              "episode_augmented_total_reward": augmented_episode_reward,
+ 6558          })
+ 6559  
+ 6560          self.buffer.save_episode(
+ 6561              trajectory,
+ 6562              discount=self.discount,
+ 6563              n_steps=self.n_step_return,
+ 6564          )
+ 6565          self.episode_count += 1
+ 6566          recent_tail_snapshot = self.record_recent_combat_episode(trajectory.metadata)
+ 6567  
+ 6568          if search_root_candidates:
+ 6569              self.writer.add_scalar(
+ 6570                  "search/max_depth_mean",
+ 6571                  float(np.mean(search_max_depths)) if search_max_depths else 0.0,
+ 6572                  self.episode_count,
+ 6573              )
+ 6574              self.writer.add_scalar(
+ 6575                  "search/num_simulations",
+ 6576                  float(np.mean(search_num_simulations)) if search_num_simulations else 0.0,
+ 6577                  self.episode_count,
+ 6578              )
+ 6579              self.writer.add_scalar(
+ 6580                  "search/root_candidates_mean",
+ 6581                  float(np.mean(search_root_candidates)),
+ 6582                  self.episode_count,
+ 6583              )
+ 6584              self.writer.add_scalar(
+ 6585                  "search/root_selectable_children_mean",
+ 6586                  float(np.mean(search_root_selectable_children)) if search_root_selectable_children else 0.0,
+ 6587                  self.episode_count,
+ 6588              )
+ 6589              self.writer.add_scalar(
+ 6590                  "search/expanded_children_mean",
+ 6591                  float(np.mean(search_expanded_children)),
+ 6592                  self.episode_count,
+ 6593              )
+ 6594              self.writer.add_scalar(
+ 6595                  "search/predicted_legal_mean",
+ 6596                  float(np.mean(search_predicted_legal)),
+ 6597                  self.episode_count,
+ 6598              )
+ 6599              self.writer.add_scalar(
+ 6600                  "search/surface_keep_mean",
+ 6601                  float(np.mean(search_surface_keep)) if search_surface_keep else 0.0,
+ 6602                  self.episode_count,
+ 6603              )
+ 6604              self.writer.add_scalar(
+ 6605                  "search/leaf_depth_mean",
+ 6606                  float(np.mean(search_depths)),
+ 6607                  self.episode_count,
+ 6608              )
+ 6609              self.writer.add_scalar(
+ 6610                  "search/concrete_leaf_depth_mean",
+ 6611                  float(np.mean(search_concrete_depths)) if search_concrete_depths else 0.0,
+ 6612                  self.episode_count,
+ 6613              )
+ 6614              self.writer.add_scalar(
+ 6615                  "search/depth_ge_2_rate",
+ 6616                  float(np.mean(search_depth_ge_2)) if search_depth_ge_2 else 0.0,
+ 6617                  self.episode_count,
+ 6618              )
+ 6619              self.writer.add_scalar(
+ 6620                  "search/depth_ge_3_rate",
+ 6621                  float(np.mean(search_depth_ge_3)) if search_depth_ge_3 else 0.0,
+ 6622                  self.episode_count,
+ 6623              )
+ 6624              self.writer.add_scalar(
+ 6625                  "search/semantic_expansion_rate",
+ 6626                  float(np.mean(search_semantic_expansion)) if search_semantic_expansion else 0.0,
+ 6627                  self.episode_count,
+ 6628              )
+ 6629              self.writer.add_scalar(
+ 6630                  "search/semantic_switch_rate",
+ 6631                  float(np.mean(search_semantic_switch)) if search_semantic_switch else 0.0,
+ 6632                  self.episode_count,
+ 6633              )
+ 6634              self.writer.add_scalar(
+ 6635                  "search/semantic_chain_steps_mean",
+ 6636                  float(np.mean(search_semantic_chain_steps)) if search_semantic_chain_steps else 0.0,
+ 6637                  self.episode_count,
+ 6638              )
+ 6639              self.writer.add_scalar(
+ 6640                  "search/semantic_drill_rate",
+ 6641                  float(np.mean(search_semantic_drill)) if search_semantic_drill else 0.0,
+ 6642                  self.episode_count,
+ 6643              )
+ 6644              self.writer.add_scalar(
+ 6645                  "search/root_top1_visit_share",
+ 6646                  float(np.mean(search_root_top1_visit_share)) if search_root_top1_visit_share else 0.0,
+ 6647                  self.episode_count,
+ 6648              )
+ 6649              self.writer.add_scalar(
+ 6650                  "search/root_visit_entropy",
+ 6651                  float(np.mean(search_root_visit_entropy)) if search_root_visit_entropy else 0.0,
+ 6652                  self.episode_count,
+ 6653              )
+ 6654              self.writer.add_scalar(
+ 6655                  "search/root_bias_scale",
+ 6656                  float(np.mean(search_root_bias_scale)) if search_root_bias_scale else 0.0,
+ 6657                  self.episode_count,
+ 6658              )
+ 6659              self.writer.add_scalar(
+ 6660                  "search/root_bias_nonzero_rate",
+ 6661                  float(np.mean(search_root_bias_nonzero)) if search_root_bias_nonzero else 0.0,
+ 6662                  self.episode_count,
+ 6663              )
+ 6664              self.writer.add_scalar(
+ 6665                  "search/root_bias_abs_mean",
+ 6666                  float(np.mean(search_root_bias_abs_mean)) if search_root_bias_abs_mean else 0.0,
+ 6667                  self.episode_count,
+ 6668              )
+ 6669              self.writer.add_scalar(
+ 6670                  "search/root_bias_max_abs",
+ 6671                  float(np.max(search_root_bias_max_abs)) if search_root_bias_max_abs else 0.0,
+ 6672                  self.episode_count,
+ 6673              )
+ 6674              self.writer.add_scalar(
+ 6675                  "search/root_bias_changed_top1_rate",
+ 6676                  float(np.mean(search_root_bias_changed_top1)) if search_root_bias_changed_top1 else 0.0,
+ 6677                  self.episode_count,
+ 6678              )
+ 6679              self.writer.add_scalar(
+ 6680                  "search/root_bias_selected_action_delta_mean",
+ 6681                  float(np.mean(search_root_bias_selected_delta)) if search_root_bias_selected_delta else 0.0,
+ 6682                  self.episode_count,
+ 6683              )
+ 6684              self.writer.add_scalar(
+ 6685                  "search/root_bias_suppressed_by_gate_rate",
+ 6686                  float(np.mean(search_root_bias_suppressed_by_gate)) if search_root_bias_suppressed_by_gate else 0.0,
+ 6687                  self.episode_count,
+ 6688              )
+ 6689              self.writer.add_scalar(
+ 6690                  "search/root_bias_scale_effective_mean",
+ 6691                  float(np.mean(search_root_bias_scale_effective)) if search_root_bias_scale_effective else 0.0,
+ 6692                  self.episode_count,
+ 6693              )
+ 6694              self.writer.add_scalar(
+ 6695                  "search/end_turn_guard_applied",
+ 6696                  float(np.mean(search_end_turn_guard_applied)) if search_end_turn_guard_applied else 0.0,
+ 6697                  self.episode_count,
+ 6698              )
+ 6699              self.writer.add_scalar(
+ 6700                  "search/end_turn_guard_forced_alternative",
+--- 6700-6904
+ 6700                  "search/end_turn_guard_forced_alternative",
+ 6701                  float(np.mean(search_end_turn_guard_forced_alt)) if search_end_turn_guard_forced_alt else 0.0,
+ 6702                  self.episode_count,
+ 6703              )
+ 6704              objective_weight_keys = (
+ 6705                  ("search/objective_weight_survival", "objective_weight_survival"),
+ 6706                  ("search/objective_weight_hp", "objective_weight_hp"),
+ 6707                  ("search/objective_weight_build", "objective_weight_build"),
+ 6708                  ("search/objective_weight_resource", "objective_weight_resource"),
+ 6709                  ("search/root_objective_value", "root_objective_value"),
+ 6710                  ("search/end_turn_bias_applied", "end_turn_bias_applied"),
+ 6711                  ("search/objective_prior_applied", "objective_prior_applied"),
+ 6712              )
+ 6713              for writer_key, stat_key in objective_weight_keys:
+ 6714                  values = [
+ 6715>>                    float(step.get("search_stats", {}).get(stat_key, 0.0))
+ 6716                      for step in trajectory.steps
+ 6717>>                    if isinstance(step.get("search_stats"), dict)
+ 6718                  ]
+ 6719                  if values:
+ 6720                      self.writer.add_scalar(writer_key, float(np.mean(values)), self.episode_count)
+ 6721  
+ 6722          domain_search_means: dict[str, dict[str, float]] = {}
+ 6723          domain_family_rates: dict[str, dict[str, float]] = {}
+ 6724          total_fast_paths = int(sum(fast_path_counts.values()))
+ 6725  
+ 6726          self.writer.add_scalar("decision/total_count", float(total_decisions), self.episode_count)
+ 6727          self.writer.add_scalar(
+ 6728              "decision/domain_override_count",
+ 6729              float(sum(domain_override_counts.values())),
+ 6730              self.episode_count,
+ 6731          )
+ 6732          self.writer.add_scalar("decision/combat_like_count", float(combat_like_decision_count), self.episode_count)
+ 6733          self.writer.add_scalar(
+ 6734              "decision/direct_policy_eligible_count",
+ 6735              float(direct_policy_eligible_count),
+ 6736              self.episode_count,
+ 6737          )
+ 6738          self.writer.add_scalar(
+ 6739              "decision/direct_policy_used_count",
+ 6740              float(direct_policy_used_count),
+ 6741              self.episode_count,
+ 6742          )
+ 6743          self.writer.add_scalar(
+ 6744              "decision/direct_policy_used_rate",
+ 6745              float(direct_policy_used_count) / float(max(direct_policy_eligible_count, 1)),
+ 6746              self.episode_count,
+ 6747          )
+ 6748          self.writer.add_scalar("decision/fast_path_count", float(total_fast_paths), self.episode_count)
+ 6749          self.writer.add_scalar(
+ 6750              "decision/fast_path_rate",
+ 6751              float(total_fast_paths) / float(total_decisions),
+ 6752              self.episode_count,
+ 6753          )
+ 6754          for domain in DECISION_DOMAINS:
+ 6755              domain_count = decision_counts.get(domain, 0)
+ 6756              self.writer.add_scalar(f"decision/{domain}_count", float(domain_count), self.episode_count)
+ 6757              self.writer.add_scalar(f"decision/{domain}_share", float(domain_count) / float(total_decisions), self.episode_count)
+ 6758              domain_fast_paths = fast_path_counts.get(domain, 0)
+ 6759              if domain_count > 0:
+ 6760                  self.writer.add_scalar(
+ 6761                      f"decision/{domain}/fast_path_rate",
+ 6762                      float(domain_fast_paths) / float(domain_count),
+ 6763                      self.episode_count,
+ 6764                  )
+ 6765>>            metric_lists = domain_search_stats.get(domain) or {}
+ 6766              if not metric_lists:
+ 6767                  continue
+ 6768>>            metric_name_map = {
+ 6769                  "root_candidates": "root_candidates_mean",
+ 6770                  "root_selectable_children_mean": "root_selectable_children_mean",
+ 6771                  "num_simulations": "num_simulations",
+ 6772                  "mean_expanded_children": "expanded_children_mean",
+ 6773                  "mean_predicted_legal_count": "predicted_legal_mean",
+ 6774                  "mean_surface_keep_count": "surface_keep_mean",
+ 6775                  "max_search_depth": "max_depth_mean",
+ 6776                  "mean_leaf_depth": "leaf_depth_mean",
+ 6777                  "mean_concrete_leaf_depth": "concrete_leaf_depth_mean",
+ 6778                  "depth_ge_2_rate": "depth_ge_2_rate",
+ 6779                  "depth_ge_3_rate": "depth_ge_3_rate",
+ 6780                  "root_top1_visit_share": "root_top1_visit_share",
+ 6781                  "root_visit_entropy": "root_visit_entropy",
+ 6782                  "search_mode_direct_policy": "search_mode_direct_policy",
+ 6783                  "search_mode_direct_rollout_planner": "search_mode_direct_rollout_planner",
+ 6784                  "direct_rollout_q_mean": "direct_rollout_q_mean",
+ 6785                  "direct_rollout_objective_q_mean": "direct_rollout_objective_q_mean",
+ 6786                  "direct_rollout_risk_q_mean": "direct_rollout_risk_q_mean",
+ 6787                  "direct_rollout_uncertainty_mean": "direct_rollout_uncertainty_mean",
+ 6788                  "direct_rollout_surprise_mean": "direct_rollout_surprise_mean",
+ 6789                  "direct_rollout_surface_entropy_mean": "direct_rollout_surface_entropy_mean",
+ 6790                  "direct_rollout_latent_drift_mean": "direct_rollout_latent_drift_mean",
+ 6791                  "direct_rollout_branch_disagreement_mean": "direct_rollout_branch_disagreement_mean",
+ 6792                  "direct_rollout_steps_used": "direct_rollout_steps_used",
+ 6793                  "direct_rollout_branch_count_mean": "direct_rollout_branch_count_mean",
+ 6794                  "direct_rollout_root_valid_count": "direct_rollout_root_valid_count",
+ 6795                  "direct_rollout_root_bucket_size": "direct_rollout_root_bucket_size",
+ 6796                  "direct_rollout_bucket_padding_ratio": "direct_rollout_bucket_padding_ratio",
+ 6797                  "direct_rollout_max_branch_bucket_size": "direct_rollout_max_branch_bucket_size",
+ 6798                  "direct_rollout_branch_padding_ratio": "direct_rollout_branch_padding_ratio",
+ 6799                  "semantic_switch_rate": "semantic_switch_rate",
+ 6800                  "semantic_expansion_rate": "semantic_expansion_rate",
+ 6801                  "semantic_chain_steps_mean": "semantic_chain_steps_mean",
+ 6802                  "semantic_drill_rate": "semantic_drill_rate",
+ 6803                  "root_bias_scale": "root_bias_scale",
+ 6804                  "root_bias_nonzero": "root_bias_nonzero_rate",
+ 6805                  "root_bias_abs_mean": "root_bias_abs_mean",
+ 6806                  "root_bias_max_abs": "root_bias_max_abs",
+ 6807                  "root_bias_changed_top1": "root_bias_changed_top1_rate",
+ 6808                  "root_bias_selected_action_delta": "root_bias_selected_action_delta_mean",
+ 6809                  "root_bias_suppressed_by_gate": "root_bias_suppressed_by_gate_rate",
+ 6810                  "root_bias_scale_effective": "root_bias_scale_effective_mean",
+ 6811                  "objective_weight_survival": "objective_weight_survival",
+ 6812                  "objective_weight_hp": "objective_weight_hp",
+ 6813                  "objective_weight_build": "objective_weight_build",
+ 6814                  "objective_weight_resource": "objective_weight_resource",
+ 6815                  "root_objective_value": "root_objective_value",
+ 6816                  "end_turn_bias_applied": "end_turn_bias_applied",
+ 6817                  "end_turn_guard_applied": "end_turn_guard_applied",
+ 6818                  "end_turn_guard_forced_alternative": "end_turn_guard_forced_alternative",
+ 6819                  "objective_prior_applied": "objective_prior_applied",
+ 6820                  "combat_grounded_root_enabled": "combat_grounded_root_enabled",
+ 6821                  "q_value_ucb_enabled": "q_value_ucb_enabled",
+ 6822              }
+ 6823>>            for stat_key, writer_suffix in metric_name_map.items():
+ 6824                  values = metric_lists.get(stat_key)
+ 6825                  if values:
+ 6826                      domain_search_means.setdefault(domain, {})[stat_key] = float(np.mean(values))
+ 6827                      self.writer.add_scalar(
+ 6828                          f"search/{domain}/{writer_suffix}",
+ 6829                          float(np.mean(values)),
+ 6830                          self.episode_count,
+ 6831                      )
+ 6832  
+ 6833              family_counts = selected_family_counts.get(domain) or {}
+ 6834              if family_counts and domain_count > 0:
+ 6835                  for family, count in sorted(family_counts.items()):
+ 6836                      safe_family = family.replace("/", "_").replace(" ", "_")
+ 6837                      domain_family_rates.setdefault(domain, {})[family] = float(count) / float(domain_count)
+ 6838                      self.writer.add_scalar(
+ 6839                          f"decision/{domain}/family_{safe_family}_rate",
+ 6840                          float(count) / float(domain_count),
+ 6841                          self.episode_count,
+ 6842                      )
+ 6843          if total_fast_paths > 0:
+ 6844              for reason in TRIVIAL_BUILD_FAST_PATH_REASONS:
+ 6845                  safe_reason = reason.replace("/", "_").replace(" ", "_")
+ 6846                  count = int(fast_path_reason_counts.get(reason, 0))
+ 6847                  self.writer.add_scalar(
+ 6848                      f"decision/fast_path/reason_{safe_reason}_rate",
+ 6849                      float(count) / float(total_fast_paths),
+ 6850                      self.episode_count,
+ 6851                  )
+ 6852  
+ 6853          self.writer.add_scalar("episode/max_floor", float(max_floor), self.episode_count)
+ 6854          self.writer.add_scalar("episode/max_act_id", float(max_act_id), self.episode_count)
+ 6855          self.writer.add_scalar("episode/rooms_seen", float(rooms_seen), self.episode_count)
+ 6856          self.writer.add_scalar("episode/death_floor", float(death_floor), self.episode_count)
+ 6857          self.writer.add_scalar("episode/elite_rooms_seen", float(len(elite_floors)), self.episode_count)
+ 6858          self.writer.add_scalar("episode/act1_boss_seen", 1.0 if act1_boss_seen else 0.0, self.episode_count)
+ 6859          self.writer.add_scalar("episode/act1_clear", 1.0 if act1_clear else 0.0, self.episode_count)
+ 6860          self.writer.add_scalar("episode/settlement_signal", float(settlement_stats.get("signal", 0.0)), self.episode_count)
+ 6861          self.writer.add_scalar("episode/settlement_applied_steps", float(settlement_stats.get("applied_steps", 0.0)), self.episode_count)
+ 6862          self.writer.add_scalar("episode/settlement_total_bonus", float(settlement_stats.get("total_bonus", 0.0)), self.episode_count)
+ 6863          self.writer.add_scalar("episode/reward_augmented", float(augmented_episode_reward), self.episode_count)
+ 6864>>        boss_diagnostics = self._emit_boss_episode_diagnostics(
+ 6865              trajectory,
+ 6866              boss_entry=boss_entry_snapshot,
+ 6867              final_potion_count=final_potion_count,
+ 6868          )
+ 6869  
+ 6870          self.last_episode_metrics = {
+ 6871              "decision_counts": {domain: int(count) for domain, count in decision_counts.items()},
+ 6872              "decision_total": int(total_decisions),
+ 6873              "decision_domain_overrides": {key: int(value) for key, value in domain_override_counts.items()},
+ 6874              "combat_like_decision_count": int(combat_like_decision_count),
+ 6875              "direct_policy_eligible_count": int(direct_policy_eligible_count),
+ 6876              "direct_policy_used_count": int(direct_policy_used_count),
+ 6877              "fast_path_counts": {domain: int(count) for domain, count in fast_path_counts.items()},
+ 6878              "fast_path_total": int(total_fast_paths),
+ 6879              "fast_path_reason_counts": {
+ 6880                  reason: int(fast_path_reason_counts.get(reason, 0))
+ 6881                  for reason in TRIVIAL_BUILD_FAST_PATH_REASONS
+ 6882                  if int(fast_path_reason_counts.get(reason, 0)) > 0
+ 6883              },
+ 6884              "domain_search_means": domain_search_means,
+ 6885              "domain_family_rates": domain_family_rates,
+ 6886              "episode_reward": float(episode_reward),
+ 6887              "episode_length": int(episode_length),
+ 6888              "max_floor": float(max_floor),
+ 6889              "max_act_id": float(max_act_id),
+ 6890              "rooms_seen": int(rooms_seen),
+ 6891              "death_floor": float(death_floor),
+ 6892              "elite_rooms_seen": int(len(elite_floors)),
+ 6893              "act1_boss_seen": bool(act1_boss_seen),
+ 6894              "act1_clear": bool(act1_clear),
+ 6895              "settlement_signal": float(settlement_stats.get("signal", 0.0)),
+ 6896              "settlement_applied_steps": int(settlement_stats.get("applied_steps", 0.0)),
+ 6897              "settlement_total_bonus": float(settlement_stats.get("total_bonus", 0.0)),
+ 6898              "episode_reward_augmented": float(augmented_episode_reward),
+ 6899>>            "boss_diagnostics": boss_diagnostics,
+ 6900          }
+ 6901          if recent_tail_snapshot:
+ 6902              self.last_episode_metrics["recent_tail"] = recent_tail_snapshot
+ 6903  
+ 6904          return episode_reward, episode_length

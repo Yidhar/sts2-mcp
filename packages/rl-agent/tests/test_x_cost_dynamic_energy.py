@@ -89,6 +89,22 @@ class XCostDiagnosticTests(unittest.TestCase):
         self.assertEqual(diag["is_x_cost"], 1.0)
         self.assertEqual(diag["x_cost_effective_energy"], 1.0)
 
+    def test_semantic_role_only_x_cost_detected(self):
+        # Live compact-action diagnostics may expose the X-cost fact only via
+        # semantic roles.  The hard guard must use the same contract as the
+        # selected-action metrics, otherwise zero-energy X plays are logged as
+        # offenders while the guard never becomes available.
+        action = {
+            "kind": "play_card",
+            "title": "Whirlwind+",
+            "semantic": {"roles": ["attack", "aoe", "x_cost"]},
+            "card": {"id": "WHIRLWIND", "title": "Whirlwind+", "cost": 4},
+        }
+        diag = MuZeroTrainer._x_cost_diagnostic(action, current_energy=0.0)
+        self.assertEqual(diag["is_x_cost"], 1.0)
+        self.assertEqual(diag["x_cost_effective_energy"], 0.0)
+        self.assertEqual(diag["x_cost_bad"], 1.0)
+
 
 class SemanticSignatureTests(unittest.TestCase):
     def test_signature_exposes_base_cost_and_non_energy_flag_for_x_cost(self):

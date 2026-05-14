@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import math
+import os
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+try:  # PyTorch 2.x SDPA backend selector.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+except Exception:  # pragma: no cover - older torch fallback.
+    SDPBackend = None  # type: ignore[assignment]
+    sdpa_kernel = None  # type: ignore[assignment]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _attention_mask_value(dtype: torch.dtype) -> float:
+    # Keep fp32 close to the historical implementation (-1e9), but avoid
+    # half/bfloat16 overflow when autocast routes attention through SDPA.
+    if dtype in (torch.float16, torch.bfloat16):
+        return float(torch.finfo(dtype).min)
+    return -1e9
 
 
 def _ensure_mask(mask: torch.Tensor | None, *, device: torch.device, batch_size: int, length: int) -> torch.Tensor:
@@ -15,6 +39,40 @@ def _ensure_mask(mask: torch.Tensor | None, *, device: torch.device, batch_size:
     if mask.ndim == 1:
         mask = mask.unsqueeze(0)
     return mask
+
+
+def _sdpa_backend_context():
+    """Return an optional SDPA backend guard.
+
+    ROCm/AOTriton efficient-attention is valuable for memory, but on the large
+    token-memory model we have observed rare hard stalls after several live
+    combat observations.  Keep the fast default available, while allowing the
+    training launcher to force the stable PyTorch math SDPA implementation via
+    ``STS2_SDPA_BACKEND=math`` without reverting to the fully hand-written
+    legacy attention path.
+    """
+
+    raw_backend = str(os.environ.get("STS2_SDPA_BACKEND") or "auto").strip().lower()
+    if raw_backend in {"", "auto", "default"} or sdpa_kernel is None or SDPBackend is None:
+        return nullcontext()
+
+    backend_map = {
+        "math": "MATH",
+        "flash": "FLASH_ATTENTION",
+        "efficient": "EFFICIENT_ATTENTION",
+        "mem_efficient": "EFFICIENT_ATTENTION",
+        "memory_efficient": "EFFICIENT_ATTENTION",
+    }
+    enum_name = backend_map.get(raw_backend)
+    if enum_name is None:
+        raise ValueError(
+            f"Unsupported STS2_SDPA_BACKEND={raw_backend!r}; "
+            "use auto, math, flash, or efficient."
+        )
+    backend = getattr(SDPBackend, enum_name, None)
+    if backend is None:
+        raise RuntimeError(f"PyTorch SDPA backend {enum_name!r} is not available in this build.")
+    return sdpa_kernel([backend])
 
 
 class RelationBias(nn.Module):
@@ -276,7 +334,15 @@ class RelationBias(nn.Module):
 
 
 class MultiheadAttentionWithBias(nn.Module):
-    """Small custom MHA with additive relation bias support."""
+    """Small MHA with additive relation bias support.
+
+    By default this module uses PyTorch scaled_dot_product_attention (SDPA).
+    On recent CUDA/ROCm builds SDPA dispatches to flash or memory-efficient
+    kernels when the current mask/bias/dtype/device are supported, avoiding the
+    explicit ``scores`` and ``softmax attention`` tensors used by the old
+    hand-written path.  Set ``STS2_USE_SDPA_ATTENTION=0`` to force the legacy
+    implementation for debugging/numerical bisects.
+    """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -291,7 +357,12 @@ class MultiheadAttentionWithBias(nn.Module):
         self.k_proj = nn.Linear(self.d_model, self.d_model)
         self.v_proj = nn.Linear(self.d_model, self.d_model)
         self.out_proj = nn.Linear(self.d_model, self.d_model)
+        self.dropout_p = float(dropout)
         self.dropout = nn.Dropout(dropout)
+        self.use_sdpa = _env_flag("STS2_USE_SDPA_ATTENTION", True) and hasattr(
+            F,
+            "scaled_dot_product_attention",
+        )
 
     def forward(
         self,
@@ -313,20 +384,95 @@ class MultiheadAttentionWithBias(nn.Module):
         k = self.k_proj(key_value).view(batch_size, key_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(key_value).view(batch_size, key_len, self.n_heads, self.head_dim).transpose(1, 2)
 
+        if self.use_sdpa:
+            try:
+                out = self._forward_sdpa(q, k, v, query_mask=query_mask, key_mask=key_mask, attn_bias=attn_bias)
+                out = self.out_proj(out)
+                out = out * query_mask.unsqueeze(-1).float()
+                return out
+            except RuntimeError as exc:
+                # Unsupported SDPA combinations should fall back once to the
+                # historical implementation.  Do not hide true memory failures:
+                # the fallback materializes more attention tensors and is
+                # unlikely to recover from OOM.
+                if "out of memory" in str(exc).lower():
+                    raise
+                if _env_flag("STS2_SDPA_STRICT", False):
+                    raise
+                self.use_sdpa = False
+
+        out = self._forward_legacy(q, k, v, key_mask=key_mask, attn_bias=attn_bias)
+        out = self.out_proj(out)
+        out = out * query_mask.unsqueeze(-1).float()
+        return out
+
+    def _forward_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        query_mask: torch.Tensor,
+        key_mask: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
+        key_len = k.shape[-2]
+
+        has_any_key = key_mask.any(dim=-1)
+        if not bool(has_any_key.all()):
+            safe_key_mask = key_mask.clone()
+            if key_len > 0:
+                safe_key_mask[~has_any_key, 0] = True
+        else:
+            safe_key_mask = key_mask
+
+        safe_key_mask_expanded = safe_key_mask.unsqueeze(1).unsqueeze(2)
+        if attn_bias is None:
+            # Boolean SDPA masks use True = keep.  This path is the most likely
+            # to hit flash attention because no dense additive QK bias is needed.
+            attn_mask: torch.Tensor | None = safe_key_mask_expanded
+        else:
+            attn_mask = attn_bias.to(device=q.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(~safe_key_mask_expanded, _attention_mask_value(q.dtype))
+
+        dropout_p = self.dropout_p if self.training else 0.0
+        with _sdpa_backend_context():
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+        if not bool(has_any_key.all()):
+            out = out * has_any_key.view(batch_size, 1, 1, 1).to(dtype=out.dtype)
+        out = out.transpose(1, 2).contiguous().view(batch_size, q.shape[2], self.d_model)
+        return out
+
+    def _forward_legacy(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        key_mask: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if attn_bias is not None:
-            scores = scores + attn_bias.to(device=device, dtype=scores.dtype)
+            scores = scores + attn_bias.to(device=q.device, dtype=scores.dtype)
 
         key_mask_expanded = key_mask.unsqueeze(1).unsqueeze(2)
-        scores = scores.masked_fill(~key_mask_expanded, -1e9)
+        scores = scores.masked_fill(~key_mask_expanded, _attention_mask_value(scores.dtype))
 
         attn = torch.softmax(scores, dim=-1)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, query_len, self.d_model)
-        out = self.out_proj(out)
-        out = out * query_mask.unsqueeze(-1).float()
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, q.shape[2], self.d_model)
         return out
 
 

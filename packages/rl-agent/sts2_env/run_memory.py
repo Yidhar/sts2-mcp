@@ -18,6 +18,46 @@ OBJECTIVE_CONTEXT_DIM = 16
 _LOG1P_200 = math.log1p(200.0)
 _LOG1P_500 = math.log1p(500.0)
 
+_ROUTE_SNAPSHOT_MAX_SUMMARIES = 8
+_ROUTE_SNAPSHOT_MAX_NODES = 128
+_ROUTE_SUMMARY_KEYS = (
+    "count_elite",
+    "count_rest_site",
+    "count_shop",
+    "count_event",
+    "count_question_mark",
+    "count_treasure",
+    "count_monster",
+    "count_boss",
+    "direct_child_count",
+    "reachable_node_count",
+    "max_depth",
+    "forced_path_steps_before_branch",
+    "next_elite_steps",
+    "next_rest_steps",
+    "next_shop_steps",
+    "next_event_steps",
+    "next_question_mark_steps",
+    "next_treasure_steps",
+    "next_boss_steps",
+    "can_reach_rest_site_before_elite",
+    "can_reach_elite_then_rest_site",
+)
+_ROUTE_NODE_KEYS = (
+    "row",
+    "y",
+    "x",
+    "col",
+    "coord",
+    "point_type",
+    "pointType",
+    "type",
+    "room_type",
+    "kind",
+    "point_type_norm",
+)
+_ROUTE_CONTAINER_KEYS = ("map", "route", "current_map")
+
 
 def _float(value: Any, default: float = 0.0) -> float:
     if value is None:
@@ -36,6 +76,194 @@ def _log_norm(value: float, anchor: float) -> float:
 
 def _clip01(value: float) -> float:
     return min(max(value, 0.0), 1.0)
+
+
+def _compact_scalar(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
+
+
+def _compact_coord(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("row", "y", "x", "col"):
+        scalar = _compact_scalar(value.get(key))
+        if scalar is not None:
+            out[key] = scalar
+    return out or None
+
+
+def _compact_route_node(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in _ROUTE_NODE_KEYS:
+        value = node.get(key)
+        if key == "coord":
+            coord = _compact_coord(value)
+            if coord:
+                out[key] = coord
+            continue
+        scalar = _compact_scalar(value)
+        if scalar is not None:
+            out[key] = scalar
+
+    point = node.get("point") if isinstance(node.get("point"), dict) else {}
+    if isinstance(point, dict):
+        for key in ("row", "y", "x", "col", "point_type", "pointType", "type", "room_type", "kind"):
+            if key in out:
+                continue
+            scalar = _compact_scalar(point.get(key))
+            if scalar is not None:
+                out[key] = scalar
+    return out or None
+
+
+def _compact_route_nodes(nodes: Any, *, limit: int = _ROUTE_SNAPSHOT_MAX_NODES) -> list[dict[str, Any]]:
+    if not isinstance(nodes, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        compact = _compact_route_node(node)
+        if compact:
+            out.append(compact)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _compact_route_summary(summary: Any) -> dict[str, Any] | None:
+    if not isinstance(summary, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in _ROUTE_SUMMARY_KEYS:
+        if key not in summary:
+            continue
+        scalar = _compact_scalar(summary.get(key))
+        if scalar is not None:
+            out[key] = scalar
+    for key in ("nodes", "route_nodes", "points"):
+        nodes = _compact_route_nodes(summary.get(key), limit=32)
+        if nodes:
+            out[key] = nodes
+    return out or None
+
+
+def _append_unique_route_summary(target: list[dict[str, Any]], value: Any) -> None:
+    if len(target) >= _ROUTE_SNAPSHOT_MAX_SUMMARIES:
+        return
+    summary = _compact_route_summary(value)
+    if not summary:
+        return
+    if summary not in target:
+        target.append(summary)
+
+
+def _append_route_nodes(target: list[dict[str, Any]], value: Any) -> None:
+    if len(target) >= _ROUTE_SNAPSHOT_MAX_NODES:
+        return
+    for node in _compact_route_nodes(value, limit=_ROUTE_SNAPSHOT_MAX_NODES - len(target)):
+        if node not in target:
+            target.append(node)
+        if len(target) >= _ROUTE_SNAPSHOT_MAX_NODES:
+            break
+
+
+def _copy_route_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in ("current_floor", "act_id", "source"):
+        value = _compact_scalar(snapshot.get(key))
+        if value is not None:
+            out[key] = value
+    summaries = snapshot.get("route_summaries")
+    if isinstance(summaries, list):
+        out["route_summaries"] = [
+            dict(summary)
+            for summary in summaries[:_ROUTE_SNAPSHOT_MAX_SUMMARIES]
+            if isinstance(summary, dict)
+        ]
+    nodes = snapshot.get("route_nodes")
+    if isinstance(nodes, list):
+        out["route_nodes"] = [
+            dict(node)
+            for node in nodes[:_ROUTE_SNAPSHOT_MAX_NODES]
+            if isinstance(node, dict)
+        ]
+        out["map"] = {"nodes": [dict(node) for node in out["route_nodes"]]}
+    return out
+
+
+def _extract_route_snapshot(
+    obs: dict[str, Any] | None,
+    legal_actions: list[dict[str, Any]] | None,
+    *,
+    floor: int,
+    act: int,
+) -> dict[str, Any]:
+    summaries: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    sources: set[str] = set()
+
+    def scan_container(container: Any, source: str) -> None:
+        if not isinstance(container, dict):
+            return
+        before = len(summaries) + len(nodes)
+        _append_unique_route_summary(summaries, container.get("route_summary"))
+        _append_unique_route_summary(summaries, container.get("summary"))
+        for key in ("route_summaries", "available_route_summaries", "summaries"):
+            value = container.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    _append_unique_route_summary(summaries, item)
+        for key in ("nodes", "all_nodes", "route_nodes", "points"):
+            _append_route_nodes(nodes, container.get(key))
+        for key in _ROUTE_CONTAINER_KEYS:
+            nested = container.get(key)
+            if isinstance(nested, dict):
+                scan_container(nested, source)
+        if len(summaries) + len(nodes) > before:
+            sources.add(source)
+
+    if isinstance(obs, dict):
+        scan_container(obs, "obs")
+        sim_raw = obs.get("_sim_raw") if isinstance(obs.get("_sim_raw"), dict) else {}
+        scan_container(sim_raw, "sim_raw")
+        run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
+        scan_container(run, "run")
+
+    if isinstance(legal_actions, list):
+        for action in legal_actions:
+            if not isinstance(action, dict):
+                continue
+            before = len(summaries) + len(nodes)
+            _append_unique_route_summary(summaries, action.get("route_summary"))
+            _append_unique_route_summary(summaries, action.get("summary"))
+            for key in ("nodes", "all_nodes", "route_nodes", "points"):
+                _append_route_nodes(nodes, action.get(key))
+            # Some bridge variants only expose the immediate map point on the
+            # action itself.  Keep it as low-confidence map context; downstream
+            # runway logic ignores immediate-only one-row maps for hard caps.
+            if str(action.get("kind") or "").strip() == "map":
+                _append_route_nodes(nodes, [action])
+            if len(summaries) + len(nodes) > before:
+                sources.add("legal_actions")
+
+    if not summaries and not nodes:
+        return {}
+
+    snapshot: dict[str, Any] = {
+        "current_floor": floor,
+        "act_id": act,
+        "source": "+".join(sorted(sources)) if sources else "unknown",
+    }
+    if summaries:
+        snapshot["route_summaries"] = summaries[:_ROUTE_SNAPSHOT_MAX_SUMMARIES]
+    if nodes:
+        snapshot["route_nodes"] = nodes[:_ROUTE_SNAPSHOT_MAX_NODES]
+        snapshot["map"] = {"nodes": nodes[:_ROUTE_SNAPSHOT_MAX_NODES]}
+    return snapshot
 
 
 def _preview_metric(source: dict[str, Any] | None, key: str, default: float = 0.0) -> float:
@@ -235,6 +463,7 @@ class RunMemoryState:
     last_room_floor: int = -1
     floor_room_types: set[tuple[int, int, str]] = field(default_factory=set)
     last_semantic_action: dict[str, Any] | None = None
+    route_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 class RunMemoryTracker:
@@ -335,6 +564,25 @@ class RunMemoryTracker:
                 self.state.shops_seen += 1
             elif room_type in {"Event"}:
                 self.state.event_rooms_seen += 1
+
+        route_snapshot = _extract_route_snapshot(obs, legal_actions, floor=floor, act=act)
+        if route_snapshot:
+            # Do not overwrite a useful map snapshot with an empty reward/combat
+            # DTO.  Card reward valuation needs the last known future route
+            # runway because reward surfaces usually do not carry map actions.
+            self.state.route_snapshot = route_snapshot
+
+    def route_snapshot_for_obs(self) -> dict[str, Any]:
+        if not isinstance(self.state.route_snapshot, dict) or not self.state.route_snapshot:
+            return {}
+        return _copy_route_snapshot(self.state.route_snapshot)
+
+    def attach_route_snapshot_to_obs(self, obs: dict[str, Any] | None) -> None:
+        if not isinstance(obs, dict):
+            return
+        snapshot = self.route_snapshot_for_obs()
+        if snapshot:
+            obs["_run_route_snapshot"] = snapshot
 
     def build_context(
         self,
