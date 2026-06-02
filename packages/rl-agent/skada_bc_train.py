@@ -41,7 +41,7 @@ from sts2_env.observation_v3 import (
     MAX_ACTIONS, MAX_CANDIDATE_LOCAL_TOKENS, OBSERVATION_API_VERSION,
     WorldTokenObservationEncoder,
 )
-from sts2_env.omni_attention_policy import (
+from legacy.attention_ppo.omni_attention_policy import (
     ATTENTION_ARCHITECTURE_VERSION,
     CANDIDATE_AUX_HEAD_NAMES,
     DEFAULT_POLICY_CLASS_PATH,

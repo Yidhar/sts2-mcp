@@ -27,11 +27,11 @@ from sts2_env.async_ready_collector import (
     resolve_action_mask,
     stack_observations,
 )
-from sts2_env.aux_maskable_ppo import AsyncAuxMaskableDictRolloutBuffer, AuxMaskablePPO
+from legacy.attention_ppo.aux_maskable_ppo import AsyncAuxMaskableDictRolloutBuffer, AuxMaskablePPO
 from sts2_env.checkpoint import load_online_policy_state_dict, save_online_checkpoint, save_rotating_online_checkpoint
 from sts2_env.combat_env import CombatSandboxEnv
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
-from sts2_env.omni_attention_policy import (
+from legacy.attention_ppo.omni_attention_policy import (
     ATTENTION_ARCHITECTURE_VERSION,
     CANDIDATE_AUX_HEAD_NAMES,
     DEFAULT_POLICY_CLASS_PATH,

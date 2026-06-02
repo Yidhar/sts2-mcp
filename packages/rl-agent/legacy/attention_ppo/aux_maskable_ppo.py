@@ -18,7 +18,7 @@ from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 
-from .aux_targets import (
+from sts2_env.aux_targets import (
     ENEMY_STATE_SLOT_COUNT,
     NUM_BUILD_HEADS,
     NUM_CAUSALITY_HEADS,

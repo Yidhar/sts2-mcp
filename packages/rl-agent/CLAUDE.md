@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-An RL training system for Slay the Spire 2. A Gymnasium environment communicates with the game via HTTP through the sibling `mcp-server` bridge mod. The active training path uses a search-free omni-attention policy (`STS2OmniAttentionPolicy`) trained with `AuxMaskablePPO` (masked PPO with 6 auxiliary supervision heads).
+An RL training system for Slay the Spire 2. A Gymnasium environment communicates with the game via HTTP through the sibling `mcp-server` bridge mod.
+
+**Active training path (as of 2026-06):** the MuZero / `token_memory_v1` search-free world-model planner under `muzero/` (see `muzero/README.md`). Entry point: `python -m muzero.train`.
+
+**Archived (2026-06-02):** the earlier search-free omni-attention policy (`STS2OmniAttentionPolicy`) trained with `AuxMaskablePPO` (masked PPO + auxiliary supervision heads) now lives under `legacy/attention_ppo/`. It is superseded by, and a control baseline for, the MuZero path — see `legacy/attention_ppo/ARCHIVE.md` and `_analysis_rl_diagnosis_20260602.md`. Note `sts2_env/attention_blocks.py` and `sts2_env/aux_targets.py` stayed in the active package because the MuZero token-memory encoder imports them. The PPO-era architecture described in the sections below is retained for historical reference but is no longer the active path.
 
 ## Commands
 

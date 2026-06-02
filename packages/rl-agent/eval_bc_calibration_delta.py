@@ -43,7 +43,7 @@ from sts2_env.observation_v3 import (
     MAX_ACTIONS,
     WorldTokenObservationEncoder,
 )
-from sts2_env.omni_attention_policy import STS2OmniAttentionPolicy
+from legacy.attention_ppo.omni_attention_policy import STS2OmniAttentionPolicy
 
 
 def load_policy(checkpoint_dir: Path, device: torch.device) -> STS2OmniAttentionPolicy:

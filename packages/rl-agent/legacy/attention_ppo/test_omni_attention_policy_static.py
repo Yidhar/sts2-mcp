@@ -5,8 +5,8 @@ from pathlib import Path
 import unittest
 
 
-RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
-POLICY_PATH = RL_AGENT_ROOT / "sts2_env" / "omni_attention_policy.py"
+RL_AGENT_ROOT = Path(__file__).resolve().parents[2]
+POLICY_PATH = RL_AGENT_ROOT / "legacy" / "attention_ppo" / "omni_attention_policy.py"
 
 
 class OmniAttentionPolicyStaticContractTest(unittest.TestCase):

@@ -21,12 +21,12 @@ RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_ROOT))
 
-from train_attention_policy import parse_csv, resolve_snapshot_pool, resolve_text_device, resolve_training_session_files  # noqa: E402
+from legacy.attention_ppo.train_attention_policy import parse_csv, resolve_snapshot_pool, resolve_text_device, resolve_training_session_files  # noqa: E402
 from sts2_env.async_ready_collector import AsyncReadyCollector, AsyncReadyItem, resolve_action_mask, stack_observations  # noqa: E402
 from sts2_env.checkpoint import load_online_checkpoint_metadata  # noqa: E402
 from sts2_env.combat_env import CombatSandboxEnv  # noqa: E402
 from sts2_env.observation_v3 import MAX_ACTIONS, WorldTokenObservationEncoder  # noqa: E402
-from sts2_env.omni_attention_policy import STS2OmniAttentionPolicy  # noqa: E402
+from legacy.attention_ppo.omni_attention_policy import STS2OmniAttentionPolicy  # noqa: E402
 
 
 def _timestamp() -> str:

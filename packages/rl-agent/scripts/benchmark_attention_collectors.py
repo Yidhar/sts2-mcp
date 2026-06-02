@@ -22,7 +22,7 @@ RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_ROOT))
 
-from train_attention_policy import (  # noqa: E402
+from legacy.attention_ppo.train_attention_policy import (  # noqa: E402
     build_env_factory,
     build_policy_kwargs,
     parse_csv,
@@ -32,7 +32,7 @@ from train_attention_policy import (  # noqa: E402
 )
 from sts2_env.async_ready_collector import AsyncReadyCollector, AsyncReadyItem, resolve_action_mask, stack_observations  # noqa: E402
 from sts2_env.observation_v3 import MAX_ACTIONS, WorldTokenObservationEncoder  # noqa: E402
-from sts2_env.omni_attention_policy import STS2OmniAttentionPolicy  # noqa: E402
+from legacy.attention_ppo.omni_attention_policy import STS2OmniAttentionPolicy  # noqa: E402
 
 
 DEFAULT_METRICS = (

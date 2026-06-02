@@ -13,8 +13,9 @@ import torch
 from gymnasium import spaces
 
 
-RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+RL_AGENT_ROOT = Path(__file__).resolve().parents[2]
 STS2_ENV_ROOT = RL_AGENT_ROOT / "sts2_env"
+ATTENTION_PPO_ROOT = RL_AGENT_ROOT / "legacy" / "attention_ppo"
 
 
 def _load_sts2_env_modules():
@@ -44,7 +45,8 @@ def _load_sts2_env_modules():
     ):
         qualified = f"{pkg_name}.{name}"
         if qualified not in sys.modules:
-            path = STS2_ENV_ROOT / f"{name}.py"
+            root = ATTENTION_PPO_ROOT if name in ("omni_attention_policy", "aux_maskable_ppo") else STS2_ENV_ROOT
+            path = root / f"{name}.py"
             spec = importlib.util.spec_from_file_location(qualified, path)
             if spec is None or spec.loader is None:
                 raise RuntimeError(f"Failed to load module spec for {qualified}")

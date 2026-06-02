@@ -19,14 +19,12 @@ from typing import Any
 # attribute matches the module-level name.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "BridgeClient":                          (".bridge_client",  "BridgeClient"),
-    "AuxMaskablePPO":                        (".aux_maskable_ppo", "AuxMaskablePPO"),
     "build_aux_targets":                     (".aux_targets",    "build_aux_targets"),
     "save_online_checkpoint":                (".checkpoint",     "save_online_checkpoint"),
     "load_online_checkpoint":                (".checkpoint",     "load_online_checkpoint"),
     "load_online_checkpoint_metadata":       (".checkpoint",     "load_online_checkpoint_metadata"),
     "CombatSandboxEnv":                      (".combat_env",     "CombatSandboxEnv"),
     "SlayTheSpire2EnvV2":                    (".env_v2",         "SlayTheSpire2EnvV2"),
-    "STS2OmniAttentionPolicy":               (".omni_attention_policy", "STS2OmniAttentionPolicy"),
     "ObservationEncoderV3":                  (".observation_v3", "ObservationEncoderV3"),
     "WorldTokenObservationEncoder":          (".observation_v3", "WorldTokenObservationEncoder"),
     "bind_semantic_action":                  (".action_binder",  "bind_semantic_action"),

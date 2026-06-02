@@ -12,8 +12,8 @@ from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistrib
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule
 
-from .attention_blocks import CandidateDecoderBlock, CrossAttentionBlock, EntityPooling, RelationBias, TransformerEncoderBlock
-from .aux_targets import (
+from sts2_env.attention_blocks import CandidateDecoderBlock, CrossAttentionBlock, EntityPooling, RelationBias, TransformerEncoderBlock
+from sts2_env.aux_targets import (
     ENEMY_STATE_SLOT_COUNT,
     NUM_BUILD_HEADS,
     NUM_ENEMY_STATE_FIELDS,
@@ -23,7 +23,7 @@ from .aux_targets import (
     NUM_TRAIT_HEADS,
     NUM_TRANSITION_HEADS,
 )
-from .observation_v3 import (
+from sts2_env.observation_v3 import (
     ENTITY_HASH_BUCKETS,
     MAX_ACTIONS,
     MAX_OWNER_ID,
@@ -45,7 +45,7 @@ _POWER_SLOT_ROLE_ID = TOKEN_ROLE_TO_ID.get("POWER_SLOT", 0)
 # ENTITY_HASH_BUCKETS matches the hash space used by _stable_card_bucket
 # inside action_history.py, so HISTORY tokens' entity_ids land in the
 # same bucket namespace as hand/deck/discard card entity_ids.
-from .observation_v3 import ENTITY_HASH_BUCKETS
+from sts2_env.observation_v3 import ENTITY_HASH_BUCKETS
 
 _HISTORY_ROLE_ID = TOKEN_ROLE_TO_ID.get("HISTORY", 0)
 _RELATION_BIAS_KW = {
@@ -389,7 +389,7 @@ class STS2OmniAttentionPolicy(MaskableActorCriticPolicy):
         # Distinguishes "this card deals 6 base damage" from "this card
         # deals 6 damage in current buff context" — pure prediction,
         # no rules.
-        from .action_history import NUM_CAUSALITY_HEADS
+        from sts2_env.action_history import NUM_CAUSALITY_HEADS
         self.candidate_causality_head = nn.Sequential(
             nn.LayerNorm(self._d_model),
             nn.Linear(self._d_model, NUM_CAUSALITY_HEADS),

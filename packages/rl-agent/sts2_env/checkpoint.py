@@ -9,8 +9,8 @@ from typing import Any
 from safetensors.torch import load_file, save_file
 from sb3_contrib import MaskablePPO
 
-from .aux_maskable_ppo import AuxMaskablePPO
-from .omni_attention_policy import DEFAULT_POLICY_CLASS_PATH, STS2OmniAttentionPolicy
+from legacy.attention_ppo.aux_maskable_ppo import AuxMaskablePPO
+from legacy.attention_ppo.omni_attention_policy import DEFAULT_POLICY_CLASS_PATH, STS2OmniAttentionPolicy
 
 REQUIRED_OBSERVATION_API_VERSION = "attention_obs_v4"
 # Older obs API versions that the warmstart migration path knows how to
