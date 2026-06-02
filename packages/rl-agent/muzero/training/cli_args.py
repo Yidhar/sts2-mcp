@@ -62,6 +62,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "legal and positionally aligned, override to that safe alternative. "
                             "Default off; intended for recovery runs with route_heuristic_bias=0."
                         ))
+    parser.add_argument("--combat-hard-guard-policy", type=str, default="full",
+                        choices=["full", "emergency", "off"],
+                        help=(
+                            "Controls post-search combat hard overrides. full keeps all legacy "
+                            "tactical hard guards; emergency keeps only protocol/mechanic/safety "
+                            "guards (selection loops, boss countdown/facing, bad X=0, lethal/full-"
+                            "energy EndTurn rescues) so behaviour quality is learned from losses "
+                            "and alignment instead of rule-forced; off disables combat hard "
+                            "overrides while preserving telemetry defaults."
+                        ))
+    parser.add_argument("--build-hard-guard-policy", type=str, default="full",
+                        choices=["full", "emergency", "off"],
+                        help=(
+                            "Controls post-search build/reward/shop/rest hard overrides. full "
+                            "keeps legacy card/shop/rest/smith guards; emergency keeps only the "
+                            "low-HP campfire heal safety guard; off disables build hard overrides "
+                            "while preserving telemetry defaults."
+                        ))
     parser.add_argument("--root-progressive-widening-init", type=int, default=2,
                         help="Initially selectable root children before visit-based widening grows the frontier.")
     parser.add_argument("--child-progressive-widening-init", type=int, default=1,
@@ -130,6 +148,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Loss weight for multi-head objective value prediction.")
     parser.add_argument("--objective-reward-weight", type=float, default=0.75,
                         help="Loss weight for multi-head objective reward prediction.")
+    parser.add_argument("--combat-hp-preservation-aux-weight", type=float, default=0.0,
+                        help=(
+                            "Extra loss weight on the HP-preservation objective-reward head. "
+                            "This is a trainable anti-HP-loss signal, not a hard guard; "
+                            "default 0 keeps checkpoint/training behaviour unchanged."
+                        ))
+    parser.add_argument("--human-demo-alignment-path", type=str, default=None,
+                        help=(
+                            "JSONL file, directory, or comma/semicolon-separated list of human demo records "
+                            "(obs + ordered legal_actions + selected_action_id) for root-policy alignment. "
+                            "Default off."
+                        ))
+    parser.add_argument("--human-demo-alignment-weight", type=float, default=0.0,
+                        help=(
+                            "Small behaviour-cloning CE weight for human demo policy alignment. "
+                            "Ignored unless --human-demo-alignment-enable-loss is set."
+                        ))
+    parser.add_argument("--human-demo-alignment-batch-size", type=int, default=64,
+                        help="Human demo alignment mini-batch size.")
+    parser.add_argument("--human-demo-alignment-every-n-train-steps", type=int, default=4,
+                        help="Run one human demo alignment mini-batch every N optimizer steps.")
+    parser.add_argument("--human-demo-alignment-max-samples", type=int, default=0,
+                        help="Optional deterministic cap for human demo rows; <=0 uses all rows.")
+    parser.add_argument("--human-demo-alignment-encounters", type=str, default=None,
+                        help="Optional comma/semicolon-separated encounter_id filter for human demo rows.")
+    parser.add_argument("--human-demo-alignment-strict", action="store_true", default=False,
+                        help="Raise on invalid human demo rows instead of skipping them.")
+    parser.add_argument("--human-demo-alignment-enable-loss", action="store_true", default=False,
+                        help=(
+                            "Actually apply human demo CE to the policy. Without this flag the path runs in "
+                            "shadow/no-grad mode and only emits metrics."
+                        ))
+    parser.add_argument("--offline-alignment-root", type=str, default=None,
+                        help=(
+                            "Root directory for normalized offline parquet/json build/shop/reward/rest rows. "
+                            "Rows are converted back into live-style obs + ordered legal_actions before policy CE. "
+                            "Default off."
+                        ))
+    parser.add_argument("--offline-alignment-tasks", type=str, default=None,
+                        help=(
+                            "Comma/semicolon-separated offline tasks to use for policy alignment. "
+                            "Default: reward/smith/remove/shop/rest tasks; route tasks are rejected unless "
+                            "--offline-alignment-allow-route is set."
+                        ))
+    parser.add_argument("--offline-alignment-weight", type=float, default=0.0,
+                        help=(
+                            "Small behaviour-cloning CE weight for offline human/history policy alignment. "
+                            "Ignored unless --offline-alignment-enable-loss is set."
+                        ))
+    parser.add_argument("--offline-alignment-batch-size", type=int, default=64,
+                        help="Offline policy alignment mini-batch size.")
+    parser.add_argument("--offline-alignment-every-n-train-steps", type=int, default=4,
+                        help="Run one offline alignment mini-batch every N optimizer steps.")
+    parser.add_argument("--offline-alignment-max-rows-per-task", type=int, default=0,
+                        help="Optional deterministic cap per offline task; <=0 uses all rows.")
+    parser.add_argument("--offline-alignment-allow-route", action="store_true", default=False,
+                        help=(
+                            "Allow route_room_type/route_point_type in offline policy CE. "
+                            "Keep off for the first active phase because route direct CE previously regressed."
+                        ))
+    parser.add_argument("--offline-alignment-enable-loss", action="store_true", default=False,
+                        help=(
+                            "Actually apply offline CE to the policy. Without this flag the path runs in "
+                            "shadow/no-grad mode and only emits metrics."
+                        ))
     parser.add_argument("--semantic-policy-weight", type=float, default=1.0,
                         help="Loss weight for semantic rollout policy supervision.")
     parser.add_argument("--semantic-value-weight", type=float, default=1.0,

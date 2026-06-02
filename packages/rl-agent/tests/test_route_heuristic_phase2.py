@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 from sts2_env.route_heuristic import (
     REST_URGENCY_HP_RATIO,
     ROUTE_LOW_HP_RATIO,
+    _hp_ratio,
     compute_elite_risk,
     count_non_empty_potions,
     rank_legal_route_actions,
@@ -121,6 +122,12 @@ def test_returns_full_key_set_on_missing_summary():
     assert set(out.keys()) == _OUTPUT_KEYS
     assert out["summary_used"] is False
     assert out["score"] == 0.0
+
+
+def test_hp_ratio_does_not_treat_max_hp_one_as_full_health():
+    assert _hp_ratio(50, 1) == 0.0
+    assert _hp_ratio(1, 1) == 0.0
+    assert _hp_ratio(40, 80) == 0.5
 
 
 def test_non_dict_summary_returns_safe_zero():

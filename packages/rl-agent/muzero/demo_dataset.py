@@ -92,6 +92,37 @@ def _safe_str(value: Any, default: str = "") -> str:
     return str(value) if value is not None else default
 
 
+def _safe_float_or_none(value: Any) -> float | None:
+    """Best-effort numeric conversion used for optional outcome targets."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    # NaN should behave like a missing target so downstream masks stay clean.
+    if out != out:
+        return None
+    return out
+
+
+def _safe_bool_float_or_none(value: Any) -> float | None:
+    """Convert an optional bool-like value to 0.0 / 1.0, preserving missing."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return 1.0 if float(value) > 0.0 else 0.0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "win", "won"}:
+            return 1.0
+        if lowered in {"0", "false", "no", "n", "loss", "lost"}:
+            return 0.0
+    return None
+
+
 def _validate_row(row: dict[str, Any]) -> tuple[DemoSample | None, str | None]:
     if not isinstance(row, dict):
         return None, "row is not a JSON object"
@@ -161,6 +192,14 @@ def iter_demo_jsonl(path: str | Path, *, strict: bool = False) -> Iterator[DemoS
                 if strict:
                     raise DemoValidationError(f"line {lineno}: invalid JSON ({e})") from e
                 continue
+            # HumanDemoRecorder writes decision rows to decisions.jsonl and
+            # episode lifecycle rows to episodes.jsonl.  If a caller points a
+            # strict loader at a mixed/session file or concatenated dump, skip
+            # non-decision events instead of treating recorder metadata as
+            # malformed demonstrations.
+            event = row.get("event") if isinstance(row, dict) else None
+            if event not in (None, "", "decision"):
+                continue
             sample, error = _validate_row(row)
             if sample is None:
                 if strict:
@@ -193,25 +232,75 @@ def build_demo_training_batch(samples: Iterable[DemoSample]) -> dict[str, Any]:
     """Build a training-batch-ready dict from a sequence of demo samples.
 
     Returns a dict with stable keys ``obs``, ``legal_action_ids``,
-    ``selected_action_indices``, ``reason_tags`` and ``encounter_ids``.
-    The trainer slices it into the policy-CE loss and an optional
-    reason-tag aux head.
+    ``selected_action_indices``, ``bc_target_policy``, ``reason_tags``,
+    ``encounter_ids`` and optional outcome targets.
+
+    The action fields are intended for behaviour cloning / policy CE.  Outcome
+    fields deliberately carry a parallel ``*_mask`` so rows without post-combat
+    labels can still be mixed into BC batches without teaching fake zeros.
     """
     obs_list: list[dict[str, Any]] = []
     legal_ids: list[list[str]] = []
     selected_indices: list[int] = []
+    bc_target_policy: list[list[float]] = []
     reason_tag_lists: list[list[str]] = []
     encounter_ids: list[str] = []
+    outcomes: list[dict[str, Any]] = []
+    target_hp_loss: list[float] = []
+    target_hp_loss_mask: list[float] = []
+    combat_win: list[float] = []
+    combat_win_mask: list[float] = []
+    turns: list[float] = []
+    turns_mask: list[float] = []
     for sample in samples:
         obs_list.append(sample.obs)
-        legal_ids.append([_safe_str(a.get("action_id")) for a in sample.legal_actions])
+        sample_legal_ids = [_safe_str(a.get("action_id")) for a in sample.legal_actions]
+        legal_ids.append(sample_legal_ids)
         selected_indices.append(sample.selected_action_index)
+        one_hot = [0.0] * len(sample_legal_ids)
+        if 0 <= sample.selected_action_index < len(one_hot):
+            one_hot[sample.selected_action_index] = 1.0
+        bc_target_policy.append(one_hot)
         reason_tag_lists.append(list(sample.reason_tags))
         encounter_ids.append(sample.encounter_id)
+        outcome = dict(sample.outcome) if isinstance(sample.outcome, dict) else {}
+        outcomes.append(outcome)
+
+        hp_loss_value = _safe_float_or_none(outcome.get("hp_loss"))
+        if hp_loss_value is None:
+            target_hp_loss.append(0.0)
+            target_hp_loss_mask.append(0.0)
+        else:
+            target_hp_loss.append(max(0.0, hp_loss_value))
+            target_hp_loss_mask.append(1.0)
+
+        combat_win_value = _safe_bool_float_or_none(outcome.get("combat_win"))
+        if combat_win_value is None:
+            combat_win.append(0.0)
+            combat_win_mask.append(0.0)
+        else:
+            combat_win.append(combat_win_value)
+            combat_win_mask.append(1.0)
+
+        turns_value = _safe_float_or_none(outcome.get("turns"))
+        if turns_value is None:
+            turns.append(0.0)
+            turns_mask.append(0.0)
+        else:
+            turns.append(max(0.0, turns_value))
+            turns_mask.append(1.0)
     return {
         "obs": obs_list,
         "legal_action_ids": legal_ids,
         "selected_action_indices": selected_indices,
+        "bc_target_policy": bc_target_policy,
         "reason_tags": reason_tag_lists,
         "encounter_ids": encounter_ids,
+        "outcomes": outcomes,
+        "target_hp_loss": target_hp_loss,
+        "target_hp_loss_mask": target_hp_loss_mask,
+        "combat_win": combat_win,
+        "combat_win_mask": combat_win_mask,
+        "turns": turns,
+        "turns_mask": turns_mask,
     }

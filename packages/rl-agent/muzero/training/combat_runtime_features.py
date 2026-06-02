@@ -454,9 +454,15 @@ class CombatRuntimeFeatureMixin:
             hp_raw = player.get("current_hp")
         if hp_raw is None:
             hp_raw = player.get("currentHealth")
+        if hp_raw is None:
+            hp_raw = player.get("current_health")
         max_hp_raw = player.get("max_hp")
         if max_hp_raw is None:
             max_hp_raw = player.get("maxHealth")
+        if max_hp_raw is None:
+            max_hp_raw = player.get("max_health")
+        if max_hp_raw is None:
+            max_hp_raw = player.get("maximum_hp")
         if max_hp_raw is None:
             max_hp_raw = player.get("max_hp_raw")
         try:
@@ -464,8 +470,35 @@ class CombatRuntimeFeatureMixin:
             max_hp = float(max_hp_raw)
         except (TypeError, ValueError):
             return 0.0, 0.0, False
-        valid = bool(np.isfinite(hp) and np.isfinite(max_hp) and hp > 0.0 and max_hp > 0.0)
+        normal_valid = bool(np.isfinite(hp) and np.isfinite(max_hp) and hp > 0.0 and max_hp > 1.0)
+        # Bridge hiccups can briefly publish hp<=1,max_hp<=1 in mid-run death
+        # / critical frames.  Treat that as genuinely low instead of full HP,
+        # but never accept hp>1,max_hp<=1 as a valid denominator.
+        critical_valid = bool(np.isfinite(hp) and np.isfinite(max_hp) and 0.0 < hp <= 1.0 and 0.0 < max_hp <= 1.0)
+        valid = bool(normal_valid or critical_valid)
         return (hp if np.isfinite(hp) else 0.0), (max_hp if np.isfinite(max_hp) else 0.0), valid
+
+    @staticmethod
+    def _player_hp_ratio_from_values(hp: float, max_hp: float, *, default: float = 0.0) -> float:
+        """Safe player HP ratio for guard logic.
+
+        The live bridge has occasionally emitted mid-run snapshots such as
+        ``hp=1,max_hp=1`` or ``hp=50,max_hp=1``.  Dividing by
+        ``max(max_hp, 1)`` turns the former into "full HP" and the latter into
+        a clipped full-health signal, which is exactly the failure mode that
+        made route/rest/potion guards under-react.  Treat max_hp<=1 as
+        critical/unknown, never as healthy.
+        """
+        try:
+            hp_f = float(hp)
+            max_hp_f = float(max_hp)
+        except (TypeError, ValueError):
+            return float(default)
+        if not (np.isfinite(hp_f) and np.isfinite(max_hp_f)) or hp_f <= 0.0:
+            return float(default)
+        if max_hp_f <= 1.0:
+            return 0.0
+        return float(np.clip(hp_f / max_hp_f, 0.0, 1.0))
 
     @staticmethod
     def _discard_pile_count_from_raw(raw_obs: dict[str, Any] | None) -> int:

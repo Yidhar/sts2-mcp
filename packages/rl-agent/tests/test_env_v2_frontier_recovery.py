@@ -33,18 +33,66 @@ from sts2_env.reward_constants import (
 
 
 def _env_stub() -> SlayTheSpire2EnvV2:
+    class _DummyActionHistory:
+        def record(self, **_kwargs: Any) -> None:
+            return None
+
+        def to_obs_dict(self) -> dict[str, Any]:
+            return {}
+
+    class _DummyObsEncoder:
+        def encode(
+            self,
+            obs: dict[str, Any],
+            legal_actions: list[dict[str, Any]],
+            planner_context: dict[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                "encoded": True,
+                "legal_count": len(legal_actions),
+                "planner_context": dict(planner_context),
+            }
+
+    class _DummyRunMemory:
+        def build_context(
+            self,
+            obs: dict[str, Any] | None,
+            legal_actions: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            return {"legal_count": len(legal_actions)}
+
+        def update_transition(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def attach_route_snapshot_to_obs(self, _obs: dict[str, Any]) -> None:
+            return None
+
+    class _DummyCombatMemory:
+        def snapshot(self) -> dict[str, Any]:
+            return {}
+
+        def update(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
     env = object.__new__(SlayTheSpire2EnvV2)
     env.step_timeout_ms = 20_000
     env.reset_timeout_ms = 60_000
+    env.include_debug_info = False
+    env.obs_encoder = _DummyObsEncoder()
+    env._run_memory = _DummyRunMemory()
+    env._combat_memory = _DummyCombatMemory()
+    env._action_history = _DummyActionHistory()
     env._legal_actions = []
     env._last_obs_raw = {}
     env._last_actionability = None
     env._last_bridge_info = None
     env._last_action_overflow = 0
     env._last_raw_legal_action_count = 0
+    env._last_raw_legal_actions_compact = []
     env._last_blocked_action_drop_count = 0
     env._consecutive_end_turn_leaks = 0
     env._max_floor_reached = 0
+    env.stuck_watchdog_steps = 0
     env._episode_id = "test-episode"
     env._episode_telemetry = SlayTheSpire2EnvV2._blank_telemetry()
     return env
@@ -79,9 +127,43 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
             }
         )
         self.assertEqual(env._last_raw_legal_action_count, 3)
+        self.assertEqual(len(env._last_raw_legal_actions_compact), 3)
         self.assertEqual(env._last_blocked_action_drop_count, 2)
         self.assertEqual(env._legal_actions, [{"action_id": "end_turn", "kind": "end_turn"}])
         self.assertEqual(env._episode_telemetry["frontier_actions_dropped_blocked"], 2.0)
+
+    def test_build_info_exposes_raw_compact_actions_after_filtering(self):
+        env = _env_stub()
+        env._update_live_state(
+            {
+                "obs": {
+                    "phase": "rest_site",
+                    "player": {"hp": 20, "max_hp": 80},
+                    "run": {"floor": 7},
+                },
+                "legal_actions": [
+                    {
+                        "kind": "rest_site",
+                        "action_id": "rest_site:0",
+                        "option": {"option_id": "HEAL", "option_type": "HealRestSiteOption", "title": "休息"},
+                    },
+                    {
+                        "kind": "rest_site",
+                        "action_id": "rest_site:1",
+                        "option": {"option_id": "SMITH", "option_type": "SmithRestSiteOption", "title": "锻造"},
+                    },
+                ],
+                "info": {},
+            }
+        )
+
+        info = env._build_info({})
+
+        self.assertEqual(info["raw_legal_action_count"], 2)
+        self.assertEqual(len(info["raw_legal_actions_compact"]), 2)
+        self.assertEqual(len(info["legal_actions_compact"]), 1)
+        self.assertEqual(info["raw_legal_actions_compact"][0]["option_type"], "HealRestSiteOption")
+        self.assertEqual(info["raw_legal_actions_compact"][1]["option_type"], "SmithRestSiteOption")
 
     def test_update_live_state_keeps_forced_singleton_discard_potion(self):
         env = _env_stub()
@@ -146,6 +228,195 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
         }
         self.assertTrue(env._current_frontier_needs_short_wait())
         self.assertTrue(env._frontier_suspicion_has_energy_and_hand())
+        self.assertTrue(env._frontier_has_affordable_raw_combat_card())
+
+    def test_affordable_raw_combat_card_predicate_ignores_quest_status_and_expensive_cards(self):
+        env = _env_stub()
+        env._last_obs_raw = {
+            "combat": {
+                "in_progress": True,
+                "energy": 1,
+                "hand": [
+                    {"id": "CARD.TREASURE_MAP", "title": "藏宝图", "type": "Quest", "cost": 0},
+                    {"id": "CARD.DAZED", "title": "晕眩", "type": "Status", "cost": 0},
+                    {"id": "CARD.EMBER", "title": "余烬", "type": "Attack", "cost": 2},
+                ],
+            }
+        }
+        self.assertFalse(env._frontier_has_affordable_raw_combat_card())
+
+        env._last_obs_raw["combat"]["hand"].append(
+            {"id": "CARD.DEFEND_IRONCLAD", "title": "防御", "type": "Skill", "cost": 1}
+        )
+        self.assertTrue(env._frontier_has_affordable_raw_combat_card())
+
+    def test_singleton_end_turn_with_filtered_drop_short_waits_even_if_actionability_has_non_end_turn(self):
+        env = _env_stub()
+        env._legal_actions = [{"action_id": "end_turn", "kind": "end_turn"}]
+        env._last_actionability = {"frontier_stable": True, "legal_non_end_turn_count": 1}
+        env._last_blocked_action_drop_count = 1
+        env._last_obs_raw = {
+            "combat": {
+                "in_progress": True,
+                "energy": 0,
+                "hand": [],
+            }
+        }
+
+        self.assertTrue(env._current_frontier_needs_short_wait())
+
+    def test_step_blocks_stale_singleton_end_turn_when_recovery_finds_non_end_turn(self):
+        env = _env_stub()
+        env._legal_actions = [{"action_id": "end_turn", "kind": "end_turn"}]
+        env._last_actionability = {"frontier_stable": False, "legal_non_end_turn_count": 0}
+        env._last_obs_raw = {
+            "phase": "combat",
+            "run": {"floor": 17, "room_type": "Boss"},
+            "player": {"hp": 42, "max_hp": 80, "energy": 3},
+            "combat": {
+                "in_progress": True,
+                "energy": 3,
+                "hand": [{"id": "CARD.STRIKE_R", "title": "打击", "cost": 1}],
+            },
+        }
+        calls = {"recover": 0, "bridge_step": 0}
+
+        def _recover_filtered_action_window(*, timeout_ms: int) -> bool:
+            calls["recover"] += 1
+            env._legal_actions = [
+                {
+                    "action_id": "play_card:0:0",
+                    "kind": "play_card",
+                    "card": {"id": "CARD.STRIKE_R", "title": "打击", "cost": 1},
+                },
+                {"action_id": "end_turn", "kind": "end_turn"},
+            ]
+            env._last_actionability = {"frontier_stable": True, "legal_non_end_turn_count": 1}
+            return True
+
+        class _BridgeShouldNotStep:
+            def step(self, **kwargs: Any) -> dict[str, Any]:
+                calls["bridge_step"] += 1
+                raise AssertionError("stale singleton EndTurn must not reach bridge.step")
+
+        env._recover_filtered_action_window = _recover_filtered_action_window  # type: ignore[method-assign]
+        env.bridge = _BridgeShouldNotStep()
+
+        obs, reward, terminated, truncated, info = env.step(0)
+
+        self.assertEqual(calls["recover"], 1)
+        self.assertEqual(calls["bridge_step"], 0)
+        self.assertEqual(obs["legal_count"], 2)
+        self.assertEqual(reward, 0.0)
+        self.assertFalse(terminated)
+        self.assertFalse(truncated)
+        self.assertTrue(info["frontier_refreshed_before_end_turn"])
+        self.assertEqual(
+            info["bridge_info"]["action_diagnostics"]["frontier_pre_dispatch_end_turn_blocked"],
+            1.0,
+        )
+        self.assertEqual(env._episode_telemetry["frontier_only_end_turn_pre_dispatch_waits"], 1.0)
+        self.assertEqual(env._episode_telemetry["frontier_only_end_turn_pre_dispatch_blocked"], 1.0)
+
+    def test_step_blocks_high_confidence_singleton_end_turn_even_when_recovery_times_out(self):
+        env = _env_stub()
+        env._legal_actions = [{"action_id": "end_turn", "kind": "end_turn"}]
+        env._last_actionability = {"frontier_stable": True, "legal_non_end_turn_count": 0}
+        env._last_obs_raw = {
+            "phase": "combat",
+            "run": {"floor": 7, "room_type": "Monster"},
+            "player": {"hp": 38, "max_hp": 80, "energy": 1},
+            "combat": {
+                "in_progress": True,
+                "energy": 1,
+                "hand": [
+                    {"id": "CARD.DEFEND_IRONCLAD", "title": "防御", "type": "Skill", "cost": 1},
+                    {"id": "CARD.DEFEND_IRONCLAD", "title": "防御", "type": "Skill", "cost": 1},
+                ],
+            },
+        }
+        calls = {"recover": 0, "bridge_step": 0}
+
+        def _recover_filtered_action_window(*, timeout_ms: int) -> bool:
+            calls["recover"] += 1
+            # Simulate the observed bridge failure: bounded wait expires but
+            # the visible frontier is still singleton EndTurn despite an
+            # affordable raw card in hand.
+            env._legal_actions = [{"action_id": "end_turn", "kind": "end_turn"}]
+            return True
+
+        class _BridgeShouldNotStep:
+            def step(self, **kwargs: Any) -> dict[str, Any]:
+                calls["bridge_step"] += 1
+                raise AssertionError("high-confidence singleton EndTurn leak must not dispatch")
+
+        env._recover_filtered_action_window = _recover_filtered_action_window  # type: ignore[method-assign]
+        env.bridge = _BridgeShouldNotStep()
+
+        obs, reward, terminated, truncated, info = env.step(0)
+
+        self.assertEqual(calls["recover"], 1)
+        self.assertEqual(calls["bridge_step"], 0)
+        self.assertEqual(obs["legal_count"], 1)
+        self.assertEqual(reward, 0.0)
+        self.assertFalse(terminated)
+        self.assertFalse(truncated)
+        self.assertFalse(info["frontier_refreshed_before_end_turn"])
+        self.assertTrue(info["frontier_stale_singleton_end_turn_blocked"])
+        self.assertEqual(
+            info["bridge_info"]["action_diagnostics"]["frontier_pre_dispatch_high_confidence"],
+            1.0,
+        )
+        self.assertEqual(
+            env._episode_telemetry["frontier_only_end_turn_pre_dispatch_high_confidence_blocked"],
+            1.0,
+        )
+
+    def test_step_allows_singleton_end_turn_when_raw_hand_has_only_quest_card(self):
+        env = _env_stub()
+        env._legal_actions = [{"action_id": "end_turn", "kind": "end_turn"}]
+        env._last_actionability = {"frontier_stable": True, "legal_non_end_turn_count": 0}
+        env._last_obs_raw = {
+            "phase": "combat",
+            "run": {"floor": 17, "room_type": "Boss"},
+            "player": {"hp": 39, "max_hp": 80, "energy": 2},
+            "combat": {
+                "in_progress": True,
+                "energy": 2,
+                "hand": [{"id": "CARD.TREASURE_MAP", "title": "藏宝图", "type": "Quest", "cost": 0}],
+            },
+        }
+        calls = {"recover": 0, "bridge_step": 0}
+
+        def _recover_filtered_action_window(*, timeout_ms: int) -> bool:
+            calls["recover"] += 1
+            return True
+
+        class _BridgeAllowsStep:
+            def step(self, episode_id: str, action_id: str, timeout_ms: int) -> dict[str, Any]:
+                calls["bridge_step"] += 1
+                return {
+                    "obs": env._last_obs_raw,
+                    "legal_actions": [],
+                    "reward": 0.0,
+                    "done": True,
+                    "terminated": True,
+                    "truncated": False,
+                    "info": {},
+                }
+
+        env._recover_filtered_action_window = _recover_filtered_action_window  # type: ignore[method-assign]
+        env.bridge = _BridgeAllowsStep()
+
+        _obs, _reward, terminated, _truncated, _info = env.step(0)
+
+        self.assertEqual(calls["recover"], 1)
+        self.assertEqual(calls["bridge_step"], 1)
+        self.assertTrue(terminated)
+        self.assertEqual(
+            env._episode_telemetry["frontier_only_end_turn_pre_dispatch_high_confidence_blocked"],
+            0.0,
+        )
 
     def test_singleton_end_turn_with_zero_energy_does_not_short_wait(self):
         env = _env_stub()
@@ -567,6 +838,29 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
         self.assertEqual(env._episode_telemetry["rest_skip_heal_at_low_hp"], 1.0)
         self.assertEqual(env._episode_telemetry["rest_penalty_total"], float(REST_SITE_SKIP_HEAL_PENALTY))
 
+    def test_rest_site_smith_identity_overrides_stale_heal_flags(self):
+        env = _env_stub()
+        action = {
+            "index": 1,
+            "kind": "rest_site",
+            "action_id": "rest_site:1",
+            "action_kind": "heal",
+            "title": "锻造",
+            "is_rest_site": True,
+            "is_heal": True,
+            "is_smith": True,
+        }
+
+        self.assertTrue(SlayTheSpire2EnvV2._is_rest_site_choice_action(action))
+        self.assertTrue(SlayTheSpire2EnvV2._is_rest_smith_choice_action(action))
+        self.assertFalse(SlayTheSpire2EnvV2._is_rest_heal_choice_action(action))
+
+        reward = env._rest_site_skip_heal_penalty({"player": {"hp": 80, "max_hp": 100}}, action)
+        self.assertEqual(reward, 0.0)
+        self.assertEqual(env._episode_telemetry["rest_site_encounters"], 1.0)
+        self.assertEqual(env._episode_telemetry["rest_smith_chosen"], 1.0)
+        self.assertEqual(env._episode_telemetry["rest_heal_chosen"], 0.0)
+
     def test_low_hp_rest_site_exposure_filters_to_heal_only(self):
         env = _env_stub()
 
@@ -753,6 +1047,53 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
         filtered = env._apply_low_hp_rest_heal_exposure_filter(
             actions,
             {"player": {"hp": 90, "max_hp": 100}},
+        )
+
+        self.assertEqual(filtered, actions)
+        self.assertEqual(env._episode_telemetry["rest_heal_exposure_forced"], 0.0)
+
+    def test_low_hp_rest_site_exposure_accepts_max_health_schema(self):
+        env = _env_stub()
+        actions = [
+            {"kind": "rest_site", "action_id": "rest_site:smith", "option": {"option_type": "smith"}},
+            {"kind": "rest_site", "action_id": "rest_site:rest", "option": {"option_type": "rest"}},
+        ]
+
+        filtered = env._apply_low_hp_rest_heal_exposure_filter(
+            actions,
+            {"player": {"hp": 40, "maxHealth": 100}, "run": {"floor": 13}},
+        )
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["option"]["option_type"], "rest")
+        self.assertEqual(env._episode_telemetry["rest_heal_exposure_forced"], 1.0)
+
+    def test_low_hp_rest_site_exposure_treats_mid_act_max_hp_one_as_critical(self):
+        env = _env_stub()
+        actions = [
+            {"kind": "rest_site", "action_id": "rest_site:smith", "option": {"option_type": "smith"}},
+            {"kind": "rest_site", "action_id": "rest_site:rest", "option": {"option_type": "rest"}},
+        ]
+
+        filtered = env._apply_low_hp_rest_heal_exposure_filter(
+            actions,
+            {"player": {"hp": 1, "max_hp": 1}, "run": {"floor": 13}},
+        )
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["option"]["option_type"], "rest")
+        self.assertEqual(env._episode_telemetry["rest_heal_exposure_forced"], 1.0)
+
+    def test_low_hp_rest_site_exposure_fails_open_when_max_hp_missing(self):
+        env = _env_stub()
+        actions = [
+            {"kind": "rest_site", "action_id": "rest_site:smith", "option": {"option_type": "smith"}},
+            {"kind": "rest_site", "action_id": "rest_site:rest", "option": {"option_type": "rest"}},
+        ]
+
+        filtered = env._apply_low_hp_rest_heal_exposure_filter(
+            actions,
+            {"player": {"hp": 50}, "run": {"floor": 13}},
         )
 
         self.assertEqual(filtered, actions)

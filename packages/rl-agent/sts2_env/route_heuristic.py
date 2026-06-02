@@ -163,8 +163,10 @@ def _zero_score() -> dict[str, Any]:
 
 
 def _hp_ratio(hp: float, max_hp: float) -> float:
-    if max_hp <= 0:
-        return 1.0  # unknown max → assume full
+    if max_hp <= 1.0:
+        # Missing/suspicious max HP is unsafe/unknown, not full HP.  The
+        # caller may fail-open; the heuristic must not route as if healthy.
+        return 0.0
     return _clamp(hp / max_hp, 0.0, 1.0)
 
 

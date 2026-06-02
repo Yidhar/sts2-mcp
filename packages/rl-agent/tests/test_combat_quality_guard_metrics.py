@@ -29,6 +29,8 @@ def test_hard_guard_default_keys_cover_current_guard_families() -> None:
         "combat_quality_selection_loop_",
         "combat_quality_meaningful_damage_endturn_guard_",
         "combat_quality_urgent_endturn_guard_",
+        "combat_quality_full_energy_endturn_guard_",
+        "combat_quality_end_turn_pre_dispatch_",
         "combat_quality_no_pressure_block_guard_",
     )
 

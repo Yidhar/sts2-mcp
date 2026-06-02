@@ -14,19 +14,58 @@ from muzero.combat_quality import (
     COMBAT_QUALITY_CARD_BLOCK_SEARCH_SUFFIXES,
     COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES,
 )
+from muzero.diagnostics.deck_build_metrics import (
+    CARD_REWARD_TB_KEYS,
+    DEATH_DECK_QUALITY_TB_KEYS,
+    FINAL_DECK_QUALITY_TB_KEYS,
+)
+from muzero.diagnostics.deck_upgrade_metrics import DECK_UPGRADE_TB_KEYS
+from muzero.diagnostics.rest_site_metrics import REST_SITE_TB_KEYS
+from muzero.diagnostics.shop_metrics import SHOP_TB_KEYS
+from muzero.diagnostics.summoner_targeting import SUMMONER_TARGETING_TB_KEYS
+from muzero.diagnostics.target_priority import TARGET_PRIORITY_TB_KEYS
+from muzero.combat_quality.summoner_target_guard import SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES
+from muzero.combat_quality.target_priority_guard import TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES
 from muzero.training.card_reward_guard import CARD_REWARD_GUARD_SEARCH_SUFFIXES
+from muzero.training.card_reward_pick_quality_guard import CARD_REWARD_PICK_QUALITY_GUARD_SEARCH_SUFFIXES
+from muzero.training.post_search_policy_retarget import POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES
+from muzero.training.rest_site_smith_guard import REST_SITE_SMITH_GUARD_SEARCH_SUFFIXES
+from muzero.training.shop_action_guard import SHOP_ACTION_GUARD_SEARCH_SUFFIXES
+from sts2_env.observation_v2 import DECISION_DOMAINS
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_tag(value: Any) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "").strip().lower()).strip("_") or "unknown"
+
+
+def log_environment_episode_telemetry(
+    *,
+    writer: Any,
+    episode_index: int,
+    episode_telemetry: dict[str, Any] | None,
+) -> None:
+    """Replay env_v2 per-episode counters into ``env/*`` TensorBoard tags.
+
+    Full-run Act1 decisions depend on sparse campfire/shop/boss surfaces.  The
+    env already attaches these counters to terminal ``info``; this helper keeps
+    sync and async self-play on the same tag path instead of relying on ad-hoc
+    event-log parsing.
+    """
+
+    if not isinstance(episode_telemetry, dict):
+        return
+    for key, value in episode_telemetry.items():
+        writer.add_scalar(f"env/{_safe_tag(key)}", _to_float(value), int(episode_index))
 
 
 def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics: dict[str, Any], actor_completed_episodes: Sequence[int]) -> None:
-    def _to_float(value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return float(default)
-
-    def _safe_tag(value: Any) -> str:
-        return re.sub(r"[^0-9a-zA-Z]+", "_", str(value or "").strip().lower()).strip("_") or "unknown"
-
     metric_map = {
         "max_floor": "episode/max_floor",
         "max_act_id": "episode/max_act_id",
@@ -49,9 +88,11 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
             trainer.writer.add_scalar(writer_key, 1.0 if bool(episode_metrics.get(metric_key)) else 0.0, trainer.episode_count)
 
     episode_telemetry = episode_metrics.get("episode_telemetry")
-    if isinstance(episode_telemetry, dict):
-        for key, value in episode_telemetry.items():
-            trainer.writer.add_scalar(f"env/{_safe_tag(key)}", _to_float(value), trainer.episode_count)
+    log_environment_episode_telemetry(
+        writer=trainer.writer,
+        episode_index=trainer.episode_count,
+        episode_telemetry=episode_telemetry if isinstance(episode_telemetry, dict) else None,
+    )
 
     # Async actors use NullSummaryWriter while collecting episodes, so replay the
     # per-episode diagnostics on the learner writer here. Without this, combat
@@ -251,6 +292,9 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
         "route_safety_guard_selected_immediate_elite": "route_safety_guard_selected_immediate_elite_rate",
         "route_safety_guard_low_hp_forced": "route_safety_guard_low_hp_forced_rate",
         "route_safety_guard_invalid_obs": "route_safety_guard_invalid_obs_rate",
+        "build_hard_guard_policy_full": "build_hard_guard_policy_full",
+        "build_hard_guard_policy_emergency": "build_hard_guard_policy_emergency",
+        "build_hard_guard_policy_off": "build_hard_guard_policy_off",
         "build_safety_guard_enabled": "build_safety_guard_enabled",
         "build_safety_guard_rest_low_hp_applicable": "build_safety_guard_rest_low_hp_applicable_rate",
         "build_safety_guard_rest_available": "build_safety_guard_rest_available_rate",
@@ -266,6 +310,12 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
         "q_value_ucb_enabled": "q_value_ucb_enabled",
     }
     search_suffix_map.update(CARD_REWARD_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(CARD_REWARD_PICK_QUALITY_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(SHOP_ACTION_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(REST_SITE_SMITH_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES)
+    search_suffix_map.update(TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES)
     search_suffix_map.update(COMBAT_QUALITY_CARD_BLOCK_SEARCH_SUFFIXES)
     search_suffix_map.update(COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES)
     domain_search_means = episode_metrics.get("domain_search_means") if isinstance(episode_metrics.get("domain_search_means"), dict) else {}
@@ -296,5 +346,81 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
     boss_diagnostics = episode_metrics.get("boss_diagnostics") if isinstance(episode_metrics.get("boss_diagnostics"), dict) else {}
     for tag, value in boss_diagnostics.items():
         trainer.writer.add_scalar(str(tag), _to_float(value), trainer.episode_count)
+
+    # Async actors collect with NullSummaryWriter, so episode-level deck/build
+    # diagnostics must be replayed here too.  Keep this in lock-step with the
+    # synchronous writer in self_play.py; otherwise multi-actor runs lose the
+    # exact metrics we need for Act1 debugging (reward skip, shop use, death
+    # deck quality).
+    deck_quality = episode_metrics.get("deck_quality_v2")
+    if isinstance(deck_quality, dict):
+        for tag_suffix, quality_key in FINAL_DECK_QUALITY_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"deck/final_{tag_suffix}",
+                _to_float(deck_quality.get(quality_key)),
+                trainer.episode_count,
+            )
+
+    card_reward_metrics = episode_metrics.get("card_reward_metrics")
+    if isinstance(card_reward_metrics, dict):
+        for tag_suffix, meta_key in CARD_REWARD_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"build/card_reward_{tag_suffix}",
+                _to_float(card_reward_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    shop_metrics = episode_metrics.get("shop_metrics")
+    if isinstance(shop_metrics, dict):
+        for tag_suffix, meta_key in SHOP_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"build/shop_{tag_suffix}",
+                _to_float(shop_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    rest_site_metrics = episode_metrics.get("rest_site_metrics")
+    if isinstance(rest_site_metrics, dict):
+        for tag_suffix, meta_key in REST_SITE_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"build/rest_site_{tag_suffix}",
+                _to_float(rest_site_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    deck_upgrade_metrics = episode_metrics.get("deck_upgrade_metrics")
+    if isinstance(deck_upgrade_metrics, dict):
+        for tag_suffix, meta_key in DECK_UPGRADE_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"build/deck_upgrade_{tag_suffix}",
+                _to_float(deck_upgrade_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    summoner_targeting_metrics = episode_metrics.get("summoner_targeting_metrics")
+    if isinstance(summoner_targeting_metrics, dict):
+        for tag_suffix, meta_key in SUMMONER_TARGETING_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"combat/summoner_targeting_{tag_suffix}",
+                _to_float(summoner_targeting_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    target_priority_metrics = episode_metrics.get("target_priority_metrics")
+    if isinstance(target_priority_metrics, dict):
+        for tag_suffix, meta_key in TARGET_PRIORITY_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"combat/target_priority_{tag_suffix}",
+                _to_float(target_priority_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    if _to_float(episode_metrics.get("death_floor"), 0.0) > 0.0 and isinstance(deck_quality, dict):
+        for tag_suffix, quality_key in DEATH_DECK_QUALITY_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"death_deck/{tag_suffix}",
+                _to_float(deck_quality.get(quality_key)),
+                trainer.episode_count,
+            )
 
     trainer.writer.add_scalar(f"env/{actor_index}_episodes", float(actor_completed_episodes[actor_index]), trainer.total_steps)

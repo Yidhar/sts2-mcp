@@ -18,6 +18,42 @@ import numpy as np
 from muzero.route_heuristics.root_bias import compute_route_heuristic_bias_vector
 
 
+_PLAYER_HP_KEYS = ("hp", "current_hp", "currentHealth", "current_health")
+_PLAYER_MAX_HP_KEYS = ("max_hp", "maxHealth", "max_health", "maximum_hp", "max_hp_raw")
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not np.isfinite(result):
+        return float(default)
+    return float(result)
+
+
+def _player_number(player: dict[str, Any], keys: tuple[str, ...]) -> float:
+    for key in keys:
+        if key in player and player.get(key) is not None:
+            return _finite_float(player.get(key), 0.0)
+    return 0.0
+
+
+def _player_hp_triplet(player: dict[str, Any]) -> tuple[float, float, float]:
+    """Return hp, max_hp, hp_ratio without treating max_hp<=1 as full health."""
+
+    hp = _player_number(player, _PLAYER_HP_KEYS) if isinstance(player, dict) else 0.0
+    max_hp = _player_number(player, _PLAYER_MAX_HP_KEYS) if isinstance(player, dict) else 0.0
+    if hp <= 0.0:
+        return 0.0, max_hp, 0.0
+    if max_hp <= 1.0:
+        # Bridge hiccups can publish hp=1/max_hp=1 or hp>>1/max_hp=1.  Both are
+        # unsafe as denominators; route telemetry/bias must not classify these
+        # frames as healthy/full HP.
+        return hp, max_hp, 0.0
+    return hp, max_hp, float(np.clip(hp / max_hp, 0.0, 1.0))
+
+
 class RouteHeuristicTelemetryMixin:
     """Helpers used by ``SelfPlayMixin`` for route-prior experiments."""
 
@@ -79,18 +115,16 @@ class RouteHeuristicTelemetryMixin:
                 if isinstance(raw_for_heuristic, dict) and isinstance(raw_for_heuristic.get("run"), dict)
                 else {}
             )
-            cur_hp = float(player.get("hp") or 0.0)
-            cur_max_hp = float(player.get("max_hp") or 0.0)
-            cur_gold = float(player.get("gold") or 0.0)
+            cur_hp, cur_max_hp, hp_ratio_now = _player_hp_triplet(player)
+            cur_gold = _finite_float(player.get("gold") if isinstance(player, dict) else 0.0, 0.0)
             cur_potions = count_non_empty_potions(player.get("potions"))
             cur_floor = int(run.get("floor") or 0)
-            hp_ratio_now = (cur_hp / cur_max_hp) if cur_max_hp > 0 else 1.0
 
             ranked = rank_legal_route_actions(
                 legal_actions=full_legal_actions,
                 deck_quality=deck_quality_now,
                 hp=cur_hp,
-                max_hp=cur_max_hp,
+                max_hp=cur_max_hp if cur_max_hp > 1.0 else 0.0,
                 gold=cur_gold,
                 potion_count=cur_potions,
                 floor=cur_floor,

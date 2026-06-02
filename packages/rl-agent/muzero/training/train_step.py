@@ -171,6 +171,11 @@ class TrainStepMixin:
             objective_value_loss_sum = 0.0
             reward_loss_sum = 0.0
             objective_reward_loss_sum = 0.0
+            combat_hp_preservation_aux_loss_sum = 0.0
+            combat_hp_preservation_mae_sum = 0.0
+            combat_hp_preservation_pred_mean_sum = 0.0
+            combat_hp_preservation_target_mean_sum = 0.0
+            combat_hp_preservation_active_sum = 0.0
             semantic_policy_loss_sum = 0.0
             semantic_value_loss_sum = 0.0
             semantic_reward_loss_sum = 0.0
@@ -427,6 +432,22 @@ class TrainStepMixin:
                     recurrent.reward_component_logits,
                     reward_component_target[:, step_k],
                 )
+                if self.combat_hp_preservation_aux_weight > 0.0:
+                    (
+                        combat_hp_preservation_aux_loss,
+                        combat_hp_preservation_metrics,
+                    ) = self._hp_preservation_reward_aux_loss(
+                        recurrent.reward_component_logits,
+                        reward_component_target[:, step_k],
+                    )
+                else:
+                    combat_hp_preservation_aux_loss = recurrent.reward_logits.new_zeros(())
+                    combat_hp_preservation_metrics = {
+                        "mae": 0.0,
+                        "pred_mean": 0.0,
+                        "target_mean": 0.0,
+                        "active_rate": 0.0,
+                    }
                 if semantic_training_active and semantic_recurrent is not None:
                     semantic_policy_loss = self._semantic_policy_loss(
                         semantic_recurrent.semantic_policy_logits,
@@ -663,6 +684,7 @@ class TrainStepMixin:
                     + reward_loss
                     + self.objective_value_weight * objective_value_loss
                     + self.objective_reward_weight * objective_reward_loss
+                    + self.combat_hp_preservation_aux_weight * combat_hp_preservation_aux_loss
                     + self.semantic_policy_weight * semantic_policy_loss
                     + self.semantic_value_weight * (semantic_value_loss + semantic_objective_value_loss)
                     + self.semantic_reward_weight * (semantic_reward_loss + semantic_objective_reward_loss)
@@ -695,6 +717,11 @@ class TrainStepMixin:
                 reward_loss_sum += reward_loss.item()
                 objective_value_loss_sum += objective_value_loss.item()
                 objective_reward_loss_sum += objective_reward_loss.item()
+                combat_hp_preservation_aux_loss_sum += combat_hp_preservation_aux_loss.item()
+                combat_hp_preservation_mae_sum += combat_hp_preservation_metrics["mae"]
+                combat_hp_preservation_pred_mean_sum += combat_hp_preservation_metrics["pred_mean"]
+                combat_hp_preservation_target_mean_sum += combat_hp_preservation_metrics["target_mean"]
+                combat_hp_preservation_active_sum += combat_hp_preservation_metrics["active_rate"]
                 semantic_policy_loss_sum += semantic_policy_loss.item()
                 semantic_value_loss_sum += (semantic_value_loss.item() + semantic_objective_value_loss.item())
                 semantic_reward_loss_sum += (semantic_reward_loss.item() + semantic_objective_reward_loss.item())
@@ -800,6 +827,83 @@ class TrainStepMixin:
                 current_obs_torch = next_obs_torch
                 current_teacher_token_encoded = next_teacher_token_encoded
     
+        human_demo_alignment_metrics: dict[str, float] = {
+            "human_demo_alignment/active": 0.0,
+            "human_demo_alignment/loss_applied": 0.0,
+            "human_demo_alignment/weight": float(getattr(self, "human_demo_alignment_weight", 0.0)),
+            "human_demo_alignment/shadow_only": (
+                1.0 if getattr(self, "human_demo_alignment_shadow_only", True) else 0.0
+            ),
+            "human_demo_alignment/batch_size": 0.0,
+            "human_demo_alignment/label_valid_rate": 0.0,
+        }
+        human_demo_policy_alignment = getattr(self, "human_demo_policy_alignment", None)
+        if human_demo_policy_alignment is not None and not spike_detected_in_step:
+            every = max(int(getattr(self, "human_demo_alignment_every_n_train_steps", 1)), 1)
+            train_step_count = int(getattr(self, "total_steps", 0))
+            if train_step_count % every == 0:
+                human_demo_batch = human_demo_policy_alignment.next_batch()
+                if human_demo_batch is not None:
+                    from muzero.training.human_demo_alignment import (
+                        compute_human_demo_policy_alignment_loss,
+                    )
+
+                    with self._amp_autocast():
+                        (
+                            human_demo_alignment_loss,
+                            human_demo_alignment_metrics,
+                        ) = compute_human_demo_policy_alignment_loss(
+                            self.network,
+                            human_demo_batch,
+                            device=self.device,
+                            weight=float(getattr(self, "human_demo_alignment_weight", 0.0)),
+                            shadow_only=bool(
+                                getattr(self, "human_demo_alignment_shadow_only", True)
+                            ),
+                        )
+                    total_loss = total_loss + human_demo_alignment_loss
+
+        offline_alignment_metrics: dict[str, float] = {
+            "offline_alignment/active": 0.0,
+            "offline_alignment/loss_applied": 0.0,
+            "offline_alignment/weight": max(float(getattr(self, "offline_alignment_weight", 0.0)), 0.0),
+            "offline_alignment/shadow_only": (
+                1.0 if getattr(self, "offline_alignment_shadow_only", True) else 0.0
+            ),
+            "offline_alignment/batch_size": 0.0,
+            "offline_alignment/valid_count": 0.0,
+            "offline_alignment/label_valid_rate": 0.0,
+            "offline_alignment/label_in_range_rate": 0.0,
+            "offline_alignment/label_unmasked_rate": 0.0,
+            "offline_alignment/label_oor_count": 0.0,
+            "offline_alignment/label_masked_count": 0.0,
+        }
+        offline_policy_alignment = getattr(self, "offline_policy_alignment", None)
+        if offline_policy_alignment is not None and not spike_detected_in_step:
+            every = max(int(getattr(self, "offline_alignment_every_n_train_steps", 1)), 1)
+            train_step_count = int(getattr(self, "total_steps", 0))
+            if train_step_count % every == 0:
+                offline_batch = offline_policy_alignment.next_batch()
+                if offline_batch is not None:
+                    from muzero.training.offline_policy_alignment import (
+                        compute_offline_policy_alignment_loss,
+                    )
+
+                    with self._amp_autocast():
+                        (
+                            offline_alignment_loss,
+                            offline_alignment_metrics,
+                        ) = compute_offline_policy_alignment_loss(
+                            self.network,
+                            offline_batch,
+                            device=self.device,
+                            weight=float(getattr(self, "offline_alignment_weight", 0.0)),
+                            shadow_only=bool(
+                                getattr(self, "offline_alignment_shadow_only", True)
+                            ),
+                        )
+                    total_loss = total_loss + offline_alignment_loss
+
         # Backward pass
         self.optimizer.zero_grad(set_to_none=True)
         # P0-7 hardening (recovery 2026-05-07): hard-skip the optimizer step
@@ -857,6 +961,7 @@ class TrainStepMixin:
             "loss/semantic_value": semantic_value_loss_sum / policy_terms,
             "loss/reward": reward_loss_sum / reward_terms,
             "loss/objective_reward": objective_reward_loss_sum / reward_terms,
+            "loss/combat_hp_preservation_aux": combat_hp_preservation_aux_loss_sum / reward_terms,
             "loss/semantic_reward": semantic_reward_loss_sum / reward_terms,
             "loss/semantic_state_consistency": semantic_state_consistency_loss_sum / surface_terms,
             "loss/objective_diversity": objective_diversity_loss_sum / policy_terms,
@@ -886,6 +991,14 @@ class TrainStepMixin:
             "metric/planner_q_mae": planner_q_mae_sum / planner_terms,
             "metric/planner_objective_q_mae": planner_objective_q_mae_sum / planner_objective_terms,
             "metric/planner_risk_q_mae": planner_risk_q_mae_sum / planner_objective_terms,
+            "combat_hp_preservation/mae": combat_hp_preservation_mae_sum / reward_terms,
+            "combat_hp_preservation/pred_mean": combat_hp_preservation_pred_mean_sum / reward_terms,
+            "combat_hp_preservation/target_mean": combat_hp_preservation_target_mean_sum / reward_terms,
+            "combat_hp_preservation/active_rate": combat_hp_preservation_active_sum / reward_terms,
+            "combat_hp_preservation/aux_weight": float(self.combat_hp_preservation_aux_weight),
+            "combat_hp_preservation/loss_applied": (
+                1.0 if self.combat_hp_preservation_aux_weight > 0.0 else 0.0
+            ),
             "metric/teacher_policy_entropy": teacher_entropy_sum / policy_terms,
             "metric/student_policy_entropy": student_entropy_sum / policy_terms,
             "metric/state_consistency_cosine": state_consistency_cosine_sum / surface_terms,
@@ -937,6 +1050,8 @@ class TrainStepMixin:
             "buffer/sample_encounter_weight_mean": float(sample_encounter_weight.mean().item()),
             "buffer/sample_sampling_scale_mean": float(sample_sampling_scale.mean().item()),
         }
+        metrics.update(human_demo_alignment_metrics)
+        metrics.update(offline_alignment_metrics)
         # P0-2 (recovery 2026-05-06): emit per-batch tier-quota diagnostics so
         # TensorBoard shows whether the hard quota actually held boss<=cap and
         # delivered the configured normal/elite minimums.

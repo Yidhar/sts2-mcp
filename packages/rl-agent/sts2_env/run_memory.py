@@ -78,6 +78,37 @@ def _clip01(value: float) -> float:
     return min(max(value, 0.0), 1.0)
 
 
+_PLAYER_HP_KEYS = ("hp", "current_hp", "currentHealth", "current_health")
+_PLAYER_MAX_HP_KEYS = ("max_hp", "maxHealth", "max_health", "maximum_hp", "max_hp_raw")
+
+
+def _player_number(player: dict[str, Any] | None, keys: tuple[str, ...], default: float = 0.0) -> float:
+    if not isinstance(player, dict):
+        return default
+    for key in keys:
+        if key in player and player.get(key) is not None:
+            value = _float(player.get(key), default)
+            return value if math.isfinite(value) else default
+    creature = player.get("creature")
+    if isinstance(creature, dict):
+        for key in keys:
+            if key in creature and creature.get(key) is not None:
+                value = _float(creature.get(key), default)
+                return value if math.isfinite(value) else default
+    return default
+
+
+def _player_hp_triplet(player: dict[str, Any] | None) -> tuple[float, float, float]:
+    hp = _player_number(player, _PLAYER_HP_KEYS, 0.0)
+    max_hp = _player_number(player, _PLAYER_MAX_HP_KEYS, 0.0)
+    if hp < 0.0:
+        hp = 0.0
+    if max_hp > 1.0:
+        return hp, max_hp, _clip01(hp / max_hp)
+    # Missing/suspicious max_hp=1 must not be encoded as "full HP".
+    return hp, max_hp, 0.0
+
+
 def _compact_scalar(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -541,11 +572,10 @@ class RunMemoryTracker:
         act = int(_float(run.get("act_id")))
         room_type = _room_type(obs)
 
-        hp = _float(player.get("hp"))
-        max_hp = max(_float(player.get("max_hp"), 1.0), 1.0)
-        hp_ratio = hp / max_hp
+        hp, max_hp, hp_ratio = _player_hp_triplet(player)
         self.state.lowest_hp_ratio_seen = min(self.state.lowest_hp_ratio_seen, hp_ratio)
-        self.state.max_hp_seen = max(self.state.max_hp_seen, max_hp)
+        if max_hp > 1.0:
+            self.state.max_hp_seen = max(self.state.max_hp_seen, max_hp)
         self.state.last_floor = max(self.state.last_floor, floor)
         self.state.last_act = max(self.state.last_act, act)
 
@@ -619,9 +649,7 @@ class RunMemoryTracker:
         run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
         player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
         combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
-        hp = _float(player.get("hp"))
-        max_hp = max(_float(player.get("max_hp"), 1.0), 1.0)
-        hp_ratio = hp / max_hp
+        hp, max_hp, hp_ratio = _player_hp_triplet(player)
         gold = _float(player.get("gold"))
         potion_count = _count_nonempty_potions(obs)
         potion_mechanics_available = 1.0 if self.state.potion_mechanics_available else 0.0

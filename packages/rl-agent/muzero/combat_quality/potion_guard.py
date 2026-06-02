@@ -577,7 +577,11 @@ def boss_zero_energy_liquid_escape(
         effective_max_hp = profile_max_hp
     effective_hp_ratio = float(hp_ratio)
     if effective_hp_ratio <= 0.0 and effective_hp > 0.0 and effective_max_hp > 0.0:
-        effective_hp_ratio = effective_hp / max(effective_max_hp, 1.0)
+        effective_hp_ratio = (
+            min(max(effective_hp / effective_max_hp, 0.0), 1.0)
+            if effective_max_hp > 1.0
+            else 0.0
+        )
     pressure = float(threat_gap)
     if pressure <= 0.05:
         # Preserve the existing idle-waste behavior at 25/91 HP; only

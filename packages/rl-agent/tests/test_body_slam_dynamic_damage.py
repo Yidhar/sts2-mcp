@@ -131,6 +131,45 @@ def test_body_slam_missing_preview_uses_current_block_for_action_and_lethal_cont
     np.testing.assert_allclose(encoded["world_tokens"][hand_idx, 14], expected_damage_200, rtol=1e-5)
 
 
+def test_body_slam_stale_low_preview_is_raised_to_current_block() -> None:
+    modules = _load_sts2_env_modules()
+    obs_common = modules["observation_common"]
+    obs_v3 = modules["observation_v3"]
+
+    encoder = obs_v3.WorldTokenObservationEncoder(use_text=False)
+    obs, legal_actions = _obs_and_actions(player_block=17, enemy_hp=12)
+    body_slam = legal_actions[0]["card"]
+    # Some bridge/static variants may expose a non-zero but stale value.  Body
+    # Slam's live damage is current block, so 3 must not mask the lethal 17.
+    body_slam["damage"] = 3
+    body_slam["effect_preview"] = {"damage": 3, "total_damage": 3, "damage_per_hit": 3, "hits": 1}
+    encoded = encoder.encode(obs, legal_actions=legal_actions)
+
+    expected_damage_200 = obs_common._log_norm(17, obs_common._LOG1P_200)
+    expected_damage_100 = obs_common._log_norm(17, obs_common._LOG1P_100)
+    stale_damage_200 = obs_common._log_norm(3, obs_common._LOG1P_200)
+
+    assert encoded["candidate_query_tokens"][0, 22] > stale_damage_200
+    np.testing.assert_allclose(encoded["candidate_query_tokens"][0, 22], expected_damage_200, rtol=1e-5)
+    np.testing.assert_allclose(encoded["candidate_query_tokens"][0, 40], expected_damage_200, rtol=1e-5)
+    np.testing.assert_allclose(encoded["candidate_query_tokens"][0, 42], expected_damage_100, rtol=1e-5)
+
+    local_types = encoded["candidate_local_type_ids"][0]
+    local_tokens = encoded["candidate_local_tokens"][0]
+    source_idx = int(np.where(local_types == obs_v3.TOKEN_TYPE_TO_ID["SOURCE_CARD_LOCAL"])[0][0])
+    np.testing.assert_allclose(local_tokens[source_idx, 22], expected_damage_200, rtol=1e-5)
+
+    reaction_idx = int(np.where(local_types == obs_v3.TOKEN_TYPE_TO_ID["TARGET_REACTION_LOCAL"])[0][0])
+    assert local_tokens[reaction_idx, 9] == 1.0
+
+    hand_idx = int(np.where(encoded["world_token_type_ids"] == obs_v3.TOKEN_TYPE_TO_ID["HAND_CARD"])[0][0])
+    np.testing.assert_allclose(encoded["world_tokens"][hand_idx, 14], expected_damage_200, rtol=1e-5)
+
+    profile = encoder._source_profile_for_obs(body_slam, obs)
+    assert profile["damage"] == 17
+    assert profile["block_scaled_damage"] == 1.0
+
+
 def test_body_slam_zero_block_does_not_invent_damage() -> None:
     modules = _load_sts2_env_modules()
     obs_v3 = modules["observation_v3"]

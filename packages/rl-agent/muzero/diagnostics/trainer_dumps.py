@@ -17,8 +17,10 @@ import numpy as np
 
 from sts2_env.observation_v2 import MAX_ACTIONS
 
+from muzero.diagnostics.death_slice_dumps import DeathSliceDumpMixin
 
-class DiagnosticDumpMixin:
+
+class DiagnosticDumpMixin(DeathSliceDumpMixin):
     """JSONL dump helpers mixed into MuZeroTrainer."""
 
     def _diagnostic_jsonl_path(self, filename: str) -> Path | None:
@@ -75,6 +77,143 @@ class DiagnosticDumpMixin:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             self._card_reward_choice_dump_count = count + 1
+        except Exception:
+            return
+
+    def _dump_death_deck_summary(
+        self,
+        *,
+        final_info: dict[str, Any] | None,
+        final_progress: dict[str, Any] | None,
+        final_deck_cards: list[Any] | tuple[Any, ...] | None,
+        final_deck_quality: dict[str, Any] | None,
+        final_deck_compact: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+        card_reward_meta: dict[str, Any] | None,
+        episode_reward: float,
+        episode_length: int,
+        max_floor: float,
+        death_floor: float,
+        act1_boss_seen: bool,
+        act1_clear: bool,
+        progress_snapshots: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    ) -> None:
+        """Append one compact death-deck post-mortem record.
+
+        TensorBoard scalars show when a dying deck is weak, but not which
+        concrete cards caused the construction failure.  This bounded JSONL
+        keeps card counts, deck-quality scalars, reward skip/pick metadata,
+        and final floor context together for post-mortems.
+        """
+
+        if float(death_floor or 0.0) <= 0.0:
+            return
+        if getattr(self, "_death_deck_summary_dump_disabled", False):
+            return
+        cap = int(getattr(self, "_death_deck_summary_dump_max", 100000))
+        count = int(getattr(self, "_death_deck_summary_dump_count", 0) or 0)
+        if cap > 0 and count >= cap:
+            return
+
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            return out if math.isfinite(out) else float(default)
+
+        def _safe_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return int(default)
+
+        try:
+            compact_cards = list(final_deck_compact or [])
+            title_counts: dict[str, int] = {}
+            upgraded_counts: dict[str, int] = {}
+            for card in compact_cards:
+                if not isinstance(card, dict):
+                    continue
+                title = str(card.get("title") or card.get("id") or "<unknown>").strip() or "<unknown>"
+                title_counts[title] = int(title_counts.get(title, 0)) + 1
+                if bool(card.get("upgraded")) or _safe_int(card.get("upgrade_level"), 0) > 0:
+                    upgraded_counts[title] = int(upgraded_counts.get(title, 0)) + 1
+
+            progress = dict(final_progress or {})
+            final_info_phase = final_info.get("phase") if isinstance(final_info, dict) else None
+            payload = {
+                "time": time.time(),
+                "kind": "death_deck_summary",
+                "global_step": int(getattr(self, "total_steps", 0)),
+                "episode_id": int(getattr(self, "episode_count", 0)),
+                "episode": {
+                    "reward": _safe_float(episode_reward),
+                    "length": _safe_int(episode_length),
+                    "max_floor": _safe_float(max_floor),
+                    "death_floor": _safe_float(death_floor),
+                    "act1_boss_seen": bool(act1_boss_seen),
+                    "act1_clear": bool(act1_clear),
+                    "final_phase": final_info_phase,
+                },
+                "final_progress": {
+                    "floor": _safe_float(progress.get("floor")),
+                    "act_id": _safe_float(progress.get("act_id")),
+                    "room_type": progress.get("room_type"),
+                    "room_model": progress.get("room_model"),
+                    "encounter_id": progress.get("encounter_id"),
+                    "hp": _safe_float(progress.get("hp")),
+                    "max_hp": _safe_float(progress.get("max_hp")),
+                    "hp_valid": bool(progress.get("hp_valid")),
+                    "max_hp_suspicious": bool(progress.get("max_hp_suspicious")),
+                },
+                "deck": {
+                    "size": len(final_deck_cards or []),
+                    "compact_size": len(compact_cards),
+                    "starter_count": _safe_float((final_deck_quality or {}).get("starter_count"), 0.0),
+                    "starter_ratio": _safe_float((final_deck_quality or {}).get("starter_ratio"), 0.0),
+                    "nonstarter_count": _safe_float((final_deck_quality or {}).get("nonstarter_count"), 0.0),
+                    "strike_count": _safe_float((final_deck_quality or {}).get("strike_count"), 0.0),
+                    "defend_count": _safe_float((final_deck_quality or {}).get("defend_count"), 0.0),
+                    "upgraded_count": _safe_float((final_deck_quality or {}).get("upgraded_count"), 0.0),
+                    "upgraded_ratio": _safe_float((final_deck_quality or {}).get("upgraded_ratio"), 0.0),
+                    "starter_upgrade_count": _safe_float((final_deck_quality or {}).get("starter_upgrade_count"), 0.0),
+                    "starter_upgrade_ratio": _safe_float((final_deck_quality or {}).get("starter_upgrade_ratio"), 0.0),
+                    "title_counts": [
+                        {
+                            "title": title,
+                            "count": int(count_value),
+                            "upgraded_count": int(upgraded_counts.get(title, 0)),
+                        }
+                        for title, count_value in sorted(
+                            title_counts.items(),
+                            key=lambda kv: (-int(kv[1]), str(kv[0])),
+                        )
+                    ],
+                    "cards": compact_cards,
+                },
+                "deck_quality": {
+                    str(key): _safe_float(value, 0.0)
+                    for key, value in (final_deck_quality or {}).items()
+                    if isinstance(value, (bool, int, float, np.generic)) or value is None
+                },
+                "card_reward": {
+                    str(key): _safe_float(value, 0.0)
+                    for key, value in (card_reward_meta or {}).items()
+                    if isinstance(value, (bool, int, float, np.generic)) or value is None
+                },
+                "progress_tail": [
+                    dict(item)
+                    for item in list(progress_snapshots or [])[-8:]
+                    if isinstance(item, dict)
+                ],
+            }
+            path = self._diagnostic_jsonl_path("death_deck_summary.jsonl")
+            if path is None:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._death_deck_summary_dump_count = count + 1
         except Exception:
             return
 
@@ -458,6 +597,7 @@ class DiagnosticDumpMixin:
         action_diagnostics: dict[str, Any] | None,
         encounter: str,
         tier: str,
+        pre_step_info: dict[str, Any] | None = None,
     ) -> None:
         """Append one JSONL entry per selected end_turn action.
 
@@ -478,14 +618,64 @@ class DiagnosticDumpMixin:
             raw_player = raw_obs.get("player") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("player"), dict) else {}
             if not raw_player and isinstance(raw_combat.get("player"), dict):
                 raw_player = raw_combat.get("player")
+            raw_run = raw_obs.get("run") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("run"), dict) else {}
+            if not raw_run and isinstance(raw_obs, dict) and isinstance(raw_obs.get("transition_state"), dict):
+                transition_run = raw_obs["transition_state"].get("run")
+                if isinstance(transition_run, dict):
+                    raw_run = transition_run
+            pre_info = pre_step_info if isinstance(pre_step_info, dict) else {}
+            pre_actionability = (
+                pre_info.get("actionability")
+                if isinstance(pre_info.get("actionability"), dict)
+                else {}
+            )
+            pre_bridge_info = (
+                pre_info.get("bridge_info")
+                if isinstance(pre_info.get("bridge_info"), dict)
+                else {}
+            )
+            pre_bridge_actionability = (
+                pre_bridge_info.get("actionability")
+                if isinstance(pre_bridge_info.get("actionability"), dict)
+                else {}
+            )
+
+            def _safe_float_local(value: Any, default: float = 0.0) -> float:
+                try:
+                    out = float(value)
+                except (TypeError, ValueError):
+                    return float(default)
+                return out if math.isfinite(out) else float(default)
+
+            floor_value = (
+                _safe_float_local(raw_run.get("floor", raw_run.get("total_floor")))
+                if isinstance(raw_run, dict)
+                else 0.0
+            )
+            parse_act = getattr(self, "_parse_progress_act_id", None)
+            if callable(parse_act) and isinstance(raw_run, dict):
+                try:
+                    act_id_value = float(parse_act(raw_run.get("act_id"), raw_run))
+                except Exception:
+                    act_id_value = 0.0
+            else:
+                act_id_value = _safe_float_local(raw_run.get("act_id")) if isinstance(raw_run, dict) else 0.0
             incoming, block, hp = self._incoming_damage_pressure(raw_obs)
             energy_val = float(context.get("energy", 0.0) or 0.0)
             try:
-                hand_count = len(raw_combat.get("hand") or []) if isinstance(raw_combat.get("hand"), list) else 0
+                raw_hand = raw_combat.get("hand")
+                if not isinstance(raw_hand, list) and isinstance(raw_player, dict):
+                    raw_hand = raw_player.get("hand")
+                if not isinstance(raw_hand, list):
+                    raw_hand = []
+                hand_count = len(raw_hand)
+                if hand_count <= 0:
+                    hand_count = int(_safe_float_local(raw_combat.get("hand_count", raw_combat.get("num_cards_in_hand")), 0.0))
                 draw_count = len(raw_combat.get("draw_pile") or []) if isinstance(raw_combat.get("draw_pile"), list) else 0
                 discard_count = len(raw_combat.get("discard_pile") or []) if isinstance(raw_combat.get("discard_pile"), list) else 0
                 exhaust_count = len(raw_combat.get("exhaust_pile") or []) if isinstance(raw_combat.get("exhaust_pile"), list) else 0
             except Exception:
+                raw_hand = []
                 hand_count = draw_count = discard_count = exhaust_count = 0
 
             x_cost_count = 0
@@ -584,6 +774,118 @@ class DiagnosticDumpMixin:
             except Exception:
                 top_actions = []
 
+            def _compact_card_local(card: Any) -> dict[str, Any]:
+                if not isinstance(card, dict):
+                    return {"repr": str(card)}
+                return {
+                    "id": card.get("id") or card.get("card_id"),
+                    "title": card.get("title") or card.get("name"),
+                    "instance_uuid": card.get("instance_uuid") or card.get("uuid") or card.get("runtime_id"),
+                    "type": card.get("type") or card.get("card_type"),
+                    "cost": card.get("cost"),
+                    "cost_for_turn": card.get("cost_for_turn"),
+                    "is_playable": card.get("is_playable"),
+                    "upgrade_level": card.get("upgrade_level", card.get("upgrades")),
+                    "damage": card.get("damage"),
+                    "block": card.get("block"),
+                }
+
+            def _compact_action_local(idx: int, action: Any, *, score: float | None = None) -> dict[str, Any]:
+                if not isinstance(action, dict):
+                    return {"idx": int(idx), "repr": str(action), "score": score}
+                semantic = action.get("semantic") if isinstance(action.get("semantic"), dict) else {}
+                card = action.get("card") if isinstance(action.get("card"), dict) else {}
+                potion = action.get("potion") if isinstance(action.get("potion"), dict) else {}
+                target = action.get("target") if isinstance(action.get("target"), dict) else {}
+                family = self._semantic_family(action)
+                return {
+                    "idx": int(idx),
+                    "is_chosen": int(idx) == int(chosen_idx),
+                    "mask_legal": bool(idx < mask_np.shape[0] and mask_np[idx] > 0),
+                    "family": family,
+                    "kind": action.get("kind"),
+                    "action_id": action.get("action_id"),
+                    "title": action.get("title") or card.get("title") or potion.get("title") or potion.get("name"),
+                    "card_id": card.get("id") or action.get("card_id"),
+                    "card_title": card.get("title") or action.get("card_title"),
+                    "potion_id": potion.get("id") or action.get("potion_id"),
+                    "potion_title": potion.get("title") or potion.get("name"),
+                    "cost": card.get("cost", action.get("cost")),
+                    "target": target.get("name") or target.get("id") or action.get("target"),
+                    "roles": semantic.get("roles") or semantic.get("tags"),
+                    "semantic": {
+                        "family": semantic.get("family") or semantic.get("action_kind"),
+                        "domain": semantic.get("domain"),
+                        "surface": semantic.get("surface"),
+                        "selection": semantic.get("selection"),
+                    } if semantic else {},
+                    "damage": action.get("damage", card.get("damage")),
+                    "block": action.get("block", card.get("block")),
+                    "score": score,
+                }
+
+            legal_actions_compact: list[dict[str, Any]] = []
+            selected_action_compact: dict[str, Any] = {}
+            try:
+                policy_np_full = (
+                    np.asarray(search_policy, dtype=np.float32).reshape(-1)
+                    if search_policy is not None
+                    else np.zeros(MAX_ACTIONS, dtype=np.float32)
+                )
+                compact_count = min(len(legal_actions or []), MAX_ACTIONS, 32)
+                for idx in range(compact_count):
+                    score = float(policy_np_full[idx]) if idx < policy_np_full.shape[0] else None
+                    row = _compact_action_local(idx, (legal_actions or [])[idx], score=score)
+                    legal_actions_compact.append(row)
+                    if idx == int(chosen_idx):
+                        selected_action_compact = row
+            except Exception:
+                legal_actions_compact = []
+                selected_action_compact = {}
+
+            actionability_record: dict[str, Any] = {}
+            try:
+                raw_legal_action_count = int(pre_info.get("raw_legal_action_count", 0) or 0)
+            except (TypeError, ValueError):
+                raw_legal_action_count = 0
+            try:
+                blocked_action_drop_count = int(pre_info.get("blocked_action_drop_count", 0) or 0)
+            except (TypeError, ValueError):
+                blocked_action_drop_count = 0
+            try:
+                actionability_legal_non_end_turn_count = int(
+                    pre_actionability.get(
+                        "legal_non_end_turn_count",
+                        pre_bridge_actionability.get("legal_non_end_turn_count", 0),
+                    )
+                    or 0
+                )
+            except (TypeError, ValueError):
+                actionability_legal_non_end_turn_count = 0
+            action_diag = action_diagnostics if isinstance(action_diagnostics, dict) else {}
+            try:
+                actionability_record = {
+                    "transient_only_end_turn": bool(
+                        pre_actionability.get(
+                            "transient_only_end_turn",
+                            pre_bridge_actionability.get("transient_only_end_turn", False),
+                        )
+                    ),
+                    "frontier_stable": pre_actionability.get(
+                        "frontier_stable",
+                        pre_bridge_actionability.get("frontier_stable"),
+                    ),
+                    "legal_non_end_turn_count": actionability_legal_non_end_turn_count,
+                    "raw_legal_action_count": raw_legal_action_count,
+                    "blocked_action_drop_count": blocked_action_drop_count,
+                    "combat_quality_prior_transient_only_end_turn": action_diag.get("combat_quality_prior_transient_only_end_turn"),
+                    "combat_quality_post_step_frontier_leaked": action_diag.get("combat_quality_post_step_frontier_leaked"),
+                    "combat_quality_post_step_frontier_suspicious_singleton": action_diag.get("combat_quality_post_step_frontier_suspicious_singleton"),
+                    "frontier_pre_dispatch_end_turn_blocked": action_diag.get("frontier_pre_dispatch_end_turn_blocked"),
+                }
+            except Exception:
+                actionability_record = {}
+
             positive_progress_count = int(context.get("positive_progress_count", 0) or 0)
             urgent_action_count = int(context.get("urgent_positive_count", 0) or 0)
             forced_no_non_end_turn_action = bool(class_name == "forced_end_turn" and legal_non_end_turn_count <= 0)
@@ -599,6 +901,18 @@ class DiagnosticDumpMixin:
                 and legal_non_end_turn_count > 0
                 and urgent_action_count <= 0
             )
+            singleton_end_turn_leak_suspect = bool(
+                class_name == "forced_end_turn"
+                and legal_non_end_turn_count <= 0
+                and energy_val > 0.05
+                and hand_count > 0
+                and (
+                    bool(actionability_record.get("transient_only_end_turn", False))
+                    or actionability_record.get("frontier_stable") is False
+                    or raw_legal_action_count <= 1
+                    or blocked_action_drop_count > 0
+                )
+            )
             # Keep selected-EndTurn diagnostics reviewable: leftover energy after
             # all real actions are exhausted is a benign forced EndTurn, not an
             # empty-pass mistake.
@@ -607,6 +921,7 @@ class DiagnosticDumpMixin:
                 "forced_no_non_end_turn_action": forced_no_non_end_turn_action,
                 "benign_leftover_energy": benign_leftover_energy,
                 "optional_only_nonurgent_action": optional_only_nonurgent_action,
+                "singleton_end_turn_leak_suspect": singleton_end_turn_leak_suspect,
             })
 
             payload = {
@@ -620,6 +935,16 @@ class DiagnosticDumpMixin:
                 "selected_family": "end_turn",
                 "end_turn_class": class_name,
                 "reason_flags": reason_flags,
+                "progress": {
+                    "floor": float(floor_value),
+                    "act_id": float(act_id_value),
+                    "room_type": raw_run.get("room_type") or raw_run.get("room_type_name"),
+                    "room_model": raw_run.get("room_model") or raw_run.get("room_id"),
+                    "encounter_id_raw": raw_run.get("encounter_id") or raw_run.get("encounter"),
+                    "screen": raw_obs.get("screen") if isinstance(raw_obs, dict) else None,
+                    "phase": raw_obs.get("phase") if isinstance(raw_obs, dict) else None,
+                    "state_version": raw_obs.get("state_version") if isinstance(raw_obs, dict) else None,
+                },
                 "player": {
                     "hp": float(hp),
                     "max_hp": float(self._safe_float(raw_player.get("max_hp"))) if isinstance(raw_player, dict) else 0.0,
@@ -646,7 +971,14 @@ class DiagnosticDumpMixin:
                     "zero_energy_x_cost_candidate_count": int(zero_x_count),
                     "potion_available_count": int(context.get("potion_available_count", 0) or 0),
                     "potion_urgent_count": int(context.get("potion_urgent_count", 0) or 0),
+                    "raw_legal_action_count": int(raw_legal_action_count),
+                    "blocked_action_drop_count": int(blocked_action_drop_count),
+                    "actionability_legal_non_end_turn_count": int(actionability_legal_non_end_turn_count),
                 },
+                "actionability": actionability_record,
+                "raw_hand_cards": [_compact_card_local(card) for card in (raw_hand or [])[:12]],
+                "selected_action": selected_action_compact,
+                "legal_actions_compact": legal_actions_compact,
                 "boss_context": boss_context,
                 "top_legal_actions": top_actions,
             }
@@ -1046,391 +1378,6 @@ class DiagnosticDumpMixin:
             return
 
     @staticmethod
-    def _compact_death_slice_array(value: Any, *, head: int = 16) -> Any:
-        """Return a bounded JSON-safe summary for large ndarray-like values."""
-
-        try:
-            arr = np.asarray(value)
-        except Exception:
-            return value
-        if arr.dtype == object:
-            return str(value)
-        flat = arr.reshape(-1)
-        summary: dict[str, Any] = {
-            "shape": [int(dim) for dim in arr.shape],
-            "size": int(flat.size),
-        }
-        if flat.size:
-            try:
-                numeric = flat.astype(np.float32, copy=False)
-                summary.update(
-                    {
-                        "min": float(np.nanmin(numeric)),
-                        "max": float(np.nanmax(numeric)),
-                        "mean": float(np.nanmean(numeric)),
-                        "sum": float(np.nansum(numeric)),
-                        "head": [float(x) for x in numeric[:head].tolist()],
-                    }
-                )
-            except Exception:
-                summary["head"] = [str(x) for x in flat[:head].tolist()]
-        return summary
-
-    @classmethod
-    def _compact_death_slice_obs(cls, obs: Any) -> dict[str, Any]:
-        """Summarise the packed observation kept in replay without dumping it whole.
-
-        Combat failure slices are post-mortem artifacts, not replay files.  Full
-        token/vector observations can be large enough to make long sandbox runs
-        noisy, so keep only shapes/statistics plus small scalar metadata.
-        """
-
-        if not isinstance(obs, dict):
-            return {}
-        out: dict[str, Any] = {}
-        for key, value in obs.items():
-            if isinstance(value, (int, float, bool, str)) or value is None:
-                out[str(key)] = value
-                continue
-            if isinstance(value, np.ndarray):
-                out[str(key)] = cls._compact_death_slice_array(value)
-                continue
-            if isinstance(value, (list, tuple)) and value and all(
-                isinstance(x, (int, float, bool, np.integer, np.floating, np.bool_)) for x in value[:64]
-            ):
-                out[str(key)] = cls._compact_death_slice_array(value)
-                continue
-            if isinstance(value, dict):
-                small: dict[str, Any] = {}
-                for sub_key, sub_value in list(value.items())[:24]:
-                    if isinstance(sub_value, (int, float, bool, str)) or sub_value is None:
-                        small[str(sub_key)] = sub_value
-                    elif isinstance(sub_value, np.ndarray):
-                        small[str(sub_key)] = cls._compact_death_slice_array(sub_value, head=8)
-                if small:
-                    out[str(key)] = small
-        return out
-
-    @staticmethod
-    def _compact_death_slice_policy(
-        *,
-        action_mask: Any,
-        search_policy: Any,
-        selected_action: int,
-        top_k: int = 8,
-    ) -> dict[str, Any]:
-        """Compact selected/legal/top-policy information for a death slice."""
-
-        try:
-            mask = np.asarray(action_mask, dtype=np.float32).reshape(-1)
-        except Exception:
-            mask = np.zeros(0, dtype=np.float32)
-        try:
-            policy = np.asarray(search_policy, dtype=np.float32).reshape(-1)
-        except Exception:
-            policy = np.zeros(0, dtype=np.float32)
-        legal_indices = np.flatnonzero(mask > 0.0) if mask.size else np.asarray([], dtype=np.int64)
-        top: list[dict[str, Any]] = []
-        if policy.size:
-            candidates = legal_indices if legal_indices.size else np.arange(policy.size)
-            ranked = sorted(
-                (int(idx) for idx in candidates if 0 <= int(idx) < policy.size),
-                key=lambda idx: float(policy[idx]),
-                reverse=True,
-            )[: max(int(top_k), 0)]
-            top = [{"idx": int(idx), "p": float(policy[idx])} for idx in ranked]
-        selected_p = float(policy[int(selected_action)]) if 0 <= int(selected_action) < policy.size else 0.0
-        return {
-            "legal_count": int(legal_indices.size),
-            "selected_policy_prob": selected_p,
-            "top_policy": top,
-        }
-
-    @staticmethod
-    def _compact_death_slice_search_stats(search_stats: Any) -> dict[str, Any]:
-        """Keep the search/planner fields that explain tactical failure."""
-
-        if not isinstance(search_stats, dict):
-            return {}
-        allowed_exact = {
-            "num_simulations",
-            "root_candidates",
-            "root_selectable_children_mean",
-            "mean_expanded_children",
-            "mean_predicted_legal_count",
-            "mean_surface_keep_count",
-            "root_top1_visit_share",
-            "root_visit_entropy",
-            "root_value",
-            "max_search_depth",
-            "mean_leaf_depth",
-            "direct_rollout_steps_used",
-            "direct_rollout_branch_count_mean",
-            "direct_rollout_root_valid_count",
-            "direct_rollout_q_mean",
-            "direct_rollout_objective_q_mean",
-            "direct_rollout_risk_q_mean",
-            "direct_rollout_uncertainty_mean",
-            "direct_rollout_branch_disagreement_mean",
-            "root_bias_scale",
-            "root_bias_nonzero",
-            "root_bias_abs_mean",
-            "root_bias_max_abs",
-            "root_bias_changed_top1",
-            "root_bias_selected_action_delta",
-            "combat_quality_energy",
-            "combat_quality_incoming_damage",
-            "combat_quality_positive_action_count",
-            "combat_quality_urgent_positive_action_count",
-            "combat_quality_deferable_positive_action_count",
-        }
-        out: dict[str, Any] = {}
-        for key, value in search_stats.items():
-            keep = (
-                key in allowed_exact
-                or str(key).startswith("combat_quality_")
-                or str(key).startswith("offender/")
-            )
-            if not keep or not isinstance(value, (int, float, bool, np.integer, np.floating, np.bool_)):
-                continue
-            out[str(key)] = float(value)
-        return out
-
-    @staticmethod
-    def _death_slice_lucky_text_match(value: Any) -> bool:
-        """Best-effort Lucky/Fortune potion detector for post-mortem dumps.
-
-        Death-slice logging is diagnostic-only; it should prefer catching a
-        suspicious death over silently dropping it because an upstream metadata
-        flag was not set.  Match the compact potion payload, selected action, or
-        final inventory dump by both canonical ids and localized titles.
-        """
-
-        try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
-        except Exception:
-            text = str(value)
-        text_u = text.upper()
-        return bool(
-            "LUCKY_TONIC" in text_u
-            or "LUCKY TONIC" in text_u
-            or "POTION.LUCK" in text_u
-            or "FORTUNE" in text_u
-            or "幸运药剂" in text
-            or "幸运补剂" in text
-            or "幸运药" in text
-            or "幸运补" in text
-            or "幸運" in text
-        )
-
-    @classmethod
-    def _death_slice_lucky_count(cls, values: Any) -> int:
-        if not isinstance(values, list):
-            return 0
-        return int(sum(1 for item in values if cls._death_slice_lucky_text_match(item)))
-
-    @classmethod
-    def _death_slice_lucky_used_in_rows(cls, values: Any) -> bool:
-        if not isinstance(values, list):
-            return False
-        for item in values:
-            if not cls._death_slice_lucky_text_match(item):
-                continue
-            action_id = ""
-            if isinstance(item, dict):
-                action_id = str(
-                    item.get("action_id")
-                    or item.get("selected_action_id")
-                    or item.get("action")
-                    or ""
-                ).strip().lower()
-            # Some historical rows only record the potion payload after a use.
-            # Treat those as used instead of flagging a false "unused Lucky".
-            if not action_id:
-                return True
-            if action_id.startswith("use_potion") or "use_potion" in action_id:
-                return True
-        return False
-
-    def _dump_death_slice(
-        self,
-        *,
-        trajectory: Any,
-        encounter_id: str,
-        encounter_tier: str,
-        loss: bool,
-        steps: list[dict[str, Any]],
-        watch_only: bool = True,
-        tail_len: int = 5,
-        reason: str = "",
-    ) -> None:
-        """Append a death-slice record to ``diagnostics/death_slices/<eid>.jsonl``
-        when a watch-listed or explicitly requested combat episode loses.
-
-        Each record captures:
-        * the last few combat steps before death (action / search_stats / mask)
-        * episode-level metadata (encounter id, tier, length)
-        * mechanic context for Kaiser / Insatiable / Ceremonial as a
-          convenience so the slice is self-contained.
-
-        The writer is bounded by ``_DEATH_SLICE_PER_ENCOUNTER_CAP`` so a
-        long run cannot produce a multi-gigabyte JSONL. After the cap is
-        reached the writer becomes a no-op for that encounter.
-        """
-        if not loss:
-            return
-        eid_upper = str(encounter_id or "").strip().upper()
-        targets = tuple(str(x).upper() for x in getattr(self, "_DEATH_SLICE_TARGETS", ()))
-        if not eid_upper:
-            return
-        if not isinstance(steps, list) or not steps:
-            return
-        metadata = trajectory.metadata if isinstance(getattr(trajectory, "metadata", None), dict) else {}
-        final_lucky_potion_count = self._death_slice_lucky_count(metadata.get("final_potion_dump"))
-        lucky_seen_anywhere = bool(
-            bool(metadata.get("lucky_seen_this_combat"))
-            or bool(metadata.get("lucky_legal_this_combat"))
-            or final_lucky_potion_count > 0
-            or self._death_slice_lucky_count(metadata.get("last_seen_potions_this_combat")) > 0
-            or self._death_slice_lucky_count(metadata.get("last_seen_legal_potion_actions_this_combat")) > 0
-            or self._death_slice_lucky_count(metadata.get("selected_potion_actions_this_combat")) > 0
-            or self._death_slice_lucky_count(metadata.get("potion_use_transitions_this_combat")) > 0
-        )
-        lucky_selected_or_used = bool(
-            bool(metadata.get("lucky_selected_this_combat"))
-            or self._death_slice_lucky_used_in_rows(metadata.get("selected_potion_actions_this_combat"))
-            or self._death_slice_lucky_used_in_rows(metadata.get("potion_use_transitions_this_combat"))
-        )
-        lucky_unused_survival_potion_death = bool(
-            lucky_seen_anywhere
-            and not lucky_selected_or_used
-        )
-        if bool(watch_only) and eid_upper not in targets and not lucky_unused_survival_potion_death:
-            return
-
-        if not hasattr(self, "_death_slice_counts"):
-            self._death_slice_counts: dict[str, int] = {}
-        if self._death_slice_counts.get(eid_upper, 0) >= self._DEATH_SLICE_PER_ENCOUNTER_CAP:
-            return
-
-        # Pull the last N combat decisions before death (or fewer if the
-        # episode was very short).
-        tail_n = max(1, min(int(tail_len or 5), 12))
-        tail_steps = steps[-tail_n:]
-        slice_steps: list[dict[str, Any]] = []
-        for step in tail_steps:
-            if not isinstance(step, dict):
-                continue
-            search_stats = step.get("search_stats") if isinstance(step.get("search_stats"), dict) else {}
-            action_info = step.get("action_info") if isinstance(step.get("action_info"), dict) else {}
-            decision_diagnostics = (
-                step.get("decision_diagnostics")
-                if isinstance(step.get("decision_diagnostics"), dict)
-                else {}
-            )
-            selected_action = int(step.get("action") or 0)
-            slice_steps.append(
-                {
-                    "family": self._step_family(step) or "",
-                    "decision_domain": str(step.get("decision_domain") or ""),
-                    "phase": str(step.get("phase") or ""),
-                    "surface": str(step.get("surface") or ""),
-                    "room_type": str(step.get("room_type") or ""),
-                    "encounter_id": str(step.get("encounter_id") or ""),
-                    "encounter_tier": str(step.get("encounter_tier") or ""),
-                    "floor": step.get("floor"),
-                    "act_id": step.get("act_id"),
-                    "action_index": selected_action,
-                    "reward": float(step.get("reward") or 0.0),
-                    "root_value": float(step.get("root_value") or 0.0),
-                    "wasteful_end_turn": bool(step.get("wasteful_end_turn") or False),
-                    "settlement_bonus": float(step.get("settlement_bonus") or 0.0),
-                    "action_info": action_info,
-                    "policy_summary": self._compact_death_slice_policy(
-                        action_mask=step.get("action_mask"),
-                        search_policy=step.get("search_policy"),
-                        selected_action=selected_action,
-                    ),
-                    "search_stats": self._compact_death_slice_search_stats(search_stats),
-                    "decision_diagnostics": decision_diagnostics,
-                    "obs_summary": self._compact_death_slice_obs(step.get("obs")),
-                }
-            )
-
-        record = {
-            "time": time.time(),
-            "schema_version": 3,
-            "global_step": int(getattr(self, "total_steps", 0)),
-            "episode_id": int(getattr(self, "episode_count", 0)),
-            "reason": str(reason or ""),
-            "encounter_id": str(encounter_id or ""),
-            "encounter_tier": str(encounter_tier or ""),
-            "episode_steps": int(len(steps)),
-            "tail_steps": slice_steps,
-            "metadata_subset": {
-                "episode_mode": metadata.get("episode_mode"),
-                "death_floor": metadata.get("death_floor"),
-                "max_floor": metadata.get("max_floor"),
-                "max_act_id": metadata.get("max_act_id"),
-                "max_floor_reached": metadata.get("max_floor_reached"),
-                "episode_total_reward": metadata.get("episode_total_reward")
-                or metadata.get("episode_reward"),
-                "episode_length": metadata.get("episode_length"),
-                "negative_reward_episode": metadata.get("negative_reward_episode"),
-                "final_deck_cards_compact": metadata.get("final_deck_cards_compact"),
-                "final_deck_quality_v2": metadata.get("final_deck_quality_v2"),
-                "card_reward_seen_count": metadata.get("card_reward_seen_count"),
-                "card_reward_pick_count": metadata.get("card_reward_pick_count"),
-                "card_reward_skip_count": metadata.get("card_reward_skip_count"),
-                "card_reward_other_count": metadata.get("card_reward_other_count"),
-                "card_reward_pick_rate": metadata.get("card_reward_pick_rate"),
-                "card_reward_skip_rate": metadata.get("card_reward_skip_rate"),
-                "card_reward_consecutive_skip_current": metadata.get("card_reward_consecutive_skip_current"),
-                "card_reward_consecutive_skip_max": metadata.get("card_reward_consecutive_skip_max"),
-                "boss_rooms_seen": metadata.get("boss_rooms_seen"),
-                "elite_rooms_seen": metadata.get("elite_rooms_seen"),
-                "snapshot_sample_id": metadata.get("snapshot_sample_id"),
-                "snapshot_run_id": metadata.get("snapshot_run_id"),
-                "snapshot_floor_number": metadata.get("snapshot_floor_number"),
-                "snapshot_build_id": metadata.get("snapshot_build_id"),
-                "final_potion_count": metadata.get("final_potion_count"),
-                "final_potion_dump": metadata.get("final_potion_dump"),
-                "used_potion_count_this_combat": metadata.get("used_potion_count_this_combat"),
-                "used_potion_count_final_info": metadata.get("used_potion_count_final_info"),
-                "used_potion_count_transition_current": metadata.get("used_potion_count_transition_current"),
-                "used_potion_count_episode": metadata.get("used_potion_count_episode"),
-                "potion_history_schema": metadata.get("potion_history_schema"),
-                "potion_history_steps_this_combat": metadata.get("potion_history_steps_this_combat"),
-                "last_seen_potions_this_combat": metadata.get("last_seen_potions_this_combat"),
-                "last_seen_legal_potion_actions_this_combat": metadata.get("last_seen_legal_potion_actions_this_combat"),
-                "selected_potion_actions_this_combat": metadata.get("selected_potion_actions_this_combat"),
-                "lucky_seen_this_combat": metadata.get("lucky_seen_this_combat"),
-                "lucky_legal_this_combat": metadata.get("lucky_legal_this_combat"),
-                "lucky_selected_this_combat": metadata.get("lucky_selected_this_combat"),
-                "lucky_seen_anywhere_on_death": lucky_seen_anywhere,
-                "lucky_selected_or_used_this_combat": lucky_selected_or_used,
-                "final_lucky_potion_count": final_lucky_potion_count,
-                "final_lucky_unused_on_death": bool(final_lucky_potion_count > 0 and not lucky_selected_or_used),
-                "lucky_unused_survival_potion_death": lucky_unused_survival_potion_death,
-                "potion_use_transitions_this_combat": metadata.get("potion_use_transitions_this_combat"),
-                "potion_transition_sync_suspect_this_combat": metadata.get("potion_transition_sync_suspect_this_combat"),
-            },
-        }
-
-        try:
-            path = self._diagnostic_jsonl_path(
-                f"death_slices/{eid_upper.replace('.', '_').lower()}.jsonl"
-            )
-            if path is None:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-            self._death_slice_counts[eid_upper] = self._death_slice_counts.get(eid_upper, 0) + 1
-        except Exception:
-            return
-
-    @staticmethod
     def _classify_action_offenders(
         *,
         search_stats: dict[str, Any] | None,
@@ -1525,6 +1472,13 @@ class DiagnosticDumpMixin:
         # The old ``high_save_value_potion_unused`` tag inverted that semantic
         # and produced noisy offenders on high-HP / zero-incoming end turns.
         if family_l == "end_turn":
+            if (
+                gt("combat_quality_prior_transient_only_end_turn")
+                or gt("combat_quality_post_step_frontier_leaked")
+                or gt("combat_quality_post_step_frontier_suspicious_singleton")
+                or gt("frontier_pre_dispatch_end_turn_blocked")
+            ):
+                out.append("singleton_end_turn_leak")
             try:
                 urgent_potions = (
                     float(s.get("combat_quality_potion_urgent_count", 0.0) or 0.0)
@@ -1639,6 +1593,8 @@ class DiagnosticDumpMixin:
                 except Exception:
                     effective_tier = ""
             state_summary = {
+                "floor": float(floor_value),
+                "act_id": float(act_id_value),
                 "energy": float(stats.get("combat_quality_energy", 0.0) or 0.0),
                 "incoming_damage": float(incoming),
                 "block": float(block),
@@ -1673,6 +1629,18 @@ class DiagnosticDumpMixin:
                 "insatiable_sandpit_countdown": float(stats.get("combat_quality_insatiable_sandpit_countdown", 0.0) or 0.0),
                 "insatiable_frantic_escape_available": float(stats.get("combat_quality_insatiable_frantic_escape_available", 0.0) or 0.0),
                 "insatiable_escape_cycle_risk": float(stats.get("combat_quality_insatiable_escape_cycle_risk", 0.0) or 0.0),
+            }
+            guard_bits = {
+                "no_pressure_available": float(stats.get("combat_quality_no_pressure_block_guard_available", 0.0) or 0.0),
+                "no_pressure_applied": float(stats.get("combat_quality_no_pressure_block_guard_applied", 0.0) or 0.0),
+                "no_pressure_override": float(stats.get("combat_quality_no_pressure_block_guard_override", 0.0) or 0.0),
+                "no_pressure_candidate_count": float(stats.get("combat_quality_no_pressure_block_guard_candidate_count", 0.0) or 0.0),
+                "no_pressure_no_alternative": float(stats.get("combat_quality_no_pressure_block_guard_no_alternative", 0.0) or 0.0),
+                "no_pressure_progress_override_idx": float(stats.get("combat_quality_no_pressure_block_guard_progress_override_idx", -1.0) or -1.0),
+                "no_pressure_progress_override_lock": float(stats.get("combat_quality_no_pressure_block_guard_progress_override_lock", 0.0) or 0.0),
+                "survival_override": float(stats.get("combat_quality_survival_non_endturn_guard_override", 0.0) or 0.0),
+                "survival_candidate_count": float(stats.get("combat_quality_survival_non_endturn_guard_candidate_count", 0.0) or 0.0),
+                "hard_guard_override_any": float(stats.get("combat_quality_hard_guard_override_any", 0.0) or 0.0),
             }
             reason_flags = {
                 key: float(stats.get(f"combat_quality_{key}", 0.0) or 0.0) > 0.5
@@ -1756,6 +1724,7 @@ class DiagnosticDumpMixin:
                     lethal = False
                 return {
                     "action_idx": int(idx),
+                    "mask": float(mask_np[int(idx)]) if 0 <= int(idx) < mask_np.shape[0] else 0.0,
                     "is_chosen": bool(chosen),
                     "family": family_i,
                     "kind": action.get("kind"),
@@ -1837,11 +1806,14 @@ class DiagnosticDumpMixin:
                     "time": time.time(),
                     "global_step": int(getattr(self, "total_steps", 0)),
                     "episode_id": int(getattr(self, "episode_count", 0)),
+                    "floor": float(floor_value),
+                    "act_id": float(act_id_value),
                     "encounter_id": str(encounter or ""),
                     "tier": effective_tier,
                     "turn": raw_combat.get("round"),
                     "offender_type": offender_type,
                     "selected_action_idx": int(chosen_idx),
+                    "selected_action_id": chosen_action.get("action_id") if isinstance(chosen_action, dict) else None,
                     "selected_family": family,
                     "selected_card_id": card.get("id") if isinstance(card, dict) else None,
                     "selected_potion_id": potion.get("id") if isinstance(potion, dict) else None,
@@ -1850,6 +1822,7 @@ class DiagnosticDumpMixin:
                         or (potion.get("title") if isinstance(potion, dict) else None),
                     "selected_target": target.get("name") if isinstance(target, dict) else None,
                     "reason_flags": reason_flags,
+                    "guard_bits": guard_bits,
                     "state_summary": state_summary,
                     "selected_action_detail": selected_detail,
                     "alternative_actions": alternatives,

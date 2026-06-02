@@ -163,6 +163,43 @@ class DemoBatchTests(unittest.TestCase):
         self.assertEqual(batch["legal_action_ids"][0][0], "play:strike")
         self.assertEqual(batch["encounter_ids"], ["kaiser_crab_boss"] * 3)
         self.assertEqual(batch["reason_tags"][2], ["save_exhaust_card"])
+        self.assertEqual(batch["bc_target_policy"], [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        self.assertEqual(batch["target_hp_loss"], [6.0, 6.0, 6.0])
+        self.assertEqual(batch["target_hp_loss_mask"], [1.0, 1.0, 1.0])
+        self.assertEqual(batch["combat_win"], [1.0, 1.0, 1.0])
+        self.assertEqual(batch["combat_win_mask"], [1.0, 1.0, 1.0])
+        self.assertEqual(batch["turns"], [5.0, 5.0, 5.0])
+        self.assertEqual(batch["turns_mask"], [1.0, 1.0, 1.0])
+
+    def test_build_batch_masks_missing_outcomes(self):
+        path = _write_jsonl([
+            _row(outcome={}),
+            _row(
+                episode_id="ep2",
+                selected="play:defend",
+                outcome={"combat_win": False, "hp_loss": "bad", "turns": None},
+            ),
+        ])
+        try:
+            samples = load_demo_dataset(path)
+        finally:
+            path.unlink()
+        batch = build_demo_training_batch(samples)
+        self.assertEqual(batch["selected_action_indices"], [0, 1])
+        self.assertEqual(batch["bc_target_policy"], [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ])
+        self.assertEqual(batch["target_hp_loss"], [0.0, 0.0])
+        self.assertEqual(batch["target_hp_loss_mask"], [0.0, 0.0])
+        self.assertEqual(batch["combat_win"], [0.0, 0.0])
+        self.assertEqual(batch["combat_win_mask"], [0.0, 1.0])
+        self.assertEqual(batch["turns"], [0.0, 0.0])
+        self.assertEqual(batch["turns_mask"], [0.0, 0.0])
 
     def test_encounter_filter(self):
         path = _write_jsonl([

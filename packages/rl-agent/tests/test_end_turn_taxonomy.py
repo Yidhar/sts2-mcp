@@ -1,7 +1,7 @@
 """Tests for the end_turn taxonomy (TASK-B1).
 
 Verifies the central ``_classify_end_turn_action`` priority chain
-(``bad > forced(transient) > forced > strategic_defer > unknown``) and the
+(``bad > forced(transient) > forced > empty_skip > strategic_defer > unknown``) and the
 boss-window override rule that upgrades end_turn to ``bad_end_turn`` when
 Kaiser back-attack risk + facing candidate or Ceremonial stun-window are open.
 """
@@ -28,6 +28,12 @@ def _ctx(
     positive_progress_count: int = 0,
     urgent_positive_count: int = 0,
     deferable_positive_count: int = 0,
+    safe_progress_candidate_count: int = 0,
+    full_energy_like: bool = False,
+    full_energy_nonurgent_skip_available: bool = False,
+    safe_progress_skip_available: bool = False,
+    max_energy: float = 3.0,
+    energy_ratio: float = 0.0,
     energy: float = 0.0,
 ) -> dict[str, object]:
     return {
@@ -37,6 +43,12 @@ def _ctx(
         "positive_progress_count": positive_progress_count,
         "urgent_positive_count": urgent_positive_count,
         "deferable_positive_count": deferable_positive_count,
+        "safe_progress_candidate_count": safe_progress_candidate_count,
+        "full_energy_like": full_energy_like,
+        "full_energy_nonurgent_skip_available": full_energy_nonurgent_skip_available,
+        "safe_progress_skip_available": safe_progress_skip_available,
+        "max_energy": max_energy,
+        "energy_ratio": energy_ratio,
         "energy": energy,
     }
 
@@ -72,6 +84,60 @@ class TaxonomyPriorityTests(unittest.TestCase):
         cls, _ = MuZeroTrainer._classify_end_turn_action(ctx)
         self.assertEqual(cls, "strategic_defer_end_turn")
 
+    def test_full_energy_safe_progress_marks_empty_skip(self):
+        # Full energy + a same-frontier safe progress action is now its own
+        # actionable bucket.  It is not "forced" and should not be hidden under
+        # strategic defer.
+        ctx = _ctx(
+            wasteful=False,
+            strategic_defer_available=True,
+            energy=3.0,
+            max_energy=3.0,
+            energy_ratio=1.0,
+            full_energy_like=True,
+            full_energy_nonurgent_skip_available=True,
+            safe_progress_skip_available=True,
+            positive_progress_count=1,
+            urgent_positive_count=0,
+            deferable_positive_count=1,
+            safe_progress_candidate_count=1,
+        )
+        cls, flags = MuZeroTrainer._classify_end_turn_action(ctx)
+        self.assertEqual(cls, "empty_skip_end_turn")
+        self.assertTrue(flags["full_energy_like"])
+        self.assertTrue(flags["safe_progress_skip_available"])
+        self.assertTrue(flags["safe_progress_candidate_count"])
+
+    def test_forced_only_endturn_stays_forced_even_at_full_energy(self):
+        ctx = _ctx(
+            positive_progress_count=0,
+            energy=3.0,
+            max_energy=3.0,
+            energy_ratio=1.0,
+            full_energy_like=True,
+            full_energy_nonurgent_skip_available=False,
+            safe_progress_skip_available=False,
+            safe_progress_candidate_count=0,
+        )
+        cls, flags = MuZeroTrainer._classify_end_turn_action(ctx)
+        self.assertEqual(cls, "forced_end_turn")
+        self.assertTrue(flags["no_legal_positive_action"])
+
+    def test_zero_energy_deferable_only_not_left_unknown(self):
+        # Diagnostic cleanup: after all energy is spent, a lone deferable/setup
+        # option should not pollute the unknown/"true空过" bucket.
+        ctx = _ctx(
+            wasteful=False,
+            strategic_defer_available=False,
+            energy=0.0,
+            positive_progress_count=1,
+            urgent_positive_count=0,
+            deferable_positive_count=1,
+        )
+        cls, flags = MuZeroTrainer._classify_end_turn_action(ctx)
+        self.assertEqual(cls, "strategic_defer_end_turn")
+        self.assertTrue(flags["zero_energy_only_deferable"])
+
 
 class BossWindowOverrideTests(unittest.TestCase):
     def test_kaiser_back_attack_with_facing_candidate_marks_bad(self):
@@ -97,6 +163,28 @@ class BossWindowOverrideTests(unittest.TestCase):
         }
         cls, _ = MuZeroTrainer._classify_end_turn_action(ctx, None, boss)
         self.assertEqual(cls, "bad_end_turn")
+
+    def test_boss_window_still_overrides_full_energy_empty_skip_bucket(self):
+        ctx = _ctx(
+            positive_progress_count=1,
+            urgent_positive_count=0,
+            deferable_positive_count=1,
+            strategic_defer_available=True,
+            energy=3.0,
+            max_energy=3.0,
+            energy_ratio=1.0,
+            full_energy_like=True,
+            full_energy_nonurgent_skip_available=True,
+            safe_progress_skip_available=True,
+            safe_progress_candidate_count=1,
+        )
+        boss = {
+            "kaiser_back_attack_risk": 0.6,
+            "kaiser_facing_change_candidate_count": 1.0,
+        }
+        cls, flags = MuZeroTrainer._classify_end_turn_action(ctx, None, boss)
+        self.assertEqual(cls, "bad_end_turn")
+        self.assertTrue(flags["boss_window_open"])
 
     def test_no_facing_candidate_does_not_override(self):
         # Risk exists but no facing change actually playable — fallback to the

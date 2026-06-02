@@ -164,8 +164,117 @@ POTION_SURVIVAL_TAGS: tuple[str, ...] = (
 )
 
 
+SHOP_ECONOMY_TAGS: tuple[str, ...] = (
+    "decision/build/family_shop_rate",
+    "route_heuristic/shop_with_gold_available_rate",
+    "route_heuristic/shop_selected_high_gold_rate",
+    "build/shop_seen",
+    "build/shop_open_rate",
+    "build/shop_buy_any_rate",
+    "build/shop_buy_card_rate",
+    "build/shop_buy_relic_rate",
+    "build/shop_buy_potion_rate",
+    "build/shop_remove_rate",
+    "build/shop_leave_rate",
+    "build/shop_back_rate",
+    "build/shop_remove_available_rate",
+    "build/shop_remove_affordable_rate",
+    "build/shop_leave_with_gold_ge_100_rate",
+    "build/shop_leave_with_remove_affordable_rate",
+    "build/shop_deck_context_present_rate",
+    "build/shop_deck_size_mean",
+    "build/shop_starter_count_mean",
+    "build/shop_starter_ratio_mean",
+    "build/shop_nonstarter_count_mean",
+    "build/shop_starter_heavy_rate",
+    "build/shop_buy_with_affordable_remove_rate",
+    "build/shop_buy_blocks_affordable_remove_rate",
+    "build/shop_buy_blocks_affordable_remove_starter_heavy_rate",
+    "build/shop_gold_before_mean",
+    "build/shop_selected_cost_mean",
+    "build/shop_affordable_item_count_mean",
+    "search/build/shop_action_guard_shop_surface_rate",
+    "search/build/shop_action_guard_selected_open_rate",
+    "search/build/shop_action_guard_selected_buy_rate",
+    "search/build/shop_action_guard_selected_remove_rate",
+    "search/build/shop_action_guard_selected_leave_rate",
+    "search/build/shop_action_guard_selected_back_rate",
+    "search/build/shop_action_guard_open_available_rate",
+    "search/build/shop_action_guard_remove_affordable_available_rate",
+    "search/build/shop_action_guard_gold_mean",
+    "search/build/shop_action_guard_starter_count_mean",
+    "search/build/shop_action_guard_junk_count_mean",
+    "search/build/shop_action_guard_open_applicable_rate",
+    "search/build/shop_action_guard_open_applied_rate",
+    "search/build/shop_action_guard_remove_applicable_rate",
+    "search/build/shop_action_guard_remove_applied_rate",
+    "search/build/shop_action_guard_buy_blocks_remove_applicable_rate",
+    "search/build/shop_action_guard_buy_blocks_remove_applied_rate",
+    "search/build/shop_action_guard_buy_blocks_remove_premium_allow_rate",
+    "search/build/shop_action_guard_selected_buy_cost_mean",
+    "search/build/shop_action_guard_remove_cost_min_mean",
+    "search/build/shop_action_guard_gold_after_selected_buy_mean",
+    "search/build/shop_action_guard_remove_selection_surface_rate",
+    "search/build/shop_action_guard_remove_selection_selected_score_mean",
+    "search/build/shop_action_guard_remove_selection_best_score_mean",
+    "search/build/shop_action_guard_remove_selection_applied_rate",
+    "search/build/shop_action_guard_alignment_error_rate",
+    "search/build/shop_action_guard_invalid_obs_rate",
+)
+
+
+CAMPFIRE_REST_TAGS: tuple[str, ...] = (
+    "decision/build/family_rest_rate",
+    "route_heuristic/rest_before_elite_available_rate",
+    "route_heuristic/rest_before_elite_selected_rate",
+    "route_heuristic/no_rest_before_elite_selected_rate",
+    "route_heuristic/rest_selected_low_hp_rate",
+    "route_heuristic/rest_selected_when_low_hp_rate",
+    "env/rest_site_encounters",
+    "env/rest_heal_chosen",
+    "env/rest_smith_chosen",
+    "env/rest_skip_heal_chosen",
+    "env/rest_skip_heal_at_low_hp",
+    "env/rest_penalty_total",
+    "env/rest_heal_exposure_low_hp",
+    "env/rest_heal_exposure_heal_available",
+    "env/rest_heal_exposure_forced",
+    "env/rest_heal_exposure_miss",
+    "search/build/rest_site_smith_guard_enabled",
+    "search/build/rest_site_smith_guard_applicable_rate",
+    "search/build/rest_site_smith_guard_smith_available_rate",
+    "search/build/rest_site_smith_guard_selected_heal_safe_hp_rate",
+    "search/build/rest_site_smith_guard_applied_rate",
+    "search/build/rest_site_smith_guard_override_rate",
+    "search/build/rest_site_smith_guard_invalid_obs_rate",
+    "search/build/rest_site_smith_guard_alignment_error_rate",
+    "search/build/rest_site_smith_guard_hp_ratio_mean",
+    "search/build/rest_site_smith_guard_hp_threshold",
+    "build/deck_upgrade_smith_selected",
+    "build/deck_upgrade_smith_to_upgrade_seen_rate",
+    "build/deck_upgrade_smith_no_upgrade_surface_rate",
+    "build/deck_upgrade_seen",
+    "build/deck_upgrade_selected_rate",
+    "build/deck_upgrade_applied_rate",
+    "build/deck_upgrade_target_count_mean",
+    "build/deck_upgrade_applied_delta_mean",
+    "build/deck_upgrade_context_present_rate",
+    "build/deck_upgrade_upgraded_before_mean",
+    "build/deck_upgrade_upgraded_after_mean",
+)
+
+
 DECK_BUILD_TAGS: tuple[str, ...] = (
     "deck/final_size",
+    "deck/final_starter_count",
+    "deck/final_starter_ratio",
+    "deck/final_nonstarter_count",
+    "deck/final_strike_count",
+    "deck/final_defend_count",
+    "deck/final_upgraded_count",
+    "deck/final_upgraded_ratio",
+    "deck/final_starter_upgrade_count",
+    "deck/final_starter_upgrade_ratio",
     "deck/final_raw_avg_damage_per_energy",
     "deck/final_raw_avg_block_per_energy",
     "deck/final_raw_expected_extra_draw_per_turn",
@@ -242,6 +351,15 @@ DECK_BUILD_TAGS: tuple[str, ...] = (
     "deck/final_delayed_payoff_option_value_score",
     "deck/final_delayed_payoff_unrealized_risk_score",
     "death_deck/size",
+    "death_deck/starter_count",
+    "death_deck/starter_ratio",
+    "death_deck/nonstarter_count",
+    "death_deck/strike_count",
+    "death_deck/defend_count",
+    "death_deck/upgraded_count",
+    "death_deck/upgraded_ratio",
+    "death_deck/starter_upgrade_count",
+    "death_deck/starter_upgrade_ratio",
     "death_deck/raw_avg_damage_per_energy",
     "death_deck/raw_avg_block_per_energy",
     "death_deck/raw_expected_extra_draw_per_turn",
@@ -329,6 +447,31 @@ DECK_BUILD_TAGS: tuple[str, ...] = (
     "search/build/card_reward_guard_applied_rate",
     "search/build/card_reward_guard_override_rate",
     "search/build/card_reward_guard_skip_blocked_rate",
+    "search/build/post_search_hard_guard_policy_retargeted_rate",
+    "search/build/post_search_hard_guard_original_action_idx_mean",
+    "search/build/post_search_hard_guard_final_action_idx_mean",
+    "search/build/card_reward_pick_quality_guard_context_rate",
+    "search/build/card_reward_pick_quality_guard_applicable_rate",
+    "search/build/card_reward_pick_quality_guard_selected_pick_rate",
+    "search/build/card_reward_pick_quality_guard_pick_available_rate",
+    "search/build/card_reward_pick_quality_guard_accepted_available_rate",
+    "search/build/card_reward_pick_quality_guard_applied_rate",
+    "search/build/card_reward_pick_quality_guard_override_rate",
+    "search/build/card_reward_pick_quality_guard_alignment_error_rate",
+    "search/build/card_reward_pick_quality_guard_invalid_obs_rate",
+    "search/build/card_reward_pick_quality_guard_not_act1_rate",
+    "search/build/card_reward_pick_quality_guard_no_deficit_rate",
+    "search/build/card_reward_pick_quality_guard_selected_rejected_rate",
+    "search/build/card_reward_pick_quality_guard_best_score_mean",
+    "search/build/card_reward_pick_quality_guard_selected_score_mean",
+    "search/build/card_reward_pick_quality_guard_best_minus_selected_mean",
+    "search/build/card_reward_pick_quality_guard_dynamic_min_useful_score_mean",
+    "search/build/card_reward_pick_quality_guard_deck_size_mean",
+    "search/build/card_reward_pick_quality_guard_low_block_rate",
+    "search/build/card_reward_pick_quality_guard_low_draw_rate",
+    "search/build/card_reward_pick_quality_guard_low_attack_rate",
+    "search/build/card_reward_pick_quality_guard_low_scaling_rate",
+    "search/build/card_reward_pick_quality_guard_thin_deck_rate",
     "search/build/card_reward_guard_alignment_error_rate",
     "search/build/card_reward_guard_invalid_obs_rate",
     "search/build/card_reward_guard_not_act1_rate",
@@ -377,6 +520,8 @@ ALL_TAGS: tuple[str, ...] = (
     *MEMORY_TAGS,
     *TACTICAL_REDLINE_TAGS,
     *POTION_SURVIVAL_TAGS,
+    *SHOP_ECONOMY_TAGS,
+    *CAMPFIRE_REST_TAGS,
     *DECK_BUILD_TAGS,
 )
 
@@ -494,6 +639,120 @@ def deck_build_warnings(summary: dict[str, dict[str, Any]]) -> list[dict[str, An
             threshold=4.0,
             message="observed 4+ consecutive card-reward skips in at least one episode",
         )
+    skip_blocked_rate = value(summary, "search/build/card_reward_guard_skip_blocked_rate", "avg_tail")
+    policy_retargeted_rate = value(
+        summary,
+        "search/build/post_search_hard_guard_policy_retargeted_rate",
+        "avg_tail",
+    )
+    if skip_blocked_rate is not None and skip_blocked_rate > 0.01:
+        if policy_retargeted_rate is None:
+            add(
+                "card_reward_policy_retarget_missing",
+                "search/build/post_search_hard_guard_policy_retargeted_rate",
+                field="avg_tail",
+                actual=None,
+                threshold=skip_blocked_rate,
+                message=(
+                    "card-reward skip guard is firing but post-search policy-retarget telemetry is missing; "
+                    "new-run validation cannot prove replay learns the final guarded pick"
+                ),
+            )
+        elif policy_retargeted_rate + 1e-9 < 0.80 * skip_blocked_rate:
+            add(
+                "card_reward_policy_retarget_low",
+                "search/build/post_search_hard_guard_policy_retargeted_rate",
+                field="avg_tail",
+                actual=policy_retargeted_rate,
+                threshold=0.80 * skip_blocked_rate,
+                message=(
+                    "card-reward skip guard is firing but policy target rewrite rate is much lower; "
+                    "replay may still reinforce skipped rewards"
+                ),
+            )
+
+    shop_seen_avg = value(summary, "build/shop_seen", "avg_tail")
+    if shop_seen_avg is None:
+        # Older/self-play processes can still expose coarse build/route shop
+        # signals while missing the richer shop telemetry tags added for the
+        # Act1 build-quality work.  Surface that as an advisory warning so a
+        # run does not silently look "clean" just because the detailed shop
+        # tracker is not writing yet.
+        shop_family_rate = value(summary, "decision/build/family_shop_rate", "avg_tail")
+        shop_with_gold_rate = value(summary, "route_heuristic/shop_with_gold_available_rate", "avg_tail")
+        shop_high_gold_selected_rate = value(summary, "route_heuristic/shop_selected_high_gold_rate", "avg_tail")
+        if any(
+            rate is not None and rate > 0.0
+            for rate in (shop_family_rate, shop_with_gold_rate, shop_high_gold_selected_rate)
+        ):
+            add(
+                "shop_metrics_missing",
+                "build/shop_seen",
+                field="avg_tail",
+                actual=None,
+                threshold=1.0,
+                message=(
+                    "coarse shop/build route signals exist but detailed build/shop_* telemetry is missing; "
+                    "new-run validation cannot judge shop open/buy/remove behavior yet"
+                ),
+            )
+    if shop_seen_avg is not None and shop_seen_avg >= 1.0:
+        shop_open_rate = value(summary, "build/shop_open_rate", "avg_tail")
+        shop_buy_rate = value(summary, "build/shop_buy_any_rate", "avg_tail")
+        shop_remove_affordable_rate = value(summary, "build/shop_remove_affordable_rate", "avg_tail")
+        shop_remove_rate = value(summary, "build/shop_remove_rate", "avg_tail")
+        shop_leave_gold_rate = value(summary, "build/shop_leave_with_gold_ge_100_rate", "avg_tail")
+        shop_leave_remove_rate = value(summary, "build/shop_leave_with_remove_affordable_rate", "avg_tail")
+        if shop_open_rate is not None and shop_open_rate < 0.35:
+            add(
+                "low_shop_open_rate",
+                "build/shop_open_rate",
+                field="avg_tail",
+                actual=shop_open_rate,
+                threshold=0.35,
+                message="shop surfaces are seen but the agent rarely opens the merchant/inventory",
+            )
+        if shop_buy_rate is not None and shop_buy_rate < 0.20:
+            add(
+                "low_shop_buy_rate",
+                "build/shop_buy_any_rate",
+                field="avg_tail",
+                actual=shop_buy_rate,
+                threshold=0.20,
+                message="shop surfaces are seen but purchases are rare",
+            )
+        if (
+            shop_remove_affordable_rate is not None
+            and shop_remove_rate is not None
+            and shop_remove_affordable_rate >= 0.10
+            and shop_remove_rate < 0.05
+        ):
+            add(
+                "low_shop_remove_rate",
+                "build/shop_remove_rate",
+                field="avg_tail",
+                actual=shop_remove_rate,
+                threshold=0.05,
+                message="card removal is affordable in shops but is almost never selected",
+            )
+        if shop_leave_gold_rate is not None and shop_leave_gold_rate > 0.35:
+            add(
+                "shop_leave_with_gold",
+                "build/shop_leave_with_gold_ge_100_rate",
+                field="avg_tail",
+                actual=shop_leave_gold_rate,
+                threshold=0.35,
+                message="agent often leaves shops while still holding at least 100 gold",
+            )
+        if shop_leave_remove_rate is not None and shop_leave_remove_rate > 0.10:
+            add(
+                "shop_leave_with_remove_affordable",
+                "build/shop_leave_with_remove_affordable_rate",
+                field="avg_tail",
+                actual=shop_leave_remove_rate,
+                threshold=0.10,
+                message="agent leaves shops while card removal is affordable",
+            )
 
     max_floor_avg = value(summary, "episode/max_floor", "avg_tail")
     final_size_avg = value(summary, "deck/final_size", "avg_tail")
@@ -507,6 +766,39 @@ def deck_build_warnings(summary: dict[str, dict[str, Any]]) -> list[dict[str, An
             message="episodes are reaching mid Act1 with a very small final deck",
         )
 
+    final_starter_ratio_avg = value(summary, "deck/final_starter_ratio", "avg_tail")
+    final_starter_count_avg = value(summary, "deck/final_starter_count", "avg_tail")
+    if (
+        max_floor_avg is not None
+        and max_floor_avg >= 7.0
+        and final_starter_ratio_avg is not None
+        and final_starter_ratio_avg >= 0.45
+    ):
+        add(
+            "starter_heavy_final_deck",
+            "deck/final_starter_ratio",
+            field="avg_tail",
+            actual=final_starter_ratio_avg,
+            threshold=0.45,
+            message="episodes reach mid Act1 with starter cards still making up too much of the deck",
+        )
+    final_nonstarter_avg = value(summary, "deck/final_nonstarter_count", "avg_tail")
+    if (
+        max_floor_avg is not None
+        and max_floor_avg >= 7.0
+        and final_nonstarter_avg is not None
+        and final_nonstarter_avg <= 6.0
+        and (final_starter_count_avg is None or final_starter_count_avg >= 6.0)
+    ):
+        add(
+            "low_final_nonstarter_count",
+            "deck/final_nonstarter_count",
+            field="avg_tail",
+            actual=final_nonstarter_avg,
+            threshold=6.0,
+            message="episodes reach mid Act1 without adding enough non-starter cards",
+        )
+
     death_floor_avg = value(summary, "episode/death_floor", "avg_tail")
     death_size_avg = value(summary, "death_deck/size", "avg_tail")
     if death_size_avg is not None and death_floor_avg is not None and death_floor_avg >= 7.0 and death_size_avg <= 12.0:
@@ -517,6 +809,40 @@ def deck_build_warnings(summary: dict[str, dict[str, Any]]) -> list[dict[str, An
             actual=death_size_avg,
             threshold=12.0,
             message="death episodes are still dying with starter-sized decks",
+        )
+
+    death_starter_ratio_avg = value(summary, "death_deck/starter_ratio", "avg_tail")
+    death_starter_count_avg = value(summary, "death_deck/starter_count", "avg_tail")
+    if (
+        death_floor_avg is not None
+        and death_floor_avg >= 7.0
+        and death_starter_ratio_avg is not None
+        and death_starter_count_avg is not None
+        and death_starter_count_avg >= 6.0
+        and death_starter_ratio_avg >= 0.45
+    ):
+        add(
+            "starter_heavy_death_deck",
+            "death_deck/starter_ratio",
+            field="avg_tail",
+            actual=death_starter_ratio_avg,
+            threshold=0.45,
+            message="death decks are still dominated by Strike/Defend starters",
+        )
+    death_nonstarter_avg = value(summary, "death_deck/nonstarter_count", "avg_tail")
+    if (
+        death_floor_avg is not None
+        and death_floor_avg >= 7.0
+        and death_nonstarter_avg is not None
+        and death_nonstarter_avg <= 7.0
+    ):
+        add(
+            "low_death_nonstarter_count",
+            "death_deck/nonstarter_count",
+            field="avg_tail",
+            actual=death_nonstarter_avg,
+            threshold=7.0,
+            message="death decks contain too few non-starter cards for mid/late Act1",
         )
 
     death_atk_avg = value(summary, "death_deck/expected_hand_attack_damage_per_turn", "avg_tail")
@@ -946,6 +1272,8 @@ def print_human(payload: dict[str, Any]) -> None:
         ("MEMORY", MEMORY_TAGS),
         ("TACTICAL REDLINES", TACTICAL_REDLINE_TAGS),
         ("POTION / BOSS SURVIVAL", POTION_SURVIVAL_TAGS),
+        ("SHOP / ECONOMY", SHOP_ECONOMY_TAGS),
+        ("CAMPFIRE / REST-SMITH", CAMPFIRE_REST_TAGS),
         ("DECK / BUILD QUALITY", DECK_BUILD_TAGS),
     )
     for title, tags in sections:
@@ -1052,6 +1380,8 @@ def main() -> int:
         "missing_memory_tags": [tag for tag in MEMORY_TAGS if tag not in tags],
         "missing_tactical_redline_tags": [tag for tag in TACTICAL_REDLINE_TAGS if tag not in tags],
         "missing_potion_survival_tags": [tag for tag in POTION_SURVIVAL_TAGS if tag not in tags],
+        "missing_shop_economy_tags": [tag for tag in SHOP_ECONOMY_TAGS if tag not in tags],
+        "missing_campfire_rest_tags": [tag for tag in CAMPFIRE_REST_TAGS if tag not in tags],
         "missing_deck_build_tags": [tag for tag in DECK_BUILD_TAGS if tag not in tags],
         "deck_build_warnings": deck_build_warnings(summaries),
         "gate": evaluate_gate(

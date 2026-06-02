@@ -129,16 +129,63 @@ def _safe_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+_SHOP_REMOVE_KINDS = {"card_removal", "remove", "removal", "purge"}
+
+
+def _shop_item(action: dict[str, Any]) -> dict[str, Any]:
+    item = action.get("item")
+    return item if isinstance(item, dict) else {}
+
+
+def _shop_item_kind(action: dict[str, Any]) -> str:
+    item = _shop_item(action)
+    return _safe_text(item.get("item_kind") or item.get("kind")).lower()
+
+
+def _shop_is_remove(action: dict[str, Any]) -> bool:
+    item = _shop_item(action)
+    shop_action = _safe_text(action.get("shop_action")).lower()
+    item_kind = _shop_item_kind(action)
+    item_title = _safe_text(item.get("title")).lower()
+    return (
+        "remove" in shop_action
+        or item_kind in _SHOP_REMOVE_KINDS
+        or "remove" in item_title
+        or "purge" in item_title
+    )
+
+
+def _action_source_payload(action: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the payload whose semantics should describe this action.
+
+    Shop purchase actions keep the actual card/relic/potion inside
+    ``action["item"]``.  Without looking through that nesting, a shop card and
+    card-removal purchase both collapse into a generic ``shop/buy`` signature.
+    """
+
+    for payload in (
+        action.get("card"),
+        action.get("potion"),
+        action.get("relic"),
+        (_shop_item(action) or {}).get("card"),
+        (_shop_item(action) or {}).get("potion"),
+        (_shop_item(action) or {}).get("relic"),
+    ):
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def _metadata_for_action(action: dict[str, Any]) -> dict[str, Any] | None:
-    card = action.get("card") if isinstance(action.get("card"), dict) else None
-    potion = action.get("potion") if isinstance(action.get("potion"), dict) else None
-    relic = action.get("relic") if isinstance(action.get("relic"), dict) else None
-    if isinstance(card, dict):
-        return get_card_metadata(_safe_text(card.get("id")))
-    if isinstance(potion, dict):
-        return get_potion_metadata(_safe_text(potion.get("id")))
-    if isinstance(relic, dict):
-        return get_relic_metadata(_safe_text(relic.get("id")))
+    source = _action_source_payload(action)
+    if not isinstance(source, dict):
+        return None
+    if isinstance(action.get("card"), dict) or isinstance((_shop_item(action) or {}).get("card"), dict):
+        return get_card_metadata(_safe_text(source.get("id")))
+    if isinstance(action.get("potion"), dict) or isinstance((_shop_item(action) or {}).get("potion"), dict):
+        return get_potion_metadata(_safe_text(source.get("id")))
+    if isinstance(action.get("relic"), dict) or isinstance((_shop_item(action) or {}).get("relic"), dict):
+        return get_relic_metadata(_safe_text(source.get("id")))
     return None
 
 
@@ -151,8 +198,16 @@ def _preferred_signature_title(
     metadata_title = _safe_text((metadata or {}).get("title")) if isinstance(metadata, dict) else ""
     if metadata_title:
         return metadata_title
+    item = _shop_item(action)
+    for nested_key in ("card", "relic", "potion"):
+        nested = item.get(nested_key)
+        if isinstance(nested, dict):
+            nested_title = _safe_text(nested.get("title") or nested.get("name"))
+            if nested_title:
+                return nested_title
     return _safe_text(
         (source or {}).get("title")
+        or item.get("title")
         or action.get("title")
         or action.get("label")
         or stable_id
@@ -252,11 +307,7 @@ def _infer_roles(action: dict[str, Any], metadata: dict[str, Any] | None) -> lis
         if any(token in semantics for token in ("exhaust", "discard")):
             roles.add("setup")
 
-    source = None
-    if isinstance(action.get("card"), dict):
-        source = action["card"]
-    elif isinstance(action.get("potion"), dict):
-        source = action["potion"]
+    source = _action_source_payload(action)
     effect_sem = _aggregate_card_effect_profile_semantics(source) if isinstance(source, dict) else {}
 
     damage = _preview_metric(source, "damage")
@@ -400,6 +451,22 @@ def _stable_entity_id(action: dict[str, Any]) -> str:
             title = _safe_text(payload.get("title"))
             if title:
                 return title.lower().replace(" ", "_")
+    item = _shop_item(action)
+    for payload_key in ("card", "potion", "relic"):
+        payload = item.get(payload_key)
+        if isinstance(payload, dict):
+            entity_id = _safe_text(payload.get("id"))
+            if entity_id:
+                return entity_id
+            title = _safe_text(payload.get("title") or payload.get("name"))
+            if title:
+                return title.lower().replace(" ", "_")
+    item_kind = _shop_item_kind(action)
+    if item_kind:
+        item_title = _safe_text(item.get("title") or item.get("canonical_text") or item.get("description"))
+        if item_title:
+            return f"shop:{item_kind}:{item_title.lower().replace(' ', '_')}"
+        return f"shop:{item_kind}"
     title = _safe_text(action.get("title") or action.get("label") or action.get("name"))
     if title:
         return title.lower().replace(" ", "_")
@@ -420,11 +487,7 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
     stable_id = _stable_entity_id(action)
     roles = _infer_roles(action, metadata)
 
-    source = None
-    if isinstance(action.get("card"), dict):
-        source = action["card"]
-    elif isinstance(action.get("potion"), dict):
-        source = action["potion"]
+    source = _action_source_payload(action)
 
     title = _preferred_signature_title(source, action, metadata, stable_id)
     price = _float(action.get("price") if action.get("price") is not None else action.get("cost"))
@@ -438,6 +501,9 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
 
     card_type = _safe_text((source or {}).get("type"))
     selection_value = _safe_text(action.get("selection") or action.get("selection_action"))
+    item_kind = _shop_item_kind(action)
+    shop_action = _safe_text(action.get("shop_action"))
+    shop_is_remove = _shop_is_remove(action)
     effect_summary = _safe_text(
         _nested_value(source, "effect_preview", "summary")
         or (source or {}).get("effect")
@@ -457,7 +523,8 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
             _safe_text(action.get("surface")),
             selection_value,
             _safe_text(action.get("selection_semantics")),
-            _safe_text(action.get("shop_action")),
+            shop_action,
+            item_kind,
             _safe_text((action.get("reward") or {}).get("type")),
         )
         if part
@@ -478,6 +545,9 @@ def semantic_action_signature(action: Any) -> dict[str, Any]:
             "combat"
         ),
         "selection_semantics": _safe_text(action.get("selection_semantics")),
+        "shop_action": shop_action,
+        "shop_item_kind": item_kind,
+        "shop_is_remove": bool(shop_is_remove),
         "target_scope": target_scope,
         "target_index": int(target_index) if isinstance(target_index, int) else None,
         "choice_index": int(choice_index) if isinstance(choice_index, int) else None,
@@ -594,6 +664,13 @@ def semantic_action_text(signature: dict[str, Any] | None) -> str:
     semantics = _safe_text(signature.get("selection_semantics"))
     if semantics:
         parts.append(f"selection={semantics}")
+    shop_action = _safe_text(signature.get("shop_action"))
+    shop_item_kind = _safe_text(signature.get("shop_item_kind"))
+    if shop_action or shop_item_kind:
+        shop_parts = ",".join(part for part in (shop_action, shop_item_kind) if part)
+        parts.append(f"shop={shop_parts}")
+    if signature.get("shop_is_remove"):
+        parts.append("shop_remove=1")
     if roles:
         parts.append(f"role={','.join(_safe_text(role) for role in roles if _safe_text(role))}")
     metrics: list[str] = []
@@ -695,6 +772,9 @@ def compact_semantic_signature(signature: dict[str, Any] | None) -> dict[str, An
         "title": signature.get("title"),
         "stable_id": signature.get("stable_id"),
         "selection_semantics": signature.get("selection_semantics"),
+        "shop_action": signature.get("shop_action"),
+        "shop_item_kind": signature.get("shop_item_kind"),
+        "shop_is_remove": signature.get("shop_is_remove"),
         "target_scope": signature.get("target_scope"),
         "roles": signature.get("roles"),
         "damage": signature.get("damage"),

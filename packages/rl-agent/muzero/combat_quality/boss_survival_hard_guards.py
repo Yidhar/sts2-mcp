@@ -37,7 +37,7 @@ class BossSurvivalHardGuardMixin:
                 if hp_valid and encounter_tier == "boss":
                     incoming, current_block, _current_hp = self._incoming_damage_pressure(raw_obs if isinstance(raw_obs, dict) else None)
                     threat_gap = max(0.0, float(incoming) - float(current_block))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     current_energy = float(self._combat_energy(None, raw_obs))
                     boss_setup_window = bool(
                         threat_gap <= 0.05
@@ -513,7 +513,7 @@ class BossSurvivalHardGuardMixin:
             if hp_valid and encounter_tier in {"elite", "boss"}:
                 incoming, current_block, _current_hp = self._incoming_damage_pressure(raw_obs if isinstance(raw_obs, dict) else None)
                 threat_gap = max(0.0, float(incoming) - float(current_block))
-                hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                 survival_window = bool(
                     hp_ratio <= 0.15
                     or threat_gap >= max(1.0, hp - 1.0)
@@ -700,7 +700,7 @@ class BossSurvivalHardGuardMixin:
                 if hp_valid and encounter_tier in {"elite", "boss"}:
                     incoming, current_block, _current_hp = self._incoming_damage_pressure(raw_obs if isinstance(raw_obs, dict) else None)
                     threat_gap = max(0.0, float(incoming) - float(current_block))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     survival_window = bool(
                         threat_gap >= max(6.0, 0.20 * max(hp, 1.0))
                         or threat_gap >= max(1.0, hp - 1.0)

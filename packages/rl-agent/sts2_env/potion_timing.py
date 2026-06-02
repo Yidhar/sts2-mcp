@@ -38,9 +38,57 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if value is None:
         return default
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
+    if not np.isfinite(result):
+        return default
+    return float(result)
+
+
+_PLAYER_HP_KEYS = ("hp", "current_hp", "currentHealth", "current_health")
+_PLAYER_MAX_HP_KEYS = ("max_hp", "maxHealth", "max_health", "maximum_hp", "max_hp_raw")
+
+
+def _player_number(player: dict[str, Any], keys: tuple[str, ...]) -> float:
+    if not isinstance(player, dict):
+        return 0.0
+    for key in keys:
+        if key in player and player.get(key) is not None:
+            return _safe_float(player.get(key))
+    return 0.0
+
+
+def _player_hp_ratio_from_values(hp: float, max_hp: float) -> float:
+    """Safe potion-timing HP ratio.
+
+    Do not allow bridge snapshots with max_hp<=1 to become a clipped
+    full-health signal.  Those frames are either critical (hp<=1) or unknown
+    (hp>1/max_hp=1), but never healthy.
+    """
+
+    hp_f = _safe_float(hp)
+    max_hp_f = _safe_float(max_hp)
+    if hp_f <= 0.0:
+        return 0.0
+    if max_hp_f <= 1.0:
+        return 0.0
+    return float(np.clip(hp_f / max_hp_f, 0.0, 1.0))
+
+
+def _player_hp_triplet_from_raw(raw_obs: dict[str, Any] | None) -> tuple[float, float, float, bool]:
+    if not isinstance(raw_obs, dict):
+        return 0.0, 0.0, 0.0, False
+    player = raw_obs.get("player") if isinstance(raw_obs.get("player"), dict) else {}
+    if not player and isinstance(raw_obs.get("combat"), dict):
+        combat_player = raw_obs["combat"].get("player")
+        if isinstance(combat_player, dict):
+            player = combat_player
+    hp = _player_number(player, _PLAYER_HP_KEYS)
+    max_hp = _player_number(player, _PLAYER_MAX_HP_KEYS)
+    normal_valid = bool(hp > 0.0 and max_hp > 1.0)
+    critical_valid = bool(0.0 < hp <= 1.0 and 0.0 < max_hp <= 1.0)
+    return hp, max_hp, _player_hp_ratio_from_values(hp, max_hp), bool(normal_valid or critical_valid)
 
 
 def _action_family(action: dict[str, Any] | None) -> str:
@@ -111,7 +159,7 @@ def _incoming_damage_pressure(raw_obs: dict[str, Any] | None) -> tuple[float, fl
     return (
         incoming,
         _safe_float(player.get("block")),
-        _safe_float(player.get("hp", player.get("current_hp"))),
+        _player_number(player, _PLAYER_HP_KEYS),
     )
 
 
@@ -395,13 +443,9 @@ def compute_potion_timing(
     hp_ratio = 0.0
     hp_valid = False
     if isinstance(raw_obs, dict):
-        player_max_hp = _safe_float((raw_obs.get("player") or {}).get("max_hp"))
-        if player_max_hp <= 0.0:
-            player_max_hp = _safe_float((raw_obs.get("player") or {}).get("maxHealth"))
-        max_hp = player_max_hp
-        hp_valid = bool(np.isfinite(hp) and np.isfinite(max_hp) and hp > 0.0 and max_hp > 0.0)
-        if hp_valid:
-            hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+        hp_from_player, max_hp, hp_ratio, hp_valid = _player_hp_triplet_from_raw(raw_obs)
+        if hp <= 0.0 and hp_from_player > 0.0:
+            hp = hp_from_player
     discard_count = _discard_pile_count_from_raw(raw_obs)
     retrieve_has_target = bool(discard_count > 0)
     new_option_resource_like = bool(

@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import observation_common as obs_common
 from .run_memory import _build_profile, _clip01, _count_nonempty_potions, _float
 from .semantic_action import semantic_action_signature
 
@@ -165,12 +166,31 @@ def blended_objective_scalar_np(
 
 def _player_hp(obs: dict[str, Any] | None) -> float:
     player = (obs or {}).get("player") if isinstance(obs, dict) else {}
-    return _float(player.get("hp")) if isinstance(player, dict) else 0.0
+    return obs_common._player_hp_value(player) if isinstance(player, dict) else 0.0
 
 
 def _player_max_hp(obs: dict[str, Any] | None) -> float:
     player = (obs or {}).get("player") if isinstance(obs, dict) else {}
-    return max(_float(player.get("max_hp"), 1.0), 1.0) if isinstance(player, dict) else 1.0
+    return obs_common._player_max_hp_value(player) if isinstance(player, dict) else 0.0
+
+
+def _player_hp_ratio(obs: dict[str, Any] | None) -> float:
+    player = (obs or {}).get("player") if isinstance(obs, dict) else {}
+    return obs_common._player_hp_triplet(player)[2] if isinstance(player, dict) else 0.0
+
+
+def _player_max_hp_denominator(*obs_values: dict[str, Any] | None) -> float:
+    best_max = 0.0
+    best_hp = 0.0
+    for obs in obs_values:
+        player = (obs or {}).get("player") if isinstance(obs, dict) else {}
+        if not isinstance(player, dict):
+            continue
+        hp, max_hp, _ratio = obs_common._player_hp_triplet(player)
+        best_hp = max(best_hp, hp)
+        if max_hp > 1.0:
+            best_max = max(best_max, max_hp)
+    return max(best_max, best_hp if best_hp > 1.0 else 0.0, 1.0)
 
 
 def _player_block(obs: dict[str, Any] | None) -> float:
@@ -288,7 +308,7 @@ def compute_transition_objective_rewards(
     """Decompose one observed transition into planner-aligned reward components."""
     prev_hp = _player_hp(prev_obs)
     next_hp = _player_hp(next_obs)
-    max_hp = max(_player_max_hp(prev_obs), _player_max_hp(next_obs), 1.0)
+    max_hp = _player_max_hp_denominator(prev_obs, next_obs)
     hp_loss = max(prev_hp - next_hp, 0.0)
     prev_block = _player_block(prev_obs)
     next_block = _player_block(next_obs)
@@ -374,7 +394,7 @@ def compute_transition_objective_rewards(
         # old blanket penalty taught the policy to die with potions.  Without
         # encounter metadata in this pure transition function, infer tactical
         # pressure from incoming intent, low HP, and large enemy HP pools.
-        hp_ratio = next_hp / max_hp if max_hp > 0.0 else 0.0
+        hp_ratio = _player_hp_ratio(next_obs)
         lethal_pressure = prev_intent > max(prev_block + prev_hp * 0.35, 0.0)
         boss_like_pressure = prev_enemy_hp >= 180.0 or next_enemy_hp >= 180.0
         if lethal_pressure or hp_ratio <= 0.35 or boss_like_pressure:

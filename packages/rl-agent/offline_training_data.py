@@ -26,6 +26,15 @@ BUILD_V2_CANDIDATE_TASKS = {
     "shop_potion_pick_step",
     "shop_remove_target_step",
 }
+BUILD_V2_OPTIONAL_SKIP_TASKS = {
+    # Online these surfaces expose "skip/no buy" as a competing action even
+    # when the human actually picked an item.  Keep the offline candidate set
+    # aligned with online legal actions instead of appending <skip> only on
+    # skipped rows.
+    "regular_card_reward",
+    "shop_relic_pick_step",
+    "shop_potion_pick_step",
+}
 ROUTE_TASKS = {"route_room_type", "route_point_type"}
 ACTION_ONLY_CARD_TASKS = {"upgrade", "card_remove", "card_transform"}
 ACTION_ONLY_CLASS_TASKS = {"rest_site"}
@@ -169,6 +178,11 @@ def build_state_vocabs(rows: list[dict[str, Any]]) -> dict[str, StringVocab]:
 def build_output_vocabs(rows: list[dict[str, Any]], task: str) -> dict[str, StringVocab]:
     if task == "card_choice":
         return {}
+    if task in BUILD_V2_CANDIDATE_TASKS:
+        choice_ids: list[str] = []
+        for row in rows:
+            choice_ids.extend(row["candidate_ids"])
+        return {"choice": StringVocab.build(choice_ids)}
     if task in {"ancient_choice", "relic_choice", "potion_choice"}:
         choice_ids: list[str] = []
         for row in rows:
@@ -290,7 +304,7 @@ def _normalize_v2_candidate_row(row: dict[str, Any], task: str) -> dict[str, Any
     for candidate_id in candidate_ids:
         candidate_upgrade_levels.append(float(option_upgrade_levels.get(candidate_id, 0.0)))
 
-    if row.get("skip_available"):
+    if (row.get("skip_available") or task in BUILD_V2_OPTIONAL_SKIP_TASKS or label_id == "<skip>") and "<skip>" not in candidate_ids:
         candidate_ids.append("<skip>")
         candidate_counts.append(0.0)
         candidate_upgrade_levels.append(0.0)
@@ -319,7 +333,7 @@ def _normalize_v2_candidate_row(row: dict[str, Any], task: str) -> dict[str, Any
         "selection_step_index": int(row.get("selection_step_index") or 0),
         "selection_steps_total": int(row.get("selection_steps_total") or 1),
         "selected_prefix_ids": [str(value) for value in row.get("selected_prefix_ids") or [] if value],
-        "skip_available": bool(row.get("skip_available")),
+        "skip_available": "<skip>" in candidate_ids,
         "label_id": label_id,
         "option_kind": str(row.get("option_kind") or "unknown"),
     }

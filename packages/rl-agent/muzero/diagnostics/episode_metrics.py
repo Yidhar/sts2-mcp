@@ -463,6 +463,31 @@ class EpisodeMetricsMixin:
                 compact[key] = float(value)
             except (TypeError, ValueError):
                 continue
+        full_energy_extra_keys = {
+            "combat_quality_max_energy",
+            "combat_quality_energy_ratio",
+            "combat_quality_full_energy_like",
+            "combat_quality_full_energy_nonurgent_end_turn_available",
+            "combat_quality_full_energy_nonurgent_end_turn_selected",
+            "combat_quality_safe_progress_skip_available",
+            "combat_quality_safe_progress_skip_selected",
+            "combat_quality_full_energy_nonurgent_end_turn_bias_applied",
+        }
+        full_energy_prefixes = (
+            "combat_quality_full_energy_endturn_guard_",
+            "combat_quality_end_turn_pre_dispatch_",
+        )
+        for key, value in search_stats.items():
+            if key in compact:
+                continue
+            if key not in full_energy_extra_keys and not any(
+                str(key).startswith(prefix) for prefix in full_energy_prefixes
+            ):
+                continue
+            try:
+                compact[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
         return compact
 
     @staticmethod
@@ -553,10 +578,48 @@ class EpisodeMetricsMixin:
     @staticmethod
     def _episode_progress_snapshot(info: dict[str, Any] | None) -> dict[str, Any]:
         transition_state = info.get("transition_state") if isinstance(info, dict) else None
+        raw_obs = info.get("raw_obs") if isinstance(info, dict) else None
         run = transition_state.get("run") if isinstance(transition_state, dict) else None
         player = transition_state.get("player") if isinstance(transition_state, dict) else None
         if not isinstance(run, dict):
             return {}
+        raw_player: dict[str, Any] | None = None
+        if isinstance(raw_obs, dict):
+            if isinstance(raw_obs.get("player"), dict):
+                raw_player = raw_obs.get("player")
+            combat = raw_obs.get("combat") if isinstance(raw_obs.get("combat"), dict) else None
+            if raw_player is None and isinstance(combat, dict) and isinstance(combat.get("player"), dict):
+                raw_player = combat.get("player")
+
+        def _first_float(*values: Any) -> float:
+            for value in values:
+                if value is None:
+                    continue
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(parsed):
+                    return parsed
+            return 0.0
+
+        def _player_value(keys: tuple[str, ...]) -> float:
+            sources: list[dict[str, Any]] = []
+            if isinstance(player, dict):
+                sources.append(player)
+            if isinstance(raw_player, dict):
+                sources.append(raw_player)
+            for source in sources:
+                for key in keys:
+                    if key in source and source.get(key) is not None:
+                        return _first_float(source.get(key))
+                creature = source.get("creature")
+                if isinstance(creature, dict):
+                    for key in keys:
+                        if key in creature and creature.get(key) is not None:
+                            return _first_float(creature.get(key))
+            return 0.0
+
         room_type = str(run.get("room_type") or run.get("state_type") or "")
         room_model = str(
             run.get("room_model")
@@ -571,14 +634,10 @@ class EpisodeMetricsMixin:
         except (TypeError, ValueError):
             floor = 0.0
         act_id = EpisodeMetricsMixin._parse_progress_act_id(run.get("act_id"), run)
-        try:
-            hp = float(player.get("hp") or 0.0) if isinstance(player, dict) else 0.0
-        except (TypeError, ValueError):
-            hp = 0.0
-        try:
-            max_hp = float(player.get("max_hp") or 0.0) if isinstance(player, dict) else 0.0
-        except (TypeError, ValueError):
-            max_hp = 0.0
+        hp = _player_value(("hp", "current_hp", "currentHealth", "current_health"))
+        max_hp = _player_value(("max_hp", "maxHealth", "max_health", "maximum_hp", "max_hp_raw"))
+        max_hp_suspicious = bool(floor > 0.0 and max_hp <= 1.0)
+        hp_valid = bool(np.isfinite(hp) and np.isfinite(max_hp) and hp >= 0.0 and max_hp > 1.0)
         return {
             "floor": floor,
             "act_id": act_id,
@@ -592,6 +651,8 @@ class EpisodeMetricsMixin:
             "encounter_id_upper": room_model.upper(),
             "hp": hp,
             "max_hp": max_hp,
+            "hp_valid": hp_valid,
+            "max_hp_suspicious": max_hp_suspicious,
         }
 
     @staticmethod
@@ -665,7 +726,7 @@ class EpisodeMetricsMixin:
         return {
             "hp": hp,
             "max_hp": max_hp,
-            "hp_ratio": hp / max_hp if max_hp > 0.0 else 0.0,
+            "hp_ratio": hp / max_hp if max_hp > 1.0 else 0.0,
         }
 
     @staticmethod

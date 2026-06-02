@@ -1053,11 +1053,16 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         cards: list[Any],
         obs: dict[str, Any],
     ) -> None:
-        """Patch live hand-card numeric rows when Body Slam lacks preview damage.
+        """Patch live hand-card numeric rows for Body Slam dynamic damage.
 
         CARD_FEAT_DIM columns mirror DenseObservationEncoder._enc_card_collection:
         12/14 are base/preview damage, 25 is hit count, 31/32 are per-hit and
         per-energy damage, 34 is damage delta.  We do not change shape/schema.
+
+        Bridge/static payloads may expose Body Slam either as zero damage or as
+        a stale low non-zero preview.  The live tactical value is current block,
+        so always raise the encoded damage columns to at least that value rather
+        than only filling missing zeros.
         """
         if rows.size == 0 or not isinstance(cards, list):
             return
@@ -1066,8 +1071,6 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
                 continue
             damage = self._body_slam_dynamic_damage(card, obs)
             if damage <= 0.0:
-                continue
-            if rows.shape[1] > 14 and rows[index, 14] > 1e-6:
                 continue
             cost = max(obs_common._runtime_spend_cost(card), 0.0)
             damage_per_energy = damage / obs_common._normalized_cost_for_efficiency(cost)
@@ -1093,7 +1096,9 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         This is intentionally observation-side as well as bridge-side: old
         snapshots and stale bridge DLLs can still produce Body Slam with
         effect_preview.damage=0.  The policy/action scorer must see the live
-        damage columns as at least current block.
+        damage columns as at least current block.  Do this even when the bridge
+        exposes a stale low non-zero preview: Body Slam's damage scales from
+        live block, so a static 1-3 damage preview is still underexposed.
         """
         if actions.size == 0:
             return
@@ -1105,8 +1110,6 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             if damage <= 0.0:
                 continue
             row = actions[index]
-            if row.shape[0] > 22 and row[22] > 1e-6:
-                continue
             cost = max(obs_common._runtime_spend_cost(card), 0.0)
             damage_per_energy = damage / obs_common._normalized_cost_for_efficiency(cost)
             if row.shape[0] > 22:
@@ -1173,13 +1176,12 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         player = obs.get("player") or {}
         combat = obs.get("combat") or {}
         enemies = combat.get("enemies") or []
-        hp = obs_common._float(player.get("hp", player.get("current_hp")))
-        max_hp = obs_common._float(player.get("max_hp"))
+        hp, max_hp, hp_ratio = obs_common._player_hp_triplet(player)
         block = obs_common._float(player.get("block"))
         incoming = sum(obs_common._float(((enemy or {}).get("intent") or {}).get("total_damage")) for enemy in enemies if isinstance(enemy, dict))
 
         survival = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-        survival[0] = min(hp / max(max_hp, 1.0), 1.0) if max_hp > 0 else 0.0
+        survival[0] = hp_ratio
         survival[1] = obs_common._log_norm(hp, obs_common._LOG1P_200)
         survival[2] = obs_common._log_norm(block, obs_common._LOG1P_200)
         survival[3] = obs_common._log_norm(incoming, obs_common._LOG1P_200)
@@ -1205,7 +1207,12 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         threat[4] = float(any(self._infer_enemy_traits(enemy)[0] for enemy in enemies if isinstance(enemy, dict)))
         combat_memory = (planner_context or {}).get("combat_memory") or {}
         if combat_memory:
-            player_max_hp = max(obs_common._float(combat_memory.get("player_max_hp"), max_hp or 1.0), 1.0)
+            player_max_hp = max(
+                obs_common._float(combat_memory.get("player_max_hp")),
+                max_hp if max_hp > 1.0 else 0.0,
+                hp if hp > 1.0 else 0.0,
+                1.0,
+            )
             initial_total_hp = max(obs_common._float(combat_memory.get("initial_enemy_total_hp"), 1.0), 1.0)
             threat[5] = min(obs_common._float(combat_memory.get("turns_in_combat")) / 20.0, 1.0)
             threat[6] = obs_common._signed_log_norm(obs_common._float(combat_memory.get("player_hp_delta_last_turn")), obs_common._LOG1P_200)
@@ -1609,8 +1616,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         if not combat:
             return
 
-        hp = obs_common._float(player.get("hp", player.get("current_hp")))
-        max_hp = obs_common._float(player.get("max_hp"))
+        hp, _max_hp, hp_ratio = obs_common._player_hp_triplet(player)
         block = obs_common._float(player.get("block"))
         enemies = combat.get("enemies") or []
         incoming = sum(
@@ -1621,7 +1627,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         boss_player_state = self._boss_player_state()
 
         player_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
-        player_numeric[0] = min(hp / max(max_hp, 1.0), 1.0) if max_hp > 0 else 0.0
+        player_numeric[0] = hp_ratio
         player_numeric[1] = obs_common._log_norm(hp, obs_common._LOG1P_200)
         player_numeric[2] = obs_common._log_norm(block, obs_common._LOG1P_200)
         player_numeric[3] = obs_common._log_norm(incoming, obs_common._LOG1P_200)
@@ -2161,7 +2167,8 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             option = action.get("option") if isinstance(action.get("option"), dict) else None
             deltas = option.get("effect_deltas") if isinstance(option, dict) else None
             if isinstance(deltas, dict):
-                player_max_hp = max(obs_common._float((obs.get("player") or {}).get("max_hp"), 1.0), 1.0)
+                event_hp, event_max_hp, _event_hp_ratio = obs_common._player_hp_triplet(obs.get("player") if isinstance(obs.get("player"), dict) else {})
+                player_max_hp = max(event_max_hp if event_max_hp > 1.0 else 0.0, event_hp if event_hp > 1.0 else 0.0, 1.0)
                 hp_delta = obs_common._float(deltas.get("hp_delta"))
                 max_hp_delta = obs_common._float(deltas.get("max_hp_delta"))
                 gold_delta = obs_common._float(deltas.get("gold_delta"))
@@ -2221,15 +2228,49 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             shop_numeric = np.zeros(TOKEN_NUMERIC_DIM, dtype=np.float32)
             item = action.get("item") if isinstance(action.get("item"), dict) else {}
             cost = obs_common._float(item.get("cost"))
+            shop_action = str(action.get("shop_action") or "").strip().lower()
+            item_kind = str(item.get("item_kind") or item.get("kind") or "").strip().lower()
+            item_title = str(item.get("title") or "").strip().lower()
+            is_open = shop_action == "open"
+            is_leave = shop_action in {"leave", "back"} or any(token in shop_action for token in ("leave", "back"))
+            is_buy = shop_action == "buy" or "buy" in shop_action or "purchase" in shop_action
+            is_remove = (
+                "remove" in shop_action
+                or item_kind in {"card_removal", "remove", "removal", "purge"}
+                or "remove" in item_title
+                or "purge" in item_title
+            )
+            is_affordable = item.get("is_affordable")
+            if is_affordable is None:
+                is_affordable = item.get("affordable")
+            if is_affordable is None:
+                is_affordable = item.get("enough_gold")
+            if isinstance(is_affordable, str):
+                is_affordable = is_affordable.strip().lower() in {"1", "true", "yes", "y"}
+            else:
+                is_affordable = bool(is_affordable)
             shop_numeric[0] = obs_common._log_norm(gold, obs_common._LOG1P_500)
             shop_numeric[1] = obs_common._log_norm(cost, obs_common._LOG1P_500)
-            shop_numeric[2] = float(gold >= cost and cost > 0)
+            shop_numeric[2] = float(is_affordable or (gold >= cost and cost > 0))
             shop_numeric[3] = min(cost / max(gold, 1.0), 1.0) if gold > 0 else float(cost > 0)
             shop_numeric[4] = min(len(deck_cards) / 50.0, 1.0) if isinstance(deck_cards, list) else 0.0
             shop_numeric[5] = float(isinstance(item.get("card"), dict))
             shop_numeric[6] = float(isinstance(item.get("relic"), dict))
             shop_numeric[7] = float(isinstance(item.get("potion"), dict))
-            shop_numeric[8] = float(str(action.get("shop_action") or "").strip().lower().find("remove") >= 0)
+            # Keep slot 8 as the long-standing "remove" bit, but also expose
+            # explicit shop action/item-kind bits below.  Bridge card removal
+            # arrives as shop_action=buy + item_kind=card_removal, not as a
+            # shop_action containing the word "remove".
+            shop_numeric[8] = float(is_remove)
+            shop_numeric[9] = float(is_open)
+            shop_numeric[10] = float(is_leave)
+            shop_numeric[11] = float(is_buy)
+            shop_numeric[12] = float(is_remove)
+            shop_numeric[13] = float(item_kind == "card")
+            shop_numeric[14] = float(item_kind == "relic")
+            shop_numeric[15] = float(item_kind == "potion")
+            shop_numeric[16] = float(item_kind == "card_removal")
+            shop_numeric[17] = float(bool(item.get("used")))
             entries.append(
                 self._entry(
                     "SHOP_ECON_LOCAL",
@@ -2259,7 +2300,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
             risk_numeric[21] = route_summary[6] if route_summary.shape[0] > 6 else 0.0
             risk_numeric[22] = route_summary[12] if route_summary.shape[0] > 12 else 0.0
             risk_numeric[23] = route_summary[18] if route_summary.shape[0] > 18 else 0.0
-            risk_numeric[24] = min(obs_common._float((player or {}).get("hp")) / max(obs_common._float((player or {}).get("max_hp")), 1.0), 1.0) if isinstance(player, dict) else 0.0
+            risk_numeric[24] = obs_common._player_hp_triplet(player)[2] if isinstance(player, dict) else 0.0
             risk_numeric[25] = obs_common._log_norm(obs_common._float((player or {}).get("gold")), obs_common._LOG1P_500)
 
             value_numeric[: min(obs_common.ROUTE_SUMMARY_DIM, TOKEN_NUMERIC_DIM)] = route_summary[:TOKEN_NUMERIC_DIM]
@@ -3919,7 +3960,7 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         """
         profile = self._source_profile(source)
         body_slam_damage = self._body_slam_dynamic_damage(source, obs)
-        if body_slam_damage <= 0.0 or profile.get("damage", 0.0) > 1e-6:
+        if body_slam_damage <= 0.0:
             return profile
         patched = dict(profile)
         patched["damage"] = max(patched.get("damage", 0.0), body_slam_damage)
@@ -3974,6 +4015,15 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         return str(potion or "")
 
     def _shop_item_text(self, item: dict[str, Any]) -> str:
+        item_kind = str(item.get("item_kind") or item.get("kind") or "").strip().lower()
+        cost = item.get("cost")
+        cost_text = ""
+        if cost is not None:
+            cost_text = f" | cost {int(obs_common._float(cost))}"
+        if item_kind in {"card_removal", "remove", "removal", "purge"}:
+            title = str(item.get("title") or "card removal").strip()
+            used = " | used" if bool(item.get("used")) else ""
+            return f"shop remove card | {title}{cost_text}{used}"
         if isinstance(item.get("card"), dict):
             return self._build_live_card_text(item.get("card"))
         if isinstance(item.get("relic"), dict):
@@ -3983,6 +4033,10 @@ class WorldTokenObservationEncoder(obs_common.DenseObservationEncoder):
         return str(item.get("title") or item.get("canonical_text") or "")
 
     def _shop_item_entity_key(self, item: dict[str, Any]) -> str:
+        item_kind = str(item.get("item_kind") or item.get("kind") or "").strip().lower()
+        if item_kind in {"card_removal", "remove", "removal", "purge"}:
+            title = item.get("title") or item.get("name") or item.get("index") or "remove"
+            return f"shop:{item_kind}:{title}"
         for key in ("card", "relic", "potion"):
             payload = item.get(key)
             if isinstance(payload, dict):

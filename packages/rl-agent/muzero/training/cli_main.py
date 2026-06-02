@@ -307,6 +307,89 @@ def main():
         weight_decay=args.weight_decay,
     )
 
+    human_demo_policy_alignment = None
+    if args.human_demo_alignment_path:
+        from muzero.training.human_demo_alignment import (
+            HumanDemoAlignmentConfig,
+            HumanDemoPolicyAligner,
+            parse_human_demo_paths,
+        )
+
+        encounter_filter = None
+        if args.human_demo_alignment_encounters:
+            encounter_filter = tuple(
+                part.strip()
+                for part in str(args.human_demo_alignment_encounters).replace(";", ",").split(",")
+                if part.strip()
+            )
+        human_demo_policy_alignment = HumanDemoPolicyAligner(
+            HumanDemoAlignmentConfig(
+                paths=parse_human_demo_paths(args.human_demo_alignment_path),
+                batch_size=args.human_demo_alignment_batch_size,
+                strict=bool(args.human_demo_alignment_strict),
+                encounter_filter=encounter_filter,
+                max_samples=(
+                    None
+                    if int(args.human_demo_alignment_max_samples) <= 0
+                    else int(args.human_demo_alignment_max_samples)
+                ),
+                seed=0,
+                shuffle=True,
+                use_text=False,
+            )
+        )
+        print(
+            "[setup] Human demo alignment: "
+            f"{'loss' if args.human_demo_alignment_enable_loss else 'shadow'} "
+            f"rows={int(human_demo_policy_alignment.load_stats['rows'])} "
+            f"path={args.human_demo_alignment_path} "
+            f"weight={args.human_demo_alignment_weight} "
+            f"batch={args.human_demo_alignment_batch_size} "
+            f"every={args.human_demo_alignment_every_n_train_steps}",
+            flush=True,
+        )
+    else:
+        print("[setup] Human demo alignment: off", flush=True)
+
+    offline_policy_alignment = None
+    if args.offline_alignment_root:
+        from muzero.training.offline_policy_alignment import (
+            OfflinePolicyAligner,
+            OfflinePolicyAlignmentConfig,
+            parse_offline_alignment_tasks,
+        )
+
+        offline_tasks = parse_offline_alignment_tasks(args.offline_alignment_tasks)
+        offline_policy_alignment = OfflinePolicyAligner(
+            OfflinePolicyAlignmentConfig(
+                root=args.offline_alignment_root,
+                tasks=offline_tasks,
+                batch_size=args.offline_alignment_batch_size,
+                max_rows_per_task=(
+                    None
+                    if int(args.offline_alignment_max_rows_per_task) <= 0
+                    else int(args.offline_alignment_max_rows_per_task)
+                ),
+                allow_route=bool(args.offline_alignment_allow_route),
+                seed=0,
+                shuffle=True,
+                use_text=False,
+            )
+        )
+        print(
+            "[setup] Offline policy alignment: "
+            f"{'loss' if args.offline_alignment_enable_loss else 'shadow'} "
+            f"rows={int(offline_policy_alignment.load_stats['rows'])} "
+            f"tasks={','.join(offline_tasks)} "
+            f"root={args.offline_alignment_root} "
+            f"weight={args.offline_alignment_weight} "
+            f"batch={args.offline_alignment_batch_size} "
+            f"every={args.offline_alignment_every_n_train_steps}",
+            flush=True,
+        )
+    else:
+        print("[setup] Offline policy alignment: off", flush=True)
+
     trainer = MuZeroTrainer(
         network=network,
         mcts=mcts,
@@ -322,6 +405,15 @@ def main():
         planner_objective_q_loss_weight=args.planner_objective_q_loss_weight,
         objective_value_weight=args.objective_value_weight,
         objective_reward_weight=args.objective_reward_weight,
+        combat_hp_preservation_aux_weight=args.combat_hp_preservation_aux_weight,
+        human_demo_policy_alignment=human_demo_policy_alignment,
+        human_demo_alignment_weight=args.human_demo_alignment_weight,
+        human_demo_alignment_shadow_only=not args.human_demo_alignment_enable_loss,
+        human_demo_alignment_every_n_train_steps=args.human_demo_alignment_every_n_train_steps,
+        offline_policy_alignment=offline_policy_alignment,
+        offline_alignment_weight=args.offline_alignment_weight,
+        offline_alignment_shadow_only=not args.offline_alignment_enable_loss,
+        offline_alignment_every_n_train_steps=args.offline_alignment_every_n_train_steps,
         semantic_policy_weight=0.0 if args.disable_semantic_training else args.semantic_policy_weight,
         semantic_value_weight=0.0 if args.disable_semantic_training else args.semantic_value_weight,
         semantic_reward_weight=0.0 if args.disable_semantic_training else args.semantic_reward_weight,
@@ -384,6 +476,8 @@ def main():
         recent_tail_min_samples=args.recent_tail_min_samples,
         route_heuristic_bias=args.route_heuristic_bias,
         route_safety_guard=args.route_safety_guard,
+        combat_hard_guard_policy=args.combat_hard_guard_policy,
+        build_hard_guard_policy=args.build_hard_guard_policy,
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_keep_last=args.checkpoint_keep_last,
@@ -455,6 +549,12 @@ def main():
         f"build={args.build_num_simulations}, "
         f"route={args.route_num_simulations}, "
         f"fallback={args.num_simulations}"
+    )
+    print(
+        "[setup] Hard guards: "
+        f"combat={args.combat_hard_guard_policy} "
+        f"build={args.build_hard_guard_policy} "
+        f"route_safety={'on' if args.route_safety_guard else 'off'}"
     )
     print(
         "[setup] Network: "
@@ -689,6 +789,7 @@ def main():
             planner_objective_q_loss_weight=args.planner_objective_q_loss_weight,
             objective_value_weight=args.objective_value_weight,
             objective_reward_weight=args.objective_reward_weight,
+            combat_hp_preservation_aux_weight=args.combat_hp_preservation_aux_weight,
             semantic_policy_weight=0.0 if args.disable_semantic_training else args.semantic_policy_weight,
             semantic_value_weight=0.0 if args.disable_semantic_training else args.semantic_value_weight,
             semantic_reward_weight=0.0 if args.disable_semantic_training else args.semantic_reward_weight,
@@ -751,6 +852,8 @@ def main():
             recent_tail_min_samples=args.recent_tail_min_samples,
             route_heuristic_bias=args.route_heuristic_bias,
             route_safety_guard=args.route_safety_guard,
+            combat_hard_guard_policy=args.combat_hard_guard_policy,
+            build_hard_guard_policy=args.build_hard_guard_policy,
             log_dir=actor_log_dir,
             checkpoint_dir=actor_ckpt_dir,
             checkpoint_keep_last=0,

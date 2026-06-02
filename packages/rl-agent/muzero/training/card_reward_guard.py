@@ -344,6 +344,15 @@ def _is_pick_action(action: Any, *, card_reward_context: bool) -> bool:
     if selection in _PICK_SELECTIONS:
         return True
     for container in _containers(action):
+        action_id = str(container.get("action_id") or "").strip().lower()
+        # Compact replay/frontier signatures may reduce a picked card reward to
+        # only a positional id such as ``card_reward:0``.  Treat those as picks
+        # even when ``kind``/``selection`` and the full card payload were
+        # stripped; otherwise guard/retarget telemetry can silently classify the
+        # final executed pick as neither-pick-nor-skip and inflate skip pressure.
+        if action_id.startswith("card_reward:") and "skip" not in action_id:
+            return True
+    for container in _containers(action):
         kind = str(container.get("kind") or container.get("action_type") or "").strip().lower()
         if kind in {"card_reward", "choose_card_reward"}:
             return True
@@ -392,19 +401,21 @@ def _card_from_action(action: Any) -> dict[str, Any]:
             card = option.get("card")
             if isinstance(card, dict):
                 return dict(card)
-        card_id = (
-            container.get("card_id")
-            or container.get("cardId")
-            or container.get("id")
-            if _reward_type(container) == "card"
-            else None
-        )
+        card_id = container.get("card_id") or container.get("cardId")
+        if not card_id and _reward_type(container) == "card":
+            card_id = container.get("id")
         if card_id:
             return {
                 "id": card_id,
-                "title": container.get("card_title") or container.get("title") or container.get("name"),
+                "title": container.get("card_title") or container.get("title") or container.get("name") or container.get("label"),
                 "type": container.get("card_type") or container.get("type"),
-                "cost": container.get("cost") if container.get("cost") is not None else container.get("energy_cost"),
+                "cost": (
+                    container.get("card_cost")
+                    if container.get("card_cost") is not None
+                    else container.get("cost")
+                    if container.get("cost") is not None
+                    else container.get("energy_cost")
+                ),
                 "card_effect_profile": container.get("card_effect_profile"),
             }
     return {}
@@ -1402,6 +1413,12 @@ def _store_card_reward_choice_diagnostic(
                 selected_action,
                 index=int(original_action_idx),
             ),
+            # This payload is produced while evaluating the model/search choice,
+            # before self_play knows the final post-guard action.  Keep the
+            # original and final skip semantics separate: self_play overwrites
+            # selected_is_skip with final-action semantics before JSONL dump.
+            "original_selected_is_skip": True,
+            "final_selected_is_skip": None,
             "selected_is_skip": True,
             "min_useful_score": float(min_useful_score),
             "dynamic_min_useful_score": float(dynamic_min_useful_score),

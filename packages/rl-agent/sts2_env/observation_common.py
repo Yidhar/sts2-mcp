@@ -186,6 +186,69 @@ def _metric(source, key, default=0.0):
     return _float(source.get(key), default)
 
 
+_PLAYER_HP_KEYS = ("hp", "current_hp", "currentHealth", "current_health")
+_PLAYER_MAX_HP_KEYS = ("max_hp", "maxHealth", "max_health", "maximum_hp", "max_hp_raw")
+
+
+def _finite_float(val, default: float = 0.0) -> float:
+    value = _float(val, default)
+    return value if math.isfinite(value) else default
+
+
+def _first_player_number(source: dict | None, keys: tuple[str, ...], default: float = 0.0) -> float:
+    if not isinstance(source, dict):
+        return default
+    for key in keys:
+        if key in source and source.get(key) is not None:
+            return _finite_float(source.get(key), default)
+    creature = source.get("creature")
+    if isinstance(creature, dict):
+        for key in keys:
+            if key in creature and creature.get(key) is not None:
+                return _finite_float(creature.get(key), default)
+    return default
+
+
+def _player_hp_value(player: dict | None) -> float:
+    """Bridge-tolerant player HP parser shared by dense and token encoders."""
+    return _first_player_number(player, _PLAYER_HP_KEYS, 0.0)
+
+
+def _player_max_hp_value(player: dict | None) -> float:
+    """Bridge-tolerant max HP parser.
+
+    A transient ``max_hp == 1`` after floor 0 has appeared in full-run logs.
+    Callers should treat that as suspicious unless the actual HP is also a
+    critical/dead 0-1 frame; do not use it as a denominator for "full HP".
+    """
+    return _first_player_number(player, _PLAYER_MAX_HP_KEYS, 0.0)
+
+
+def _hp_ratio_from_values(hp: float, max_hp: float, *, fallback_max_hp: float = 0.0) -> float:
+    hp = _finite_float(hp, 0.0)
+    max_hp = _finite_float(max_hp, 0.0)
+    fallback_max_hp = _finite_float(fallback_max_hp, 0.0)
+    if max_hp <= 1.0 and fallback_max_hp > 1.0:
+        max_hp = fallback_max_hp
+    if hp < 0.0:
+        hp = 0.0
+    if max_hp > 1.0:
+        return _clip01(hp / max_hp)
+    # Missing/suspicious max HP is unknown/unsafe, not "full HP".
+    return 0.0
+
+
+def _player_hp_triplet(
+    player: dict | None,
+    *,
+    fallback_max_hp: float = 0.0,
+) -> tuple[float, float, float]:
+    """Return ``(hp, max_hp, hp_ratio)`` without max_hp=1 -> full-HP leakage."""
+    hp = _player_hp_value(player)
+    max_hp = _player_max_hp_value(player)
+    return hp, max_hp, _hp_ratio_from_values(hp, max_hp, fallback_max_hp=fallback_max_hp)
+
+
 _LOG1P_200 = math.log1p(200.0)
 _LOG1P_1200 = math.log1p(1200.0)
 _LOG1P_500 = math.log1p(500.0)
@@ -1024,11 +1087,10 @@ class DenseObservationEncoder:
 
         player = obs.get("player") or {}
         combat = obs.get("combat") or {}
-        hp = _float(player.get("hp"))
-        max_hp = _float(player.get("max_hp"))
-        vector[offset] = min(hp / max_hp, 1.0) if max_hp > 0 else 0.0
+        hp, max_hp, hp_ratio = _player_hp_triplet(player)
+        vector[offset] = hp_ratio
         vector[offset + 1] = min(hp / 100.0, 1.0)
-        vector[offset + 2] = min(max_hp / 100.0, 1.0)
+        vector[offset + 2] = min(max_hp / 100.0, 1.0) if max_hp > 1.0 else 0.0
         vector[offset + 3] = _log_norm(_float(player.get("block")), _LOG1P_200)
         vector[offset + 4] = _log_norm(_float(player.get("gold")), _LOG1P_500)
         energy = _float(combat.get("energy"))
@@ -1549,8 +1611,13 @@ class DenseObservationEncoder:
             item = action.get("item")
             if isinstance(item, dict):
                 shop_action = str(action.get("shop_action") or "").strip().lower()
+                item_kind = str(item.get("item_kind") or item.get("kind") or "").strip().lower()
                 item_cost = item.get("cost")
                 cost_text = f"cost {_float(item_cost):.0f}" if item_cost is not None else ""
+                if item_kind in {"card_removal", "remove", "removal", "purge"}:
+                    title = str(item.get("title") or "card removal").strip()
+                    prefix = "leave shop" if any(token in shop_action for token in ("leave", "back")) else "buy card removal"
+                    return " | ".join(part for part in (prefix, title, cost_text) if part)
                 item_card = item.get("card")
                 if isinstance(item_card, dict):
                     item_text = self._build_live_card_text(item_card)

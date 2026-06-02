@@ -289,6 +289,17 @@ class CheckpointingMixin:
             "planner_objective_q_loss_weight": float(self.planner_objective_q_loss_weight),
             "objective_value_weight": float(self.objective_value_weight),
             "objective_reward_weight": float(self.objective_reward_weight),
+            "combat_hp_preservation_aux_weight": float(
+                getattr(self, "combat_hp_preservation_aux_weight", 0.0)
+            ),
+            "human_demo_alignment": {
+                "active": bool(getattr(self, "human_demo_policy_alignment", None) is not None),
+                "weight": float(getattr(self, "human_demo_alignment_weight", 0.0)),
+                "shadow_only": bool(getattr(self, "human_demo_alignment_shadow_only", True)),
+                "every_n_train_steps": int(
+                    getattr(self, "human_demo_alignment_every_n_train_steps", 1)
+                ),
+            },
             "semantic_policy_weight": float(self.semantic_policy_weight),
             "semantic_value_weight": float(self.semantic_value_weight),
             "semantic_reward_weight": float(self.semantic_reward_weight),

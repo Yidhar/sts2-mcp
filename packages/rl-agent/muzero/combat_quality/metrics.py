@@ -43,6 +43,9 @@ COMBAT_QUALITY_CARD_BLOCK_SEARCH_SUFFIXES: Mapping[str, str] = MappingProxyType(
 
 COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES: Mapping[str, str] = MappingProxyType(
     {
+        "combat_hard_guard_policy_full": "combat_hard_guard_policy_full",
+        "combat_hard_guard_policy_emergency": "combat_hard_guard_policy_emergency",
+        "combat_hard_guard_policy_off": "combat_hard_guard_policy_off",
         "combat_quality_meaningful_damage_endturn_guard_available": "combat_quality_meaningful_damage_endturn_guard_available",
         "combat_quality_meaningful_damage_endturn_guard_applied": "combat_quality_meaningful_damage_endturn_guard_applied",
         "combat_quality_meaningful_damage_endturn_guard_override": "combat_quality_meaningful_damage_endturn_guard_override",
@@ -178,6 +181,71 @@ COMBAT_QUALITY_TACTICAL_SEARCH_SUFFIXES: Mapping[str, str] = MappingProxyType(
         "combat_quality_potion_discard_guard_override": "combat_quality_potion_discard_guard_override",
         "combat_quality_potion_discard_guard_candidate_count": "combat_quality_potion_discard_guard_candidate_count",
         "combat_quality_potion_discard_guard_saved_survival": "combat_quality_potion_discard_guard_saved_survival",
+    }
+)
+
+_FULL_ENERGY_ENDTURN_GUARD_SUFFIXES: Mapping[str, str] = MappingProxyType(
+    {
+        "combat_quality_full_energy_endturn_guard_full_energy_selected": "combat_quality_full_energy_endturn_guard_full_energy_selected",
+        "combat_quality_full_energy_endturn_guard_available": "combat_quality_full_energy_endturn_guard_available",
+        "combat_quality_full_energy_endturn_guard_applied": "combat_quality_full_energy_endturn_guard_applied",
+        "combat_quality_full_energy_endturn_guard_override": "combat_quality_full_energy_endturn_guard_override",
+        "combat_quality_full_energy_endturn_guard_candidate_count": "combat_quality_full_energy_endturn_guard_candidate_count",
+        "combat_quality_full_energy_endturn_guard_no_alternative": "combat_quality_full_energy_endturn_guard_no_alternative",
+        "combat_quality_full_energy_endturn_guard_legal_generation_gap_suspect": "combat_quality_full_energy_endturn_guard_legal_generation_gap_suspect",
+        "combat_quality_full_energy_endturn_guard_legal_surface_mismatch_skip": "combat_quality_full_energy_endturn_guard_legal_surface_mismatch_skip",
+        "combat_quality_full_energy_endturn_guard_selection_screen_skip": "combat_quality_full_energy_endturn_guard_selection_screen_skip",
+        "combat_quality_full_energy_endturn_guard_lethal_candidate": "combat_quality_full_energy_endturn_guard_lethal_candidate",
+        "combat_quality_full_energy_endturn_guard_ui_affordable_count": "combat_quality_full_energy_endturn_guard_ui_affordable_count",
+        "combat_quality_full_energy_endturn_guard_legal_play_card_count": "combat_quality_full_energy_endturn_guard_legal_play_card_count",
+        "combat_quality_full_energy_endturn_guard_affordable_play_card_count": "combat_quality_full_energy_endturn_guard_affordable_play_card_count",
+        "combat_quality_full_energy_endturn_guard_pressure_skip": "combat_quality_full_energy_endturn_guard_pressure_skip",
+        "combat_quality_full_energy_endturn_guard_invalid_obs": "combat_quality_full_energy_endturn_guard_invalid_obs",
+        "combat_quality_full_energy_endturn_guard_forced_skip": "combat_quality_full_energy_endturn_guard_forced_skip",
+        "combat_quality_full_energy_endturn_guard_energy": "combat_quality_full_energy_endturn_guard_energy",
+        "combat_quality_full_energy_endturn_guard_energy_ratio": "combat_quality_full_energy_endturn_guard_energy_ratio",
+        "combat_quality_full_energy_endturn_guard_illegal_candidate_reject": "combat_quality_full_energy_endturn_guard_illegal_candidate_reject",
+    }
+)
+
+_FULL_ENERGY_ENDTURN_TACTICAL_SUFFIXES: Mapping[str, str] = MappingProxyType(
+    {
+        "combat_quality_full_energy_nonurgent_end_turn_available": "combat_quality_full_energy_nonurgent_end_turn_available",
+        "combat_quality_full_energy_nonurgent_end_turn_selected": "combat_quality_full_energy_nonurgent_end_turn_selected",
+        "combat_quality_safe_progress_skip_available": "combat_quality_safe_progress_skip_available",
+        "combat_quality_safe_progress_skip_selected": "combat_quality_safe_progress_skip_selected",
+        "combat_quality_full_energy_nonurgent_end_turn_bias_applied": "combat_quality_full_energy_nonurgent_end_turn_bias_applied",
+        "combat_quality_full_energy_like": "combat_quality_full_energy_like",
+        "combat_quality_max_energy": "combat_quality_max_energy",
+        "combat_quality_energy_ratio": "combat_quality_energy_ratio",
+        "combat_quality_end_turn_pre_dispatch_full_energy_like": "combat_quality_end_turn_pre_dispatch_full_energy_like",
+        "combat_quality_end_turn_pre_dispatch_full_energy_skip_suspect": "combat_quality_end_turn_pre_dispatch_full_energy_skip_suspect",
+        "combat_quality_end_turn_pre_dispatch_legal_generation_gap": "combat_quality_end_turn_pre_dispatch_legal_generation_gap",
+        "combat_quality_end_turn_pre_dispatch_raw_hand_legal_surface_mismatch": "combat_quality_end_turn_pre_dispatch_raw_hand_legal_surface_mismatch",
+        "combat_quality_end_turn_pre_dispatch_singleton_frontier_suspect": "combat_quality_end_turn_pre_dispatch_singleton_frontier_suspect",
+        "combat_quality_end_turn_pre_dispatch_pressure_skip_suspect": "combat_quality_end_turn_pre_dispatch_pressure_skip_suspect",
+        "combat_quality_end_turn_pre_dispatch_full_energy_skip_with_playable_hand": "combat_quality_end_turn_pre_dispatch_full_energy_skip_with_playable_hand",
+        "combat_quality_end_turn_pre_dispatch_safe_progress_candidate_count": "combat_quality_end_turn_pre_dispatch_safe_progress_candidate_count",
+        "combat_quality_end_turn_pre_dispatch_ui_affordable_hand_card_count": "combat_quality_end_turn_pre_dispatch_ui_affordable_hand_card_count",
+        "combat_quality_end_turn_pre_dispatch_legal_play_card_action_count": "combat_quality_end_turn_pre_dispatch_legal_play_card_action_count",
+        "combat_quality_end_turn_pre_dispatch_affordable_play_card_action_count": "combat_quality_end_turn_pre_dispatch_affordable_play_card_action_count",
+        "combat_quality_end_turn_pre_dispatch_mask_legal_count": "combat_quality_end_turn_pre_dispatch_mask_legal_count",
+        "combat_quality_end_turn_pre_dispatch_raw_hand_card_count": "combat_quality_end_turn_pre_dispatch_raw_hand_card_count",
+        "combat_quality_end_turn_pre_dispatch_energy": "combat_quality_end_turn_pre_dispatch_energy",
+        "combat_quality_end_turn_pre_dispatch_energy_ratio": "combat_quality_end_turn_pre_dispatch_energy_ratio",
+    }
+)
+
+COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES = MappingProxyType(
+    {
+        **COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES,
+        **_FULL_ENERGY_ENDTURN_GUARD_SUFFIXES,
+    }
+)
+COMBAT_QUALITY_TACTICAL_SEARCH_SUFFIXES = MappingProxyType(
+    {
+        **COMBAT_QUALITY_TACTICAL_SEARCH_SUFFIXES,
+        **_FULL_ENERGY_ENDTURN_TACTICAL_SUFFIXES,
     }
 )
 
@@ -340,6 +408,20 @@ def combat_tactical_issue_metrics(
         f"{tag_prefix}forced_end_turn_selected_rate": selected_mean("combat_quality_forced_end_turn_selected"),
         f"{tag_prefix}end_turn_unknown_selected_rate": selected_mean("combat_quality_end_turn_unknown_selected"),
         f"{tag_prefix}direct_end_turn_selected_rate": selected_mean("combat_quality_end_turn_selected"),
+        f"{tag_prefix}full_energy_nonurgent_end_turn_available_rate": mean("combat_quality_full_energy_nonurgent_end_turn_available"),
+        f"{tag_prefix}full_energy_nonurgent_end_turn_selected_rate": selected_mean("combat_quality_full_energy_nonurgent_end_turn_selected"),
+        f"{tag_prefix}safe_progress_skip_available_rate": mean("combat_quality_safe_progress_skip_available"),
+        f"{tag_prefix}safe_progress_skip_selected_rate": selected_mean("combat_quality_safe_progress_skip_selected"),
+        f"{tag_prefix}full_energy_nonurgent_end_turn_bias_applied_rate": mean("combat_quality_full_energy_nonurgent_end_turn_bias_applied"),
+        f"{tag_prefix}full_energy_like_rate": mean("combat_quality_full_energy_like"),
+        f"{tag_prefix}energy_ratio_mean": mean("combat_quality_energy_ratio"),
+        f"{tag_prefix}max_energy_mean": mean("combat_quality_max_energy"),
+        f"{tag_prefix}end_turn_pre_dispatch_full_energy_skip_suspect_rate": mean("combat_quality_end_turn_pre_dispatch_full_energy_skip_suspect"),
+        f"{tag_prefix}end_turn_pre_dispatch_legal_generation_gap_rate": mean("combat_quality_end_turn_pre_dispatch_legal_generation_gap"),
+        f"{tag_prefix}end_turn_pre_dispatch_safe_progress_candidate_count_mean": mean("combat_quality_end_turn_pre_dispatch_safe_progress_candidate_count"),
+        f"{tag_prefix}end_turn_pre_dispatch_ui_affordable_hand_card_count_mean": mean("combat_quality_end_turn_pre_dispatch_ui_affordable_hand_card_count"),
+        f"{tag_prefix}end_turn_pre_dispatch_energy_mean": mean("combat_quality_end_turn_pre_dispatch_energy"),
+        f"{tag_prefix}end_turn_pre_dispatch_energy_ratio_mean": mean("combat_quality_end_turn_pre_dispatch_energy_ratio"),
         f"{tag_prefix}x_cost_available_count_mean": mean("combat_quality_x_cost_available_count"),
         f"{tag_prefix}x_cost_selected_rate": selected_mean("combat_quality_x_cost_selected"),
         f"{tag_prefix}x_cost_selected_energy_mean": (

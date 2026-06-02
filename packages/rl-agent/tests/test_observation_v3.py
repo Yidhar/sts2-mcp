@@ -59,7 +59,18 @@ class ObservationV3ContractTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         modules = _load_sts2_env_modules()
         cls.semantic_action = modules["semantic_action"]
+        cls.observation_common = modules["observation_common"]
         cls.observation_v3 = modules["observation_v3"]
+
+    def test_player_hp_triplet_never_treats_max_hp_one_as_full_health(self) -> None:
+        obs_common = self.observation_common
+
+        self.assertEqual(obs_common._player_hp_triplet({"hp": 50, "max_hp": 1})[2], 0.0)
+        self.assertEqual(obs_common._player_hp_triplet({"hp": 1, "max_hp": 1})[2], 0.0)
+        self.assertAlmostEqual(
+            obs_common._player_hp_triplet({"currentHealth": 40, "maxHealth": 80})[2],
+            0.5,
+        )
 
     def test_entry_texts_are_deduped_and_batch_encoded_once_per_step(self) -> None:
         obs_v3 = self.observation_v3
@@ -929,6 +940,54 @@ class ObservationV3ContractTest(unittest.TestCase):
             int(encoded["candidate_query_role_ids"][0]),
             obs_v3.TOKEN_ROLE_TO_ID["QUERY_ROUTE"],
         )
+
+    def test_shop_card_removal_action_sets_shop_econ_flags(self) -> None:
+        obs_v3 = self.observation_v3
+        encoder = obs_v3.WorldTokenObservationEncoder(use_text=False)
+        obs = {
+            "phase": "shop",
+            "player": {
+                "hp": 55,
+                "max_hp": 80,
+                "block": 0,
+                "gold": 120,
+                "deck_cards": [
+                    _card("card.deck.1", "Strike"),
+                    _card("card.deck.2", "Defend", card_type="Skill"),
+                ],
+                "relics": [],
+                "potions": [],
+            },
+        }
+        legal_actions = [
+            {
+                "action_id": "shop:buy:3",
+                "kind": "shop",
+                "shop_action": "buy",
+                "item": {
+                    "item_kind": "card_removal",
+                    "title": "Remove a card",
+                    "cost": 75,
+                    "is_affordable": True,
+                    "used": False,
+                },
+            }
+        ]
+
+        encoded = encoder.encode(obs, legal_actions=legal_actions)
+        local_indices = np.flatnonzero(encoded["candidate_local_masks"][0] > 0.5)
+        shop_idx = next(
+            idx
+            for idx in local_indices
+            if obs_v3.TOKEN_TYPES[int(encoded["candidate_local_type_ids"][0, idx])] == "SHOP_ECON_LOCAL"
+        )
+        shop_numeric = encoded["candidate_local_tokens"][0, shop_idx, : obs_v3.TOKEN_NUMERIC_DIM]
+
+        self.assertEqual(float(shop_numeric[2]), 1.0)   # affordable
+        self.assertEqual(float(shop_numeric[8]), 1.0)   # legacy remove bit
+        self.assertEqual(float(shop_numeric[11]), 1.0)  # buy
+        self.assertEqual(float(shop_numeric[12]), 1.0)  # explicit remove
+        self.assertEqual(float(shop_numeric[16]), 1.0)  # card_removal item kind
 
 
 if __name__ == "__main__":

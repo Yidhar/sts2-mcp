@@ -5453,6 +5453,229 @@ def test_survival_non_endturn_guard_skips_low_value_block_when_threat_remains_un
     assert search_stats["combat_quality_survival_non_endturn_guard_applied"] == 0.0
 
 
+def test_survival_non_endturn_guard_preserves_critical_hallway_progress_when_block_does_not_solve(
+    trainer_stub,
+):
+    """Critical hallway does not mean every attack should be rewritten to Defend.
+
+    Regression for full-run traces where normal hallway fights at moderate HP
+    repeatedly rewrote Strike/Pommel-like progress into a 5-block Defend even
+    though the original play survived the hit and Defend did not materially
+    solve the incoming damage.  This is the over-defense shape that drags
+    hallway fights out and increases total HP loss before the Act1 boss.
+    """
+    raw_obs = {
+        "encounter": "ENCOUNTER.FOGMOG_NORMAL",
+        "run": {"floor": 8},
+        "combat": {
+            "energy": 2,
+            "enemies": [{"current_hp": 74, "intent": {"total_damage": 9, "damage": 9}}],
+        },
+        "player": {"hp": 20, "current_hp": 20, "max_hp": 80, "block": 0},
+    }
+    legal_actions = [
+        {
+            "action_id": "play_card_strike",
+            "kind": "play_card",
+            "card": {
+                "id": "CARD.STRIKE",
+                "title": "Strike",
+                "type": "Attack",
+                "cost": 1,
+                "damage": 6,
+                "total_damage": 6,
+                "preview_damage": 6,
+                "card_effect_profile": {"semantic_tags": ["attack", "damage"], "training_tags": []},
+            },
+            "semantic": {"damage": 6, "roles": ["attack", "damage"]},
+        },
+        {
+            "action_id": "play_card_defend",
+            "kind": "play_card",
+            "card": {
+                "id": "CARD.DEFEND",
+                "title": "Defend",
+                "type": "Skill",
+                "cost": 1,
+                "block": 5,
+                "total_block": 5,
+                "preview_block": 5,
+                "card_effect_profile": {"semantic_tags": ["block"], "training_tags": []},
+            },
+            "semantic": {"block": 5, "roles": ["block"]},
+        },
+    ]
+    mask = np.array([1, 1], dtype=np.float32)
+    search_stats: dict = {}
+
+    with patch.object(trainer_stub, "_is_kaiser_encounter_context", return_value=False), patch.object(
+        trainer_stub, "_is_insatiable_encounter_context", return_value=False
+    ), patch.object(
+        trainer_stub, "_combat_encounter_tier_from_raw", return_value="normal"
+    ), patch.object(
+        trainer_stub, "_combat_energy", return_value=2.0
+    ), patch.object(
+        trainer_stub, "_is_action_confirmed_lethal", return_value=False
+    ):
+        new_idx = trainer_stub._apply_combat_action_hard_guards(
+            action_idx=0,
+            legal_actions=legal_actions,
+            action_mask=mask,
+            raw_obs=raw_obs,
+            boss_ctx={},
+            encounter="ENCOUNTER.FOGMOG_NORMAL",
+            search_stats=search_stats,
+        )
+
+    assert new_idx == 0
+    assert search_stats["combat_quality_survival_non_endturn_guard_available"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_progress_exemption"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_low_value_block_skip"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_critical_low_value_block_skip"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_applied"] == 0.0
+
+
+def test_survival_non_endturn_guard_preserves_floor9_tempo_when_five_block_does_not_solve(
+    trainer_stub,
+):
+    """Regression for the live full-run floor-8/9 normal over-defense loop.
+
+    Recent diagnostics showed hp=27/80, incoming=14, selected Strike, and the
+    survival_non_endturn guard rewriting it to a 5-block Defend.  The original
+    play survives at 13 HP, while Defend still leaves 9 damage and removes all
+    tempo.  Keep the attack so the hallway fight can end instead of locking into
+    repeated low-value block.
+    """
+    raw_obs = {
+        "encounter": "ENCOUNTER.FOGMOG_NORMAL",
+        "run": {"floor": 9},
+        "combat": {
+            "energy": 1,
+            "enemies": [{"current_hp": 32, "intent": {"total_damage": 14, "damage": 14}}],
+        },
+        "player": {"hp": 27, "current_hp": 27, "max_hp": 80, "block": 0},
+    }
+    legal_actions = [
+        {
+            "action_id": "play_card_strike",
+            "kind": "play_card",
+            "card": {
+                "id": "CARD.STRIKE",
+                "title": "Strike",
+                "type": "Attack",
+                "cost": 1,
+                "damage": 6,
+                "total_damage": 6,
+                "preview_damage": 6,
+                "card_effect_profile": {"semantic_tags": ["attack", "damage"], "training_tags": []},
+            },
+            "semantic": {"damage": 6, "roles": ["attack", "damage"]},
+        },
+        {
+            "action_id": "play_card_defend",
+            "kind": "play_card",
+            "card": {
+                "id": "CARD.DEFEND",
+                "title": "Defend",
+                "type": "Skill",
+                "cost": 1,
+                "block": 5,
+                "total_block": 5,
+                "preview_block": 5,
+                "card_effect_profile": {"semantic_tags": ["block"], "training_tags": []},
+            },
+            "semantic": {"block": 5, "roles": ["block"]},
+        },
+    ]
+    mask = np.array([1, 1], dtype=np.float32)
+    search_stats: dict = {}
+
+    with patch.object(trainer_stub, "_is_kaiser_encounter_context", return_value=False), patch.object(
+        trainer_stub, "_is_insatiable_encounter_context", return_value=False
+    ), patch.object(
+        trainer_stub, "_combat_encounter_tier_from_raw", return_value="normal"
+    ), patch.object(
+        trainer_stub, "_combat_energy", return_value=1.0
+    ), patch.object(
+        trainer_stub, "_is_action_confirmed_lethal", return_value=False
+    ):
+        new_idx = trainer_stub._apply_combat_action_hard_guards(
+            action_idx=0,
+            legal_actions=legal_actions,
+            action_mask=mask,
+            raw_obs=raw_obs,
+            boss_ctx={},
+            encounter="ENCOUNTER.FOGMOG_NORMAL",
+            search_stats=search_stats,
+        )
+
+    assert new_idx == 0
+    assert search_stats["combat_quality_survival_non_endturn_guard_available"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_progress_exemption"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_low_value_block_skip"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_normal_hallway_tempo_candidate"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_tempo_exempt"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_applied"] == 0.0
+
+
+def test_survival_non_endturn_guard_still_blocks_true_lethal_hallway_attack(trainer_stub):
+    """The low-value block exemption must not reopen real self-lethal attacks."""
+    raw_obs = {
+        "encounter": "ENCOUNTER.FLYCONID_NORMAL",
+        "run": {"floor": 8},
+        "combat": {"energy": 1, "enemies": [{"current_hp": 40, "intent": {"total_damage": 12}}]},
+        "player": {"hp": 11, "current_hp": 11, "max_hp": 80, "block": 0},
+    }
+    legal_actions = [
+        {
+            "action_id": "play_card_strike",
+            "kind": "play_card",
+            "card": {"id": "CARD.STRIKE", "title": "Strike", "type": "Attack", "cost": 1},
+            "semantic": {"damage": 6, "roles": ["attack", "damage"]},
+        },
+        {
+            "action_id": "play_card_defend",
+            "kind": "play_card",
+            "card": {
+                "id": "CARD.DEFEND",
+                "title": "Defend",
+                "type": "Skill",
+                "cost": 1,
+                "block": 5,
+                "total_block": 5,
+                "preview_block": 5,
+            },
+            "semantic": {"block": 5, "roles": ["block"]},
+        },
+    ]
+    mask = np.array([1, 1], dtype=np.float32)
+    search_stats: dict = {}
+
+    with patch.object(trainer_stub, "_is_kaiser_encounter_context", return_value=False), patch.object(
+        trainer_stub, "_is_insatiable_encounter_context", return_value=False
+    ), patch.object(
+        trainer_stub, "_combat_encounter_tier_from_raw", return_value="normal"
+    ), patch.object(
+        trainer_stub, "_combat_energy", return_value=1.0
+    ), patch.object(
+        trainer_stub, "_is_action_confirmed_lethal", return_value=False
+    ):
+        new_idx = trainer_stub._apply_combat_action_hard_guards(
+            action_idx=0,
+            legal_actions=legal_actions,
+            action_mask=mask,
+            raw_obs=raw_obs,
+            boss_ctx={},
+            encounter="ENCOUNTER.FLYCONID_NORMAL",
+            search_stats=search_stats,
+        )
+
+    assert new_idx == 1
+    assert search_stats["combat_quality_survival_non_endturn_guard_available"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_applied"] == 1.0
+    assert search_stats["combat_quality_survival_non_endturn_guard_override"] == 1.0
+
+
 def test_survival_non_endturn_guard_preserves_progress_when_followup_block_is_affordable(trainer_stub):
     """Do not treat a high-energy hallway opener as if it ended the turn.
 

@@ -392,6 +392,13 @@ class CombatSandboxEnv(gym.Env):
             "transient_resolved_count": 0,
             "transient_leaked_count": 0,
             "wait_timeout_count": 0,
+            "frontier_pre_dispatch_attempt_count": 0,
+            "frontier_pre_dispatch_resolved_count": 0,
+            "frontier_pre_dispatch_timeout_count": 0,
+            "frontier_pre_dispatch_rebind_attempt_count": 0,
+            "frontier_pre_dispatch_rebind_success_count": 0,
+            "frontier_pre_dispatch_blocked_count": 0,
+            "frontier_pre_dispatch_high_confidence_blocked_count": 0,
             "stable_no_actions_count": 0,
             "post_step_frontier_attempt_count": 0,
             "post_step_frontier_resolved_count": 0,
@@ -595,6 +602,14 @@ class CombatSandboxEnv(gym.Env):
             return self._make_invalid_action_response(action)
 
         legal_action = self._legal_actions[normalized_action]
+        if self._is_end_turn_action(legal_action):
+            pre_dispatch_response = self._recover_pre_dispatch_end_turn_frontier(
+                attempted_action_index=action,
+                selected_action=legal_action if isinstance(legal_action, dict) else None,
+            )
+            if pre_dispatch_response is not None:
+                return pre_dispatch_response
+
         legal_actions_before = list(self._legal_actions)
         prev_obs = self._last_obs_raw or {}
         prev_planner_context = self._planner_context()
@@ -1312,6 +1327,147 @@ class CombatSandboxEnv(gym.Env):
             "block": player.get("block") if isinstance(player, dict) else None,
         }
 
+    def _current_frontier_needs_short_wait(self) -> bool:
+        """Return True for suspicious singleton EndTurn combat frontiers.
+
+        This is the combat-sandbox mirror of EnvV2's pre-dispatch guard.  The
+        post-step recovery below can repair a transient singleton EndTurn after
+        an action, but it is too late for the selected EndTurn itself: by then
+        the bridge has already burned the in-game turn.  This predicate is
+        deliberately narrow enough to avoid delaying normal play while catching
+        the exact leak reported by the operator: RL-visible actions contain
+        only EndTurn, but bridge actionability or raw combat obs says cards may
+        still be settling into the playable frontier.
+        """
+
+        if len(self._legal_actions) != 1 or not self._is_end_turn_action(self._legal_actions[0]):
+            return False
+        if getattr(self, "_fast_step_disabled", False):
+            return False
+
+        actionability = self._last_actionability if isinstance(self._last_actionability, dict) else {}
+        if bool(actionability.get("transient_only_end_turn", False)):
+            return True
+        try:
+            legal_non_end_turn = int(actionability.get("legal_non_end_turn_count", 0) or 0)
+        except (TypeError, ValueError):
+            legal_non_end_turn = 0
+        if legal_non_end_turn > 0:
+            return True
+        if bool(actionability.get("frontier_stable", True)) is False:
+            return True
+
+        return self._frontier_suspicion_has_energy_and_hand()
+
+    def _frontier_suspicion_has_energy_and_hand(self) -> bool:
+        obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+        if not isinstance(combat, dict) or not combat:
+            return False
+        if combat.get("in_progress") is False:
+            return False
+
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+        energy = _float(combat.get("energy"), 0.0)
+        if energy <= 0.0 and isinstance(player, dict):
+            energy = _float(player.get("energy"), 0.0)
+        if energy <= 0.0:
+            return False
+
+        hand = combat.get("hand")
+        if not isinstance(hand, list) and isinstance(player, dict):
+            hand = player.get("hand")
+        if isinstance(hand, list):
+            return len(hand) > 0
+        for container in (combat, player):
+            if not isinstance(container, dict):
+                continue
+            for key in ("hand_count", "num_cards_in_hand", "cards_in_hand"):
+                if _float(container.get(key), 0.0) > 0.0:
+                    return True
+        return False
+
+    def _frontier_has_affordable_raw_combat_card(self) -> bool:
+        """Return True for high-confidence stale singleton EndTurn windows.
+
+        Broad suspicion (energy + cards in hand) is enough to short-poll.  To
+        *block* dispatch after the bounded wait, require a stronger raw-observe
+        proof: a non-status/non-curse/non-quest card in hand is currently
+        affordable, or bridge explicitly marked it playable.  This prevents
+        false positives such as "only Quest cards remain" while catching full
+        energy + playable hand leaks.
+        """
+
+        obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+        if not isinstance(combat, dict) or not combat:
+            return False
+        if combat.get("in_progress") is False:
+            return False
+
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+        energy = _float(combat.get("energy"), 0.0)
+        if energy <= 0.0 and isinstance(player, dict):
+            energy = _float(player.get("energy"), 0.0)
+        if energy <= 0.0:
+            return False
+
+        hand = combat.get("hand")
+        if not isinstance(hand, list) and isinstance(player, dict):
+            hand = player.get("hand")
+        if not isinstance(hand, list):
+            return False
+
+        return any(self._raw_card_is_affordable_combat_action(card, energy) for card in hand)
+
+    @staticmethod
+    def _raw_card_is_affordable_combat_action(card: Any, energy: float) -> bool:
+        if not isinstance(card, dict):
+            return False
+
+        card_type = str(card.get("type") or card.get("card_type") or "").strip().lower()
+        card_id = str(card.get("id") or card.get("card_id") or "").strip().lower()
+        title = str(card.get("title") or card.get("name") or "").strip().lower()
+        blocked_type_fragments = ("status", "curse", "quest")
+        if card_type in blocked_type_fragments:
+            return False
+        if any(fragment in card_id for fragment in blocked_type_fragments):
+            return False
+        if any(fragment in title for fragment in ("晕眩", "伤口", "灼伤", "虚无", "诅咒")):
+            return False
+
+        playable = card.get("is_playable")
+        if playable is False:
+            return False
+        if playable is True:
+            return True
+
+        if card_type and card_type not in {"attack", "skill", "power"}:
+            return False
+
+        cost: float | None = None
+        for key in (
+            "cost_for_turn",
+            "resolved_energy_cost",
+            "energy_cost",
+            "canonical_energy_cost",
+            "cost",
+        ):
+            if card.get(key) is None:
+                continue
+            parsed = _float(card.get(key), float("nan"))
+            if parsed == parsed:
+                cost = parsed
+                break
+        if cost is None:
+            return False
+        if cost < 0.0:
+            # X-cost / special-cost cards may be playable, but absent an
+            # explicit is_playable=True flag they are not a high-confidence
+            # proof that the singleton EndTurn frontier is stale.
+            return False
+        return cost <= energy + 1e-6
+
     def _result_needs_post_step_frontier_wait(self, result: dict[str, Any] | None) -> tuple[bool, str, dict[str, Any]]:
         if getattr(self, "_fast_step_disabled", False):
             return False, "disabled", {}
@@ -1505,6 +1661,144 @@ class CombatSandboxEnv(gym.Env):
         info["post_step_frontier_rebound"] = True
         merged["info"] = info
         return merged
+
+    def _recover_pre_dispatch_end_turn_frontier(
+        self,
+        *,
+        attempted_action_index: Any,
+        selected_action: dict[str, Any] | None,
+    ):
+        """Block stale singleton EndTurn before it reaches ``bridge.step``.
+
+        ``_recover_post_step_frontier`` repairs the *next* frontier after an
+        action resolves.  The user-observed failure is different: the policy is
+        handed a singleton EndTurn mask while the game still has energy and
+        legal cards.  If we let that EndTurn through, the game turn is already
+        lost and no post-step recovery can undo the HP/card-tempo damage.
+
+        Return a Gym step tuple when dispatch was blocked/refreshed, otherwise
+        return ``None`` to allow the selected EndTurn to proceed.
+        """
+
+        if not self._is_end_turn_action(selected_action):
+            return None
+        if not self._current_frontier_needs_short_wait():
+            return None
+
+        self._fast_step_metric_inc("frontier_pre_dispatch_attempt_count")
+        metrics: dict[str, Any] = {
+            "attempted": True,
+            "resolved": False,
+            "timeout": False,
+            "rebind_attempted": False,
+            "rebind_succeeded": False,
+            "blocked": False,
+            "high_confidence": False,
+            "wait_ms": 0.0,
+            "poll_count": 0,
+            "selected_action_id": selected_action.get("action_id") if isinstance(selected_action, dict) else None,
+            "selected_action_kind": selected_action.get("kind") if isinstance(selected_action, dict) else None,
+            "obs_summary": self._obs_energy_hand_summary(self._last_obs_raw),
+        }
+        trace: dict[str, Any] = {
+            "event": "pre_dispatch_end_turn_frontier_trace",
+            "selected_action": self._compact_frontier_action(selected_action, -1)
+            if isinstance(selected_action, dict)
+            else None,
+            "pre_legal_action_count": len(self._legal_actions),
+            "pre_obs": metrics["obs_summary"],
+            "pre_actionability": dict(self._last_actionability)
+            if isinstance(self._last_actionability, dict)
+            else None,
+            "polls": [],
+        }
+        metrics["trace"] = trace
+
+        max_wait_ms = max(0, int(getattr(self, "_fast_step_max_wait_ms", 100) or 0))
+        poll_interval_ms = max(1, int(getattr(self, "_fast_step_poll_interval_ms", 10) or 10))
+        started = time.perf_counter()
+        deadline = started + (max_wait_ms / 1000.0)
+
+        while time.perf_counter() < deadline:
+            time.sleep(poll_interval_ms / 1000.0)
+            metrics["poll_count"] = int(metrics["poll_count"]) + 1
+            state = self._safe_get_state()
+            state_summary = self._frontier_state_summary(state, source="pre_dispatch_state_poll")
+            if len(trace["polls"]) < 8:
+                trace["polls"].append(state_summary)
+            non_end_turn_count = int(state_summary.get("non_end_turn_count") or 0)
+            if non_end_turn_count <= 0:
+                continue
+            if not self._state_allows_soft_rebind(state):
+                continue
+
+            metrics["rebind_attempted"] = True
+            self._fast_step_metric_inc("frontier_pre_dispatch_rebind_attempt_count")
+            remaining_ms = max(int((deadline - time.perf_counter()) * 1000.0), 1)
+            rebind_timeout_ms = max(
+                250,
+                min(remaining_ms, int(getattr(self, "reset_timeout_ms", 1000) or 1000)),
+            )
+            rebound = self._safe_reset_into_current_run(rebind_timeout_ms)
+            if not isinstance(rebound, dict):
+                continue
+            rebound_summary = self._frontier_result_summary(rebound, source="pre_dispatch_soft_rebind_result")
+            trace["rebind"] = rebound_summary
+            rebound_actions = self._filtered_result_legal_actions(rebound)
+            rebound_non_end_turn = sum(1 for action in rebound_actions if not self._is_end_turn_action(action))
+            if rebound_actions and rebound_non_end_turn > 0:
+                self._update_live_state(rebound)
+                if "episode_id" in rebound:
+                    self._episode_id = rebound.get("episode_id", getattr(self, "_episode_id", None))
+                rebound_info = rebound.get("info") if isinstance(rebound.get("info"), dict) else {}
+                rebound_actionability = (
+                    rebound_info.get("actionability")
+                    if isinstance(rebound_info.get("actionability"), dict)
+                    else None
+                )
+                if isinstance(rebound_actionability, dict):
+                    self._last_actionability = rebound_actionability
+                metrics["wait_ms"] = max((time.perf_counter() - started) * 1000.0, 0.0)
+                metrics["resolved"] = True
+                metrics["rebind_succeeded"] = True
+                metrics["blocked"] = True
+                trace["final_status"] = "blocked_refreshed_non_end_turn_rebound"
+                self._fast_step_metric_inc("frontier_pre_dispatch_resolved_count")
+                self._fast_step_metric_inc("frontier_pre_dispatch_rebind_success_count")
+                self._fast_step_metric_inc("frontier_pre_dispatch_blocked_count")
+                self._fast_step_metric_inc("transient_resolved_count")
+                return self._make_frontier_refreshed_response(
+                    attempted_action_index,
+                    metrics=metrics,
+                    reason="frontier_refreshed_before_end_turn",
+                    refreshed=True,
+                    high_confidence=False,
+                )
+
+        metrics["wait_ms"] = max((time.perf_counter() - started) * 1000.0, float(max_wait_ms))
+        metrics["timeout"] = True
+        self._fast_step_metric_inc("frontier_pre_dispatch_timeout_count")
+
+        if self._frontier_has_affordable_raw_combat_card():
+            # High-confidence stale frontier: raw obs has an affordable real
+            # combat card but the filtered bridge frontier is still singleton
+            # EndTurn.  Do not burn the turn; return the same obs/mask so the
+            # collector can poll/reselect after the bridge catches up.
+            metrics["blocked"] = True
+            metrics["high_confidence"] = True
+            trace["final_status"] = "blocked_high_confidence_raw_affordable_card"
+            self._fast_step_metric_inc("frontier_pre_dispatch_blocked_count")
+            self._fast_step_metric_inc("frontier_pre_dispatch_high_confidence_blocked_count")
+            return self._make_frontier_refreshed_response(
+                attempted_action_index,
+                metrics=metrics,
+                reason="frontier_stale_singleton_end_turn_blocked",
+                refreshed=False,
+                high_confidence=True,
+            )
+
+        trace["final_status"] = "allowed_no_rebound_no_affordable_raw_card"
+        return None
 
     def _recover_post_step_frontier(
         self,
@@ -3260,6 +3554,60 @@ class CombatSandboxEnv(gym.Env):
             },
         )
         return obs, INVALID_ACTION_REWARD, False, True, info
+
+    def _make_frontier_refreshed_response(
+        self,
+        attempted_action: Any,
+        *,
+        metrics: dict[str, Any] | None = None,
+        reason: str = "frontier_refreshed_before_end_turn",
+        refreshed: bool = True,
+        high_confidence: bool = False,
+    ):
+        """Return a non-terminal no-op after blocking stale EndTurn dispatch.
+
+        This response intentionally does *not* mark the action invalid.  The
+        policy selected EndTurn from the mask it was shown; the environment then
+        discovered, before calling ``bridge.step``, that the singleton frontier
+        was stale or high-confidence suspicious.  Returning the current/refreshed
+        observation lets self-play reselect without burning the game turn.
+        """
+
+        obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions, self._planner_context())
+        metrics_out = {
+            k: v
+            for k, v in dict(metrics or {}).items()
+            if k != "trace"
+        }
+        bridge_info = {
+            "action_error": reason,
+            "step_recovery": reason,
+            "action_diagnostics": {
+                "frontier_pre_dispatch_refreshed": 1.0 if refreshed else 0.0,
+                "frontier_pre_dispatch_end_turn_blocked": 1.0,
+                "frontier_pre_dispatch_high_confidence": 1.0 if high_confidence else 0.0,
+            },
+        }
+        extra: dict[str, Any] = {
+            "frontier_refreshed_before_end_turn": bool(refreshed),
+            "frontier_stale_singleton_end_turn_blocked": bool(not refreshed),
+            "frontier_refreshed_attempted_action": attempted_action,
+            "pre_dispatch_frontier_recovery": metrics_out,
+            "bridge_fast_step_metrics_cumulative": dict(self._fast_step_metrics_total),
+            "python_timing_ms": self._python_timing(
+                bridge_roundtrip=0.0,
+                run_memory_update=0.0,
+                obs_encode=0.0,
+                aux_targets=0.0,
+                info_build=0.0,
+                total=0.0,
+            ),
+        }
+        trace = (metrics or {}).get("trace") if isinstance(metrics, dict) else None
+        if isinstance(trace, dict):
+            extra["frontier_trace"] = trace
+        info = self._build_info(bridge_info, extra=extra)
+        return obs, 0.0, False, False, info
 
     def _planner_context(self) -> dict[str, Any]:
         context = self._run_memory.build_context(self._last_obs_raw, self._legal_actions)

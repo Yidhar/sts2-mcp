@@ -25,12 +25,64 @@ from muzero.diagnostics.deck_build_metrics import (
     compute_deck_quality_summary,
     extract_deck_cards_from_obs_like,
 )
+from muzero.diagnostics.shop_metrics import (
+    SHOP_TB_KEYS,
+    ShopEpisodeTracker,
+    build_shop_choice_payload,
+    dump_shop_choice_diagnostic,
+)
+from muzero.diagnostics.rest_site_metrics import (
+    REST_SITE_TB_KEYS,
+    RestSiteEpisodeTracker,
+    build_rest_site_choice_payload,
+    dump_rest_site_choice_diagnostic,
+)
+from muzero.diagnostics.deck_upgrade_metrics import (
+    DECK_UPGRADE_TB_KEYS,
+    DeckUpgradeEpisodeTracker,
+    build_deck_upgrade_choice_payload,
+    build_smith_upgrade_transition_payload,
+    complete_deck_upgrade_choice_payload,
+    dump_deck_upgrade_choice_diagnostic,
+    dump_smith_upgrade_transition_diagnostic,
+)
+from muzero.diagnostics.summoner_targeting import (
+    SUMMONER_TARGETING_TB_KEYS,
+    SummonerTargetingEpisodeTracker,
+    build_summoner_targeting_payload,
+    dump_summoner_targeting_diagnostic,
+)
+from muzero.diagnostics.target_priority import (
+    TARGET_PRIORITY_TB_KEYS,
+    TargetPriorityEpisodeTracker,
+    build_target_priority_payload,
+    dump_target_priority_diagnostic,
+)
+from muzero.diagnostics.intent_combat_quality import (
+    INTENT_COMBAT_QUALITY_TB_KEYS,
+    IntentCombatQualityEpisodeTracker,
+    build_intent_combat_quality_payload,
+    dump_intent_combat_quality_diagnostic,
+)
+from muzero.diagnostics.end_turn_pre_dispatch import dump_end_turn_pre_dispatch_audit
 from muzero.sts2_env.muzero_buffer import GameTrajectory, MuZeroReplayBuffer
 from muzero.training.action_hard_guard_dispatch import ActionHardGuardDispatchMixin
 from muzero.training.checkpointing import dict_obs_to_torch
 from muzero.training.card_reward_guard import CARD_REWARD_GUARD_SEARCH_SUFFIXES
+from muzero.training.card_reward_pick_quality_guard import CARD_REWARD_PICK_QUALITY_GUARD_SEARCH_SUFFIXES
 from muzero.training.decision_constants import TRIVIAL_BUILD_FAST_PATH_REASONS
+from muzero.training.async_telemetry import log_environment_episode_telemetry
+from muzero.training.post_search_policy_retarget import (
+    POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES,
+    annotate_card_reward_final_selection,
+    retarget_search_policy_after_hard_guard,
+)
+from muzero.training.rest_site_smith_guard import REST_SITE_SMITH_GUARD_SEARCH_SUFFIXES
+from muzero.training.shop_action_guard import SHOP_ACTION_GUARD_SEARCH_SUFFIXES
 from muzero.training.route_heuristic_telemetry import RouteHeuristicTelemetryMixin
+from muzero.combat_quality import COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES
+from muzero.combat_quality.summoner_target_guard import SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES
+from muzero.combat_quality.target_priority_guard import TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES
 from sts2_env.action_compact import compact_action_signature
 from sts2_env.boss_mechanics import build_boss_mechanics_context
 from sts2_env.objective_heads import NUM_OBJECTIVE_HEADS, compute_transition_objective_rewards
@@ -513,6 +565,12 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
         direct_policy_eligible_count = 0
         direct_policy_used_count = 0
         card_reward_tracker = CardRewardEpisodeTracker()
+        shop_tracker = ShopEpisodeTracker()
+        rest_site_tracker = RestSiteEpisodeTracker()
+        deck_upgrade_tracker = DeckUpgradeEpisodeTracker()
+        summoner_targeting_tracker = SummonerTargetingEpisodeTracker()
+        target_priority_tracker = TargetPriorityEpisodeTracker()
+        intent_combat_quality_tracker = IntentCombatQualityEpisodeTracker()
         route_dry_run_records: list[dict[str, Any]] = []
         route_dry_run_error_count = 0
         terminated = False
@@ -879,6 +937,7 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                         decision_domain=decision_domain,
                     )
                 search_stats = getattr(self.mcts, "last_run_stats", {}) or {}
+            pre_guard_action_idx = int(action_idx)
             action_idx = self._apply_post_search_action_hard_guards(
                 decision_domain=decision_domain,
                 action_idx=int(action_idx),
@@ -888,6 +947,18 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 info=prev_info if isinstance(prev_info, dict) else None,
                 search_stats=search_stats if isinstance(search_stats, dict) else {},
             )
+            if isinstance(search_stats, dict):
+                search_policy, policy_retargeted = retarget_search_policy_after_hard_guard(
+                    search_policy,
+                    original_action_idx=pre_guard_action_idx,
+                    final_action_idx=int(action_idx),
+                    max_actions=MAX_ACTIONS,
+                )
+                search_stats["post_search_hard_guard_policy_retargeted"] = 1.0 if policy_retargeted else 0.0
+                search_stats["post_search_hard_guard_original_action_idx"] = float(pre_guard_action_idx)
+                search_stats["post_search_hard_guard_final_action_idx"] = float(action_idx)
+                if policy_retargeted and decision_domain == "combat":
+                    search_stats["combat_quality_hard_guard_policy_target_rewrite"] = 1.0
             if decision_domain == "route":
                 route_dry_run_error_count = self._record_route_heuristic_dry_run(
                     records=route_dry_run_records,
@@ -1021,6 +1092,7 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                             action_diagnostics=action_diag_pre if isinstance(action_diag_pre, dict) else None,
                             encounter=encounter_for_dump,
                             tier=str((info.get("tier") if isinstance(info, dict) else "") or ""),
+                            pre_step_info=info if isinstance(info, dict) else None,
                         )
                     except Exception:
                         pass
@@ -1042,32 +1114,17 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 payload = search_stats.get("_card_reward_choice_diagnostic")
                 if isinstance(payload, dict):
                     try:
-                        payload.setdefault("final_action_idx", int(action_idx))
-                        payload.setdefault("final_action", {})
-                        if isinstance(chosen_action, dict):
-                            final_action = {
-                                "kind": chosen_action.get("kind"),
-                                "surface": chosen_action.get("surface"),
-                                "selection": chosen_action.get("selection"),
-                                "action_id": chosen_action.get("action_id"),
-                                "label": chosen_action.get("label"),
-                            }
-                            card = chosen_action.get("card") if isinstance(chosen_action.get("card"), dict) else {}
-                            if card:
-                                final_action["card"] = {
-                                    "id": card.get("id") or card.get("card_id"),
-                                    "title": card.get("title") or card.get("name"),
-                                    "type": card.get("type") or card.get("card_type"),
-                                    "cost": card.get("cost")
-                                    if card.get("cost") is not None
-                                    else card.get("energy_cost"),
-                                }
-                            payload["final_action"] = {
-                                key: value for key, value in final_action.items() if value not in (None, "")
-                            }
-                        payload.setdefault("final_selected_family", action_family)
-                        payload.setdefault("phase", phase)
-                        payload.setdefault("decision_domain", decision_domain)
+                        annotate_card_reward_final_selection(
+                            payload,
+                            chosen_action=chosen_action,
+                            final_action_idx=int(action_idx),
+                            final_selected_family=action_family,
+                            phase=phase,
+                            decision_domain=decision_domain,
+                            policy_retargeted=bool(
+                                float(search_stats.get("post_search_hard_guard_policy_retargeted", 0.0) or 0.0)
+                            ),
+                        )
                         self._dump_card_reward_choice_diagnostic(payload)
                     except Exception:
                         pass
@@ -1130,6 +1187,106 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
             decision_floor = decision_progress.get("floor", 0.0)
             decision_act_id = decision_progress.get("act_id", 0.0)
             decision_diagnostics: dict[str, Any] = {}
+            shop_payload = None
+            rest_site_payload = None
+            deck_upgrade_payload = None
+            rest_raw_context: Any = prev_info
+            try:
+                transition_state = prev_info.get("transition_state") if isinstance(prev_info, dict) else None
+                env_unwrap_for_shop = getattr(self.env, "unwrapped", self.env)
+                raw_obs_for_shop = getattr(env_unwrap_for_shop, "_last_obs_raw", None)
+                player_state = transition_state.get("player") if isinstance(transition_state, dict) else None
+                gold_before = player_state.get("gold") if isinstance(player_state, dict) else prev_info.get("gold")
+                if gold_before is None and isinstance(raw_obs_for_shop, dict):
+                    raw_shop_player = raw_obs_for_shop.get("player")
+                    if isinstance(raw_shop_player, dict):
+                        gold_before = raw_shop_player.get("gold")
+                    if gold_before is None:
+                        gold_before = raw_obs_for_shop.get("gold")
+                shop_raw_context: Any
+                if isinstance(raw_obs_for_shop, dict) and isinstance(transition_state, dict):
+                    # ``transition_state`` is the compact info payload used for
+                    # replay metadata; on shop surfaces it can omit
+                    # ``player.deck_cards``.  The hard shop guard already uses
+                    # the env's raw pre-step obs, so include the same source
+                    # here as a fallback.  This keeps episode-level
+                    # build/shop_deck_* telemetry aligned with the guard
+                    # without changing replay schemas or model inputs.
+                    shop_raw_context = {"transition_state": transition_state, "raw_obs": raw_obs_for_shop}
+                elif isinstance(raw_obs_for_shop, dict):
+                    shop_raw_context = raw_obs_for_shop
+                elif isinstance(transition_state, dict):
+                    shop_raw_context = transition_state
+                else:
+                    shop_raw_context = prev_info
+                shop_payload = build_shop_choice_payload(
+                    decision_domain=decision_domain,
+                    phase=phase,
+                    legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                    chosen_action=chosen_action if isinstance(chosen_action, dict) else None,
+                    chosen_signature=chosen_signature if isinstance(chosen_signature, dict) else None,
+                    selected_index=int(action_idx),
+                    progress=decision_progress,
+                    gold=gold_before,
+                    raw_obs=shop_raw_context,
+                    search_policy=search_policy,
+                    max_topk=8,
+                )
+                if isinstance(shop_payload, dict):
+                    shop_tracker.update(shop_payload)
+                    dump_shop_choice_diagnostic(self, shop_payload)
+            except Exception:
+                shop_payload = None
+            try:
+                transition_state = prev_info.get("transition_state") if isinstance(prev_info, dict) else None
+                env_unwrap_for_rest = getattr(self.env, "unwrapped", self.env)
+                raw_obs_for_rest = getattr(env_unwrap_for_rest, "_last_obs_raw", None)
+                if isinstance(raw_obs_for_rest, dict) and isinstance(transition_state, dict):
+                    rest_raw_context = {"transition_state": transition_state, "raw_obs": raw_obs_for_rest}
+                elif isinstance(raw_obs_for_rest, dict):
+                    rest_raw_context = raw_obs_for_rest
+                elif isinstance(transition_state, dict):
+                    rest_raw_context = transition_state
+                else:
+                    rest_raw_context = prev_info
+                raw_legal_actions = (
+                    prev_info.get("raw_legal_actions_compact")
+                    if isinstance(prev_info.get("raw_legal_actions_compact"), list)
+                    else None
+                )
+                rest_site_payload = build_rest_site_choice_payload(
+                    decision_domain=decision_domain,
+                    phase=phase,
+                    legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                    raw_legal_actions=raw_legal_actions,
+                    chosen_action=chosen_action if isinstance(chosen_action, dict) else None,
+                    chosen_signature=chosen_signature if isinstance(chosen_signature, dict) else None,
+                    selected_index=int(action_idx),
+                    progress=decision_progress,
+                    raw_obs=rest_raw_context,
+                    search_policy=search_policy,
+                    max_topk=8,
+                )
+                if isinstance(rest_site_payload, dict):
+                    rest_site_tracker.update(rest_site_payload)
+                    dump_rest_site_choice_diagnostic(self, rest_site_payload)
+            except Exception:
+                rest_site_payload = None
+            try:
+                deck_upgrade_payload = build_deck_upgrade_choice_payload(
+                    decision_domain=decision_domain,
+                    phase=phase,
+                    legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                    chosen_action=chosen_action if isinstance(chosen_action, dict) else None,
+                    chosen_signature=chosen_signature if isinstance(chosen_signature, dict) else None,
+                    selected_index=int(action_idx),
+                    progress=decision_progress,
+                    raw_obs=rest_raw_context,
+                    search_policy=search_policy,
+                    max_topk=8,
+                )
+            except Exception:
+                deck_upgrade_payload = None
             if decision_domain == "combat":
                 try:
                     raw_obs_for_pre_step = pre_step_raw_combat_obs
@@ -1146,6 +1303,146 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                     )
                 except Exception:
                     decision_diagnostics = {}
+                try:
+                    summoner_payload = build_summoner_targeting_payload(
+                        raw_obs=raw_obs_for_pre_step if isinstance(raw_obs_for_pre_step, dict) else None,
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                        selected_idx=int(action_idx),
+                        search_policy=search_policy,
+                        progress=decision_progress,
+                        encounter_id=decision_encounter_id,
+                        encounter_tier=decision_encounter_tier,
+                        max_candidates=16,
+                    )
+                    if isinstance(summoner_payload, dict):
+                        decision_diagnostics.setdefault("summoner_targeting", summoner_payload)
+                        summoner_targeting_tracker.update(summoner_payload)
+                        dump_summoner_targeting_diagnostic(self, summoner_payload)
+                except Exception:
+                    pass
+                try:
+                    intent_combat_quality_payload = build_intent_combat_quality_payload(
+                        raw_obs=raw_obs_for_pre_step if isinstance(raw_obs_for_pre_step, dict) else None,
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                        selected_idx=int(action_idx),
+                        search_policy=search_policy,
+                        progress=decision_progress,
+                        encounter_id=decision_encounter_id,
+                        encounter_tier=decision_encounter_tier,
+                        max_candidates=12,
+                    )
+                    if isinstance(intent_combat_quality_payload, dict):
+                        decision_diagnostics.setdefault("intent_combat_quality", intent_combat_quality_payload)
+                        intent_combat_quality_tracker.update(intent_combat_quality_payload)
+                        dump_intent_combat_quality_diagnostic(self, intent_combat_quality_payload)
+                except Exception:
+                    pass
+                try:
+                    target_priority_payload = build_target_priority_payload(
+                        raw_obs=raw_obs_for_pre_step if isinstance(raw_obs_for_pre_step, dict) else None,
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                        selected_idx=int(action_idx),
+                        search_policy=search_policy,
+                        progress=decision_progress,
+                        encounter_id=decision_encounter_id,
+                        encounter_tier=decision_encounter_tier,
+                        max_candidates=32,
+                    )
+                    if isinstance(target_priority_payload, dict):
+                        decision_diagnostics.setdefault("target_priority", target_priority_payload)
+                        target_priority_tracker.update(target_priority_payload)
+                        dump_target_priority_diagnostic(self, target_priority_payload)
+                except Exception:
+                    pass
+            if isinstance(shop_payload, dict):
+                decision_diagnostics.setdefault("shop_choice", shop_payload)
+            if isinstance(rest_site_payload, dict):
+                decision_diagnostics.setdefault("rest_site_choice", rest_site_payload)
+            if isinstance(deck_upgrade_payload, dict):
+                decision_diagnostics.setdefault("deck_upgrade_choice", deck_upgrade_payload)
+            if decision_domain == "combat" and action_family == "end_turn":
+                try:
+                    raw_obs_for_audit = pre_step_raw_combat_obs
+                    if raw_obs_for_audit is None:
+                        raw_obs_for_audit = self._current_raw_combat_obs()
+                    if not isinstance(search_stats, dict):
+                        search_stats = {}
+                    audit_payload = dump_end_turn_pre_dispatch_audit(
+                        self,
+                        encoded_obs=obs if isinstance(obs, dict) else None,
+                        raw_obs=raw_obs_for_audit if isinstance(raw_obs_for_audit, dict) else None,
+                        action_mask=np.asarray(action_mask, dtype=np.float32),
+                        legal_actions=legal_actions if isinstance(legal_actions, list) else [],
+                        chosen_idx=int(action_idx),
+                        search_policy=search_policy,
+                        search_stats=search_stats,
+                        pre_step_info=prev_info if isinstance(prev_info, dict) else None,
+                        encounter=pre_step_encounter_off or decision_encounter_id,
+                        tier=pre_step_tier_off or decision_encounter_tier,
+                    )
+                    if isinstance(audit_payload, dict):
+                        decision_diagnostics.setdefault("end_turn_pre_dispatch", audit_payload)
+                        flags = audit_payload.get("flags")
+                        counts = audit_payload.get("counts")
+                        player = audit_payload.get("player")
+                        flags = flags if isinstance(flags, dict) else {}
+                        counts = counts if isinstance(counts, dict) else {}
+                        player = player if isinstance(player, dict) else {}
+
+                        def _audit_float(src: dict[str, Any], key: str, default: float = 0.0) -> float:
+                            try:
+                                return float(src.get(key, default) or default)
+                            except (TypeError, ValueError):
+                                return float(default)
+
+                        search_stats["combat_quality_end_turn_pre_dispatch_full_energy_like"] = (
+                            1.0 if bool(flags.get("full_energy_like")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_full_energy_skip_suspect"] = (
+                            1.0 if bool(flags.get("full_energy_skip_suspect")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_legal_generation_gap"] = (
+                            1.0 if bool(flags.get("legal_generation_gap_suspect")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_raw_hand_legal_surface_mismatch"] = (
+                            1.0 if bool(flags.get("raw_hand_legal_surface_mismatch")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_singleton_frontier_suspect"] = (
+                            1.0 if bool(flags.get("singleton_frontier_suspect")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_pressure_skip_suspect"] = (
+                            1.0 if bool(flags.get("pressure_skip_suspect")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_full_energy_skip_with_playable_hand"] = (
+                            1.0 if bool(flags.get("full_energy_skip_with_playable_hand")) else 0.0
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_safe_progress_candidate_count"] = _audit_float(
+                            counts, "safe_progress_candidate_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_ui_affordable_hand_card_count"] = _audit_float(
+                            counts, "ui_affordable_hand_card_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_legal_play_card_action_count"] = _audit_float(
+                            counts, "legal_play_card_action_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_affordable_play_card_action_count"] = _audit_float(
+                            counts, "affordable_play_card_action_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_mask_legal_count"] = _audit_float(
+                            counts, "mask_legal_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_raw_hand_card_count"] = _audit_float(
+                            counts, "raw_hand_card_count"
+                        )
+                        search_stats["combat_quality_end_turn_pre_dispatch_energy"] = _audit_float(player, "energy")
+                        search_stats["combat_quality_end_turn_pre_dispatch_energy_ratio"] = _audit_float(
+                            player, "energy_ratio"
+                        )
+                except Exception:
+                    pass
             trajectory.add_step(
                 obs=obs,
                 action=action_idx,
@@ -1181,6 +1478,77 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
 
             # Take action in environment
             obs, reward, terminated, truncated, info = self.env.step(int(action_idx))
+            try:
+                env_unwrap_after = getattr(self.env, "unwrapped", self.env)
+                post_raw_obs = getattr(env_unwrap_after, "_last_obs_raw", None)
+                post_transition_state = (
+                    info.get("transition_state")
+                    if isinstance(info, dict) and isinstance(info.get("transition_state"), dict)
+                    else None
+                )
+                post_obs_context: Any
+                if isinstance(post_raw_obs, dict) and isinstance(post_transition_state, dict):
+                    post_obs_context = {
+                        "transition_state": post_transition_state,
+                        "raw_obs": post_raw_obs,
+                        "info": info if isinstance(info, dict) else {},
+                    }
+                elif isinstance(post_raw_obs, dict):
+                    post_obs_context = {
+                        "raw_obs": post_raw_obs,
+                        "info": info if isinstance(info, dict) else {},
+                    }
+                elif isinstance(post_transition_state, dict):
+                    post_obs_context = {
+                        "transition_state": post_transition_state,
+                        "info": info if isinstance(info, dict) else {},
+                    }
+                else:
+                    post_obs_context = info
+
+                post_legal_actions: Any = []
+                if isinstance(info, dict):
+                    post_legal_actions = (
+                        info.get("legal_actions_compact")
+                        if isinstance(info.get("legal_actions_compact"), list)
+                        else info.get("legal_actions")
+                    )
+                if not isinstance(post_legal_actions, list):
+                    compact_getter = getattr(env_unwrap_after, "get_compact_legal_actions", None)
+                    post_legal_actions = compact_getter() if callable(compact_getter) else []
+                if not isinstance(post_legal_actions, list):
+                    post_legal_actions = []
+
+                smith_transition_payload = build_smith_upgrade_transition_payload(
+                    rest_site_payload=rest_site_payload,
+                    post_legal_actions=post_legal_actions,
+                    pre_obs=rest_raw_context,
+                    post_obs=post_obs_context,
+                    post_info=info if isinstance(info, dict) else None,
+                )
+                if isinstance(smith_transition_payload, dict):
+                    deck_upgrade_tracker.update_smith_transition(smith_transition_payload)
+                    dump_smith_upgrade_transition_diagnostic(self, smith_transition_payload)
+                    if trajectory.steps:
+                        trajectory.steps[-1].setdefault("decision_diagnostics", {}).setdefault(
+                            "smith_upgrade_transition",
+                            smith_transition_payload,
+                        )
+
+                completed_deck_upgrade_payload = complete_deck_upgrade_choice_payload(
+                    deck_upgrade_payload,
+                    post_obs=post_obs_context,
+                    post_info=info if isinstance(info, dict) else None,
+                )
+                if isinstance(completed_deck_upgrade_payload, dict):
+                    deck_upgrade_tracker.update_deck_upgrade_choice(completed_deck_upgrade_payload)
+                    dump_deck_upgrade_choice_diagnostic(self, completed_deck_upgrade_payload)
+                    if trajectory.steps:
+                        trajectory.steps[-1].setdefault("decision_diagnostics", {})[
+                            "deck_upgrade_choice"
+                        ] = completed_deck_upgrade_payload
+            except Exception:
+                pass
             potion_transition_record = info.get("potion_transition") if isinstance(info, dict) else None
             if isinstance(potion_transition_record, dict):
                 self._dump_potion_transition(potion_transition_record)
@@ -1295,6 +1663,8 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 break
 
         final_info = dict(info)
+        episode_telemetry = final_info.get("episode_telemetry") if isinstance(final_info, dict) else None
+        episode_telemetry = episode_telemetry if isinstance(episode_telemetry, dict) else {}
         max_floor = max((float(snapshot.get("floor", 0.0)) for snapshot in progress_snapshots), default=0.0)
         max_act_id = max((float(snapshot.get("act_id", 0.0)) for snapshot in progress_snapshots), default=0.0)
         rooms_seen = len(seen_floors)
@@ -1324,6 +1694,12 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
         final_deck_quality = compute_deck_quality_summary(final_deck_cards)
         final_deck_compact = compact_deck_cards(final_deck_cards, limit=80)
         card_reward_meta = card_reward_tracker.as_metadata()
+        shop_meta = shop_tracker.as_metadata()
+        rest_site_meta = rest_site_tracker.as_metadata()
+        deck_upgrade_meta = deck_upgrade_tracker.as_metadata()
+        summoner_targeting_meta = summoner_targeting_tracker.as_metadata()
+        target_priority_meta = target_priority_tracker.as_metadata()
+        intent_combat_quality_meta = intent_combat_quality_tracker.as_metadata()
         final_potion_dump = (
             self._compact_raw_potion_inventory(
                 final_transition_state if isinstance(final_transition_state, dict) else None,
@@ -1412,6 +1788,12 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
             "final_deck_cards_compact": final_deck_compact,
             "final_deck_quality_v2": final_deck_quality,
             **card_reward_meta,
+            **shop_meta,
+            **rest_site_meta,
+            **deck_upgrade_meta,
+            **summoner_targeting_meta,
+            **target_priority_meta,
+            **intent_combat_quality_meta,
             "max_floor": float(max_floor),
             "max_act_id": float(max_act_id),
             "rooms_seen": int(rooms_seen),
@@ -1437,6 +1819,7 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
             "combat_like_decision_count": int(combat_like_decision_count),
             "direct_policy_eligible_count": int(direct_policy_eligible_count),
             "direct_policy_used_count": int(direct_policy_used_count),
+            "episode_telemetry": dict(episode_telemetry),
         }
 
         settlement_signal = self._episode_settlement_signal(
@@ -1467,6 +1850,11 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
             n_steps=self.n_step_return,
         )
         self.episode_count += 1
+        log_environment_episode_telemetry(
+            writer=self.writer,
+            episode_index=self.episode_count,
+            episode_telemetry=episode_telemetry,
+        )
         recent_tail_snapshot = self.record_recent_combat_episode(trajectory.metadata)
 
         if search_root_candidates:
@@ -1734,6 +2122,23 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 "route_safety_guard_selected_immediate_elite": "route_safety_guard_selected_immediate_elite_rate",
                 "route_safety_guard_low_hp_forced": "route_safety_guard_low_hp_forced_rate",
                 "route_safety_guard_invalid_obs": "route_safety_guard_invalid_obs_rate",
+                # Build hard-guard policy/telemetry.  Emergency mode keeps only
+                # low-HP campfire survival protection; full-only card/shop/rest
+                # overrides should stay at zero under that mode.
+                "build_hard_guard_policy_full": "build_hard_guard_policy_full",
+                "build_hard_guard_policy_emergency": "build_hard_guard_policy_emergency",
+                "build_hard_guard_policy_off": "build_hard_guard_policy_off",
+                "build_safety_guard_enabled": "build_safety_guard_enabled",
+                "build_safety_guard_rest_low_hp_applicable": "build_safety_guard_rest_low_hp_applicable_rate",
+                "build_safety_guard_rest_available": "build_safety_guard_rest_available_rate",
+                "build_safety_guard_rest_applied": "build_safety_guard_rest_applied_rate",
+                "build_safety_guard_rest_override": "build_safety_guard_rest_override_rate",
+                "build_safety_guard_rest_selected_non_heal_low_hp": "build_safety_guard_rest_selected_non_heal_low_hp_rate",
+                "build_safety_guard_rest_selected_heal": "build_safety_guard_rest_selected_heal_rate",
+                "build_safety_guard_invalid_obs": "build_safety_guard_invalid_obs_rate",
+                "build_safety_guard_alignment_error": "build_safety_guard_alignment_error_rate",
+                "build_safety_guard_hp_ratio": "build_safety_guard_hp_ratio_mean",
+                "build_safety_guard_hp_threshold": "build_safety_guard_hp_threshold",
                 "objective_weight_survival": "objective_weight_survival",
                 "objective_weight_hp": "objective_weight_hp",
                 "objective_weight_build": "objective_weight_build",
@@ -1747,6 +2152,13 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 "q_value_ucb_enabled": "q_value_ucb_enabled",
             }
             metric_name_map.update(CARD_REWARD_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(CARD_REWARD_PICK_QUALITY_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(SHOP_ACTION_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(REST_SITE_SMITH_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(COMBAT_QUALITY_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES)
+            metric_name_map.update(TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES)
             for stat_key, writer_suffix in metric_name_map.items():
                 values = metric_lists.get(stat_key)
                 if values:
@@ -1800,6 +2212,42 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                 float(card_reward_meta.get(meta_key, 0.0)),
                 self.episode_count,
             )
+        for tag_suffix, meta_key in SHOP_TB_KEYS:
+            self.writer.add_scalar(
+                f"build/shop_{tag_suffix}",
+                float(shop_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in REST_SITE_TB_KEYS:
+            self.writer.add_scalar(
+                f"build/rest_site_{tag_suffix}",
+                float(rest_site_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in DECK_UPGRADE_TB_KEYS:
+            self.writer.add_scalar(
+                f"build/deck_upgrade_{tag_suffix}",
+                float(deck_upgrade_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in SUMMONER_TARGETING_TB_KEYS:
+            self.writer.add_scalar(
+                f"combat/summoner_targeting_{tag_suffix}",
+                float(summoner_targeting_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in TARGET_PRIORITY_TB_KEYS:
+            self.writer.add_scalar(
+                f"combat/target_priority_{tag_suffix}",
+                float(target_priority_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
+        for tag_suffix, meta_key in INTENT_COMBAT_QUALITY_TB_KEYS:
+            self.writer.add_scalar(
+                f"combat/intent_quality_{tag_suffix}",
+                float(intent_combat_quality_meta.get(meta_key, 0.0)),
+                self.episode_count,
+            )
         if float(death_floor) > 0.0:
             for tag_suffix, quality_key in DEATH_DECK_QUALITY_TB_KEYS:
                 self.writer.add_scalar(
@@ -1807,6 +2255,21 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
                     float(final_deck_quality.get(quality_key, 0.0)),
                     self.episode_count,
                 )
+            self._dump_death_deck_summary(
+                final_info=final_info,
+                final_progress=final_progress,
+                final_deck_cards=final_deck_cards,
+                final_deck_quality=final_deck_quality,
+                final_deck_compact=final_deck_compact,
+                card_reward_meta=card_reward_meta,
+                episode_reward=float(episode_reward),
+                episode_length=int(episode_length),
+                max_floor=float(max_floor),
+                death_floor=float(death_floor),
+                act1_boss_seen=bool(act1_boss_seen),
+                act1_clear=bool(act1_clear),
+                progress_snapshots=progress_snapshots,
+            )
         self._emit_route_heuristic_dry_run_metrics(
             records=route_dry_run_records,
             error_count=route_dry_run_error_count,
@@ -1838,6 +2301,12 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
             "deck_quality_v2": final_deck_quality,
             "final_deck_cards_compact": final_deck_compact,
             "card_reward_metrics": card_reward_meta,
+            "shop_metrics": shop_meta,
+            "rest_site_metrics": rest_site_meta,
+            "deck_upgrade_metrics": deck_upgrade_meta,
+            "summoner_targeting_metrics": summoner_targeting_meta,
+            "target_priority_metrics": target_priority_meta,
+            "episode_telemetry": dict(episode_telemetry),
             "episode_reward": float(episode_reward),
             "episode_length": int(episode_length),
             "max_floor": float(max_floor),

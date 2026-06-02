@@ -33,6 +33,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import observation_common as obs_common
 from .semantic_action import (
     SEMANTIC_ACTION_FAMILIES,
     SEMANTIC_ROLE_NAMES,
@@ -280,12 +281,18 @@ def _hand_size(obs: dict[str, Any] | None) -> int:
 
 def _player_max_hp(obs: dict[str, Any] | None) -> float:
     if not isinstance(obs, dict):
-        return 1.0
+        return 0.0
     player = obs.get("player") if isinstance(obs.get("player"), dict) else None
     if isinstance(player, dict):
-        mh = _float(player.get("max_hp"), 1.0)
-        return mh if mh > 0 else 1.0
-    return 1.0
+        return obs_common._player_max_hp_value(player)
+    return 0.0
+
+
+def _player_hp_ratio(obs: dict[str, Any] | None) -> float:
+    if not isinstance(obs, dict):
+        return 0.0
+    player = obs.get("player") if isinstance(obs.get("player"), dict) else None
+    return obs_common._player_hp_triplet(player)[2]
 
 
 def _build_state_snapshot(obs: dict[str, Any] | None) -> tuple[float, ...]:
@@ -303,7 +310,6 @@ def _build_state_snapshot(obs: dict[str, Any] | None) -> tuple[float, ...]:
     energy = _float(combat.get("energy")) if combat else 0.0
     hand_size = _hand_size(obs)
     player_hp = _player_hp(obs)
-    max_hp = _player_max_hp(obs)
     player_block = _player_block(obs)
     player_strength = _player_power_amount(obs, "strength")
     player_dex = _player_power_amount(obs, "dexterity")
@@ -324,7 +330,7 @@ def _build_state_snapshot(obs: dict[str, Any] | None) -> tuple[float, ...]:
     return (
         max(0.0, min(energy / 5.0, 1.0)),
         max(0.0, min(hand_size / 10.0, 1.0)),
-        max(0.0, min(player_hp / max_hp, 1.0)),
+        _player_hp_ratio(obs),
         max(0.0, min(enemy_hp / enemy_max_ref, 1.0)),
         max(0.0, min(player_strength / 10.0, 1.0)),
         max(0.0, min(player_dex / 10.0, 1.0)),

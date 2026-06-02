@@ -563,7 +563,11 @@ class PotionBadUseGuardMixin:
                                     effective_max_hp = effective_hp / max(float(hp_ratio), 1e-6)
                                 effective_hp_ratio = float(hp_ratio)
                                 if effective_hp_ratio <= 0.0 and effective_hp > 0.0 and effective_max_hp > 0.0:
-                                    effective_hp_ratio = effective_hp / max(effective_max_hp, 1.0)
+                                    effective_hp_ratio = (
+                                        min(max(effective_hp / effective_max_hp, 0.0), 1.0)
+                                        if effective_max_hp > 1.0
+                                        else 0.0
+                                    )
 
                                 encounter_tier = self._combat_encounter_tier_from_raw(
                                     raw_obs if isinstance(raw_obs, dict) else None

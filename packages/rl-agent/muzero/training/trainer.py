@@ -96,6 +96,7 @@ from muzero.sts2_env.latent_regularizers import (
     slot_latent_gaussian_regularizer,
 )
 from sts2_env.objective_heads import (
+    HEAD_HP_PRESERVATION,
     NUM_OBJECTIVE_HEADS,
     compute_transition_objective_rewards,
 )
@@ -208,6 +209,15 @@ class MuZeroTrainer(
         planner_objective_q_loss_weight: float = 0.75,
         objective_value_weight: float = 1.0,
         objective_reward_weight: float = 0.75,
+        combat_hp_preservation_aux_weight: float = 0.0,
+        human_demo_policy_alignment: Any | None = None,
+        human_demo_alignment_weight: float = 0.0,
+        human_demo_alignment_shadow_only: bool = True,
+        human_demo_alignment_every_n_train_steps: int = 4,
+        offline_policy_alignment: Any | None = None,
+        offline_alignment_weight: float = 0.0,
+        offline_alignment_shadow_only: bool = True,
+        offline_alignment_every_n_train_steps: int = 4,
         semantic_policy_weight: float = 1.0,
         semantic_value_weight: float = 1.0,
         semantic_reward_weight: float = 0.75,
@@ -270,6 +280,8 @@ class MuZeroTrainer(
         recent_tail_min_samples: int = 4,
         route_heuristic_bias: float = 0.0,
         route_safety_guard: bool = False,
+        combat_hard_guard_policy: str = "full",
+        build_hard_guard_policy: str = "full",
         log_dir: str = "runs",
         checkpoint_dir: str = "checkpoints",
         checkpoint_keep_last: int = 3,
@@ -306,6 +318,26 @@ class MuZeroTrainer(
         self.planner_objective_q_loss_weight = max(float(planner_objective_q_loss_weight), 0.0)
         self.objective_value_weight = max(float(objective_value_weight), 0.0)
         self.objective_reward_weight = max(float(objective_reward_weight), 0.0)
+        self.combat_hp_preservation_aux_weight = max(float(combat_hp_preservation_aux_weight), 0.0)
+        if self.combat_hp_preservation_aux_weight > 0.0 and HEAD_HP_PRESERVATION >= NUM_OBJECTIVE_HEADS:
+            raise ValueError(
+                "HP-preservation objective head index is outside reward_component_logits; "
+                "refusing to enable combat_hp_preservation_aux_weight."
+            )
+        self.human_demo_policy_alignment = human_demo_policy_alignment
+        self.human_demo_alignment_weight = max(float(human_demo_alignment_weight), 0.0)
+        self.human_demo_alignment_shadow_only = bool(human_demo_alignment_shadow_only)
+        self.human_demo_alignment_every_n_train_steps = max(
+            int(human_demo_alignment_every_n_train_steps),
+            1,
+        )
+        self.offline_policy_alignment = offline_policy_alignment
+        self.offline_alignment_weight = max(float(offline_alignment_weight), 0.0)
+        self.offline_alignment_shadow_only = bool(offline_alignment_shadow_only)
+        self.offline_alignment_every_n_train_steps = max(
+            int(offline_alignment_every_n_train_steps),
+            1,
+        )
         self.semantic_policy_weight = max(float(semantic_policy_weight), 0.0)
         self.semantic_value_weight = max(float(semantic_value_weight), 0.0)
         self.semantic_reward_weight = max(float(semantic_reward_weight), 0.0)
@@ -376,6 +408,13 @@ class MuZeroTrainer(
         # positionally aligned and legal.  Default off for reproducibility;
         # launch scripts opt in with ``--route-safety-guard``.
         self.route_safety_guard_enabled = bool(route_safety_guard)
+        valid_guard_policies = {"full", "emergency", "off"}
+        self.combat_hard_guard_policy = str(combat_hard_guard_policy or "full").strip().lower()
+        if self.combat_hard_guard_policy not in valid_guard_policies:
+            self.combat_hard_guard_policy = "full"
+        self.build_hard_guard_policy = str(build_hard_guard_policy or "full").strip().lower()
+        if self.build_hard_guard_policy not in valid_guard_policies:
+            self.build_hard_guard_policy = "full"
         self.recent_tail_tracked_encounters = [
             str(encounter_id).strip()
             for encounter_id in (recent_tail_tracked_encounters or [])
@@ -427,6 +466,16 @@ class MuZeroTrainer(
             self._end_turn_context_dump_max = 50000
         self._end_turn_context_dump_disabled = (
             os.environ.get("MUZERO_END_TURN_CONTEXT_DUMP", "1").strip() == "0"
+        )
+        self._end_turn_pre_dispatch_audit_count = 0
+        try:
+            self._end_turn_pre_dispatch_audit_max = int(
+                os.environ.get("MUZERO_END_TURN_PRE_DISPATCH_AUDIT_MAX", "100000")
+            )
+        except (TypeError, ValueError):
+            self._end_turn_pre_dispatch_audit_max = 100000
+        self._end_turn_pre_dispatch_audit_disabled = (
+            os.environ.get("MUZERO_END_TURN_PRE_DISPATCH_AUDIT", "1").strip() == "0"
         )
         self._action_offender_dump_count = 0
         try:

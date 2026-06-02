@@ -123,10 +123,19 @@ def _player_snapshot(obs: dict[str, Any] | None) -> tuple[float, float, float, f
     if not isinstance(obs, dict):
         return 0.0, 0.0, 0.0, 1.0
     player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
-    hp = _float(player.get("hp"))
+    hp = _float(player.get("hp", player.get("current_hp", player.get("currentHealth"))))
     block = _float(player.get("block"))
     energy = _float(player.get("energy"))
-    max_hp = max(_float(player.get("max_hp"), 1.0), 1.0)
+    max_hp = _float(
+        player.get(
+            "max_hp",
+            player.get("maxHealth", player.get("max_health", player.get("maximum_hp", player.get("max_hp_raw")))),
+        ),
+        0.0,
+    )
+    if max_hp <= 1.0 and hp > 1.0:
+        max_hp = hp
+    max_hp = max(max_hp, 1.0)
     return hp, block, energy, max_hp
 
 

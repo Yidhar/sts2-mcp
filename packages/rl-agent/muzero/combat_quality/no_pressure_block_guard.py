@@ -270,6 +270,8 @@ class NoPressureBlockGuardMixin:
         original_idx: int,
         encounter: str,
         current_energy: float,
+        search_stats: dict[str, Any] | None = None,
+        encounter_tier: str | None = None,
         selected_block: float,
         threat_gap: float,
         current_hp: float,
@@ -330,6 +332,46 @@ class NoPressureBlockGuardMixin:
                 for k, v in (selected_profile or {}).items()
                 if isinstance(v, (bool, int, float, str, np.generic)) or v is None
             }
+
+            def _safe_float_local(value: Any, default: float = 0.0) -> float:
+                try:
+                    out = float(value)
+                except (TypeError, ValueError):
+                    return float(default)
+                return out if np.isfinite(out) else float(default)
+
+            raw_run = raw_obs.get("run") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("run"), dict) else {}
+            if not raw_run and isinstance(raw_obs, dict) and isinstance(raw_obs.get("transition_state"), dict):
+                transition_run = raw_obs["transition_state"].get("run")
+                if isinstance(transition_run, dict):
+                    raw_run = transition_run
+            floor_value = (
+                _safe_float_local(raw_run.get("floor", raw_run.get("total_floor")))
+                if isinstance(raw_run, dict)
+                else 0.0
+            )
+            parse_act = getattr(self, "_parse_progress_act_id", None)
+            if callable(parse_act) and isinstance(raw_run, dict):
+                try:
+                    act_id_value = float(parse_act(raw_run.get("act_id"), raw_run))
+                except Exception:
+                    act_id_value = 0.0
+            else:
+                act_id_value = _safe_float_local(raw_run.get("act_id")) if isinstance(raw_run, dict) else 0.0
+            raw_combat = raw_obs.get("combat") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("combat"), dict) else {}
+            stats = search_stats if isinstance(search_stats, dict) else {}
+            guard_bits = {
+                "no_pressure_available": float(stats.get("combat_quality_no_pressure_block_guard_available", 0.0) or 0.0),
+                "no_pressure_applied": float(stats.get("combat_quality_no_pressure_block_guard_applied", 0.0) or 0.0),
+                "no_pressure_override": float(stats.get("combat_quality_no_pressure_block_guard_override", 0.0) or 0.0),
+                "no_pressure_candidate_count": float(stats.get("combat_quality_no_pressure_block_guard_candidate_count", 0.0) or 0.0),
+                "no_pressure_no_alternative": float(stats.get("combat_quality_no_pressure_block_guard_no_alternative", 0.0) or 0.0),
+                "no_pressure_progress_override_idx": float(stats.get("combat_quality_no_pressure_block_guard_progress_override_idx", -1.0) or -1.0),
+                "no_pressure_progress_override_lock": float(stats.get("combat_quality_no_pressure_block_guard_progress_override_lock", 0.0) or 0.0),
+                "survival_override": float(stats.get("combat_quality_survival_non_endturn_guard_override", 0.0) or 0.0),
+                "survival_candidate_count": float(stats.get("combat_quality_survival_non_endturn_guard_candidate_count", 0.0) or 0.0),
+                "hard_guard_override_any": float(stats.get("combat_quality_hard_guard_override_any", 0.0) or 0.0),
+            }
             payload = {
                 "time": time.time(),
                 "kind": "no_pressure_block_eval",
@@ -337,7 +379,11 @@ class NoPressureBlockGuardMixin:
                 "total_steps": int(getattr(self, "total_steps", 0)),
                 "episode_id": int(getattr(self, "episode_count", 0)),
                 "global_step": int(getattr(self, "total_steps", 0)),
+                "floor": float(floor_value),
+                "act_id": float(act_id_value),
+                "turn": raw_combat.get("round"),
                 "encounter": encounter,
+                "tier": encounter_tier,
                 "original_idx": int(original_idx),
                 "legal_count": int(legal_count),
                 "energy": float(current_energy),
@@ -356,6 +402,7 @@ class NoPressureBlockGuardMixin:
                 },
                 "selected": selected_summary,
                 "selected_profile": selected_profile_keep,
+                "guard_bits": guard_bits,
                 "candidates": [
                     {
                         "idx": int(getattr(candidate, "index", -1)),
@@ -539,6 +586,8 @@ class NoPressureBlockGuardMixin:
             selected_profile=selected_profile if isinstance(selected_profile, dict) else {},
             candidates=candidates,
             rejection_counts=rejection_counts,
+            search_stats=search_stats,
+            encounter_tier=str(encounter_tier or ""),
             meaningful_block_urgent=bool(meaningful_block_urgent),
             survival_justified=bool(survival_justified),
             mid_pressure_rewrite_attempt=bool(mid_pressure_rewrite_attempt),

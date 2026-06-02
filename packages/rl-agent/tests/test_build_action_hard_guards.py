@@ -69,6 +69,115 @@ def test_low_hp_rest_site_smith_overrides_to_rest():
     assert search_stats["build_safety_guard_rest_override"] == 1.0
 
 
+def test_high_hp_rest_site_rest_overrides_to_smith():
+    raw_obs = {"player": {"hp": 64, "max_hp": 80}}
+    full_actions = [
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:smith",
+            "label": "Rest site option 0: 锻造",
+            "option": {
+                "option_id": "SMITH",
+                "option_type": "SmithRestSiteOption",
+                "title": "锻造",
+                "description": "升级你牌组中的1张牌。",
+            },
+        },
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:rest",
+            "label": "Rest site option 1: 休息",
+            "option": {
+                "option_id": "HEAL",
+                "option_type": "HealRestSiteOption",
+                "title": "休息",
+                "description": "回复18点生命值。",
+            },
+        },
+    ]
+    # Compact actions may not carry option identity; the guard must use the
+    # full live bridge actions by index and still return the compact index.
+    compact_actions = [{"kind": "rest_site", "action_id": "rest_site:0"}, {"kind": "rest_site", "action_id": "rest_site:1"}]
+    trainer = _trainer_with_raw(raw_obs, full_actions)
+    search_stats: dict = {}
+
+    new_idx = trainer._apply_build_action_hard_guards(
+        action_idx=1,
+        legal_actions=compact_actions,
+        action_mask=np.array([1, 1], dtype=np.float32),
+        search_stats=search_stats,
+    )
+
+    assert new_idx == 0
+    assert search_stats["rest_site_smith_guard_applicable"] == 1.0
+    assert search_stats["rest_site_smith_guard_selected_heal_safe_hp"] == 1.0
+    assert search_stats["rest_site_smith_guard_smith_available"] == 1.0
+    assert search_stats["rest_site_smith_guard_applied"] == 1.0
+    assert search_stats["rest_site_smith_guard_override"] == 1.0
+    # The low-HP survival rest override must not fight the high-HP smith guard.
+    assert search_stats["build_safety_guard_rest_low_hp_applicable"] == 0.0
+    assert search_stats["build_safety_guard_rest_applied"] == 0.0
+
+
+def test_mid_hp_rest_site_rest_is_not_forced_to_smith():
+    raw_obs = {"player": {"hp": 55, "max_hp": 80}}
+    full_actions = [
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:smith",
+            "option": {"option_id": "SMITH", "option_type": "SmithRestSiteOption", "title": "Smith"},
+        },
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:rest",
+            "option": {"option_id": "HEAL", "option_type": "HealRestSiteOption", "title": "Rest"},
+        },
+    ]
+    trainer = _trainer_with_raw(raw_obs, full_actions)
+    search_stats: dict = {}
+
+    new_idx = trainer._apply_build_action_hard_guards(
+        action_idx=1,
+        legal_actions=full_actions,
+        action_mask=np.array([1, 1], dtype=np.float32),
+        search_stats=search_stats,
+    )
+
+    assert new_idx == 1
+    assert search_stats["rest_site_smith_guard_applied"] == 0.0
+    assert search_stats["build_safety_guard_rest_applied"] == 0.0
+
+
+def test_high_hp_rest_site_selected_smith_is_kept():
+    raw_obs = {"player": {"hp": 64, "max_hp": 80}}
+    full_actions = [
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:smith",
+            "option": {"option_id": "SMITH", "option_type": "SmithRestSiteOption", "title": "Smith"},
+        },
+        {
+            "kind": "rest_site",
+            "action_id": "rest_site:rest",
+            "option": {"option_id": "HEAL", "option_type": "HealRestSiteOption", "title": "Rest"},
+        },
+    ]
+    trainer = _trainer_with_raw(raw_obs, full_actions)
+    search_stats: dict = {}
+
+    new_idx = trainer._apply_build_action_hard_guards(
+        action_idx=0,
+        legal_actions=full_actions,
+        action_mask=np.array([1, 1], dtype=np.float32),
+        search_stats=search_stats,
+    )
+
+    assert new_idx == 0
+    assert search_stats["rest_site_smith_guard_applicable"] == 1.0
+    assert search_stats["rest_site_smith_guard_selected_heal_safe_hp"] == 0.0
+    assert search_stats["rest_site_smith_guard_applied"] == 0.0
+
+
 def test_low_hp_rest_site_live_bridge_heal_option_overrides_indexed_smith():
     raw_obs = {"player": {"hp": 39, "max_hp": 80}}
     full_actions = [
@@ -267,3 +376,65 @@ def test_build_rest_guard_ignores_route_actions_with_future_rest_sites():
     assert new_idx == 0
     assert search_stats["build_safety_guard_rest_low_hp_applicable"] == 0.0
     assert search_stats["build_safety_guard_rest_applied"] == 0.0
+
+
+def test_deck_upgrade_close_overrides_to_best_upgrade_target():
+    raw_obs = {"player": {"hp": 70, "max_hp": 80}}
+    full_actions = [
+        {
+            "kind": "deck_upgrade",
+            "action_id": "deck_upgrade:0",
+            "card": {"id": "CARD.STRIKE_IRONCLAD", "title": "打击"},
+        },
+        {
+            "kind": "deck_upgrade",
+            "action_id": "deck_upgrade:1",
+            "card": {"id": "CARD.BASH_IRONCLAD", "title": "痛击"},
+        },
+        {
+            "kind": "deck_upgrade",
+            "action_id": "deck_upgrade:close",
+            "title": "关闭",
+        },
+    ]
+    compact_actions = [
+        {"kind": "deck_upgrade", "action_id": "deck_upgrade:0", "card": {"title": "打击"}},
+        {"kind": "deck_upgrade", "action_id": "deck_upgrade:1", "card": {"title": "痛击"}},
+        {"kind": "deck_upgrade", "action_id": "deck_upgrade:close", "title": "关闭"},
+    ]
+    trainer = _trainer_with_raw(raw_obs, full_actions)
+    search_stats: dict = {}
+
+    new_idx = trainer._apply_build_action_hard_guards(
+        action_idx=2,
+        legal_actions=compact_actions,
+        action_mask=np.array([1, 1, 1], dtype=np.float32),
+        search_stats=search_stats,
+    )
+
+    assert new_idx == 1
+    assert search_stats["deck_upgrade_target_guard_context"] == 1.0
+    assert search_stats["deck_upgrade_target_guard_selected_close"] == 1.0
+    assert search_stats["deck_upgrade_target_guard_close_with_upgrade_available"] == 1.0
+    assert search_stats["deck_upgrade_target_guard_applied"] == 1.0
+    assert search_stats["deck_upgrade_target_guard_close_override"] == 1.0
+    assert search_stats["deck_upgrade_target_guard_bash_available"] == 1.0
+
+
+def test_deck_upgrade_close_without_targets_is_allowed():
+    raw_obs = {"player": {"hp": 70, "max_hp": 80}}
+    full_actions = [{"kind": "deck_upgrade", "action_id": "deck_upgrade:close", "title": "关闭"}]
+    trainer = _trainer_with_raw(raw_obs, full_actions)
+    search_stats: dict = {}
+
+    new_idx = trainer._apply_build_action_hard_guards(
+        action_idx=0,
+        legal_actions=full_actions,
+        action_mask=np.array([1], dtype=np.float32),
+        search_stats=search_stats,
+    )
+
+    assert new_idx == 0
+    assert search_stats["deck_upgrade_target_guard_context"] == 0.0
+    assert search_stats["deck_upgrade_target_guard_applied"] == 0.0
+    assert search_stats["deck_upgrade_target_guard_close_override"] == 0.0

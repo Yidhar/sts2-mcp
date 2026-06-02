@@ -85,6 +85,28 @@ def _pick_action(card: dict, idx: int = 0) -> dict:
     }
 
 
+def _compact_pick_action(card: dict, idx: int = 0) -> dict:
+    return {
+        "surface": "card_reward",
+        "action_id": f"card_reward:{idx}",
+        "choice_index": idx,
+        "card_id": card["id"],
+        "card_title": card.get("title"),
+        "title": card.get("title"),
+        "card_type": card.get("type"),
+        "card_cost": card.get("cost"),
+        "card_effect_profile": card.get("card_effect_profile"),
+    }
+
+
+def _compact_skip_action() -> dict:
+    return {
+        "surface": "card_reward",
+        "action_id": "card_reward:skip",
+        "selection": "skip",
+    }
+
+
 def test_thin_low_block_deck_blocks_skip_to_best_block_card():
     from muzero.training.card_reward_guard import apply_card_reward_guard
 
@@ -560,6 +582,12 @@ def test_card_reward_guard_emits_choice_diagnostic_payload():
     assert new_idx == 2
     assert isinstance(payload, dict)
     assert payload["skip_blocked"] is True
+    assert payload["original_selected_is_skip"] is True
+    assert payload["final_selected_is_skip"] is None
+    # The raw guard payload is created before self_play knows the final
+    # post-guard action; self_play rewrites selected_is_skip to final semantics
+    # before JSONL dump.
+    assert payload["selected_is_skip"] is True
     assert payload["decision_reason"] == "skip_blocked"
     assert payload["best_score"] == stats["card_reward_guard_best_score"]
     assert payload["dynamic_min_useful_score"] == stats["card_reward_guard_dynamic_min_useful_score"]
@@ -645,6 +673,58 @@ def test_non_card_reward_context_and_existing_pick_are_noops():
         == 1
     )
     assert stats["card_reward_guard_selected_pick"] == 1.0
+
+
+def test_compact_only_card_reward_skip_overrides_to_positional_pick():
+    from muzero.training.card_reward_guard import apply_card_reward_guard
+
+    block_card = _card("good_block", type_="Skill", block=12)
+    attack_card = _card("ok_attack", type_="Attack", damage=6)
+    actions = [
+        _compact_skip_action(),
+        _compact_pick_action(attack_card, 0),
+        _compact_pick_action(block_card, 1),
+    ]
+    stats: dict = {}
+
+    new_idx = apply_card_reward_guard(
+        action_idx=0,
+        legal_actions=actions,
+        full_legal_actions=None,
+        action_mask=np.array([1, 1, 1], dtype=np.float32),
+        raw_obs=_raw(_thin_low_block_deck()),
+        search_stats=stats,
+    )
+
+    assert new_idx == 2
+    assert stats["card_reward_guard_context"] == 1.0
+    assert stats["card_reward_guard_pick_available"] == 1.0
+    assert stats["card_reward_guard_skip_blocked"] == 1.0
+    assert stats["card_reward_guard_override"] == 1.0
+    assert stats["_card_reward_choice_diagnostic"]["best_card"]["id"] == "good_block"
+
+
+def test_compact_positional_card_reward_pick_is_noop_not_skip():
+    from muzero.training.card_reward_guard import apply_card_reward_guard
+
+    block_card = _card("good_block", type_="Skill", block=12)
+    actions = [_compact_skip_action(), _compact_pick_action(block_card, 0)]
+    stats: dict = {}
+
+    new_idx = apply_card_reward_guard(
+        action_idx=1,
+        legal_actions=actions,
+        full_legal_actions=None,
+        action_mask=np.array([1, 1], dtype=np.float32),
+        raw_obs=_raw(_thin_low_block_deck()),
+        search_stats=stats,
+    )
+
+    assert new_idx == 1
+    assert stats["card_reward_guard_context"] == 1.0
+    assert stats["card_reward_guard_selected_pick"] == 1.0
+    assert stats["card_reward_guard_selected_skip"] == 0.0
+    assert stats["card_reward_guard_override"] == 0.0
 
 
 def test_alignment_error_fails_open():

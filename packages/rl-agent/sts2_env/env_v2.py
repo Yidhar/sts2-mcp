@@ -233,6 +233,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._last_bridge_info: dict[str, Any] | None = None
         self._last_actionability: dict[str, Any] | None = None
         self._last_raw_legal_action_count: int = 0
+        self._last_raw_legal_actions_compact: list[dict[str, Any]] = []
         self._last_blocked_action_drop_count: int = 0
         self._max_floor_reached: int = 0
         self._stuck_fingerprint: tuple | None = None
@@ -334,6 +335,13 @@ class SlayTheSpire2EnvV2(gym.Env):
             "frontier_only_end_turn_resolved": 0.0,
             "frontier_only_end_turn_leaked": 0.0,
             "frontier_only_end_turn_with_energy": 0.0,
+            "frontier_only_end_turn_with_affordable_card": 0.0,
+            "frontier_only_end_turn_pre_dispatch_waits": 0.0,
+            "frontier_only_end_turn_pre_dispatch_blocked": 0.0,
+            "frontier_only_end_turn_pre_dispatch_high_confidence_blocked": 0.0,
+            "frontier_only_end_turn_pre_dispatch_stalls": 0.0,
+            "frontier_only_end_turn_reset_post_gate_waits": 0.0,
+            "frontier_only_end_turn_reset_post_gate_resolved": 0.0,
             "frontier_only_discard_potion_short_waits": 0.0,
             "frontier_only_discard_potion_resolved": 0.0,
             "frontier_only_discard_potion_leaked": 0.0,
@@ -364,6 +372,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         self._last_bridge_info = None
         self._last_actionability = None
         self._last_raw_legal_action_count = 0
+        self._last_raw_legal_actions_compact = []
         self._last_blocked_action_drop_count = 0
         self._action_history.reset()
         self._episode_telemetry = self._blank_telemetry()
@@ -377,6 +386,8 @@ class SlayTheSpire2EnvV2(gym.Env):
         direct_after_obs = self._last_obs_raw
         self._inject_action_history_into_obs()
         self._recover_filtered_action_window(timeout_ms=min(self.reset_timeout_ms, RECOVERY_MAX_WAIT_MS))
+        self._inject_action_history_into_obs()
+        self._recover_reset_singleton_end_turn_window()
         self._inject_action_history_into_obs()
         run_memory_started = time.perf_counter()
         self._run_memory.reset(
@@ -425,6 +436,46 @@ class SlayTheSpire2EnvV2(gym.Env):
             return self._make_invalid_action_response(action)
 
         legal_action = self._legal_actions[normalized_action]
+        if self._is_end_turn_action(legal_action) and self._current_frontier_needs_short_wait():
+            self._episode_telemetry["frontier_only_end_turn_pre_dispatch_waits"] += 1.0
+            recovered = self._recover_filtered_action_window(
+                timeout_ms=self._transition_recovery_timeout_ms()
+            )
+            if not recovered:
+                self._episode_telemetry["frontier_only_end_turn_pre_dispatch_stalls"] += 1.0
+                return self._make_terminal()
+            refreshed_has_non_end_turn = any(
+                not self._is_end_turn_action(action_item)
+                for action_item in self._legal_actions[:MAX_ACTIONS]
+            )
+            if refreshed_has_non_end_turn:
+                self._episode_telemetry["frontier_only_end_turn_pre_dispatch_blocked"] += 1.0
+                return self._make_frontier_refreshed_response(action)
+            if self._frontier_has_affordable_raw_combat_card():
+                # High-confidence stale frontier: the filtered bridge mask is
+                # still singleton EndTurn, but raw combat obs says there is an
+                # affordable real card in hand.  Do not burn the in-game turn;
+                # return a no-op response so the collector can poll/reselect.
+                # If the bridge never recovers, _recover_filtered_action_window
+                # will terminal-stall after a small number of repeated
+                # high-confidence leaks instead of dispatching EndTurn.
+                self._episode_telemetry[
+                    "frontier_only_end_turn_pre_dispatch_high_confidence_blocked"
+                ] += 1.0
+                return self._make_frontier_refreshed_response(
+                    action,
+                    reason="frontier_stale_singleton_end_turn_blocked",
+                    refreshed=False,
+                    high_confidence=True,
+                )
+            # The bounded wait/rebind still exposes only end_turn.  Rebind can
+            # reindex singleton actions, so refresh the dispatch target before
+            # calling the bridge rather than using a stale pre-wait dict.
+            normalized_action = 0 if len(self._legal_actions) == 1 else min(
+                int(normalized_action),
+                max(len(self._legal_actions) - 1, 0),
+            )
+            legal_action = self._legal_actions[normalized_action]
         legal_actions_before = list(self._legal_actions)
         prev_obs = self._last_obs_raw or {}
         prev_planner_context = self._planner_context()
@@ -808,6 +859,14 @@ class SlayTheSpire2EnvV2(gym.Env):
         """
         if not isinstance(action, dict):
             return False
+        # HEAL and SMITH must be mutually exclusive even when compact bridge
+        # payloads contain stale derived fields (e.g. title="锻造" plus
+        # action_kind/is_heal from an earlier classifier).  Prefer concrete
+        # smith/upgrade identity before accepting broad rest/heal wording; this
+        # keeps the low-HP exposure filter, rest telemetry, and replay action
+        # labels aligned with the executed campfire option.
+        if cls._is_rest_smith_choice_action(action):
+            return False
 
         containers = [action]
         payload = action.get("payload")
@@ -1114,10 +1173,38 @@ class SlayTheSpire2EnvV2(gym.Env):
             return 0.0, False
         player = obs.get("player") if isinstance(obs.get("player"), dict) else None
         if not isinstance(player, dict):
+            combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+            player = combat.get("player") if isinstance(combat.get("player"), dict) else None
+        if not isinstance(player, dict):
             return 0.0, False
-        hp = _float(player.get("hp"))
-        max_hp = max(_float(player.get("max_hp"), 1.0), 1.0)
-        if hp <= 0.0 or max_hp <= 0.0:
+        hp = _float(
+            player.get("hp", player.get("current_hp", player.get("currentHealth"))),
+            0.0,
+        )
+        max_hp_raw = player.get("max_hp")
+        if max_hp_raw is None:
+            max_hp_raw = player.get("maxHealth")
+        if max_hp_raw is None:
+            max_hp_raw = player.get("max_health")
+        if max_hp_raw is None:
+            max_hp_raw = player.get("maximum_hp")
+        max_hp = _float(max_hp_raw, 0.0)
+        if hp <= 0.0:
+            return 0.0, False
+        if max_hp <= 1.0:
+            # Live bridge hiccups have produced full-run snapshots with
+            # player.max_hp == 1 on mid-Act floors while the player is really
+            # at critical HP.  Treat hp<=1/max_hp<=1 as critical instead of
+            # as 100% HP; otherwise the rest-site exposure filter can leave
+            # Smith/Leave visible at a campfire and train a death spiral.
+            run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
+            floor = max(
+                _float(run.get("floor"), 0.0),
+                _float(run.get("total_floor"), 0.0),
+                _float(obs.get("snapshot_floor_number"), 0.0),
+            )
+            if floor > 0.0 and hp <= 1.0:
+                return 0.0, True
             return 0.0, False
         return hp / max_hp, True
 
@@ -1287,6 +1374,9 @@ class SlayTheSpire2EnvV2(gym.Env):
         phase = self._extract_phase(result)
         legal_actions = result.get("legal_actions", [])
         self._last_raw_legal_action_count = len(legal_actions) if isinstance(legal_actions, list) else 0
+        self._last_raw_legal_actions_compact = (
+            compact_legal_actions(legal_actions) if isinstance(legal_actions, list) else []
+        )
         obs = result.get("obs", {})
         self._last_obs_raw = obs if isinstance(obs, dict) else {}
         if isinstance(legal_actions, list):
@@ -1616,7 +1706,8 @@ class SlayTheSpire2EnvV2(gym.Env):
             return 0.0
         if not self._is_rest_site_choice_action(action):
             return 0.0
-        heal_picked = self._is_rest_heal_choice_action(action)
+        smith_picked = self._is_rest_smith_choice_action(action)
+        heal_picked = (not smith_picked) and self._is_rest_heal_choice_action(action)
         # Telemetry: always count rest-site encounters + the HEAL/non-HEAL
         # split, regardless of HP threshold. Helps diagnose "is the
         # policy even reaching campfires" vs "is it choosing correctly".
@@ -1624,7 +1715,7 @@ class SlayTheSpire2EnvV2(gym.Env):
         if heal_picked:
             self._episode_telemetry["rest_heal_chosen"] += 1.0
             return 0.0
-        if self._is_rest_smith_choice_action(action):
+        if smith_picked:
             self._episode_telemetry["rest_smith_chosen"] += 1.0
         self._episode_telemetry["rest_skip_heal_chosen"] += 1.0
 
@@ -2636,6 +2727,8 @@ class SlayTheSpire2EnvV2(gym.Env):
             self._episode_telemetry["frontier_only_end_turn_short_waits"] += 1.0
             if self._frontier_suspicion_has_energy_and_hand():
                 self._episode_telemetry["frontier_only_end_turn_with_energy"] += 1.0
+            if self._frontier_has_affordable_raw_combat_card():
+                self._episode_telemetry["frontier_only_end_turn_with_affordable_card"] += 1.0
         if short_wait_for_discard_potion:
             self._episode_telemetry["frontier_only_discard_potion_short_waits"] += 1.0
             if self._frontier_suspicion_has_energy_and_hand():
@@ -2696,7 +2789,11 @@ class SlayTheSpire2EnvV2(gym.Env):
                     float(self._episode_telemetry.get("frontier_consecutive_end_turn_leaks", 0.0) or 0.0),
                     float(self._consecutive_end_turn_leaks),
                 )
-                if self._consecutive_end_turn_leaks >= 8:
+                high_confidence_end_turn_leak = bool(
+                    short_wait_for_end_turn and self._frontier_has_affordable_raw_combat_card()
+                )
+                rebind_threshold = 1 if high_confidence_end_turn_leak else 8
+                if self._consecutive_end_turn_leaks >= rebind_threshold:
                     self._episode_telemetry["frontier_end_turn_leak_rebinds"] += 1.0
                     refreshed = None
                     state = self._safe_get_state()
@@ -2712,7 +2809,8 @@ class SlayTheSpire2EnvV2(gym.Env):
                             self._episode_telemetry["frontier_only_end_turn_resolved"] += 1.0
                             self._consecutive_end_turn_leaks = 0
                             return True
-                if self._consecutive_end_turn_leaks >= 16:
+                stall_threshold = 2 if high_confidence_end_turn_leak else 16
+                if self._consecutive_end_turn_leaks >= stall_threshold:
                     self._episode_telemetry["frontier_end_turn_leak_stalls"] += 1.0
                     return False
             elif short_wait_for_discard_potion:
@@ -2726,6 +2824,38 @@ class SlayTheSpire2EnvV2(gym.Env):
             return True
 
         return False
+
+    def _recover_reset_singleton_end_turn_window(self) -> None:
+        """One extra reset-time rebind for high-confidence EndTurn leaks.
+
+        ``reset``/ready-gate can occasionally publish a combat frontier while
+        the bridge is still settling the new hand.  If the only RL-visible
+        action is EndTurn despite active combat energy + hand, do not let the
+        very first policy decision start from that stale singleton.  This is a
+        bounded best-effort refresh; it never blocks normal reset if the bridge
+        cannot be rebound immediately.
+        """
+
+        if not self._current_frontier_needs_short_wait():
+            return
+        if not self._frontier_suspicion_has_energy_and_hand():
+            return
+
+        self._episode_telemetry["frontier_only_end_turn_reset_post_gate_waits"] += 1.0
+        refreshed = None
+        state = self._safe_get_state()
+        if self._state_allows_soft_rebind(state):
+            refreshed = self._safe_reset_into_current_run(
+                max(250, min(ACTIONABILITY_REBIND_TIMEOUT_MS, self.reset_timeout_ms))
+            )
+        if refreshed is None:
+            return
+
+        self._episode_id = refreshed.get("episode_id", self._episode_id)
+        self._update_live_state(refreshed)
+        if self._legal_actions and not self._current_frontier_needs_short_wait():
+            self._episode_telemetry["frontier_recovery_successes"] += 1.0
+            self._episode_telemetry["frontier_only_end_turn_reset_post_gate_resolved"] += 1.0
 
     @staticmethod
     def _is_end_turn_action(action: dict[str, Any] | None) -> bool:
@@ -2767,6 +2897,8 @@ class SlayTheSpire2EnvV2(gym.Env):
         except (TypeError, ValueError):
             legal_non_end_turn = 0
         if legal_non_end_turn > 0:
+            if self._last_blocked_action_drop_count > 0:
+                return True
             return False
         if bool(actionability.get("frontier_stable", True)) is False:
             return True
@@ -2821,6 +2953,91 @@ class SlayTheSpire2EnvV2(gym.Env):
             if _float(combat.get(key), 0.0) > 0.0:
                 return True
         return False
+
+    def _frontier_has_affordable_raw_combat_card(self) -> bool:
+        """Return True for high-confidence stale singleton EndTurn windows.
+
+        ``_frontier_suspicion_has_energy_and_hand`` intentionally stays broad
+        so EnvV2 does a cheap wait whenever combat has energy plus any hand.
+        Blocking dispatch needs a narrower predicate: a non-status/non-curse
+        card in the raw hand must be affordable by current energy, or the
+        bridge must explicitly mark it playable.  This prevents false positives
+        such as Quest cards (e.g. 藏宝图) while catching real action-surface
+        leaks like energy=1 with four Defends in hand but only EndTurn exposed.
+        """
+
+        obs = self._last_obs_raw if isinstance(self._last_obs_raw, dict) else {}
+        combat = obs.get("combat") if isinstance(obs.get("combat"), dict) else {}
+        if not isinstance(combat, dict) or not combat:
+            return False
+        if combat.get("in_progress") is False:
+            return False
+
+        player = obs.get("player") if isinstance(obs.get("player"), dict) else {}
+        energy = _float(combat.get("energy"), 0.0)
+        if energy <= 0.0 and isinstance(player, dict):
+            energy = _float(player.get("energy"), 0.0)
+        if energy <= 0.0:
+            return False
+
+        hand = combat.get("hand")
+        if not isinstance(hand, list) and isinstance(player, dict):
+            hand = player.get("hand")
+        if not isinstance(hand, list):
+            return False
+
+        return any(self._raw_card_is_affordable_combat_action(card, energy) for card in hand)
+
+    @staticmethod
+    def _raw_card_is_affordable_combat_action(card: Any, energy: float) -> bool:
+        if not isinstance(card, dict):
+            return False
+
+        card_type = str(card.get("type") or card.get("card_type") or "").strip().lower()
+        card_id = str(card.get("id") or card.get("card_id") or "").strip().lower()
+        title = str(card.get("title") or card.get("name") or "").strip().lower()
+        blocked_type_fragments = ("status", "curse", "quest")
+        if card_type in blocked_type_fragments:
+            return False
+        if any(fragment in card_id for fragment in blocked_type_fragments):
+            return False
+        if any(fragment in title for fragment in ("晕眩", "伤口", "灼伤", "虚无", "诅咒")):
+            return False
+
+        playable = card.get("is_playable")
+        if playable is False:
+            return False
+        if playable is True:
+            return True
+
+        # Missing card type is common in compact bridge payloads/tests.  Treat
+        # explicit combat card types as valid, and allow unknown type only if a
+        # finite non-negative energy cost is present.
+        if card_type and card_type not in {"attack", "skill", "power"}:
+            return False
+
+        cost: float | None = None
+        for key in (
+            "cost_for_turn",
+            "resolved_energy_cost",
+            "energy_cost",
+            "canonical_energy_cost",
+            "cost",
+        ):
+            if card.get(key) is None:
+                continue
+            parsed = _float(card.get(key), float("nan"))
+            if parsed == parsed:
+                cost = parsed
+                break
+        if cost is None:
+            return False
+        if cost < 0.0:
+            # X-cost or special-cost cards may be playable, but they are not a
+            # high-confidence proof that EndTurn is stale unless the bridge
+            # explicitly sets is_playable=True.
+            return False
+        return cost <= energy + 1e-6
 
     def _safe_get_state(self) -> dict[str, Any] | None:
         try:
@@ -3103,6 +3320,7 @@ class SlayTheSpire2EnvV2(gym.Env):
             "transition_state": self._transition_state(),
             "bridge_info": self._decorate_bridge_info(bridge_info),
             "raw_legal_action_count": int(self._last_raw_legal_action_count),
+            "raw_legal_actions_compact": list(self._last_raw_legal_actions_compact),
             "blocked_action_drop_count": int(self._last_blocked_action_drop_count),
         }
         if isinstance(self._last_actionability, dict):
@@ -3140,6 +3358,53 @@ class SlayTheSpire2EnvV2(gym.Env):
             },
         )
         return obs, INVALID_ACTION_REWARD, False, True, info
+
+    def _make_frontier_refreshed_response(
+        self,
+        attempted_action: Any,
+        *,
+        reason: str = "frontier_refreshed_before_end_turn",
+        refreshed: bool = True,
+        high_confidence: bool = False,
+    ):
+        """Return a non-terminal no-op after blocking a stale EndTurn.
+
+        This is intentionally not an invalid-action truncation: the agent chose
+        EndTurn from the mask it was shown, but EnvV2 discovered before
+        dispatch that the bridge frontier was stale and now has real actions.
+        Returning the refreshed observation lets self-play reselect on the new
+        mask without burning an in-game turn.
+        """
+
+        self._inject_action_history_into_obs()
+        obs = self.obs_encoder.encode(self._last_obs_raw or {}, self._legal_actions, self._planner_context())
+        bridge_info = {
+            "action_error": reason,
+            "step_recovery": reason,
+            "action_diagnostics": {
+                "frontier_pre_dispatch_refreshed": 1.0 if refreshed else 0.0,
+                "frontier_pre_dispatch_end_turn_blocked": 1.0,
+                "frontier_pre_dispatch_high_confidence": 1.0 if high_confidence else 0.0,
+            },
+        }
+        info = self._build_info(
+            bridge_info,
+            extra={
+                "frontier_refreshed_before_end_turn": bool(refreshed),
+                "frontier_stale_singleton_end_turn_blocked": bool(not refreshed),
+                "frontier_refreshed_attempted_action": attempted_action,
+                "episode_telemetry": dict(self._episode_telemetry),
+                "python_timing_ms": self._python_timing(
+                    bridge_roundtrip=0.0,
+                    run_memory_update=0.0,
+                    obs_encode=0.0,
+                    aux_targets=0.0,
+                    info_build=0.0,
+                    total=0.0,
+                ),
+            },
+        )
+        return obs, 0.0, False, False, info
 
     def _planner_context(self) -> dict[str, Any]:
         context = self._run_memory.build_context(self._last_obs_raw, self._legal_actions)

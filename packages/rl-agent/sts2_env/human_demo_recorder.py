@@ -71,6 +71,18 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return _jsonable(value) if isinstance(value, dict) else {}
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out:  # NaN
+        return None
+    return out
+
+
 def _safe_action_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -115,6 +127,46 @@ def _extract_turn(obs: dict[str, Any] | None) -> int:
     return 0
 
 
+def _extract_player_hp(obs: dict[str, Any] | None) -> float | None:
+    player = obs.get("player") if isinstance(obs, dict) else None
+    if not isinstance(player, dict):
+        return None
+    return _safe_float(player.get("hp", player.get("current_hp")))
+
+
+def _extract_player_max_hp(obs: dict[str, Any] | None) -> float | None:
+    player = obs.get("player") if isinstance(obs, dict) else None
+    if not isinstance(player, dict):
+        return None
+    return _safe_float(player.get("max_hp", player.get("maximum_hp")))
+
+
+def _extract_state_blocks(
+    *,
+    info: dict[str, Any] | None,
+    next_obs: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return best-effort ``(player, combat)`` blocks for a post-step state."""
+
+    info = info or {}
+    transition_state = info.get("transition_state") if isinstance(info, dict) else None
+    if isinstance(transition_state, dict):
+        player = transition_state.get("player")
+        combat = transition_state.get("combat")
+        return (
+            player if isinstance(player, dict) else {},
+            combat if isinstance(combat, dict) else {},
+        )
+    if isinstance(next_obs, dict):
+        player = next_obs.get("player")
+        combat = next_obs.get("combat")
+        return (
+            player if isinstance(player, dict) else {},
+            combat if isinstance(combat, dict) else {},
+        )
+    return {}, {}
+
+
 def _terminal_outcome(
     *,
     reward: float | None,
@@ -122,18 +174,17 @@ def _terminal_outcome(
     truncated: bool,
     info: dict[str, Any] | None,
     next_obs: dict[str, Any] | None,
+    start_hp: float | None = None,
+    start_max_hp: float | None = None,
+    start_turn: int | None = None,
+    fallback_turn: int | None = None,
+    decision_count: int | None = None,
 ) -> dict[str, Any]:
-    info = info or {}
-    transition_state = info.get("transition_state") if isinstance(info, dict) else None
-    player: dict[str, Any] = {}
-    combat: dict[str, Any] = {}
-    if isinstance(transition_state, dict):
-        player = transition_state.get("player") if isinstance(transition_state.get("player"), dict) else {}
-        combat = transition_state.get("combat") if isinstance(transition_state.get("combat"), dict) else {}
-    elif isinstance(next_obs, dict):
-        player = next_obs.get("player") if isinstance(next_obs.get("player"), dict) else {}
-        combat = next_obs.get("combat") if isinstance(next_obs.get("combat"), dict) else {}
-    hp = player.get("hp", player.get("current_hp"))
+    player, combat = _extract_state_blocks(info=info, next_obs=next_obs)
+    hp = _safe_float(player.get("hp", player.get("current_hp")))
+    max_hp = _safe_float(player.get("max_hp", player.get("maximum_hp")))
+    if max_hp is None:
+        max_hp = start_max_hp
     enemies = combat.get("enemies") if isinstance(combat, dict) else None
     enemy_hp_total = None
     if isinstance(enemies, list):
@@ -146,17 +197,48 @@ def _terminal_outcome(
             except (TypeError, ValueError):
                 continue
         enemy_hp_total = total
+    hp_loss = None
+    if start_hp is not None and hp is not None:
+        hp_loss = max(float(start_hp) - float(hp), 0.0)
+    hp_loss_ratio = None
+    denom = max_hp if max_hp and max_hp > 0 else start_max_hp
+    if hp_loss is not None and denom and denom > 0:
+        hp_loss_ratio = float(hp_loss) / float(denom)
+    end_turn = _extract_turn(next_obs) if isinstance(next_obs, dict) else 0
+    if end_turn <= 0:
+        end_turn = _safe_int(combat.get("round") or combat.get("turn") or combat.get("turn_number")) or 0
+    if end_turn <= 0 and fallback_turn is not None:
+        end_turn = int(fallback_turn)
+    turns = None
+    if start_turn is not None and end_turn > 0:
+        turns = max(int(end_turn) - int(start_turn) + 1, 1)
     win: bool | None = None
     if done and enemy_hp_total is not None:
         win = enemy_hp_total <= 0.0
-    return {
+    out = {
         "done": bool(done),
         "truncated": bool(truncated),
         "reward": float(reward or 0.0),
         "combat_win": win,
         "player_hp": hp,
+        "player_max_hp": max_hp,
         "enemy_hp_total": enemy_hp_total,
+        "decision_count": decision_count,
     }
+    if hp_loss is not None:
+        out["hp_loss"] = hp_loss
+    if hp_loss_ratio is not None:
+        out["hp_loss_ratio"] = hp_loss_ratio
+    if turns is not None:
+        out["turns"] = turns
+    return out
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -204,6 +286,9 @@ class HumanDemoRecorder:
         self._step_in_episode: int = 0
         self._step_in_turn: int = 0
         self._last_turn: int = -1
+        self._episode_start_hp: float | None = None
+        self._episode_start_max_hp: float | None = None
+        self._episode_start_turn: int | None = None
         self._write_manifest()
 
     @classmethod
@@ -260,6 +345,9 @@ class HumanDemoRecorder:
         self._step_in_episode = 0
         self._step_in_turn = 0
         self._last_turn = _extract_turn(obs)
+        self._episode_start_hp = _extract_player_hp(obs)
+        self._episode_start_max_hp = _extract_player_max_hp(obs)
+        self._episode_start_turn = self._last_turn if self._last_turn > 0 else None
         row = {
             "version": SCHEMA_VERSION,
             "event": "episode_start",
@@ -302,6 +390,12 @@ class HumanDemoRecorder:
         encounter_id = self._encounter_id or str((info or {}).get("encounter_id") or "")
         selected_id = _action_id(selected_action)
         safe_legal_actions = _safe_action_list(legal_actions)
+        prev_hp = _extract_player_hp(obs)
+        next_hp = _extract_player_hp(next_obs)
+        transition_hp_loss = None
+        if prev_hp is not None and next_hp is not None:
+            transition_hp_loss = max(float(prev_hp) - float(next_hp), 0.0)
+        decision_count = self._step_in_episode + 1
         row = {
             "version": SCHEMA_VERSION,
             "event": "decision",
@@ -324,12 +418,22 @@ class HumanDemoRecorder:
             "reward": float(reward or 0.0),
             "done": bool(done),
             "truncated": bool(truncated),
+            "transition": {
+                "player_hp_before": prev_hp,
+                "player_hp_after": next_hp,
+                "hp_loss": transition_hp_loss,
+            },
             "outcome": _terminal_outcome(
                 reward=reward,
                 done=done,
                 truncated=truncated,
                 info=info,
                 next_obs=next_obs,
+                start_hp=self._episode_start_hp,
+                start_max_hp=self._episode_start_max_hp,
+                start_turn=self._episode_start_turn,
+                fallback_turn=turn,
+                decision_count=decision_count,
             )
             if (done or truncated)
             else {},
@@ -373,6 +477,10 @@ class HumanDemoRecorder:
                 truncated=truncated,
                 info=info,
                 next_obs=final_obs,
+                start_hp=self._episode_start_hp,
+                start_max_hp=self._episode_start_max_hp,
+                start_turn=self._episode_start_turn,
+                decision_count=self._step_in_episode,
             ),
             "metadata": _jsonable(metadata or {}),
         }

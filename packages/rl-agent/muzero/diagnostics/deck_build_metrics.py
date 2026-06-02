@@ -22,8 +22,30 @@ from sts2_env.action_compact import compact_action_signature
 from sts2_env.deck_quality import DECK_QUALITY_V2_KEYS, deck_quality_v2
 
 
+DECK_COMPOSITION_KEYS: tuple[str, ...] = (
+    "starter_count",
+    "starter_ratio",
+    "nonstarter_count",
+    "strike_count",
+    "defend_count",
+    "upgraded_count",
+    "upgraded_ratio",
+    "starter_upgrade_count",
+    "starter_upgrade_ratio",
+)
+
+
 FINAL_DECK_QUALITY_TB_KEYS: tuple[tuple[str, str], ...] = (
     ("size", "deck_size_raw"),
+    ("starter_count", "starter_count"),
+    ("starter_ratio", "starter_ratio"),
+    ("nonstarter_count", "nonstarter_count"),
+    ("strike_count", "strike_count"),
+    ("defend_count", "defend_count"),
+    ("upgraded_count", "upgraded_count"),
+    ("upgraded_ratio", "upgraded_ratio"),
+    ("starter_upgrade_count", "starter_upgrade_count"),
+    ("starter_upgrade_ratio", "starter_upgrade_ratio"),
     ("raw_avg_damage_per_energy", "raw_avg_damage_per_energy"),
     ("raw_avg_block_per_energy", "raw_avg_block_per_energy"),
     ("raw_expected_extra_draw_per_turn", "raw_expected_extra_draw_per_turn"),
@@ -104,6 +126,15 @@ FINAL_DECK_QUALITY_TB_KEYS: tuple[tuple[str, str], ...] = (
 
 DEATH_DECK_QUALITY_TB_KEYS: tuple[tuple[str, str], ...] = (
     ("size", "deck_size_raw"),
+    ("starter_count", "starter_count"),
+    ("starter_ratio", "starter_ratio"),
+    ("nonstarter_count", "nonstarter_count"),
+    ("strike_count", "strike_count"),
+    ("defend_count", "defend_count"),
+    ("upgraded_count", "upgraded_count"),
+    ("upgraded_ratio", "upgraded_ratio"),
+    ("starter_upgrade_count", "starter_upgrade_count"),
+    ("starter_upgrade_ratio", "starter_upgrade_ratio"),
     ("raw_avg_damage_per_energy", "raw_avg_damage_per_energy"),
     ("raw_avg_block_per_energy", "raw_avg_block_per_energy"),
     ("raw_expected_extra_draw_per_turn", "raw_expected_extra_draw_per_turn"),
@@ -363,8 +394,114 @@ def compact_deck_cards(deck_cards: list[Any] | tuple[Any, ...] | None, *, limit:
     return compact
 
 
+def _normalised_card_title(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    # Upgrade marks can arrive as localized titles (``打击+``), English
+    # titles (``Strike+``), or occasionally with a numeric suffix.  Starter
+    # detection should not miss upgraded starter cards just because the bridge
+    # encoded the upgrade in the title instead of ``upgrade_level``.
+    while text and text[-1] in {"+", "＋", "0", "1", "2", "3", "4", "5", " "}:
+        text = text[:-1].strip()
+    return text
+
+
+def _card_identity(card: Any) -> tuple[str, str]:
+    if not isinstance(card, dict):
+        return "", ""
+    card_id = str(
+        card.get("id")
+        or card.get("card_id")
+        or card.get("cardId")
+        or card.get("model_id")
+        or card.get("modelId")
+        or ""
+    ).strip().lower()
+    title = _normalised_card_title(
+        card.get("title")
+        or card.get("name")
+        or card.get("localized_title")
+        or card.get("localizedTitle")
+        or ""
+    )
+    return card_id, title
+
+
+def _is_upgraded_card(card: Any) -> bool:
+    if not isinstance(card, dict):
+        return False
+    if bool(card.get("upgraded")):
+        return True
+    for key in ("upgrade_level", "upgradeLevel", "upgrades"):
+        try:
+            if int(card.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    raw_title = str(
+        card.get("title")
+        or card.get("name")
+        or card.get("localized_title")
+        or card.get("localizedTitle")
+        or ""
+    ).strip()
+    return raw_title.endswith(("+", "＋"))
+
+
+def _starter_kind(card: Any) -> str:
+    card_id, title = _card_identity(card)
+    if "strike_ironclad" in card_id or card_id in {"card.strike", "strike"} or title in {"打击", "strike"}:
+        return "strike"
+    if "defend_ironclad" in card_id or card_id in {"card.defend", "defend"} or title in {"防御", "defend"}:
+        return "defend"
+    return ""
+
+
+def compute_deck_composition_summary(deck_cards: list[Any] | tuple[Any, ...] | None) -> dict[str, float]:
+    """Count starter/upgraded composition for Act1 build-quality diagnostics.
+
+    ``deck_quality_v2`` intentionally focuses on normalized efficiency and
+    readiness scores.  For operator decisions we also need literal composition:
+    a run dying on floor 10 with 8-9 Strike/Defend cards is a different failure
+    mode from a low-readiness deck that at least took non-starter cards.  These
+    keys are diagnostic-only and do not change observation/replay schemas.
+    """
+
+    cards = [card for card in (deck_cards if isinstance(deck_cards, (list, tuple)) else []) if isinstance(card, dict)]
+    deck_size = float(len(cards))
+    strike_count = 0
+    defend_count = 0
+    upgraded_count = 0
+    starter_upgrade_count = 0
+    for card in cards:
+        starter = _starter_kind(card)
+        upgraded = _is_upgraded_card(card)
+        if starter == "strike":
+            strike_count += 1
+        elif starter == "defend":
+            defend_count += 1
+        if upgraded:
+            upgraded_count += 1
+            if starter:
+                starter_upgrade_count += 1
+
+    starter_count = strike_count + defend_count
+    denom = deck_size if deck_size > 0.0 else 1.0
+    starter_denom = float(starter_count) if starter_count > 0 else 1.0
+    return {
+        "starter_count": float(starter_count),
+        "starter_ratio": float(starter_count) / denom,
+        "nonstarter_count": max(0.0, deck_size - float(starter_count)),
+        "strike_count": float(strike_count),
+        "defend_count": float(defend_count),
+        "upgraded_count": float(upgraded_count),
+        "upgraded_ratio": float(upgraded_count) / denom,
+        "starter_upgrade_count": float(starter_upgrade_count),
+        "starter_upgrade_ratio": float(starter_upgrade_count) / starter_denom,
+    }
+
+
 def compute_deck_quality_summary(deck_cards: list[Any] | tuple[Any, ...] | None) -> dict[str, float]:
-    """Compute ``deck_quality_v2`` and guarantee finite floats for all keys."""
+    """Compute finite deck-quality and composition diagnostics."""
 
     try:
         raw = deck_quality_v2(deck_cards)
@@ -373,6 +510,7 @@ def compute_deck_quality_summary(deck_cards: list[Any] | tuple[Any, ...] | None)
     out: dict[str, float] = {}
     for key in DECK_QUALITY_V2_KEYS:
         out[key] = _finite_float(raw.get(key, 0.0), 0.0) if isinstance(raw, dict) else 0.0
+    out.update(compute_deck_composition_summary(deck_cards))
     return out
 
 
@@ -450,19 +588,37 @@ def _is_card_reward_context(
     phase_text = str(phase or "").strip().lower()
     domain_text = str(decision_domain or "").strip().lower()
     family_text = str(selected_family or "").strip().lower()
-    if domain_text == "card_reward" or family_text == "card_reward":
+    chosen_is_card_reward = _is_card_reward_action(chosen_action, chosen_signature)
+    legal_has_card_reward = any(_is_card_reward_action(action) for action in legal_actions[:96])
+    if family_text == "card_reward":
         return True
-    if "card_reward" in phase_text or "card reward" in phase_text:
+    if chosen_is_card_reward:
         return True
-    if "reward" in phase_text and (
-        _is_card_reward_action(chosen_action, chosen_signature)
-        or any(_is_card_reward_action(action) for action in legal_actions[:96])
-    ):
-        return True
-    return bool(
-        _is_card_reward_action(chosen_action, chosen_signature)
-        or any(_is_card_reward_action(action) for action in legal_actions[:96])
+
+    active_card_reward_surface = (
+        domain_text == "card_reward"
+        or "card_reward" in phase_text
+        or "card reward" in phase_text
     )
+    if active_card_reward_surface:
+        # A card-reward-labelled phase can still include ordinary room-reward
+        # cleanup actions such as claiming gold/relic/potion rewards.  Counting
+        # those as "other -> skip" inflates skip_rate by 3-4x and makes death
+        # decks look like the agent skipped every reward.  Only count a
+        # non-card action on this surface when it is an explicit skip/proceed
+        # while a card choice is still available.
+        if legal_has_card_reward:
+            return _is_skip_action(chosen_action, chosen_signature, card_reward_context=True)
+        return False
+
+    # Room-reward surfaces often expose gold/relic/potion/proceed actions at
+    # the same time as card reward actions.  Merely seeing a card-reward legal
+    # action must not turn an unrelated "claim gold" click into a card-reward
+    # skip.  Only count a non-card chosen action as a card-reward decision when
+    # it is an explicit skip/proceed while card choices are still available.
+    if legal_has_card_reward and ("reward" in phase_text or domain_text == "build"):
+        return _is_skip_action(chosen_action, chosen_signature, card_reward_context=True)
+    return False
 
 
 def _is_pick_action(
@@ -482,8 +638,20 @@ def _is_pick_action(
         or ""
     ).strip().lower()
     kind = str((sig or {}).get("kind") or (action.get("kind") if isinstance(action, dict) else "") or "").strip().lower()
+    action_id = str(
+        (sig or {}).get("action_id")
+        or (action.get("action_id") if isinstance(action, dict) else "")
+        or ""
+    ).strip().lower()
     family = _semantic_family(sig) or _semantic_family(action)
     if selection in {"pick", "take", "choose", "select", "add", "claim"}:
+        return True
+    # Some compact card-reward actions only preserve a positional action id such
+    # as ``card_reward:0``.  There is no card payload left after compaction, but
+    # on a known card-reward surface any non-skip positional card_reward id is a
+    # concrete pick.  Without this, post-guard overrides from skip -> pick can be
+    # miscounted as ``other`` and then folded into the skip bucket.
+    if action_id and "card_reward" in action_id and "skip" not in action_id:
         return True
     if kind in {"card_reward", "choose_card_reward"}:
         return True

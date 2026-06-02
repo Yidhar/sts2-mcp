@@ -46,7 +46,7 @@ class NonEndTurnSurvivalGuardMixin:
                         encounter_l,
                     )
                     floor_value = float(self._combat_floor_value(raw_obs if isinstance(raw_obs, dict) else None))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     encounter_eligible = bool(
                         encounter_tier in {"elite", "boss"}
                         or (is_normal_hallway and (floor_value >= 8.0 or hp_ratio <= 0.35 or hard_normal_profile))
@@ -496,6 +496,9 @@ class NonEndTurnSurvivalGuardMixin:
                                 relaxed_post_hit_ok = False
                                 critical_low_value_post_hit_ok = False
                                 selected_progressish = False
+                                normal_hallway_tempo_candidate = False
+                                tempo_block_low_value = False
+                                tempo_exempt = False
                                 has_scaling_enemy_candidate = False
                                 if selected_family == "play_card":
                                     sel_block, sel_heal, sel_hp_cost = _card_block_heal_value(selected)
@@ -714,6 +717,37 @@ class NonEndTurnSurvivalGuardMixin:
                                                 or max(0.0, float(threat_gap) - float(best_card_protection))
                                                 <= max(3.0, 0.20 * float(threat_gap))
                                             )
+                                            # P1-8b (2026-05-14): live full-run traces
+                                            # showed the guard repeatedly rewriting
+                                            # floor 8-10 normal-hallway tempo attacks
+                                            # into a single 5-block Defend when that
+                                            # Defend still left most incoming damage
+                                            # unresolved.  The old low-value exemption
+                                            # required post-hit HP >= 20% max HP, so
+                                            # hp=27/max80/incoming14/post=13 missed it
+                                            # and taught slow attrition.  Keep the
+                                            # carve-out narrow: hallway only, selected
+                                            # card must advance the fight, the original
+                                            # play must survive, and available card
+                                            # block must *not* materially solve the
+                                            # threat.  True lethal / solved-by-block
+                                            # windows still fall through to candidates.
+                                            normal_hallway_tempo_candidate = bool(
+                                                is_normal_hallway
+                                                and selected_progressish
+                                                and threat_gap >= 4.0
+                                                and threat_gap < max(1.0, hp - 1.0)
+                                                and post_hit_hp >= max(12.0, 0.15 * max_hp)
+                                            )
+                                            tempo_block_low_value = bool(
+                                                (not block_solves_materially)
+                                                and best_card_protection <= max(6.0, 0.50 * max(threat_gap, 1.0))
+                                            )
+                                            tempo_exempt = bool(
+                                                normal_hallway_tempo_candidate
+                                                and tempo_block_low_value
+                                                and not has_scaling_enemy_candidate
+                                            )
                                             selected_low_value_block_exempt = bool(
                                                 (not critical_survival)
                                                 and selected_progressish
@@ -756,6 +790,15 @@ class NonEndTurnSurvivalGuardMixin:
                                             search_stats[
                                                 "combat_quality_survival_non_endturn_guard_critical_low_value_block_skip"
                                             ] = 1.0 if selected_critical_low_value_block_exempt else 0.0
+                                            search_stats[
+                                                "combat_quality_survival_non_endturn_guard_normal_hallway_tempo_candidate"
+                                            ] = 1.0 if normal_hallway_tempo_candidate else 0.0
+                                            search_stats[
+                                                "combat_quality_survival_non_endturn_guard_tempo_block_low_value"
+                                            ] = 1.0 if tempo_block_low_value else 0.0
+                                            search_stats[
+                                                "combat_quality_survival_non_endturn_guard_tempo_exempt"
+                                            ] = 1.0 if tempo_exempt else 0.0
                                 elif selected_family in {"use_potion", "potion"}:
                                     sel_profile = self._potion_timing_profile(
                                         selected,
@@ -813,6 +856,17 @@ class NonEndTurnSurvivalGuardMixin:
                                     search_stats["combat_quality_survival_non_endturn_guard_available"] = 1.0
                                     search_stats[
                                         "combat_quality_survival_non_endturn_guard_progress_exemption"
+                                    ] = 1.0
+                                elif tempo_exempt:
+                                    search_stats["combat_quality_survival_non_endturn_guard_available"] = 1.0
+                                    search_stats[
+                                        "combat_quality_survival_non_endturn_guard_progress_exemption"
+                                    ] = 1.0
+                                    search_stats[
+                                        "combat_quality_survival_non_endturn_guard_low_value_block_skip"
+                                    ] = 1.0
+                                    search_stats[
+                                        "combat_quality_survival_non_endturn_guard_tempo_exempt"
                                     ] = 1.0
                                 elif selected_low_value_block_exempt:
                                     search_stats["combat_quality_survival_non_endturn_guard_available"] = 1.0
@@ -1086,6 +1140,11 @@ class NonEndTurnSurvivalGuardMixin:
                                                 "critical_low_value_post_hit_ok": bool(
                                                     critical_low_value_post_hit_ok
                                                 ),
+                                                "normal_hallway_tempo_candidate": bool(
+                                                    normal_hallway_tempo_candidate
+                                                ),
+                                                "tempo_block_low_value": bool(tempo_block_low_value),
+                                                "tempo_exempt": bool(tempo_exempt),
                                                 "candidate_count": int(len(candidates)),
                                                 "candidate_top": _candidate_debug_rows(),
                                             },

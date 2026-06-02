@@ -15,7 +15,7 @@ from muzero.sts2_env.muzero_model import (
     support_tensor_to_scalar,
     support_to_scalar,
 )
-from sts2_env.objective_heads import NUM_OBJECTIVE_HEADS
+from sts2_env.objective_heads import HEAD_HP_PRESERVATION, NUM_OBJECTIVE_HEADS
 from sts2_env.observation_v2 import NUM_PHASES
 from muzero.sts2_env.semantic_rollout import SEMANTIC_ROLLOUT_SIZE
 
@@ -177,6 +177,82 @@ class TrainingLossMixin:
         log_probs = torch.log_softmax(flat_logits, dim=-1)
         loss = -(support_targets * log_probs).sum(dim=-1).mean()
         return loss
+
+    def _objective_reward_head_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        head_index: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Single objective-reward-head CE plus scalar calibration metrics.
+
+        This is intentionally a thin weighting hook over the existing
+        objective reward decomposition.  It lets us emphasize one semantic
+        transition target (currently HP preservation) without adding a new
+        network head or changing checkpoint compatibility.
+        """
+        if logits.ndim != 3 or targets.ndim != 2:
+            zero = logits.new_zeros(())
+            return zero, {
+                "mae": 0.0,
+                "pred_mean": 0.0,
+                "target_mean": 0.0,
+                "active_rate": 0.0,
+            }
+        head_count = int(min(logits.shape[1], targets.shape[1]))
+        if head_index < 0 or head_index >= head_count:
+            zero = logits.new_zeros(())
+            return zero, {
+                "mae": 0.0,
+                "pred_mean": 0.0,
+                "target_mean": 0.0,
+                "active_rate": 0.0,
+            }
+
+        head_logits = logits[:, head_index, :]
+        head_targets = targets[:, head_index].detach().float()
+        valid = torch.isfinite(head_targets)
+        if not valid.any():
+            zero = logits.new_zeros(())
+            return zero, {
+                "mae": 0.0,
+                "pred_mean": 0.0,
+                "target_mean": 0.0,
+                "active_rate": 0.0,
+            }
+
+        head_logits = head_logits[valid]
+        head_targets = head_targets[valid]
+        support_targets = scalar_to_support(
+            head_targets.reshape(-1),
+            support_size=self.network.support_size,
+        ).to(head_logits.device)
+        log_probs = torch.log_softmax(head_logits, dim=-1)
+        loss = -(support_targets * log_probs).sum(dim=-1).mean()
+        with torch.no_grad():
+            pred = support_tensor_to_scalar(head_logits, self.network.support_size).reshape(-1)
+            mae = (pred - head_targets.reshape(-1)).abs().mean().item()
+            pred_mean = pred.mean().item()
+            target_mean = head_targets.mean().item()
+            active_rate = valid.float().mean().item()
+        return loss, {
+            "mae": float(mae),
+            "pred_mean": float(pred_mean),
+            "target_mean": float(target_mean),
+            "active_rate": float(active_rate),
+        }
+
+    def _hp_preservation_reward_aux_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Extra trainable pressure on the HP-preservation transition head."""
+        return self._objective_reward_head_loss(
+            logits,
+            targets,
+            HEAD_HP_PRESERVATION,
+        )
 
     def _objective_head_diversity_loss(self, *component_tensors: torch.Tensor) -> torch.Tensor:
         valid = [tensor for tensor in component_tensors if isinstance(tensor, torch.Tensor) and tensor.numel() > 0]

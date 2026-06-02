@@ -7,7 +7,41 @@ from muzero.combat_quality.potion_guard import (
     potion_identity_text_for_guard,
     raw_potion_payload_for_guard,
 )
+from sts2_env.aux_targets import compute_trait_targets
 from sts2_env.potion_profiles import get_potion_profile, reload_registry
+from sts2_env.potion_timing import _player_hp_triplet_from_raw
+
+
+def test_shared_potion_timing_hp_ratio_never_treats_max_hp_one_as_full_health():
+    assert _player_hp_triplet_from_raw({"player": {"hp": 50, "max_hp": 1}})[2] == 0.0
+    assert _player_hp_triplet_from_raw({"player": {"hp": 1, "max_hp": 1}})[2] == 0.0
+    assert _player_hp_triplet_from_raw({"player": {"currentHealth": 40, "maxHealth": 80}})[2] == 0.5
+
+
+def test_aux_trait_potion_timing_handles_suspicious_max_hp_one():
+    obs = {
+        "player": {
+            "hp": 50,
+            "max_hp": 1,
+            "potions": [{"title": "Fire Potion"}],
+        },
+        "combat": {
+            "energy": 3,
+            "block": 0,
+            "enemies": [{"hp": 30, "max_hp": 30, "intent": {"total_damage": 0}}],
+        },
+    }
+    action = {
+        "kind": "use_potion",
+        "action_id": "use_potion:0:enemy:0",
+        "potion": {"title": "Fire Potion"},
+        "source": {"damage": 20},
+    }
+
+    targets = compute_trait_targets(obs, action, legal_actions_before=[action])
+
+    assert targets.shape[0] > 1
+    assert 0.0 <= float(targets[1]) <= 1.0
 
 
 def test_boss_race_potion_traits_strength_damage_and_empty_liquid():

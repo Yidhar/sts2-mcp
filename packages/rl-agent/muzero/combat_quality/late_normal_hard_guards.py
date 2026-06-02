@@ -38,7 +38,7 @@ class LateNormalHardGuardMixin:
                 )
                 if hp_valid and is_normal_hallway:
                     floor_value = float(self._combat_floor_value(raw_obs if isinstance(raw_obs, dict) else None))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     late_or_critical = bool(
                         floor_value >= 11.0
                         or hp_ratio <= 0.35
@@ -111,7 +111,7 @@ class LateNormalHardGuardMixin:
                 )
                 if hp_valid and is_normal_hallway:
                     floor_value = float(self._combat_floor_value(raw_obs if isinstance(raw_obs, dict) else None))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     late_or_critical = bool(floor_value >= 11.0 or hp_ratio <= 0.35 or hard_normal_profile)
                     if late_or_critical:
                         incoming, current_block, _current_hp = self._incoming_damage_pressure(raw_obs if isinstance(raw_obs, dict) else None)
@@ -323,7 +323,7 @@ class LateNormalHardGuardMixin:
                 )
                 if hp_valid and is_normal_hallway:
                     floor_value = float(self._combat_floor_value(raw_obs if isinstance(raw_obs, dict) else None))
-                    hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0))
+                    hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
                     current_energy = float(self._combat_energy(None, raw_obs))
                     incoming, current_block, _current_hp = self._incoming_damage_pressure(raw_obs if isinstance(raw_obs, dict) else None)
                     threat_gap = max(0.0, float(incoming) - float(current_block))

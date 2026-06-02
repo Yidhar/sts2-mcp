@@ -95,6 +95,58 @@ class CardSelectionCompactSemanticsTest(unittest.TestCase):
         self.assertIn("confirm", signature["semantic_key"])
         self.assertIn("exhaust", signature["semantic_key"])
 
+    def test_compact_action_signature_preserves_shop_card_removal_item(self) -> None:
+        action = {
+            "kind": "shop",
+            "action_id": "shop:buy:3",
+            "shop_action": "buy",
+            "item": {
+                "item_kind": "card_removal",
+                "title": "Remove a card",
+                "cost": 75,
+                "is_affordable": True,
+                "used": False,
+            },
+        }
+
+        compact = compact_action_signature(action)
+
+        self.assertEqual(compact["shop_action"], "buy")
+        self.assertEqual(compact["shop_item_kind"], "card_removal")
+        self.assertEqual(compact["shop_item_cost"], 75)
+        self.assertIs(compact["shop_item_affordable"], True)
+        self.assertEqual(compact["semantic"]["family"], "shop")
+        self.assertEqual(compact["semantic"]["shop_item_kind"], "card_removal")
+        self.assertIs(compact["semantic"]["shop_is_remove"], True)
+        self.assertIn("card_removal", compact["semantic"]["semantic_key"])
+
+    def test_compact_action_signature_preserves_reward_card_identity(self) -> None:
+        action = {
+            "surface": "card_reward",
+            "action_id": "card_reward:0",
+            "choice_index": 0,
+            "reward": {
+                "type": "card",
+                "card": {
+                    "id": "CARD.TRUE_GRIT",
+                    "title": "坚毅",
+                    "type": "Skill",
+                    "cost": 1,
+                },
+            },
+        }
+
+        compact = compact_action_signature(action)
+
+        self.assertEqual(compact["surface"], "card_reward")
+        self.assertEqual(compact["reward_type"], "card")
+        self.assertEqual(compact["action_id"], "card_reward:0")
+        self.assertEqual(compact["card_id"], "CARD.TRUE_GRIT")
+        self.assertEqual(compact["card_title"], "坚毅")
+        self.assertEqual(compact["title"], "坚毅")
+        self.assertEqual(compact["card_type"], "Skill")
+        self.assertEqual(compact["card_cost"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

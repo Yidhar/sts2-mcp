@@ -45,11 +45,21 @@ def compute_route_heuristic_bias_vector(
             return None
         player = raw_obs.get("player") if isinstance(raw_obs.get("player"), dict) else {}
         run = raw_obs.get("run") if isinstance(raw_obs.get("run"), dict) else {}
+        hp = float(player.get("hp") or player.get("current_hp") or player.get("currentHealth") or 0.0)
+        max_hp = float(
+            player.get("max_hp")
+            or player.get("maxHealth")
+            or player.get("max_health")
+            or player.get("maximum_hp")
+            or 0.0
+        )
+        if max_hp <= 1.0 and hp > 1.0:
+            max_hp = 0.0
         ranked = rank_legal_route_actions(
             legal_actions=full_legal,
             deck_quality=deck_quality_v2_from_obs(raw_obs),
-            hp=float(player.get("hp") or 0.0),
-            max_hp=float(player.get("max_hp") or 0.0),
+            hp=hp,
+            max_hp=max_hp,
             gold=float(player.get("gold") or 0.0),
             potion_count=count_non_empty_potions(player.get("potions")),
             floor=int(run.get("floor") or 0),

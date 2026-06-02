@@ -17,6 +17,7 @@ import torch
 from muzero.combat_quality.action_bias import apply_card_block_waste_bias
 from muzero.combat_quality.progress_candidates import collect_safe_progress_candidates
 from muzero.combat_quality.survival_math import protection_outcome
+from muzero.diagnostics.end_turn_pre_dispatch import raw_max_energy
 from sts2_env.boss_mechanics import build_boss_mechanics_context
 from sts2_env.observation_v2 import MAX_ACTIONS
 from sts2_env.semantic_action import SEMANTIC_ACTION_FAMILIES, SEMANTIC_ROLE_NAMES
@@ -36,7 +37,7 @@ class CombatActionQualityMixin:
         Used by both the bias-side stats and the selected-action JSONL dumper so
         ``bad_end_turn``/``forced_end_turn``/``strategic_defer_end_turn`` rates
         cannot drift between detector and tracker.  Priority is strict:
-        ``bad > transient(forced) > forced > strategic_defer > unknown``.
+        ``bad > transient(forced) > forced > empty_skip > strategic_defer > unknown``.
 
         ``boss_signals`` carries already-computed mechanism flags (Kaiser back
         attack + facing candidate, Ceremonial stun window, etc.) so end_turn
@@ -51,6 +52,14 @@ class CombatActionQualityMixin:
         urgent_count = int(context.get("urgent_positive_count", 0) or 0)
         deferable_count = int(context.get("deferable_positive_count", 0) or 0)
         energy = float(context.get("energy", 0.0) or 0.0)
+        safe_progress_candidate_count = int(context.get("safe_progress_candidate_count", 0) or 0)
+        full_energy_like = bool(context.get("full_energy_like", False))
+        full_energy_nonurgent_skip_available = bool(
+            context.get("full_energy_nonurgent_skip_available", False)
+        )
+        safe_progress_skip_available = bool(context.get("safe_progress_skip_available", False))
+        max_energy = float(context.get("max_energy", 0.0) or 0.0)
+        energy_ratio = float(context.get("energy_ratio", 0.0) or 0.0)
         diag = action_diagnostics if isinstance(action_diagnostics, dict) else {}
         transient = bool(diag.get("transient_only_end_turn", False))
         boss = boss_signals if isinstance(boss_signals, dict) else {}
@@ -71,9 +80,18 @@ class CombatActionQualityMixin:
             "has_urgent_or_mandatory_action": urgent_count > 0,
             "has_strategic_defer_reason": strategic_defer_available,
             "has_deferable_action": deferable_count > 0,
+            "zero_energy_only_deferable": bool(
+                energy <= 0.05 and positive_count > 0 and urgent_count <= 0 and deferable_count > 0
+            ),
             "kaiser_pressure_window_open": kaiser_pressure_window,
             "ceremonial_open_window": ceremonial_open_window,
             "boss_window_open": boss_window_open,
+            "full_energy_like": full_energy_like,
+            "full_energy_nonurgent_skip_available": full_energy_nonurgent_skip_available,
+            "safe_progress_skip_available": safe_progress_skip_available,
+            "safe_progress_candidate_count": safe_progress_candidate_count > 0,
+            "max_energy_present": max_energy > 0.0,
+            "energy_ratio_full": energy_ratio >= 0.95,
         }
         if not end_turn_indices:
             return "unknown", flags
@@ -85,7 +103,16 @@ class CombatActionQualityMixin:
             return "bad_end_turn", flags
         if positive_count == 0:
             return "forced_end_turn", flags
+        if full_energy_nonurgent_skip_available or safe_progress_skip_available:
+            return "empty_skip_end_turn", flags
         if strategic_defer_available:
+            return "strategic_defer_end_turn", flags
+        # Diagnostic taxonomy only: an energy=0 frame with a remaining
+        # low-value/deferable action (typical examples are Havoc/setup cards
+        # after all energy is spent) should not remain in the "unknown" bucket
+        # and should not be counted as a true wasteful空过.  Runtime selection is
+        # unchanged; this only makes the JSONL/TB diagnosis sharper.
+        if flags["zero_energy_only_deferable"]:
             return "strategic_defer_end_turn", flags
         return "unknown", flags
 
@@ -234,6 +261,13 @@ class CombatActionQualityMixin:
         urgent_positive_count = len(urgent_positive_indices)
         deferable_positive_count = len(deferable_positive_indices)
         safe_progress_candidate_count = 0
+        safe_progress_candidate_indices: list[int] = []
+        max_energy = raw_max_energy(raw_obs, default=max(3.0, float(energy)))
+        try:
+            energy_ratio = float(energy) / max(float(max_energy), 1.0)
+        except Exception:
+            energy_ratio = 0.0
+        full_energy_like = bool(energy_ratio >= 0.95 or float(energy) >= float(max_energy) - 1e-6)
         if isinstance(raw_obs, dict) and isinstance(legal_actions, list) and end_turn_indices:
             try:
                 safe_candidates, _ = collect_safe_progress_candidates(
@@ -248,8 +282,10 @@ class CombatActionQualityMixin:
                     include_debug=False,
                 )
                 safe_progress_candidate_count = len(safe_candidates)
+                safe_progress_candidate_indices = [int(candidate.index) for candidate in safe_candidates]
             except Exception:
                 safe_progress_candidate_count = 0
+                safe_progress_candidate_indices = []
         # True waste is now gated on urgent progress.  Exhaust/retain/HP-cost
         # resource cards can be legal and positive but strategically correct to
         # let flow to discard/retain instead of consuming the combat loop.
@@ -259,6 +295,12 @@ class CombatActionQualityMixin:
             and safe_progress_candidate_count > 0
             and urgent_positive_count == 0
             and deferable_positive_count > 0
+        )
+        full_energy_nonurgent_skip_available = bool(
+            end_turn_indices
+            and full_energy_like
+            and urgent_positive_count == 0
+            and safe_progress_candidate_count > 0
         )
         severity = 0.0
         if wasteful:
@@ -275,8 +317,14 @@ class CombatActionQualityMixin:
             "true_wasteful": wasteful,
             "strategic_defer_available": strategic_defer_available,
             "energy": float(energy),
+            "max_energy": float(max_energy),
+            "energy_ratio": float(energy_ratio),
+            "full_energy_like": bool(full_energy_like),
+            "full_energy_nonurgent_skip_available": bool(full_energy_nonurgent_skip_available),
+            "safe_progress_skip_available": bool(full_energy_nonurgent_skip_available),
             "end_turn_indices": end_turn_indices,
             "positive_indices": positive_indices,
+            "safe_progress_candidate_indices": safe_progress_candidate_indices,
             "urgent_positive_indices": urgent_positive_indices,
             "deferable_positive_indices": deferable_positive_indices,
             "deferable_exhaust_indices": deferable_exhaust_indices,
@@ -552,6 +600,10 @@ class CombatActionQualityMixin:
         card_pure_block_indices = {int(i) for i in context.get("card_pure_block_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         card_no_damage_pressure_indices = {int(i) for i in context.get("card_no_damage_pressure_indices", []) if 0 <= int(i) < MAX_ACTIONS}
         setup_indices = {int(i) for i in context.get("setup_scaling_indices", []) if 0 <= int(i) < MAX_ACTIONS}
+        safe_progress_candidate_indices = {
+            int(i) for i in context.get("safe_progress_candidate_indices", []) if 0 <= int(i) < MAX_ACTIONS
+        }
+        full_energy_nonurgent = bool(context.get("full_energy_nonurgent_skip_available", False))
         end_turn_indices.update(int(i) for i in context.get("end_turn_indices", []) if 0 <= int(i) < MAX_ACTIONS)
         if not positive_indices and not urgent_positive_indices:
             # Fallback is intentionally weaker than the old detector: do not
@@ -574,6 +626,19 @@ class CombatActionQualityMixin:
             for idx in boost_indices:
                 if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
                     bias[idx] += positive_bonus + (setup_bonus if idx in setup_indices else 0.0)
+        elif full_energy_nonurgent and end_turn_indices:
+            # Narrow, non-urgent empty-skip pressure: full energy plus at least
+            # one safe progress action in the same legal frontier.  This is
+            # softer than true wasteful/urgent EndTurn but strong enough to stop
+            # repeated full-energy passes in normal combats (e.g. Living Fog).
+            end_turn_penalty = min(3.0, 1.75 + 0.25 * min(float(energy), 4.0))
+            positive_bonus = 0.35
+            for idx in end_turn_indices:
+                if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
+                    bias[idx] -= end_turn_penalty
+            for idx in safe_progress_candidate_indices:
+                if 0 <= idx < MAX_ACTIONS and idx < mask_np.shape[0] and mask_np[idx] > 0:
+                    bias[idx] += positive_bonus
         else:
             end_turn_penalty = 0.0
 
@@ -917,10 +982,22 @@ class CombatActionQualityMixin:
             "combat_quality_wasteful_end_turn_available": 1.0 if wasteful and bool(end_turn_indices) else 0.0,
             "combat_quality_end_turn_penalty_max": float(end_turn_penalty),
             "combat_quality_energy": float(energy),
+            "combat_quality_max_energy": float(context.get("max_energy", 0.0) or 0.0),
+            "combat_quality_energy_ratio": float(context.get("energy_ratio", 0.0) or 0.0),
+            "combat_quality_full_energy_like": 1.0 if context.get("full_energy_like") else 0.0,
             "combat_quality_positive_action_count": float(len(positive_indices)),
             "combat_quality_urgent_positive_action_count": float(len(urgent_positive_indices)),
             "combat_quality_deferable_positive_action_count": float(len(deferable_positive_indices)),
             "combat_quality_safe_progress_candidate_count": float(context.get("safe_progress_candidate_count", 0) or 0),
+            "combat_quality_full_energy_nonurgent_end_turn_available": (
+                1.0 if full_energy_nonurgent and bool(end_turn_indices) else 0.0
+            ),
+            "combat_quality_safe_progress_skip_available": (
+                1.0 if context.get("safe_progress_skip_available") and bool(end_turn_indices) else 0.0
+            ),
+            "combat_quality_full_energy_nonurgent_end_turn_bias_applied": (
+                1.0 if full_energy_nonurgent and bool(end_turn_indices) else 0.0
+            ),
             "combat_quality_deferable_exhaust_card_count": float(len(deferable_exhaust_indices)),
             "combat_quality_energy_gain_without_followup_count": float(len(energy_gain_without_followup_indices)),
             "combat_quality_typed_followup_missing_count": float(len(typed_followup_missing_indices)),
@@ -1301,6 +1378,23 @@ class CombatActionQualityMixin:
                 "urgent_positive_count": int(float(stats.get("combat_quality_urgent_positive_action_count", 0.0) or 0.0)),
                 "deferable_positive_count": int(float(stats.get("combat_quality_deferable_positive_action_count", 0.0) or 0.0)),
                 "energy": float(stats.get("combat_quality_energy", energy) or energy),
+                "max_energy": float(stats.get("combat_quality_max_energy", 0.0) or 0.0),
+                "energy_ratio": float(stats.get("combat_quality_energy_ratio", 0.0) or 0.0),
+                "full_energy_like": bool(
+                    float(stats.get("combat_quality_full_energy_like", 0.0) or 0.0) > 0.5
+                ),
+                "full_energy_nonurgent_skip_available": bool(
+                    float(
+                        stats.get("combat_quality_full_energy_nonurgent_end_turn_available", 0.0) or 0.0
+                    )
+                    > 0.5
+                ),
+                "safe_progress_skip_available": bool(
+                    float(stats.get("combat_quality_safe_progress_skip_available", 0.0) or 0.0) > 0.5
+                ),
+                "safe_progress_candidate_count": int(
+                    float(stats.get("combat_quality_safe_progress_candidate_count", 0.0) or 0.0)
+                ),
             }
             boss_signals = {
                 "kaiser_back_attack_risk": float(stats.get("combat_quality_kaiser_back_attack_risk", 0.0) or 0.0),
@@ -1316,6 +1410,7 @@ class CombatActionQualityMixin:
             )
         bad_selected = end_turn_selected and end_turn_class == "bad_end_turn"
         forced_selected = end_turn_selected and end_turn_class == "forced_end_turn"
+        empty_skip_selected = end_turn_selected and end_turn_class == "empty_skip_end_turn"
         defer_selected_taxonomy = end_turn_selected and end_turn_class == "strategic_defer_end_turn"
         unknown_selected = end_turn_selected and end_turn_class == "unknown"
         result = {
@@ -1335,7 +1430,12 @@ class CombatActionQualityMixin:
             "combat_quality_wasteful_end_turn_selected": 1.0 if bad_selected else (1.0 if (end_turn_selected and true_waste_available) else 0.0),
             "combat_quality_bad_end_turn_selected": 1.0 if bad_selected else 0.0,
             "combat_quality_forced_end_turn_selected": 1.0 if forced_selected else 0.0,
-            "combat_quality_strategic_defer_end_turn_selected": 1.0 if (defer_selected_taxonomy or (end_turn_selected and strategic_defer_available and not bad_selected)) else 0.0,
+            "combat_quality_full_energy_nonurgent_end_turn_selected": 1.0 if empty_skip_selected else 0.0,
+            "combat_quality_safe_progress_skip_selected": 1.0 if empty_skip_selected else 0.0,
+            "combat_quality_strategic_defer_end_turn_selected": 1.0 if (
+                defer_selected_taxonomy
+                or (end_turn_selected and strategic_defer_available and not bad_selected and not empty_skip_selected)
+            ) else 0.0,
             "combat_quality_end_turn_unknown_selected": 1.0 if unknown_selected else 0.0,
             "combat_quality_end_turn_class": end_turn_class,
         }

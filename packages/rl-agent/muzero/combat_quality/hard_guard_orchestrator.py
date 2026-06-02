@@ -16,6 +16,7 @@ from sts2_env.observation_v2 import MAX_ACTIONS
 from muzero.combat_quality import COMBAT_HARD_GUARD_DEFAULT_KEYS
 from muzero.combat_quality.basic_hard_guards import BasicCombatHardGuardMixin
 from muzero.combat_quality.boss_survival_hard_guards import BossSurvivalHardGuardMixin
+from muzero.combat_quality.full_energy_endturn_guard import FullEnergyEndTurnGuardMixin
 from muzero.combat_quality.late_normal_hard_guards import LateNormalHardGuardMixin
 from muzero.combat_quality.meaningful_damage_guard import MeaningfulDamageEndTurnGuardMixin
 from muzero.combat_quality.no_pressure_block_guard import NoPressureBlockGuardMixin
@@ -24,7 +25,9 @@ from muzero.combat_quality.refund_no_followup_guard import RefundNoFollowupGuard
 from muzero.combat_quality.selection_loop_guard import SelectionLoopGuardMixin
 from muzero.combat_quality.strategic_defer_endturn_guard import StrategicDeferEndTurnGuardMixin
 from muzero.combat_quality.strategic_skip_guard import StrategicSkipGuardMixin
+from muzero.combat_quality.summoner_target_guard import SummonerTargetGuardMixin
 from muzero.combat_quality.survival_non_endturn_guard import NonEndTurnSurvivalGuardMixin
+from muzero.combat_quality.target_priority_guard import TargetPriorityGuardMixin
 from muzero.combat_quality.urgent_endturn_guard import UrgentEndTurnGuardMixin
 
 
@@ -36,8 +39,11 @@ class CombatHardGuardMixin(
     NoPressureBlockGuardMixin,
     RefundNoFollowupGuardMixin,
     StrategicSkipGuardMixin,
+    SummonerTargetGuardMixin,
+    TargetPriorityGuardMixin,
     StrategicDeferEndTurnGuardMixin,
     UrgentEndTurnGuardMixin,
+    FullEnergyEndTurnGuardMixin,
     NonEndTurnSurvivalGuardMixin,
     PotionBadUseGuardMixin,
     SelectionLoopGuardMixin,
@@ -208,6 +214,15 @@ class CombatHardGuardMixin(
         for key in COMBAT_HARD_GUARD_DEFAULT_KEYS:
             search_stats.setdefault(key, 0.0)
 
+        policy = str(getattr(self, "combat_hard_guard_policy", "full") or "full").strip().lower()
+        if policy not in {"full", "emergency", "off"}:
+            policy = "full"
+        search_stats["combat_hard_guard_policy_full"] = 1.0 if policy == "full" else 0.0
+        search_stats["combat_hard_guard_policy_emergency"] = 1.0 if policy == "emergency" else 0.0
+        search_stats["combat_hard_guard_policy_off"] = 1.0 if policy == "off" else 0.0
+        if policy == "off":
+            return int(action_idx)
+
         if not isinstance(legal_actions, list) or len(legal_actions) == 0:
             return int(action_idx)
 
@@ -261,33 +276,52 @@ class CombatHardGuardMixin(
             encounter=encounter,
             search_stats=search_stats,
         )
-        action_idx = self._apply_refund_no_followup_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_strategic_skip_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_hp_cost_margin_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
+        if policy == "full":
+            action_idx = self._apply_refund_no_followup_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_strategic_skip_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_summoner_lethal_retarget_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_source_pressure_target_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_hp_cost_margin_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
         action_idx = self._apply_elite_boss_lethal_endturn_guard(
             action_idx=int(action_idx),
             legal_count=legal_count,
@@ -297,96 +331,97 @@ class CombatHardGuardMixin(
             encounter=encounter,
             search_stats=search_stats,
         )
-        action_idx = self._apply_meaningful_damage_endturn_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_strategic_defer_endturn_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_no_pressure_block_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_boss_race_potion_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_boss_survival_potion_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_boss_survival_block_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_late_normal_lethal_endturn_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_late_normal_survival_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_late_normal_race_potion_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
-        action_idx = self._apply_survival_non_endturn_guard(
-            action_idx=int(action_idx),
-            legal_count=legal_count,
-            legal_actions=legal_actions,
-            mask_np=mask_np,
-            raw_obs=raw_obs,
-            encounter=encounter,
-            search_stats=search_stats,
-        )
+        if policy == "full":
+            action_idx = self._apply_meaningful_damage_endturn_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_strategic_defer_endturn_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_no_pressure_block_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_boss_race_potion_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_boss_survival_potion_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_boss_survival_block_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_late_normal_lethal_endturn_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_late_normal_survival_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_late_normal_race_potion_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
+            action_idx = self._apply_survival_non_endturn_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
         # Generic urgent EndTurn rescue runs after the boss/late-normal
         # specialist guards so it does not steal their more specific telemetry.
         # It only patches remaining exploration-tail EndTurn samples when the
@@ -400,7 +435,12 @@ class CombatHardGuardMixin(
             encounter=encounter,
             search_stats=search_stats,
         )
-        action_idx = self._apply_potion_bad_use_guard(
+        # Reported live full-run failures show EndTurn being dispatched with
+        # full energy and a safe legal play-card still available (e.g. floor 5
+        # and floor 11 Living Fog).  Run the narrow full-energy guard after
+        # urgent/survival specialists so it only patches the remaining
+        # non-urgent full-energy empty skips.
+        action_idx = self._apply_full_energy_endturn_guard(
             action_idx=int(action_idx),
             legal_count=legal_count,
             legal_actions=legal_actions,
@@ -409,6 +449,16 @@ class CombatHardGuardMixin(
             encounter=encounter,
             search_stats=search_stats,
         )
+        if policy == "full":
+            action_idx = self._apply_potion_bad_use_guard(
+                action_idx=int(action_idx),
+                legal_count=legal_count,
+                legal_actions=legal_actions,
+                mask_np=mask_np,
+                raw_obs=raw_obs,
+                encounter=encounter,
+                search_stats=search_stats,
+            )
         action_idx = self._apply_selection_loop_guard(
             action_idx=int(action_idx),
             legal_count=legal_count,

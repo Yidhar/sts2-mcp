@@ -206,12 +206,30 @@ def _self_inflicted_hp_loss_cumulative(obs: dict[str, Any] | None) -> float:
 
 def _player_hp(obs: dict[str, Any] | None) -> float:
     player = _player_state(obs)
-    return _float(player.get("hp", player.get("current_hp")))
+    return obs_common._player_hp_value(player)
 
 
 def _player_max_hp(obs: dict[str, Any] | None) -> float:
     player = _player_state(obs)
-    return max(_float(player.get("max_hp"), 1.0), 1.0)
+    return obs_common._player_max_hp_value(player)
+
+
+def _player_hp_ratio(obs: dict[str, Any] | None) -> float:
+    player = _player_state(obs)
+    return obs_common._player_hp_triplet(player)[2]
+
+
+def _player_max_hp_denominator(*obs_values: dict[str, Any] | None) -> float:
+    """Safe normalizer for damage attribution; never use suspicious max_hp=1."""
+    best_max = 0.0
+    best_hp = 0.0
+    for obs in obs_values:
+        player = _player_state(obs)
+        hp, max_hp, _ratio = obs_common._player_hp_triplet(player)
+        best_hp = max(best_hp, hp)
+        if max_hp > 1.0:
+            best_max = max(best_max, max_hp)
+    return max(best_max, best_hp if best_hp > 1.0 else 0.0, 1.0)
 
 
 def _player_block(obs: dict[str, Any] | None) -> float:
@@ -696,8 +714,8 @@ def _potion_timing_line_score(
     incoming = _combat_total_intent_damage(prev_obs)
     current_block = _player_block(prev_obs)
     hp = _player_hp(prev_obs)
-    max_hp = max(_player_max_hp(prev_obs), 1.0)
-    hp_ratio = float(np.clip(hp / max_hp, 0.0, 1.0))
+    hp_ratio = _player_hp_ratio(prev_obs)
+    max_hp = _player_max_hp_denominator(prev_obs)
     threat_gap = max(incoming - current_block, 0.0)
     target_hp = _target_enemy_hp(prev_obs, action)
 
@@ -1019,7 +1037,7 @@ def compute_route_targets(
     rest_value_bias = float(objective[12]) if objective.size > 12 else 0.5
     elite_pressure = float(objective[8]) if objective.size > 8 else 0.5
 
-    hp_ratio = min(_player_hp(prev_obs) / _player_max_hp(prev_obs), 1.0)
+    hp_ratio = _player_hp_ratio(prev_obs)
     gold_norm = min(np.log1p(max(_player_gold(prev_obs), 0.0)) / np.log1p(500.0), 1.0)
     elite_count = min(_float(summary.get("count_elite")) / 5.0, 1.0)
     rest_count = min(_float(summary.get("count_rest_site")) / 5.0, 1.0)
@@ -1253,7 +1271,7 @@ def compute_transition_targets(
     """Combat-specific next-state summary for action-conditioned auxiliary loss."""
     del action  # transition summary is action-conditioned via the chosen rollout action.
     target = np.zeros(NUM_TRANSITION_HEADS, dtype=np.float32)
-    target[0] = min(_player_hp(next_obs) / _player_max_hp(next_obs), 1.0)
+    target[0] = _player_hp_ratio(next_obs)
     target[1] = min(_player_block(next_obs) / 60.0, 1.0)
     target[2] = min(_combat_energy(next_obs) / _combat_max_energy(next_obs), 1.0) if _in_combat(next_obs) else 0.0
 
@@ -1302,7 +1320,7 @@ def compute_enemy_state_targets(
 
     prev_player_hp = _player_hp(prev_obs)
     next_player_hp = _player_hp(next_obs)
-    player_max_hp = max(_player_max_hp(prev_obs), _player_max_hp(next_obs), 1.0)
+    player_max_hp = _player_max_hp_denominator(prev_obs, next_obs)
     raw_player_hp_loss = max(prev_player_hp - next_player_hp, 0.0)
 
     # Strip self-inflicted HP loss (Offering / Bloodletting / etc) using the

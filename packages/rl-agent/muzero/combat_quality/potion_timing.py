@@ -347,7 +347,7 @@ class PotionTimingMixin:
             hp, max_hp, hp_valid = self._player_hp_values(raw_obs if isinstance(raw_obs, dict) else None)
         except Exception:
             hp_valid = False
-        hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0)) if hp_valid else 1.0
+        hp_ratio = self._player_hp_ratio_from_values(hp, max_hp) if hp_valid else 1.0
 
         # High-value survival tools.  These are exactly the potions that should
         # survive overflow so late hallway/boss windows have outs.
@@ -718,7 +718,7 @@ class PotionTimingMixin:
         prevent_major_loss = bool(threat_gap >= max(8.0, 0.25 * max(hp, 1.0)) and defensive)
         block_waste = bool((block > 0.0 and threat_gap <= 0.05) or amplify_block_noop)
         encounter_tier = self._combat_encounter_tier_from_raw(raw_obs)
-        hp_ratio = float(np.clip(hp / max(max_hp, 1.0), 0.0, 1.0)) if hp_valid else 0.0
+        hp_ratio = self._player_hp_ratio_from_values(hp, max_hp) if hp_valid else 0.0
         critical_hp_survival_tool = bool(
             hp_valid
             and encounter_tier in {"elite", "boss"}

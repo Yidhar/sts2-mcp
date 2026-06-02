@@ -19,6 +19,19 @@ from typing import Any
 import numpy as np
 
 from muzero.training.card_reward_guard import apply_card_reward_guard, card_reward_guard_metric_keys
+from muzero.training.card_reward_pick_quality_guard import (
+    apply_card_reward_pick_quality_guard,
+    card_reward_pick_quality_guard_metric_keys,
+)
+from muzero.training.deck_upgrade_target_guard import (
+    apply_deck_upgrade_target_guard,
+    deck_upgrade_target_guard_metric_keys,
+)
+from muzero.training.rest_site_smith_guard import (
+    apply_rest_site_smith_guard,
+    rest_site_smith_guard_metric_keys,
+)
+from muzero.training.shop_action_guard import apply_shop_action_guard, shop_action_guard_metric_keys
 from sts2_env.observation_v2 import MAX_ACTIONS
 from sts2_env.reward_constants import REST_SITE_SKIP_HEAL_HP_THRESHOLD
 
@@ -106,6 +119,9 @@ class BuildRouteHardGuardMixin:
     @staticmethod
     def _build_safety_guard_metric_keys() -> tuple[str, ...]:
         return (
+            "build_hard_guard_policy_full",
+            "build_hard_guard_policy_emergency",
+            "build_hard_guard_policy_off",
             "build_safety_guard_enabled",
             "build_safety_guard_rest_low_hp_applicable",
             "build_safety_guard_rest_available",
@@ -348,9 +364,26 @@ class BuildRouteHardGuardMixin:
             search_stats.setdefault(key, 0.0)
         for key in card_reward_guard_metric_keys():
             search_stats.setdefault(key, 0.0)
-        search_stats["build_safety_guard_enabled"] = 1.0
+        for key in card_reward_pick_quality_guard_metric_keys():
+            search_stats.setdefault(key, 0.0)
+        for key in shop_action_guard_metric_keys():
+            search_stats.setdefault(key, 0.0)
+        for key in rest_site_smith_guard_metric_keys():
+            search_stats.setdefault(key, 0.0)
+        for key in deck_upgrade_target_guard_metric_keys():
+            search_stats.setdefault(key, 0.0)
+
+        policy = str(getattr(self, "build_hard_guard_policy", "full") or "full").strip().lower()
+        if policy not in {"full", "emergency", "off"}:
+            policy = "full"
+        search_stats["build_hard_guard_policy_full"] = 1.0 if policy == "full" else 0.0
+        search_stats["build_hard_guard_policy_emergency"] = 1.0 if policy == "emergency" else 0.0
+        search_stats["build_hard_guard_policy_off"] = 1.0 if policy == "off" else 0.0
+        search_stats["build_safety_guard_enabled"] = 0.0 if policy == "off" else 1.0
         search_stats["build_safety_guard_hp_threshold"] = float(REST_SITE_SKIP_HEAL_HP_THRESHOLD)
 
+        if policy == "off":
+            return int(action_idx)
         if not isinstance(legal_actions, list) or len(legal_actions) == 0:
             return action_idx
         try:
@@ -365,23 +398,56 @@ class BuildRouteHardGuardMixin:
         raw = getattr(env_unwrap, "_last_obs_raw", None)
         full_legal_actions = getattr(env_unwrap, "_legal_actions", None)
 
-        # Card-reward anti-skip must run before the campfire HP-specific path:
-        # reward surfaces often do not expose HP cleanly, but they do expose the
-        # deck needed to decide whether skipping is pathological.
-        action_idx = apply_card_reward_guard(
-            action_idx=int(action_idx),
-            legal_actions=legal_actions,
-            full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
-            action_mask=action_mask,
-            raw_obs=raw if isinstance(raw, dict) else None,
-            search_stats=search_stats,
-        )
+        if policy == "full":
+            # Card-reward anti-skip must run before the campfire HP-specific path:
+            # reward surfaces often do not expose HP cleanly, but they do expose the
+            # deck needed to decide whether skipping is pathological.
+            action_idx = apply_card_reward_guard(
+                action_idx=int(action_idx),
+                legal_actions=legal_actions,
+                full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
+                action_mask=action_mask,
+                raw_obs=raw if isinstance(raw, dict) else None,
+                search_stats=search_stats,
+            )
+            action_idx = apply_card_reward_pick_quality_guard(
+                action_idx=int(action_idx),
+                legal_actions=legal_actions,
+                full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
+                action_mask=action_mask,
+                raw_obs=raw if isinstance(raw, dict) else None,
+                search_stats=search_stats,
+            )
+            action_idx = apply_shop_action_guard(
+                action_idx=int(action_idx),
+                legal_actions=legal_actions,
+                full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
+                action_mask=action_mask,
+                raw_obs=raw if isinstance(raw, dict) else None,
+                search_stats=search_stats,
+            )
+            action_idx = apply_rest_site_smith_guard(
+                action_idx=int(action_idx),
+                legal_actions=legal_actions,
+                full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
+                action_mask=action_mask,
+                raw_obs=raw if isinstance(raw, dict) else None,
+                search_stats=search_stats,
+            )
+            action_idx = apply_deck_upgrade_target_guard(
+                action_idx=int(action_idx),
+                legal_actions=legal_actions,
+                full_legal_actions=full_legal_actions if isinstance(full_legal_actions, list) else None,
+                action_mask=action_mask,
+                raw_obs=raw if isinstance(raw, dict) else None,
+                search_stats=search_stats,
+            )
 
         hp, max_hp, hp_valid = self._player_hp_values(raw)
         if not hp_valid:
             search_stats["build_safety_guard_invalid_obs"] = 1.0
             return action_idx
-        hp_ratio = float(hp) / max(float(max_hp), 1e-6)
+        hp_ratio = self._player_hp_ratio_from_values(hp, max_hp)
         search_stats["build_safety_guard_hp_ratio"] = hp_ratio
         if hp_ratio >= float(REST_SITE_SKIP_HEAL_HP_THRESHOLD):
             return action_idx
