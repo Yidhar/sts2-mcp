@@ -336,6 +336,7 @@ class RuntimeConfig:
     total_environment_steps: int = 1_000_000
     train_every_steps: int = 4
     updates_per_cycle: int = 1
+    warmup_credit_policy: Literal["discard", "accrue"] = "discard"
     seed: int = 0
     log_dir: str = "runs/grounded-baseline"
     checkpoint_dir: str = "checkpoints/grounded-baseline"
@@ -366,6 +367,10 @@ class RuntimeConfig:
             label="runtime.evaluation_episodes",
             minimum=0,
         )
+        if self.warmup_credit_policy not in {"discard", "accrue"}:
+            raise ValueError(
+                "runtime.warmup_credit_policy must be 'discard' or 'accrue'"
+            )
         if not isinstance(self.device, str) or not self.device.strip():
             raise TypeError("runtime.device must be a non-empty string")
         if (

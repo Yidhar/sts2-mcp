@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,6 +32,9 @@ class LearnerMetrics:
     advantage_mean: float
     td_error_mean: float
     gradient_norm: float
+    # Optional default preserves compatibility for external metric consumers
+    # that instantiate the pre-profiling ten-field record directly.
+    timings: LearnerTimings | None = None
 
     def to_mapping(self) -> dict[str, float]:
         return {
@@ -45,6 +49,46 @@ class LearnerMetrics:
             "td_error_mean": self.td_error_mean,
             "gradient_norm": self.gradient_norm,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class LearnerTimings:
+    """Exclusive wall-clock stage timings for one learner update.
+
+    CUDA work is synchronized only at stage boundaries which were already
+    followed by finite-value checks.  This keeps the measurements useful
+    without introducing per-operation synchronization into the hot path.
+    """
+
+    encoding_ms: float
+    forward_ms: float
+    loss_compute_ms: float
+    backward_ms: float
+    finite_check_ms: float
+    optimizer_step_ms: float
+    replay_priority_ms: float
+    total_ms: float
+
+    def to_mapping(self) -> dict[str, float]:
+        return {
+            "encoding": self.encoding_ms,
+            "forward": self.forward_ms,
+            "loss_compute": self.loss_compute_ms,
+            "backward": self.backward_ms,
+            "finite_check": self.finite_check_ms,
+            "optimizer_step": self.optimizer_step_ms,
+            "replay_priority": self.replay_priority_ms,
+            "total": self.total_ms,
+        }
+
+
+def _elapsed_ms(start_ns: int) -> float:
+    return (time.perf_counter_ns() - start_ns) / 1_000_000.0
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _weighted_mean(values: Tensor, weights: Tensor) -> Tensor:
@@ -112,8 +156,23 @@ class GroundedLearner:
         *,
         replay: StratifiedReplayBuffer | None = None,
     ) -> LearnerMetrics:
+        update_started_ns = time.perf_counter_ns()
+        finite_check_ms = 0.0
+
+        def require_finite(
+            stage: str,
+            tensors: tuple[tuple[str, Tensor], ...],
+        ) -> None:
+            nonlocal finite_check_ms
+            started_ns = time.perf_counter_ns()
+            try:
+                _require_finite_tensors(stage, tensors)
+            finally:
+                finite_check_ms += _elapsed_ms(started_ns)
+
         if not batch.samples:
             raise ValueError("learner batch cannot be empty")
+        encoding_started_ns = time.perf_counter_ns()
         experiences: list[DecisionExperience] = []
         targets: list[float] = []
         rewards: list[float] = []
@@ -171,7 +230,9 @@ class GroundedLearner:
             dtype=torch.float32,
             device=self.device,
         )
-        _require_finite_tensors(
+        _synchronize_device(self.device)
+        encoding_ms = _elapsed_ms(encoding_started_ns)
+        require_finite(
             "inputs",
             (
                 ("world.features", model_batch.world.features),
@@ -188,7 +249,7 @@ class GroundedLearner:
             raise ValueError("replay probabilities must be positive")
         if bool((weights <= 0.0).any().item()):
             raise ValueError("replay importance weights must be positive")
-        _require_finite_tensors(
+        require_finite(
             "model parameters",
             tuple(
                 (name, parameter)
@@ -196,11 +257,14 @@ class GroundedLearner:
                 if parameter.is_floating_point() or parameter.is_complex()
             ),
         )
-        _require_finite_tensors("optimizer state", _optimizer_tensors(self.optimizer))
+        require_finite("optimizer state", _optimizer_tensors(self.optimizer))
 
         self.model.train()
+        forward_started_ns = time.perf_counter_ns()
         output = self.model(model_batch, validate=False)
-        _require_finite_tensors(
+        _synchronize_device(self.device)
+        forward_ms = _elapsed_ms(forward_started_ns)
+        require_finite(
             "outputs",
             (
                 ("world_latents", output.world_latents),
@@ -218,6 +282,7 @@ class GroundedLearner:
         if not bool(selected_legal.all().item()):
             raise ValueError("replay selected an action that the grounded encoder marks illegal")
 
+        loss_compute_started_ns = time.perf_counter_ns()
         combat_objective = torch.tensor(
             [experience.objective == "combat" for experience in experiences],
             dtype=torch.bool,
@@ -288,7 +353,9 @@ class GroundedLearner:
             + self.config.terminal_weight * terminal_loss
             - self.config.entropy_weight * entropy
         )
-        _require_finite_tensors(
+        _synchronize_device(self.device)
+        loss_compute_ms = _elapsed_ms(loss_compute_started_ns)
+        require_finite(
             "losses",
             (
                 ("value_loss", value_loss),
@@ -303,8 +370,13 @@ class GroundedLearner:
             ),
         )
         self.optimizer.zero_grad(set_to_none=True)
+        backward_ms = 0.0
+        optimizer_step_ms = 0.0
         try:
+            backward_started_ns = time.perf_counter_ns()
             loss.backward()  # type: ignore[no-untyped-call]
+            _synchronize_device(self.device)
+            backward_ms = _elapsed_ms(backward_started_ns)
             gradients = tuple(
                 (f"{name}.grad", parameter.grad)
                 for name, parameter in self.model.named_parameters()
@@ -312,17 +384,20 @@ class GroundedLearner:
             )
             if not gradients:
                 raise RuntimeError("learner backward produced no gradients")
-            _require_finite_tensors("gradients", gradients)
+            require_finite("gradients", gradients)
             gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.config.gradient_clip_norm,
             )
-            _require_finite_tensors(
+            require_finite(
                 "gradient norm",
                 (("gradient_norm", gradient_norm_tensor),),
             )
+            optimizer_started_ns = time.perf_counter_ns()
             self.optimizer.step()
-            _require_finite_tensors(
+            _synchronize_device(self.device)
+            optimizer_step_ms = _elapsed_ms(optimizer_started_ns)
+            require_finite(
                 "updated model parameters",
                 tuple(
                     (name, parameter)
@@ -330,7 +405,7 @@ class GroundedLearner:
                     if parameter.is_floating_point() or parameter.is_complex()
                 ),
             )
-            _require_finite_tensors(
+            require_finite(
                 "updated optimizer state",
                 _optimizer_tensors(self.optimizer),
             )
@@ -339,12 +414,24 @@ class GroundedLearner:
             raise
 
         td_errors = (predicted_q.detach() - return_targets).abs()
-        _require_finite_tensors("TD errors", (("td_errors", td_errors),))
+        require_finite("TD errors", (("td_errors", td_errors),))
+        replay_priority_started_ns = time.perf_counter_ns()
         if replay is not None:
             replay.update_priorities(
                 batch.indices.tolist(),
                 (td_errors.cpu().numpy() + replay.priority_epsilon).tolist(),
             )
+        replay_priority_ms = _elapsed_ms(replay_priority_started_ns)
+        timings = LearnerTimings(
+            encoding_ms=encoding_ms,
+            forward_ms=forward_ms,
+            loss_compute_ms=loss_compute_ms,
+            backward_ms=backward_ms,
+            finite_check_ms=finite_check_ms,
+            optimizer_step_ms=optimizer_step_ms,
+            replay_priority_ms=replay_priority_ms,
+            total_ms=_elapsed_ms(update_started_ns),
+        )
         return LearnerMetrics(
             loss=float(loss.detach().cpu()),
             policy_loss=float(policy_loss.detach().cpu()),
@@ -356,7 +443,8 @@ class GroundedLearner:
             advantage_mean=float(advantage.mean().cpu()),
             td_error_mean=float(td_errors.mean().cpu()),
             gradient_norm=float(gradient_norm_tensor.detach().cpu()),
+            timings=timings,
         )
 
 
-__all__ = ["GroundedLearner", "LearnerMetrics"]
+__all__ = ["GroundedLearner", "LearnerMetrics", "LearnerTimings"]

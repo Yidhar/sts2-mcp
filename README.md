@@ -183,9 +183,15 @@ python -m sts2_rl.train --dry-run
 Start the optional combat bootstrap or the full-run mainline with:
 
 ```powershell
-python -m sts2_rl.train --profile combat
-python -m sts2_rl.train --profile default
+python -m sts2_rl.train --profile combat --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
+python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
 ```
+
+Formal headless runs require a `Release` simulator built from the locked
+`sts2-ai` commit and a matching binary-identity sidecar. Debug, stale, dirty-
+source, and hash-mismatched binaries are rejected before the simulator starts.
+See [HeadlessSim build identity](./docs/headless-simulator-identity.md) for the
+build and verification procedure.
 
 The default model has 3,642,824 parameters, scores only currently grounded legal
 candidates, and uses no latent dynamics, MCTS, planner or game-specific action

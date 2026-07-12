@@ -28,6 +28,8 @@ def test_default_and_combat_profiles_select_matching_horizons() -> None:
     assert combat.environment.scenario == "combat"
     assert combat.curriculum.reward_objective == "combat"
     assert default.model.architecture == combat.model.architecture == "grounded_candidate_v1"
+    assert default.runtime.warmup_credit_policy == "discard"
+    assert combat.runtime.warmup_credit_policy == "discard"
 
 
 def test_strict_dotted_overrides_accept_known_and_reject_retired_keys() -> None:
@@ -108,6 +110,12 @@ def test_environment_backend_and_scenario_fields_fail_when_ignored() -> None:
         EnvironmentConfig(scenario="full-run", encounter_id="boss")
 
 
+def test_warmup_credit_policy_is_strict_and_legacy_mode_is_explicit() -> None:
+    assert RuntimeConfig(warmup_credit_policy="accrue").warmup_credit_policy == "accrue"
+    with pytest.raises(ValueError, match="warmup_credit_policy"):
+        RuntimeConfig(warmup_credit_policy="catch-up")  # type: ignore[arg-type]
+
+
 def test_lineage_mapping_excludes_only_mutable_execution_controls() -> None:
     config = TrainingConfig()
     mutable_runtime = replace(
@@ -126,5 +134,10 @@ def test_lineage_mapping_excludes_only_mutable_execution_controls() -> None:
         config,
         runtime=replace(config.runtime, train_every_steps=8),
     )
+    changed_warmup_policy = replace(
+        config,
+        runtime=replace(config.runtime, warmup_credit_policy="accrue"),
+    )
     assert changed_seed.lineage_mapping() != config.lineage_mapping()
     assert changed_cadence.lineage_mapping() != config.lineage_mapping()
+    assert changed_warmup_policy.lineage_mapping() != config.lineage_mapping()

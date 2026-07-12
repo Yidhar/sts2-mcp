@@ -169,9 +169,14 @@ python -m sts2_rl.train --dry-run
 可选的 combat bootstrap 与正式 full-run 主线：
 
 ```powershell
-python -m sts2_rl.train --profile combat
-python -m sts2_rl.train --profile default
+python -m sts2_rl.train --profile combat --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
+python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
 ```
+
+正式无头训练必须使用从锁定 `sts2-ai` 提交构建的 `Release` 模拟器，并提供与
+二进制匹配的身份 sidecar。Debug、过期、脏源码构建或哈希不一致的二进制都会在
+模拟器启动前被拒绝。构建和验证流程见
+[HeadlessSim 构建身份](./docs/headless-simulator-identity.md)。
 
 默认模型有 3,642,824 个参数，只对当前合法候选评分；没有 latent dynamics、MCTS、
 planner 或游戏特定 action rewrite。Reward 固定且归一化，replay 混合 coverage、

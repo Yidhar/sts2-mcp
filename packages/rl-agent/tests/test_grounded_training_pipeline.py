@@ -286,6 +286,20 @@ def test_collector_returns_auditable_monte_carlo_targets() -> None:
     assert episode.metrics.steps == 2
     assert episode.metrics.combat_won
     assert len(episode.samples) == 2
+    assert episode.timings is not None
+    collector_timings = episode.timings.to_mapping()
+    assert collector_timings["reset"]["count"] == 1
+    assert collector_timings["target_finalize"]["count"] == 1
+    for stage_name in (
+        "observation_encoding",
+        "policy_forward",
+        "sim_step",
+        "transition_reward_compaction",
+    ):
+        stage = collector_timings[stage_name]
+        assert stage["count"] == episode.metrics.steps
+        assert 0.0 <= stage["min_ms"] <= stage["mean_ms"] <= stage["max_ms"]
+        assert stage["total_ms"] >= stage["max_ms"]
     assert episode.samples[-1].transition.combat_result == "win"
     assert episode.samples[-1].targets.value == episode.samples[-1].targets.reward
     assert episode.samples[0].targets.value is not None
@@ -523,6 +537,19 @@ def test_learner_updates_model_and_refreshes_replay_priority() -> None:
     after = next(resources.model.parameters()).detach()
     assert not torch.equal(before, after)
     assert metrics.loss == metrics.loss
+    assert metrics.timings is not None
+    assert set(metrics.timings.to_mapping()) == {
+        "encoding",
+        "forward",
+        "loss_compute",
+        "backward",
+        "finite_check",
+        "optimizer_step",
+        "replay_priority",
+        "total",
+    }
+    assert all(value >= 0.0 for value in metrics.timings.to_mapping().values())
+    assert "timings" not in metrics.to_mapping()
     assert all(resources.replay.priority(int(index)) > 0.0 for index in batch.indices)
 
 
@@ -559,13 +586,63 @@ def test_learner_rejects_non_finite_state_before_optimizer_step() -> None:
 
 def test_atomic_checkpoint_roundtrip_and_runtime(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
-    config = _small_config()
+    # This checkpoint/timing test intentionally exercises the learner in its
+    # only two collected steps.  Opt into the legacy warm-up credit behavior;
+    # the default discard policy is covered independently below.
+    base_config = _small_config()
+    config = replace(
+        base_config,
+        runtime=replace(base_config.runtime, warmup_credit_policy="accrue"),
+    )
     first_backend = FakeCombatBackend()
 
     state = run_training(config, backend=first_backend)
 
     assert state.environment_steps == 2
     assert state.learner_updates > 0
+    metric_directories = list((tmp_path / "tests" / "run").glob("run-*"))
+    assert len(metric_directories) == 1
+    metric_records = [
+        json.loads(line)
+        for line in (metric_directories[0] / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    train_record = next(
+        record for record in metric_records if record["event"] == "train_episode"
+    )
+    timing_payload = train_record["timings"]
+    assert timing_payload["schema_version"] == 1
+    assert timing_payload["scope"] == "train_episode"
+    assert timing_payload["unit"] == "milliseconds"
+    stages = timing_payload["stages"]
+    assert stages["collect_episode"]["count"] == 1
+    assert stages["replay_extend"]["count"] == 1
+    assert stages["collector.reset"]["count"] == 1
+    assert stages["collector.target_finalize"]["count"] == 1
+    for name in (
+        "collector.observation_encoding",
+        "collector.policy_forward",
+        "collector.sim_step",
+        "collector.transition_reward_compaction",
+    ):
+        assert stages[name]["count"] == train_record["episode"]["steps"]
+    assert stages["replay_sample"]["count"] == state.learner_updates
+    assert stages["learner_update"]["count"] == state.learner_updates
+    for name in (
+        "learner.encoding",
+        "learner.forward",
+        "learner.loss_compute",
+        "learner.backward",
+        "learner.finite_check",
+        "learner.optimizer_step",
+        "learner.replay_priority",
+        "learner.total",
+    ):
+        stage = stages[name]
+        assert stage["count"] == state.learner_updates
+        assert 0.0 <= stage["min_ms"] <= stage["mean_ms"] <= stage["max_ms"]
+        assert stage["total_ms"] >= stage["max_ms"]
     run_directories = list((tmp_path / "tests" / "checkpoints").glob("run-*"))
     assert len(run_directories) == 1
     final = run_directories[0] / "final-step-000000002"
@@ -585,6 +662,19 @@ def test_atomic_checkpoint_roundtrip_and_runtime(tmp_path: Path, monkeypatch: An
     assert loaded == state
     assert len(resources.replay) == 2
     resources.close()
+
+
+def test_training_discards_unusable_warmup_credit(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+
+    state = run_training(_small_config(), backend=FakeCombatBackend())
+
+    assert state.environment_steps == 2
+    assert state.learner_updates == 0
+    assert state.update_credit == 0
 
 
 def test_checkpoint_rejects_config_drift(tmp_path: Path) -> None:

@@ -43,6 +43,9 @@ historical RL artifacts.
   disjoint held-out evaluation seeds with per-seed metrics, complete reward-projection
   fingerprints in replay, exact checkpoint resume and a dry-run CLI gate. No new
   long-run or Act 1 performance result is claimed in this release.
+- Added episode-aggregated collector/learner stage timings, a warm-up credit policy
+  that avoids synchronous replay-debt catch-up, and a fail-closed HeadlessSim build
+  identity gate binding formal training to the locked source commit and binary hash.
 - Added Bridge core tests, MCP SDK/unit tests, contract/repository/data/release gates,
   GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub

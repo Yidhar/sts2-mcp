@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -62,6 +63,76 @@ class EpisodeMetrics:
 class CollectedEpisode:
     samples: tuple[ReplaySample, ...]
     metrics: EpisodeMetrics
+    timings: CollectorTimings | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorStageTiming:
+    count: int
+    total_ms: float
+    min_ms: float
+    max_ms: float
+
+    def to_mapping(self) -> dict[str, float | int]:
+        return {
+            "count": self.count,
+            "total_ms": self.total_ms,
+            "mean_ms": self.total_ms / self.count,
+            "min_ms": self.min_ms,
+            "max_ms": self.max_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CollectorTimings:
+    """Episode-aggregated collector timings; never written per environment step."""
+
+    stages: dict[str, CollectorStageTiming]
+
+    def to_mapping(self) -> dict[str, dict[str, float | int]]:
+        return {
+            name: timing.to_mapping()
+            for name, timing in sorted(self.stages.items())
+        }
+
+
+@dataclass(slots=True)
+class _MutableStageTiming:
+    count: int = 0
+    total_ms: float = 0.0
+    min_ms: float = float("inf")
+    max_ms: float = 0.0
+
+    def add(self, duration_ms: float) -> None:
+        duration_ms = max(0.0, float(duration_ms))
+        self.count += 1
+        self.total_ms += duration_ms
+        self.min_ms = min(self.min_ms, duration_ms)
+        self.max_ms = max(self.max_ms, duration_ms)
+
+
+class _CollectorTimingAccumulator:
+    def __init__(self) -> None:
+        self._stages: dict[str, _MutableStageTiming] = {}
+
+    def add(self, stage: str, duration_ms: float) -> None:
+        self._stages.setdefault(stage, _MutableStageTiming()).add(duration_ms)
+
+    def record(self, stage: str, started_ns: int) -> None:
+        self.add(stage, (time.perf_counter_ns() - started_ns) / 1_000_000.0)
+
+    def snapshot(self) -> CollectorTimings:
+        return CollectorTimings(
+            stages={
+                name: CollectorStageTiming(
+                    count=timing.count,
+                    total_ms=timing.total_ms,
+                    min_ms=timing.min_ms,
+                    max_ms=timing.max_ms,
+                )
+                for name, timing in self._stages.items()
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,15 +454,20 @@ class GroundedCollector:
         *,
         epsilon: float,
         deterministic: bool,
-    ) -> tuple[int, float, int]:
+    ) -> tuple[int, float, int, float, float]:
         normalized_epsilon = float(epsilon)
         if not math.isfinite(normalized_epsilon) or not 0.0 <= normalized_epsilon <= 1.0:
             raise ValueError("exploration epsilon must be finite and in [0, 1]")
+        encoding_started_ns = time.perf_counter_ns()
         encoded = self.encoder.encode(
             state.observation,
             state.legal_actions,
             device=self.device,
         )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        encoding_ms = (time.perf_counter_ns() - encoding_started_ns) / 1_000_000.0
+        policy_started_ns = time.perf_counter_ns()
         was_training = self.model.training
         self.model.eval()
         try:
@@ -401,6 +477,7 @@ class GroundedCollector:
                 valid = output.action_mask[0].cpu().numpy().astype(bool)
         finally:
             self.model.train(was_training)
+        policy_forward_ms = (time.perf_counter_ns() - policy_started_ns) / 1_000_000.0
         valid_indices = np.flatnonzero(valid)
         if valid_indices.size == 0:
             raise CollectionProtocolError(
@@ -415,7 +492,7 @@ class GroundedCollector:
             raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
         if deterministic:
             selected = int(valid_indices[int(np.argmax(valid_policy))])
-            return selected, 0.0, valid_count
+            return selected, 0.0, valid_count, encoding_ms, policy_forward_ms
 
         behavior = np.zeros_like(policy, dtype=np.float64)
         behavior[valid_indices] = (
@@ -426,7 +503,13 @@ class GroundedCollector:
         if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0):
             raise CollectionProtocolError("collector produced an invalid behavior policy")
         selected = int(self._rng.choice(len(behavior), p=behavior))
-        return selected, float(math.log(max(float(behavior[selected]), 1e-30))), valid_count
+        return (
+            selected,
+            float(math.log(max(float(behavior[selected]), 1e-30))),
+            valid_count,
+            encoding_ms,
+            policy_forward_ms,
+        )
 
     def _step(
         self,
@@ -457,8 +540,11 @@ class GroundedCollector:
         record: bool = True,
         evaluation_seed: int | None = None,
     ) -> CollectedEpisode:
+        timings = _CollectorTimingAccumulator()
         reset_seed = self._episode_seed if evaluation_seed is None else evaluation_seed
+        reset_started_ns = time.perf_counter_ns()
         state = self.reset(evaluation_seed=evaluation_seed)
+        timings.record("reset", reset_started_ns)
         pending: list[_Pending] = []
         reward_total = 0.0
         max_act, max_floor = _run_position(state.observation)
@@ -474,14 +560,24 @@ class GroundedCollector:
                 raise CollectionProtocolError(
                     f"episode={state.episode_id!r} step={state.step_index} returned zero legal actions"
                 )
-            action_index, behavior_log_probability, valid_count = self._choose_action(
+            (
+                action_index,
+                behavior_log_probability,
+                valid_count,
+                encoding_ms,
+                policy_forward_ms,
+            ) = self._choose_action(
                 state,
                 epsilon=epsilon,
                 deterministic=deterministic,
             )
+            timings.add("observation_encoding", encoding_ms)
+            timings.add("policy_forward", policy_forward_ms)
             policy_decisions += int(valid_count > 1)
             forced_decisions += int(valid_count == 1)
+            sim_step_started_ns = time.perf_counter_ns()
             next_state, action_handle = self._step(state, action_index=action_index)
+            timings.record("sim_step", sim_step_started_ns)
             steps_taken += 1
             if next_state.truncated:
                 raise CollectionProtocolError(
@@ -492,6 +588,7 @@ class GroundedCollector:
                 and not next_state.terminated
                 and not next_state.truncated
             )
+            transition_started_ns = time.perf_counter_ns()
             transition = baseline_transition(
                 before=state,
                 after=next_state,
@@ -527,6 +624,10 @@ class GroundedCollector:
                         objective_terminal=task_terminal,
                     )
                 )
+            timings.record(
+                "transition_reward_compaction",
+                transition_started_ns,
+            )
             final_transition = transition
             state = next_state
             act, floor = _run_position(state.observation)
@@ -535,6 +636,7 @@ class GroundedCollector:
             if state.terminated or task_terminal or forced_truncation:
                 break
 
+        target_finalize_started_ns = time.perf_counter_ns()
         samples: list[ReplaySample] = []
         running_return = 0.0
         for item in reversed(pending):
@@ -550,6 +652,7 @@ class GroundedCollector:
                 )
             )
         samples.reverse()
+        timings.record("target_finalize", target_finalize_started_ns)
 
         run_won = bool(final_transition is not None and final_transition.run_result == "win")
         combat_won = bool(
@@ -573,6 +676,7 @@ class GroundedCollector:
                 policy_decisions=policy_decisions,
                 forced_decisions=forced_decisions,
             ),
+            timings=timings.snapshot(),
         )
 
 

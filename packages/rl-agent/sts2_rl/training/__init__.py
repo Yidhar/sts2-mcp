@@ -43,6 +43,7 @@ from .runtime import (
     run_training,
     summarize_evaluation,
 )
+from .update_schedule import WarmupCreditPolicy, advance_update_credit
 
 __all__ = [
     "CONFIG_VERSION",
@@ -62,6 +63,8 @@ __all__ = [
     "TrainingConfig",
     "TrainingResources",
     "TrainingState",
+    "WarmupCreditPolicy",
+    "advance_update_credit",
     "build_backend",
     "build_training_resources",
     "checkpoint_summary",

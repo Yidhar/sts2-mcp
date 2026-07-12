@@ -65,6 +65,7 @@ device = "auto"
 total_environment_steps = 1000000
 train_every_steps = 4
 updates_per_cycle = 1
+warmup_credit_policy = "discard"
 seed = 0
 log_dir = "runs/grounded-baseline"
 checkpoint_dir = "checkpoints/grounded-baseline"

@@ -8,7 +8,13 @@ from collections.abc import Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from sts2_env.headless_sim_bridge_client import HeadlessSimError, resolve_headless_sim_exe
 from sts2_rl.artifacts import resolve_external_input_path
+from sts2_rl.simulator_identity import (
+    SimulatorIdentityError,
+    verify_headless_simulator,
+    write_preflight_audit,
+)
 from sts2_rl.training.config import TrainingConfig, load_training_config
 from sts2_rl.training.runtime import inspect_baseline, run_training
 
@@ -36,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, help="override deterministic seed")
     parser.add_argument("--backend", choices=("live", "headless"))
     parser.add_argument("--sim-exe", help="headless simulator executable")
+    parser.add_argument(
+        "--sim-identity",
+        help="HeadlessSim identity sidecar (default: <sim-exe>.identity.json)",
+    )
     parser.add_argument("--session-path", help="live bridge session descriptor path")
     parser.add_argument("--resume", help="exact baseline checkpoint directory")
     parser.add_argument(
@@ -83,6 +93,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         print(json.dumps(inspect_baseline(config), indent=2, sort_keys=True))
         return 0
+    if args.sim_identity and config.environment.backend != "headless":
+        raise SystemExit("--sim-identity is only valid for the headless backend")
+    if config.environment.backend == "headless":
+        try:
+            simulator = verify_headless_simulator(
+                resolve_headless_sim_exe(config.environment.sim_exe_path),
+                identity_path=args.sim_identity,
+            )
+            audit_path = write_preflight_audit(simulator)
+        except (HeadlessSimError, OSError, SimulatorIdentityError, ValueError) as exc:
+            raise SystemExit(f"HeadlessSim identity preflight failed: {exc}") from exc
+        config = replace(
+            config,
+            environment=replace(
+                config.environment,
+                sim_exe_path=str(simulator.executable),
+            ),
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "simulator_identity_verified",
+                    "audit_path": str(audit_path),
+                    **simulator.to_mapping(),
+                },
+                sort_keys=True,
+            )
+        )
     resume: Path | None = None
     initialization: Path | None = None
     if args.resume and args.initialize_from:

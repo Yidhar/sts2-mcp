@@ -45,6 +45,7 @@ decisions from a launcher, compatibility wrapper, or build script.
 - [Development and verification](./runbooks/development.md)
 - [Artifact inventory and externalization](./runbooks/artifacts.md)
 - [WSL ROCm training](./runbooks/wsl-rocm-training.md)
+- [HeadlessSim build identity](./headless-simulator-identity.md)
 - [Release validation and evidence](./runbooks/release.md)
 - [V2 migration guide](./migration/README.md)
 

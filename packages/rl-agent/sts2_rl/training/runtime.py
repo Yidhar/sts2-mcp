@@ -6,7 +6,7 @@ import json
 import statistics
 import time
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -36,6 +36,7 @@ from .factory import (
     resolve_device,
 )
 from .seeding import held_out_evaluation_seeds
+from .update_schedule import advance_update_credit
 
 
 def exploration_epsilon(config: TrainingConfig, environment_steps: int) -> float:
@@ -60,6 +61,85 @@ class JsonlMetrics:
         record = {"event": event, "unix_s": time.time(), **payload}
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+
+
+@dataclass(slots=True)
+class _StageTiming:
+    count: int = 0
+    total_ms: float = 0.0
+    min_ms: float = float("inf")
+    max_ms: float = 0.0
+
+    def add(self, duration_ms: float) -> None:
+        duration_ms = max(0.0, float(duration_ms))
+        self.count += 1
+        self.total_ms += duration_ms
+        self.min_ms = min(self.min_ms, duration_ms)
+        self.max_ms = max(self.max_ms, duration_ms)
+
+    def merge(
+        self,
+        *,
+        count: int,
+        total_ms: float,
+        min_ms: float,
+        max_ms: float,
+    ) -> None:
+        if count <= 0:
+            return
+        self.count += count
+        self.total_ms += max(0.0, float(total_ms))
+        self.min_ms = min(self.min_ms, max(0.0, float(min_ms)))
+        self.max_ms = max(self.max_ms, max(0.0, float(max_ms)))
+
+    def to_mapping(self) -> dict[str, float | int]:
+        return {
+            "count": self.count,
+            "total_ms": self.total_ms,
+            "mean_ms": self.total_ms / self.count,
+            "min_ms": self.min_ms,
+            "max_ms": self.max_ms,
+        }
+
+
+class _EpisodeTimings:
+    """Aggregate hot-path durations without emitting per-step log records."""
+
+    def __init__(self) -> None:
+        self._stages: dict[str, _StageTiming] = {}
+
+    def record(self, stage: str, started_ns: int) -> None:
+        self.add(stage, (time.perf_counter_ns() - started_ns) / 1_000_000.0)
+
+    def add(self, stage: str, duration_ms: float) -> None:
+        self._stages.setdefault(stage, _StageTiming()).add(duration_ms)
+
+    def merge(
+        self,
+        stage: str,
+        *,
+        count: int,
+        total_ms: float,
+        min_ms: float,
+        max_ms: float,
+    ) -> None:
+        self._stages.setdefault(stage, _StageTiming()).merge(
+            count=count,
+            total_ms=total_ms,
+            min_ms=min_ms,
+            max_ms=max_ms,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "scope": "train_episode",
+            "unit": "milliseconds",
+            "stages": {
+                name: timing.to_mapping()
+                for name, timing in sorted(self._stages.items())
+            },
+        }
 
 
 def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | int]:
@@ -272,20 +352,42 @@ def run_training(
 
         try:
             while state.environment_steps < config.runtime.total_environment_steps:
+                episode_timings = _EpisodeTimings()
                 epsilon = exploration_epsilon(config, state.environment_steps)
+                collect_started_ns = time.perf_counter_ns()
                 episode = resources.collector.collect_episode(
                     epsilon=epsilon,
                     deterministic=False,
                     record=True,
                 )
+                episode_timings.record("collect_episode", collect_started_ns)
+                if episode.timings is not None:
+                    for stage, timing in episode.timings.stages.items():
+                        episode_timings.merge(
+                            f"collector.{stage}",
+                            count=timing.count,
+                            total_ms=timing.total_ms,
+                            min_ms=timing.min_ms,
+                            max_ms=timing.max_ms,
+                        )
                 if not episode.samples:
                     raise RuntimeError("collector produced an empty training episode")
+                replay_size_before = len(resources.replay)
+                replay_extend_started_ns = time.perf_counter_ns()
                 resources.replay.extend(episode.samples)
+                episode_timings.record("replay_extend", replay_extend_started_ns)
                 state = replace(
                     state,
                     environment_steps=state.environment_steps + episode.metrics.steps,
                     episodes=state.episodes + 1,
-                    update_credit=state.update_credit + episode.metrics.steps,
+                    update_credit=advance_update_credit(
+                        current_credit=state.update_credit,
+                        collected_steps=episode.metrics.steps,
+                        replay_size_before=replay_size_before,
+                        replay_size_after=len(resources.replay),
+                        minimum_replay_size=config.replay.minimum_size,
+                        warmup_policy=config.runtime.warmup_credit_policy,
+                    ),
                 )
                 latest_learner: dict[str, float] | None = None
                 while (
@@ -299,13 +401,29 @@ def run_training(
                         ),
                     )
                     for _ in range(config.runtime.updates_per_cycle):
+                        replay_sample_started_ns = time.perf_counter_ns()
                         replay_batch = resources.replay.sample(
                             config.optimization.batch_size
                         )
+                        episode_timings.record(
+                            "replay_sample",
+                            replay_sample_started_ns,
+                        )
+                        learner_update_started_ns = time.perf_counter_ns()
                         learner_metrics = resources.learner.update(
                             replay_batch,
                             replay=resources.replay,
                         )
+                        episode_timings.record(
+                            "learner_update",
+                            learner_update_started_ns,
+                        )
+                        if learner_metrics.timings is not None:
+                            for (
+                                stage,
+                                duration_ms,
+                            ) in learner_metrics.timings.to_mapping().items():
+                                episode_timings.add(f"learner.{stage}", duration_ms)
                         latest_learner = learner_metrics.to_mapping()
                         state = replace(
                             state,
@@ -323,6 +441,7 @@ def run_training(
                         "epsilon": epsilon,
                         "episode": asdict(episode.metrics),
                         "learner": latest_learner,
+                        "timings": episode_timings.to_mapping(),
                     },
                 )
 
