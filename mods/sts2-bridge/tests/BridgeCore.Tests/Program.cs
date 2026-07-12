@@ -1065,6 +1065,7 @@ using (var environmentFixtureDocument = JsonDocument.Parse(
         idx = 0,
         action_id = "reward:continue",
         kind = "continue",
+        model_action_kind = "reward",
         label = "Continue",
         selection = "proceed",
         diagnostic = new { retained = true }
@@ -1075,9 +1076,49 @@ using (var environmentFixtureDocument = JsonDocument.Parse(
     Assert(projectedAction.GetProperty("action_handle").GetString() ==
                fixtureAction.GetProperty("action_handle").GetString() &&
            !projectedAction.TryGetProperty("action_id", out _) &&
+           projectedAction.GetProperty("model_action_kind").GetString() ==
+               fixtureAction.GetProperty("model_action_kind").GetString() &&
            projectedAction.GetProperty("diagnostic").GetProperty("retained").GetBoolean() &&
            legacyActionBefore.GetProperty("action_id").GetString() == "reward:continue",
         "training legal-action projection must preserve metadata, avoid mutation, and emit action_handle only");
+
+    var liveEventAction = new
+    {
+        idx = 1,
+        action_id = "event_option:1",
+        kind = "event_option",
+        model_action_kind = "event_option",
+        option = new
+        {
+            index = 1,
+            title = "Visible choice",
+            description = "Visible description",
+            is_locked = false,
+            is_proceed = false
+        }
+    };
+    var projectedEventAction = JsonSerializer.SerializeToElement(
+        BridgeLegalActionProjector.ProjectEnvironmentAction(liveEventAction));
+    var projectedEventOption = projectedEventAction.GetProperty("option");
+    Assert(projectedEventAction.GetProperty("model_action_kind").GetString() == "event_option" &&
+           projectedEventOption.GetProperty("title").GetString() == "Visible choice" &&
+           projectedEventOption.GetProperty("description").GetString() == "Visible description" &&
+           !projectedEventOption.GetProperty("is_locked").GetBoolean() &&
+           !projectedEventOption.GetProperty("is_proceed").GetBoolean(),
+        "live event legal actions must preserve a nested reviewed option DTO for model parity");
+
+    var projectedRunModeAction = JsonSerializer.SerializeToElement(
+        BridgeLegalActionProjector.ProjectEnvironmentAction(new
+        {
+            idx = 2,
+            action_id = "run_mode:standard",
+            kind = "run_mode_selection",
+            model_action_kind = "run_mode_selection",
+            run_mode_action = "standard"
+        }));
+    Assert(projectedRunModeAction.GetProperty("run_mode_action").GetString() == "standard" &&
+           !projectedRunModeAction.TryGetProperty("run_mode", out _),
+        "live run-mode legal actions must preserve the canonical run_mode_action field");
 }
 Console.WriteLine("Bridge shared wire fixtures passed.");
 
@@ -1090,11 +1131,24 @@ var v2Source = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameA
 var snapshotsSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Snapshots.cs"));
 var stateProjectorSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgePlayerStateProjector.cs"));
 var sessionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeSessionRegistry.cs"));
+var envSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Env.cs"));
 var envHelpersSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvHelpers.cs"));
 var envV2Source = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvV2.cs"));
 var protocolSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeProtocolV2.cs"));
 var actionRegistrySource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Actions.Registry.cs"));
 var projectorSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeLegalActionProjector.cs"));
+var glossarySource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.GameAdapter.Glossary.cs"));
+var enemyPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Payloads.Enemies.cs"));
+var combatPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Payloads.Combat.cs"));
+var navigationPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Payloads.Navigation.cs"));
+var compactPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvCompact.cs"));
+var envPayloadsSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvPayloads.cs"));
+var envTextSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvText.cs"));
+var cardFactsSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.GameAdapter.CardFacts.cs"));
+var selectionActionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Actions.SelectionShop.cs"));
+var navigationSelectionActionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Actions.NavigationSelection.cs"));
+var selectionPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Payloads.Selection.cs"));
+var bridgeProjectSource = File.ReadAllText(Path.Combine(bridgeRoot, "sts2-bridge.csproj"));
 var entrySource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "Entry.cs"));
 var compatibilitySource = File.ReadAllText(
     Path.Combine(bridgeRoot, "Scripts", "BridgeGameCompatibilityGate.cs"));
@@ -1114,16 +1168,15 @@ var extractedPartials = new Dictionary<string, string[]>(StringComparer.Ordinal)
     ["BridgeGameApi.Payloads.Enemies.cs"] = ["private static object BuildCreaturePayload(", "private static object BuildMonsterIntentPayload("],
     ["BridgeGameApi.Payloads.Selection.cs"] = ["private static object BuildRewardsPayload(", "private static object BuildCrystalSpherePayload("],
     ["BridgeGameApi.Payloads.Navigation.cs"] = ["private static object BuildMapPayload(", "private static object BuildShopPayload("],
-    ["BridgeGameApi.GameAdapter.CardSemantics.cs"] = ["private static Dictionary<string, object?> BuildCardModifierSummaryPayload(", "private static string BuildCardEffectSummary("],
+    ["BridgeGameApi.GameAdapter.CardFacts.cs"] = ["private static string FirstNonEmptyText(", "private static object[] BuildDynamicVarPayloads("],
     ["BridgeGameApi.GameAdapter.Context.cs"] = ["private static BridgeWorldContext CaptureContext("],
     ["BridgeGameApi.GameAdapter.Glossary.cs"] = ["private static object BuildEventOptionPayload(", "private static object[] BuildVisibleGlossaryPayload("],
     ["BridgeGameApi.GameAdapter.UI.cs"] = ["private static string ResolveCurrentScreen(", "private static List<T> FindVisibleDescendants<T>("],
     ["BridgeGameApi.GameAdapter.Reflection.cs"] = ["private static object? InvokeParameterless(", "private static PropertyInfo? FindProperty(", "private static FieldInfo? FindField("],
     ["BridgeGameApi.GameAdapter.Text.cs"] = ["private static string DescribeText(", "private static string ResolvePlaceholderText("],
     ["BridgeGameApi.EnvHelpers.cs"] = ["private static object BuildEnvActionPayload(", "private static bool TrySetHiddenFieldValue("],
-    ["BridgeGameApi.EnvRewardShaping.cs"] = ["private static BridgeLegacyEnvRewardBreakdown BuildLegacyEnvRewardBreakdown(", "private static void ApplyCombatActionShaping("],
-    ["BridgeGameApi.EnvEventEffects.cs"] = ["internal sealed class EventOptionEffectDeltas", "internal static EventOptionEffectDeltas ExtractEventOptionEffectDeltas("],
-    ["BridgeGameApi.EnvModels.cs"] = ["private sealed class BridgeEnvEpisode", "private sealed class BridgeEnvActionShaping"],
+    ["BridgeGameApi.EnvStateTracking.cs"] = ["private static bool HasMeaningfulEnvSnapshotDifference(", "private static IReadOnlyList<BridgeEnvDeckEntry> BuildEnvDeckEntries("],
+    ["BridgeGameApi.EnvModels.cs"] = ["private sealed class BridgeEnvEpisode", "private sealed class BridgeEnvSnapshot"],
     ["BridgeGameApi.EnvCombatSandbox.cs"] = ["public static async Task<object> CombatResetEnvResponseAsync(", "private static async Task<object> StepCombatSandboxEpisodeAsync("],
     ["BridgeGameApi.EnvCombatCatalog.cs"] = ["public static async Task<object> GetCombatCatalogResponseAsync(", "private sealed class EncounterCatalogEntry"],
     ["BridgeGameApi.EnvCombatSetup.cs"] = ["private static CombatSandboxSetupResult SetUpCombatSandbox(", "internal static void DrainManagedFinalizersLogged("],
@@ -1172,6 +1225,103 @@ Assert(File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Snapshots.
     "frontier/SSE ownership must live in the snapshots partial");
 Assert(!File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.StaticExport.cs")),
     "game-process static exporter must stay removed");
+Assert(!enemyPayloadSource.Contains("static_traits", StringComparison.Ordinal) &&
+       !enemyPayloadSource.Contains("reactive_triggers", StringComparison.Ordinal) &&
+       !enemyPayloadSource.Contains("phase_rules", StringComparison.Ordinal) &&
+       !enemyPayloadSource.Contains("combat_tags", StringComparison.Ordinal) &&
+       !enemyPayloadSource.Contains("danger_profile", StringComparison.Ordinal) &&
+       !enemyPayloadSource.Contains("target_priority_hints", StringComparison.Ordinal),
+    "enemy payloads must expose runtime state and intent, not hand-written policy annotations");
+Assert(!combatPayloadSource.Contains("card_effect_profile", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("effect_preview", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("TryGetPotionProfileEntry", StringComparison.Ordinal) &&
+       !navigationPayloadSource.Contains("TryGetPotionProfileEntry", StringComparison.Ordinal) &&
+       !compactPayloadSource.Contains("card_effect_profile", StringComparison.Ordinal) &&
+       !compactPayloadSource.Contains("effect_preview", StringComparison.Ordinal),
+    "card and potion payloads must not reintroduce curated effect/timing profiles");
+Assert(!combatPayloadSource.Contains("BuildPlayCardSemantic", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("BuildUsePotionSemantic", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("modifier_summary", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("card_flow", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("semantic_tags", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("semantic_values", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("safety = new", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("x_cost = new", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("selection = new", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("will_exhaust", StringComparison.Ordinal) &&
+       !compactPayloadSource.Contains("semantic_tags", StringComparison.Ordinal) &&
+       !compactPayloadSource.Contains("semantic_values", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("is_debuff = GetHiddenPropertyValue<bool>", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("is_buff = GetHiddenPropertyValue<bool>", StringComparison.Ordinal) &&
+       compactPayloadSource.Contains("var amount = TryGetNestedDecimal(modifier, \"amount\")", StringComparison.Ordinal) &&
+       !cardFactsSource.Contains("BodySlam", StringComparison.Ordinal) &&
+       !cardFactsSource.Contains("strategic", StringComparison.Ordinal) &&
+       !File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.GameAdapter.CardSemantics.cs")),
+    "card payloads must expose raw runtime facts without modifier rules, card-flow labels, or card-specific exceptions");
+Assert(!File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.CardEffectProfiles.cs")) &&
+       !File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.PotionProfiles.cs")) &&
+       !bridgeProjectSource.Contains("card_effect_profiles.generated.json", StringComparison.Ordinal) &&
+       !bridgeProjectSource.Contains("potions.timing", StringComparison.Ordinal),
+    "the Bridge must not embed retired card-effect or potion-timing registries");
+Assert(!File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvRoutes.cs")) &&
+       !actionRegistrySource.Contains("route_summary", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("route_summary", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("route_nodes", StringComparison.Ordinal) &&
+       !compactPayloadSource.Contains("CompactMapRoute", StringComparison.Ordinal),
+    "map actions must expose travelable coordinates and point types without route-policy summaries");
+Assert(!File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvEventEffects.cs")) &&
+       !glossarySource.Contains("effect_deltas", StringComparison.Ordinal) &&
+       !glossarySource.Contains("ExtractEventOptionEffectDeltas", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("effect_deltas", StringComparison.Ordinal) &&
+       envHelpersSource.Contains("entry[\"description\"] = TryGetNestedString(payload, \"option\", \"description\")", StringComparison.Ordinal),
+    "event options must expose visible game text without regex-derived outcome annotations");
+Assert(!File.Exists(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvRewardShaping.cs")) &&
+       !envHelpersSource.Contains("BuildLegacyEnvRewardBreakdown", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("reward_breakdown", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("action_diagnostics", StringComparison.Ordinal) &&
+       envHelpersSource.Contains("reward = (double?)null", StringComparison.Ordinal) &&
+       envSource.Contains("scalar_computed_by_bridge = false", StringComparison.Ordinal),
+    "the Bridge environment must emit transition facts and never compute legacy scalar reward");
+Assert(!envPayloadsSource.Contains("ResolveCardSelectionSemantics", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("ResolveCardSelectionDomain", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("selection_semantics", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("selection_domain", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("source_effect_type", StringComparison.Ordinal) &&
+       !selectionActionSource.Contains("selection_semantics", StringComparison.Ordinal) &&
+       !selectionPayloadSource.Contains("selection_semantics", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("selection_semantics", StringComparison.Ordinal) &&
+       !envTextSource.Contains("DescribeSelectionSemanticsLabel", StringComparison.Ordinal) &&
+       navigationSelectionActionSource.Contains("operation_type = operationType", StringComparison.Ordinal) &&
+       selectionActionSource.Contains("\"select\"", StringComparison.Ordinal),
+    "card-selection transport must retain typed UI facts without classifying natural-language prompts");
+Assert(!mainApiSource.Contains("MaxShopOpenActionsPerRoom", StringComparison.Ordinal) &&
+       !mainApiSource.Contains("ShopOpenLimiter", StringComparison.Ordinal) &&
+       !cardFactsSource.Contains("CanExposeShopOpenAction", StringComparison.Ordinal) &&
+       !cardFactsSource.Contains("RecordShopOpenAction", StringComparison.Ordinal) &&
+       !selectionActionSource.Contains("shopOpenAvailable", StringComparison.Ordinal),
+    "legal shop-open actions must never be hidden by a strategy-oriented per-room counter");
+Assert(!envPayloadsSource.Contains("player_powers", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("allies =", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("incoming_damage_multiplier", StringComparison.Ordinal) &&
+       !envPayloadsSource.Contains("intent = new", StringComparison.Ordinal) &&
+       envPayloadsSource.Contains("players = context.CombatState.PlayerCreatures", StringComparison.Ordinal) &&
+       envPayloadsSource.Contains("powers = creature?.Powers.Select(BuildEnvPowerPayload)", StringComparison.Ordinal) &&
+       envPayloadsSource.Contains("intents = BuildEnvEnemyIntentPayloads(intentEnvelope)", StringComparison.Ordinal),
+    "live environment observations must use the grounded player/powers and enemy-intents structure shared with headless transport");
+Assert(envHelpersSource.Contains("[\"model_action_kind\"] = modelActionKind", StringComparison.Ordinal) &&
+       envHelpersSource.Contains("return \"end_turn\";", StringComparison.Ordinal),
+    "live environment legal actions must expose an exact stable model-facing action kind");
+Assert(envHelpersSource.Contains("entry[\"option\"] = CompactEventOptionPayload", StringComparison.Ordinal) &&
+       compactPayloadSource.Contains("private static object? CompactEventOptionPayload(", StringComparison.Ordinal) &&
+       compactPayloadSource.Contains("is_locked = TryGetNestedBool", StringComparison.Ordinal) &&
+       compactPayloadSource.Contains("is_proceed = TryGetNestedBool", StringComparison.Ordinal),
+    "live event candidates must retain a nested raw option DTO instead of flattening away candidate identity");
+Assert(envHelpersSource.Contains("entry[\"run_mode_action\"] = TryGetNestedString", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("entry[\"run_mode\"]", StringComparison.Ordinal),
+    "live run-mode candidates must use the canonical run_mode_action field");
+Assert(envHelpersSource.Contains("STS2_FAST_STEP_MAX_WAIT_MS", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("MUZERO_FAST_STEP_MAX_WAIT_MS", StringComparison.Ordinal),
+    "Bridge comments and configuration names must not retain the retired MuZero fast-step prefix");
 Assert(serverSource.Contains("HttpStatusCode.Gone", StringComparison.Ordinal) &&
        !serverSource.Contains("ExportStaticDataResponseAsync", StringComparison.Ordinal),
     "legacy static export must return 410 and never invoke game-process export");

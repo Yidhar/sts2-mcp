@@ -33,9 +33,7 @@ flowchart TD
     C[contracts] --> B[Bridge mod]
     C --> M[MCP server]
     C --> R[RL trainer]
-    D[game-data] --> B
-    D --> M
-    D --> R
+    D[policy-free game-data] --> O[offline catalog tools]
     B --> A[Versioned game adapter]
     M --> BC[Typed Bridge client]
     R --> LB[LiveBackend]
@@ -44,9 +42,11 @@ flowchart TD
     HB --> S[Pinned HeadlessSim]
 ```
 
-Allowed direction is `contracts + game-data -> applications`. Bridge and MCP must
-not import from the RL tree. Cross-language values are generated from the contract
-manifest rather than copied by hand.
+Allowed runtime direction is `contracts -> applications`. `game-data` feeds only
+offline catalog tooling; the grounded trainer and Bridge runtime derive facts
+from typed environment state. Bridge and MCP must not import from the RL tree.
+Cross-language values are generated from the contract manifest rather than
+copied by hand.
 
 ## Runtime domains
 
@@ -102,6 +102,15 @@ or training reward. Game-specific reflection must remain behind a versioned adap
 boundary so a retail update can disable an unsupported adapter without corrupting a
 run.
 
+Bridge payload projection is fact-only: raw card modifier IDs/types/text/amounts
+may cross the boundary, but modifier semantic tags, inferred card flow, named-card
+exceptions, redundant safety/keyword wrappers, and natural-language card-selection
+classification may not. Legal UI
+actions are never suppressed by strategy counters. Live and headless candidate
+DTOs preserve the same model-facing identity fields (`model_action_kind`, nested
+event `option`, and `run_mode_action`) without parsing visible descriptions into
+effects.
+
 Bridge activation is fail-closed and ordered: capture the loaded retail assembly
 name/version/informational version/module ID, select one exact audited profile, run
 that profile's required lifecycle and mutation-member probes, then activate Harmony,
@@ -134,25 +143,42 @@ The Python package exclusively owns:
 
 - episode and scenario semantics;
 - canonical observation and action encoding;
-- the versioned reward calculator;
-- curriculum and constraints;
+- the immutable normalized reward calculator;
+- the horizon/data curriculum;
 - replay, learner, model, evaluation, and telemetry;
-- checkpoint identity and migration;
+- checkpoint identity and exact resume;
 - experiment metadata and artifact paths.
 
-`python -m muzero.train` is the maintained training entry. PPO and historical
-attention paths are compatibility/archive material.
+`python -m sts2_rl.train` is the maintained training entry. The old
+MuZero/token-memory/MCTS, PPO, semantic rollout, planner and hand-written action
+guard paths have been deleted. They are not compatibility surfaces.
+
+World state is encoded before and independently of legal candidates. The model
+then scores only grounded legal candidates, without candidate-position embeddings.
+No transport adapter may filter, reorder, retarget or rescore legal candidates.
+See [`rl-grounded-baseline.md`](./rl-grounded-baseline.md).
+
+Before tokenization, both backends project into one model DTO using their
+observable intersection. Headless-only pile identities and inactive sections
+are removed; deck/coordinate/enemy-intent aliases are normalized; live target
+handles are joined to stable world facts. Legal actions must carry a member of a
+closed `model_action_kind` vocabulary. The encoder uses collision-free reviewed
+numeric slots, dual entity hashes, a versioned fingerprint and fail-closed
+capacity checks. Missing/unknown action kinds, non-finite facts and token overflow
+are protocol failures, not new model categories.
 
 Live and headless execution implement one typed environment backend contract. An
-adapter translates transport, but it must not silently patch a second reward or
-change episode meaning.
+adapter translates transport, but it must not patch reward, action choice or episode
+meaning.
 
 ### Game data
 
-`game-data/` is the only supported cross-component source for generated card,
-enemy, relic, potion, and effect-profile data. A manifest records deterministic
-hashes and provenance. Consumers may use `STS2_GAME_DATA_ROOT`; new imports from
-`packages/rl-agent/content` are forbidden.
+`game-data/` is the supported offline source for generated card, relic, and
+potion factual snapshots. Version 2 removed scored cards, curated task summaries,
+priors and semantic tags/signals. A manifest records deterministic hashes and
+provenance. Runtime Bridge observations come from visible game state, never this
+catalog or curated effect profiles. Offline consumers may use
+`STS2_GAME_DATA_ROOT`; new imports from `packages/rl-agent/content` are forbidden.
 
 ## Command transaction
 
@@ -212,11 +238,17 @@ explicitly.
 
 The Bridge and headless adapter emit canonical transition facts. A pure versioned
 RL reward calculator consumes those facts. Replay and checkpoints record reward,
-contract, action-ordering, observation, and game-data identities.
+contract, action-ordering, observation, dependency-lock and grounded-encoding
+identities plus exact stochastic continuation state. A valid static game-data
+manifest is optional audit provenance only because the baseline does not read it.
 
-Post-hoc tactical action/target rewriting is not a default policy layer. Runtime
-constraints are limited to structural legality, process safety, and explicit
-deadlock recovery; any override is recorded as a different executed action.
+The Bridge never computes a scalar training reward or derives event outcomes and
+route scores from display text or map topology. It exposes visible event text,
+factual map state, legal action handles, and measured transition deltas instead.
+
+Post-hoc tactical action/target rewriting is absent from the maintained RL path.
+Runtime constraints are limited to authoritative structural legality and process
+safety; protocol failure stops collection instead of substituting another action.
 
 ## Lifecycle and health
 

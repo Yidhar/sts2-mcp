@@ -19,7 +19,7 @@ const COMMITTED_COMMAND_FIXTURE = contractFixture("command-result.committed.json
 const COMMITTED_ENVIRONMENT_FIXTURE = contractFixture("environment.command-result.json");
 const COMMAND_ENVELOPE_BASE = {
   api_version: "2.0.0",
-  schema_version: "2026-07-11.1",
+  schema_version: "2026-07-13.1",
   replayed_result: false,
   accepted_at_utc: "2026-07-11T12:00:00Z"
 };

@@ -255,7 +255,6 @@ internal static partial class BridgeGameApi
     }
 
     private static object BuildCardSelectionPayload(
-        BridgeWorldContext context,
         Node? cardSelectionScreen,
         IReadOnlyList<NCardHolder> cardSelectionOptions,
         Node? cardSelectionConfirmButton,
@@ -277,8 +276,6 @@ internal static partial class BridgeGameApi
         var selectedCount = state.SelectedCount;
         var minSelect = state.MinSelect ?? GetHiddenPropertyValue<int>(prefs, "MinSelect");
         var maxSelect = state.MaxSelect ?? GetHiddenPropertyValue<int>(prefs, "MaxSelect");
-        var selectionSemantics = ResolveCardSelectionSemantics(cardSelectionScreen, prompt, texts);
-        var selectionDomain = ResolveCardSelectionDomain(context, selectionSemantics);
         var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
         var confirmVisible = state.ConfirmReady;
         var skipVisible = cardSelectionSkipButton is not null &&
@@ -291,18 +288,7 @@ internal static partial class BridgeGameApi
             screen_type = visible ? cardSelectionScreen!.GetType().Name : null,
             prompt,
             texts,
-            selection_semantics = selectionSemantics,
-            selection_domain = selectionDomain,
-            source_effect_type = selectionSemantics,
             remaining_select = remainingSelect,
-            decision_text = BuildCardSelectionDecisionText(
-                selectionSemantics,
-                prompt,
-                selectedCount,
-                minSelect,
-                maxSelect,
-                confirmVisible,
-                skipVisible),
             selected_count = selectedCount,
             min_select = minSelect,
             max_select = maxSelect,
@@ -948,10 +934,8 @@ internal static partial class BridgeGameApi
             visible = visible,
             use_single_selection = useSingleSelection,
             selected_count = selectedCount,
-            selection_semantics = "upgrade",
             prompt,
             texts,
-            decision_text = BuildDeckUpgradeDecisionText(prompt, useSingleSelection, selectedCount, confirmVisible),
             confirm_visible = confirmVisible,
             cancel_visible = deckUpgradeCancelButton is not null &&
                              IsNodeVisible(deckUpgradeCancelButton) &&

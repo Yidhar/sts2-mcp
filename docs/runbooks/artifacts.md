@@ -1,15 +1,16 @@
 # Artifact inventory and externalization runbook
 
-This runbook is intentionally conservative. Checkpoints, optimizer state, replay, and
-datasets may be irreplaceable. A request to clean the repository is not authorization
-to discard them.
+This runbook externalizes current architecture-v2 assets and dependency checkouts.
+Artifacts from the deleted MuZero/PPO/offline/demo routes are not migration inputs and
+are deliberately absent from the move map; remove them rather than archiving them as a
+supported lineage.
 
 ## Scope
 
 Runtime artifacts include:
 
 - checkpoint and optimizer directories;
-- replay buffers and offline datasets;
+- replay buffers contained in complete current atomic checkpoints and current datasets;
 - TensorBoard and diagnostic logs;
 - virtual environments and downloaded runtimes;
 - PIDs and launch-command files;
@@ -26,11 +27,10 @@ The target root must be outside the repository and is configured as
 1. Stop trainers, supervisors, game instances, Bridge, MCP, recorders, and sync jobs.
 2. Verify no process is writing into a source directory.
 3. Ensure the destination has enough free space.
-4. Back up high-value artifacts independently.
-5. Keep the pre-refactor Git patch and baseline manifests.
-6. Deactivate repository-local virtual environments. The inventory interpreter
+4. Back up current high-value artifacts independently.
+5. Deactivate repository-local virtual environments. The inventory interpreter
    must be outside every mapped source (pass `-PythonExe` explicitly if needed),
-   because post-move verification runs after the legacy environments are moved.
+   because post-move verification runs after mapped sources are moved.
 
 ## Inventory
 
@@ -74,17 +74,13 @@ destinations, parent/child destination namespace collisions, cross-volume moves,
 and ignored runtime residue that has no reviewed mapping. The target and every
 existing path component must be a normal filesystem directory, not a reparse point.
 
-The migration requires the checkout and destination to be on the same physical
+Externalization requires the checkout and destination to be on the same physical
 volume so each directory or file move is an exact atomic rename. The reviewed
-source-to-canonical mapping is versioned in `tools/artifacts/move-map.json`; legacy
-`logs_muzero`, `checkpoints_muzero`, data, dependency checkouts, loose ignored logs,
-and reports are not preserved under their old repository-prefixed layout.
-
-The Windows and WSL virtual environments are preserved only as byte-for-byte legacy
-snapshots under `legacy/environment-snapshots/`. Python virtual environments contain
-absolute activation paths and shebangs and are **not relocatable runtimes**. Never
-activate the snapshots. Rebuild usable environments at their final external paths
-from the exact dependency locks/wheel pins, then smoke-test the rebuilt interpreters.
+source-to-canonical mapping is versioned in `tools/artifacts/move-map.json`. It covers
+only current generic quarantine, release, MCP smoke, and pinned dependency paths. Any
+retired learner checkpoint, replay, demo, cache, or virtual environment is an unmapped
+residue and blocks the move until it is deleted. Rebuild usable environments at their
+final external paths from the exact dependency locks/wheel pins.
 
 ## Execute
 

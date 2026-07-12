@@ -81,7 +81,6 @@ internal static partial class BridgeGameApi
                 context.CardRewardOptions,
                 context.CardRewardSkipButton),
             CardSelection = BuildCardSelectionPayload(
-                context,
                 context.CardSelectionScreen,
                 context.CardSelectionOptions,
                 context.CardSelectionConfirmButton,

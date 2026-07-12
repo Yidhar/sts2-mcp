@@ -11,7 +11,6 @@ from launcher_watchdog import (
     _default_health_probe,
 )
 
-
 BASE_URL = "http://127.0.0.1:9123"
 
 

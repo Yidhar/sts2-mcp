@@ -26,21 +26,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="..\..\game-data\generated\card_effect_profiles.generated.json">
-      <LogicalName>Sts2McpBridge.Content.card_effect_profiles.generated.json</LogicalName>
-      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
-    </EmbeddedResource>
-    <EmbeddedResource Include="..\..\game-data\generated\potions.timing.generated.json">
-      <LogicalName>Sts2McpBridge.Content.potions.timing.generated.json</LogicalName>
-      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
-    </EmbeddedResource>
-    <EmbeddedResource Include="..\..\game-data\raw\potions.timing.overrides.json">
-      <LogicalName>Sts2McpBridge.Content.potions.timing.overrides.json</LogicalName>
-      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
-    </EmbeddedResource>
-  </ItemGroup>
-
-  <ItemGroup>
     <Reference Include="sts2">
       <HintPath>$(Sts2DataDir)\sts2.dll</HintPath>
       <Private>false</Private>

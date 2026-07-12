@@ -5,10 +5,12 @@ Status: accepted for the 2.0 refactor.
 ## Dependency direction
 
 ```text
-contracts + game-data -> bridge-mod / mcp-server / rl-trainer
+contracts -> bridge-mod / mcp-server / rl-trainer
+game-data -> offline catalog and release-audit tools only
 ```
 
-The bridge and MCP server must never import from the RL package. Game-specific
+The bridge and MCP server must never import from the RL package, and the grounded
+trainer must not read the static game-data catalog. Game-specific
 reflection is isolated behind a versioned game adapter. Runtime artifacts are
 stored outside the source checkout.
 

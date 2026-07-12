@@ -106,27 +106,23 @@ def main() -> int:
     train = exact_python_specs(extras.get("train", []), "Python train", errors)
     test = exact_python_specs(extras.get("test", []), "Python test", errors)
     dev = exact_python_specs(extras.get("dev", []), "Python dev", errors)
-    text = exact_python_specs(extras.get("text", []), "Python text", errors)
 
     runtime_lock = python_requirements(rl_root / "requirements.lock")
     dev_lock = python_requirements(rl_root / "requirements-dev.lock")
-    text_lock = python_requirements(rl_root / "requirements-text.lock")
     wsl_lock_path = rl_root / "requirements-wsl-rocm.txt"
     for filename, profile in (
         ("requirements-bootstrap.lock", "any-py3"),
         ("requirements.lock", "windows-cp313"),
         ("requirements-dev.lock", "windows-cp313"),
-        ("requirements-text.lock", "windows-cp313"),
         ("requirements-wsl-rocm.txt", "wsl-cp312-rocm-7.2.1"),
     ):
         validate_python_hash_lock(rl_root / filename, profile, errors)
     wsl_lock = python_requirements(wsl_lock_path)
     require_subset({**base, **build, **train}, runtime_lock, "requirements.lock", errors)
     require_subset({**base, **build, **train, **test, **dev}, dev_lock, "requirements-dev.lock", errors)
-    require_subset({**base, **text}, text_lock, "requirements-text.lock", errors)
     wsl_train = {name: version for name, version in train.items() if name != "torch"}
     require_subset(
-        {**base, **build, **wsl_train, **text},
+        {**base, **build, **wsl_train},
         wsl_lock,
         "requirements-wsl-rocm.txt",
         errors,

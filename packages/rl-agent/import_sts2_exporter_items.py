@@ -4,11 +4,11 @@ This script is the bridge between OceanUwU/sts2-exporter and our own RL/content
 pipeline. It reads the exporter-produced ``items.json`` and writes two kinds of
 outputs:
 
-1. Shared generated game data consumed by ``content_registry.py``:
+1. Shared generated game data consumed by the Bridge/catalog build:
    - ``game-data/generated/cards.static.generated.json``
    - ``game-data/generated/relics.static.generated.json``
    - ``game-data/generated/potions.static.generated.json``
-2. Normalized dataset-side exports for future offline tasks:
+2. Optional normalized catalog snapshots for inspection and interchange:
    - ``datasets/static_export/cards.normalized.json``
    - ``datasets/static_export/relics.normalized.json``
    - ``datasets/static_export/potions.normalized.json``
@@ -84,7 +84,7 @@ def _normalize_value(value: Any) -> Any:
     if isinstance(value, dict):
         normalized = {str(key): _normalize_value(val) for key, val in value.items()}
         return {key: val for key, val in normalized.items() if not _is_effectively_empty(val)}
-    if isinstance(value, (int, float, bool)) or value is None:
+    if isinstance(value, int | float | bool) or value is None:
         return value
     return _normalize_text(value)
 
@@ -148,7 +148,7 @@ def _is_effectively_empty(value: Any) -> bool:
         return True
     if isinstance(value, str) and value == "":
         return True
-    if isinstance(value, (dict, list)) and len(value) == 0:
+    if isinstance(value, dict | list) and len(value) == 0:
         return True
     return False
 
@@ -201,12 +201,6 @@ def _build_card_variant(entry: dict[str, Any]) -> dict[str, Any]:
         "keyword_details": _normalize_value(entry.get("keywordDetails") or []),
         "canonical_text": _normalize_text(entry.get("canonicalText")),
     }
-    semantic_tags = [str(tag) for tag in entry.get("semanticTags") or [] if str(tag).strip()]
-    semantic_signals = _normalize_value(entry.get("semanticSignals") or {})
-    if semantic_tags:
-        variant["semantic_tags"] = semantic_tags
-    if isinstance(semantic_signals, dict) and semantic_signals:
-        variant["semantic_signals"] = semantic_signals
     variant.update(_parse_energy_cost(entry.get("cost")))
     variant.update(_parse_star_cost(entry.get("starCost")))
     return variant
@@ -272,8 +266,6 @@ def _normalize_cards(raw_cards: list[dict[str, Any]], *, source_path: Path, mod_
             "effect": variants[0]["effect"],
             "keywords": variants[0].get("keywords") or [],
             "keyword_details": variants[0].get("keyword_details") or [],
-            "semantic_tags": variants[0].get("semantic_tags") or [],
-            "semantic_signals": variants[0].get("semantic_signals") or {},
             "canonical_text": variants[0].get("canonical_text") or "",
             "upgrade_levels": max_upgrade_level,
             "upgrade_level_texts": {
@@ -442,7 +434,7 @@ def _write_content_outputs(content_dir: Path, cards: dict[str, Any], relics: dic
         content_dir / "relics.static.generated.json",
         content_dir / "potions.static.generated.json",
     ]
-    for path, payload in zip(outputs, (cards, relics, potions)):
+    for path, payload in zip(outputs, (cards, relics, potions), strict=True):
         _write_json(path, payload)
     return outputs
 
@@ -473,7 +465,7 @@ def _write_dataset_outputs(
         dataset_dir / "afflictions.normalized.json",
     ]
     payloads = [cards, relics, potions, events, creatures, keywords, enchantments, afflictions]
-    for path, payload in zip(outputs, payloads):
+    for path, payload in zip(outputs, payloads, strict=True):
         _write_json(path, payload)
 
     manifest = {

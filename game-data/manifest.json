@@ -1,48 +1,18 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "generator": "tools/game_data/build_manifest.py",
-  "generator_version": "1.0.0",
+  "generator_version": "2.0.0",
   "upstream_sts2_ai_commit": "459f30873eac374c160f0b409d2d8167e7eead7c",
   "files": [
     {
-      "path": "raw/cards.json",
-      "bytes": 6732,
-      "sha256": "f5ece600d4f0ebfa0603726eed0da01716291b3f9a40936316ed77f6c93092aa"
-    },
-    {
-      "path": "raw/potions.timing.overrides.json",
-      "bytes": 23524,
-      "sha256": "2b83d5357ef84d90d1ee8b112674e5d6bcbde547c4724729eaef1c1da1f9cd72"
-    },
-    {
-      "path": "generated/card_effect_profiles.generated.json",
-      "bytes": 1879683,
-      "sha256": "5eb2e0c0223d284ad2cc30fd10a632426ad771e5b4a98d541af3ac77cd8ce39d"
-    },
-    {
-      "path": "generated/cards.generated.json",
-      "bytes": 704464,
-      "sha256": "a7a8c3455d7d9221f08c62cbaea67cfd88de1e2a46210cd5a6fd00ff8efdff57"
-    },
-    {
       "path": "generated/cards.static.generated.json",
-      "bytes": 1350142,
-      "sha256": "bf05a28c55f7f68c0f892fe45c486155bcedc5fa0045d3562df265283a075209"
-    },
-    {
-      "path": "generated/enemies.static.generated.json",
-      "bytes": 87869,
-      "sha256": "bdb22d1ff36012759d047a696a3078c26c5e4f6daa49ac0ff311e98ed2136d6b"
+      "bytes": 1148622,
+      "sha256": "16764d3e61754cf9656b16d01f1eca493fff4224fcb09482cafb5ba0a6a81276"
     },
     {
       "path": "generated/potions.static.generated.json",
       "bytes": 16575,
       "sha256": "1c05cfeb9052178bd21bb3255cd0a1185158a5837e08c6b656a5f2fa32bd0768"
-    },
-    {
-      "path": "generated/potions.timing.generated.json",
-      "bytes": 24749,
-      "sha256": "1a43a838cf5993b84adfa56de64937326f3767e4f8ab94b69f7ac31dadefacb3"
     },
     {
       "path": "generated/relics.static.generated.json",

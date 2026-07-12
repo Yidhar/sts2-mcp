@@ -119,55 +119,9 @@ internal static partial class BridgeGameApi
             },
             reward = new
             {
-                authority = "bridge-legacy-v1-only",
-                deprecated = true,
-                v2_authority = "external-rl",
-                v2_output = "transition_facts",
-                scalar = "room_settlement_milestone_v2",
-                optimized_components = new[]
-                {
-                    "combat_room_complete_bonus",
-                    "combat_room_quality_bonus",
-                    "floor_progress_bonus",
-                    "elite_clear_bonus",
-                    "boss_clear_bonus",
-                    "act_clear_bonus",
-                    "relic_gain_bonus",
-                    "max_hp_gain_bonus",
-                    "run_victory_bonus"
-                },
-                component_scales = new
-                {
-                    combat_room_complete = EnvRewardCombatWinBonus,
-                    room_hp_delta_normalized = EnvRewardRoomHpDeltaWeight,
-                    floor_delta = EnvRewardFloorDeltaWeight,
-                    elite_clear = EnvRewardEliteClearBonus,
-                    boss_clear = EnvRewardBossClearBonus,
-                    act_clear = EnvRewardActClearBonus,
-                    relic_gain_count = EnvRewardRelicGainWeight,
-                    max_hp_gain_normalized = EnvRewardMaxHpGainWeight,
-                    death = EnvRewardDeathPenalty,
-                    victory = EnvRewardVictoryBonus
-                },
-                diagnostic_channels = new[]
-                {
-                    "hp_loss_normalized",
-                    "hp_gain_normalized",
-                    "room_complete",
-                    "combat_room_complete",
-                    "room_hp_delta_normalized",
-                    "floor_delta",
-                    "act_clear",
-                    "relic_gain_count",
-                    "max_hp_gain_normalized",
-                    "death",
-                    "victory"
-                },
-                direct_terms = new
-                {
-                    action_error_penalty = EnvRewardActionErrorPenalty,
-                    truncated_penalty = EnvRewardTruncatedPenalty
-                }
+                authority = "external-rl",
+                scalar_computed_by_bridge = false,
+                output = "transition_facts"
             },
             done_conditions = new[] { "run_game_over", "step_timeout" }
         };

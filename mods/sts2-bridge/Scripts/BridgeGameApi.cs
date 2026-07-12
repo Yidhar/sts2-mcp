@@ -98,14 +98,13 @@ internal static partial class BridgeGameApi
 {
     private const int NextFrontierWaitTimeoutMs = 5000;
     // Fast combat frontier gate: after play_card/use_potion/card_selection, do
-    // not stack long heuristic waits. Re-sample direct CombatManager state and
+    // not stack long action-list polling waits. Re-sample direct CombatManager state and
     // return as soon as the state itself says the player can act
     // (IsPlayPhase && !PlayerActionsDisabled && !IsPaused), or combat exits.
     // The short budget only covers the UI-lock frame while an action resolves.
     private const int ActionableFrontierTimeoutMs = 250;
     private const int ActionableFrontierPollIntervalMs = 16;
     private const int PassiveFrontierWaitTimeoutMs = 1000;
-    private const int MaxShopOpenActionsPerRoom = 2;
     private const int DefaultMainThreadTaskTimeoutMs = 3000;
     private const int DefaultPumpWaitTimeoutMs = 2000;
     private const int MaxMainThreadGuardTimeoutMs = 5000;
@@ -114,12 +113,10 @@ internal static partial class BridgeGameApi
     {
         WriteIndented = false
     };
-    private static readonly object ShopOpenLimiterSync = new();
     private static readonly HashSet<string> SemanticStateExcludedPropertyNames = new(StringComparer.Ordinal)
     {
         "available_actions",
         "description",
-        "effect_preview",
         "dynamic_vars",
         "texts",
         "prompt",
@@ -130,19 +127,7 @@ internal static partial class BridgeGameApi
         "selection_screen_prompt",
         "watchdog_dump"
     };
-    private static string? _shopOpenLimiterRoomKey;
-    private static int _shopOpenLimiterCount;
     private static long _lastSnapshotAtTickMs;
-
-    // Cumulative self-inflicted HP loss tracker, used by the Python env to isolate
-    // player-initiated HP loss (Offering / Bloodletting / Hemokinesis / Curse draw
-    // side effects declared via card effect_preview.hp_loss) from enemy damage.
-    // Resets when the combat identity changes. Exposed via BuildEnvCombatPayload
-    // as `self_inflicted_hp_loss_cumulative`.
-    private static readonly object SelfInflictedHpLossSync = new();
-    private static WeakReference<object>? _selfInflictedHpLossCombatKey;
-    private static double _selfInflictedHpLossCumulative;
-    private static int _selfInflictedHpLossLastRound = -1;
 
     public static long? MillisecondsSinceLastSnapshot
     {
@@ -255,7 +240,6 @@ internal static partial class BridgeGameApi
         }
 
         var waitAfterMs = Math.Clamp(request.WaitAfterMs ?? 0, 0, 5000);
-        AccumulateSelfInflictedHpLossIfPlayCard(actionId, action);
         var executeStart = DateTimeOffset.UtcNow;
         var after = await ExecuteActionAndWaitForFrontierAsync(
             before,
@@ -459,7 +443,7 @@ internal static partial class BridgeGameApi
         var waitAfterEnd = DateTimeOffset.UtcNow;
 
         // For combat-mutating actions, use direct CombatManager state rather than
-        // waiting for end_turn/action-list heuristics. A real end-turn-only state
+        // waiting for end_turn/action-list polling. A real end-turn-only state
         // is actionable immediately once PlayerActionsDisabled clears; a transient
         // animation frame is identified by direct disabled/paused/playphase flags.
         var requireActionable = ShouldTryImmediateObservedFrontier(actionId);
@@ -730,85 +714,6 @@ internal static partial class BridgeGameApi
     {
         var value = ReadPayloadPropertyValue(payload, propertyName);
         return value as string;
-    }
-
-    internal static void ResetSelfInflictedHpLossTrackerForNewCombat(object? combatKey)
-    {
-        lock (SelfInflictedHpLossSync)
-        {
-            _selfInflictedHpLossCombatKey = combatKey is null
-                ? null
-                : new WeakReference<object>(combatKey);
-            _selfInflictedHpLossCumulative = 0.0;
-            _selfInflictedHpLossLastRound = -1;
-        }
-    }
-
-    internal static double ObserveSelfInflictedHpLossCumulative(object? combatKey, int currentRound)
-    {
-        // Called from env payload building. Two fresh-combat detections:
-        //   (a) CombatState reference changed — new object, new combat.
-        //   (b) Round number rolled back vs. the last observed value — same
-        //       object reused across combats (engine object pooling).
-        // Either fires a flush so full_run combat→combat transitions don't
-        // leak self-damage counters into the next encounter.
-        lock (SelfInflictedHpLossSync)
-        {
-            if (combatKey is null)
-            {
-                return 0.0;
-            }
-            object? currentKey = null;
-            _selfInflictedHpLossCombatKey?.TryGetTarget(out currentKey);
-            var refChanged = !ReferenceEquals(currentKey, combatKey);
-            var roundRolledBack =
-                _selfInflictedHpLossLastRound >= 0 &&
-                currentRound >= 0 &&
-                currentRound < _selfInflictedHpLossLastRound;
-            if (refChanged || roundRolledBack)
-            {
-                _selfInflictedHpLossCombatKey = new WeakReference<object>(combatKey);
-                _selfInflictedHpLossCumulative = 0.0;
-            }
-            if (currentRound >= 0)
-            {
-                _selfInflictedHpLossLastRound = currentRound;
-            }
-            return _selfInflictedHpLossCumulative;
-        }
-    }
-
-    private static void AccumulateSelfInflictedHpLossIfPlayCard(
-        string actionId, BridgeResolvedAction action)
-    {
-        if (string.IsNullOrEmpty(actionId) || !actionId.StartsWith("play_card:", StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        double hpLoss;
-        try
-        {
-            var payload = JsonSerializer.SerializeToElement(action.Payload);
-            var fromCard = TryGetNestedInt(payload, "card", "effect_preview", "hp_loss");
-            var fromTop = TryGetNestedInt(payload, "effect_preview", "hp_loss");
-            var resolved = fromCard ?? fromTop;
-            if (!resolved.HasValue || resolved.Value <= 0)
-            {
-                return;
-            }
-            hpLoss = resolved.Value;
-        }
-        catch
-        {
-            // Malformed payload — skip accumulation rather than crash the request path.
-            return;
-        }
-
-        lock (SelfInflictedHpLossSync)
-        {
-            _selfInflictedHpLossCumulative += hpLoss;
-        }
     }
 
     private static int? ReadPayloadIntegerProperty(object? payload, string propertyName)

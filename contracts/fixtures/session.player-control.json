@@ -9,8 +9,8 @@
   "api_versions": [
     "2.0.0"
   ],
-  "schema_version": "2026-07-11.1",
-  "action_schema_version": "2.0.0",
+  "schema_version": "2026-07-13.1",
+  "action_schema_version": "2.1.0",
   "legal_action_ordering_version": "2.0.0",
   "capabilities": [
     "player-control"

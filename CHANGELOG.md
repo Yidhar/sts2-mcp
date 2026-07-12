@@ -18,9 +18,9 @@ historical RL artifacts.
 - Disabled `legacy-v1` by default. It is published only when the operator explicitly
   sets `STS2_BRIDGE_ENABLE_LEGACY_V1=true`; canonical v2 environment step accepts
   exactly one `action_handle` or `action_index` and no `action_id` alias.
-- Declared `python -m muzero.train` as the maintained RL entry point. The three-stage
-  PPO, obsolete attention/MuZero wrappers, and duplicate training launch paths were
-  removed; archived design notes are non-executable reference material.
+- Replaced the failed MuZero/token-memory/MCTS line with
+  `python -m sts2_rl.train`. Old checkpoints and replay are not compatible with the
+  new randomly initialized grounded baseline.
 - Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
 
 ### Added
@@ -37,6 +37,12 @@ historical RL artifacts.
 - Added the typed Python `sts2_rl` contract/backend/reward/checkpoint foundation, atomic
   checkpoint helpers, portable game-data lookup, scoped live/headless backends, external
   reward ownership, process-identity checks, and stricter lifecycle tests in RL 0.2.
+- Added RL 0.3: a 3,642,824-parameter candidate-independent world encoder, grounded
+  legal-candidate policy/Q heads, dual combat/run values, fixed normalized reward,
+  coverage/recent/PER replay, direct typed-backend collector, actor-critic learner,
+  disjoint held-out evaluation seeds with per-seed metrics, complete reward-projection
+  fingerprints in replay, exact checkpoint resume and a dry-run CLI gate. No new
+  long-run or Act 1 performance result is claimed in this release.
 - Added Bridge core tests, MCP SDK/unit tests, contract/repository/data/release gates,
   GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub
@@ -52,6 +58,11 @@ historical RL artifacts.
 - Removed Bridge static-export execution, duplicate in-game Draft Tracker ownership,
   legacy PPO/attention packages, obsolete supervisors/probes, and checked-in RL-owned
   game-data copies.
+- Removed the complete MuZero/MCTS/token-memory/latent-dynamics/future-world stack,
+  objective heads, semantic planners, boss/card/potion/route heuristics, tactical
+  action guards, old offline/expert trainers, their tests, scripts and recovery notes.
+- Removed scored/prior-bearing and hand-curated card strategy data. Game-data 2.0
+  retains only policy-free static facts and strips semantic tags/signals at generation.
 - Archived pre-v2 architecture and implementation history under `docs/archive/v1`.
 
 ### Compatibility
@@ -59,9 +70,11 @@ historical RL artifacts.
 - Bridge keeps an opt-in, disabled-by-default `legacy-v1` migration surface. It is not
   advertised unless explicitly enabled; legacy mutations remain non-idempotent and are
   not the final security boundary.
-- Old replay/checkpoint compatibility is never inferred from filenames. A supported
-  migration validates contract, action-ordering, observation, reward, game-data, model,
-  optimizer, replay, and scheduler identities and fails closed otherwise.
+- Old learner replay/checkpoints are not migration inputs. Exact resume validates the
+  grounded-baseline contract, reward, dependency locks, typed lineage config, encoding
+  fingerprint, model, optimizer, replay and stochastic continuation state and fails
+  closed otherwise. Valid static game-data is optional provenance, not a runtime or
+  model identity.
 - V1 removal is gated by contract, idempotency, concurrency, capability, live/headless
   parity, checkpoint migration, CI, live end-to-end, and zero-v1-client evidence.
 

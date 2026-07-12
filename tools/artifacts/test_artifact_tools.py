@@ -40,25 +40,22 @@ class MoveMapTests(unittest.TestCase):
         self.assertEqual(len(sources), len(destinations))
         self.assertEqual(len(sources), len({value.casefold() for value in sources}))
         self.assertEqual(len(destinations), len({value.casefold() for value in destinations}))
-        self.assertIn("packages/rl-agent/checkpoints_muzero", sources)
-        self.assertIn("checkpoints/muzero", destinations)
+        self.assertIn("artifacts", sources)
+        self.assertIn("quarantine/repository-artifacts", destinations)
+        self.assertNotIn("packages/rl-agent/checkpoints_muzero", sources)
+        self.assertNotIn("checkpoints/muzero", destinations)
         self.assertIn("dependencies/sts2-ai", destinations)
-        self.assertNotIn("packages/rl-agent/checkpoints_muzero", destinations)
-        self.assertIn("packages/mcp-server/autoslay-runner-20260325-210624.log", sources)
-        self.assertIn("packages/rl-agent/training_v2.log", sources)
-        self.assertIn("legacy/environment-snapshots/windows-python", destinations)
-        self.assertIn("legacy/environment-snapshots/wsl-rocm", destinations)
-        self.assertGreater(len(move_map["forbidden_residue_patterns"]), 20)
+        self.assertNotIn("packages/rl-agent/offline_runs", sources)
+        self.assertNotIn("packages/rl-agent/human_demos", sources)
+        self.assertGreater(len(move_map["forbidden_residue_patterns"]), 15)
 
         payload = json.loads(MOVE_MAP_PATH.read_text(encoding="utf-8"))
         self.assertTrue(all(entry.get("category") for entry in payload["entries"]))
 
     def test_compatibility_root_list_does_not_double_count_nested_destinations(self) -> None:
         selected = remove_overlapping_paths(move_map_paths("artifact"))
-        self.assertIn("runs", selected)
-        self.assertNotIn("runs/legacy-policy-runs", selected)
         self.assertIn("datasets", selected)
-        self.assertNotIn("datasets/skada_clean", selected)
+        self.assertIn("dependencies/sts2-ai", selected)
 
     def test_cross_platform_relative_validation_rejects_all_anchored_spellings(self) -> None:
         for invalid in (
@@ -84,14 +81,14 @@ class InventoryTests(unittest.TestCase):
         artifact = base / "artifact"
         (source / "datasets").mkdir(parents=True)
         (source / "datasets" / "base.txt").write_text("base", encoding="utf-8")
-        (source / "packages" / "rl-agent" / "logs_attention").mkdir(parents=True)
-        (source / "packages" / "rl-agent" / "logs_attention" / "child.txt").write_text(
+        (source / "third_party" / "sts2-ai").mkdir(parents=True)
+        (source / "third_party" / "sts2-ai" / "child.txt").write_text(
             "child", encoding="utf-8"
         )
         (artifact / "datasets").mkdir(parents=True)
         (artifact / "datasets" / "base.txt").write_text("base", encoding="utf-8")
-        (artifact / "runs" / "attention-ppo-archive").mkdir(parents=True)
-        (artifact / "runs" / "attention-ppo-archive" / "child.txt").write_text(
+        (artifact / "dependencies" / "sts2-ai").mkdir(parents=True)
+        (artifact / "dependencies" / "sts2-ai" / "child.txt").write_text(
             "child", encoding="utf-8"
         )
         try:
@@ -114,13 +111,13 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(before["complete"])
         self.assertTrue(after["complete"])
         self.assertEqual(comparison["status"], "ok", comparison["problems"])
-        # The canonical runs parent exists only as scaffolding around another
-        # mapping; its reserved child namespace must not be double counted.
-        runs_parent = next(
-            entry for entry in after["entries"] if entry["destination_relative_path"] == "runs"
+        dependency = next(
+            entry
+            for entry in after["entries"]
+            if entry["destination_relative_path"] == "dependencies/sts2-ai"
         )
-        self.assertTrue(runs_parent["exists"])
-        self.assertEqual(runs_parent["files"], 0)
+        self.assertTrue(dependency["exists"])
+        self.assertEqual(dependency["files"], 1)
 
     def test_content_hash_mismatch_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -14,8 +14,8 @@ NOW = datetime(2026, 7, 12, 12, 0, tzinfo=timezone.utc)
 COMMIT = "a" * 40
 IDENTITIES = {
     "api_version": "2.0.0",
-    "schema_version": "2026-07-11.1",
-    "action_schema_version": "2.0.0",
+    "schema_version": "2026-07-13.1",
+    "action_schema_version": "2.1.0",
     "legal_action_ordering_version": "2.0.0",
     "observation_schema_version": "5.0.0",
     "reward_schema_version": "2.0.0",

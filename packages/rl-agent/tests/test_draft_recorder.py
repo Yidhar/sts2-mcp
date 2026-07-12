@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 RECORD_PATH = Path(__file__).resolve().parents[3] / "tools" / "draft_recorder" / "record.py"
 SPEC = importlib.util.spec_from_file_location("draft_recorder_record", RECORD_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -22,8 +21,8 @@ def session_payload(base_url: str = "http://127.0.0.1:27100/") -> dict[str, obje
         "base_url": base_url,
         "capability_tokens": {"player-control": "p" * 32},
         "api_versions": ["2.0.0"],
-        "schema_version": "2026-07-11.1",
-        "action_schema_version": "2.0.0",
+        "schema_version": "2026-07-13.1",
+        "action_schema_version": "2.1.0",
         "legal_action_ordering_version": "2.0.0",
         "capabilities": ["player-control"],
     }

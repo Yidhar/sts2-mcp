@@ -18,9 +18,6 @@ from sts2_env.headless_sim_bridge_client import (
 def _bare_client() -> HeadlessSimBridgeClient:
     client = HeadlessSimBridgeClient.__new__(HeadlessSimBridgeClient)
     client._current_episode_id = ""
-    client._sandbox_start_hp = None
-    client._sandbox_max_hp = None
-    client._sandbox_encounter_id = None
     return client
 
 

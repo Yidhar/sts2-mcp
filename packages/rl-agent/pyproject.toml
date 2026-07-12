@@ -7,11 +7,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sts2-rl"
-version = "0.2.0"
-description = "Typed environment contracts and composable training runtime for Slay the Spire 2"
+version = "0.3.0"
+description = "Grounded legal-candidate actor-critic baseline for Slay the Spire 2"
 requires-python = ">=3.11"
 dependencies = [
-  "gymnasium==1.2.3",
   "numpy==2.4.3",
   "requests==2.33.0",
 ]
@@ -19,12 +18,6 @@ dependencies = [
 [project.optional-dependencies]
 train = [
   "torch==2.11.0+cpu",
-  "tensorboard==2.20.0",
-  "pyarrow==23.0.1",
-  "safetensors==0.7.0",
-]
-text = [
-  "sentence-transformers==3.3.1",
 ]
 test = [
   "pytest==8.3.4",
@@ -36,17 +29,17 @@ dev = [
   "types-requests==2.32.0.20241016",
 ]
 
+[project.scripts]
+sts2-train = "sts2_rl.train:main"
+
 [tool.setuptools]
 py-modules = [
-  "combat_snapshot_dataset",
-  "content_registry",
   "launcher",
-  "offline_training_data",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["sts2_rl*", "sts2_env*", "muzero*"]
+include = ["sts2_rl*", "sts2_env*", "sts2_baseline*"]
 exclude = ["tests*", "legacy*"]
 
 [tool.pytest.ini_options]
@@ -72,7 +65,7 @@ ignore = ["B008"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["sts2_rl"]
+files = ["sts2_rl", "sts2_baseline"]
 pretty = true
 show_error_codes = true
 warn_unused_configs = true

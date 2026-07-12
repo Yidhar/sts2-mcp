@@ -8,8 +8,8 @@ route strategy belong outside this mod.
 The Bridge exposes contract API `2.0.0`. The original endpoints exist only as an
 explicitly enabled, independently authenticated `legacy-v1` migration surface.
 Canonical schemas and generated
-version constants live under `../../contracts`; embedded static game data lives
-under `../../game-data`.
+version constants live under `../../contracts`; offline catalog snapshots live
+under `../../game-data` and are not embedded as policy annotations.
 
 ## Source boundaries
 
@@ -23,14 +23,24 @@ The boundaries are intentional:
 - `BridgeGameApi.Payloads.*.cs` owns factual combat, enemy, selection, and
   navigation payload projection.
 - `BridgeGameApi.GameAdapter.*.cs` isolates game/UI/reflection compatibility,
-  context capture, card semantics, glossary extraction, and localization text.
+  context capture, raw card facts, glossary extraction, and localization text.
 - `BridgeGameCompatibilityGate.cs` owns the exact retail-assembly profile
   registry, assembly identity capture, and required startup capability probes.
 - `BridgeGameApi.Snapshots.*.cs` owns frontier/state payload assembly and SSE
   publication; `BridgeGameApi.Models.cs` owns the internal facade models.
 - `BridgeGameApi.GameCompatibility.cs` is the narrow version-difference shim.
-- `BridgeGameApi.Env*.cs` is the remaining privileged legacy/training adapter;
-  it must not leak reward or policy ownership back into the control surface.
+- `BridgeGameApi.Env*.cs` adapts factual observations, legal actions and
+  transition facts. It does not compute scalar reward, route summaries, or
+  event outcomes inferred from display text. Card modifiers retain only their
+  typed runtime fields; card-selection prompts remain opaque visible text and
+  are never classified into effects. Legal candidates include a stable
+  `model_action_kind`, nested event `option` DTOs, and canonical
+  `run_mode_action` values for live/headless parity.
+
+The action registry mirrors currently executable UI actions. It does not hide
+shop-open or other legal actions with policy-oriented loop counters, and it
+does not attach card-flow/safety wrappers, strategic skip flags, duplicated
+keyword flags, or card-specific damage exceptions.
 
 Dependency-free source-boundary tests require every newly extracted semantic
 partial to stay below 2,000 lines, verify definition-level ownership, and reject
@@ -161,8 +171,8 @@ and `/env/*` routes return `404 legacy_v1_disabled` unless
 `STS2_BRIDGE_ENABLE_LEGACY_V1=true`. When enabled they require only the separate
 `legacy-privileged` token; player-control and training tokens receive `403`.
 Legacy mutations remain non-idempotent and should be migrated to v2. Legacy
-environment responses still expose a scalar reward marked
-`legacy-bridge-v1-deprecated` for compatibility only.
+environment responses no longer compute a scalar reward; consumers must derive
+reward outside the game process from the emitted transition facts.
 
 `POST /static/export` is permanently retired and returns `410 Gone`. Use the
 dependency-free offline publisher instead:

@@ -19,7 +19,3 @@
 *.pkl binary
 *.onnx binary
 *.safetensors binary
-
-# Preserve the pre-refactor dirty-worktree evidence byte-for-byte and keep its
-# intentionally raw patch whitespace out of normal source diffs.
-docs/migration/baseline-2026-07-11/** -text -diff

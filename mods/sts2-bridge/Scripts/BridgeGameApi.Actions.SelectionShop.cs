@@ -65,14 +65,6 @@ internal static partial class BridgeGameApi
         }
 
         var selectionPrompt = TryGetCardSelectionPrompt(context.CardSelectionScreen);
-        var selectionTexts = CollectCardSelectionSurfaceTexts(
-            context.CardSelectionScreen,
-            selectionPrompt,
-            context.CardSelectionConfirmButton,
-            context.CardSelectionCancelButton,
-            context.CardSelectionCloseButton,
-            context.CardSelectionSkipButton);
-        var selectionSemantics = ResolveCardSelectionSemantics(context.CardSelectionScreen, selectionPrompt, selectionTexts);
         var selectionState = CaptureCardSelectionUiState(context.CardSelectionScreen);
         var selectedCount = selectionState.SelectedCount;
         var minSelect = selectionState.MinSelect;
@@ -91,7 +83,7 @@ internal static partial class BridgeGameApi
         var openedAgeMs = selectionState.OpenedAgeMs;
         var typedSelection = BuildRuntimeSelectionPayload(
             context.CardSelectionScreen?.GetType().Name,
-            selectionSemantics,
+            "select",
             selectedCount,
             minSelect,
             maxSelect,
@@ -120,7 +112,6 @@ internal static partial class BridgeGameApi
                         action_id = actionId,
                         kind = "card_selection",
                         selection_action = "select",
-                        selection_semantics = selectionSemantics,
                         selection_prompt = selectionPrompt,
                         typed_selection = typedSelection,
                         selected_count = selectedCount,
@@ -167,7 +158,6 @@ internal static partial class BridgeGameApi
                         action_id = actionId,
                         kind = "card_selection",
                         selection_action = "select",
-                        selection_semantics = selectionSemantics,
                         selection_prompt = selectionPrompt,
                         typed_selection = typedSelection,
                         selected_count = selectedCount,
@@ -209,7 +199,6 @@ internal static partial class BridgeGameApi
                     action_id = "card_selection:confirm",
                     kind = "card_selection",
                     selection_action = "confirm",
-                    selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
@@ -244,7 +233,6 @@ internal static partial class BridgeGameApi
                     action_id = "card_selection:cancel",
                     kind = "card_selection",
                     selection_action = "cancel",
-                    selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
@@ -279,7 +267,6 @@ internal static partial class BridgeGameApi
                     action_id = "card_selection:close",
                     kind = "card_selection",
                     selection_action = "close",
-                    selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
@@ -314,7 +301,6 @@ internal static partial class BridgeGameApi
                     action_id = "card_selection:skip",
                     kind = "card_selection",
                     selection_action = "skip",
-                    selection_semantics = selectionSemantics,
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
@@ -347,10 +333,8 @@ internal static partial class BridgeGameApi
         }
 
         var inventoryIsOpen = context.MerchantInventory?.IsOpen == true;
-        var shopOpenAvailable = CanExposeShopOpenAction(context);
 
         if (!inventoryIsOpen &&
-            shopOpenAvailable &&
             context.MerchantButton is not null &&
             IsNodeVisible(context.MerchantButton) &&
             IsButtonEnabled(context.MerchantButton))
@@ -366,11 +350,7 @@ internal static partial class BridgeGameApi
                     label = "Open merchant inventory",
                     screen = context.Screen
                 },
-                Execute = () =>
-                {
-                    InvokeButtonAction(context.MerchantButton, "OnRelease", "OnPress");
-                    RecordShopOpenAction(context);
-                }
+                Execute = () => InvokeButtonAction(context.MerchantButton, "OnRelease", "OnPress")
             });
         }
 

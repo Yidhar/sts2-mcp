@@ -8,7 +8,6 @@
 **/obj/
 *.user
 *.tmp
-*.log
 
 # OS noise
 Thumbs.db
@@ -44,35 +43,9 @@ htmlcov/
 /新建游戏项目/
 /.switchyard/
 
-# Training data, runtime state, and artifacts
-/artifacts/
-/checkpoints/
-/datasets/
-/train_logs/
-packages/rl-agent/checkpoints*/
-packages/rl-agent/data/
-packages/rl-agent/artifacts/
-packages/rl-agent/logs*/
-packages/rl-agent/runs*/
-packages/rl-agent/train_logs/
-packages/rl-agent/offline_runs/
-packages/rl-agent/eval_reports/
-packages/rl-agent/cleanup_reports/
-packages/rl-agent/human_demos/
-packages/rl-agent/analysis/
-packages/rl-agent/tmp_audit_slices/
-packages/rl-agent/.trash_training_artifacts/
-packages/rl-agent/.text_cache*/
-packages/rl-agent/.tmp_text_cache/
-packages/rl-agent/tmp/
-packages/rl-agent/tmp_gate*
-packages/rl-agent/sp_out.txt
-packages/rl-agent/sp_err.txt
-packages/rl-agent/startprocess_*_marker.txt
-packages/rl-agent/startprocess_marker*.txt
-packages/mcp-server/rl-smoke-logs/
-**/train.pid
-**/launch_command.txt
+# Training data, runs, checkpoints, logs, and process state are intentionally
+# not ignored. They must be written below the external STS2_ARTIFACT_ROOT; any
+# repository-local residue should be visible to the hygiene gate and removed.
 
 # Generated release packages belong in CI release artifacts, not Git
 /release-assets/

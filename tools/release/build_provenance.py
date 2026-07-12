@@ -28,7 +28,6 @@ IDENTITY_FILES = (
     "packages/rl-agent/requirements-bootstrap.lock",
     "packages/rl-agent/requirements.lock",
     "packages/rl-agent/requirements-dev.lock",
-    "packages/rl-agent/requirements-text.lock",
     "packages/rl-agent/requirements-wsl-rocm.txt",
     "packages/rl-agent/scripts/bootstrap_wsl_rocm.sh",
     "third_party/sts2-ai.lock.json",

@@ -1,6 +1,6 @@
 # WSL ROCm training for `rl-agent`
 
-This repo can now run MuZero training/evaluation from WSL while the STS2 game +
+This repo can run grounded-baseline training from WSL while the STS2 game +
 bridge stay on Windows.
 
 ## System networking prerequisite
@@ -31,17 +31,16 @@ directly at the loopback URL already written into `session.json`
 - `sts2_env/bridge_client.py`
   - supports `STS2_BRIDGE_BASE_URL` override
   - resolves Windows session paths correctly from WSL
-- `python -m muzero.train` / `python -m muzero.evaluate`
-  - normalize Windows paths when launched from WSL
-  - accept `--device auto` / `--device rocm` aliases (`rocm -> cuda`)
-  - print WSL bridge/device setup at startup
+- `python -m sts2_rl.train`
+  - uses the typed live backend and scoped training capability
+  - accepts `--device auto` or the ROCm-compatible PyTorch device name `cuda`
 - New bridge relay:
   - `scripts/bridge_wsl_relay.py`
   - `scripts/start_wsl_bridge_relay.ps1`
   - `scripts/stop_wsl_bridge_relay.ps1`
 - New WSL ROCm bootstrap + launcher:
   - `scripts/bootstrap_wsl_rocm.sh`
-  - `scripts/train_muzero_wsl_rocm.sh`
+  - `scripts/train_grounded_wsl_rocm.sh`
 
 ## Why the relay still exists
 
@@ -79,17 +78,15 @@ This installs:
 - this project in editable mode without build isolation, using the already locked
   `setuptools`/`wheel`, followed by `pip check` and a real GPU visibility check
 
-## Launch MuZero training from WSL
+## Launch grounded-baseline training from WSL
 
 ```bash
 export REPO_ROOT='/mnt/<drive>/path/to/sts2_mcp'
 export STS2_ARTIFACT_ROOT='/mnt/<drive>/sts2-artifacts'
 cd "$REPO_ROOT/packages/rl-agent"
-bash scripts/train_muzero_wsl_rocm.sh \
-  --resume-from "$STS2_ARTIFACT_ROOT/checkpoints/your_checkpoint" \
-  --log-dir "$STS2_ARTIFACT_ROOT/runs/example" \
-  --checkpoint-dir "$STS2_ARTIFACT_ROOT/checkpoints/example" \
-  --total-timesteps 200000
+bash scripts/train_grounded_wsl_rocm.sh \
+  --profile default \
+  --steps 200000
 ```
 
 The launcher will:
@@ -97,10 +94,10 @@ The launcher will:
 1. ensure the WSL ROCm venv exists
 2. try direct `127.0.0.1` bridge access from WSL
 3. only start the Windows relay if direct localhost access fails
-4. launch `python -m muzero.train --device cuda ...`
+4. launch `python -m sts2_rl.train --device cuda --backend live ...`
 
-The deleted top-level compatibility wrappers are not supported. Maintained WSL
-automation invokes the `muzero` module entry points directly.
+The deleted MuZero/token-memory compatibility wrappers are not supported.
+Checkpoints and logs resolve below `STS2_ARTIFACT_ROOT` through the typed config.
 
 ## Custom bridge session path
 

@@ -121,6 +121,31 @@
         }
       ]
     },
+    "model_action_kind": {
+      "type": "string",
+      "description": "Stable model-facing category shared by every Contract-v2 legal action producer and grounded learner.",
+      "enum": [
+        "card_reward",
+        "card_selection",
+        "character_select",
+        "deck_upgrade",
+        "discard_potion",
+        "end_turn",
+        "event_option",
+        "game_over",
+        "main_menu",
+        "map",
+        "play_card",
+        "proceed",
+        "rest_site",
+        "reward",
+        "run_mode_selection",
+        "shop",
+        "treasure",
+        "treasure_relic",
+        "use_potion"
+      ]
+    },
     "legal_action": {
       "type": "object",
       "additionalProperties": true,
@@ -128,7 +153,8 @@
       "required": [
         "idx",
         "action_handle",
-        "kind"
+        "kind",
+        "model_action_kind"
       ],
       "properties": {
         "idx": {
@@ -144,6 +170,9 @@
         "kind": {
           "type": "string",
           "minLength": 1
+        },
+        "model_action_kind": {
+          "$ref": "#/$defs/model_action_kind"
         }
       }
     },
@@ -284,7 +313,7 @@
           "const": "2.0.0"
         },
         "schema_version": {
-          "const": "2026-07-11.1"
+          "const": "2026-07-13.1"
         },
         "capability": {
           "const": "training"
@@ -411,7 +440,7 @@
           "const": "2.0.0"
         },
         "schema_version": {
-          "const": "2026-07-11.1"
+          "const": "2026-07-13.1"
         },
         "capability": {
           "const": "training"
@@ -492,7 +521,7 @@
           "const": "2.0.0"
         },
         "schema_version": {
-          "const": "2026-07-11.1"
+          "const": "2026-07-13.1"
         },
         "capability": {
           "const": "training"

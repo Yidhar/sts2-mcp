@@ -7,7 +7,12 @@ from urllib.parse import urlparse
 import pytest
 
 from sts2_rl.contracts import ResetRequest
-from sts2_rl.contracts.versions import API_VERSION, SCHEMA_VERSION
+from sts2_rl.contracts.versions import (
+    ACTION_SCHEMA_VERSION,
+    API_VERSION,
+    SCHEMA_VERSION,
+)
+from sts2_rl.encoding import MODEL_ACTION_KIND_VOCABULARY
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONTRACT_ROOT = REPO_ROOT / "contracts"
@@ -35,6 +40,19 @@ def test_manifest_versions_match_generated_python_source() -> None:
     manifest = _load(MANIFEST_PATH)
     assert manifest["api_version"] == API_VERSION
     assert manifest["schema_version"] == SCHEMA_VERSION
+    assert manifest["action_schema_version"] == ACTION_SCHEMA_VERSION
+
+
+def test_environment_model_action_kind_contract_matches_grounded_encoder() -> None:
+    schema = _load(CONTRACT_ROOT / "schemas" / "environment.schema.json")
+    legal_action = schema["$defs"]["legal_action"]
+    model_action_kind = schema["$defs"]["model_action_kind"]
+
+    assert "model_action_kind" in legal_action["required"]
+    assert legal_action["properties"]["model_action_kind"] == {
+        "$ref": "#/$defs/model_action_kind"
+    }
+    assert set(model_action_kind["enum"]) == MODEL_ACTION_KIND_VOCABULARY
 
 
 def test_manifest_lists_parseable_schemas_and_resolvable_local_refs() -> None:

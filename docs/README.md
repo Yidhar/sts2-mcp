@@ -12,7 +12,8 @@ Use these sources in this order:
    and fixtures for wire behavior.
 2. [`../release-manifest.json`](../release-manifest.json) for component versions.
 3. [`architecture.md`](./architecture.md) and
-   [`architecture/target-architecture.md`](./architecture/target-architecture.md)
+   [`architecture/target-architecture.md`](./architecture/target-architecture.md),
+   plus [`rl-grounded-baseline.md`](./rl-grounded-baseline.md)
    for boundaries and ownership.
 4. Accepted decisions under [`adr/`](./adr).
 5. [`migration/README.md`](./migration/README.md) and
@@ -21,7 +22,7 @@ Use these sources in this order:
 6. Component READMEs:
    - [`../mods/sts2-bridge/README.md`](../mods/sts2-bridge/README.md)
    - [`../packages/mcp-server/README.md`](../packages/mcp-server/README.md)
-   - [`../packages/rl-agent/muzero/README.md`](../packages/rl-agent/muzero/README.md)
+   - [`rl-grounded-baseline.md`](./rl-grounded-baseline.md)
    - [`../game-data/README.md`](../game-data/README.md)
 7. Operational runbooks under [`runbooks/`](./runbooks).
 
@@ -56,9 +57,9 @@ decisions from a launcher, compatibility wrapper, or build script.
   override current entry points, contracts, reward ownership, or safety rules.
 - [`generated/`](./generated) is produced by tooling. Do not hand-edit generated
   tables or JSON.
-- The protected baseline files in `migration/baseline-2026-07-11/`,
-  `migration/pre-move-artifacts.json`, and `migration/legacy-worktree-sha256.txt`
-  are audit evidence. Do not rewrite them as documentation cleanup.
+- Historical RL worktree patches, artifact inventories, checkpoint paths, and replay
+  hashes are intentionally not retained in the rebooted repository. Git history is
+  the only archive; none of it is a supported training input.
 
 ## Documentation maintenance rules
 

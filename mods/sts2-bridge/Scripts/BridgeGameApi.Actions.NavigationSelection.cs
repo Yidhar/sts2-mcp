@@ -222,28 +222,9 @@ internal static partial class BridgeGameApi
         }
     }
 
-    private static string NormalizeSelectionOperationType(string? semantics)
-    {
-        return (semantics ?? string.Empty).Trim().ToLowerInvariant() switch
-        {
-            "discard" => "discard",
-            "retain" => "retain",
-            "exhaust" => "exhaust",
-            "remove" => "remove",
-            "transform" => "transform",
-            "upgrade" => "upgrade",
-            "copy" => "copy",
-            "add" => "add",
-            "replace" => "replace",
-            "enchant" => "enchant",
-            "afflict" => "afflict",
-            _ => "unknown"
-        };
-    }
-
     private static object BuildRuntimeSelectionPayload(
         string? screenType,
-        string? selectionSemantics,
+        string operationType,
         int selectedCount,
         int? minSelect,
         int? maxSelect,
@@ -256,7 +237,7 @@ internal static partial class BridgeGameApi
         return new
         {
             screen_type = string.IsNullOrWhiteSpace(screenType) ? "card_selection" : screenType,
-            operation_type = NormalizeSelectionOperationType(selectionSemantics),
+            operation_type = operationType,
             source = string.IsNullOrWhiteSpace(source) ? "card_selection" : source,
             source_zone = sourceZone ?? string.Empty,
             destination_zone = destinationZone ?? string.Empty,
@@ -305,7 +286,6 @@ internal static partial class BridgeGameApi
                     action_id = actionId,
                     kind = "deck_upgrade",
                     upgrade_action = "select_card",
-                    selection_semantics = "upgrade",
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     index,
@@ -329,7 +309,6 @@ internal static partial class BridgeGameApi
                     action_id = "deck_upgrade:confirm",
                     kind = "deck_upgrade",
                     upgrade_action = "confirm",
-                    selection_semantics = "upgrade",
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     label = "Confirm upgrade selection",
@@ -354,7 +333,6 @@ internal static partial class BridgeGameApi
                     action_id = "deck_upgrade:cancel",
                     kind = "deck_upgrade",
                     upgrade_action = "cancel",
-                    selection_semantics = "upgrade",
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     label = "Cancel upgrade selection",
@@ -379,7 +357,6 @@ internal static partial class BridgeGameApi
                     action_id = "deck_upgrade:close",
                     kind = "deck_upgrade",
                     upgrade_action = "close",
-                    selection_semantics = "upgrade",
                     selection_prompt = selectionPrompt,
                     typed_selection = typedSelection,
                     label = "Close upgrade selection",

@@ -68,17 +68,17 @@ python -m pip install -r requirements-bootstrap.lock
 python -m pip install -r requirements-dev.lock
 python -m pip install -e . --no-deps --no-build-isolation
 python -m pip check
-python -m ruff check sts2_rl launcher.py launcher_watchdog.py
-python -m mypy sts2_rl
+python -m ruff check sts2_rl sts2_baseline launcher.py launcher_watchdog.py
+python -m mypy sts2_rl sts2_baseline
 python -m pytest tests -q -p no:cacheprovider
-python .\scripts\check_muzero_file_budget.py
-python -m muzero.train --help
+python -m sts2_rl.train --dry-run
 Set-Location ..\..
 ```
 
 Live or headless smoke runs are separate from unit/contract tests. A long training run
 requires green backend lifecycle, live/headless parity, reward identity, checkpoint
-resume, and artifact-path checks.
+resume, artifact-path checks, and the fixed odd held-out seed namespace with per-seed
+logs. Dry-run and unit tests do not establish Act 1 performance.
 
 ## Contract and game-data changes
 

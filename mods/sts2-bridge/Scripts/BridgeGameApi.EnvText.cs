@@ -1,8 +1,6 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using MegaCrit.Sts2.Core.Entities.Creatures;
-using MegaCrit.Sts2.Core.Models;
 
 namespace Sts2McpBridge.Scripts;
 
@@ -13,40 +11,6 @@ namespace Sts2McpBridge.Scripts;
 /// </summary>
 internal static partial class BridgeGameApi
 {
-    // -----------------------------------------------------------------------
-    // Card
-    // -----------------------------------------------------------------------
-
-    private static string BuildCanonicalCardText(CardModel? card, Creature? previewTarget = null)
-    {
-        if (card is null) return "";
-        var sb = new StringBuilder("卡牌｜");
-        sb.Append(NormalizeSemanticText(TextOf(card.Title)));
-        sb.Append("｜").Append(card.Type.ToString());
-
-        if (card.EnergyCost.CostsX)
-            sb.Append("｜能量X");
-        else
-            sb.Append("｜能量").Append(card.EnergyCost.GetResolved());
-
-        var starCost = SafeGetStarCost(card);
-        if (starCost is not null)
-        {
-            if (SafeHasStarCostX(card))
-                sb.Append("｜星辉X");
-            else
-                sb.Append("｜星辉").Append(starCost);
-        }
-
-        sb.Append("｜目标").Append(TranslateTargetType(card.TargetType.ToString()));
-
-        var effect = SafeGetCardEffectText(card, previewTarget);
-        if (!string.IsNullOrWhiteSpace(effect))
-            sb.Append("｜效果：").Append(NormalizeSemanticText(effect));
-
-        return sb.ToString();
-    }
-
     // -----------------------------------------------------------------------
     // Relic
     // -----------------------------------------------------------------------
@@ -194,7 +158,7 @@ internal static partial class BridgeGameApi
             }
 
             case "map":
-                return BuildCanonicalMapRouteActionText(payload);
+                return BuildCanonicalMapActionText(payload);
 
             case "rest_site":
                 return $"动作｜营火｜{NormalizeSemanticText(TryGetNestedString(payload, "option", "label") ?? TryGetNestedString(payload, "option", "semantic_action") ?? "")}";
@@ -202,19 +166,14 @@ internal static partial class BridgeGameApi
             case "deck_upgrade":
             {
                 var upgradeAction = TryGetNestedString(payload, "upgrade_action") ?? "";
-                var selectionSemantics = TryGetNestedString(payload, "selection_semantics") ?? "upgrade";
-                var selectionLabel = DescribeSelectionSemanticsLabel(selectionSemantics);
-                if (upgradeAction.Contains("confirm", StringComparison.OrdinalIgnoreCase))
-                    return $"动作｜确认{selectionLabel}选择";
-                if (upgradeAction.Contains("cancel", StringComparison.OrdinalIgnoreCase))
-                    return $"动作｜取消{selectionLabel}选择";
-                if (upgradeAction.Contains("close", StringComparison.OrdinalIgnoreCase))
-                    return $"动作｜关闭{selectionLabel}界面";
+                if (upgradeAction == "confirm") return "动作｜确认升级选择";
+                if (upgradeAction == "cancel") return "动作｜取消升级选择";
+                if (upgradeAction == "close") return "动作｜关闭升级界面";
                 var origTitle = TryGetNestedString(payload, "card", "title") ?? "";
                 var previewEffect = TryGetNestedString(payload, "upgrade_preview", "effect")
                                     ?? TryGetNestedString(payload, "upgrade_preview", "description") ?? "";
                 var sb = new StringBuilder("动作｜");
-                sb.Append(selectionLabel).Append("候选｜").Append(NormalizeSemanticText(origTitle));
+                sb.Append("升级候选｜").Append(NormalizeSemanticText(origTitle));
                 if (!string.IsNullOrWhiteSpace(previewEffect))
                     sb.Append("｜升级后：").Append(NormalizeSemanticText(previewEffect));
                 return sb.ToString();
@@ -247,16 +206,14 @@ internal static partial class BridgeGameApi
             case "card_selection":
             {
                 var sel = TryGetNestedString(payload, "selection_action") ?? "";
-                var selectionSemantics = TryGetNestedString(payload, "selection_semantics") ?? "choose";
-                var selectionLabel = DescribeSelectionSemanticsLabel(selectionSemantics);
-                if (sel.Contains("confirm", StringComparison.OrdinalIgnoreCase)) return $"动作｜确认{selectionLabel}选择";
-                if (sel.Contains("cancel", StringComparison.OrdinalIgnoreCase)) return $"动作｜取消{selectionLabel}选择";
-                if (sel.Contains("close", StringComparison.OrdinalIgnoreCase)) return $"动作｜关闭{selectionLabel}界面";
-                if (sel.Contains("skip", StringComparison.OrdinalIgnoreCase)) return $"动作｜跳过{selectionLabel}选择";
+                if (sel == "confirm") return "动作｜确认卡牌选择";
+                if (sel == "cancel") return "动作｜取消卡牌选择";
+                if (sel == "close") return "动作｜关闭卡牌选择界面";
+                if (sel == "skip") return "动作｜跳过卡牌选择";
                 var cardTitle = NormalizeSemanticText(TryGetNestedString(payload, "card", "title") ?? "");
                 if (!string.IsNullOrWhiteSpace(cardTitle))
-                    return $"动作｜{selectionLabel}候选｜{cardTitle}";
-                return $"动作｜{selectionLabel}候选";
+                    return $"动作｜卡牌候选｜{cardTitle}";
+                return "动作｜卡牌候选";
             }
 
             default:
@@ -278,22 +235,13 @@ internal static partial class BridgeGameApi
         return result;
     }
 
-    private static string BuildCanonicalMapRouteActionText(JsonElement payload)
+    private static string BuildCanonicalMapActionText(JsonElement payload)
     {
         var pointType = TranslateMapPointType(
             TryGetNestedString(payload, "point_type_norm") ??
             TryGetNestedString(payload, "point_type"));
         var col = TryGetNestedInt(payload, "coord", "col");
         var row = TryGetNestedInt(payload, "coord", "row");
-        var countShop = TryGetNestedInt(payload, "route_summary", "count_shop");
-        var countRest = TryGetNestedInt(payload, "route_summary", "count_rest_site");
-        var countElite = TryGetNestedInt(payload, "route_summary", "count_elite");
-        var countQuestion = TryGetNestedInt(payload, "route_summary", "count_question_mark");
-        var nextShop = TryGetNestedInt(payload, "route_summary", "next_shop_steps");
-        var nextRest = TryGetNestedInt(payload, "route_summary", "next_rest_steps");
-        var nextElite = TryGetNestedInt(payload, "route_summary", "next_elite_steps");
-        var nextQuestion = TryGetNestedInt(payload, "route_summary", "next_question_mark_steps");
-        var forcedSteps = TryGetNestedInt(payload, "route_summary", "forced_path_steps_before_branch");
 
         var sb = new StringBuilder("动作｜前往｜");
         sb.Append(pointType);
@@ -302,56 +250,26 @@ internal static partial class BridgeGameApi
             sb.Append($"｜坐标({col},{row})");
         }
 
-        if (countShop is > 0 || countRest is > 0 || countElite is > 0 || countQuestion is > 0)
-        {
-            sb.Append("｜未来");
-            if (countShop is > 0)
-            {
-                sb.Append($"｜商店{countShop}");
-            }
-
-            if (countRest is > 0)
-            {
-                sb.Append($"｜营火{countRest}");
-            }
-
-            if (countElite is > 0)
-            {
-                sb.Append($"｜精英{countElite}");
-            }
-
-            if (countQuestion is > 0)
-            {
-                sb.Append($"｜问号{countQuestion}");
-            }
-        }
-
-        if (nextRest is not null)
-        {
-            sb.Append($"｜最近营火{nextRest}步");
-        }
-
-        if (nextShop is not null)
-        {
-            sb.Append($"｜最近商店{nextShop}步");
-        }
-
-        if (nextElite is not null)
-        {
-            sb.Append($"｜最近精英{nextElite}步");
-        }
-
-        if (nextQuestion is not null)
-        {
-            sb.Append($"｜最近问号{nextQuestion}步");
-        }
-
-        if (forcedSteps is > 1)
-        {
-            sb.Append($"｜强制路径{forcedSteps}步");
-        }
-
         return sb.ToString();
+    }
+
+    private static string NormalizeEnvMapPointType(string? pointType)
+    {
+        return pointType switch
+        {
+            "Merchant" => "Shop",
+            "Shop" => "Shop",
+            "Rest" => "RestSite",
+            "RestSite" => "RestSite",
+            "Monster" => "Monster",
+            "Elite" => "Elite",
+            "Boss" => "Boss",
+            "Event" => "Event",
+            "Unknown" => "QuestionMark",
+            "QuestionMark" => "QuestionMark",
+            "Treasure" => "Treasure",
+            _ => pointType ?? "Unknown"
+        };
     }
 
     private static string TranslateMapPointType(string? pointType)
@@ -370,21 +288,6 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static string DescribeSelectionSemanticsLabel(string? semantics)
-    {
-        return (semantics ?? "").Trim().ToLowerInvariant() switch
-        {
-            "remove" => "移除",
-            "transform" => "变化",
-            "upgrade" => "升级",
-            "discard" => "弃牌",
-            "retain" => "保留",
-            "bundle" => "组合",
-            "choose" => "选择",
-            _ => "选择"
-        };
-    }
-
     private static string TranslateTargetType(string? targetType)
     {
         return (targetType ?? "") switch
@@ -400,51 +303,4 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static string SafeGetCardEffectText(CardModel card, Creature? target)
-    {
-        // Try effect preview via reflection
-        try
-        {
-            var resolvedTarget = target ?? GetHiddenFieldValue(card, "_currentTarget") as Creature;
-            var method = FindMethod(card.GetType(), "GetEffectPreviewSummary", 1);
-            if (method is not null)
-            {
-                var result = method.Invoke(card, new object?[] { resolvedTarget });
-                if (result is string s && !string.IsNullOrWhiteSpace(s)) return s;
-            }
-        }
-        catch { /* best effort */ }
-
-        // Fall back to description
-        try
-        {
-            var desc = DescribeText(card.Description, card);
-            if (!string.IsNullOrWhiteSpace(desc)) return desc;
-        }
-        catch { /* best effort */ }
-
-        return "";
-    }
-
-    private static int? SafeGetStarCost(CardModel card)
-    {
-        try
-        {
-            var prop = card.GetType().GetProperty("CurrentStarCost");
-            if (prop?.GetValue(card) is int v && v >= 0) return v;
-        }
-        catch { /* best effort */ }
-        return null;
-    }
-
-    private static bool SafeHasStarCostX(CardModel card)
-    {
-        try
-        {
-            var prop = card.GetType().GetProperty("HasStarCostX");
-            if (prop?.GetValue(card) is bool v) return v;
-        }
-        catch { /* best effort */ }
-        return false;
-    }
 }

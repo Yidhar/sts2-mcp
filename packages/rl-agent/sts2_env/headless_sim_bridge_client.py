@@ -1,22 +1,8 @@
-"""BridgeClient-compatible adapter that talks to frankqwang/sts2-ai's
-HeadlessSim instead of the real Godot bridge HTTP mod.
+"""Synchronous JSON-lines transport for the HeadlessSim process.
 
-The HeadlessSim is a C# process that links against the decompiled STS2 game
-code minus rendering — so game logic is identical to the real game but it
-runs ~100-1000× faster, can be parallelized to many processes, and doesn't
-crash from PunchOff / silent-hang / save-file contention issues.
-
-Architectural notes:
-- This client IS a BridgeClient subclass API-wise (same method signatures)
-  so CombatSandboxEnv and SlayTheSpire2EnvV2 don't need changes.
-- Sim speaks line-delimited JSON over stdio (`{"method": ..., "params": ...}`
-  per line). Much lower latency than HTTP.
-- Sim's state dict format is STRUCTURALLY DIFFERENT from our bridge's. All
-  the translation happens in ``_translate_to_bridge_shape``.
-- This is Phase 2 of the sim migration — focused on getting training running
-  today. Many aux fields (self_inflicted_hp_loss_cumulative,
-  incoming_damage_multiplier, power.id, event_option.effect_deltas) are
-  zero-filled for now; Phase 3 will port those from our mod into the sim.
+This client owns subprocess lifecycle, RPC framing, action-handle dispatch,
+and structural DTO translation only.  Rewards and learning semantics are
+owned by the typed ``sts2_rl`` boundary.
 """
 from __future__ import annotations
 
@@ -30,9 +16,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-# Inherit from BridgeError so the combat_env narrow `except BridgeError`
-# path catches sim failures too. env_v2 already uses `except Exception` so
-# it doesn't care about the MRO.
+# Use the shared transport exception so typed live/headless callers have one
+# failure boundary without importing simulator-specific exception classes.
 from sts2_env.bridge_client import BridgeError
 from sts2_rl.artifacts import artifact_root, resolve_artifact_path, resolve_external_input_path
 from sts2_rl.contracts.versions import API_VERSION, SCHEMA_VERSION
@@ -142,23 +127,6 @@ class HeadlessSimBridgeClient:
         # PID once it's up so 4 parallel sims don't clobber each other.
         self._hang_log_path: Path | None = None
         self._hang_log_handle = None
-        # Tracks cumulative self-inflicted HP loss across combat turns.
-        # Reset at combat entry, advanced when a known self-damage card is
-        # played and HP subsequently drops. Mirrors the bridge mod's
-        # BuildEnvCombatPayload.self_inflicted_hp_loss_cumulative field.
-        from sts2_env._sim_translate import SelfInflictedHpTracker  # noqa: PLC0415
-        self._self_inflicted_tracker = SelfInflictedHpTracker()
-        self._last_in_combat: bool = False
-        # Combat-sandbox terminal-reward parity. Sim's C# side emits a flat
-        # -1.0 / +1.0 terminal reward which does NOT match live bridge mod's
-        # breakdown (BridgeGameApi.EnvHelpers.BuildEnvCombatSandboxReward-
-        # Breakdown). Live formula for sandbox loss: death(-2.0) +
-        # room_hp_delta_normalized*1.5 = -3.5 on full-HP-loss boss defeat.
-        # We track per-combat start state at combat_reset and override sim's
-        # terminal reward with the live-parity formula.
-        self._sandbox_start_hp: float | None = None
-        self._sandbox_max_hp: float | None = None
-        self._sandbox_encounter_id: str | None = None
         self._start_subprocess(startup_timeout_s)
 
     # ------------------------------------------------------------------
@@ -296,7 +264,7 @@ class HeadlessSimBridgeClient:
                 self._hang_log("reader_readline_done", nchars=len(line))
                 if not self._enqueue_stdout(line):
                     return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Push a sentinel so waiters don't block forever. We swallow
             # the exception because the worker thread picking up the
             # sentinel will raise a clean HeadlessSimError.
@@ -385,7 +353,7 @@ class HeadlessSimBridgeClient:
             except (OSError, ValueError):
                 pass
 
-    def __enter__(self) -> "HeadlessSimBridgeClient":
+    def __enter__(self) -> HeadlessSimBridgeClient:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -463,7 +431,7 @@ class HeadlessSimBridgeClient:
                     f"HeadlessSim RPC {method} timed out after "
                     f"{waited:.1f}s (sim hung on params={json.dumps(params or {}, ensure_ascii=False)[:200]} — "
                     f"killed; see {self._hang_log_path} for context)"
-                )
+                ) from None
         elapsed = time.time() - sent_at
         # Phase A checkpoint D: got a line from reader queue.
         self._hang_log("rpc_stdout_await_done", method=method, elapsed_s=elapsed)
@@ -539,11 +507,10 @@ class HeadlessSimBridgeClient:
 
     def get_state(self) -> dict[str, Any]:
         sim_state = self._rpc("state")
-        from sts2_env._sim_translate import translate_to_bridge_shape  # noqa: PLC0415
+        from sts2_env._sim_translate import translate_to_bridge_shape
         return translate_to_bridge_shape(
             sim_state,
             episode_id=self._current_episode_id,
-            self_inflicted_tracker=self._self_inflicted_tracker,
         )
 
     def reset(
@@ -570,11 +537,6 @@ class HeadlessSimBridgeClient:
         if defensive_buffs:
             params["defensive_buffs"] = True
         sim_state = self._rpc("reset", params, timeout_s=timeout_s)
-        # Full-run reset clears any combat_sandbox tracking — the sandbox
-        # reward formula shouldn't fire during full-run episodes.
-        self._sandbox_start_hp = None
-        self._sandbox_max_hp = None
-        self._sandbox_encounter_id = None
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
         )
@@ -621,10 +583,6 @@ class HeadlessSimBridgeClient:
             if field in raw and raw[field] is not None:
                 params[field] = raw[field]
 
-        # Inform the self-damage tracker about the action BEFORE dispatching,
-        # so the post-step HP observation can attribute any drop.
-        self._self_inflicted_tracker.note_action(raw)
-
         wrapped = self._rpc("step", params, timeout_s=max(float(timeout_ms) / 1000.0, 0.001))
         # Sim step wraps the new state under {accepted, state, error}. Unwrap.
         sim_state = wrapped.get("state") or {}
@@ -635,44 +593,6 @@ class HeadlessSimBridgeClient:
             info_extra["sim_step_rejected"] = True
             info_extra["sim_error"] = str(wrapped.get("error") or "")
 
-        # Deadlock workaround (2026-04-18): the C# sim's internal
-        # auto-advance runs up to 30 iterations to settle a turn transition,
-        # then returns control. Empirically, dense enemy-turn resolution
-        # (multiple enemies × multiple intents × power triggers) can exceed
-        # that budget, leaving the sim in a state where it THINKS the
-        # player can act but internal action_queue / coroutines are still
-        # draining. The next play_card then hangs waiting for a
-        # "player_turn_ready" signal that never arrives in headless mode.
-        #
-        # Observed pattern (3/3 hangs in one training run):
-        #   end_turn → sim returns ok → play_card → deadlock at 45s.
-        #
-        # Fix: after every successful end_turn that leaves us still in
-        # combat (not game_over, not post-combat event), proactively send
-        # one extra "wait" RPC to give sim another auto-advance cycle.
-        # "wait" is the same action sim's internal auto-advance uses, so
-        # it's a well-tested code path.
-        action_kind = str(raw.get("action") or "")
-        if accepted and action_kind == "end_turn":
-            post_state_type = str(sim_state.get("state_type") or "").lower()
-            if post_state_type in ("combat", "battle"):
-                try:
-                    wait_wrapped = self._rpc("step", {"action": "wait"})
-                    wait_state = wait_wrapped.get("state")
-                    if isinstance(wait_state, dict):
-                        sim_state = wait_state
-                        # Accumulate any reward that fired during the
-                        # wait's extra auto-advance (enemy pokes,
-                        # end-of-turn powers, etc.)
-                        reward += float(wait_wrapped.get("reward", 0.0) or 0.0)
-                        info_extra["sim_end_turn_settle_wait"] = True
-                except HeadlessSimError as exc:
-                    # Wait itself hung/died — this combat is probably
-                    # unrecoverable anyway. Fall through with the
-                    # original end_turn response; the next normal step
-                    # will hit the same error and trigger worker restart
-                    # via our standard error path.
-                    info_extra["sim_settle_wait_failed"] = repr(exc)
         return _build_bridge_step_response(
             self, sim_state, episode_started=False, reward=reward,
             info_extra=info_extra,
@@ -778,41 +698,9 @@ class HeadlessSimBridgeClient:
                 f"{str(combat_result.get('error'))[:500]}"
             )
         sim_state = self._rpc("state", timeout_s=timeout_s)
-        # Capture starting HP for live-parity terminal reward computation.
-        # max_hp in the sandbox reset request sets the new combat's max;
-        # current_hp sets the starting HP. Fall back to observed player HP
-        # if either is missing from the request.
-        observed_hp = _extract_player_hp(sim_state)
-        self._sandbox_start_hp = float(current_hp if current_hp is not None else (observed_hp or 0))
-        self._sandbox_max_hp = float(max_hp if max_hp is not None else (observed_hp or 0))
-        self._sandbox_encounter_id = str(encounter_id) if encounter_id else None
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
         )
-
-
-# ----------------------------------------------------------------------
-# Translation: sim state dict → bridge-shaped observation
-# ----------------------------------------------------------------------
-
-def _extract_player_hp(sim_state: dict[str, Any]) -> int | None:
-    """Dig out the player's current HP from whichever sub-state holds it."""
-    for key in ("battle", "event", "map", "rest_site", "shop", "treasure",
-                "rewards", "card_reward", "card_select", "hand_select",
-                "relic_select", "game_over"):
-        section = sim_state.get(key)
-        if isinstance(section, dict):
-            player = section.get("player")
-            if isinstance(player, dict):
-                hp = player.get("current_hp", player.get("hp"))
-                if isinstance(hp, int):
-                    return hp
-    player = sim_state.get("player")
-    if isinstance(player, dict):
-        hp = player.get("current_hp", player.get("hp"))
-        if isinstance(hp, int):
-            return hp
-    return None
 
 
 def _normalize_character(character: str | None) -> str:
@@ -840,33 +728,14 @@ def _build_bridge_step_response(
     if episode_started:
         client._episode_counter += 1
         client._current_episode_id = f"sim-ep-{client._episode_counter}"
-        # Fresh episode: reset self-damage tracking to the starting HP.
-        initial_hp = _extract_player_hp(sim_state)
-        client._self_inflicted_tracker.reset(initial_hp)
-        client._last_in_combat = False
 
     terminal = bool(sim_state.get("terminal", False))
     truncated = bool(sim_state.get("truncated", False))
 
-    # If we just entered combat (wasn't combat last tick, is now), reset the
-    # self-damage tracker at combat start so carry-over from previous combats
-    # doesn't contaminate. Bridge mod resets per combat via
-    # ResetSelfInflictedHpLossTrackerForNewCombat; mirror here.
-    sim_state_type = str(sim_state.get("state_type") or "").lower()
-    in_combat_now = sim_state_type in {"combat", "battle"}
-    if in_combat_now and not client._last_in_combat:
-        client._self_inflicted_tracker.reset(_extract_player_hp(sim_state))
-    client._last_in_combat = in_combat_now
-
-    # Advance tracker with the new player HP (attribution happens if the
-    # last dispatched action was a known self-damage card).
-    client._self_inflicted_tracker.observe_hp(_extract_player_hp(sim_state))
-
-    from sts2_env._sim_translate import translate_to_bridge_shape  # noqa: PLC0415
+    from sts2_env._sim_translate import translate_to_bridge_shape
     bridge_obs = translate_to_bridge_shape(
         sim_state,
         episode_id=client._current_episode_id,
-        self_inflicted_tracker=client._self_inflicted_tracker,
     )
     legal_actions = bridge_obs.get("available_actions") or []
     # Cache so the next step() call can map an action_index back to the raw
@@ -877,23 +746,18 @@ def _build_bridge_step_response(
     if info_extra:
         info.update(info_extra)
 
-    # The simulator's scalar is retained only as a diagnostic. Canonical
-    # transition facts are projected by HeadlessBackend and the shared
-    # VersionedRewardCalculator is the sole scalar reward authority.
-    info["sim_backend_reward_ignored"] = float(reward)
-    info["reward_authority"] = "external-rl"
-    if terminal:
-        client._sandbox_start_hp = None
-        client._sandbox_max_hp = None
-        client._sandbox_encounter_id = None
+    # This adapter preserves the simulator scalar as transport data only.
+    # HeadlessBackend projects transition facts and replaces it before any
+    # learner sees a reward.
+    info["sim_backend_reward"] = float(reward)
 
     return {
         "ok": True,
         "episode_id": client._current_episode_id,
         "step_index": int(sim_state.get("step_index", 0) or 0),
-        "reward": None,
-        "reward_status": "not_computed",
-        "reward_authority": "external-rl",
+        "reward": float(reward),
+        "reward_status": "backend-diagnostic",
+        "reward_authority": "backend-diagnostic",
         "done": terminal,
         "truncated": truncated,
         "obs": bridge_obs,

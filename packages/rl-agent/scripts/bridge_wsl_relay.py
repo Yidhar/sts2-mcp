@@ -9,20 +9,19 @@ import http.client
 import ipaddress
 import json
 import os
-import socket
 import sys
 import threading
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import urlsplit
 
 RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_ROOT))
 
-from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -151,7 +150,7 @@ class RelayServer(ThreadingHTTPServer):
         self.max_concurrency = int(max_concurrency)
         self._request_slots = threading.BoundedSemaphore(self.max_concurrency)
         self.instance_id = str(instance_id)
-        self.process_started_at_utc = datetime.now(timezone.utc).isoformat()
+        self.process_started_at_utc = datetime.now(UTC).isoformat()
         super().__init__(server_address, RelayHandler)
 
     @property
@@ -337,7 +336,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if payload:
                 self.wfile.write(payload)
-        except (socket.timeout, TimeoutError):
+        except TimeoutError:
             self._send_json(504, {"ok": False, "error": "relay_upstream_timeout"})
         except Exception:
             self._send_json(502, {"ok": False, "error": "relay_upstream_error"})

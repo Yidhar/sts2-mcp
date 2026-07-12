@@ -8,8 +8,12 @@ from sts2_rl.game_data import resolve_game_data_file, resolve_generated_game_dat
 
 
 def test_repository_game_data_is_canonical() -> None:
-    path = resolve_game_data_file("cards.generated.json", required=True)
-    assert path.parts[-3:] == ("game-data", "generated", "cards.generated.json")
+    path = resolve_game_data_file("cards.static.generated.json", required=True)
+    assert path.parts[-3:] == (
+        "game-data",
+        "generated",
+        "cards.static.generated.json",
+    )
 
 
 def test_environment_override_has_highest_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

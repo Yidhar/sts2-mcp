@@ -75,7 +75,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.lock
       - run: python -m pip install -e . --no-deps --no-build-isolation
       - run: python -m pip check
-      - run: python -m ruff check sts2_rl launcher.py launcher_watchdog.py
-      - run: python -m mypy sts2_rl
+      - run: python -m ruff check sts2_rl sts2_baseline launcher.py launcher_watchdog.py
+      - run: python -m mypy sts2_rl sts2_baseline
       - run: python -m pytest tests -q -p no:cacheprovider
-      - run: python scripts/check_muzero_file_budget.py
+      - run: python -m sts2_rl.train --dry-run

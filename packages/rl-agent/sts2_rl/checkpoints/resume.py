@@ -21,7 +21,13 @@ from .atomic import (
 )
 
 EXACT_RESUME_REQUIRED_FILES = frozenset(
-    {"metadata.json", "network.pt", "optimizer.pt", "replay_buffer.pkl"}
+    {
+        "metadata.json",
+        "network.pt",
+        "optimizer.pt",
+        "replay_buffer.pkl",
+        "stochastic_state.pkl",
+    }
 )
 
 
@@ -55,7 +61,9 @@ def _require_equal(actual: Any, expected: Any, *, label: str) -> None:
         )
 
 
-def _game_data_identity(value: Any, *, label: str) -> dict[str, Any]:
+def _game_data_identity(value: Any, *, label: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
     payload = _object(value, label=label)
     identity_keys = (
         "sha256",
@@ -68,6 +76,19 @@ def _game_data_identity(value: Any, *, label: str) -> dict[str, Any]:
     missing = [key for key in identity_keys if key not in payload]
     if missing:
         raise CheckpointIntegrityError(f"{label} is missing identity fields: {missing}")
+    sha256 = payload["sha256"]
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise CheckpointIntegrityError(f"{label}.sha256 must be a lowercase SHA-256 digest")
+    size_bytes = payload["size_bytes"]
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise CheckpointIntegrityError(f"{label}.size_bytes must be non-negative")
+    for key in identity_keys[2:]:
+        if not isinstance(payload[key], str) or not payload[key].strip():
+            raise CheckpointIntegrityError(f"{label}.{key} must be non-empty text")
     return {key: payload[key] for key in identity_keys}
 
 
@@ -79,7 +100,7 @@ def _validate_semantic_identity(
     expected = checkpoint_runtime_identity()
     expected_contract = expected["contract"]
     expected_reward = expected["reward_spec"]
-    expected_game_data = expected["game_data_manifest"]
+    expected_locks = expected["dependency_locks"]
 
     manifest_contract = _object(manifest.get("contract"), label="manifest.contract")
     _require_equal(manifest_contract, expected_contract, label="contract identity")
@@ -96,11 +117,16 @@ def _validate_semantic_identity(
         label="manifest.provenance.reward_spec",
     )
     _require_equal(manifest_reward, expected_reward, label="reward identity")
-    manifest_game_data = _game_data_identity(
+    # Static catalog facts are recorded for provenance, but the grounded model
+    # never reads them.  They therefore must not create false exact-resume
+    # incompatibilities.  Validate their shape only; encoder semantics have a
+    # dedicated fingerprint in training metadata.
+    _game_data_identity(
         manifest_provenance.get("game_data_manifest"),
         label="manifest.provenance.game_data_manifest",
     )
-    _require_equal(manifest_game_data, expected_game_data, label="game-data identity")
+    manifest_locks = manifest_provenance.get("dependency_locks")
+    _require_equal(manifest_locks, expected_locks, label="dependency-lock identity")
 
     metadata_contract = _object(metadata.get("contract"), label="metadata.contract")
     _require_equal(metadata_contract, manifest_contract, label="metadata contract identity")
@@ -137,8 +163,8 @@ def validate_resume_checkpoint(
     """Validate an exact-resume checkpoint without deserializing executable data.
 
     Exact resume requires an atomic completion manifest, a valid SHA-256 for
-    every payload file, no unlisted payload, and exact contract/reward/game-data
-    identity. Any missing or incompatible identity fails closed.
+    every payload file, no unlisted payload, and exact contract/reward/dependency
+    identity. Optional static game-data provenance is shape-validated only.
     """
 
     root = Path(checkpoint).expanduser().resolve(strict=False)
@@ -167,40 +193,3 @@ def validate_resume_checkpoint(
     metadata = _read_json_object(root / "metadata.json", label="checkpoint metadata")
     _validate_semantic_identity(manifest=manifest, metadata=metadata)
     return ValidatedResumeCheckpoint(root=root, manifest=manifest, metadata=metadata)
-
-
-def validate_hashed_warm_start_checkpoint(
-    checkpoint: str | Path,
-) -> tuple[Path, dict[str, Any] | None, dict[str, Any]]:
-    """Validate bytes for an explicitly requested weights-only migration.
-
-    Atomic checkpoints still require a complete all-file hash manifest. A legacy
-    checkpoint is represented by ``manifest=None`` and must be explicitly allowed
-    by the higher-level warm-start caller.
-    """
-
-    root = Path(checkpoint).expanduser().resolve(strict=False)
-    manifest_path = root / "checkpoint.manifest.json"
-    manifest: dict[str, Any] | None
-    if manifest_path.is_file():
-        manifest = verify_checkpoint_directory(
-            root,
-            require_manifest=True,
-            require_hashes=True,
-            require_all_files_listed=True,
-        )
-    else:
-        if not root.is_dir():
-            raise CheckpointIntegrityError(f"checkpoint directory does not exist: {root}")
-        manifest = None
-    metadata_path = root / "metadata.json"
-    if metadata_path.is_symlink():
-        raise CheckpointIntegrityError(
-            f"warm-start metadata.json must not be a symlink: {metadata_path}"
-        )
-    metadata = (
-        _read_json_object(metadata_path, label="checkpoint metadata")
-        if metadata_path.is_file()
-        else {}
-    )
-    return root, manifest, metadata

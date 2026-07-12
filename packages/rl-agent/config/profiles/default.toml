@@ -1,28 +1,73 @@
-version = "sts2-training-config-v1"
+version = "sts2-grounded-baseline-config-v1"
 profile = "default"
 
 [model]
-obs_mode = "token_v3"
-model_arch = "token_memory_v1"
-token_memory_slot_layout = "pass_large_v1"
+architecture = "grounded_candidate_v1"
+token_feature_dim = 160
+d_model = 128
+n_heads = 4
+ffn_dim = 384
+world_layers = 3
+latent_slots = 12
+latent_layers = 2
+local_layers = 1
+candidate_layers = 1
+dropout = 0.05
+type_vocab_size = 128
+role_vocab_size = 64
+owner_vocab_size = 128
+entity_vocab_size = 8192
+zone_vocab_size = 32
+order_vocab_size = 128
+domain_count = 8
+max_world_tokens = 256
+max_candidates = 96
+max_candidate_local_tokens = 16
 
 [optimization]
-learning_rate = 0.0001
-batch_size = 64
+learning_rate = 0.0003
+weight_decay = 0.0001
+batch_size = 32
 discount = 0.997
-n_step_return = 10
+gradient_clip_norm = 1.0
+importance_ratio_clip = 1.0
+policy_weight = 1.0
+value_weight = 0.5
+q_weight = 0.5
+reward_weight = 0.25
+terminal_weight = 0.10
+entropy_weight = 0.01
+
+[replay]
+capacity = 100000
+recent_window = 10000
+coverage_fraction = 0.50
+recent_fraction = 0.25
+priority_fraction = 0.25
+alpha = 0.6
+beta = 0.4
+priority_epsilon = 0.000001
+minimum_size = 1024
 
 [environment]
-environment_backend = "live"
+backend = "headless"
+scenario = "full-run"
+max_episode_steps = 10000
+
+[curriculum]
+reward_objective = "run"
+epsilon_start = 0.30
+epsilon_end = 0.05
+epsilon_decay_steps = 250000
 
 [runtime]
 device = "auto"
-total_timesteps = 100000
-n_envs = 1
-mixed_precision = "auto"
-
-[guards]
-combat_hard_guard_policy = "off"
-build_hard_guard_policy = "off"
-hard_guard_target_rewrite = "off"
-route_safety_guard = false
+total_environment_steps = 1000000
+train_every_steps = 4
+updates_per_cycle = 1
+seed = 0
+log_dir = "runs/grounded-baseline"
+checkpoint_dir = "checkpoints/grounded-baseline"
+checkpoint_interval_steps = 50000
+evaluation_interval_steps = 50000
+evaluation_episodes = 20

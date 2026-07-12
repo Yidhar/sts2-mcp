@@ -17,14 +17,6 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
-from sts2_rl.reward import (
-    CanonicalTransition,
-    LegacyRewardCalculator,
-    RewardSpec,
-    TransitionFacts,
-    VersionedRewardCalculator,
-    canonicalize_legacy_transition,
-)
 
 
 class FakeLegacyClient:
@@ -158,51 +150,6 @@ def test_legacy_backend_context_manager_closes_client() -> None:
     assert client.close_count == 1
 
 
-def test_canonical_transition_preserves_legacy_reward_provenance() -> None:
-    transition = canonicalize_legacy_transition(
-        FakeLegacyClient()._result(3.25),
-        action_handle="end_turn",
-        backend_name="live_bridge",
-    )
-    assert transition.facts.backend_reward == 3.25
-    assert transition.action_handle == "end_turn"
-    fact_reward = VersionedRewardCalculator().evaluate(transition)
-    assert fact_reward.total == 0.0
-    legacy_reward = LegacyRewardCalculator().evaluate(transition)
-    assert legacy_reward.total == 3.25
-    assert legacy_reward.spec_version == "legacy-backend-reward-v1"
-
-
-def test_versioned_reward_is_pure_and_reports_components() -> None:
-    transition = CanonicalTransition(
-        episode_id="ep",
-        step_index=1,
-        before_state_version=10,
-        after_state_version=11,
-        action_handle="play",
-        observation={},
-        facts=TransitionFacts(
-            backend_reward=1.0,
-            hp_delta=-2.0,
-            enemy_hp_delta=5.0,
-            combat_result="victory",
-        ),
-        terminated=True,
-        truncated=False,
-    )
-    calculator = VersionedRewardCalculator(
-        RewardSpec(
-            hp_delta_weight=0.5,
-            enemy_hp_delta_weight=0.2,
-            combat_win_bonus=2.0,
-        )
-    )
-    first = calculator.evaluate(transition)
-    second = calculator.evaluate(transition)
-    assert first == second
-    assert first.total == pytest.approx(2.0)
-    assert first.components["combat_victory"] == 2.0
-
 class FakeV2Client(FakeLegacyClient):
     session_id = "v2-session"
 
@@ -245,7 +192,7 @@ class FakeV2Client(FakeLegacyClient):
         return {
             "ok": True,
             "api_version": "2.0.0",
-            "schema_version": "2026-07-11.1",
+            "schema_version": "2026-07-13.1",
             "request_id": request_id,
             "status": "committed",
             "replayed_result": False,
@@ -324,7 +271,7 @@ def test_live_backend_does_not_fallback_on_v2_rejection() -> None:
     client.reset_v2 = lambda **kwargs: {
         "ok": False,
         "api_version": "2.0.0",
-        "schema_version": "2026-07-11.1",
+        "schema_version": "2026-07-13.1",
         "request_id": kwargs["request_id"],
         "status": "rejected_before_execution",
         "replayed_result": False,

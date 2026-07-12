@@ -1,0 +1,104 @@
+"""CLI entrypoint for the grounded-candidate baseline."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections.abc import Sequence
+from dataclasses import asdict, replace
+from pathlib import Path
+
+from sts2_rl.artifacts import resolve_external_input_path
+from sts2_rl.training.config import TrainingConfig, load_training_config
+from sts2_rl.training.runtime import inspect_baseline, run_training
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m sts2_rl.train",
+        description=(
+            "Train the small grounded legal-candidate actor-critic baseline "
+            "(no MuZero, MCTS, planner, or heuristic action guards)."
+        ),
+    )
+    parser.add_argument("--profile", default="default", help="built-in TOML profile")
+    parser.add_argument("--config", help="additional versioned TOML config")
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="strict dotted config override; repeatable",
+    )
+    parser.add_argument("--device", help="override runtime device (auto/cpu/cuda)")
+    parser.add_argument("--steps", type=int, help="override total environment steps")
+    parser.add_argument("--seed", type=int, help="override deterministic seed")
+    parser.add_argument("--backend", choices=("live", "headless"))
+    parser.add_argument("--sim-exe", help="headless simulator executable")
+    parser.add_argument("--session-path", help="live bridge session descriptor path")
+    parser.add_argument("--resume", help="exact baseline checkpoint directory")
+    parser.add_argument(
+        "--initialize-from",
+        help="valid RL 0.3 checkpoint model for a new profile/horizon lineage",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate config/model/encoder without launching the game",
+    )
+    parser.add_argument("--print-config", action="store_true")
+    return parser
+
+
+def _cli_overrides(config: TrainingConfig, args: argparse.Namespace) -> TrainingConfig:
+    runtime = config.runtime
+    if args.device is not None:
+        runtime = replace(runtime, device=str(args.device))
+    if args.steps is not None:
+        runtime = replace(runtime, total_environment_steps=int(args.steps))
+    if args.seed is not None:
+        runtime = replace(runtime, seed=int(args.seed))
+
+    environment = config.environment
+    if args.backend is not None:
+        environment = replace(environment, backend=args.backend)
+    if args.sim_exe is not None:
+        environment = replace(environment, sim_exe_path=str(args.sim_exe))
+    if args.session_path is not None:
+        environment = replace(environment, session_path=str(args.session_path))
+    return replace(config, runtime=runtime, environment=environment)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = load_training_config(
+        profile=args.profile,
+        config_path=args.config,
+        overrides=tuple(args.overrides),
+    )
+    config = _cli_overrides(config, args)
+    if args.print_config:
+        print(json.dumps(config.to_mapping(), indent=2, sort_keys=True))
+    if args.dry_run:
+        print(json.dumps(inspect_baseline(config), indent=2, sort_keys=True))
+        return 0
+    resume: Path | None = None
+    initialization: Path | None = None
+    if args.resume and args.initialize_from:
+        raise SystemExit("--resume and --initialize-from are mutually exclusive")
+    if args.resume:
+        resume = resolve_external_input_path(args.resume)
+    if args.initialize_from:
+        initialization = resolve_external_input_path(args.initialize_from)
+    final_state = run_training(
+        config,
+        resume_from=resume,
+        initialize_from=initialization,
+    )
+    print(json.dumps({"status": "complete", **asdict(final_state)}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

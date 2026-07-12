@@ -16,62 +16,19 @@ internal static partial class BridgeGameApi
 {
     private const int EnvDefenseBlockAmount = 999;
     private const int EnvDefensePlatingAmount = 999;
-    // LEGACY-V1 ONLY: reward weights remain for compatibility. Contract v2 emits
-    // transition facts and delegates reward computation to the external RL service.
-    private const double EnvRewardHpLossWeight = 0.0d;
-    private const double EnvRewardHpGainWeight = 0.0d;
-    private const double EnvRewardRoomHpDeltaWeight = 1.50d;
-    private const double EnvRewardFloorDeltaWeight = 0.25d;
-    private const double EnvRewardGoldGainWeight = 0.01d;
-    private const double EnvRewardGoldSpendWeight = 0.01d;
-    private const double EnvRewardRelicGainWeight = 1.00d;
-    private const double EnvRewardMaxHpGainWeight = 0.25d;
-    private const double EnvRewardPotionGainWeight = 0.0d;
-    private const double EnvRewardCardAddWeight = 0.0d;
-    private const double EnvRewardStarterRemoveWeight = 0.0d;
-    private const double EnvRewardOtherRemoveWeight = 0.0d;
-    private const double EnvRewardCardUpgradeWeight = 0.0d;
-    private const double EnvRewardCombatWinBonus = 1.00d;
-    private const double EnvRewardEliteClearBonus = 0.75d;
-    private const double EnvRewardBossClearBonus = 1.50d;
-    private const double EnvRewardActClearBonus = 2.00d;
-    private const double EnvRewardDeathPenalty = -2.00d;
-    private const double EnvRewardVictoryBonus = 5.00d;
-    private const double EnvRewardStepPenalty = 0.0d;
-    private const double EnvRewardActionErrorPenalty = -0.10d;
-    private const double EnvRewardTruncatedPenalty = -1.00d;
-    private const double EnvRewardEndTurnWastePenalty = 0.0d;
-    private const double EnvRewardNoProgressPenalty = 0.0d;
-    private const double EnvRewardPlayCardBonus = 0.0d;
-    private const double EnvRewardEffectiveBlockWeight = 0.00d;
-    private const double EnvRewardWastedBlockWeight = 0.0d;
-    private const double EnvRewardWeakIntentReductionWeight = 0.0d;
-    private const double EnvRewardVulnerableRealizedDamageWeight = 0.0d;
-    private const double EnvRewardThreatGapReductionWeight = 0.0d;
-    private const double EnvRewardMissedDefensePenaltyWeight = 0.00d;
-    private const double EnvRewardSkipBadCardsBonus = 0.0d;
-    private const double EnvRewardRestLowHpBonus = 0.0d;
-    private const double EnvRewardRestHighHpMismatchPenalty = 0.0d;
-    private const double EnvRewardSmithHealthyBonus = 0.0d;
-    private const double EnvRewardSmithLowHpMismatchPenalty = 0.0d;
-    private const double EnvRewardCardHeuristicLimit = 0.0d;
     private const int EnvCardSelectionSelectFastFailTimeoutMs = 1000;
-    private const int EnvCombatSandboxGoldDeltaAnomalyThreshold = 10000;
-    private const int EnvCombatSandboxFloorDeltaAnomalyThreshold = 3;
-    private const int EnvCombatSandboxActDeltaAnomalyThreshold = 1;
-    private const int EnvCombatSandboxRelicGainAnomalyThreshold = 3;
-    private const double EnvCombatSandboxRoomHpDeltaNormalizedLimit = 1.0d;
-    private const double EnvCombatSandboxMaxHpGainNormalizedLimit = 1.0d;
 
     private static object BuildEnvActionPayload(BridgeResolvedAction action, int index)
     {
         var payload = JsonSerializer.SerializeToElement(action.Payload);
         var kind = TryGetNestedString(payload, "kind") ?? InferEnvActionKind(action.ActionId);
+        var modelActionKind = InferEnvModelActionKind(action.ActionId, kind);
         var entry = new Dictionary<string, object?>
         {
             ["idx"] = index,
             ["action_id"] = action.ActionId,
-            ["kind"] = kind
+            ["kind"] = kind,
+            ["model_action_kind"] = modelActionKind
         };
 
         switch (kind)
@@ -115,24 +72,18 @@ internal static partial class BridgeGameApi
 
             case "event_option":
                 entry["index"] = TryGetNestedInt(payload, "index");
+                entry["option"] = CompactEventOptionPayload(TryGetNestedElement(payload, "option"));
                 entry["title"] = TryGetNestedString(payload, "option", "title");
+                entry["description"] = TryGetNestedString(payload, "option", "description");
                 entry["option_type"] = TryGetNestedString(payload, "option", "option_type");
                 entry["proceed"] = TryGetNestedBool(payload, "option", "is_proceed");
                 entry["coord"] = CompactCoordPayload(TryGetNestedElement(payload, "option", "coord"));
-                var eventEffectDeltas = TryGetNestedElement(payload, "option", "effect_deltas");
-                if (eventEffectDeltas is { ValueKind: JsonValueKind.Object })
-                {
-                    entry["effect_deltas"] = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
-                        eventEffectDeltas.Value.GetRawText());
-                }
                 break;
 
             case "map":
                 entry["coord"] = CompactCoordPayload(TryGetNestedElement(payload, "coord"));
                 entry["point_type"] = TryGetNestedString(payload, "point_type");
                 entry["point_type_norm"] = TryGetNestedString(payload, "point_type_norm");
-                entry["route_summary"] = CompactMapRouteSummaryPayload(TryGetNestedElement(payload, "route_summary"));
-                entry["route_nodes"] = CompactMapRouteNodesPayload(TryGetNestedElement(payload, "route_summary"));
                 break;
 
             case "rest_site":
@@ -143,7 +94,6 @@ internal static partial class BridgeGameApi
                 entry["selection"] = TryGetNestedString(payload, "upgrade_action");
                 entry["typed_selection"] = CompactSelectionPayload(TryGetNestedElement(payload, "typed_selection"));
                 entry["index"] = TryGetNestedInt(payload, "index");
-                entry["selection_semantics"] = TryGetNestedString(payload, "selection_semantics");
                 entry["card"] = CompactCardPayload(TryGetNestedElement(payload, "card"));
                 entry["upgrade_preview"] = CompactCardPayload(TryGetNestedElement(payload, "upgrade_preview"));
                 break;
@@ -153,7 +103,6 @@ internal static partial class BridgeGameApi
                 entry["typed_selection"] = CompactSelectionPayload(TryGetNestedElement(payload, "typed_selection"));
                 entry["index"] = TryGetNestedInt(payload, "index");
                 entry["selection_id"] = TryGetNestedString(payload, "selection_id");
-                entry["selection_semantics"] = TryGetNestedString(payload, "selection_semantics");
                 entry["selection_prompt"] = TryGetNestedString(payload, "selection_prompt");
                 entry["screen_type"] = TryGetNestedString(payload, "screen_type");
                 entry["is_selected"] = TryGetNestedBool(payload, "is_selected");
@@ -186,7 +135,7 @@ internal static partial class BridgeGameApi
                 break;
 
             case "run_mode_selection":
-                entry["run_mode"] = TryGetNestedString(payload, "run_mode_action");
+                entry["run_mode_action"] = TryGetNestedString(payload, "run_mode_action");
                 break;
 
             case "main_menu":
@@ -207,6 +156,19 @@ internal static partial class BridgeGameApi
         entry["canonical_text"] = BuildCanonicalActionText(kind, action.ActionId, payload);
 
         return entry;
+    }
+
+    private static string InferEnvModelActionKind(string actionId, string transportKind)
+    {
+        if (actionId.Equals("end_turn", StringComparison.Ordinal))
+        {
+            return "end_turn";
+        }
+
+        var inferredKind = InferEnvActionKind(actionId);
+        return inferredKind is "action" or "combat"
+            ? transportKind
+            : inferredKind;
     }
 
     private static string InferEnvActionKind(string actionId)
@@ -492,11 +454,6 @@ internal static partial class BridgeGameApi
         BridgeEnvSnapshot state,
         IReadOnlyList<object> resetActions)
     {
-        SyncEnvEpisodeAnchor(episode, state, force: true);
-        // Fresh episode → clear any residual self-inflicted HP loss counter from
-        // the previous run. Covers both full_run env/reset and combat_sandbox
-        // (which also funnels through BuildEnvResetPayload).
-        ResetSelfInflictedHpLossTrackerForNewCombat(null);
         // Episode boundary is a game-quiescent window — drain finalizers here
         // so GodotObject disposal can't race the next combat's ObjectDB
         // mutations. combat_sandbox has its own call site at reset time;
@@ -662,14 +619,6 @@ internal static partial class BridgeGameApi
         bool forceDone = false,
         BridgeEnvStepTimingCollector? timing = null)
     {
-        var rewardBreakdown = BuildLegacyEnvRewardBreakdown(
-            episode,
-            before,
-            after,
-            selectedAction,
-            truncated,
-            actionError);
-        var actionDiagnostics = BuildEnvActionDiagnostics(before, selectedAction, actionError);
         var cardSelectionBefore = BuildEnvCardSelectionStepInfoPayload(before);
         var cardSelectionAfter = BuildEnvCardSelectionStepInfoPayload(after);
         var actionability = BuildEnvActionabilityPayload(after, episode);
@@ -683,15 +632,14 @@ internal static partial class BridgeGameApi
             truncationReason,
             actionError,
             done);
-        SyncEnvEpisodeAnchor(episode, after, force: !done && HasEnvRoomTransition(before, after));
         return new
         {
             ok = true,
             episode_id = episode.Id,
             step_index = episode.StepIndex,
-            reward = rewardBreakdown.Total,
-            reward_semantics = "legacy-bridge-v1-deprecated",
-            reward_authority = "bridge-legacy-v1-only",
+            reward = (double?)null,
+            reward_semantics = "not-computed",
+            reward_authority = "external-rl",
             transition = transitionFacts,
             transition_facts = transitionFacts,
             done,
@@ -727,8 +675,6 @@ internal static partial class BridgeGameApi
                 action_error = actionError,
                 step_timing_ms = timing?.ToTimingPayload(),
                 step_timing_counts = timing?.ToCountPayload(),
-                action_diagnostics = actionDiagnostics,
-                reward_breakdown = rewardBreakdown,
                 actionability = actionability
             }
         };
@@ -743,7 +689,7 @@ internal static partial class BridgeGameApi
     // P0-2 actionability payload — additive enrichment of the C1 block.
     // The Python short-poll budget defaults to 100ms (matches the in-process
     // helper ``CombatSandboxEnv._fast_step_max_wait_ms``); operators can
-    // override via the ``MUZERO_FAST_STEP_MAX_WAIT_MS`` env var on the
+    // override via the ``STS2_FAST_STEP_MAX_WAIT_MS`` env var on the
     // Python side.
     private const int DefaultActionabilityWaitBudgetMs = 100;
 

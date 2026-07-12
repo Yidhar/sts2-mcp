@@ -6,7 +6,7 @@
 `sts2-mcp` is a local control and reinforcement-learning stack for **Slay the Spire 2**.
 A C# mod observes the game and executes explicit legal actions, a TypeScript server
 exposes a Model Context Protocol (MCP) surface, and the Python package trains and
-evaluates the active MuZero/token-memory agent.
+evaluates the grounded legal-candidate actor-critic baseline.
 
 This repository is in the **architecture-v2 cutover**. The v2 contract and capability
 model are the development target. Legacy v1 endpoints are disabled by default and,
@@ -24,10 +24,10 @@ they must not receive new features.
 | Component | Version | Responsibility |
 |---|---:|---|
 | [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema, OpenAPI, fixtures, generated cross-language version constants |
-| [`game-data/`](./game-data/README.md) | `1.0.0` | Versioned card, enemy, relic, potion, and effect-profile data |
+| [`game-data/`](./game-data/README.md) | `2.0.0` | Policy-free static card, relic, and potion facts |
 | [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | Game adapter, visible snapshots, legal handles, command serialization, session discovery |
 | [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | TypeScript MCP server using the official SDK; default `minimal` control surface |
-| [`packages/rl-agent/`](./packages/rl-agent/muzero/README.md) | `0.2.0` | MuZero/token-memory training, typed environments, reward and checkpoint migration |
+| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | Grounded-candidate model, typed backends, fixed reward, replay, learner and checkpoints |
 | [`tools/`](./tools) | — | Contract, data, artifact, release, license, and repository checks |
 
 Component versions are coordinated through [`release-manifest.json`](./release-manifest.json).
@@ -48,14 +48,13 @@ flowchart LR
     C[contracts 2.0] --> M
     C --> B
     C --> R
-    D[game-data] --> M
-    D --> B
-    D --> R
+    D[policy-free game-data] --> O[offline catalog tools]
 ```
 
 The dependency and ownership rules are deliberate:
 
-- `contracts` and `game-data` are leaf dependencies shared by all runtimes.
+- `contracts` is the shared runtime leaf dependency. `game-data` is a verified
+  offline factual catalog, not a policy input or grounded-trainer dependency.
 - The Bridge owns factual game adaptation, legal actions, state revision, idempotent
   mutation arbitration, session lifecycle, and bounded events.
 - The MCP server owns protocol framing, input validation, presentation, and small
@@ -165,8 +164,9 @@ multi-instance configurations.
 
 ## RL development and training
 
-The maintained training entry point is **MuZero**, not the archived PPO
-`train_pipeline.py` flow:
+The maintained entry point is the **grounded-candidate actor-critic baseline**.
+The failed MuZero/token-memory/MCTS line, PPO paths, planners and hand-written
+action guards have been removed:
 
 ```powershell
 Set-Location .\packages\rl-agent
@@ -177,30 +177,33 @@ python -m pip install -r requirements-bootstrap.lock
 python -m pip install -r requirements-dev.lock
 python -m pip install -e . --no-deps --no-build-isolation
 python -m pytest tests -q -p no:cacheprovider
-python -m muzero.train --help
+python -m sts2_rl.train --dry-run
 ```
 
-An illustrative token-memory launch starts with:
+Start the optional combat bootstrap or the full-run mainline with:
 
 ```powershell
-python -m muzero.train `
-  --obs-mode token_v3 `
-  --model-arch token_memory_v1 `
-  --mixed-precision auto
+python -m sts2_rl.train --profile combat
+python -m sts2_rl.train --profile default
 ```
 
-Choose backend, scenario, seed, checkpoint, artifact paths, and resource limits
-explicitly for a real experiment. Do not start a long run until the v2
-environment/parity checks for the selected backend are green. PPO and historical
-attention paths have been removed from the supported source tree; their archived
-design notes are non-executable reference material only.
+The default model has 3,642,824 parameters, scores only currently grounded legal
+candidates, and uses no latent dynamics, MCTS, planner or game-specific action
+rewrite. Reward is fixed and normalized; replay mixes coverage, recent data and
+refreshable priorities. See
+[`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md).
+
+The software path is tested, but no new long-run checkpoint or Act 1 clear-rate
+claim exists yet. Do not start a long run until the v2 environment/parity checks
+for the selected backend are green.
 
 ## Contracts and game data
 
 The current contract identity is:
 
 - API: `2.0.0`
-- schema: `2026-07-11.1`
+- schema: `2026-07-13.1`
+- action schema: `2.1.0`
 - action ordering: `2.0.0`
 - observation schema: `5.0.0`
 - reward schema: `2.0.0`
@@ -270,9 +273,11 @@ game assemblies are not committed.
 - Strict `expected_state_version` is required for gameplay mutation.
 - Training reset/step requires the training capability; step is bound to
   `episode_id` and `expected_step_index`.
-- Old replay and checkpoint files are not assumed compatible. Migration must
-  validate contract, action-ordering, observation, reward, and game-data hashes
-  and fail closed on unsupported formats.
+- Old replay and checkpoint files are not compatible. Grounded exact resume
+  validates contract, action ordering, observation/reward identity, dependency
+  locks, encoding fingerprint, model/optimizer/replay and stochastic state, and
+  fails closed on unsupported formats. Valid static game-data is optional audit
+  provenance, not a runtime or model compatibility input.
 - Historical journal/knowledge persistence, AutoSlay runners, Draft Tracker, PPO
   pipeline descriptions, checked-in logs, and release binaries are outside the v2
   control-plane source tree.

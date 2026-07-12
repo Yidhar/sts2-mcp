@@ -15,11 +15,11 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from sts2_baseline import baseline_reward_identity
 from sts2_rl.contracts.versions import (
     ACTION_SCHEMA_VERSION,
     API_VERSION,
@@ -28,9 +28,13 @@ from sts2_rl.contracts.versions import (
     REWARD_SCHEMA_VERSION,
     SCHEMA_VERSION,
 )
-from sts2_rl.reward import RewardSpec
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_DEPENDENCY_LOCK_NAMES = (
+    "requirements.lock",
+    "requirements-dev.lock",
+    "requirements-wsl-rocm.txt",
+)
 
 
 class CheckpointIntegrityError(RuntimeError):
@@ -51,13 +55,7 @@ def contract_metadata() -> dict[str, str]:
 def reward_spec_metadata() -> dict[str, Any]:
     """Return the complete, stable identity of the active reward specification."""
 
-    reward_spec = RewardSpec()
-    payload = asdict(reward_spec)
-    payload["fingerprint"] = reward_spec.fingerprint
-    payload["fingerprint_sha256"] = hashlib.sha256(
-        reward_spec.fingerprint.encode("utf-8")
-    ).hexdigest()
-    return payload
+    return baseline_reward_identity()
 
 
 def _sha256(path: Path) -> str:
@@ -111,24 +109,22 @@ def _json_object(path: Path) -> dict[str, Any] | None:
     return {str(key): item for key, item in value.items()}
 
 
-def game_data_manifest_metadata() -> dict[str, Any]:
-    """Return the stable identity of the repository's canonical game-data manifest.
+def game_data_manifest_metadata() -> dict[str, Any] | None:
+    """Return optional audit provenance for the static game-data manifest.
 
-    The absolute source path is useful provenance, but is deliberately not part of
-    resume identity: moving a verified checkout must not change the data identity.
+    The grounded trainer does not read this catalog, so absence (for example in
+    an installed wheel) must not become a delayed checkpoint failure. When a
+    valid repository manifest is available, its checkout-independent identity is
+    recorded for audit only.
     """
 
     manifest_path = _repository_root() / "game-data" / "manifest.json"
     descriptor = _hashed_file(manifest_path)
     if descriptor is None:
-        raise CheckpointIntegrityError(
-            f"canonical game-data manifest is missing: {manifest_path}"
-        )
+        return None
     payload = _json_object(manifest_path)
     if payload is None:
-        raise CheckpointIntegrityError(
-            f"canonical game-data manifest is not a JSON object: {manifest_path}"
-        )
+        return None
     identity_fields = (
         "schema_version",
         "upstream_sts2_ai_commit",
@@ -141,10 +137,7 @@ def game_data_manifest_metadata() -> dict[str, Any]:
         if not isinstance(payload.get(key), str) or not str(payload[key]).strip()
     ]
     if missing_identity:
-        raise CheckpointIntegrityError(
-            "canonical game-data manifest has missing/invalid identity fields: "
-            f"{missing_identity}"
-        )
+        return None
     return {
         "sha256": descriptor["sha256"],
         "size_bytes": descriptor["size_bytes"],
@@ -155,13 +148,34 @@ def game_data_manifest_metadata() -> dict[str, Any]:
     }
 
 
+def dependency_lock_metadata() -> list[dict[str, Any]]:
+    """Return checkout-independent identities for every committed RL lock."""
+
+    root = _repository_root()
+    result: list[dict[str, Any]] = []
+    for name in _DEPENDENCY_LOCK_NAMES:
+        descriptor = _hashed_file(root / "packages" / "rl-agent" / name)
+        if descriptor is None:
+            raise CheckpointIntegrityError(
+                f"required RL dependency lock is missing: packages/rl-agent/{name}"
+            )
+        result.append(
+            {
+                "path": f"packages/rl-agent/{name}",
+                "size_bytes": descriptor["size_bytes"],
+                "sha256": descriptor["sha256"],
+            }
+        )
+    return result
+
+
 def checkpoint_runtime_identity() -> dict[str, Any]:
     """Return every semantic identity that an exact resume must match."""
 
     return {
         "contract": contract_metadata(),
         "reward_spec": reward_spec_metadata(),
-        "game_data_manifest": game_data_manifest_metadata(),
+        "dependency_locks": dependency_lock_metadata(),
     }
 
 
@@ -172,31 +186,29 @@ def build_checkpoint_provenance(
     config_version: str | None = None,
     config_profile: str | None = None,
     checkpoint_load_mode: str | None = None,
-    checkpoint_migration_id: str | None = None,
-    checkpoint_allow_legacy: bool = False,
+    parent_relation: str | None = None,
 ) -> dict[str, Any]:
     """Capture reproducibility inputs shared by metadata and atomic manifest."""
+    if checkpoint_load_mode not in {"fresh", "exact_resume", "model_initialization"}:
+        raise ValueError("checkpoint load mode is missing or unsupported")
     root = _repository_root()
     reward_payload = reward_spec_metadata()
     game_manifest_path = root / "game-data" / "manifest.json"
-    game_manifest = {
-        "path": game_manifest_path.as_posix(),
-        **game_data_manifest_metadata(),
-    }
-    locks = []
-    for name in (
-        "requirements.lock",
-        "requirements-dev.lock",
-        "requirements-text.lock",
-        "requirements-wsl-rocm.txt",
-    ):
-        descriptor = _hashed_file(root / "packages" / "rl-agent" / name)
-        if descriptor is not None:
-            locks.append(descriptor)
+    game_identity = game_data_manifest_metadata()
+    game_manifest = (
+        None
+        if game_identity is None
+        else {"path": game_manifest_path.as_posix(), **game_identity}
+    )
+    locks = dependency_lock_metadata()
     parent: dict[str, Any] | None = None
     if parent_checkpoint:
         parent_path = Path(parent_checkpoint).expanduser().resolve(strict=False)
         parent = {"path": str(parent_path)}
+        relation = parent_relation or "unspecified_parent"
+        if relation not in {"loaded_parent", "in_process_successor", "unspecified_parent"}:
+            raise ValueError("checkpoint parent relation is missing or unsupported")
+        parent["relation"] = relation
         manifest = _hashed_file(parent_path / "checkpoint.manifest.json")
         metadata = _hashed_file(parent_path / "metadata.json")
         parent_manifest_payload = _json_object(parent_path / "checkpoint.manifest.json")
@@ -212,10 +224,6 @@ def build_checkpoint_provenance(
                     parent["reward_spec_fingerprint"] = parent_reward.get("fingerprint")
         if manifest is not None:
             parent["manifest"] = manifest
-        else:
-            legacy_network = _hashed_file(parent_path / "network.pt")
-            if legacy_network is not None:
-                parent["legacy_network"] = legacy_network
         if metadata is not None:
             parent["metadata"] = metadata
     return {
@@ -233,8 +241,6 @@ def build_checkpoint_provenance(
         "training_config_version": config_version,
         "training_profile": config_profile,
         "checkpoint_load_mode": checkpoint_load_mode,
-        "checkpoint_migration_id": checkpoint_migration_id,
-        "checkpoint_allow_legacy": bool(checkpoint_allow_legacy),
         "parent_checkpoint": parent,
     }
 
@@ -248,8 +254,9 @@ def verify_checkpoint_directory(
 ) -> dict[str, Any] | None:
     """Validate the atomic completion manifest and its payload files.
 
-    Legacy callers may retain ``None`` for a missing manifest. Production resume
-    must set all three strict flags (or call ``validate_resume_checkpoint``).
+    Diagnostic callers may accept ``None`` for a missing manifest. Grounded
+    training resume always sets all three strict flags through
+    ``validate_resume_checkpoint``.
     """
 
     root = Path(checkpoint).resolve(strict=False)
@@ -378,6 +385,10 @@ class AtomicCheckpointDirectory:
     def prepare(self) -> Path:
         if self._prepared:
             return self.staging
+        if self.target.exists():
+            raise FileExistsError(
+                f"published checkpoints are immutable and already exist: {self.target}"
+            )
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self.staging.mkdir(parents=False, exist_ok=False)
         self._prepared = True
@@ -411,6 +422,17 @@ class AtomicCheckpointDirectory:
         if not self._prepared:
             raise RuntimeError("prepare() must be called before commit()")
 
+        if self.target.exists():
+            raise FileExistsError(
+                f"published checkpoints are immutable and already exist: {self.target}"
+            )
+
+        for payload_path in sorted(self.staging.rglob("*")):
+            if not payload_path.is_file():
+                continue
+            with payload_path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+
         manifest_path = self.staging / "checkpoint.manifest.json"
         manifest_path.write_text(
             json.dumps(self._manifest(), indent=2, sort_keys=True) + os.linesep,
@@ -419,21 +441,27 @@ class AtomicCheckpointDirectory:
         with manifest_path.open("r+b") as handle:
             handle.flush()
             os.fsync(handle.fileno())
-
-        backup = self.target.with_name(f".{self.target.name}.replaced-{uuid4().hex}")
-        target_existed = self.target.exists()
-        if target_existed:
-            os.replace(self.target, backup)
-        try:
-            os.replace(self.staging, self.target)
-        except BaseException:
-            if target_existed and backup.exists() and not self.target.exists():
-                os.replace(backup, self.target)
-            raise
-        if backup.exists():
-            shutil.rmtree(backup)
+        self._fsync_directory(self.staging)
+        os.rename(self.staging, self.target)
+        self._fsync_directory(self.target.parent)
         self._committed = True
         return self.target
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Best-effort directory durability on platforms that expose dir FDs."""
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
 
     def abort(self) -> None:
         if self.staging.exists():

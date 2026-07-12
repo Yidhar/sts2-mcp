@@ -24,8 +24,6 @@ AUDITED_SCRIPT_PATHS = (
     REPOSITORY_ROOT / "tools" / "game_data" / "build_manifest.py",
     REPOSITORY_ROOT / "tools" / "game_data" / "verify_manifest.py",
     RL_AGENT_ROOT / "import_sts2_exporter_items.py",
-    RL_AGENT_ROOT / "tools" / "generate_card_effect_profiles.py",
-    RL_AGENT_ROOT / "tools" / "audit_card_mechanism_coverage.py",
 )
 
 
@@ -64,7 +62,7 @@ def test_committable_generators_do_not_read_the_wall_clock(path: Path) -> None:
     assert "_utc_now" not in source
     assert "SOURCE_DATE_EPOCH" not in source
     assert not any(
-        isinstance(node, (ast.Import, ast.ImportFrom))
+        isinstance(node, ast.Import | ast.ImportFrom)
         and (
             (isinstance(node, ast.ImportFrom) and node.module == "datetime")
             or (
@@ -138,6 +136,11 @@ def test_exporter_import_is_byte_stable_across_input_locations(
         results.append(_tree_bytes(run_root))
 
     assert results[0] == results[1]
+    generated_text = "\n".join(
+        blob.decode("utf-8") for blob in results[0].values()
+    )
+    assert "semantic_tags" not in generated_text
+    assert "semantic_signals" not in generated_text
     _assert_no_invocation_path(
         results[0],
         "machine-a-root",
@@ -185,182 +188,39 @@ def test_game_data_manifest_is_byte_stable_across_checkout_locations(
     assert "checkout-on-machine" not in manifests[0].decode("utf-8")
 
 
-def test_card_effect_profile_generator_is_byte_stable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    generator = _load_script(
-        "test_deterministic_generate_card_effect_profiles",
-        RL_AGENT_ROOT / "tools" / "generate_card_effect_profiles.py",
-    )
-    monkeypatch.setattr(generator, "load_catalog", lambda: [{"id": "CARD.B"}, {"id": "CARD.A"}])
-    monkeypatch.setattr(
-        generator,
-        "build_profile",
-        lambda row: {
-            "id": row["id"],
-            "operations": [],
-            "training_tags": ["determinism_fixture"],
-        },
-    )
-
-    outputs: list[bytes] = []
-    for index in range(2):
-        monkeypatch.setenv("SOURCE_DATE_EPOCH", str(index + 10))
-        output = tmp_path / f"effect-run-{index}" / "card_effect_profiles.generated.json"
-        monkeypatch.setattr(generator, "OUT_PATH", output)
-        generator.main()
-        outputs.append(output.read_bytes())
-
-    assert outputs[0] == outputs[1]
-    assert outputs[0].endswith(b"\n")
-    document = json.loads(outputs[0])
-    assert "generated_at_utc" not in document
-    assert list(document["cards"]) == ["CARD.A", "CARD.B"]
-    assert str(REPOSITORY_ROOT) not in outputs[0].decode("utf-8")
-
-
-def test_card_mechanism_audit_is_byte_stable_across_input_locations(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    audit = _load_script(
-        "test_deterministic_audit_card_mechanism_coverage",
-        RL_AGENT_ROOT / "tools" / "audit_card_mechanism_coverage.py",
-    )
-    monkeypatch.setattr(audit, "_load_catalog", lambda: {})
-
-    input_bytes = b'{"cards": []}\n'
-    sources = (
-        tmp_path / "audit-machine-a" / "first-items-name.json",
-        tmp_path / "audit-machine-b" / "renamed-items-input.json",
-    )
-    for source in sources:
-        source.parent.mkdir(parents=True)
-        source.write_bytes(input_bytes)
-
-    results: list[dict[str, bytes]] = []
-    for index, source in enumerate(sources):
-        monkeypatch.setenv("SOURCE_DATE_EPOCH", str(index + 20))
-        out_dir = tmp_path / f"audit-run-{index}"
-        monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(out_dir))
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "audit_card_mechanism_coverage.py",
-                "--items",
-                str(source),
-                "--out-dir",
-                str(out_dir),
-                "--report",
-                str(out_dir / "card-mechanism-coverage-audit.md"),
-            ],
-        )
-        audit.main()
-        results.append(_tree_bytes(out_dir))
-
-    assert results[0] == results[1]
-    _assert_no_invocation_path(
-        results[0],
-        "audit-machine-a",
-        "audit-machine-b",
-        "first-items-name.json",
-        "renamed-items-input.json",
-    )
-    assert all(b"Generated:" not in blob for blob in results[0].values())
-
-
-def test_card_mechanism_checked_in_publication_has_fixed_boundaries(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    audit = _load_script(
-        "test_checked_in_card_mechanism_publication_boundaries",
-        RL_AGENT_ROOT / "tools" / "audit_card_mechanism_coverage.py",
-    )
-    repository = tmp_path / "checkout"
-    (repository / "docs" / "generated").mkdir(parents=True)
-    monkeypatch.setattr(audit, "PROJECT_ROOT", repository)
-
-    out_dir, report, output_uri = audit._resolve_output_paths(
-        publish_checked_in_docs=True,
-        out_dir=None,
-        report=None,
-    )
-    assert out_dir == repository / "docs" / "generated"
-    assert report == out_dir / "card-mechanism-coverage-audit.md"
-    assert output_uri == "repo://docs/generated"
-
-    with pytest.raises(ValueError, match="cannot be combined"):
-        audit._resolve_output_paths(
-            publish_checked_in_docs=True,
-            out_dir=str(tmp_path / "arbitrary-source-path"),
-            report=None,
-        )
-    with pytest.raises(ValueError, match="cannot be combined"):
-        audit._resolve_output_paths(
-            publish_checked_in_docs=True,
-            out_dir=None,
-            report=str(tmp_path / "arbitrary-report.md"),
-        )
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "audit_card_mechanism_coverage.py",
-            "--publish-checked-in-docs",
-            "--items",
-            str(tmp_path / "arbitrary-input.json"),
-        ],
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        audit.main()
-    assert exc_info.value.code == 2
-
-
-def test_card_mechanism_checked_in_input_normalization_is_semantic() -> None:
-    audit = _load_script(
-        "test_checked_in_card_mechanism_input_normalization",
-        RL_AGENT_ROOT / "tools" / "audit_card_mechanism_coverage.py",
-    )
-    payload = {
-        "CARD.FIXTURE": {
-            "id": "CARD.FIXTURE",
-            "title": "Fixture",
-            "color": "ironclad",
-            "rarity": "Common",
-            "type": "Attack",
-            "target": "AnyEnemy",
-            "upgrade_level_texts": {
-                "0": {
-                    "canonical_text": "Fixture base",
-                    "description": "Deal 3 damage.",
-                    "effect": "3 damage",
-                    "energy_cost": 1,
-                    "energy_cost_text": "1",
-                    "keywords": [],
-                    "semantic_signals": {"damage": 3},
-                    "semantic_tags": ["damage"],
-                },
-                "1": {
-                    "canonical_text": "Fixture upgraded",
-                    "description": "Deal 5 damage.",
-                    "effect": "5 damage",
-                    "energy_cost": 1,
-                    "energy_cost_text": "1",
-                    "keywords": [],
-                    "semantic_signals": {"damage": 5},
-                    "semantic_tags": ["damage"],
-                },
-            },
-        },
-        "__meta__": {"schema": "fixture"},
+def test_committed_static_card_catalog_contains_no_policy_annotations() -> None:
+    path = REPOSITORY_ROOT / "game-data" / "generated" / "cards.static.generated.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    forbidden = {
+        "keep",
+        "observations",
+        "prior",
+        "priors",
+        "quality",
+        "quality_score",
+        "score",
+        "semantic_signals",
+        "semantic_tags",
+        "strategy",
+        "task_summaries",
     }
 
-    rows, source_kind = audit._card_rows(payload)
-    assert source_kind == "checked-in-card-data"
-    assert [row["upgrades"] for row in rows] == [0, 1]
-    assert rows[0]["semanticSignals"] == {"damage": 3}
-    assert rows[1]["description"] == "Deal 5 damage."
+    def collect_keys(value: object) -> set[str]:
+        if isinstance(value, dict):
+            return {
+                *(str(key).lower() for key in value),
+                *(
+                    child_key
+                    for child in value.values()
+                    for child_key in collect_keys(child)
+                ),
+            }
+        if isinstance(value, list):
+            return {
+                child_key
+                for child in value
+                for child_key in collect_keys(child)
+            }
+        return set()
+
+    assert collect_keys(payload).isdisjoint(forbidden)

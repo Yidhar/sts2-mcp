@@ -6,8 +6,6 @@ import pytest
 
 from sts2_rl.backends import HeadlessBackend, HeadlessProtocolError
 from sts2_rl.contracts import ResetRequest, StepRequest
-from sts2_rl.reward import VersionedRewardCalculator, canonicalize_legacy_transition
-
 
 RESET_ID = "11111111-1111-4111-8111-111111111111"
 STEP_ID = "22222222-2222-4222-8222-222222222222"
@@ -154,38 +152,6 @@ def test_headless_projects_canonical_facts_and_ignores_adapter_scalar() -> None:
     assert result.transition.facts["gold_delta"] == 2.0
     assert result.transition.facts["cards_added"] == ["CARD.B"]
     assert result.transition.facts["potions_added"] == ["POTION.X"]
-
-
-def test_headless_and_live_facts_produce_identical_versioned_reward() -> None:
-    backend = HeadlessBackend(client=FakeHeadlessClient())
-    reset = backend.reset(reset_request())
-    headless = backend.step(
-        StepRequest(
-            request_id=STEP_ID,
-            session_id=backend.session_id,
-            episode_id=reset.episode_id,
-            expected_step_index=0,
-            action_id="end_turn",
-        )
-    )
-    assert headless.transition is not None
-    live_payload = {
-        "episode_id": headless.episode_id,
-        "step_index": headless.step_index,
-        "observation": dict(headless.observation),
-        "legal_actions": [],
-        "terminated": False,
-        "truncated": False,
-        "transition": headless.transition.to_mapping(),
-        "reward": None,
-        "reward_authority": "external-rl",
-        "info": {"reward_authority": "external-rl"},
-    }
-    calculator = VersionedRewardCalculator()
-    headless_reward = calculator.evaluate(canonicalize_legacy_transition(headless))
-    live_reward = calculator.evaluate(canonicalize_legacy_transition(live_payload))
-    assert headless_reward == live_reward
-    assert headless_reward.total == pytest.approx(0.012)
 
 
 def test_headless_request_store_refuses_capacity_without_evicting_unexpired_ids() -> None:

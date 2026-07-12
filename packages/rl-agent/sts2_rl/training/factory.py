@@ -1,78 +1,129 @@
-"""Typed factory that collapses the legacy 94-argument constructor call."""
+"""Composition root for the grounded baseline; no legacy trainer facade."""
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable, Mapping
+import random
 from dataclasses import dataclass
-from typing import Any
 
+import numpy as np
+import torch
+
+from sts2_baseline import ReplayMix, StratifiedReplayBuffer
+from sts2_rl.backends import HeadlessBackend, LiveBackend
+from sts2_rl.contracts import EnvironmentBackend
+from sts2_rl.encoding import GroundedObservationEncoder
+from sts2_rl.models import GroundedCandidateModel
+
+from .collector import GroundedCollector
 from .config import TrainingConfig
+from .learner import GroundedLearner
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TrainingResources:
-    network: Any
-    mcts: Any
-    replay: Any
-    environment: Any
-    optimizer: Any
+    model: GroundedCandidateModel
+    encoder: GroundedObservationEncoder
+    replay: StratifiedReplayBuffer
+    backend: EnvironmentBackend
+    optimizer: torch.optim.Optimizer
+    collector: GroundedCollector
+    learner: GroundedLearner
+    device: torch.device
+
+    def close(self) -> None:
+        self.backend.close()
 
 
-def _derived_option(name: str, options: Mapping[str, Any]) -> tuple[bool, Any]:
-    semantic_names = {
-        "semantic_policy_weight",
-        "semantic_value_weight",
-        "semantic_reward_weight",
-        "semantic_state_consistency_weight",
-        "objective_diversity_weight",
-    }
-    if name in semantic_names:
-        return True, 0.0 if options.get("disable_semantic_training") else options.get(name)
-    if name == "trivial_build_fast_path":
-        return True, not bool(options.get("disable_trivial_build_fast_path", False))
-    if name == "potion_reward_fast_path":
-        return True, not bool(options.get("disable_potion_reward_fast_path", False))
-    if name == "human_demo_alignment_shadow_only":
-        return True, not bool(options.get("human_demo_alignment_enable_loss", False))
-    if name == "offline_alignment_shadow_only":
-        return True, not bool(options.get("offline_alignment_enable_loss", False))
-    return False, None
+def resolve_device(requested: str) -> torch.device:
+    normalized = str(requested).strip().lower()
+    if normalized == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA/ROCm device requested but torch.cuda.is_available() is false")
+    return device
 
 
-def build_legacy_trainer(
-    trainer_type: Callable[..., Any],
-    *,
-    resources: TrainingResources,
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_backend(config: TrainingConfig) -> EnvironmentBackend:
+    environment = config.environment
+    if environment.backend == "live":
+        return LiveBackend(
+            session_path=environment.session_path,
+            allow_legacy_fallback=False,
+        )
+    return HeadlessBackend(exe_path=environment.sim_exe_path)
+
+
+def build_training_resources(
     config: TrainingConfig,
-    overrides: Mapping[str, Any] | None = None,
-) -> Any:
-    """Build the temporary MuZeroTrainer facade from typed config/resources."""
+    *,
+    backend: EnvironmentBackend | None = None,
+) -> TrainingResources:
+    seed_everything(config.runtime.seed)
+    device = resolve_device(config.runtime.device)
+    model = GroundedCandidateModel(config.model.to_model_config()).to(device)
+    encoder = GroundedObservationEncoder(config.model.to_encoding_config())
+    replay = StratifiedReplayBuffer(
+        config.replay.capacity,
+        recent_window=config.replay.recent_window,
+        mix=ReplayMix(
+            coverage=config.replay.coverage_fraction,
+            recent=config.replay.recent_fraction,
+            per=config.replay.priority_fraction,
+        ),
+        alpha=config.replay.alpha,
+        beta=config.replay.beta,
+        priority_epsilon=config.replay.priority_epsilon,
+        seed=config.runtime.seed,
+    )
+    environment_backend = backend or build_backend(config)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.optimization.learning_rate,
+        weight_decay=config.optimization.weight_decay,
+    )
+    collector = GroundedCollector(
+        model=model,
+        encoder=encoder,
+        backend=environment_backend,
+        scenario=config.environment.scenario,
+        objective=config.curriculum.reward_objective,
+        discount=config.optimization.discount,
+        max_episode_steps=config.environment.max_episode_steps,
+        character=config.environment.character,
+        encounter_id=config.environment.encounter_id,
+        seed=config.runtime.seed,
+    )
+    learner = GroundedLearner(
+        model=model,
+        encoder=encoder,
+        optimizer=optimizer,
+        config=config.optimization,
+    )
+    return TrainingResources(
+        model=model,
+        encoder=encoder,
+        replay=replay,
+        backend=environment_backend,
+        optimizer=optimizer,
+        collector=collector,
+        learner=learner,
+        device=device,
+    )
 
-    explicit = dict(overrides or {})
-    options = config.options
-    resource_values = {
-        "network": resources.network,
-        "mcts": resources.mcts,
-        "buffer": resources.replay,
-        "env": resources.environment,
-        "optimizer": resources.optimizer,
-    }
-    kwargs: dict[str, Any] = {}
-    signature = inspect.signature(trainer_type)
-    for name, parameter in signature.parameters.items():
-        if name == "self":
-            continue
-        if name in resource_values:
-            kwargs[name] = resource_values[name]
-        elif name in explicit:
-            kwargs[name] = explicit[name]
-        elif name in options:
-            kwargs[name] = options[name]
-        else:
-            found, value = _derived_option(name, options)
-            if found and value is not None:
-                kwargs[name] = value
-            elif parameter.default is inspect.Parameter.empty:
-                raise ValueError(f"TrainingConfig cannot satisfy required trainer argument {name!r}")
-    return trainer_type(**kwargs)
+
+__all__ = [
+    "TrainingResources",
+    "build_backend",
+    "build_training_resources",
+    "resolve_device",
+    "seed_everything",
+]

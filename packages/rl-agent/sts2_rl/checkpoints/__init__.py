@@ -6,6 +6,7 @@ from .atomic import (
     build_checkpoint_provenance,
     checkpoint_runtime_identity,
     contract_metadata,
+    dependency_lock_metadata,
     game_data_manifest_metadata,
     reward_spec_metadata,
     verify_checkpoint_directory,
@@ -13,7 +14,6 @@ from .atomic import (
 from .resume import (
     EXACT_RESUME_REQUIRED_FILES,
     ValidatedResumeCheckpoint,
-    validate_hashed_warm_start_checkpoint,
     validate_resume_checkpoint,
 )
 
@@ -25,9 +25,9 @@ __all__ = [
     "build_checkpoint_provenance",
     "checkpoint_runtime_identity",
     "contract_metadata",
+    "dependency_lock_metadata",
     "game_data_manifest_metadata",
     "reward_spec_metadata",
-    "validate_hashed_warm_start_checkpoint",
     "validate_resume_checkpoint",
     "verify_checkpoint_directory",
 ]

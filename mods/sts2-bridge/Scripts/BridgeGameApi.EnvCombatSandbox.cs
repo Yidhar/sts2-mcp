@@ -559,11 +559,6 @@ internal static partial class BridgeGameApi
         // source of native AV at HashMapElement+0x10 under long runs.
         DrainManagedFinalizersAfterReset(diagnostics);
 
-        // A fresh combat instance starts with zero self-inflicted HP loss; clear the
-        // tracker so the first observation in this combat does not inherit a counter
-        // left over from the previous sandbox episode.
-        ResetSelfInflictedHpLossTrackerForNewCombat(null);
-
         var executedActions = new List<object>
         {
             new { action = "combat_sandbox_setup", encounter_id = encounterId, diagnostics }

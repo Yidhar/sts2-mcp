@@ -392,11 +392,14 @@ def validate_semantic_guards(
     ):
         legal_actions = fixtures[fixture_name]["legal_actions"]
         if not legal_actions or any(
-            "action_handle" not in action or "action_id" in action
+            "action_handle" not in action
+            or "action_id" in action
+            or "model_action_kind" not in action
             for action in legal_actions
         ):
             raise ContractValidationError(
-                f"{fixture_name}: v2 legal actions must use action_handle only"
+                f"{fixture_name}: v2 legal actions require action_handle and "
+                "model_action_kind, and must not expose action_id"
             )
         legacy_identity = copy.deepcopy(fixtures[fixture_name])
         action = legacy_identity["legal_actions"][0]
@@ -407,6 +410,26 @@ def validate_semantic_guards(
             manifest_path,
             manifest,
             f"{fixture_name} using legacy action_id identity",
+        )
+        missing_model_kind = copy.deepcopy(fixtures[fixture_name])
+        missing_model_kind["legal_actions"][0].pop("model_action_kind")
+        assert_rejected(
+            missing_model_kind,
+            schema_ref,
+            manifest_path,
+            manifest,
+            f"{fixture_name} without canonical model_action_kind",
+        )
+        unknown_model_kind = copy.deepcopy(fixtures[fixture_name])
+        unknown_model_kind["legal_actions"][0]["model_action_kind"] = (
+            "unregistered_backend_action"
+        )
+        assert_rejected(
+            unknown_model_kind,
+            schema_ref,
+            manifest_path,
+            manifest,
+            f"{fixture_name} with unregistered model_action_kind",
         )
 
     legacy_spec_shape = copy.deepcopy(fixtures["fixtures/environment.spec.json"])

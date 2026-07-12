@@ -25,10 +25,10 @@ class EnvironmentCommandError(RuntimeError):
 def _normalize_v2_training_payload(payload: Any, *, surface: str) -> dict[str, Any]:
     """Translate strict v2 wire handles back to the legacy/internal RL identity.
 
-    The live adapter is the only compatibility boundary that performs this
-    mapping. The Bridge and MCP retain ``action_handle`` on the v2 wire, while
-    the existing encoders, guards, and simulator continue to consume
-    ``action_id`` internally.
+    The live adapter is the only transport boundary that performs this mapping.
+    The Bridge retains ``action_handle`` on the v2 wire; the Python dispatch
+    contract uses ``action_id`` internally without exposing that opaque value to
+    model features.
     """
 
     def invalid(message: str) -> EnvironmentCommandError:

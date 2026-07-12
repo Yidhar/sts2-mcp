@@ -315,7 +315,6 @@ internal static partial class BridgeGameApi
 
         if (IsInteractiveMapSurface(context, actions))
         {
-            var routePayloadByKey = new Dictionary<string, object?>(StringComparer.Ordinal);
             foreach (var pointNode in context.MapPoints)
             {
                 if (!IsMapPointTravelable(pointNode))
@@ -330,12 +329,6 @@ internal static partial class BridgeGameApi
                 }
 
                 var actionId = $"map:{coord.col},{coord.row}";
-                var coordKey = ToEnvMapCoordKey(coord);
-                if (!routePayloadByKey.ContainsKey(coordKey))
-                {
-                    routePayloadByKey[coordKey] = BuildEnvMapRoutePayload(context, coord);
-                }
-
                 actions.Add(new BridgeResolvedAction
                 {
                     ActionId = actionId,
@@ -348,7 +341,6 @@ internal static partial class BridgeGameApi
                         point_type = pointNode.Point.PointType.ToString(),
                         point_type_norm = NormalizeEnvMapPointType(pointNode.Point.PointType.ToString()),
                         state = pointNode.State.ToString(),
-                        route_summary = routePayloadByKey[coordKey],
                         screen = context.Screen
                     },
                     Execute = () => InvokeMapTravelAction(context.RunManager, context.MapScreen, pointNode)

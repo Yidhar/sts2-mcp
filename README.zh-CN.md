@@ -5,8 +5,8 @@
 
 `sts2-mcp` 是一个面向 **《杀戮尖塔 2》** 的本地控制与强化学习工程。
 C# Bridge 模组负责读取游戏事实并执行显式合法动作，TypeScript 服务通过
-Model Context Protocol（MCP）提供工具，Python 包负责当前 MuZero/token-memory
-智能体的训练与评估。
+Model Context Protocol（MCP）提供工具，Python 包负责新的 grounded legal-candidate
+actor-critic baseline 的训练与评估。
 
 仓库目前处于 **architecture-v2 切换期**。v2 契约和能力模型是唯一的新开发
 目标；legacy v1 端点默认关闭，与剩余 Python 兼容包装一样，仅为显式迁移
@@ -22,10 +22,10 @@ Model Context Protocol（MCP）提供工具，Python 包负责当前 MuZero/toke
 | 组件 | 版本 | 职责 |
 |---|---:|---|
 | [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema、OpenAPI、fixture 与跨语言版本常量 |
-| [`game-data/`](./game-data/README.md) | `1.0.0` | 有版本的卡牌、敌人、遗物、药水和效果资料 |
+| [`game-data/`](./game-data/README.md) | `2.0.0` | 不含策略标注的卡牌、遗物与药水静态事实 |
 | [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | 游戏适配、可见状态、合法动作、串行命令与会话发现 |
 | [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | 使用官方 SDK 的 TypeScript MCP 服务；默认 `minimal` |
-| [`packages/rl-agent/`](./packages/rl-agent/muzero/README.md) | `0.2.0` | MuZero/token-memory、类型化环境、reward 与 checkpoint 迁移 |
+| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | grounded candidate 模型、类型化 backend、固定 reward、replay、learner 与 checkpoint |
 | [`tools/`](./tools) | — | 契约、数据、资产、发布、许可证和仓库检查 |
 
 组件版本由 [`release-manifest.json`](./release-manifest.json) 协调。线协议以
@@ -45,14 +45,13 @@ flowchart LR
     C[contracts 2.0] --> M
     C --> B
     C --> R
-    D[game-data] --> M
-    D --> B
-    D --> R
+    D[无策略标注的 game-data] --> O[离线 catalog 工具]
 ```
 
 依赖和职责边界是强约束：
 
-- `contracts` 和 `game-data` 是所有运行时共同依赖的叶子包。
+- `contracts` 是运行时共享的叶子依赖；`game-data` 只是经过校验的离线事实
+  catalog，不是策略输入，也不是 grounded 训练器运行依赖。
 - Bridge 只拥有游戏事实适配、合法动作、状态 revision、幂等突变仲裁、
   session 生命周期和有界事件。
 - MCP 服务只拥有协议、输入校验、表现层和小型玩家控制 workflow；不拥有
@@ -152,7 +151,8 @@ node .\packages\mcp-server\index.js
 
 ## RL 开发与训练
 
-当前受维护的正式入口是 **MuZero**，不是已归档 PPO `train_pipeline.py`：
+当前唯一受维护的训练入口是 **grounded-candidate actor-critic baseline**。
+失败的 MuZero/token-memory/MCTS、PPO、planner 与手写 action guard 已删除：
 
 ```powershell
 Set-Location .\packages\rl-agent
@@ -163,28 +163,32 @@ python -m pip install -r requirements-bootstrap.lock
 python -m pip install -r requirements-dev.lock
 python -m pip install -e . --no-deps --no-build-isolation
 python -m pytest tests -q -p no:cacheprovider
-python -m muzero.train --help
+python -m sts2_rl.train --dry-run
 ```
 
-token-memory 启动参数示例：
+可选的 combat bootstrap 与正式 full-run 主线：
 
 ```powershell
-python -m muzero.train `
-  --obs-mode token_v3 `
-  --model-arch token_memory_v1 `
-  --mixed-precision auto
+python -m sts2_rl.train --profile combat
+python -m sts2_rl.train --profile default
 ```
 
-正式实验必须显式选择 backend、scenario、seed、checkpoint、artifact 路径和
-资源上限。所选 backend 的 v2 环境与 parity 门禁未通过前，不要启动长训练。
-PPO 与历史 attention 路径已从受支持源码树移除；归档设计文档仅供参考，不能执行。
+默认模型有 3,642,824 个参数，只对当前合法候选评分；没有 latent dynamics、MCTS、
+planner 或游戏特定 action rewrite。Reward 固定且归一化，replay 混合 coverage、
+recent 与可刷新的 priority。详见
+[`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md)。
+
+软件闭环已有测试，但目前还没有新架构长期训练 checkpoint 或 Act 1 clear-rate
+成绩，不能把 dry-run/单元测试误报为模型效果。所选 backend 的 v2 parity 未通过前，
+不要启动长训练。
 
 ## 契约与 game-data
 
 当前契约标识：
 
 - API：`2.0.0`
-- schema：`2026-07-11.1`
+- schema：`2026-07-13.1`
+- action schema：`2.1.0`
 - action ordering：`2.0.0`
 - observation schema：`5.0.0`
 - reward schema：`2.0.0`
@@ -247,8 +251,10 @@ CI 运行不依赖游戏的契约、卫生、MCP、Bridge-core 和 RL suite。�
 - 游戏突变必须提供严格的 `expected_state_version`。
 - training reset/step 需要 training capability；step 与 `episode_id`、
   `expected_step_index` 绑定。
-- 旧 replay/checkpoint 不假定兼容。迁移必须校验 contract、action ordering、
-  observation、reward 和 game-data hash；不支持时 fail closed。
+- 旧 replay/checkpoint 不兼容。Grounded exact resume 会校验 contract、action
+  ordering、observation/reward、依赖锁、encoding fingerprint、model/optimizer/
+  replay 与随机状态；不支持时 fail closed。有效的静态 game-data 仅可选地记入
+  审计 provenance，不是运行依赖或模型兼容性输入。
 - 历史 journal/knowledge、AutoSlay runner、Draft Tracker、PPO pipeline 文档、
   已提交日志和发布二进制均不属于 v2 control-plane 源码。
 

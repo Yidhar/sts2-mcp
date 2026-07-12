@@ -28,7 +28,7 @@
       "const": "2.0.0"
     },
     "schema_version": {
-      "const": "2026-07-11.1"
+      "const": "2026-07-13.1"
     },
     "request_id": {
       "type": "string",

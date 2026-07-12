@@ -6,25 +6,26 @@
 is in the architecture-v2 cutover. New work targets contract API `2.0.0`;
 `legacy-v1` exists only for an explicit compatibility window.
 
-Do not describe or extend the archived three-stage PPO `train_pipeline.py` flow.
+Do not describe or extend the deleted PPO or MuZero/token-memory/MCTS flows.
 The maintained training entry point is:
 
 ```text
-python -m muzero.train
+python -m sts2_rl.train
 ```
 
 ## Canonical components
 
 1. `contracts/`: the wire-format source of truth. JSON Schema 2020-12, OpenAPI,
    fixtures, and generated C#/TypeScript/Python version constants.
-2. `game-data/`: the shared versioned card/enemy/relic/potion/effect data.
+2. `game-data/`: policy-free static card/relic/potion facts for offline catalog
+   tooling; it is not a trainer input.
 3. `mods/sts2-bridge/`: C#/.NET 9 game adapter. It owns factual snapshots, legal
    action handles, state revision, session lifecycle, bounded events, and the
    single-writer mutation gate.
 4. `packages/mcp-server/`: Node 22 + TypeScript MCP server using the official
    `@modelcontextprotocol/sdk`. Its default tool profile is `minimal`.
-5. `packages/rl-agent/`: Python 3.11+ MuZero/token-memory trainer and the typed
-   v2 environment/reward/checkpoint migration layer.
+5. `packages/rl-agent/`: Python 3.11+ grounded legal-candidate actor-critic,
+   typed v2 backends, immutable normalized reward, replay and checkpoints.
 6. `tools/`: contract, game-data, artifact, release, third-party, and repository
    validation utilities.
 
@@ -35,7 +36,8 @@ come from `docs/adr/`; migration status and removal gates come from
 ## Required dependency direction
 
 ```text
-contracts + game-data -> bridge / mcp-server / rl-agent
+contracts -> bridge / mcp-server / rl-agent
+game-data -> offline catalog tools
 ```
 
 - Bridge and MCP must never import through an RL package path.
@@ -71,7 +73,9 @@ contracts + game-data -> bridge / mcp-server / rl-agent
 - Unknown major contract versions and unsupported checkpoint/replay identities
   fail closed.
 - Replay and checkpoints must record contract, action ordering, observation,
-  reward, and game-data hashes.
+  reward, dependency-lock and grounded-encoding identities plus stochastic
+  continuation state. Valid static game-data may be recorded as optional provenance
+  but is not a runtime dependency or model compatibility identity.
 - Architecture-v2 code must use maintained module entry points directly and must
   not depend on deleted wrappers or `legacy/`.
 - Historical PPO, attention, AutoSlay, Draft Tracker, journal/knowledge, checked-
@@ -132,7 +136,7 @@ python -m pip install -r requirements-bootstrap.lock
 python -m pip install -r requirements-dev.lock
 python -m pip install -e . --no-deps
 python -m pytest tests -q -p no:cacheprovider
-python -m muzero.train --help
+python -m sts2_rl.train --dry-run
 ```
 
 ## Documentation rules

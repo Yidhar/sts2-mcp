@@ -372,9 +372,6 @@ internal static partial class BridgeGameApi
             };
         }
 
-        var profileEntry = TryGetPotionProfileEntry(potion);
-        var effectProfile = BuildPotionEffectProfilePayload(profileEntry);
-
         return new
         {
             id = potion.Id.ToString(),
@@ -386,14 +383,7 @@ internal static partial class BridgeGameApi
             can_throw_at_ally = SafeCanThrowPotionAtAlly(potion),
             is_usable = SafeGetPotionIsUsable(potion),
             is_queued = SafeGetPotionIsQueued(potion),
-            has_been_removed_from_state = SafeGetPotionHasBeenRemovedFromState(potion),
-            target_scope = profileEntry?.TargetScope,
-            effect_family = profileEntry?.EffectFamily.ToArray() ?? Array.Empty<string>(),
-            effect_profile = effectProfile,
-            semantic_tags = profileEntry?.SemanticTags.ToArray() ?? Array.Empty<string>(),
-            timing_tags = profileEntry?.TimingTags.ToArray() ?? Array.Empty<string>(),
-            training_tags = profileEntry?.TrainingTags.ToArray() ?? Array.Empty<string>(),
-            enabled_for_training = profileEntry?.EnabledForTraining ?? true
+            has_been_removed_from_state = SafeGetPotionHasBeenRemovedFromState(potion)
         };
     }
 

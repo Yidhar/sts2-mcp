@@ -86,10 +86,7 @@ internal static partial class BridgeGameApi
             is_locked = option?.IsLocked ?? true,
             is_proceed = option?.IsProceed ?? false,
             relic = (object?)null,
-            glossary,
-            // Structured delta extraction lets a text-free policy reason about
-            // what the option does (hp/gold cost, card ops, relic/potion gain).
-            effect_deltas = ExtractEventOptionEffectDeltas(resolvedTitle, resolvedDescription).ToPayload()
+            glossary
         };
     }
 

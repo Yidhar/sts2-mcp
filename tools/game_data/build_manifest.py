@@ -37,9 +37,9 @@ def main() -> None:
         (ROOT / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8")
     )
     manifest = {
-        "schema_version": "1.0.0",
+        "schema_version": "2.0.0",
         "generator": "tools/game_data/build_manifest.py",
-        "generator_version": "1.0.0",
+        "generator_version": "2.0.0",
         # Release commit/tree/toolchain identity belongs in an external build
         # attestation. Embedding HEAD or wall-clock time here creates a
         # self-referential, non-reproducible source manifest.

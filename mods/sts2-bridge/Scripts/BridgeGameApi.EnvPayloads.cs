@@ -6,7 +6,6 @@ using Godot;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
-using MegaCrit.Sts2.Core.Models.Powers;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace Sts2McpBridge.Scripts;
@@ -562,6 +561,7 @@ internal static partial class BridgeGameApi
             deck = player?.Deck?.Cards.Count ?? 0,
             deck_cards = player?.Deck?.Cards.Select(card => BuildEnvCardPayload(card, GetCardReference(card))).ToArray()
                 ?? Array.Empty<object>(),
+            powers = creature?.Powers.Select(BuildEnvPowerPayload).ToArray() ?? Array.Empty<object>(),
             relics,
             potions
         };
@@ -603,8 +603,6 @@ internal static partial class BridgeGameApi
 
         var player = GetPrimaryPlayer(context);
         var playerCombat = player?.PlayerCombatState;
-        var playerCreature = player?.Creature;
-        var playerFacing = ResolvePlayerFacing(playerCreature);
 
         return new
         {
@@ -612,10 +610,6 @@ internal static partial class BridgeGameApi
             side = context.CombatState.CurrentSide.ToString(),
             play_phase = IsCombatPlayPhase(context.CombatManager, context.CombatState),
             can_act = !context.CombatManager.PlayerActionsDisabled,
-            self_inflicted_hp_loss_cumulative = ObserveSelfInflictedHpLossCumulative(
-                context.CombatState,
-                context.CombatState.RoundNumber),
-            facing = playerFacing,
             energy = playerCombat?.Energy,
             max_energy = playerCombat?.MaxEnergy,
             stars = playerCombat?.Stars,
@@ -624,60 +618,14 @@ internal static partial class BridgeGameApi
             draw = playerCombat?.DrawPile?.Cards.Count ?? 0,
             discard = playerCombat?.DiscardPile?.Cards.Count ?? 0,
             exhaust = playerCombat?.ExhaustPile?.Cards.Count ?? 0,
-            allies = context.CombatState.PlayerCreatures
-                .Where(creature => playerCreature is null || !ReferenceEquals(creature, playerCreature))
+            players = context.CombatState.PlayerCreatures
                 .Select(BuildEnvCreaturePayload)
                 .ToArray(),
             enemies = context.CombatState.Creatures
                 .Where(static creature => creature.IsEnemy)
-                .Select(creature => BuildEnvEnemyPayload(creature, playerFacing))
-                .ToArray(),
-            player_powers = playerCreature?.Powers
-                .Select(static power => new
-                {
-                    id = power.Id.Entry,
-                    title = TextOf(power.Title),
-                    amount = power.Amount,
-                    display_amount = power.DisplayAmount,
-                    stack_type = power.StackType.ToString()
-                })
-                .ToArray() ?? Array.Empty<object>()
+                .Select(BuildEnvEnemyPayload)
+                .ToArray()
         };
-    }
-
-    // Lowercase "right"/"left" if player carries SurroundedPower; null otherwise.
-    // The back-attack mechanic (Rocket / Crusher / Kaiser Crab Boss) keys off this.
-    private static string? ResolvePlayerFacing(Creature? playerCreature)
-    {
-        if (playerCreature is null) return null;
-        foreach (var power in playerCreature.Powers)
-        {
-            if (power is SurroundedPower surrounded)
-            {
-                return surrounded.Facing.ToString().ToLowerInvariant();
-            }
-        }
-        return null;
-    }
-
-    // Damage multiplier enemy -> player if the enemy attacks right now.
-    // Mirrors SurroundedPower.ModifyDamageMultiplicative: 1.5 on matched back
-    // attack (player facing Right + enemy has BackAttackLeft, or mirror),
-    // otherwise 1.0. Returns 1.0 when no SurroundedPower is present so the
-    // field stays meaningful across every combat.
-    private static decimal ComputeIncomingDamageMultiplier(Creature enemy, string? playerFacing)
-    {
-        if (playerFacing is null) return 1m;
-        bool hasBackAttackLeft = false;
-        bool hasBackAttackRight = false;
-        foreach (var power in enemy.Powers)
-        {
-            if (power is BackAttackLeftPower) hasBackAttackLeft = true;
-            else if (power is BackAttackRightPower) hasBackAttackRight = true;
-        }
-        if (playerFacing == "right" && hasBackAttackLeft) return 1.5m;
-        if (playerFacing == "left" && hasBackAttackRight) return 1.5m;
-        return 1m;
     }
 
     private static object BuildEnvCreaturePayload(Creature creature)
@@ -688,13 +636,14 @@ internal static partial class BridgeGameApi
             name = creature.Name,
             hp = creature.CurrentHp,
             max_hp = creature.MaxHp,
-            block = creature.Block
+            block = creature.Block,
+            powers = creature.Powers.Select(BuildEnvPowerPayload).ToArray()
         };
     }
 
-    private static object BuildEnvEnemyPayload(Creature creature, string? playerFacing)
+    private static object BuildEnvEnemyPayload(Creature creature)
     {
-        var intent = JsonSerializer.SerializeToElement(BuildEnemyIntentPayload(creature));
+        var intentEnvelope = JsonSerializer.SerializeToElement(BuildEnemyIntentPayload(creature));
         return new
         {
             id = creature.CombatId,
@@ -705,23 +654,39 @@ internal static partial class BridgeGameApi
             hp = creature.CurrentHp,
             max_hp = creature.MaxHp,
             block = creature.Block,
-            incoming_damage_multiplier = ComputeIncomingDamageMultiplier(creature, playerFacing),
-            intent = new
+            intents = BuildEnvEnemyIntentPayloads(intentEnvelope),
+            powers = creature.Powers.Select(BuildEnvPowerPayload).ToArray()
+        };
+    }
+
+    private static object[] BuildEnvEnemyIntentPayloads(JsonElement intentEnvelope)
+    {
+        var intents = TryGetNestedElement(intentEnvelope, "intents");
+        if (intents is null || intents.Value.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<object>();
+        }
+
+        return intents.Value.EnumerateArray()
+            .Select(intent => (object)new
             {
-                intent_type = TryGetFirstIntentString(intent, "intent_type"),
-                title = TryGetNestedString(intent, "title"),
-                description = TryGetFirstIntentString(intent, "description"),
-                total_damage = TryGetFirstIntentTotalDamage(intent),
-                repeats = TryGetFirstIntentRepeats(intent)
-            },
-            powers = creature.Powers.Select(static power => new
-            {
-                id = power.Id.Entry,
-                title = TextOf(power.Title),
-                amount = power.Amount,
-                display_amount = power.DisplayAmount,
-                stack_type = power.StackType.ToString()
-            }).ToArray()
+                type = TryGetNestedString(intent, "intent_type"),
+                damage = TryGetNestedInt(intent, "total_damage"),
+                repeats = TryGetNestedInt(intent, "repeats")
+            })
+            .ToArray();
+    }
+
+    private static object BuildEnvPowerPayload(PowerModel power)
+    {
+        return new
+        {
+            id = power.Id.ToString(),
+            title = TextOf(power.Title),
+            amount = power.Amount,
+            display_amount = power.DisplayAmount,
+            type = power.Type.ToString(),
+            stack_type = power.StackType.ToString()
         };
     }
 
@@ -842,11 +807,9 @@ internal static partial class BridgeGameApi
             selected_count = selectedCount,
             use_single_selection = useSingleSelection,
             confirm_ready = confirmReady,
-            selection_semantics = "upgrade",
             prompt,
             texts,
             option_count = options.Count,
-            decision_text = BuildDeckUpgradeDecisionText(prompt, useSingleSelection, selectedCount, confirmReady),
             options
         };
     }
@@ -874,8 +837,6 @@ internal static partial class BridgeGameApi
         var canSkip = context.CardSelectionSkipButton is not null &&
                       IsNodeVisible(context.CardSelectionSkipButton) &&
                       IsButtonEnabled(context.CardSelectionSkipButton);
-        var selectionSemantics = ResolveCardSelectionSemantics(screen, prompt, texts);
-        var selectionDomain = ResolveCardSelectionDomain(context, selectionSemantics);
         var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
 
         return new
@@ -883,9 +844,6 @@ internal static partial class BridgeGameApi
             screen_type = screen?.GetType().Name,
             prompt,
             texts,
-            selection_semantics = selectionSemantics,
-            selection_domain = selectionDomain,
-            source_effect_type = selectionSemantics,
             remaining_select = remainingSelect,
             selected_count = selectedCount,
             min_select = minSelect,
@@ -893,57 +851,9 @@ internal static partial class BridgeGameApi
             requires_manual_confirmation = requiresManualConfirmation,
             cancelable = cancelable,
             confirm_ready = confirmReady,
-            can_skip = canSkip,
-            decision_text = BuildCardSelectionDecisionText(
-                selectionSemantics,
-                prompt,
-                selectedCount,
-                minSelect,
-                maxSelect,
-                confirmReady,
-                canSkip)
+            can_skip = canSkip
         };
     }
-
-    private static string BuildDeckUpgradeDecisionText(
-        string? prompt,
-        bool useSingleSelection,
-        int selectedCount,
-        bool confirmReady)
-    {
-        var prefix = useSingleSelection ? "smith card" : "multi smith card";
-        var status = confirmReady
-            ? "ready_confirm"
-            : useSingleSelection ? "waiting_selection" : "continue_selection";
-        var normalizedPrompt = NormalizeSemanticText(prompt ?? "");
-        return string.IsNullOrWhiteSpace(normalizedPrompt)
-            ? $"{prefix}: selected {selectedCount}; {status}"
-            : $"{prefix}: {normalizedPrompt}: selected {selectedCount}; {status}";
-    }
-
-    private static string BuildCardSelectionDecisionText(
-        string? selectionSemantics,
-        string? prompt,
-        int selectedCount,
-        int? minSelect,
-        int? maxSelect,
-        bool confirmReady,
-        bool canSkip)
-    {
-        var prefix = $"{DescribeSelectionSemanticsLabel(selectionSemantics)} card selection";
-        var normalizedPrompt = NormalizeSemanticText(prompt ?? "");
-        var targetCount = maxSelect ?? minSelect;
-        var progress = targetCount is > 0
-            ? $"selected {selectedCount}/{targetCount}"
-            : $"selected {selectedCount}";
-        var status = confirmReady
-            ? "ready_confirm"
-            : canSkip ? "can_skip" : "continue_selection";
-        return string.IsNullOrWhiteSpace(normalizedPrompt)
-            ? $"{prefix}: {progress}: {status}"
-            : $"{prefix}: {normalizedPrompt}: {progress}: {status}";
-    }
-
 
     private static int? ResolveRemainingSelectCount(int selectedCount, int? minSelect, int? maxSelect)
     {
@@ -953,107 +863,6 @@ internal static partial class BridgeGameApi
             return null;
         }
         return Math.Max(target.Value - selectedCount, 0);
-    }
-
-    private static string ResolveCardSelectionDomain(BridgeWorldContext context, string? selectionSemantics)
-    {
-        var semantic = (selectionSemantics ?? string.Empty).Trim().ToLowerInvariant();
-        var combatInProgress = context.CombatManager is not null || context.CombatState is not null || context.CombatRoom is not null;
-        if (combatInProgress)
-        {
-            return semantic is "remove" or "transform" or "upgrade" or "enchant" or "afflict"
-                ? "combat_card_mutation"
-                : "combat_card_selection";
-        }
-        return semantic is "remove" or "transform" or "upgrade" or "enchant" or "afflict" or "copy" or "add"
-            ? "build_card_mutation"
-            : "build_card_selection";
-    }
-
-    private static string ResolveCardSelectionSemantics(
-        Node? cardSelectionScreen,
-        string? prompt = null,
-        IReadOnlyList<string>? texts = null)
-    {
-        if (string.Equals(cardSelectionScreen?.GetType().Name, "NChooseABundleSelectionScreen", StringComparison.Ordinal))
-        {
-            return "bundle";
-        }
-
-        var comparableTexts = new List<string>();
-        if (!string.IsNullOrWhiteSpace(prompt))
-        {
-            comparableTexts.Add(NormalizeComparableText(prompt));
-        }
-
-        if (texts is not null)
-        {
-            comparableTexts.AddRange(texts
-                .Where(static text => !string.IsNullOrWhiteSpace(text))
-                .Select(NormalizeComparableText));
-        }
-
-        var combined = string.Join(" ", comparableTexts).ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(combined))
-        {
-            return "choose";
-        }
-
-        if (combined.Contains("移除", StringComparison.Ordinal) ||
-            combined.Contains("删除", StringComparison.Ordinal) ||
-            combined.Contains("remove", StringComparison.Ordinal) ||
-            combined.Contains("purge", StringComparison.Ordinal))
-        {
-            return "remove";
-        }
-
-        if (combined.Contains("变化", StringComparison.Ordinal) ||
-            combined.Contains("变形", StringComparison.Ordinal) ||
-            combined.Contains("transform", StringComparison.Ordinal))
-        {
-            return "transform";
-        }
-
-        if (combined.Contains("消耗", StringComparison.Ordinal) ||
-            combined.Contains("耗尽", StringComparison.Ordinal) ||
-            combined.Contains("exhaust", StringComparison.Ordinal) ||
-            combined.Contains("净化", StringComparison.Ordinal) ||
-            combined.Contains("purity", StringComparison.Ordinal))
-        {
-            // Purity/净化 is a combat-only exhaust selection, not a permanent
-            // remove/purge mutation.  Keep it distinct so RL can treat it as a
-            // hand-state/card-selection mechanism instead of deck removal.
-            return "exhaust";
-        }
-
-        if (combined.Contains("弃牌", StringComparison.Ordinal) ||
-            combined.Contains("弃置", StringComparison.Ordinal) ||
-            combined.Contains("discard", StringComparison.Ordinal))
-        {
-            return "discard";
-        }
-
-        if (combined.Contains("保留", StringComparison.Ordinal) ||
-            combined.Contains("retain", StringComparison.Ordinal))
-        {
-            return "retain";
-        }
-
-        if (combined.Contains("升级", StringComparison.Ordinal) ||
-            combined.Contains("smith", StringComparison.Ordinal) ||
-            combined.Contains("upgrade", StringComparison.Ordinal) ||
-            combined.Contains("smith", StringComparison.Ordinal))
-        {
-            return "upgrade";
-        }
-
-        if (combined.Contains("组合", StringComparison.Ordinal) ||
-            combined.Contains("bundle", StringComparison.Ordinal))
-        {
-            return "bundle";
-        }
-
-        return "choose";
     }
 
     private static int? ResolveSelectedCharacterIndex(BridgeWorldContext context)

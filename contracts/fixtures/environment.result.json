@@ -15,6 +15,7 @@
       "idx": 0,
       "action_handle": "reward:continue",
       "kind": "continue",
+      "model_action_kind": "reward",
       "label": "Continue",
       "selection": "proceed"
     }

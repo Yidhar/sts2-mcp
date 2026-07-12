@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- [x] Preserve the pre-refactor dirty diff and hashes.
+- [x] Remove pre-reboot RL patches/inventories; Git history is the only archive.
 - [x] Establish a shared contract manifest and fixtures.
 - [x] Establish a versioned game-data package.
 - [ ] Record live fixtures for every decision surface.
@@ -26,8 +26,9 @@
 
 - [x] Use one typed backend protocol for live and headless execution.
 - [x] Use one canonical transition and reward calculator.
-- [x] Record contract/content/reward hashes in replay and checkpoints.
-- [x] Remove tactical post-hoc action/target rewriting from the default path.
+- [x] Record grounded encoding and complete reward-projection fingerprints in replay;
+  record contract, reward, encoding and dependency identities in atomic checkpoints.
+- [x] Remove tactical post-hoc action/target rewriting from the maintained RL path.
 
 Local evidence for the completed items is executable rather than narrative:
 
@@ -38,13 +39,13 @@ Local evidence for the completed items is executable rather than narrative:
   credential redaction, strict v2 envelopes, legacy one-shot unknown outcomes, and
   exact duplicate replay wire construction.
 - `packages/rl-agent/tests` covers the shared backend protocol, transition/reward
-  authority, guard-off defaults, artifact boundaries, and hash/identity-gated exact
-  checkpoint resume versus explicit weights-only migration.
+  authority, absence of policy guards, artifact boundaries, hash/identity-gated exact
+  resume, and strict same-baseline model initialization into a fresh lineage.
 
 ## Removal gate
 
-Legacy v1 may be removed only when contract, idempotency, concurrency,
-live/headless parity, checkpoint migration, and end-to-end tests are green and
+Legacy control API v1 may be removed only when contract, idempotency, concurrency,
+live/headless parity, grounded-checkpoint resume, and end-to-end tests are green and
 v1 client telemetry has reached zero.
 
 The following promotion gates remain deliberately unchecked and cannot be inferred

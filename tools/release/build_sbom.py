@@ -334,7 +334,6 @@ def _requirement_profile(path: Path) -> str:
         "requirements-bootstrap.lock": "packaging-bootstrap",
         "requirements.lock": "runtime-cpu",
         "requirements-dev.lock": "development",
-        "requirements-text.lock": "text-encoder",
         "requirements-wsl-rocm.txt": "wsl-rocm",
     }.get(path.name, path.stem.removeprefix("requirements-") or "runtime")
 

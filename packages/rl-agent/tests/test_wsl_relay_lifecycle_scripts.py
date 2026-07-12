@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 START = (SCRIPTS / "start_wsl_bridge_relay.ps1").read_text(encoding="utf-8")
 STOP = (SCRIPTS / "stop_wsl_bridge_relay.ps1").read_text(encoding="utf-8")
-TRAIN = (SCRIPTS / "train_muzero_wsl_rocm.sh").read_text(encoding="utf-8")
+TRAIN = (SCRIPTS / "train_grounded_wsl_rocm.sh").read_text(encoding="utf-8")
 
 
 def test_start_defaults_to_loopback_and_rejects_wildcard() -> None:
@@ -63,6 +62,12 @@ def test_retained_wsl_launcher_has_no_personal_absolute_path() -> None:
     assert "yidhar" not in TRAIN.lower()
     assert "/mnt/c/Users/" not in TRAIN
     assert "GetFolderPath" in TRAIN
+
+
+def test_training_uses_environment_selected_relay_authority() -> None:
+    assert 'export STS2_BRIDGE_RELAY_ALLOWLIST="$STS2_BRIDGE_BASE_URL"' in TRAIN
+    assert '--session-path "$STS2_BRIDGE_SESSION_FILE"' not in TRAIN
+    assert "export STS2_BRIDGE_SESSION_FILE=" in TRAIN
 
 
 def test_launchers_keep_virtual_environments_outside_checkout() -> None:

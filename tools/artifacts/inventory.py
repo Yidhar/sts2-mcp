@@ -1,10 +1,8 @@
 """Inventory and compare repository artifact trees without following links.
 
-The migration map is one-to-one, but some canonical destinations contain other
-mapped destinations (for example ``runs`` contains archived legacy run roots).
-Artifact-layout inventories therefore reserve those child namespaces while
-scanning the parent entry.  This keeps every byte in exactly one mapped entry
-and makes source and post-move inventories directly comparable.
+The externalization map is one-to-one. Artifact-layout inventories reserve any
+nested destination namespaces while scanning a parent entry, keeping every byte
+in exactly one mapping and source/post-move inventories directly comparable.
 """
 
 from __future__ import annotations

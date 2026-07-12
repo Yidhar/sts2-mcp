@@ -4,12 +4,11 @@ import sys
 import unittest
 from pathlib import Path
 
-
 RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_ROOT))
 
-from launcher_watchdog import (
+from launcher_watchdog import (  # noqa: E402
     InstanceAction,
     Watchdog,
     WatchdogInstanceView,

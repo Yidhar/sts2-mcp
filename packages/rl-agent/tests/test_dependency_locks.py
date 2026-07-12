@@ -38,7 +38,7 @@ def test_package_version_matches_project_metadata() -> None:
     import sts2_rl
 
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert sts2_rl.__version__ == pyproject["project"]["version"] == "0.2.0"
+    assert sts2_rl.__version__ == pyproject["project"]["version"] == "0.3.0"
 
 
 def test_project_direct_dependencies_and_build_tools_are_exact() -> None:
@@ -80,7 +80,6 @@ def test_locks_have_no_deleted_sb3_stack_and_rocm_artifact_is_explicit() -> None
             "requirements-bootstrap.lock",
             "requirements.lock",
             "requirements-dev.lock",
-            "requirements-text.lock",
             "requirements-wsl-rocm.txt",
         )
     ).casefold()
@@ -121,7 +120,6 @@ def test_every_python_lock_enforces_sha256_hashes() -> None:
         "requirements-bootstrap.lock": "any-py3",
         "requirements.lock": "windows-cp313",
         "requirements-dev.lock": "windows-cp313",
-        "requirements-text.lock": "windows-cp313",
         "requirements-wsl-rocm.txt": "wsl-cp312-rocm-7.2.1",
     }
     for filename, profile in profiles.items():

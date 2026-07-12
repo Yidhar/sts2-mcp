@@ -6,10 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from muzero.training.paths import RunPaths
 from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
-from sts2_env.human_demo_recorder import HumanDemoRecorder
-from sts2_env.text_encoder import TextEncoder
 from sts2_rl.artifacts import (
     ARTIFACT_ROOT_ENV,
     artifact_root,
@@ -73,78 +70,6 @@ def test_read_only_input_allows_explicit_external_path_but_never_source_checkout
         resolve_external_input_path(source / "old-checkpoint", root=root, source_root=source)
 
 
-def test_run_path_defaults_and_resume_are_scoped_to_environment_artifact_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    artifacts = tmp_path / "external-artifacts"
-    package_root = tmp_path / "checkout" / "packages" / "rl-agent"
-    monkeypatch.setenv(ARTIFACT_ROOT_ENV, str(artifacts))
-
-    defaults = RunPaths.from_args(
-        SimpleNamespace(log_dir=None, checkpoint_dir=None, resume_from=None),
-        package_root=package_root,
-    )
-    resumed = RunPaths.from_args(
-        SimpleNamespace(log_dir="logs/custom", checkpoint_dir="checkpoints/custom", resume_from="checkpoints/base"),
-        package_root=package_root,
-    )
-
-    assert defaults.log_dir == artifacts / "runs"
-    assert defaults.checkpoint_dir == artifacts / "checkpoints"
-    assert resumed.log_dir == artifacts / "logs" / "custom"
-    assert resumed.checkpoint_dir == artifacts / "checkpoints" / "custom"
-    assert resumed.resume_from == artifacts / "checkpoints" / "base"
-    assert not defaults.log_dir.is_relative_to(package_root)
-
-
-def test_human_demo_default_and_relative_override_use_artifact_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    artifacts = tmp_path / "external-artifacts"
-    monkeypatch.setenv(ARTIFACT_ROOT_ENV, str(artifacts))
-
-    default_recorder = HumanDemoRecorder(session_id="default-session")
-    relative_recorder = HumanDemoRecorder(output_dir="curated/demos", session_id="relative-session")
-    try:
-        assert default_recorder.paths.session_dir == artifacts / "human_demos" / "default-session"
-        assert relative_recorder.paths.session_dir == artifacts / "curated" / "demos" / "relative-session"
-    finally:
-        default_recorder.close()
-        relative_recorder.close()
-
-
-def test_human_demo_rejects_session_and_source_path_traversal(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    artifacts = tmp_path / "external-artifacts"
-    monkeypatch.setenv(ARTIFACT_ROOT_ENV, str(artifacts))
-
-    with pytest.raises(ValueError, match="one safe path component"):
-        HumanDemoRecorder(session_id="../checkout")
-    with pytest.raises(ValueError, match="one safe path component"):
-        HumanDemoRecorder(source="../../escape")
-    assert not artifacts.exists()
-
-
-def test_text_embedding_cache_defaults_and_relative_override_use_artifact_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    artifacts = tmp_path / "external-artifacts"
-    monkeypatch.setenv(ARTIFACT_ROOT_ENV, str(artifacts))
-
-    default_encoder = TextEncoder()
-    relative_encoder = TextEncoder(cache_dir="cache/custom-text")
-
-    assert default_encoder._cache_dir == artifacts / "cache" / "text_embeddings"
-    assert relative_encoder._cache_dir == artifacts / "cache" / "custom-text"
-    with pytest.raises(ValueError, match="must stay below the artifact root"):
-        TextEncoder(cache_dir=str(tmp_path / "unscoped-cache"))
-
-
 def test_headless_hang_log_defaults_to_artifact_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -197,7 +122,7 @@ def test_cli_path_options_cannot_bypass_declared_source_or_artifact_boundaries()
         "--network-state",
     }
     source_paths = set(package_root.glob("*.py"))
-    for directory in ("sts2_rl", "sts2_env", "muzero", "scripts", "tools"):
+    for directory in ("sts2_rl", "sts2_baseline", "sts2_env", "scripts", "tools"):
         source_paths.update((package_root / directory).rglob("*.py"))
     violations: list[str] = []
     for path in sorted(source_paths):

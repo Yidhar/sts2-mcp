@@ -5,13 +5,12 @@ import importlib.util
 import json
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator
 
 import pytest
-
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bridge_wsl_relay.py"
 SPEC = importlib.util.spec_from_file_location("bridge_wsl_relay", SCRIPT)

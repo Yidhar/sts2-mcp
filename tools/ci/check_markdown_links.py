@@ -11,7 +11,7 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[2]
 LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
-EXCLUDED_PREFIXES = ("docs/archive/", "docs/migration/baseline-")
+EXCLUDED_PREFIXES = ("docs/archive/",)
 
 
 def candidates() -> list[Path]:

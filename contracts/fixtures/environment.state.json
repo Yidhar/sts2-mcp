@@ -1,7 +1,7 @@
 {
   "ok": true,
   "api_version": "2.0.0",
-  "schema_version": "2026-07-11.1",
+  "schema_version": "2026-07-13.1",
   "capability": "training",
   "state_version": 42,
   "episode_id": "episode-example-0001",
@@ -20,6 +20,7 @@
       "idx": 0,
       "action_handle": "reward:continue",
       "kind": "continue",
+      "model_action_kind": "proceed",
       "label": "Continue",
       "selection": "proceed"
     }

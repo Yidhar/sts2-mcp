@@ -1,18 +1,18 @@
-"""Translation facade: HeadlessSim state dict to bridge-shaped dict.
+"""Translate HeadlessSim JSON DTOs to the typed environment observation.
 
-The domain translators are pure and live in focused private modules.  This file
-keeps the historical import surface used by ``HeadlessSimBridgeClient``.
+Only structural protocol adaptation belongs here.  The translator deliberately
+does not create rewards, auxiliary targets, route summaries, inferred event
+effects, boss mechanics, or action-quality signals.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
-from ._sim_translate_actions import (
-    _translate_legal_actions,
-)
+from ._sim_translate_actions import _translate_legal_actions
 from ._sim_translate_decisions import (
-    _build_decision_block,
     _translate_card_reward_sel_block,
     _translate_card_sel_block,
     _translate_event_options,
@@ -22,122 +22,107 @@ from ._sim_translate_decisions import (
 )
 from ._sim_translate_entities import (
     _translate_combat_block,
-    _translate_flat_player_block,
     _translate_map_block,
-    _translate_player_block,
+    _translate_player,
     _translate_run_block,
 )
 from ._sim_translate_shared import (
-    SelfInflictedHpTracker,
+    _decision_domain_from_phase,
     _phase_from_state,
-    _player_facing_from_status,
     _screen_from_state_type,
     sim_kind_to_bridge_kind,
 )
+
+
+def _section(sim_state: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = sim_state.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"simulator {name} section must be a mapping")
+    return value
+
+
+def _player_snapshot(
+    sim_state: Mapping[str, Any],
+    sections: tuple[Mapping[str, Any], ...],
+) -> Mapping[str, Any]:
+    for section in sections:
+        player = section.get("player")
+        if isinstance(player, Mapping):
+            return player
+        if player is not None:
+            raise TypeError("simulator player snapshot must be a mapping")
+    direct = sim_state.get("player")
+    if isinstance(direct, Mapping):
+        return direct
+    if direct is not None:
+        raise TypeError("simulator player snapshot must be a mapping")
+    return {}
 
 
 def translate_to_bridge_shape(
     sim_state: dict[str, Any],
     *,
     episode_id: str,
-    self_inflicted_tracker: SelfInflictedHpTracker | None = None,
 ) -> dict[str, Any]:
-    """Main entry: sim state dict → bridge-shaped dict the obs encoder reads."""
+    """Translate one simulator state without modifying its legal choices."""
+
+    if not isinstance(sim_state, Mapping):
+        raise TypeError("simulator state must be a mapping")
     state_type = str(sim_state.get("state_type") or "").lower()
 
-    # Every sub-state section (when present) carries the current player
-    # snapshot — we prefer battle.player when in combat, otherwise the
-    # first available.
-    sim_run = sim_state.get("run") or {}
-    battle = sim_state.get("battle") or {}
-    event = sim_state.get("event") or {}
-    map_state = sim_state.get("map") or {}
-    rest_site = sim_state.get("rest_site") or {}
-    shop = sim_state.get("shop") or {}
-    treasure = sim_state.get("treasure") or {}
-    rewards_state = sim_state.get("rewards") or {}
-    card_reward = sim_state.get("card_reward") or {}
-    card_select = sim_state.get("card_select") or {}
-    hand_select = sim_state.get("hand_select") or {}
-    relic_select = sim_state.get("relic_select") or {}
-    game_over = sim_state.get("game_over") or {}
+    sim_run = _section(sim_state, "run")
+    battle = _section(sim_state, "battle")
+    event = _section(sim_state, "event")
+    map_state = _section(sim_state, "map")
+    rest_site = _section(sim_state, "rest_site")
+    shop = _section(sim_state, "shop")
+    treasure = _section(sim_state, "treasure")
+    rewards_state = _section(sim_state, "rewards")
+    card_reward = _section(sim_state, "card_reward")
+    card_select = _section(sim_state, "card_select")
+    hand_select = _section(sim_state, "hand_select")
+    relic_select = _section(sim_state, "relic_select")
+    game_over = _section(sim_state, "game_over")
 
-    sim_player = (
-        battle.get("player")
-        or event.get("player")
-        or map_state.get("player")
-        or rest_site.get("player")
-        or shop.get("player")
-        or treasure.get("player")
-        or rewards_state.get("player")
-        or card_reward.get("player")
-        or card_select.get("player")
-        or hand_select.get("player")
-        or relic_select.get("player")
-        or sim_state.get("player")
-        or {}
+    sim_player = _player_snapshot(
+        sim_state,
+        (
+            battle,
+            event,
+            map_state,
+            rest_site,
+            shop,
+            treasure,
+            rewards_state,
+            card_reward,
+            card_select,
+            hand_select,
+            relic_select,
+            game_over,
+        ),
     )
-
-    # Sim labels the *room* (monster/elite/boss) in state_type and carries
-    # the live fight in the ``battle`` block. The presence of battle.player
-    # (or battle.enemies) is the authoritative "we are currently mid-combat"
-    # signal — much more reliable than state_type string matching.
-    in_combat = (
+    in_combat = bool(
         state_type in {"combat", "battle"}
-        or bool(battle.get("player"))
-        or bool(battle.get("enemies"))
+        or battle.get("player") is not None
+        or battle.get("enemies") is not None
     )
-    screen = _screen_from_state_type(state_type, in_combat=in_combat)
-    player_facing = _player_facing_from_status(sim_player.get("status"))
+    phase = _phase_from_state(state_type, in_combat=in_combat)
 
-    sim_legal_actions = sim_state.get("legal_actions") or []
-
-    # --- Combat block ---
-    bridge_combat: dict[str, Any] = {"in_progress": in_combat}
-    if in_combat and battle:
-        bridge_combat.update(_translate_combat_block(
-            battle, sim_player,
-            player_facing=player_facing,
-            self_inflicted=self_inflicted_tracker.cumulative if self_inflicted_tracker else 0,
-        ))
-
-    # --- Player / deck / relics / potions ---
-    # Two shapes are needed: the legacy nested `players[0]` block (list with
-    # `creature.current_hp` etc.) AND a flat `player` dict that all downstream
-    # consumers (reward shaping in combat_env._player_hp_delta_reward, obs
-    # encoder in observation_v3, aux_targets in aux_targets.py) actually read.
-    # The real bridge emits both; the sim translator was only emitting the
-    # nested list form, so every player-side reward and player-side obs
-    # feature was zero-filled during sim training.
-    bridge_players = [_translate_player_block(
-        sim_player,
-        in_combat=in_combat,
-        player_facing=player_facing,
-    )]
-    bridge_player = _translate_flat_player_block(
-        sim_player,
-        player_facing=player_facing,
+    raw_actions = sim_state.get("legal_actions")
+    if raw_actions is None:
+        raw_actions = []
+    if not isinstance(raw_actions, list | tuple):
+        raise TypeError("simulator legal_actions must be a sequence")
+    combat_card_selection = (
+        battle.get("card_selection")
+        if isinstance(battle.get("card_selection"), Mapping)
+        else None
     )
-
-    # --- Map ---
-    bridge_map = _translate_map_block(sim_run, map_state)
-
-    # --- Rewards / shops / rest / treasure / card-reward / card-select ---
-    bridge_rewards = _translate_rewards_block(rewards_state, card_reward, treasure, relic_select)
-    bridge_rest_site = _translate_rest_site_block(rest_site)
-    bridge_shop = _translate_shop_block(shop)
-    bridge_card_reward_sel = _translate_card_reward_sel_block(card_reward)
-    bridge_card_sel = _translate_card_sel_block(card_select, hand_select, battle.get("card_selection") if battle else None)
-
-    # --- Event options (with effect_deltas TODO) ---
-    event_options = _translate_event_options(event)
-
-    # --- Run block ---
-    bridge_run = _translate_run_block(sim_run, state_type, game_over)
-
-    # --- Legal actions (rich bridge-shaped entries) ---
-    bridge_actions = _translate_legal_actions(
-        sim_legal_actions,
+    action_card_selection = card_select or hand_select or combat_card_selection or {}
+    actions = _translate_legal_actions(
+        raw_actions,
         sim_player=sim_player,
         battle=battle,
         map_state=map_state,
@@ -145,86 +130,57 @@ def translate_to_bridge_shape(
         rest_site=rest_site,
         shop=shop,
         card_reward=card_reward,
-        card_select=card_select,
+        card_select=action_card_selection,
         treasure=treasure,
+        relic_select=relic_select,
     )
 
-    phase = _phase_from_state(state_type, in_combat=in_combat)
-    # Mirror live ResolveEnvDecisionDomain (BridgeGameApi.EnvPayloads.cs:442):
-    # combat→combat, map→route, card_selection/settling→combat if in-combat
-    # else build, everything else→build. Obs encoder (_resolve_domain at
-    # observation_common.py:1547) reads this top-level.
-    if phase == "combat":
-        decision_domain = "combat"
-    elif phase == "map":
-        decision_domain = "route"
-    elif phase in {"card_selection", "settling"}:
-        decision_domain = "combat" if in_combat else "build"
-    else:
-        decision_domain = "build"
+    event_payload = {
+        key: deepcopy(value)
+        for key, value in event.items()
+        if key not in {"player", "options"}
+    }
+    event_payload["options"] = _translate_event_options(event)
 
-    bridge_state: dict[str, Any] = {
+    observation: dict[str, Any] = {
         "ok": True,
         "backend": "headless_sim",
-        "captured_at_utc": "",
-        "state_version": int(sim_state.get("state_version") or 0),
-        "state_hash": str(sim_state.get("state_hash") or ""),
-        "semantic_state_hash": str(sim_state.get("semantic_state_hash") or ""),
         "schema_version": "sim-v1",
         "bridge_version": "headless_sim",
-        "decision_domain": decision_domain,
-        "screen": screen,
-        "players": bridge_players,
-        "player": bridge_player,
-        "combat": bridge_combat,
-        "map": bridge_map,
-        "rewards": bridge_rewards,
-        "run": bridge_run,
-        "event_options": event_options,
-        "card_selection": bridge_card_sel,
-        "card_reward_selection": bridge_card_reward_sel,
-        "character_selection": {"visible": state_type == "character_select", "options": []},
-        "run_mode_selection": {"visible": False},
-        "deck_upgrade_selection": {"visible": False, "choices": []},
-        "main_menu": {"visible": screen == "MAIN_MENU"},
-        # Per-phase decision dict consumed by observation_common._append
-        # (10 scalar features: option_count, can_skip, selected_count,
-        # min_select, max_select, is_open, travelable_count, can_proceed,
-        # reward_count, item_count). Real bridge emits via
-        # BuildEnvDecisionPayload (BridgeGameApi.EnvPayloads.cs:691-762);
-        # translator was missing it entirely → every decision/phase
-        # feature read as zero during sim training.
-        "decision": _build_decision_block(
-            state_type=state_type,
-            in_combat=in_combat,
-            event=event,
-            map_state=map_state,
-            rest_site=rest_site,
-            shop=shop,
-            treasure=treasure,
-            rewards=rewards_state,
-            card_reward=card_reward,
-            card_select=card_select,
-            hand_select=hand_select,
-        ),
-        "rest_site": bridge_rest_site,
-        "shop": bridge_shop,
-        "crystal_sphere": {"visible": False},
-        "automation": {"enabled": False},
-        "available_actions": bridge_actions,
-        "_sim_raw": sim_state,
-        "episode_id": episode_id,
+        "episode_id": str(episode_id),
+        "state_type": state_type,
+        "state_version": int(sim_state.get("state_version", 0) or 0),
+        "state_hash": str(sim_state.get("state_hash") or ""),
+        "semantic_state_hash": str(sim_state.get("semantic_state_hash") or ""),
         "phase": phase,
+        "decision_domain": _decision_domain_from_phase(phase, in_combat=in_combat),
+        "screen": _screen_from_state_type(state_type, in_combat=in_combat),
+        "terminated": bool(sim_state.get("terminal", False)),
+        "truncated": bool(sim_state.get("truncated", False)),
+        "player": _translate_player(sim_player),
+        "combat": _translate_combat_block(battle, in_progress=in_combat),
+        "run": _translate_run_block(sim_run),
+        "map": _translate_map_block(map_state),
+        "event": event_payload,
+        "rewards": _translate_rewards_block(
+            rewards_state, card_reward, treasure, relic_select
+        ),
+        "rest_site": _translate_rest_site_block(rest_site),
+        "shop": _translate_shop_block(shop),
+        "card_selection": _translate_card_sel_block(
+            card_select,
+            hand_select,
+            combat_card_selection,
+        ),
+        "card_reward_selection": _translate_card_reward_sel_block(card_reward),
+        "available_actions": actions,
+        # Dispatch/debug provenance stays outside model features: the grounded
+        # encoder rejects all underscore-prefixed fields.
+        "_sim_raw": deepcopy(dict(sim_state)),
     }
-    return bridge_state
+    return observation
 
-# Preserve the historical public type/function homes for diagnostics and any
-# out-of-tree pickle/introspection consumers.
-SelfInflictedHpTracker.__module__ = __name__
+
 sim_kind_to_bridge_kind.__module__ = __name__
 
-__all__ = [
-    "SelfInflictedHpTracker",
-    "sim_kind_to_bridge_kind",
-    "translate_to_bridge_shape",
-]
+__all__ = ["sim_kind_to_bridge_kind", "translate_to_bridge_shape"]

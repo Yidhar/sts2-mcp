@@ -1,6 +1,0 @@
-
-# Skada BC dataset artifacts (~5 GB) — extract via clean_skada_runs.py + skada_bc_dataset.py
-data/skada_clean/
-data/skada_bc/
-checkpoints_attention/bc_smoke/
-checkpoints_attention/bc_pretrain/

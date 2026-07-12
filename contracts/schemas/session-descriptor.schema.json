@@ -84,10 +84,10 @@
       }
     },
     "schema_version": {
-      "const": "2026-07-11.1"
+      "const": "2026-07-13.1"
     },
     "action_schema_version": {
-      "const": "2.0.0"
+      "const": "2.1.0"
     },
     "legal_action_ordering_version": {
       "const": "2.0.0"

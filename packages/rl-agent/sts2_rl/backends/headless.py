@@ -16,7 +16,7 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
-from sts2_rl.reward import TransitionFacts, derive_transition_facts
+from sts2_rl.transitions import TransitionFacts, derive_transition_facts
 
 from .legacy import _invoke_legacy_method
 
@@ -176,8 +176,6 @@ class HeadlessBackend:
         payload = asdict(facts)
         for key in ("cards_added", "cards_removed", "potions_added", "potions_removed"):
             payload[key] = list(payload[key])
-        # Backend scalars are diagnostic only and never part of canonical v2 reward.
-        payload["backend_reward"] = 0.0
         return payload
 
     def _project(
@@ -207,7 +205,6 @@ class HeadlessBackend:
                 observation,
                 terminated=terminated,
                 terminal_reason=terminal_reason,
-                backend_reward=0.0,
             )
         episode_id = str(raw.get("episode_id") or self._episode_id)
         transition = {

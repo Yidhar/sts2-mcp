@@ -70,10 +70,8 @@ PATH_SCAN_SUFFIXES = {
 }
 PATH_SCAN_EXCLUDED_PREFIXES = (
     "docs/archive/",
-    "docs/migration/baseline-",
 )
 PATH_SCAN_EXCLUDED_FILES = {"tools/ci/check_repository.py"}
-TEXT_POLICY_EXCLUDED_PREFIXES = ("docs/migration/baseline-",)
 
 
 def candidate_files() -> list[str]:
@@ -106,10 +104,6 @@ def main() -> int:
         name = path.name.lower()
         is_text = suffix in TEXT_SUFFIXES or name in {".editorconfig", ".gitattributes", ".gitignore"}
         if not path.is_file() or not is_text:
-            continue
-        if normalized.startswith(TEXT_POLICY_EXCLUDED_PREFIXES):
-            # These are byte-preserved pre-refactor evidence files, including
-            # the original user WIP patch. Their hashes matter more than style.
             continue
         try:
             data = path.read_bytes()

@@ -100,7 +100,6 @@ internal static partial class BridgeGameApi
                         BuildSafeV2ConflictDetails(before, expectedStateVersion: null, actionId));
                 }
 
-                AccumulateSelfInflictedHpLossIfPlayCard(actionId, currentAction);
                 try
                 {
                     currentAction.Execute();

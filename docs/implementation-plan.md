@@ -1,12 +1,13 @@
 # Architecture-v2 implementation plan
 
-Status: active migration plan. Completion claims must be backed by the named tests;
-the checkbox authority is [`migration/v2-cutover.md`](./migration/v2-cutover.md).
+Status: architecture-v2 execution record. Completion claims are backed by the named
+tests; remaining external gates are tracked in
+[`migration/v2-cutover.md`](./migration/v2-cutover.md).
 
 ## Operating rules
 
-1. Preserve user work and training assets before changing layout.
-2. Do not perform a destructive cleanup on a dirty training worktree.
+1. Preserve unrelated user work before changing layout.
+2. Treat pre-reboot RL checkpoints, replay, demos and patches as unsupported inputs.
 3. Make the contract executable before deleting compatibility code.
 4. Keep v1 and v2 dual-stack only for a measured migration window.
 5. Fail closed on unknown outcome, incompatible version, or unsupported checkpoint.
@@ -14,9 +15,8 @@ the checkbox authority is [`migration/v2-cutover.md`](./migration/v2-cutover.md)
 
 ## Phase 0 — baseline and asset protection
 
-- Preserve the pre-refactor dirty patch, Git identity, and untracked-file hashes.
-- Inventory checkpoint, replay, optimizer, dataset, log, virtual-environment, and
-  release directories.
+- Use Git history as the only pre-refactor source archive; do not retain RL WIP patches.
+- Inventory current architecture-v2 release assets and pinned dependencies only.
 - Record third-party commit and license status.
 - Capture golden state/command/environment fixtures.
 - Stop writers before any artifact move.
@@ -27,7 +27,8 @@ Exit: every irreplaceable asset is backed up or represented by a verified manife
 
 - Track canonical docs, schemas, scripts, and component READMEs.
 - Stop tracking logs, PIDs, binaries, decompilations, and temporary slices.
-- Add explicit ignore, line-ending, editor, runtime-version, and dependency locks.
+- Add line-ending, editor, runtime-version and dependency locks; do not hide
+  repository-local training residue behind ignore rules.
 - Make the existing Python suite green or quarantine an obsolete test with a written
   replacement gate.
 - Add dependency-free Node and Bridge-core tests and required CI.
@@ -93,26 +94,27 @@ full build plus live scene fixtures pass.
 - Make a pure versioned reward calculator the sole reward authority.
 - Make HeadlessSim path/config portable, lifecycle bounded, and contract-compatible.
 - Enforce live/headless transition and reward parity.
-- Reduce hard guards to legality, safety, and explicit deadlock recovery; record any
-  executed-action difference.
+- Remove policy hard guards and action rewrites entirely. The authoritative backend
+  legality set is the only action mask; protocol failures stop collection.
 
 Exit: both backends pass the same contract suite and parity gate.
 
 ## Phase 7 — trainer and artifact migration
 
-- Replace trainer mixins and large constructor/CLI surfaces with typed configuration
-  and Collector, Learner, Evaluator, ReplayStore, CheckpointManager, Curriculum, and
-  Telemetry services.
-- Write checkpoints atomically with checksums and completion markers.
-- Record Git state plus contract, data, reward, observation, action, dependency, and
-  parent-checkpoint identities.
-- Provide explicit migrators for supported old replay/checkpoint formats.
-- Move runtime outputs to `STS2_ARTIFACT_ROOT` and enforce retention.
-- Archive/delete PPO, duplicate wrappers, hard-coded launchers, and obsolete probes
-  only after their replacement tests and migration gates pass.
+- Replaced the old trainer with the typed grounded encoder/model, direct Collector,
+  Learner, Evaluator, stratified ReplayStore and atomic CheckpointManager.
+- Checkpoints are written atomically with checksums and completion markers.
+- Checkpoints record Git state plus contract, optional static-data provenance, reward,
+  observation, action,
+  dependency, and parent-checkpoint identities.
+- All old learner replay/checkpoint formats are rejected; exact resume begins with RL 0.3.
+- Runtime outputs resolve below `STS2_ARTIFACT_ROOT`.
+- PPO, MuZero/token-memory/MCTS, planners, heuristics, duplicate wrappers,
+  hard-coded launchers and obsolete probes were deleted.
 
-Exit: deterministic resume restores optimizer, replay, scheduler, step, and experiment
-identity; unsupported formats fail closed.
+Exit: deterministic resume restores model, optimizer, replay, counters, pending update
+credit, collector seed/RNG, Python/NumPy/Torch RNG and experiment identity;
+unsupported formats fail closed.
 
 ## Phase 8 — cutover and removal
 

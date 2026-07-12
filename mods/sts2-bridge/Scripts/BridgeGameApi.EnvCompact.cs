@@ -37,11 +37,9 @@ internal static partial class BridgeGameApi
             payload["id"] = cardId;
         }
 
-        // Runtime per-card identity must survive env compaction.  Python-side
-        // lifecycle/selection heads require `runtime_internal` confidence and
-        // deliberately refuse to treat a static card id/title as a concrete
-        // in-combat instance.  Keep all known aliases in case future bridge
-        // payloads rename the field.
+        // Runtime per-card identity must survive env compaction so a legal
+        // candidate can be joined to the same concrete card in the world DTO.
+        // Keep the known transport aliases while retail payload names vary.
         foreach (var identityKey in new[]
                  {
                      "instance_uuid",
@@ -93,7 +91,7 @@ internal static partial class BridgeGameApi
             payload["star_x"] = true;
         }
 
-        AppendCompactCardKeywordsAndFlags(payload, element.Value);
+        AppendCompactCardKeywords(payload, element.Value);
 
         var type = TryGetNestedString(element.Value, "type");
         if (!string.IsNullOrWhiteSpace(type))
@@ -104,20 +102,13 @@ internal static partial class BridgeGameApi
         var target = TryGetNestedString(element.Value, "target_type");
         if (!string.IsNullOrWhiteSpace(target))
         {
-            // Key renamed from "target" -> "target_type" to stop colliding with the
-            // legal-action top-level `target` (creature dict). The old name shadowed
-            // the real creature object in compact_action_signature, which broke
-            // Kaiser facing-change detection (target_combat_id always resolved to None).
+            // Keep the card's declared target category separate from the legal
+            // candidate's concrete `target` creature object.
             payload["target_type"] = target;
         }
 
-        var effect = TryGetNestedString(element.Value, "effect_preview", "summary");
         var description = TryGetNestedString(element.Value, "description");
-        if (!string.IsNullOrWhiteSpace(effect))
-        {
-            payload["effect"] = effect;
-        }
-        else if (!string.IsNullOrWhiteSpace(description))
+        if (!string.IsNullOrWhiteSpace(description))
         {
             payload["description"] = description;
         }
@@ -135,20 +126,13 @@ internal static partial class BridgeGameApi
             if (starCost is { } sc)
                 ct.Append(TryGetNestedBool(element.Value, "has_star_cost_x") == true ? "\uff5c\u661f\u8f89X" : $"\uff5c\u661f\u8f89{sc}");
             ct.Append("\uff5c\u76ee\u6807").Append(TranslateTargetType(TryGetNestedString(element.Value, "target_type")));
-            var effectText = effect ?? description ?? "";
-            if (!string.IsNullOrWhiteSpace(effectText))
-                ct.Append("\uff5c\u6548\u679c\uff1a").Append(NormalizeSemanticText(effectText));
+            if (!string.IsNullOrWhiteSpace(description))
+                ct.Append("\uff5c\u6548\u679c\uff1a").Append(NormalizeSemanticText(description));
             payload["canonical_text"] = ct.ToString();
         }
 
-        AppendCompactPreviewFields(payload, element.Value);
         AppendCompactCardModifiers(payload, element.Value, "afflictions");
         AppendCompactCardModifiers(payload, element.Value, "enchantments");
-        var cardEffectProfile = CompactCardEffectProfile(TryGetNestedElement(element.Value, "card_effect_profile"));
-        if (cardEffectProfile is not null)
-        {
-            payload["card_effect_profile"] = cardEffectProfile;
-        }
 
         var typedSelection = CompactSelectionPayload(TryGetNestedElement(element.Value, "selection"));
         if (typedSelection is not null)
@@ -203,7 +187,7 @@ internal static partial class BridgeGameApi
         return payload.Count > 0 ? payload : null;
     }
 
-    private static void AppendCompactCardKeywordsAndFlags(Dictionary<string, object?> payload, JsonElement element)
+    private static void AppendCompactCardKeywords(Dictionary<string, object?> payload, JsonElement element)
     {
         var keywords = TryGetNestedElement(element, "keywords");
         if (keywords is not null && keywords.Value.ValueKind == JsonValueKind.Array)
@@ -220,13 +204,6 @@ internal static partial class BridgeGameApi
             }
         }
 
-        foreach (var flag in new[] { "exhaust", "exhaust_self", "will_exhaust", "ethereal", "retain" })
-        {
-            if (TryGetNestedBool(element, flag) == true)
-            {
-                payload[flag] = true;
-            }
-        }
     }
 
     private static void AppendCompactCardModifiers(Dictionary<string, object?> payload, JsonElement element, string fieldName)
@@ -244,7 +221,7 @@ internal static partial class BridgeGameApi
             var id = TryGetNestedString(modifier, "id");
             var type = TryGetNestedString(modifier, "type");
             var description = TryGetNestedString(modifier, "description");
-            var amount = TryGetNestedInt(modifier, "amount");
+            var amount = TryGetNestedDecimal(modifier, "amount");
             if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(id) && string.IsNullOrWhiteSpace(type))
             {
                 continue;
@@ -258,8 +235,6 @@ internal static partial class BridgeGameApi
                 amount,
                 status = TryGetNestedString(modifier, "status"),
                 enabled = TryGetNestedBool(modifier, "enabled"),
-                semantic_tags = CompactStringArray(TryGetNestedElement(modifier, "semantic_tags")),
-                semantic_values = CompactObject(TryGetNestedElement(modifier, "semantic_values")),
                 is_debuff = TryGetNestedBool(modifier, "is_debuff"),
                 is_buff = TryGetNestedBool(modifier, "is_buff")
             });
@@ -273,73 +248,6 @@ internal static partial class BridgeGameApi
         {
             payload[fieldName] = compact.ToArray();
         }
-    }
-
-    private static object? CompactCardEffectProfile(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
-        foreach (var key in new[]
-        {
-            "schema_version",
-            "normalized_id",
-            "class_name",
-            "operations",
-            "semantic_tags",
-            "training_tags"
-        })
-        {
-            if (element.Value.TryGetProperty(key, out var prop))
-            {
-                payload[key] = JsonElementToObject(prop);
-            }
-        }
-
-        return payload.Count > 0 ? payload : null;
-    }
-
-
-    private static string[] CompactStringArray(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind != JsonValueKind.Array)
-        {
-            return Array.Empty<string>();
-        }
-        return element.Value.EnumerateArray()
-            .Where(static item => item.ValueKind == JsonValueKind.String)
-            .Select(static item => item.GetString() ?? string.Empty)
-            .Where(static value => !string.IsNullOrWhiteSpace(value))
-            .Take(24)
-            .ToArray();
-    }
-
-    private static object? CompactObject(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
-        {
-            return null;
-        }
-        if (element.Value.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-        var result = new Dictionary<string, object?>();
-        foreach (var prop in element.Value.EnumerateObject())
-        {
-            result[prop.Name] = prop.Value.ValueKind switch
-            {
-                JsonValueKind.True => true,
-                JsonValueKind.False => false,
-                JsonValueKind.Number => prop.Value.TryGetInt32(out var i) ? i : prop.Value.TryGetDouble(out var d) ? d : null,
-                JsonValueKind.String => prop.Value.GetString(),
-                _ => null,
-            };
-        }
-        return result.Count > 0 ? result : null;
     }
 
     private static object? CompactRewardPayload(JsonElement? element)
@@ -393,16 +301,6 @@ internal static partial class BridgeGameApi
             payload["target_type"] = target;
         }
 
-        AppendCompactPreviewValue(payload, "damage", TryExtractEnvMetric(element.Value, "damage"));
-        AppendCompactPreviewValue(payload, "block", TryExtractEnvMetric(element.Value, "block"));
-        AppendCompactPreviewValue(payload, "draw", TryExtractEnvMetric(element.Value, "draw"));
-        AppendCompactPreviewValue(payload, "weak", TryExtractEnvMetric(element.Value, "weak"));
-        AppendCompactPreviewValue(payload, "vulnerable", TryExtractEnvMetric(element.Value, "vulnerable"));
-        AppendCompactPreviewValue(payload, "heal", TryExtractEnvMetric(element.Value, "heal"));
-        AppendCompactPreviewValue(payload, "hp_loss", TryExtractEnvMetric(element.Value, "hp_loss"));
-        AppendCompactPreviewValue(payload, "strength", TryExtractEnvMetric(element.Value, "strength"));
-        AppendCompactPreviewValue(payload, "dexterity", TryExtractEnvMetric(element.Value, "dexterity"));
-        AppendCompactPreviewValue(payload, "summon", TryExtractEnvMetric(element.Value, "summon"));
         payload["canonical_text"] = BuildCanonicalPotionText(title, rarity, target, desc);
         return payload;
     }
@@ -492,6 +390,45 @@ internal static partial class BridgeGameApi
         };
     }
 
+    private static object? CompactEventOptionPayload(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return new
+        {
+            index = TryGetNestedInt(element.Value, "index"),
+            option_type = TryGetNestedString(element.Value, "option_type"),
+            option_id = TryGetNestedString(element.Value, "option_id"),
+            title = TryGetNestedString(element.Value, "title"),
+            description = TryGetNestedString(element.Value, "description"),
+            is_locked = TryGetNestedBool(element.Value, "is_locked"),
+            is_proceed = TryGetNestedBool(element.Value, "is_proceed"),
+            is_selected = TryGetNestedBool(element.Value, "is_selected"),
+            is_enabled = TryGetNestedBool(element.Value, "is_enabled"),
+            action_available = TryGetNestedBool(element.Value, "action_available"),
+            divination_size = TryGetNestedString(element.Value, "divination_size"),
+            coord = CompactEventCoordPayload(TryGetNestedElement(element.Value, "coord")),
+            is_highlighted = TryGetNestedBool(element.Value, "is_highlighted")
+        };
+    }
+
+    private static object? CompactEventCoordPayload(JsonElement? element)
+    {
+        if (element is null || element.Value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return new
+        {
+            x = TryGetNestedInt(element.Value, "x") ?? TryGetNestedInt(element.Value, "col"),
+            y = TryGetNestedInt(element.Value, "y") ?? TryGetNestedInt(element.Value, "row")
+        };
+    }
+
     private static object? CompactCoordPayload(JsonElement? element)
     {
         if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
@@ -504,64 +441,6 @@ internal static partial class BridgeGameApi
             col = TryGetNestedInt(element.Value, "col"),
             row = TryGetNestedInt(element.Value, "row")
         };
-    }
-
-    private static object? CompactMapRouteSummaryPayload(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
-        {
-            return null;
-        }
-
-        return new
-        {
-            reachable_node_count = TryGetNestedInt(element.Value, "reachable_node_count"),
-            max_depth = TryGetNestedInt(element.Value, "max_depth"),
-            direct_child_count = TryGetNestedInt(element.Value, "direct_child_count"),
-            forced_path_steps_before_branch = TryGetNestedInt(element.Value, "forced_path_steps_before_branch"),
-            count_monster = TryGetNestedInt(element.Value, "count_monster"),
-            count_elite = TryGetNestedInt(element.Value, "count_elite"),
-            count_boss = TryGetNestedInt(element.Value, "count_boss"),
-            count_event = TryGetNestedInt(element.Value, "count_event"),
-            count_question_mark = TryGetNestedInt(element.Value, "count_question_mark"),
-            count_rest_site = TryGetNestedInt(element.Value, "count_rest_site"),
-            count_shop = TryGetNestedInt(element.Value, "count_shop"),
-            count_treasure = TryGetNestedInt(element.Value, "count_treasure"),
-            next_elite_steps = TryGetNestedInt(element.Value, "next_elite_steps"),
-            next_rest_steps = TryGetNestedInt(element.Value, "next_rest_steps"),
-            next_shop_steps = TryGetNestedInt(element.Value, "next_shop_steps"),
-            next_event_steps = TryGetNestedInt(element.Value, "next_event_steps"),
-            next_question_mark_steps = TryGetNestedInt(element.Value, "next_question_mark_steps"),
-            next_treasure_steps = TryGetNestedInt(element.Value, "next_treasure_steps"),
-            next_boss_steps = TryGetNestedInt(element.Value, "next_boss_steps"),
-            can_reach_rest_site_before_elite = TryGetNestedBool(element.Value, "can_reach_rest_site_before_elite"),
-            can_reach_elite_then_rest_site = TryGetNestedBool(element.Value, "can_reach_elite_then_rest_site")
-        };
-    }
-
-    private static object[] CompactMapRouteNodesPayload(JsonElement? element)
-    {
-        if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
-        {
-            return Array.Empty<object>();
-        }
-
-        if (!element.Value.TryGetProperty("nodes", out var nodes) || nodes.ValueKind != JsonValueKind.Array)
-        {
-            return Array.Empty<object>();
-        }
-
-        return nodes
-            .EnumerateArray()
-            .Select(node => (object)new
-            {
-                coord = CompactCoordPayload(TryGetNestedElement(node, "coord")),
-                point_type = TryGetNestedString(node, "point_type"),
-                depth = TryGetNestedInt(node, "depth"),
-                child_count = TryGetNestedInt(node, "child_count"),
-                is_leaf = TryGetNestedBool(node, "is_leaf")
-            })
-            .ToArray();
     }
 
     private static JsonElement? TryGetNestedElement(JsonElement element, params string[] path)
@@ -599,6 +478,16 @@ internal static partial class BridgeGameApi
             : null;
     }
 
+    private static decimal? TryGetNestedDecimal(JsonElement element, params string[] path)
+    {
+        var nested = TryGetNestedElement(element, path);
+        return nested is { } value &&
+               value.ValueKind == JsonValueKind.Number &&
+               value.TryGetDecimal(out var parsed)
+            ? parsed
+            : null;
+    }
+
     private static bool? TryGetNestedBool(JsonElement element, params string[] path)
     {
         var nested = TryGetNestedElement(element, path);
@@ -615,93 +504,4 @@ internal static partial class BridgeGameApi
             : null;
     }
 
-    private static int? TryGetFirstIntentTotalDamage(JsonElement? intentElement)
-    {
-        if (intentElement is null || intentElement.Value.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        var intents = TryGetNestedElement(intentElement.Value, "intents");
-        if (intents is null || intents.Value.ValueKind != JsonValueKind.Array || intents.Value.GetArrayLength() <= 0)
-        {
-            return null;
-        }
-
-        var first = intents.Value[0];
-        return TryGetNestedInt(first, "total_damage");
-    }
-
-    private static int? TryGetFirstIntentRepeats(JsonElement? intentElement)
-    {
-        if (intentElement is null || intentElement.Value.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        var intents = TryGetNestedElement(intentElement.Value, "intents");
-        if (intents is null || intents.Value.ValueKind != JsonValueKind.Array || intents.Value.GetArrayLength() <= 0)
-        {
-            return null;
-        }
-
-        var first = intents.Value[0];
-        return TryGetNestedInt(first, "repeats");
-    }
-
-    private static string? TryGetFirstIntentString(JsonElement? intentElement, params string[] path)
-    {
-        if (intentElement is null || intentElement.Value.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        var intents = TryGetNestedElement(intentElement.Value, "intents");
-        if (intents is null || intents.Value.ValueKind != JsonValueKind.Array || intents.Value.GetArrayLength() <= 0)
-        {
-            return null;
-        }
-
-        var first = intents.Value[0];
-        return TryGetNestedString(first, path);
-    }
-
-    private static void AppendCompactPreviewFields(Dictionary<string, object?> payload, JsonElement element)
-    {
-        AppendCompactPreviewValue(payload, "damage", TryGetNestedInt(element, "effect_preview", "total_damage") ?? TryExtractEnvMetric(element, "damage"));
-        AppendCompactPreviewValue(payload, "damage_per_hit", TryGetNestedInt(element, "effect_preview", "damage_per_hit"));
-        AppendCompactPreviewValue(payload, "hits", TryGetNestedInt(element, "effect_preview", "hits"));
-        AppendCompactPreviewValue(payload, "block", TryGetNestedInt(element, "effect_preview", "total_block") ?? TryExtractEnvMetric(element, "block"));
-        AppendCompactPreviewValue(payload, "draw", TryGetNestedInt(element, "effect_preview", "draw") ?? TryExtractEnvMetric(element, "draw"));
-        AppendCompactPreviewValue(payload, "weak", TryGetNestedInt(element, "effect_preview", "weak") ?? TryExtractEnvMetric(element, "weak"));
-        AppendCompactPreviewValue(payload, "vulnerable", TryGetNestedInt(element, "effect_preview", "vulnerable") ?? TryExtractEnvMetric(element, "vulnerable"));
-        AppendCompactPreviewValue(payload, "heal", TryGetNestedInt(element, "effect_preview", "heal") ?? TryExtractEnvMetric(element, "heal"));
-        AppendCompactPreviewValue(payload, "hp_loss", TryGetNestedInt(element, "effect_preview", "hp_loss") ?? TryExtractEnvMetric(element, "hp_loss"));
-        AppendCompactPreviewValue(payload, "strength", TryGetNestedInt(element, "effect_preview", "strength") ?? TryExtractEnvMetric(element, "strength"));
-        AppendCompactPreviewValue(payload, "dexterity", TryGetNestedInt(element, "effect_preview", "dexterity") ?? TryExtractEnvMetric(element, "dexterity"));
-        AppendCompactPreviewValue(payload, "summon", TryGetNestedInt(element, "effect_preview", "summon") ?? TryExtractEnvMetric(element, "summon"));
-        AppendCompactPreviewValue(payload, "x_cost_value", TryGetNestedInt(element, "effect_preview", "x_cost_value"));
-
-        var xCostSemantics = TryGetNestedString(element, "effect_preview", "x_cost_semantics");
-        if (!string.IsNullOrWhiteSpace(xCostSemantics))
-        {
-            payload["x_cost_semantics"] = xCostSemantics;
-        }
-    }
-
-    private static void AppendCompactPreviewValue(Dictionary<string, object?> payload, string key, int value)
-    {
-        if (value != 0)
-        {
-            payload[key] = value;
-        }
-    }
-
-    private static void AppendCompactPreviewValue(Dictionary<string, object?> payload, string key, int? value)
-    {
-        if (value.HasValue)
-        {
-            AppendCompactPreviewValue(payload, key, value.Value);
-        }
-    }
 }

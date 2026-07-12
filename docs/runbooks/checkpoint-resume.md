@@ -1,70 +1,108 @@
-# Checkpoint resume and weights-only migration
+# Grounded-baseline checkpoint resume
 
-MuZero has two deliberately separate checkpoint operations. Do not use the terms
-"resume" and "warm-start" interchangeably.
+The restarted learner supports exactly two explicit operations:
 
-## Exact resume
+1. **Exact resume** of the same grounded-baseline lineage.
+2. **Model initialization** of a new combat/full-run lineage from a complete,
+   valid RL 0.3 grounded-baseline checkpoint with current contract/reward/dependency
+   identities and an identical model/encoding contract.
 
-`--resume-from` means continuation of the same training lineage. Before any
-`torch.load` or replay unpickle, the loader requires and verifies:
+Old MuZero, token-memory, PPO, planner, offline-supervised, partial state dict,
+or manifest-less weights/replay are not inputs to either operation.
+
+## Exact resume invariants
+
+Before `torch.load` or replay deserialization, the loader verifies:
 
 - an `sts2-atomic-checkpoint-v1` completion manifest;
-- `hash_files=true`, a valid SHA-256 for every payload file, and no unlisted files;
-- current API, contract schema, action schema, legal-action ordering, observation
-  schema, and reward schema versions;
-- the complete canonical reward-spec fingerprint and weights;
-- the canonical `game-data/manifest.json` SHA-256 and source identity;
-- matching MuZero model constructor/state, optimizer class/layout, replay, and
-  observation-shape schemas;
-- complete network, optimizer, replay, token-target (when enabled), and AMP scaler
-  (when enabled) state.
+- `hash_files=true`, SHA-256 for every payload, and no unlisted payload;
+- current API/schema/action-ordering/observation/reward identities;
+- the immutable grounded reward-spec fingerprint;
+- dependency-lock identities and the resolved device;
+- the grounded encoding ABI version and fingerprint;
+- the immutable lineage portion of the typed training configuration;
+- strict model state keys/shapes;
+- optimizer state/specification and replay type/specification;
+- environment steps, learner updates, episode/evaluation counters and pending
+  update credit; and
+- Python, NumPy, Torch CPU/CUDA and collector RNG/seed state.
 
-Missing manifests, missing hashes, changed bytes, missing payloads, or any identity
-mismatch stop the process. Exact resume never falls back to partial model keys, a
-fresh optimizer, or an empty replay buffer.
+When a valid static catalog manifest is available it is recorded as optional audit
+provenance, but it is deliberately not an exact-resume gate or runtime dependency: the
+grounded model does not read `game-data`. A changed encoder allowlist/slot/vocabulary is
+a gate through its own fingerprint.
 
-```powershell
-python -m muzero.train `
-  --resume-from "$env:STS2_ARTIFACT_ROOT/checkpoints/<run>/<checkpoint>" `
-  --total-timesteps 500000
+Every exact checkpoint contains:
+
+```text
+checkpoint.manifest.json
+metadata.json
+network.pt
+optimizer.pt
+replay_buffer.pkl
+stochastic_state.pkl
 ```
 
-The deprecated `--no-resume-load-buffer`, `--resume-without-buffer`,
-`--no-resume-load-optimizer`, and `--resume-without-optimizer` switches remain
-parseable only so old automation fails with an actionable error. They cannot turn an
-exact resume into a silent cold continuation.
+Missing files, changed bytes or any identity/config mismatch stop loading. There
+is no partial key load, empty replay fallback, fresh optimizer fallback, legacy
+risk flag or automatic tensor remapping.
 
-## Explicit weights-only warm-start
+Each invocation writes to a fresh unique run directory; every atomically published
+checkpoint child is immutable:
 
-A partial or legacy checkpoint starts a **new** training lineage. The only supported
-migration is `sts2-weights-only-v1`: it copies only tensors whose key, shape, and
-dtype match. It never restores optimizer moments, replay, GradScaler, global step, or
-episode count.
-
-```powershell
-python -m muzero.train `
-  --resume-from "$env:STS2_ARTIFACT_ROOT/checkpoints/<old-run>/<checkpoint>" `
-  --warm-start `
-  --checkpoint-migration-id sts2-weights-only-v1 `
-  --total-timesteps 500000
+```text
+$STS2_ARTIFACT_ROOT/checkpoints/grounded-baseline/
+  run-<uuid>/
+    step-000050000/
+    final-step-001000000/
 ```
 
-Atomic warm-start sources still require every payload hash to verify. A checkpoint
-created before atomic manifests existed additionally requires the auditable risk flag:
-
 ```powershell
-  --allow-legacy-checkpoint
+python -m sts2_rl.train `
+  --profile default `
+  --resume "$env:STS2_ARTIFACT_ROOT/checkpoints/grounded-baseline/run-<uuid>/step-<steps>" `
+  --steps 2000000
 ```
 
-That flag applies only to the weights-only migration. It can never bypass exact-resume
-identity checks.
+Exact resume may change only the total execution budget and output/evaluation
+schedule: total environment steps, log/checkpoint roots, checkpoint/evaluation
+intervals and evaluation episode count. Model, reward, environment scenario,
+optimization, replay, seed, device, collection cadence and update cadence remain
+immutable. The new total step target must exceed the restored step count.
 
-## Operational checks
+The referenced checkpoint must remain immutable during verification. Never edit
+its manifest or metadata to bypass an incompatibility. Preflight hashes and
+validates metadata before creating run directories or launching a backend;
+model, optimizer and stochastic payloads are validated in disposable objects
+before live training state is committed.
 
-1. Keep the source checkpoint immutable during verification and loading.
-2. Record its checkpoint ID (or the legacy path), migration ID, and destination run ID.
-3. Run a bounded smoke after an exact resume and confirm restored step, replay size,
-   optimizer state, and output directory.
-4. Run a warm-start as a new experiment; never copy the old step or episode counters.
-5. Do not edit `checkpoint.manifest.json` to "fix" a mismatch. Regenerate an atomic
-   checkpoint through a supported migrator instead.
+## Combat-to-full-run initialization
+
+The optional curriculum boundary loads **only** a strictly matching grounded
+model from a complete atomic checkpoint. It starts a fresh optimizer, replay,
+counter set, collector RNG and output lineage:
+
+```powershell
+python -m sts2_rl.train `
+  --profile default `
+  --initialize-from "$env:STS2_ARTIFACT_ROOT/checkpoints/grounded-combat-bootstrap/run-<uuid>/final-step-<steps>"
+```
+
+This mode still requires the current atomic manifest, all hashes, the RL 0.3
+checkpoint format, current contract/reward/dependency-lock identities, identical model
+configuration, strict state keys/shapes and the same encoding fingerprint. A deliberate architecture or encoder change
+starts from random initialization; it is never partially remapped.
+
+Every checkpoint records a stable run origin (`fresh`, `exact_resume`, or
+`model_initialization`). Its parent relation separately records whether the parent was
+loaded at process start or is an in-process immutable predecessor.
+
+## Operational verification
+
+1. Validate the checkpoint directory before starting a long process.
+2. Resume with the same immutable lineage values and an increased execution
+   budget.
+3. Confirm restored environment steps, update credit, update count, replay size
+   and stochastic-state version.
+4. Run a bounded backend smoke and publish a new atomic checkpoint.
+5. Record live-game and ROCm validation separately from unit-test evidence.
