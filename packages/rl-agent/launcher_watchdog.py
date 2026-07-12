@@ -18,10 +18,11 @@ stays in one place (process ownership is there too).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Protocol
+from typing import Any, Protocol
 
 
 class InstanceAction(Enum):
@@ -43,8 +44,31 @@ class WatchdogDecision:
     log_flood_bytes_per_sec: float = 0.0
 
 
+@dataclass(frozen=True)
+class HealthSnapshot:
+    transport_alive: bool
+    game_thread_alive: bool | None = None
+    pump_tick: int | None = None
+    ms_since_last_pump: int | None = None
+    active_operation: str | None = None
+    source: str = "legacy"
+
+    @property
+    def is_v2(self) -> bool:
+        return self.source == "v2"
+
+
+@dataclass(frozen=True)
+class StateSnapshot:
+    state_version: int
+    screen: str
+    stable_decision: bool = False
+
+
 class _HealthProbe(Protocol):
-    def __call__(self, base_url: str, token: str, timeout_s: float) -> bool: ...
+    def __call__(
+        self, base_url: str, token: str, timeout_s: float,
+    ) -> HealthSnapshot | Mapping[str, Any] | bool: ...
 
 
 class _StateVersionProbe(Protocol):
@@ -63,7 +87,7 @@ class _StateVersionProbe(Protocol):
 
     def __call__(
         self, base_url: str, token: str, timeout_s: float,
-    ) -> tuple[int, str] | None: ...
+    ) -> StateSnapshot | tuple[int, str] | None: ...
 
 
 # Screens where the game is legitimately not progressing state on its own
@@ -96,7 +120,9 @@ _DEFAULT_IDLE_SCREENS: frozenset[str] = frozenset({
 class _InstanceState:
     """Internal per-instance state retained across watchdog ticks."""
     strike_count: int = 0
+    main_thread_strike_count: int = 0
     last_probe_unix_s: float = 0.0
+    last_pump_tick: int | None = None
     last_state_version: int | None = None
     last_screen: str | None = None
     # Unix time when the (state_version, screen) pair was first observed
@@ -119,34 +145,103 @@ def _default_logs_total_bytes(logs_dir: Path) -> int:
     return total
 
 
-def _default_health_probe(base_url: str, token: str, timeout_s: float) -> bool:
-    """Default HTTP /health probe. Return True on 200, False on any failure.
+def _normalize_health_snapshot(value: HealthSnapshot | Mapping[str, Any] | bool) -> HealthSnapshot:
+    if isinstance(value, HealthSnapshot):
+        return value
+    if isinstance(value, Mapping):
+        pump_tick = value.get("pump_tick")
+        pump_age = value.get("ms_since_last_pump")
+        return HealthSnapshot(
+            transport_alive=bool(value.get("transport_alive", value.get("ok", False))),
+            game_thread_alive=(
+                bool(value.get("game_thread_alive"))
+                if value.get("game_thread_alive") is not None
+                else None
+            ),
+            pump_tick=(
+                int(pump_tick)
+                if isinstance(pump_tick, int) and not isinstance(pump_tick, bool)
+                else None
+            ),
+            ms_since_last_pump=(
+                int(pump_age)
+                if isinstance(pump_age, int) and not isinstance(pump_age, bool)
+                else None
+            ),
+            active_operation=(
+                str(value.get("active_operation"))
+                if value.get("active_operation") is not None
+                else None
+            ),
+            source="v2" if "game_thread_alive" in value else "legacy",
+        )
+    return HealthSnapshot(transport_alive=bool(value), source="legacy")
 
-    Imported lazily — tests inject their own probe without pulling `requests`.
-    """
-    import requests  # local import so the tests don't need the dependency
+
+def _normalize_state_snapshot(
+    value: StateSnapshot | tuple[int, str] | None,
+) -> StateSnapshot | None:
+    if value is None or isinstance(value, StateSnapshot):
+        return value
+    version, screen = value
+    return StateSnapshot(
+        state_version=int(version),
+        screen=str(screen or "UNKNOWN").strip().upper() or "UNKNOWN",
+    )
+
+
+def _default_health_probe(
+    base_url: str, token: str, timeout_s: float,
+) -> HealthSnapshot:
+    """Prefer contract-v2 health, falling back only for old bridge builds."""
+    import requests  # local import so lightweight tests can inject probes
+
+    headers = {"Authorization": f"Bearer {token}"}
+    v2_url = f"{base_url.rstrip('/')}/v2/health"
     try:
-        resp = requests.get(
+        response = requests.get(v2_url, headers=headers, timeout=timeout_s)
+    except (requests.ConnectionError, requests.Timeout):
+        return HealthSnapshot(transport_alive=False, source="v2")
+    except Exception:
+        return HealthSnapshot(transport_alive=False, source="v2")
+
+    if 200 <= response.status_code < 300:
+        try:
+            payload = response.json()
+        except Exception:
+            return HealthSnapshot(transport_alive=False, source="v2")
+        if not isinstance(payload, dict):
+            return HealthSnapshot(transport_alive=False, source="v2")
+        return _normalize_health_snapshot(payload)
+
+    if response.status_code != 404:
+        return HealthSnapshot(transport_alive=False, source="v2")
+
+    # Compatibility only: old bridges expose transport health but no main-loop
+    # heartbeat.  Never treat a malformed v2 response as permission to downgrade.
+    try:
+        response = requests.get(
             f"{base_url.rstrip('/')}/health",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             timeout=timeout_s,
         )
     except (requests.ConnectionError, requests.Timeout):
-        return False
+        return HealthSnapshot(transport_alive=False, source="legacy")
     except Exception:
-        return False
-    return 200 <= resp.status_code < 300
+        return HealthSnapshot(transport_alive=False, source="legacy")
+    return HealthSnapshot(
+        transport_alive=200 <= response.status_code < 300,
+        source="legacy",
+    )
 
 
 def _default_state_version_probe(
     base_url: str, token: str, timeout_s: float,
-) -> tuple[int, str] | None:
-    """Default HTTP /state probe. Returns (state_version, screen) or None on
-    any failure (unreachable, malformed payload).
-    """
+) -> StateSnapshot | None:
+    """Read state version plus whether the game awaits a trainer decision."""
     import requests
     try:
-        resp = requests.get(
+        response = requests.get(
             f"{base_url.rstrip('/')}/state",
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout_s,
@@ -155,10 +250,10 @@ def _default_state_version_probe(
         return None
     except Exception:
         return None
-    if not (200 <= resp.status_code < 300):
+    if not (200 <= response.status_code < 300):
         return None
     try:
-        payload = resp.json()
+        payload = response.json()
     except Exception:
         return None
     if not isinstance(payload, dict):
@@ -167,7 +262,21 @@ def _default_state_version_probe(
     if isinstance(version, bool) or not isinstance(version, int):
         return None
     screen = str(payload.get("screen") or "UNKNOWN").strip().upper() or "UNKNOWN"
-    return version, screen
+    actions = payload.get("available_actions")
+    if not isinstance(actions, list):
+        actions = payload.get("legal_actions")
+    actionability = payload.get("actionability")
+    frontier_stable = (
+        actionability.get("frontier_stable")
+        if isinstance(actionability, dict)
+        else None
+    )
+    stable_decision = bool(actions) and frontier_stable is not False
+    return StateSnapshot(
+        state_version=version,
+        screen=screen,
+        stable_decision=stable_decision,
+    )
 
 
 @dataclass
@@ -203,6 +312,10 @@ class Watchdog:
     # brief game-over idle from a real hang at the watchdog's tick cadence.
     state_stall_threshold_s: float = 90.0
     state_probe_timeout_s: float = 10.0
+    # Independent strikes for a responsive HTTP worker whose game main loop is
+    # unhealthy, pump-stale, or cannot produce /state.
+    main_thread_strike_threshold: int | None = None
+    max_pump_age_ms: int = 30_000
     # Screens where the game is legitimately idle (waiting for the trainer
     # to act) and state_version won't advance on its own. The stall timer
     # is reset, not accumulated, while the game is on any of these.
@@ -218,79 +331,164 @@ class Watchdog:
 
     def evaluate(
         self,
-        instances: Iterable["WatchdogInstanceView"],
+        instances: Iterable[WatchdogInstanceView],
         now_unix_s: float,
     ) -> WatchdogDecision:
         per_instance: list[InstanceDecision] = []
         for view in instances:
             state = self._instance_state.setdefault(view.instance_id, _InstanceState())
             if not view.process_alive:
-                # Process has exited (crashed, killed by OS, killed by the
-                # user from the task manager, etc). The launcher's main
-                # loop only restarts instances when watchdog emits
-                # KILL_AND_RESTART — it has no separate dead-process
-                # reaper — so we must emit the restart signal here or the
-                # slot stays permanently dead.
                 state.strike_count = 0
+                state.main_thread_strike_count = 0
+                state.last_pump_tick = None
                 state.last_state_version = None
                 state.last_screen = None
                 state.last_state_change_unix_s = 0.0
                 per_instance.append(
                     InstanceDecision(
-                        view.instance_id, InstanceAction.KILL_AND_RESTART,
+                        view.instance_id,
+                        InstanceAction.KILL_AND_RESTART,
                         reason="process_exited",
                     )
                 )
                 continue
             if view.base_url is None or view.token is None:
-                # Not yet bound to bridge — watchdog abstains; launcher's
-                # own readiness gate owns the not-yet-started case.
                 per_instance.append(
                     InstanceDecision(
-                        view.instance_id, InstanceAction.HEALTHY,
+                        view.instance_id,
+                        InstanceAction.HEALTHY,
                         reason="not_bound_yet",
                     )
                 )
                 continue
 
-            ok = self.health_probe(view.base_url, view.token, self.probe_timeout_s)
+            try:
+                raw_health = self.health_probe(
+                    view.base_url,
+                    view.token,
+                    self.probe_timeout_s,
+                )
+                health = _normalize_health_snapshot(raw_health)
+            except Exception:
+                health = HealthSnapshot(transport_alive=False, source="v2")
             state.last_probe_unix_s = now_unix_s
-            if ok:
-                state.strike_count = 0
-                stall_decision = self._evaluate_state_stall(view, state, now_unix_s)
+
+            if not health.transport_alive:
+                state.strike_count += 1
+                if state.strike_count >= self.strike_threshold:
+                    per_instance.append(
+                        InstanceDecision(
+                            view.instance_id,
+                            InstanceAction.KILL_AND_RESTART,
+                            reason=f"health_failed_{state.strike_count}_consecutive",
+                        )
+                    )
+                    state.strike_count = 0
+                    state.main_thread_strike_count = 0
+                else:
+                    per_instance.append(
+                        InstanceDecision(
+                            view.instance_id,
+                            InstanceAction.HEALTHY,
+                            reason=f"strike_{state.strike_count}",
+                        )
+                    )
+                continue
+            state.strike_count = 0
+
+            probed_state: StateSnapshot | None = None
+            if self.state_stall_threshold_s > 0.0:
+                try:
+                    probed_state = _normalize_state_snapshot(
+                        self.state_version_probe(
+                            view.base_url,
+                            view.token,
+                            self.state_probe_timeout_s,
+                        )
+                    )
+                except Exception:
+                    probed_state = None
+
+            main_thread_fault: str | None = None
+            if health.is_v2:
+                if health.game_thread_alive is not True:
+                    main_thread_fault = "game_thread_not_alive"
+                elif (
+                    health.ms_since_last_pump is not None
+                    and health.ms_since_last_pump > self.max_pump_age_ms
+                ):
+                    main_thread_fault = (
+                        f"pump_stale_{health.ms_since_last_pump}ms"
+                    )
+                elif (
+                    state.last_pump_tick is not None
+                    and health.pump_tick is not None
+                    and health.pump_tick < state.last_pump_tick
+                ):
+                    main_thread_fault = (
+                        f"pump_tick_regressed_{state.last_pump_tick}_to_{health.pump_tick}"
+                    )
+                if health.pump_tick is not None:
+                    state.last_pump_tick = health.pump_tick
+                # A healthy HTTP worker with no /state is not proof the game
+                # thread is healthy; this is a main-thread strike, not merely a
+                # dropped diagnostic sample.
+                if probed_state is None and main_thread_fault is None:
+                    main_thread_fault = "state_probe_failed"
+
+            if main_thread_fault is not None:
+                state.main_thread_strike_count += 1
+                threshold = self.main_thread_strike_threshold or self.strike_threshold
+                operation = health.active_operation or "idle"
+                if state.main_thread_strike_count >= threshold:
+                    per_instance.append(
+                        InstanceDecision(
+                            view.instance_id,
+                            InstanceAction.KILL_AND_RESTART,
+                            reason=(
+                                f"main_thread_failed_{state.main_thread_strike_count}_consecutive_"
+                                f"{main_thread_fault}_operation_{operation}"
+                            ),
+                        )
+                    )
+                    state.main_thread_strike_count = 0
+                    state.last_state_version = None
+                    state.last_state_change_unix_s = 0.0
+                else:
+                    per_instance.append(
+                        InstanceDecision(
+                            view.instance_id,
+                            InstanceAction.HEALTHY,
+                            reason=(
+                                f"main_thread_strike_{state.main_thread_strike_count}_"
+                                f"{main_thread_fault}_operation_{operation}"
+                            ),
+                        )
+                    )
+                continue
+
+            state.main_thread_strike_count = 0
+            if probed_state is not None:
+                stall_decision = self._evaluate_state_stall(
+                    view,
+                    state,
+                    now_unix_s,
+                    probed_state,
+                    active_operation=health.active_operation,
+                )
                 if stall_decision is not None:
                     per_instance.append(stall_decision)
                     if stall_decision.action is InstanceAction.KILL_AND_RESTART:
-                        # Reset the stall bookkeeping so the launcher's
-                        # mid-restart window doesn't immediately re-trigger.
                         state.last_state_version = None
                         state.last_state_change_unix_s = 0.0
                     continue
-                per_instance.append(
-                    InstanceDecision(
-                        view.instance_id, InstanceAction.HEALTHY,
-                        reason="probe_ok",
-                    )
+            per_instance.append(
+                InstanceDecision(
+                    view.instance_id,
+                    InstanceAction.HEALTHY,
+                    reason="probe_ok",
                 )
-                continue
-            state.strike_count += 1
-            if state.strike_count >= self.strike_threshold:
-                per_instance.append(
-                    InstanceDecision(
-                        view.instance_id, InstanceAction.KILL_AND_RESTART,
-                        reason=f"health_failed_{state.strike_count}_consecutive",
-                    )
-                )
-                # Reset so we don't re-flag the same instance every tick
-                # while the launcher is mid-restart.
-                state.strike_count = 0
-            else:
-                per_instance.append(
-                    InstanceDecision(
-                        view.instance_id, InstanceAction.HEALTHY,
-                        reason=f"strike_{state.strike_count}",
-                    )
-                )
+            )
 
         log_flood, rate = self._evaluate_log_flood(now_unix_s)
         return WatchdogDecision(
@@ -301,9 +499,12 @@ class Watchdog:
 
     def _evaluate_state_stall(
         self,
-        view: "WatchdogInstanceView",
+        view: WatchdogInstanceView,
         state: _InstanceState,
         now_unix_s: float,
+        probed: StateSnapshot,
+        *,
+        active_operation: str | None,
     ) -> InstanceDecision | None:
         """Check for silent hangs where /health is OK but game state is frozen.
 
@@ -319,17 +520,21 @@ class Watchdog:
         """
         if self.state_stall_threshold_s <= 0.0:
             return None
-        try:
-            probed = self.state_version_probe(
-                view.base_url or "", view.token or "", self.state_probe_timeout_s,
+        current_version = probed.state_version
+        current_screen = probed.screen
+
+        # A stable actionable frontier with no mutation in flight is waiting
+        # for the trainer by design. It is idle even on COMBAT/MAP/EVENT, so an
+        # unchanged state_version must never be interpreted as a game hang.
+        if probed.stable_decision and not active_operation:
+            state.last_state_version = current_version
+            state.last_screen = current_screen
+            state.last_state_change_unix_s = now_unix_s
+            return InstanceDecision(
+                view.instance_id,
+                InstanceAction.HEALTHY,
+                reason=f"stable_decision_idle_{current_screen}",
             )
-        except Exception:
-            probed = None
-        if probed is None:
-            # /state transiently unreachable while /health is OK — don't
-            # penalize; wait for next tick. Leave bookkeeping intact.
-            return None
-        current_version, current_screen = probed
 
         # Idle screen: game is alive but not supposed to be progressing on
         # its own. Reset stall bookkeeping so the clock starts only when
@@ -402,9 +607,9 @@ class WatchdogInstanceView:
 
 
 __all__ = [
+    "InstanceAction",
+    "InstanceDecision",
     "Watchdog",
     "WatchdogDecision",
     "WatchdogInstanceView",
-    "InstanceAction",
-    "InstanceDecision",
 ]

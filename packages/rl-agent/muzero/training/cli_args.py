@@ -7,6 +7,8 @@ and environment construction stay in ``cli_main`` or smaller setup modules.
 
 from __future__ import annotations
 
+# PATH_BOUNDARY_DELEGATED: every CLI filesystem option is resolved by
+# muzero.training.paths.RunPaths or the typed environment factory before use.
 import argparse
 
 # Parser defaults come from the trainer core.  Do not import via
@@ -27,6 +29,25 @@ from muzero.training.trainer import (
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line parser for ``python -m muzero.train``."""
     parser = argparse.ArgumentParser(description="MuZero Training for STS2")
+
+    parser.add_argument(
+        "--profile",
+        default="default",
+        help="Versioned built-in profile under config/profiles (default: default).",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional versioned TOML config merged on top of the selected profile.",
+    )
+    parser.add_argument(
+        "--set",
+        dest="config_overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Highest-precedence config override; may be repeated and accepts dotted keys.",
+    )
 
     # Core training
     parser.add_argument("--total-timesteps", type=int, default=100_000)
@@ -62,7 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "legal and positionally aligned, override to that safe alternative. "
                             "Default off; intended for recovery runs with route_heuristic_bias=0."
                         ))
-    parser.add_argument("--combat-hard-guard-policy", type=str, default="full",
+    parser.add_argument("--combat-hard-guard-policy", type=str, default="off",
                         choices=["full", "emergency", "off"],
                         help=(
                             "Controls post-search combat hard overrides. full keeps all legacy "
@@ -72,13 +93,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             "and alignment instead of rule-forced; off disables combat hard "
                             "overrides while preserving telemetry defaults."
                         ))
-    parser.add_argument("--build-hard-guard-policy", type=str, default="full",
+    parser.add_argument("--build-hard-guard-policy", type=str, default="off",
                         choices=["full", "emergency", "off"],
                         help=(
                             "Controls post-search build/reward/shop/rest hard overrides. full "
                             "keeps legacy card/shop/rest/smith guards; emergency keeps only the "
                             "low-HP campfire heal safety guard; off disables build hard overrides "
                             "while preserving telemetry defaults."
+                        ))
+    parser.add_argument("--hard-guard-target-rewrite", type=str, default="off",
+                        choices=["off", "on"],
+                        help=(
+                            "RC-4: whether a post-search hard-guard OVERRIDE also rewrites the stored "
+                            "policy training target to a one-hot on the guard action (legacy=on). "
+                            "off (default, recommended): guards stay a behavior/safety wrapper -- the "
+                            "guard action is still executed, but the model trains on its OWN pre-guard "
+                            "search distribution so credit assignment stays on-policy. on restores the "
+                            "legacy one-hot rewrite (for A/B comparison)."
                         ))
     parser.add_argument("--root-progressive-widening-init", type=int, default=2,
                         help="Initially selectable root children before visit-based widening grows the frontier.")
@@ -117,7 +148,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Final scale of root prior bias after linear decay.")
     parser.add_argument("--root-bias-decay-steps", type=int, default=200000,
                         help="Training steps over which root prior bias linearly decays.")
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", "--learning-rate", dest="learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--buffer-size", type=int, default=100_000)
     parser.add_argument("--min-buffer-size", type=int, default=500)
@@ -129,13 +160,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-keep-last", type=int, default=3,
                         help="Auto-prune old muzero_step_* checkpoints in the current run directory after each save; 0 disables pruning.")
     parser.add_argument("--resume-from", type=str, default=None,
-                        help="Resume MuZero training from a checkpoint directory")
-    parser.add_argument("--resume-without-buffer", action="store_true", default=False,
-                        help="Resume weights/optimizer from checkpoint but start with an empty replay buffer.")
-    parser.add_argument("--resume-without-optimizer", action="store_true", default=False,
-                        help="Resume model weights only; re-initialize the optimizer (Adam moments). "
-                             "Use this when the aux-target schema changed mid-run and the old momentum "
-                             "is steering away from the new objective.")
+                        help=(
+                            "Exact-resume MuZero training from an atomic, fully hashed checkpoint. "
+                            "Contract, reward, game-data, model, optimizer, and replay identities "
+                            "must match. Pair with --warm-start only for an explicit weights-only migration."
+                        ))
+    parser.add_argument("--warm-start", action="store_true", default=False,
+                        help=(
+                            "Treat --resume-from as a weights-only initialization source instead of "
+                            "resuming counters/optimizer/replay. Requires --checkpoint-migration-id."
+                        ))
+    parser.add_argument("--checkpoint-migration-id", type=str, default=None,
+                        help=(
+                            "Auditable warm-start migration identifier. The only supported value is "
+                            "sts2-weights-only-v1."
+                        ))
+    parser.add_argument("--allow-legacy-checkpoint", action="store_true", default=False,
+                        help=(
+                            "Permit --warm-start from a pre-manifest checkpoint. Never applies to exact "
+                            "resume and does not restore optimizer, replay, scaler, or counters."
+                        ))
+    parser.add_argument("--resume-load-buffer", action=argparse.BooleanOptionalAction, default=True,
+                        help=(
+                            "Exact-resume compatibility switch; must remain enabled. Disabling it fails "
+                            "closed. Use --warm-start for a deliberate weights-only initialization."
+                        ))
+    parser.add_argument("--resume-load-optimizer", action=argparse.BooleanOptionalAction, default=True,
+                        help=(
+                            "Exact-resume compatibility switch; must remain enabled. Disabling it fails "
+                            "closed. Use --warm-start for a fresh optimizer."
+                        ))
+    # Deprecated aliases remain parseable so old automation gets a deliberate
+    # fail-closed error instead of being silently interpreted as an exact resume.
+    parser.add_argument("--resume-without-buffer", dest="resume_load_buffer", action="store_false",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--resume-without-optimizer", dest="resume_load_optimizer", action="store_false",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--latent-policy-distill-weight", type=float, default=0.25,
                         help="Distill latent search policy toward observation-conditioned policy.")
     parser.add_argument("--latent-policy-target-weight", type=float, default=0.5,
@@ -364,10 +424,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Disable shortcutting obvious build-domain decisions like taking gold, safe potion claims, and proceed-only screens.")
     parser.add_argument("--disable-potion-reward-fast-path", action="store_true",
                         help="Disable only automatic potion reward claims in the build fast-path; gold and proceed-only shortcuts remain enabled.")
-    parser.add_argument("--obs-mode", type=str, default="dense_v2",
+    parser.add_argument("--obs-mode", type=str, default="token_v3",
                         choices=["dense_v2", "token_v3"],
                         help="Observation encoder mode. token_v3 enables token-world MuZero inputs.")
-    parser.add_argument("--model-arch", type=str, default="dense_v1",
+    parser.add_argument("--model-arch", type=str, default="token_memory_v1",
                         choices=["dense_v1", "token_memory_v1"],
                         help="MuZero model path. token_memory_v1 uses token-world encoder + latent memory slots.")
     parser.add_argument("--token-d-model", type=int, default=128,
@@ -429,10 +489,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
                               "0 disables chunking in custom mode, but train/eval/max profiles default it to 16."))
 
     # Directories
-    parser.add_argument("--log-dir", type=str, default="runs")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Run log directory (default: <STS2_ARTIFACT_ROOT>/runs). Relative paths use the artifact root.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help=(
+            "Checkpoint directory (default: <STS2_ARTIFACT_ROOT>/checkpoints). "
+            "Relative paths use the artifact root."
+        ),
+    )
 
     # Environment setup
+    parser.add_argument(
+        "--environment-backend",
+        choices=("live", "headless"),
+        default="live",
+        help="Typed environment backend. live is strict contract-v2; headless uses the local simulator adapter.",
+    )
+    parser.add_argument(
+        "--sim-exe-path",
+        type=str,
+        default=None,
+        help="Optional HeadlessSim executable path when --environment-backend=headless.",
+    )
     parser.add_argument("--combat-sandbox", action="store_true", default=False)
     parser.add_argument("--encounter-pool", type=str, default=None)
     # Full-run mode seed pinning (recovery 2026-05-08): when set, each

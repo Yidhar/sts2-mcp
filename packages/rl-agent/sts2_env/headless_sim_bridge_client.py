@@ -26,6 +26,7 @@ import queue
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,49 @@ from typing import Any
 # path catches sim failures too. env_v2 already uses `except Exception` so
 # it doesn't care about the MRO.
 from sts2_env.bridge_client import BridgeError
+from sts2_rl.artifacts import artifact_root, resolve_artifact_path, resolve_external_input_path
+from sts2_rl.contracts.versions import API_VERSION, SCHEMA_VERSION
+
+
+def _headless_sim_candidates() -> tuple[Path, ...]:
+    """Return portable candidate paths without assuming a developer drive."""
+
+    roots: list[Path] = []
+    configured_root = os.environ.get("STS2_AI_ROOT")
+    if configured_root:
+        source_root = resolve_external_input_path(configured_root)
+    else:
+        source_root = artifact_root() / "dependencies" / "sts2-ai"
+    roots.append(source_root / "STS2AI" / "ENV" / "Sim")
+
+    relative_candidates = (
+        Path("HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"),
+        Path("HeadlessSim/bin/Debug/net9.0/HeadlessSim.exe"),
+        Path("Runtime/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"),
+        Path("Runtime/HeadlessSim/bin/Debug/net9.0/HeadlessSim.exe"),
+    )
+    return tuple(root / candidate for root in roots for candidate in relative_candidates)
+
+
+def resolve_headless_sim_exe(exe_path: str | Path | None = None) -> Path:
+    """Resolve the simulator executable from explicit/env/repository sources."""
+
+    explicit = exe_path or os.environ.get("STS2_HEADLESS_SIM_EXE")
+    if explicit:
+        candidate = resolve_external_input_path(explicit)
+        if candidate.is_file():
+            return candidate
+        raise HeadlessSimError(f"HeadlessSim exe not found: {candidate}")
+
+    candidates = _headless_sim_candidates()
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    searched = "\n  - ".join(str(candidate) for candidate in candidates)
+    raise HeadlessSimError(
+        "HeadlessSim exe not found. Set STS2_HEADLESS_SIM_EXE or STS2_AI_ROOT. "
+        f"Searched:\n  - {searched}"
+    )
 
 
 class HeadlessSimError(BridgeError):
@@ -49,10 +93,10 @@ class HeadlessSimBridgeClient:
     structurally typed so CombatSandboxEnv/SlayTheSpire2EnvV2 don't care.
     """
 
-    DEFAULT_EXE_PATH = Path(
-        "E:/game/project/sts2_mcp/third_party/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/"
-        "bin/Debug/net9.0/HeadlessSim.exe"
-    )
+    # Compatibility attribute; resolution also checks release/runtime layouts
+    # and environment overrides. This path is repository-relative, never tied
+    # to a developer drive.
+    DEFAULT_EXE_PATH = _headless_sim_candidates()[0]
 
     def __init__(
         self,
@@ -69,9 +113,7 @@ class HeadlessSimBridgeClient:
         # the worker (which otherwise leaves the sim subprocess orphaned).
         rpc_timeout_s: float = 25.0,
     ):
-        self._exe_path = Path(exe_path or self.DEFAULT_EXE_PATH)
-        if not self._exe_path.exists():
-            raise HeadlessSimError(f"HeadlessSim exe not found: {self._exe_path}")
+        self._exe_path = resolve_headless_sim_exe(exe_path)
         if protocol != "json":
             raise NotImplementedError("Only json protocol supported for now")
 
@@ -88,10 +130,12 @@ class HeadlessSimBridgeClient:
         # Dedicated reader thread drains stdout into this queue so the main
         # thread can wait with a timeout. Without this, a hung sim leaves
         # our main thread blocked in readline() indefinitely.
-        self._stdout_queue: queue.Queue = queue.Queue()
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue(maxsize=8)
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
+        self._startup_ready = threading.Event()
+        self._startup_stderr_tail: deque[str] = deque(maxlen=40)
         # Per-process hang-debug log. Each RPC starts by appending a line
         # here; on hang, the tail of this file identifies the exact action
         # that made the sim stop responding. File name includes the sim
@@ -122,110 +166,109 @@ class HeadlessSimBridgeClient:
     # ------------------------------------------------------------------
     def _start_subprocess(self, startup_timeout_s: float) -> None:
         env = os.environ.copy()
-        # Silence ThreadPool tuning noise; we don't need the stderr chatter.
         env.setdefault("STS2_MIN_THREADS", "8")
-        # PATCH 2026-04-18 (downstream fork): reconfigured subprocess pipe
-        # params after evidence-driven debugging pinpointed the hang to
-        # Python-side pipe reading (sim C# tracing showed stdout flushed
-        # in 8ms, Python timed out 27.8s later waiting on readline).
-        #
-        # Old: bufsize=0 + text=False → raw FileIO; readline() falls back
-        #   to byte-by-byte syscall loop. Flaky for Windows pipes with
-        #   responses > ~4KB (observed failure mode: 7680-byte end_turn
-        #   response sat in OS pipe buffer but readline never returned).
-        #
-        # New: bufsize=1 + text=True → line-buffered TextIOWrapper over
-        #   BufferedReader. readline() uses the buffer and only returns
-        #   a full line. Universal newline handling ('' default) normalizes
-        #   Windows \r\n to \n transparently.
         self._proc = subprocess.Popen(
             [str(self._exe_path), "--stdio", "--protocol", "json"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            cwd=str(self._exe_path.parent),
             bufsize=1,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
-        # Wait for the "stdio mode ready" banner on stderr so we know sim is up.
-        # stderr is now text mode too — read as str.
-        deadline = time.time() + startup_timeout_s
-        while time.time() < deadline:
-            if self._proc.poll() is not None:
-                raise HeadlessSimError(
-                    f"HeadlessSim exited during startup (rc={self._proc.returncode})"
-                )
-            line = self._proc.stderr.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
-            decoded = line
-            # Sim writes "HeadlessSim: stdio mode ready" once booted.
-            if "stdio mode ready" in decoded:
-                # Spin up the reader thread NOW so the first _rpc call
-                # doesn't race against stdout buffering.
-                self._reader_stop.clear()
-                self._reader_thread = threading.Thread(
-                    target=self._stdout_reader_loop,
-                    name=f"sim-stdout-reader-pid{self._proc.pid}",
-                    daemon=True,
-                )
-                self._reader_thread.start()
-                # PATCH 2026-04-18: sim writes to stderr periodically
-                # (bootstrap banner, watchdog heartbeat, Godot INFO/WARN,
-                # Sentry telemetry). The stderr pipe buffer is tiny
-                # (~4-64KB on Windows) — if nobody drains it, sim's next
-                # Console.Error.Write blocks, which can cascade into the
-                # stdio handler thread stalling and rpc hangs we've
-                # misdiagnosed for 10+ rounds. Always drain stderr.
-                self._stderr_thread = threading.Thread(
-                    target=self._stderr_reader_loop,
-                    name=f"sim-stderr-reader-pid{self._proc.pid}",
-                    daemon=True,
-                )
-                self._stderr_thread.start()
-                # Open hang-debug log for this sim instance. Kept small
-                # (truncated on reopen); we only need the last ~200 actions
-                # to backtrack a hang.
-                try:
-                    self._hang_log_path = Path(
-                        os.environ.get("STS2_SIM_HANG_LOG_DIR") or "."
-                    ) / f"sim_hang_debug_pid{self._proc.pid}.log"
-                    self._hang_log_handle = open(self._hang_log_path, "w", encoding="utf-8")
-                    self._hang_log_handle.write(
-                        f"# sim hang-debug log for pid={self._proc.pid} started at {time.time()}\n"
-                    )
-                    self._hang_log_handle.flush()
-                except Exception:
-                    self._hang_log_path = None
-                    self._hang_log_handle = None
-                return
-        raise HeadlessSimError("HeadlessSim failed to become ready in time")
+        self._reader_stop.clear()
+        self._startup_ready.clear()
+        self._reader_thread = threading.Thread(
+            target=self._stdout_reader_loop,
+            name=f"sim-stdout-reader-pid{self._proc.pid}",
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_reader_loop,
+            name=f"sim-stderr-reader-pid{self._proc.pid}",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        self._stderr_thread.start()
 
-    def _stderr_reader_loop(self) -> None:
-        """Dedicated thread that drains sim stderr into the hang-debug log.
-        Prevents stderr pipe buffer from filling up (which would block
-        sim's next Console.Error.Write and cascade into stdio hangs).
-        """
+        # Never call stderr.readline() on the constructing thread: an otherwise
+        # healthy but silent process would bypass startup_timeout_s forever.
+        deadline = time.monotonic() + max(float(startup_timeout_s), 0.001)
+        while time.monotonic() < deadline:
+            if self._startup_ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+                self._open_hang_log()
+                return
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                return_code = None if proc is None else proc.returncode
+                tail = " | ".join(self._startup_stderr_tail)
+                self._kill_sim("process exited during startup")
+                raise HeadlessSimError(
+                    f"HeadlessSim exited during startup (rc={return_code}); stderr_tail={tail!r}"
+                )
+
+        tail = " | ".join(self._startup_stderr_tail)
+        self._kill_sim(f"startup timeout after {startup_timeout_s}s")
+        raise HeadlessSimError(
+            f"HeadlessSim failed to become ready in {startup_timeout_s:.1f}s; stderr_tail={tail!r}"
+        )
+
+    def _open_hang_log(self) -> None:
         proc = self._proc
         if proc is None:
             return
-        stderr = proc.stderr
+        try:
+            directory = resolve_artifact_path(
+                os.environ.get("STS2_SIM_HANG_LOG_DIR") or None,
+                default="logs/headless-sim",
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            self._hang_log_path = directory / f"sim_hang_debug_pid{proc.pid}.log"
+            self._hang_log_handle = self._hang_log_path.open("w", encoding="utf-8")
+            self._hang_log_handle.write(
+                f"# sim hang-debug log for pid={proc.pid} started at {time.time()}\n"
+            )
+            for line in self._startup_stderr_tail:
+                self._hang_log("sim_startup_stderr", line=line)
+            self._hang_log_handle.flush()
+        except (OSError, ValueError):
+            self._hang_log_path = None
+            self._hang_log_handle = None
+
+    def _stderr_reader_loop(self) -> None:
+        """Drain stderr continuously and signal the startup banner."""
+
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
         try:
             while not self._reader_stop.is_set():
-                line = stderr.readline()
+                line = proc.stderr.readline()
                 if not line:
                     return
-                # Keep the last N stderr lines in the hang-debug log; cap
-                # per-line length so pathological output doesn't explode.
                 snippet = line.rstrip("\r\n")
                 if len(snippet) > 500:
                     snippet = snippet[:500] + "..."
+                self._startup_stderr_tail.append(snippet)
+                if "stdio mode ready" in snippet:
+                    self._startup_ready.set()
                 self._hang_log("sim_stderr", line=snippet)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             self._hang_log("stderr_reader_exception", error=repr(exc))
+
+    def _enqueue_stdout(self, line: str | None) -> bool:
+        """Bound stdout buffering while preserving response ordering."""
+
+        while not self._reader_stop.is_set():
+            try:
+                self._stdout_queue.put(line, timeout=0.1)
+                return True
+            except queue.Full:
+                self._hang_log("reader_queue_backpressure", maxsize=self._stdout_queue.maxsize)
+        return False
 
     def _stdout_reader_loop(self) -> None:
         """Dedicated thread. Reads stdout lines one-at-a-time and feeds the
@@ -247,17 +290,18 @@ class HeadlessSimBridgeClient:
                 if not line:
                     # EOF — sim died or closed its pipes.
                     self._hang_log("reader_eof")
-                    self._stdout_queue.put(None)
+                    self._enqueue_stdout(None)
                     break
                 # text mode — len(line) is character count
                 self._hang_log("reader_readline_done", nchars=len(line))
-                self._stdout_queue.put(line)
+                if not self._enqueue_stdout(line):
+                    return
         except Exception as exc:  # noqa: BLE001
             # Push a sentinel so waiters don't block forever. We swallow
             # the exception because the worker thread picking up the
             # sentinel will raise a clean HeadlessSimError.
             self._hang_log("reader_exception", error=repr(exc))
-            self._stdout_queue.put(None)
+            self._enqueue_stdout(None)
 
     def _hang_log(self, event: str, **fields: Any) -> None:
         """Append a compact JSON line to the hang-debug log. Silent on
@@ -272,68 +316,80 @@ class HeadlessSimBridgeClient:
         except Exception:
             pass
 
-    def _kill_sim(self, reason: str) -> None:
-        """Force-terminate the sim subprocess. Called when we detect a hang
-        via RPC timeout or when close() is invoked. Idempotent.
-        """
-        if self._proc is None:
-            return
-        # Signal reader thread to stop so we don't race against the pipe
-        # closure (it will also notice EOF and push a sentinel).
-        self._reader_stop.set()
-        try:
-            self._proc.kill()
-        except Exception:
-            pass
-        try:
-            self._proc.wait(timeout=5.0)
-        except Exception:
-            pass
-        self._proc = None
-        # Drain the queue so a subsequent _rpc call doesn't pick up stale
-        # bytes from a dead sim.
-        try:
-            while True:
+    def _join_reader_threads(self) -> None:
+        current = threading.current_thread()
+        for thread in (self._reader_thread, self._stderr_thread):
+            if thread is not None and thread is not current:
+                thread.join(timeout=1.0)
+        self._reader_thread = None
+        self._stderr_thread = None
+
+    @staticmethod
+    def _close_process_pipes(proc: subprocess.Popen[Any]) -> None:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+
+    def _drain_stdout_queue(self) -> None:
+        while True:
+            try:
                 self._stdout_queue.get_nowait()
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                return
+
+    def _kill_sim(self, reason: str) -> None:
+        """Force-terminate and reap the subprocess. Idempotent."""
+
+        proc = self._proc
+        self._proc = None
+        self._reader_stop.set()
+        if proc is not None:
+            self._hang_log("process_kill", reason=reason, pid=proc.pid)
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=5.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            self._close_process_pipes(proc)
+        self._join_reader_threads()
+        self._drain_stdout_queue()
 
     def close(self) -> None:
-        # Public lifecycle entry. Must always leave _proc=None and sim
-        # process reaped even on errors — otherwise we leak zombies when
-        # AsyncReadyCollector restarts an env.
-        if self._hang_log_handle is not None:
-            try:
-                self._hang_log_handle.close()
-            except Exception:
-                pass
-            self._hang_log_handle = None
+        """Close stdin, then force-kill if needed; always reap and join readers."""
+
         with self._lock:
-            if self._proc is None:
-                return
-            self._reader_stop.set()
+            proc = self._proc
+            if proc is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+            if proc is not None:
+                try:
+                    proc.wait(timeout=1.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            self._kill_sim("client close")
+        handle = self._hang_log_handle
+        self._hang_log_handle = None
+        if handle is not None:
             try:
-                self._proc.stdin.close()
-            except Exception:
+                handle.close()
+            except (OSError, ValueError):
                 pass
-            try:
-                self._proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-                try:
-                    self._proc.wait(timeout=3.0)
-                except Exception:
-                    pass
-            self._proc = None
-        if self._reader_thread is not None:
-            # Don't join the reader thread here — if close() is called from
-            # a worker thread that's holding the lock, joining could
-            # deadlock. The thread is daemon=True so it dies with the
-            # process anyway.
-            self._reader_thread = None
+
+    def __enter__(self) -> "HeadlessSimBridgeClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
 
     def __del__(self):
         try:
@@ -344,11 +400,13 @@ class HeadlessSimBridgeClient:
     # ------------------------------------------------------------------
     # Low-level RPC
     # ------------------------------------------------------------------
-    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if self._proc is None or self._proc.poll() is not None:
-            raise HeadlessSimError(
-                f"HeadlessSim subprocess is not running (method={method})"
-            )
+    def _rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
         request = {"method": method}
         if params is not None:
             request["params"] = params
@@ -356,12 +414,18 @@ class HeadlessSimBridgeClient:
         payload = json.dumps(request, ensure_ascii=False) + "\n"
         sent_at = time.time()
         self._hang_log("sent", method=method, params=params, sent_at=sent_at)
+        rpc_timeout_s = self._rpc_timeout_s if timeout_s is None else max(float(timeout_s), 0.001)
         with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None or proc.stdin is None:
+                raise HeadlessSimError(
+                    f"HeadlessSim subprocess is not running (method={method})"
+                )
             # Phase A checkpoint A: about to write request payload to sim stdin.
             self._hang_log("rpc_stdin_write_begin", method=method, nbytes=len(payload))
             try:
-                self._proc.stdin.write(payload)
-                self._proc.stdin.flush()
+                proc.stdin.write(payload)
+                proc.stdin.flush()
             except Exception as exc:
                 self._kill_sim(f"stdin write failed: {exc}")
                 self._hang_log("stdin_write_error", method=method, error=repr(exc))
@@ -374,7 +438,7 @@ class HeadlessSimBridgeClient:
             # Phase A checkpoint C: about to block waiting for response line.
             self._hang_log("rpc_stdout_await_begin", method=method)
             try:
-                line = self._stdout_queue.get(timeout=self._rpc_timeout_s)
+                line = self._stdout_queue.get(timeout=rpc_timeout_s)
             except queue.Empty:
                 # This is THE hang-diagnosis signal. The hang log tail has
                 # the exact request that went in without a response.
@@ -390,11 +454,11 @@ class HeadlessSimBridgeClient:
                     method=method,
                     params=params,
                     waited_s=waited,
-                    rpc_timeout_s=self._rpc_timeout_s,
+                    rpc_timeout_s=rpc_timeout_s,
                     reader_thread_alive=reader_alive,
                     proc_poll=self._proc.poll() if self._proc else None,
                 )
-                self._kill_sim(f"rpc timeout {self._rpc_timeout_s}s on {method}")
+                self._kill_sim(f"rpc timeout {rpc_timeout_s}s on {method}")
                 raise HeadlessSimError(
                     f"HeadlessSim RPC {method} timed out after "
                     f"{waited:.1f}s (sim hung on params={json.dumps(params or {}, ensure_ascii=False)[:200]} — "
@@ -433,8 +497,26 @@ class HeadlessSimBridgeClient:
     def session_base_url(self) -> str:
         return self.base_url
 
+    @property
+    def session_id(self) -> str:
+        proc = self._proc
+        return f"headless-sim-{proc.pid}" if proc is not None else "headless-sim-closed"
+
     def health(self) -> dict[str, Any]:
         return {"ok": self.is_connected, "backend": "headless_sim"}
+
+    def get_spec(self) -> dict[str, Any]:
+        """Return the shared typed backend capabilities without another RPC."""
+
+        return {
+            "ok": True,
+            "backend": "headless_sim",
+            "api_version": API_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "supports_full_run": True,
+            "supports_combat_reset": True,
+            "supports_seed": True,
+        }
 
     def combat_catalog(self) -> dict[str, Any]:
         response = self._rpc("combat_catalog")
@@ -470,12 +552,24 @@ class HeadlessSimBridgeClient:
         rebind_active_run: bool = False,
         force_fresh: bool = False,
         defensive_buffs: bool = False,
+        seed: str | int | None = None,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
+        timeout_s = max(float(timeout_ms) / 1000.0, 0.001)
+        if rebind_active_run and self._current_episode_id:
+            sim_state = self._rpc("state", timeout_s=timeout_s)
+            return _build_bridge_step_response(
+                self, sim_state, episode_started=False, reward=0.0,
+                info_extra={"sim_rebound_active_run": True},
+            )
         params: dict[str, Any] = {}
         if character is not None:
             params["character_id"] = _normalize_character(character)
-        sim_state = self._rpc("reset", params)
+        if seed is not None:
+            params["seed"] = str(seed)
+        if defensive_buffs:
+            params["defensive_buffs"] = True
+        sim_state = self._rpc("reset", params, timeout_s=timeout_s)
         # Full-run reset clears any combat_sandbox tracking — the sandbox
         # reward formula shouldn't fire during full-run episodes.
         self._sandbox_start_hp = None
@@ -492,6 +586,10 @@ class HeadlessSimBridgeClient:
         action_id: str | None = None,
         timeout_ms: int = 20_000,
     ) -> dict[str, Any]:
+        if str(episode_id) != self._current_episode_id:
+            raise HeadlessSimError(
+                f"step episode mismatch: requested={episode_id!r}, active={self._current_episode_id!r}"
+            )
         # Sim's step() takes the action itself (action name + index/card_index/
         # target_id etc.), not a 0-based index into a previously-emitted
         # legal_actions list. We stored the raw sim action dict inside each
@@ -527,7 +625,7 @@ class HeadlessSimBridgeClient:
         # so the post-step HP observation can attribute any drop.
         self._self_inflicted_tracker.note_action(raw)
 
-        wrapped = self._rpc("step", params)
+        wrapped = self._rpc("step", params, timeout_s=max(float(timeout_ms) / 1000.0, 0.001))
         # Sim step wraps the new state under {accepted, state, error}. Unwrap.
         sim_state = wrapped.get("state") or {}
         accepted = bool(wrapped.get("accepted", True))
@@ -618,7 +716,7 @@ class HeadlessSimBridgeClient:
         # silently ignored — every combat_reset was running on the default
         # starter Ironclad configuration regardless of snapshot content.
         # Fix: pack snapshot fields into `build`. SimulationBuildSpec fields
-        # per third_party/sts2-ai/.../FullRunSimulationDtos.cs:
+        # per <STS2_AI_ROOT>/.../FullRunSimulationDtos.cs:
         #   deck: list[SimulationBuildCardSpec{id, upgrade_level}]
         #   relics: list[SimulationBuildRelicSpec{id}]
         #   current_hp / max_hp / max_energy / gold: int
@@ -665,7 +763,8 @@ class HeadlessSimBridgeClient:
             build["potions"] = [_strip_prefix(pid, "POTION.") for pid in potions if pid]
         if build:
             params["build"] = build
-        combat_result = self._rpc("combat_reset", params)
+        timeout_s = max(float(timeout_ms) / 1000.0, 0.001)
+        combat_result = self._rpc("combat_reset", params, timeout_s=timeout_s)
         # The sim's combat_reset RPC returns a CombatTrainingStateSnapshot
         # (top-level keys: combat_active, enemies, hand, piles, ...). That
         # shape is different from FullRunSimulationStateSnapshot which our
@@ -678,7 +777,7 @@ class HeadlessSimBridgeClient:
                 f"combat_reset failed: {combat_result.get('error_code')}: "
                 f"{str(combat_result.get('error'))[:500]}"
             )
-        sim_state = self._rpc("state")
+        sim_state = self._rpc("state", timeout_s=timeout_s)
         # Capture starting HP for live-parity terminal reward computation.
         # max_hp in the sandbox reset request sets the new combat's max;
         # current_hp sets the starting HP. Fall back to observed player HP
@@ -778,44 +877,12 @@ def _build_bridge_step_response(
     if info_extra:
         info.update(info_extra)
 
-    # Live-parity combat_sandbox terminal reward. Live bridge mod emits a
-    # 5-term breakdown (BuildEnvCombatSandboxRewardBreakdown): combat_won
-    # (+1.0), room_hp_quality (clamp((hp-start)/max,-1,1) * 1.5), boss_clear
-    # (+1.5), elite_clear (+0.75), death (-2.0). Sim's C# side hardcodes
-    # -1.0 / +1.0 which training treats as ~uniform signal. Override here
-    # at terminal when we were running a sandbox combat. Clears sandbox
-    # tracking after firing so stale state can't bleed into the next run.
-    if terminal and client._sandbox_encounter_id is not None:
-        cur_hp = float(_extract_player_hp(sim_state) or 0)
-        start_hp = float(client._sandbox_start_hp or 0)
-        max_hp = float(client._sandbox_max_hp or 0)
-        enc = str(client._sandbox_encounter_id).upper()
-        room_hp_delta_normalized = 0.0
-        if max_hp > 0.0:
-            room_hp_delta_normalized = max(-1.0, min(1.0, (cur_hp - start_hp) / max_hp))
-        room_hp_quality_bonus = room_hp_delta_normalized * 1.5
-        combat_won = cur_hp > 0.0
-        combat_won_bonus = 1.0 if combat_won else 0.0
-        boss_clear_bonus = 1.5 if combat_won and enc.endswith("_BOSS") else 0.0
-        elite_clear_bonus = 0.75 if combat_won and enc.endswith("_ELITE") else 0.0
-        death_penalty = -2.0 if cur_hp <= 0.0 else 0.0
-        parity_reward = (
-            combat_won_bonus
-            + room_hp_quality_bonus
-            + boss_clear_bonus
-            + elite_clear_bonus
-            + death_penalty
-        )
-        info["_sandbox_parity_reward_breakdown"] = {
-            "sim_original_reward": float(reward),
-            "combat_won_bonus": combat_won_bonus,
-            "room_hp_quality_bonus": room_hp_quality_bonus,
-            "boss_clear_bonus": boss_clear_bonus,
-            "elite_clear_bonus": elite_clear_bonus,
-            "death_penalty": death_penalty,
-            "total": parity_reward,
-        }
-        reward = parity_reward
+    # The simulator's scalar is retained only as a diagnostic. Canonical
+    # transition facts are projected by HeadlessBackend and the shared
+    # VersionedRewardCalculator is the sole scalar reward authority.
+    info["sim_backend_reward_ignored"] = float(reward)
+    info["reward_authority"] = "external-rl"
+    if terminal:
         client._sandbox_start_hp = None
         client._sandbox_max_hp = None
         client._sandbox_encounter_id = None
@@ -824,12 +891,12 @@ def _build_bridge_step_response(
         "ok": True,
         "episode_id": client._current_episode_id,
         "step_index": int(sim_state.get("step_index", 0) or 0),
-        "reward": float(reward),
+        "reward": None,
+        "reward_status": "not_computed",
+        "reward_authority": "external-rl",
         "done": terminal,
         "truncated": truncated,
         "obs": bridge_obs,
         "legal_actions": legal_actions,
         "info": info,
     }
-
-

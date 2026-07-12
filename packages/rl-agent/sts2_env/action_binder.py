@@ -31,4 +31,3 @@ def bind_semantic_action(
             best_action = action
             best_score = score
     return best_index, best_action, best_score
-

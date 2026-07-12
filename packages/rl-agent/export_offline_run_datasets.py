@@ -32,6 +32,7 @@ from run_history_parser import (
     build_offline_training_samples,
     extract_run_history_bytes,
 )
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -394,8 +395,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    output_dir = Path(args.output_dir)
+    input_path = resolve_external_input_path(args.input)
+    output_dir = resolve_artifact_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     run_sources = _collect_run_sources(input_path)

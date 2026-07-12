@@ -12,7 +12,7 @@ import argparse
 import time
 
 from sts2_env.text_encoder import get_text_encoder
-
+from sts2_rl.artifacts import resolve_external_input_path
 
 # Common canonical text patterns to pre-cache
 _WARMUP_TEXTS = [
@@ -89,6 +89,11 @@ def main():
     parser = argparse.ArgumentParser(description="Warm text embedding cache")
     parser.add_argument("--session-file", type=str, default=None)
     args = parser.parse_args()
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
 
     encoder = get_text_encoder().ensure_ready()
     print(f"[warm] Model: {encoder._model_name}")

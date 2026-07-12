@@ -1,0 +1,17 @@
+# Optional frozen text-encoder closure; not installed in the default CI lane.
+# artifact-profile: windows-cp313
+--require-hashes
+
+-r requirements.lock
+
+huggingface-hub==0.27.0 --hash=sha256:8f2e834517f1f1ddf1ecc716f91b120d7333011b7485f665a9a412eacb1a2a81
+joblib==1.4.2 --hash=sha256:06d478d5674cbc267e7496a410ee875abd68e4340feff4490bcb7afb88060ae6
+regex==2024.11.6 --hash=sha256:2b3361af3198667e99927da8b84c1b010752fa4b1115ee30beaa332cabc3ef1a
+scikit-learn==1.6.0 --hash=sha256:a17860a562bac54384454d40b3f6155200c1c737c9399e6a97962c63fce503ac
+scipy==1.15.0 --hash=sha256:952d2e9eaa787f0a9e95b6e85da3654791b57a156c3e6609e65cc5176ccfe6f2
+sentence-transformers==3.3.1 --hash=sha256:abffcc79dab37b7d18d21a26d5914223dd42239cfe18cb5e111c66c54b658ae7
+threadpoolctl==3.5.0 --hash=sha256:56c1e26c150397e58c4926da8eeee87533b1e32bef131bd4bf6a2f45f3185467
+tokenizers==0.21.0 --hash=sha256:87841da5a25a3a5f70c102de371db120f41873b854ba65e52bccd57df5a3780c
+tqdm==4.67.1 --hash=sha256:26445eca388f82e72884e0d580d5464cd801a3ea01e63e5601bdff9ba6a48de2
+transformers==4.47.1 --hash=sha256:d2f5d19bb6283cd66c893ec7e6d931d6370bbf1cc93633326ff1f41a40046c9c
+PyYAML==6.0.2 --hash=sha256:8388ee1976c416731879ac16da0aff3f63b286ffdd57cdeb95f3f2e085687563

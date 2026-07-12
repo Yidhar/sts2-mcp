@@ -23,8 +23,9 @@ import collections
 import json
 from pathlib import Path
 
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
-SP_DIR = Path("data/skada_clean/sp")
+SP_DIR = resolve_external_input_path(None, default="datasets/skada_clean/sp")
 
 
 def load_runs(split_dir: Path, limit: int):
@@ -293,7 +294,7 @@ def main() -> None:
 
     # Dump samples
     if args.dump_samples:
-        dump_path = Path(args.dump_samples)
+        dump_path = resolve_artifact_path(args.dump_samples)
         dump_path.parent.mkdir(parents=True, exist_ok=True)
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(samples, f, ensure_ascii=False, indent=2)

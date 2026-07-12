@@ -1,0 +1,463 @@
+{
+  "POTION.ASHWATER": {
+    "description": "消耗你手牌中的任意张牌。",
+    "id": "POTION.ASHWATER",
+    "rarity": "Uncommon",
+    "summary": "消耗你手牌中的任意张牌。",
+    "title": "灰水"
+  },
+  "POTION.ATTACK_POTION": {
+    "description": "从3张随机攻击牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "id": "POTION.ATTACK_POTION",
+    "rarity": "Common",
+    "summary": "从3张随机攻击牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "攻击药水"
+  },
+  "POTION.BEETLE_JUICE": {
+    "description": "敌人的攻击在下4个回合中造成的伤害减少30%。",
+    "id": "POTION.BEETLE_JUICE",
+    "rarity": "Rare",
+    "summary": "敌人的攻击在下4个回合中造成的伤害减少30%。",
+    "title": "甲虫汁"
+  },
+  "POTION.BLESSING_OF_THE_FORGE": {
+    "description": "在本场战斗中升级你手牌中的所有牌。",
+    "id": "POTION.BLESSING_OF_THE_FORGE",
+    "rarity": "Uncommon",
+    "summary": "在本场战斗中升级你手牌中的所有牌。",
+    "title": "熔炉的祝福"
+  },
+  "POTION.BLOCK_POTION": {
+    "description": "获得12点格挡。",
+    "id": "POTION.BLOCK_POTION",
+    "rarity": "Common",
+    "summary": "获得12点格挡。",
+    "title": "格挡药水"
+  },
+  "POTION.BLOOD_POTION": {
+    "description": "回复你最大生命值的20%。",
+    "id": "POTION.BLOOD_POTION",
+    "rarity": "Common",
+    "summary": "回复你最大生命值的20%。",
+    "title": "鲜血药水"
+  },
+  "POTION.BONE_BREW": {
+    "description": "召唤15。",
+    "id": "POTION.BONE_BREW",
+    "rarity": "Uncommon",
+    "summary": "召唤15。",
+    "title": "骨头酿"
+  },
+  "POTION.BOTTLED_POTENTIAL": {
+    "description": "将你的所有牌洗入你的抽牌堆。抽5张牌。",
+    "id": "POTION.BOTTLED_POTENTIAL",
+    "rarity": "Rare",
+    "summary": "将你的所有牌洗入你的抽牌堆。抽5张牌。",
+    "title": "瓶装潜能"
+  },
+  "POTION.CLARITY": {
+    "description": "抽1张牌。在你的下3个回合开始时，额外抽1张牌。",
+    "id": "POTION.CLARITY",
+    "rarity": "Uncommon",
+    "summary": "抽1张牌。在你的下3个回合开始时，额外抽1张牌。",
+    "title": "明晰提取物"
+  },
+  "POTION.COLORLESS_POTION": {
+    "description": "从3张随机无色牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "id": "POTION.COLORLESS_POTION",
+    "rarity": "Common",
+    "summary": "从3张随机无色牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "无色药水"
+  },
+  "POTION.COSMIC_CONCOCTION": {
+    "description": "将3张升级的无色牌加入你的手牌。",
+    "id": "POTION.COSMIC_CONCOCTION",
+    "rarity": "Rare",
+    "summary": "将3张升级的无色牌加入你的手牌。",
+    "title": "宇宙药剂"
+  },
+  "POTION.CUNNING_POTION": {
+    "description": "将3张小刀+加入你的手牌。",
+    "id": "POTION.CUNNING_POTION",
+    "rarity": "Uncommon",
+    "summary": "将3张小刀+加入你的手牌。",
+    "title": "狡诈药水"
+  },
+  "POTION.CURE_ALL": {
+    "description": "获得能量。抽2张牌。",
+    "id": "POTION.CURE_ALL",
+    "rarity": "Uncommon",
+    "summary": "获得能量。抽2张牌。",
+    "title": "痊愈药水"
+  },
+  "POTION.DEPRECATED_POTION": {
+    "description": "这瓶药水已经从游戏中移除。",
+    "id": "POTION.DEPRECATED_POTION",
+    "rarity": "None",
+    "summary": "这瓶药水已经从游戏中移除。",
+    "title": "废弃药水"
+  },
+  "POTION.DEXTERITY_POTION": {
+    "description": "获得2点敏捷。",
+    "id": "POTION.DEXTERITY_POTION",
+    "rarity": "Common",
+    "summary": "获得2点敏捷。",
+    "title": "敏捷药水"
+  },
+  "POTION.DISTILLED_CHAOS": {
+    "description": "打出你抽牌堆顶部的3张牌。",
+    "id": "POTION.DISTILLED_CHAOS",
+    "rarity": "Rare",
+    "summary": "打出你抽牌堆顶部的3张牌。",
+    "title": "精炼混沌"
+  },
+  "POTION.DROPLET_OF_PRECOGNITION": {
+    "description": "选择你抽牌堆中的一张牌加入你的手牌。",
+    "id": "POTION.DROPLET_OF_PRECOGNITION",
+    "rarity": "Rare",
+    "summary": "选择你抽牌堆中的一张牌加入你的手牌。",
+    "title": "预知之滴"
+  },
+  "POTION.DUPLICATOR": {
+    "description": "本回合，你打出的下一张牌会额外打出一次。",
+    "id": "POTION.DUPLICATOR",
+    "rarity": "Uncommon",
+    "summary": "本回合，你打出的下一张牌会额外打出一次。",
+    "title": "复制药水"
+  },
+  "POTION.ENERGY_POTION": {
+    "description": "获得能量。",
+    "id": "POTION.ENERGY_POTION",
+    "rarity": "Common",
+    "summary": "获得能量。",
+    "title": "能量药水"
+  },
+  "POTION.ENTROPIC_BREW": {
+    "description": "在所有空药水栏位中获得随机药水。",
+    "id": "POTION.ENTROPIC_BREW",
+    "rarity": "Rare",
+    "summary": "在所有空药水栏位中获得随机药水。",
+    "title": "混沌药水"
+  },
+  "POTION.ESSENCE_OF_DARKNESS": {
+    "description": "生成你充能球栏位数量个黑暗充能球。",
+    "id": "POTION.ESSENCE_OF_DARKNESS",
+    "rarity": "Rare",
+    "summary": "生成你充能球栏位数量个黑暗充能球。",
+    "title": "黑暗精华"
+  },
+  "POTION.EXPLOSIVE_AMPOULE": {
+    "description": "对所有敌人造成10点伤害。",
+    "id": "POTION.EXPLOSIVE_AMPOULE",
+    "rarity": "Common",
+    "summary": "对所有敌人造成10点伤害。",
+    "title": "爆炸安瓿"
+  },
+  "POTION.FAIRY_IN_A_BOTTLE": {
+    "description": "当你的生命值将被减少至0或以下时，改为丢弃这瓶药水，然后将你回复到你最大生命值的30%。",
+    "id": "POTION.FAIRY_IN_A_BOTTLE",
+    "rarity": "Rare",
+    "summary": "当你的生命值将被减少至0或以下时，改为丢弃这瓶药水，然后将你回复到你最大生命值的30%。",
+    "title": "瓶中精灵"
+  },
+  "POTION.FIRE_POTION": {
+    "description": "造成20点伤害。",
+    "id": "POTION.FIRE_POTION",
+    "rarity": "Common",
+    "summary": "造成20点伤害。",
+    "title": "火焰药水"
+  },
+  "POTION.FLEX_POTION": {
+    "description": "获得5点力量。在你的这个回合结束时，失去5点力量。",
+    "id": "POTION.FLEX_POTION",
+    "rarity": "Common",
+    "summary": "获得5点力量。在你的这个回合结束时，失去5点力量。",
+    "title": "肌肉药水"
+  },
+  "POTION.FOCUS_POTION": {
+    "description": "获得2点集中。",
+    "id": "POTION.FOCUS_POTION",
+    "rarity": "Common",
+    "summary": "获得2点集中。",
+    "title": "集中药水"
+  },
+  "POTION.FORTIFIER": {
+    "description": "将你的格挡变为三倍。",
+    "id": "POTION.FORTIFIER",
+    "rarity": "Uncommon",
+    "summary": "将你的格挡变为三倍。",
+    "title": "固化药水"
+  },
+  "POTION.FOUL_POTION": {
+    "description": "对所有玩家和敌人造成12点伤害。\n也可以投掷给商人换取100金币。",
+    "id": "POTION.FOUL_POTION",
+    "rarity": "Event",
+    "summary": "对所有玩家和敌人造成12点伤害。 / 也可以投掷给商人换取100金币。",
+    "title": "污浊药水"
+  },
+  "POTION.FRUIT_JUICE": {
+    "description": "获得5点最大生命值。",
+    "id": "POTION.FRUIT_JUICE",
+    "rarity": "Rare",
+    "summary": "获得5点最大生命值。",
+    "title": "果汁"
+  },
+  "POTION.FYSH_OIL": {
+    "description": "获得1点力量和1点敏捷。",
+    "id": "POTION.FYSH_OIL",
+    "rarity": "Uncommon",
+    "summary": "获得1点力量和1点敏捷。",
+    "title": "异鱼之油"
+  },
+  "POTION.GAMBLERS_BREW": {
+    "description": "丢弃任意张牌，然后抽相同数量的牌。",
+    "id": "POTION.GAMBLERS_BREW",
+    "rarity": "Uncommon",
+    "summary": "丢弃任意张牌，然后抽相同数量的牌。",
+    "title": "赌徒特酿"
+  },
+  "POTION.GHOST_IN_A_JAR": {
+    "description": "获得1层无实体。",
+    "id": "POTION.GHOST_IN_A_JAR",
+    "rarity": "Rare",
+    "summary": "获得1层无实体。",
+    "title": "罐装幽灵"
+  },
+  "POTION.GIGANTIFICATION_POTION": {
+    "description": "你打出的下一张攻击牌将会造成三倍伤害。",
+    "id": "POTION.GIGANTIFICATION_POTION",
+    "rarity": "Rare",
+    "summary": "你打出的下一张攻击牌将会造成三倍伤害。",
+    "title": "超巨化药水"
+  },
+  "POTION.GLOWWATER_POTION": {
+    "description": "消耗你的手牌。抽10张牌。",
+    "id": "POTION.GLOWWATER_POTION",
+    "rarity": "Event",
+    "summary": "消耗你的手牌。抽10张牌。",
+    "title": "发光水"
+  },
+  "POTION.HEART_OF_IRON": {
+    "description": "获得7层覆甲。",
+    "id": "POTION.HEART_OF_IRON",
+    "rarity": "Uncommon",
+    "summary": "获得7层覆甲。",
+    "title": "铁心药水"
+  },
+  "POTION.KINGS_COURAGE": {
+    "description": "铸造15。",
+    "id": "POTION.KINGS_COURAGE",
+    "rarity": "Uncommon",
+    "summary": "铸造15。",
+    "title": "王之勇气"
+  },
+  "POTION.LIQUID_BRONZE": {
+    "description": "获得3点荆棘。",
+    "id": "POTION.LIQUID_BRONZE",
+    "rarity": "Uncommon",
+    "summary": "获得3点荆棘。",
+    "title": "流动铜液"
+  },
+  "POTION.LIQUID_MEMORIES": {
+    "description": "将你弃牌堆中的一张牌放入你的手牌。这张牌在本回合可以免费打出。",
+    "id": "POTION.LIQUID_MEMORIES",
+    "rarity": "Rare",
+    "summary": "将你弃牌堆中的一张牌放入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "液态记忆"
+  },
+  "POTION.LUCKY_TONIC": {
+    "description": "获得1层缓冲。",
+    "id": "POTION.LUCKY_TONIC",
+    "rarity": "Rare",
+    "summary": "获得1层缓冲。",
+    "title": "幸运补剂"
+  },
+  "POTION.MAZALETHS_GIFT": {
+    "description": "获得1层仪式。",
+    "id": "POTION.MAZALETHS_GIFT",
+    "rarity": "Rare",
+    "summary": "获得1层仪式。",
+    "title": "马萨雷斯的赠礼"
+  },
+  "POTION.OROBIC_ACID": {
+    "description": "往你的手牌中加入一张随机攻击牌、一张随机技能牌和一张随机能力牌。这些牌在本回合免费。",
+    "id": "POTION.OROBIC_ACID",
+    "rarity": "Rare",
+    "summary": "往你的手牌中加入一张随机攻击牌、一张随机技能牌和一张随机能力牌。这些牌在本回合免费。",
+    "title": "欧洛巴斯之酸"
+  },
+  "POTION.POISON_POTION": {
+    "description": "给予6层中毒。",
+    "id": "POTION.POISON_POTION",
+    "rarity": "Common",
+    "summary": "给予6层中毒。",
+    "title": "毒药水"
+  },
+  "POTION.POTION_OF_BINDING": {
+    "description": "给予所有敌人1层虚弱和1层易伤。",
+    "id": "POTION.POTION_OF_BINDING",
+    "rarity": "Uncommon",
+    "summary": "给予所有敌人1层虚弱和1层易伤。",
+    "title": "缚魂药水"
+  },
+  "POTION.POTION_OF_CAPACITY": {
+    "description": "获得2个充能球栏位。",
+    "id": "POTION.POTION_OF_CAPACITY",
+    "rarity": "Uncommon",
+    "summary": "获得2个充能球栏位。",
+    "title": "扩容药水"
+  },
+  "POTION.POTION_OF_DOOM": {
+    "description": "给予33层灾厄。",
+    "id": "POTION.POTION_OF_DOOM",
+    "rarity": "Common",
+    "summary": "给予33层灾厄。",
+    "title": "灾厄药水"
+  },
+  "POTION.POTION_SHAPED_ROCK": {
+    "description": "造成15点伤害。",
+    "id": "POTION.POTION_SHAPED_ROCK",
+    "rarity": "Token",
+    "summary": "造成15点伤害。",
+    "title": "药水形状的石头"
+  },
+  "POTION.POT_OF_GHOULS": {
+    "description": "将2张灵魂加入你的手牌。",
+    "id": "POTION.POT_OF_GHOULS",
+    "rarity": "Rare",
+    "summary": "将2张灵魂加入你的手牌。",
+    "title": "尸鬼瓮"
+  },
+  "POTION.POWDERED_DEMISE": {
+    "description": "敌人在自身的每个回合结束时，失去9点生命。",
+    "id": "POTION.POWDERED_DEMISE",
+    "rarity": "Uncommon",
+    "summary": "敌人在自身的每个回合结束时，失去9点生命。",
+    "title": "消亡粉末"
+  },
+  "POTION.POWER_POTION": {
+    "description": "从3张随机能力牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "id": "POTION.POWER_POTION",
+    "rarity": "Common",
+    "summary": "从3张随机能力牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "能力药水"
+  },
+  "POTION.RADIANT_TINCTURE": {
+    "description": "获得能量。在你的下3个回合开始时，额外获得能量。",
+    "id": "POTION.RADIANT_TINCTURE",
+    "rarity": "Uncommon",
+    "summary": "获得能量。在你的下3个回合开始时，额外获得能量。",
+    "title": "明耀酊剂"
+  },
+  "POTION.REGEN_POTION": {
+    "description": "获得5层再生。",
+    "id": "POTION.REGEN_POTION",
+    "rarity": "Uncommon",
+    "summary": "获得5层再生。",
+    "title": "再生药水"
+  },
+  "POTION.SHACKLING_POTION": {
+    "description": "所有敌人在这个回合失去7点力量。",
+    "id": "POTION.SHACKLING_POTION",
+    "rarity": "Rare",
+    "summary": "所有敌人在这个回合失去7点力量。",
+    "title": "镣铐药水"
+  },
+  "POTION.SHIP_IN_A_BOTTLE": {
+    "description": "获得10点格挡。在下个回合开始时获得10点格挡。",
+    "id": "POTION.SHIP_IN_A_BOTTLE",
+    "rarity": "Rare",
+    "summary": "获得10点格挡。在下个回合开始时获得10点格挡。",
+    "title": "瓶中船"
+  },
+  "POTION.SKILL_POTION": {
+    "description": "从3张随机技能牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "id": "POTION.SKILL_POTION",
+    "rarity": "Common",
+    "summary": "从3张随机技能牌中选择1张加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "技能药水"
+  },
+  "POTION.SNECKO_OIL": {
+    "description": "抽7张牌。在本回合随机化你手牌中所有牌的耗能。",
+    "id": "POTION.SNECKO_OIL",
+    "rarity": "Rare",
+    "summary": "抽7张牌。在本回合随机化你手牌中所有牌的耗能。",
+    "title": "异蛇之油"
+  },
+  "POTION.SOLDIERS_STEW": {
+    "description": "在本场战斗中，所有名字中有“打击”的牌获得重放：1。",
+    "id": "POTION.SOLDIERS_STEW",
+    "rarity": "Rare",
+    "summary": "在本场战斗中，所有名字中有“打击”的牌获得重放：1。",
+    "title": "士兵炖汤"
+  },
+  "POTION.SPEED_POTION": {
+    "description": "获得5点敏捷。在你的这个回合结束时，失去5点敏捷。",
+    "id": "POTION.SPEED_POTION",
+    "rarity": "Common",
+    "summary": "获得5点敏捷。在你的这个回合结束时，失去5点敏捷。",
+    "title": "速度药水"
+  },
+  "POTION.STABLE_SERUM": {
+    "description": "保留你的手牌2回合。",
+    "id": "POTION.STABLE_SERUM",
+    "rarity": "Uncommon",
+    "summary": "保留你的手牌2回合。",
+    "title": "稳定血清"
+  },
+  "POTION.STAR_POTION": {
+    "description": "获得星辉。",
+    "id": "POTION.STAR_POTION",
+    "rarity": "Common",
+    "summary": "获得星辉。",
+    "title": "星星药水"
+  },
+  "POTION.STRENGTH_POTION": {
+    "description": "获得2点力量。",
+    "id": "POTION.STRENGTH_POTION",
+    "rarity": "Common",
+    "summary": "获得2点力量。",
+    "title": "力量药水"
+  },
+  "POTION.SWIFT_POTION": {
+    "description": "抽3张牌。",
+    "id": "POTION.SWIFT_POTION",
+    "rarity": "Common",
+    "summary": "抽3张牌。",
+    "title": "迅捷药水"
+  },
+  "POTION.TOUCH_OF_INSANITY": {
+    "description": "选择你手牌中的一张牌，使其在本场战斗可以免费打出。",
+    "id": "POTION.TOUCH_OF_INSANITY",
+    "rarity": "Uncommon",
+    "summary": "选择你手牌中的一张牌，使其在本场战斗可以免费打出。",
+    "title": "癫狂之触"
+  },
+  "POTION.VULNERABLE_POTION": {
+    "description": "给予3层易伤。",
+    "id": "POTION.VULNERABLE_POTION",
+    "rarity": "Common",
+    "summary": "给予3层易伤。",
+    "title": "易伤药水"
+  },
+  "POTION.WEAK_POTION": {
+    "description": "给予3层虚弱。",
+    "id": "POTION.WEAK_POTION",
+    "rarity": "Common",
+    "summary": "给予3层虚弱。",
+    "title": "虚弱药水"
+  },
+  "__meta__": {
+    "entity_count": 64,
+    "generated_at_utc": "2026-04-05T05:15:38+00:00",
+    "generator": "import_sts2_exporter_items.py",
+    "mod": {
+      "game_assembly_version": "0.1.0.0",
+      "id": "sts2-bridge",
+      "name": "STS2 MCP Bridge",
+      "version": "0.7.12"
+    },
+    "source": "sts2-exporter",
+    "source_items_json": "sts2-export/items.json"
+  }
+}

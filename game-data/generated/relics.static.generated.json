@@ -1,0 +1,5702 @@
+{
+  "RELIC.AKABEKO": {
+    "canonical_text": "遗物｜赤牛｜稀有度Uncommon｜效果：在每场战斗开始时，获得8点活力。",
+    "description": "在每场战斗开始时，获得8点活力。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.AKABEKO",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，获得8点活力。",
+    "title": "赤牛"
+  },
+  "RELIC.ALCHEMICAL_COFFER": {
+    "canonical_text": "遗物｜炼金箱｜稀有度Ancient｜效果：拾起时，获得4个放有随机药水的药水栏位。",
+    "description": "拾起时，获得4个放有随机药水的药水栏位。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.ALCHEMICAL_COFFER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得4个放有随机药水的药水栏位。",
+    "title": "炼金箱"
+  },
+  "RELIC.AMETHYST_AUBERGINE": {
+    "canonical_text": "遗物｜紫水晶茄子｜稀有度Common｜效果：敌人额外掉落15金币。",
+    "description": "敌人额外掉落15金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.AMETHYST_AUBERGINE",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "敌人额外掉落15金币。",
+    "title": "紫水晶茄子"
+  },
+  "RELIC.ANCHOR": {
+    "canonical_text": "遗物｜锚｜稀有度Common｜效果：每场战斗开始时获得10点格挡。",
+    "description": "每场战斗开始时获得10点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ANCHOR",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每场战斗开始时获得10点格挡。",
+    "title": "锚"
+  },
+  "RELIC.ARCANE_SCROLL": {
+    "canonical_text": "遗物｜奥术卷轴｜稀有度Ancient｜效果：拾起时，将一张随机稀有牌加入你的牌组。",
+    "description": "拾起时，将一张随机稀有牌加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ARCANE_SCROLL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将一张随机稀有牌加入你的牌组。",
+    "title": "奥术卷轴"
+  },
+  "RELIC.ARCHAIC_TOOTH": {
+    "canonical_text": "遗物｜古老牙齿｜稀有度Ancient｜效果：拾起时，将{StarterCard.StringValue:cond:{StarterCard}变化为{AncientCard}|一张初始卡牌变化为先古版本}。",
+    "description": "拾起时，将{StarterCard.StringValue:cond:{StarterCard}变化为{AncientCard}|一张初始卡牌变化为先古版本}。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ARCHAIC_TOOTH",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将{StarterCard.StringValue:cond:{StarterCard}变化为{AncientCard}|一张初始卡牌变化为先古版本}。",
+    "title": "古老牙齿"
+  },
+  "RELIC.ART_OF_WAR": {
+    "canonical_text": "遗物｜孙子兵法｜稀有度Rare｜效果：如果你在本回合中没有打出过攻击牌，则在下一回合额外获得1点能量。",
+    "description": "如果你在本回合中没有打出过攻击牌，则在下一回合额外获得1点能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ART_OF_WAR",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "如果你在本回合中没有打出过攻击牌，则在下一回合额外获得1点能量。",
+    "title": "孙子兵法"
+  },
+  "RELIC.ASTROLABE": {
+    "canonical_text": "遗物｜星盘｜稀有度Ancient｜效果：拾起时，选择3张牌进行变化，然后将这些牌升级。",
+    "description": "拾起时，选择3张牌进行变化，然后将这些牌升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.ASTROLABE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，选择3张牌进行变化，然后将这些牌升级。",
+    "title": "星盘"
+  },
+  "RELIC.BAG_OF_MARBLES": {
+    "canonical_text": "遗物｜弹珠袋｜稀有度Common｜效果：在每场战斗开始时，给予所有敌人1层易伤。",
+    "description": "在每场战斗开始时，给予所有敌人1层易伤。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BAG_OF_MARBLES",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，给予所有敌人1层易伤。",
+    "title": "弹珠袋"
+  },
+  "RELIC.BAG_OF_PREPARATION": {
+    "canonical_text": "遗物｜准备背包｜稀有度Common｜效果：在每场战斗开始时，额外抽2张牌。",
+    "description": "在每场战斗开始时，额外抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BAG_OF_PREPARATION",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，额外抽2张牌。",
+    "title": "准备背包"
+  },
+  "RELIC.BEATING_REMNANT": {
+    "canonical_text": "遗物｜律动残余｜稀有度Rare｜效果：你在一回合内失去的生命值不会超过20点。",
+    "description": "你在一回合内失去的生命值不会超过20点。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BEATING_REMNANT",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你在一回合内失去的生命值不会超过20点。",
+    "title": "律动残余"
+  },
+  "RELIC.BEAUTIFUL_BRACELET": {
+    "canonical_text": "遗物｜华美手镯｜稀有度Ancient｜效果：拾起时，从你的牌组中选择3张牌，附魔：迅捷3。",
+    "description": "拾起时，从你的牌组中选择3张牌，附魔：迅捷3。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BEAUTIFUL_BRACELET",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中选择3张牌，附魔：迅捷3。",
+    "title": "华美手镯"
+  },
+  "RELIC.BELLOWS": {
+    "canonical_text": "遗物｜风箱｜稀有度Rare｜效果：你在每场战斗开始时的手牌，将被升级。",
+    "description": "你在每场战斗开始时的手牌，将被升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BELLOWS",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你在每场战斗开始时的手牌，将被升级。",
+    "title": "风箱"
+  },
+  "RELIC.BELT_BUCKLE": {
+    "canonical_text": "遗物｜腰带扣｜稀有度Shop｜效果：当你没有药水时，你额外拥有2点敏捷。",
+    "description": "当你没有药水时，你额外拥有2点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BELT_BUCKLE",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "当你没有药水时，你额外拥有2点敏捷。",
+    "title": "腰带扣"
+  },
+  "RELIC.BIG_HAT": {
+    "canonical_text": "遗物｜大帽子｜稀有度Rare｜效果：在每场战斗开始时，将2张随机虚无牌加入你的手牌。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "在每场战斗开始时，将2张随机虚无牌加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BIG_HAT",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每场战斗开始时，将2张随机虚无牌加入你的手牌。",
+    "title": "大帽子"
+  },
+  "RELIC.BIG_MUSHROOM": {
+    "canonical_text": "遗物｜大蘑菇｜稀有度Event｜效果：拾起时，将你的最大生命值提升20。在每场战斗开始时，少抽2张牌。",
+    "description": "拾起时，将你的最大生命值提升20。在每场战斗开始时，少抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.BIG_MUSHROOM",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "拾起时，将你的最大生命值提升20。在每场战斗开始时，少抽2张牌。",
+    "title": "大蘑菇"
+  },
+  "RELIC.BIIIG_HUG": {
+    "canonical_text": "遗物｜大～抱抱｜稀有度Ancient｜效果：拾起时，从你的牌组中移除4张牌。每当你的抽牌堆打乱洗牌时，将一张煤灰加入你的抽牌堆。",
+    "description": "拾起时，从你的牌组中移除4张牌。每当你的抽牌堆打乱洗牌时，将一张煤灰加入你的抽牌堆。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BIIIG_HUG",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中移除4张牌。每当你的抽牌堆打乱洗牌时，将一张煤灰加入你的抽牌堆。",
+    "title": "大～抱抱"
+  },
+  "RELIC.BING_BONG": {
+    "canonical_text": "遗物｜宾邦｜稀有度Event｜效果：每当你往牌组中增添卡牌时，都将额外添加一张相同的牌。",
+    "description": "每当你往牌组中增添卡牌时，都将额外添加一张相同的牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BING_BONG",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你往牌组中增添卡牌时，都将额外添加一张相同的牌。",
+    "title": "宾邦"
+  },
+  "RELIC.BLACK_BLOOD": {
+    "canonical_text": "遗物｜黑暗之血｜稀有度Starter｜效果：在战斗结束时，回复12点生命。",
+    "description": "在战斗结束时，回复12点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BLACK_BLOOD",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在战斗结束时，回复12点生命。",
+    "title": "黑暗之血"
+  },
+  "RELIC.BLACK_STAR": {
+    "canonical_text": "遗物｜黑星｜稀有度Ancient｜效果：精英敌人在被打败时多掉落一件遗物。",
+    "description": "精英敌人在被打败时多掉落一件遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BLACK_STAR",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "精英敌人在被打败时多掉落一件遗物。",
+    "title": "黑星"
+  },
+  "RELIC.BLESSED_ANTLER": {
+    "canonical_text": "遗物｜赐福鹿角｜稀有度Ancient｜效果：在每回合开始时获得能量。在战斗开始时，将3张晕眩放入你的抽牌堆。",
+    "description": "在每回合开始时获得能量。在战斗开始时，将3张晕眩放入你的抽牌堆。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BLESSED_ANTLER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每回合开始时获得能量。在战斗开始时，将3张晕眩放入你的抽牌堆。",
+    "title": "赐福鹿角"
+  },
+  "RELIC.BLOOD_SOAKED_ROSE": {
+    "canonical_text": "遗物｜血染玫瑰｜稀有度Ancient｜效果：拾起时，将1张执迷加入你的牌组。在回合开始时获得能量。",
+    "description": "拾起时，将1张执迷加入你的牌组。在回合开始时获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.BLOOD_SOAKED_ROSE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将1张执迷加入你的牌组。在回合开始时获得能量。",
+    "title": "血染玫瑰"
+  },
+  "RELIC.BLOOD_VIAL": {
+    "canonical_text": "遗物｜小血瓶｜稀有度Common｜效果：在每场战斗开始时，回复2点生命。",
+    "description": "在每场战斗开始时，回复2点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BLOOD_VIAL",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，回复2点生命。",
+    "title": "小血瓶"
+  },
+  "RELIC.BONE_FLUTE": {
+    "canonical_text": "遗物｜骨笛｜稀有度Common｜效果：每当奥斯提攻击时，获得2点格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "每当奥斯提攻击时，获得2点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BONE_FLUTE",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每当奥斯提攻击时，获得2点格挡。",
+    "title": "骨笛"
+  },
+  "RELIC.BONE_TEA": {
+    "canonical_text": "遗物｜骨茶｜稀有度Event｜效果：在你接下来的1场战斗开始时，升级你的初始手牌。",
+    "description": "在你接下来的1场战斗开始时，升级你的初始手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BONE_TEA",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在你接下来的1场战斗开始时，升级你的初始手牌。",
+    "title": "骨茶"
+  },
+  "RELIC.BOOKMARK": {
+    "canonical_text": "遗物｜书签｜稀有度Rare｜效果：每回合结束时，随机一张被保留的牌在被打出前的耗能减少1。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "每回合结束时，随机一张被保留的牌在被打出前的耗能减少1。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOOKMARK",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每回合结束时，随机一张被保留的牌在被打出前的耗能减少1。",
+    "title": "书签"
+  },
+  "RELIC.BOOK_OF_FIVE_RINGS": {
+    "canonical_text": "遗物｜五轮书｜稀有度Common｜效果：你每将5张牌加入你的牌组时，回复20点生命。",
+    "description": "你每将5张牌加入你的牌组时，回复20点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOOK_OF_FIVE_RINGS",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "你每将5张牌加入你的牌组时，回复20点生命。",
+    "title": "五轮书"
+  },
+  "RELIC.BOOK_REPAIR_KNIFE": {
+    "canonical_text": "遗物｜修书小刀｜稀有度Uncommon｜效果：每当有一名不是“爪牙”的敌人死于灾厄时，回复3点生命。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "每当有一名不是“爪牙”的敌人死于灾厄时，回复3点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOOK_REPAIR_KNIFE",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当有一名不是“爪牙”的敌人死于灾厄时，回复3点生命。",
+    "title": "修书小刀"
+  },
+  "RELIC.BOOMING_CONCH": {
+    "canonical_text": "遗物｜轰鸣海螺｜稀有度Ancient｜效果：在精英战的战斗开始时，额外抽2张牌。",
+    "description": "在精英战的战斗开始时，额外抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOOMING_CONCH",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在精英战的战斗开始时，额外抽2张牌。",
+    "title": "轰鸣海螺"
+  },
+  "RELIC.BOUND_PHYLACTERY": {
+    "canonical_text": "遗物｜缚魂命匣｜稀有度Starter｜效果：在你的回合开始时，召唤1",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "在你的回合开始时，召唤1",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOUND_PHYLACTERY",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "spawns_pets": true,
+    "summary": "在你的回合开始时，召唤1",
+    "title": "缚魂命匣"
+  },
+  "RELIC.BOWLER_HAT": {
+    "canonical_text": "遗物｜圆顶礼帽｜稀有度Uncommon｜效果：额外获得1.25%的金币。",
+    "description": "额外获得1.25%的金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BOWLER_HAT",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "额外获得1.25%的金币。",
+    "title": "圆顶礼帽"
+  },
+  "RELIC.BREAD": {
+    "canonical_text": "遗物｜面包｜稀有度Shop｜效果：在你的第一个回合开始时，失去能量。在其余的回合开始时，获得能量。",
+    "description": "在你的第一个回合开始时，失去能量。在其余的回合开始时，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BREAD",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在你的第一个回合开始时，失去能量。在其余的回合开始时，获得能量。",
+    "title": "面包"
+  },
+  "RELIC.BRILLIANT_SCARF": {
+    "canonical_text": "遗物｜艳丽围巾｜稀有度Ancient｜效果：你每回合打出的第5张牌可以被免费打出。",
+    "description": "你每回合打出的第5张牌可以被免费打出。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BRILLIANT_SCARF",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你每回合打出的第5张牌可以被免费打出。",
+    "title": "艳丽围巾"
+  },
+  "RELIC.BRIMSTONE": {
+    "canonical_text": "遗物｜硫磺｜稀有度Shop｜效果：在你的每个回合开始时，你获得2点力量，所有敌人获得1点力量。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "在你的每个回合开始时，你获得2点力量，所有敌人获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BRIMSTONE",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在你的每个回合开始时，你获得2点力量，所有敌人获得1点力量。",
+    "title": "硫磺"
+  },
+  "RELIC.BRONZE_SCALES": {
+    "canonical_text": "遗物｜铜质鳞片｜稀有度Common｜效果：在每场战斗开始时，获得3点荆棘。",
+    "description": "在每场战斗开始时，获得3点荆棘。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BRONZE_SCALES",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，获得3点荆棘。",
+    "title": "铜质鳞片"
+  },
+  "RELIC.BURNING_BLOOD": {
+    "canonical_text": "遗物｜燃烧之血｜稀有度Starter｜效果：在战斗结束时，回复6点生命。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "在战斗结束时，回复6点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BURNING_BLOOD",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在战斗结束时，回复6点生命。",
+    "title": "燃烧之血"
+  },
+  "RELIC.BURNING_STICKS": {
+    "canonical_text": "遗物｜燃烧木棍｜稀有度Shop｜效果：每场战斗中你第一次消耗技能牌时，将那张牌的复制品加入你的手牌",
+    "description": "每场战斗中你第一次消耗技能牌时，将那张牌的复制品加入你的手牌",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.BURNING_STICKS",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "每场战斗中你第一次消耗技能牌时，将那张牌的复制品加入你的手牌",
+    "title": "燃烧木棍"
+  },
+  "RELIC.BYRDPIP": {
+    "adds_pet": true,
+    "canonical_text": "遗物｜异鸟宝宝｜稀有度Event｜效果：拾起时，获得一张异鸟扑击。一只幼年异鸟会在战斗中陪伴你。",
+    "description": "拾起时，获得一张异鸟扑击。一只幼年异鸟会在战斗中陪伴你。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.BYRDPIP",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "spawns_pets": true,
+    "summary": "拾起时，获得一张异鸟扑击。一只幼年异鸟会在战斗中陪伴你。",
+    "title": "异鸟宝宝"
+  },
+  "RELIC.CALLING_BELL": {
+    "canonical_text": "遗物｜召唤铃铛｜稀有度Ancient｜效果：拾起时，获得一个独特的诅咒和3件遗物。",
+    "description": "拾起时，获得一个独特的诅咒和3件遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.CALLING_BELL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得一个独特的诅咒和3件遗物。",
+    "title": "召唤铃铛"
+  },
+  "RELIC.CANDELABRA": {
+    "canonical_text": "遗物｜烛台｜稀有度Uncommon｜效果：在你的第2回合开始时，获得能量。",
+    "description": "在你的第2回合开始时，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CANDELABRA",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在你的第2回合开始时，获得能量。",
+    "title": "烛台"
+  },
+  "RELIC.CAPTAINS_WHEEL": {
+    "canonical_text": "遗物｜舵盘｜稀有度Rare｜效果：在你的第三回合开始时，获得18点格挡。",
+    "description": "在你的第三回合开始时，获得18点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CAPTAINS_WHEEL",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在你的第三回合开始时，获得18点格挡。",
+    "title": "舵盘"
+  },
+  "RELIC.CAULDRON": {
+    "canonical_text": "遗物｜大锅｜稀有度Shop｜效果：拾起时，制作5瓶随机药水。",
+    "description": "拾起时，制作5瓶随机药水。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.CAULDRON",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，制作5瓶随机药水。",
+    "title": "大锅"
+  },
+  "RELIC.CENTENNIAL_PUZZLE": {
+    "canonical_text": "遗物｜百年积木｜稀有度Common｜效果：你在每场战斗中第一次损失生命值时，抽3张牌。",
+    "description": "你在每场战斗中第一次损失生命值时，抽3张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CENTENNIAL_PUZZLE",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "你在每场战斗中第一次损失生命值时，抽3张牌。",
+    "title": "百年积木"
+  },
+  "RELIC.CHANDELIER": {
+    "canonical_text": "遗物｜吊灯｜稀有度Rare｜效果：在你的第三回合开始时，获得能量。",
+    "description": "在你的第三回合开始时，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CHANDELIER",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在你的第三回合开始时，获得能量。",
+    "title": "吊灯"
+  },
+  "RELIC.CHARONS_ASHES": {
+    "canonical_text": "遗物｜卡戎之灰｜稀有度Rare｜效果：每当你消耗一张牌，对所有敌人造成3点伤害。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "每当你消耗一张牌，对所有敌人造成3点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CHARONS_ASHES",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你消耗一张牌，对所有敌人造成3点伤害。",
+    "title": "卡戎之灰"
+  },
+  "RELIC.CHEMICAL_X": {
+    "canonical_text": "遗物｜化学物X｜稀有度Shop｜效果：耗能为X的牌的效果数值增加2点。",
+    "description": "耗能为X的牌的效果数值增加2点。",
+    "flavor": "警告：严禁与糖、香料还有一切美好的味道混合在一起。",
+    "id": "RELIC.CHEMICAL_X",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "耗能为X的牌的效果数值增加2点。",
+    "title": "化学物X"
+  },
+  "RELIC.CHOICES_PARADOX": {
+    "canonical_text": "遗物｜选择悖论｜稀有度Ancient｜效果：在每场战斗开始时，从5张随机牌中选择1张放入你的手牌。被选中的牌获得保留。",
+    "description": "在每场战斗开始时，从5张随机牌中选择1张放入你的手牌。被选中的牌获得保留。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CHOICES_PARADOX",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每场战斗开始时，从5张随机牌中选择1张放入你的手牌。被选中的牌获得保留。",
+    "title": "选择悖论"
+  },
+  "RELIC.CHOSEN_CHEESE": {
+    "canonical_text": "遗物｜天选芝士｜稀有度Event｜效果：在战斗结束时，获得1点最大生命值。",
+    "description": "在战斗结束时，获得1点最大生命值。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CHOSEN_CHEESE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在战斗结束时，获得1点最大生命值。",
+    "title": "天选芝士"
+  },
+  "RELIC.CIRCLET": {
+    "canonical_text": "遗物｜头环｜稀有度None｜效果：这是一个头环。",
+    "description": "这是一个头环。",
+    "flavor": "一件有趣的遗物，只有当高塔中出现问题，或没有更多遗物可被发现时才会出现。",
+    "id": "RELIC.CIRCLET",
+    "is_stackable": true,
+    "is_tradable": true,
+    "merchant_cost": 1,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.FALLBACK_RELIC_POOL",
+        "name": "FallbackRelicPool",
+        "type": "FallbackRelicPool"
+      }
+    ],
+    "rarity": "None",
+    "summary": "这是一个头环。",
+    "title": "头环"
+  },
+  "RELIC.CLAWS": {
+    "canonical_text": "遗物｜利爪｜稀有度Ancient｜效果：拾起时，将至多6张牌变化为撕咬。",
+    "description": "拾起时，将至多6张牌变化为撕咬。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CLAWS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将至多6张牌变化为撕咬。",
+    "title": "利爪"
+  },
+  "RELIC.CLOAK_CLASP": {
+    "canonical_text": "遗物｜斗篷扣｜稀有度Rare｜效果：在你的回合结束时，每有一张手牌，就获得1点格挡",
+    "description": "在你的回合结束时，每有一张手牌，就获得1点格挡",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CLOAK_CLASP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在你的回合结束时，每有一张手牌，就获得1点格挡",
+    "title": "斗篷扣"
+  },
+  "RELIC.CRACKED_CORE": {
+    "canonical_text": "遗物｜破损核心｜稀有度Starter｜效果：在每场战斗开始时，生成1个闪电充能球。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "在每场战斗开始时，生成1个闪电充能球。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CRACKED_CORE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在每场战斗开始时，生成1个闪电充能球。",
+    "title": "破损核心"
+  },
+  "RELIC.CROSSBOW": {
+    "canonical_text": "遗物｜十字弓｜稀有度Ancient｜效果：在你的回合开始时，将一张随机攻击牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "description": "在你的回合开始时，将一张随机攻击牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CROSSBOW",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在你的回合开始时，将一张随机攻击牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "十字弓"
+  },
+  "RELIC.CURSED_PEARL": {
+    "canonical_text": "遗物｜诅咒珍珠｜稀有度Ancient｜效果：拾起时，获得一张贪婪，获得333金币。",
+    "description": "拾起时，获得一张贪婪，获得333金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.CURSED_PEARL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得一张贪婪，获得333金币。",
+    "title": "诅咒珍珠"
+  },
+  "RELIC.DARKSTONE_PERIAPT": {
+    "canonical_text": "遗物｜黑石护符｜稀有度Event｜效果：每当你获得一张诅咒，就将你的最大生命值提升6。",
+    "description": "每当你获得一张诅咒，就将你的最大生命值提升6。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DARKSTONE_PERIAPT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你获得一张诅咒，就将你的最大生命值提升6。",
+    "title": "黑石护符"
+  },
+  "RELIC.DATA_DISK": {
+    "canonical_text": "遗物｜数据磁盘｜稀有度Common｜效果：在每场战斗开始时，获得1点集中。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "在每场战斗开始时，获得1点集中。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DATA_DISK",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，获得1点集中。",
+    "title": "数据磁盘"
+  },
+  "RELIC.DAUGHTER_OF_THE_WIND": {
+    "canonical_text": "遗物｜风的女儿｜稀有度Event｜效果：每当你打出一张攻击牌时，获得1点格挡。",
+    "description": "每当你打出一张攻击牌时，获得1点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DAUGHTER_OF_THE_WIND",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你打出一张攻击牌时，获得1点格挡。",
+    "title": "风的女儿"
+  },
+  "RELIC.DELICATE_FROND": {
+    "canonical_text": "遗物｜娇嫩蕨草｜稀有度Ancient｜效果：在每场战斗开始时，用随机药水将你的空药水栏位填满。",
+    "description": "在每场战斗开始时，用随机药水将你的空药水栏位填满。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DELICATE_FROND",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每场战斗开始时，用随机药水将你的空药水栏位填满。",
+    "title": "娇嫩蕨草"
+  },
+  "RELIC.DEMON_TONGUE": {
+    "canonical_text": "遗物｜恶魔之舌｜稀有度Rare｜效果：当你第一次在自身回合内失去生命值时，回复等量的生命值。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "当你第一次在自身回合内失去生命值时，回复等量的生命值。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DEMON_TONGUE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "当你第一次在自身回合内失去生命值时，回复等量的生命值。",
+    "title": "恶魔之舌"
+  },
+  "RELIC.DEPRECATED_RELIC": {
+    "canonical_text": "遗物｜弃用遗物｜稀有度None｜效果：这件遗物已经从游戏中被移除。它在这里仅做纪念意义。",
+    "description": "这件遗物已经从游戏中被移除。它在这里仅做纪念意义。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DEPRECATED_RELIC",
+    "is_stackable": true,
+    "is_tradable": true,
+    "merchant_cost": 1,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.DEPRECATED_RELIC_POOL",
+        "name": "DeprecatedRelicPool",
+        "type": "DeprecatedRelicPool"
+      }
+    ],
+    "rarity": "None",
+    "summary": "这件遗物已经从游戏中被移除。它在这里仅做纪念意义。",
+    "title": "弃用遗物"
+  },
+  "RELIC.DIAMOND_DIADEM": {
+    "canonical_text": "遗物｜钻石头冠｜稀有度Ancient｜效果：如果你在本回合打出的牌少于等于2张，则受到敌人的伤害减半。",
+    "description": "如果你在本回合打出的牌少于等于2张，则受到敌人的伤害减半。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DIAMOND_DIADEM",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "如果你在本回合打出的牌少于等于2张，则受到敌人的伤害减半。",
+    "title": "钻石头冠"
+  },
+  "RELIC.DINGY_RUG": {
+    "canonical_text": "遗物｜肮脏地毯｜稀有度Shop｜效果：卡牌奖励现在会包括无色牌。",
+    "description": "卡牌奖励现在会包括无色牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DINGY_RUG",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "卡牌奖励现在会包括无色牌。",
+    "title": "肮脏地毯"
+  },
+  "RELIC.DISTINGUISHED_CAPE": {
+    "canonical_text": "遗物｜卓越斗篷｜稀有度Ancient｜效果：拾起时，失去9点最大生命值。将3张灵体加入你的牌组。",
+    "description": "拾起时，失去9点最大生命值。将3张灵体加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.DISTINGUISHED_CAPE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，失去9点最大生命值。将3张灵体加入你的牌组。",
+    "title": "卓越斗篷"
+  },
+  "RELIC.DIVINE_DESTINY": {
+    "canonical_text": "遗物｜天命所归｜稀有度Starter｜效果：在每场战斗开始时，获得星辉。",
+    "description": "在每场战斗开始时，获得星辉。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DIVINE_DESTINY",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在每场战斗开始时，获得星辉。",
+    "title": "天命所归"
+  },
+  "RELIC.DIVINE_RIGHT": {
+    "canonical_text": "遗物｜天赋君权｜稀有度Starter｜效果：在每场战斗开始时，获得星辉。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "在每场战斗开始时，获得星辉。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DIVINE_RIGHT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在每场战斗开始时，获得星辉。",
+    "title": "天赋君权"
+  },
+  "RELIC.DOLLYS_MIRROR": {
+    "canonical_text": "遗物｜多利之镜｜稀有度Shop｜效果：拾起时，从你的牌组中选择一张牌进行复制。",
+    "description": "拾起时，从你的牌组中选择一张牌进行复制。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.DOLLYS_MIRROR",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，从你的牌组中选择一张牌进行复制。",
+    "title": "多利之镜"
+  },
+  "RELIC.DRAGON_FRUIT": {
+    "canonical_text": "遗物｜火龙果｜稀有度Shop｜效果：每当你获得金币时，提升1点你的最大生命值。",
+    "description": "每当你获得金币时，提升1点你的最大生命值。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DRAGON_FRUIT",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "每当你获得金币时，提升1点你的最大生命值。",
+    "title": "火龙果"
+  },
+  "RELIC.DREAM_CATCHER": {
+    "canonical_text": "遗物｜捕梦网｜稀有度Event｜效果：每当你休息时，可以添加一张牌到你的牌组。",
+    "description": "每当你休息时，可以添加一张牌到你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DREAM_CATCHER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你休息时，可以添加一张牌到你的牌组。",
+    "title": "捕梦网"
+  },
+  "RELIC.DRIFTWOOD": {
+    "canonical_text": "遗物｜浮木｜稀有度Ancient｜效果：你可以在每一个卡牌奖励中重掷一次。",
+    "description": "你可以在每一个卡牌奖励中重掷一次。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DRIFTWOOD",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你可以在每一个卡牌奖励中重掷一次。",
+    "title": "浮木"
+  },
+  "RELIC.DUSTY_TOME": {
+    "canonical_text": "遗物｜尘封魔典｜稀有度Ancient｜效果：拾起时，获得一张{AncientCard.StringValue:cond:{}+|先古牌}。",
+    "description": "拾起时，获得一张{AncientCard.StringValue:cond:{}+|先古牌}。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.DUSTY_TOME",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得一张{AncientCard.StringValue:cond:{}+|先古牌}。",
+    "title": "尘封魔典"
+  },
+  "RELIC.ECTOPLASM": {
+    "canonical_text": "遗物｜灵体外质｜稀有度Ancient｜效果：你不能再获得任何金币。在回合开始时获得能量",
+    "description": "你不能再获得任何金币。在回合开始时获得能量",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ECTOPLASM",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你不能再获得任何金币。在回合开始时获得能量",
+    "title": "灵体外质"
+  },
+  "RELIC.ELECTRIC_SHRYMP": {
+    "canonical_text": "遗物｜放电异虾｜稀有度Ancient｜效果：拾起时，选择一张技能牌为它附魔：注能。",
+    "description": "拾起时，选择一张技能牌为它附魔：注能。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.ELECTRIC_SHRYMP",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，选择一张技能牌为它附魔：注能。",
+    "title": "放电异虾"
+  },
+  "RELIC.EMBER_TEA": {
+    "canonical_text": "遗物｜余烬茶｜稀有度Event｜效果：在接下来的5场战斗开始时，获得2点力量。",
+    "description": "在接下来的5场战斗开始时，获得2点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.EMBER_TEA",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在接下来的5场战斗开始时，获得2点力量。",
+    "title": "余烬茶"
+  },
+  "RELIC.EMOTION_CHIP": {
+    "canonical_text": "遗物｜情感芯片｜稀有度Rare｜效果：在每回合开始时，如果你在之前回合受到过伤害，则触发所有充能球的被动效果。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "在每回合开始时，如果你在之前回合受到过伤害，则触发所有充能球的被动效果。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.EMOTION_CHIP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每回合开始时，如果你在之前回合受到过伤害，则触发所有充能球的被动效果。",
+    "title": "情感芯片"
+  },
+  "RELIC.EMPTY_CAGE": {
+    "canonical_text": "遗物｜空鸟笼｜稀有度Ancient｜效果：拾起时，选择移除牌组中的2张牌。",
+    "description": "拾起时，选择移除牌组中的2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.EMPTY_CAGE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，选择移除牌组中的2张牌。",
+    "title": "空鸟笼"
+  },
+  "RELIC.ETERNAL_FEATHER": {
+    "canonical_text": "遗物｜永恒羽毛｜稀有度Uncommon｜效果：你的牌组中每有5张牌，当你进入休息处时就会回复3点生命。",
+    "description": "你的牌组中每有5张牌，当你进入休息处时就会回复3点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ETERNAL_FEATHER",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你的牌组中每有5张牌，当你进入休息处时就会回复3点生命。",
+    "title": "永恒羽毛"
+  },
+  "RELIC.FAKE_ANCHOR": {
+    "canonical_text": "遗物｜锚？？？｜稀有度Event｜效果：在每场战斗开始时，获得4点格挡。",
+    "description": "在每场战斗开始时，获得4点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_ANCHOR",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在每场战斗开始时，获得4点格挡。",
+    "title": "锚？？？"
+  },
+  "RELIC.FAKE_BLOOD_VIAL": {
+    "canonical_text": "遗物｜小血瓶？？？｜稀有度Event｜效果：在每场战斗开始时，回复1点生命。",
+    "description": "在每场战斗开始时，回复1点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_BLOOD_VIAL",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在每场战斗开始时，回复1点生命。",
+    "title": "小血瓶？？？"
+  },
+  "RELIC.FAKE_HAPPY_FLOWER": {
+    "canonical_text": "遗物｜开心小花？？？｜稀有度Event｜效果：每5个回合，获得能量。",
+    "description": "每5个回合，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_HAPPY_FLOWER",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每5个回合，获得能量。",
+    "title": "开心小花？？？"
+  },
+  "RELIC.FAKE_LEES_WAFFLE": {
+    "canonical_text": "遗物｜李家华夫饼？？？｜稀有度Event｜效果：拾起时，回复你10%的生命值。",
+    "description": "拾起时，回复你10%的生命值。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.FAKE_LEES_WAFFLE",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "拾起时，回复你10%的生命值。",
+    "title": "李家华夫饼？？？"
+  },
+  "RELIC.FAKE_MANGO": {
+    "canonical_text": "遗物｜芒果？？？｜稀有度Event｜效果：拾起时，将你的最大生命值提升3。",
+    "description": "拾起时，将你的最大生命值提升3。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.FAKE_MANGO",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "拾起时，将你的最大生命值提升3。",
+    "title": "芒果？？？"
+  },
+  "RELIC.FAKE_MERCHANTS_RUG": {
+    "canonical_text": "遗物｜商人的地毯？？？｜稀有度Event｜效果：低劣的仿制品。没有任何作用。",
+    "description": "低劣的仿制品。没有任何作用。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_MERCHANTS_RUG",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "低劣的仿制品。没有任何作用。",
+    "title": "商人的地毯？？？"
+  },
+  "RELIC.FAKE_ORICHALCUM": {
+    "canonical_text": "遗物｜奥利哈钢？？？｜稀有度Event｜效果：如果你在回合结束时没有任何格挡，获得3点格挡。",
+    "description": "如果你在回合结束时没有任何格挡，获得3点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_ORICHALCUM",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "如果你在回合结束时没有任何格挡，获得3点格挡。",
+    "title": "奥利哈钢？？？"
+  },
+  "RELIC.FAKE_SNECKO_EYE": {
+    "canonical_text": "遗物｜异蛇之眼？？？｜稀有度Event｜效果：每场战斗开始时获得混乱效果。",
+    "description": "每场战斗开始时获得混乱效果。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_SNECKO_EYE",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每场战斗开始时获得混乱效果。",
+    "title": "异蛇之眼？？？"
+  },
+  "RELIC.FAKE_STRIKE_DUMMY": {
+    "canonical_text": "遗物｜打击木偶？？？｜稀有度Event｜效果：名字中有“打击”的卡牌造成1点额外伤害。",
+    "description": "名字中有“打击”的卡牌造成1点额外伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_STRIKE_DUMMY",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "名字中有“打击”的卡牌造成1点额外伤害。",
+    "title": "打击木偶？？？"
+  },
+  "RELIC.FAKE_VENERABLE_TEA_SET": {
+    "canonical_text": "遗物｜古茶具套装？？？｜稀有度Event｜效果：到达休息处后的下一场战斗开始时额外获得能量。",
+    "description": "到达休息处后的下一场战斗开始时额外获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FAKE_VENERABLE_TEA_SET",
+    "merchant_cost": 50,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "到达休息处后的下一场战斗开始时额外获得能量。",
+    "title": "古茶具套装？？？"
+  },
+  "RELIC.FENCING_MANUAL": {
+    "canonical_text": "遗物｜击剑指南｜稀有度Common｜效果：在每场战斗开始时，铸造10。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "在每场战斗开始时，铸造10。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FENCING_MANUAL",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，铸造10。",
+    "title": "击剑指南"
+  },
+  "RELIC.FESTIVE_POPPER": {
+    "canonical_text": "遗物｜节日拉炮｜稀有度Common｜效果：在每场战斗开始时，对所有敌人造成9点伤害。",
+    "description": "在每场战斗开始时，对所有敌人造成9点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FESTIVE_POPPER",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，对所有敌人造成9点伤害。",
+    "title": "节日拉炮"
+  },
+  "RELIC.FIDDLE": {
+    "canonical_text": "遗物｜小提琴｜稀有度Ancient｜效果：在每个回合开始时，额外抽2张牌。你在回合进行中不再能抽任何牌。",
+    "description": "在每个回合开始时，额外抽2张牌。你在回合进行中不再能抽任何牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FIDDLE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每个回合开始时，额外抽2张牌。你在回合进行中不再能抽任何牌。",
+    "title": "小提琴"
+  },
+  "RELIC.FORGOTTEN_SOUL": {
+    "canonical_text": "遗物｜遗忘之魂｜稀有度Event｜效果：每当你消耗一张牌，随机对一名敌人造成1点伤害。",
+    "description": "每当你消耗一张牌，随机对一名敌人造成1点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FORGOTTEN_SOUL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你消耗一张牌，随机对一名敌人造成1点伤害。",
+    "title": "遗忘之魂"
+  },
+  "RELIC.FRAGRANT_MUSHROOM": {
+    "canonical_text": "遗物｜芳香蘑菇｜稀有度Event｜效果：拾起时，失去15点生命，然后随机升级2张牌。",
+    "description": "拾起时，失去15点生命，然后随机升级2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.FRAGRANT_MUSHROOM",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "拾起时，失去15点生命，然后随机升级2张牌。",
+    "title": "芳香蘑菇"
+  },
+  "RELIC.FRESNEL_LENS": {
+    "canonical_text": "遗物｜菲涅耳透镜｜稀有度Event｜效果：每当你将一张带有格挡的牌加入你的牌组时，为那张牌附魔：灵巧2",
+    "description": "每当你将一张带有格挡的牌加入你的牌组时，为那张牌附魔：灵巧2",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FRESNEL_LENS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你将一张带有格挡的牌加入你的牌组时，为那张牌附魔：灵巧2",
+    "title": "菲涅耳透镜"
+  },
+  "RELIC.FROZEN_EGG": {
+    "canonical_text": "遗物｜冻结之蛋｜稀有度Rare｜效果：每当你获得能力牌时，将其升级。",
+    "description": "每当你获得能力牌时，将其升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FROZEN_EGG",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你获得能力牌时，将其升级。",
+    "title": "冻结之蛋"
+  },
+  "RELIC.FUNERARY_MASK": {
+    "canonical_text": "遗物｜葬礼面具｜稀有度Uncommon｜效果：在每场战斗开始时，将3张灵魂加入你的抽牌堆。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "在每场战斗开始时，将3张灵魂加入你的抽牌堆。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FUNERARY_MASK",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，将3张灵魂加入你的抽牌堆。",
+    "title": "葬礼面具"
+  },
+  "RELIC.FUR_COAT": {
+    "canonical_text": "遗物｜皮草大衣｜稀有度Ancient｜效果：拾起时，随机标记7处战斗。这些战斗中的敌人将只有1点生命。",
+    "description": "拾起时，随机标记7处战斗。这些战斗中的敌人将只有1点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.FUR_COAT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，随机标记7处战斗。这些战斗中的敌人将只有1点生命。",
+    "title": "皮草大衣"
+  },
+  "RELIC.GALACTIC_DUST": {
+    "canonical_text": "遗物｜星系尘埃｜稀有度Uncommon｜效果：每消耗10点点星辉，就获得10格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "每消耗10点点星辉，就获得10格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GALACTIC_DUST",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每消耗10点点星辉，就获得10格挡。",
+    "title": "星系尘埃"
+  },
+  "RELIC.GAMBLING_CHIP": {
+    "canonical_text": "遗物｜赌博筹码｜稀有度Rare｜效果：在每场战斗开始时，丢弃任意张牌，然后抽相同数量张牌。",
+    "description": "在每场战斗开始时，丢弃任意张牌，然后抽相同数量张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GAMBLING_CHIP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每场战斗开始时，丢弃任意张牌，然后抽相同数量张牌。",
+    "title": "赌博筹码"
+  },
+  "RELIC.GAME_PIECE": {
+    "canonical_text": "遗物｜棋子｜稀有度Rare｜效果：每当你打出能力牌时，抽1张牌。",
+    "description": "每当你打出能力牌时，抽1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GAME_PIECE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你打出能力牌时，抽1张牌。",
+    "title": "棋子"
+  },
+  "RELIC.GHOST_SEED": {
+    "canonical_text": "遗物｜幽灵种子｜稀有度Shop｜效果：打击和防御获得虚无。",
+    "description": "打击和防御获得虚无。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GHOST_SEED",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "打击和防御获得虚无。",
+    "title": "幽灵种子"
+  },
+  "RELIC.GIRYA": {
+    "canonical_text": "遗物｜壶铃｜稀有度Rare｜效果：你现在能在休息处获得力量。（最多3次）",
+    "description": "你现在能在休息处获得力量。（最多3次）",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GIRYA",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你现在能在休息处获得力量。（最多3次）",
+    "title": "壶铃"
+  },
+  "RELIC.GLASS_EYE": {
+    "canonical_text": "遗物｜玻璃眼珠｜稀有度Ancient｜效果：拾起时，获得2组普通、2组罕见、和1组稀有卡牌奖励。",
+    "description": "拾起时，获得2组普通、2组罕见、和1组稀有卡牌奖励。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GLASS_EYE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得2组普通、2组罕见、和1组稀有卡牌奖励。",
+    "title": "玻璃眼珠"
+  },
+  "RELIC.GLITTER": {
+    "canonical_text": "遗物｜亮片｜稀有度Ancient｜效果：为之后的所有卡牌奖励附魔：华彩。",
+    "description": "为之后的所有卡牌奖励附魔：华彩。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GLITTER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "为之后的所有卡牌奖励附魔：华彩。",
+    "title": "亮片"
+  },
+  "RELIC.GNARLED_HAMMER": {
+    "canonical_text": "遗物｜扭曲锤子｜稀有度Shop｜效果：拾起时，从你的牌组中选择至多3张攻击牌，附魔：锋利3。",
+    "description": "拾起时，从你的牌组中选择至多3张攻击牌，附魔：锋利3。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GNARLED_HAMMER",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，从你的牌组中选择至多3张攻击牌，附魔：锋利3。",
+    "title": "扭曲锤子"
+  },
+  "RELIC.GOLDEN_COMPASS": {
+    "canonical_text": "遗物｜黄金罗盘｜稀有度Ancient｜效果：拾起时，将第2阶段的地图替换为一条特殊的直道。",
+    "description": "拾起时，将第2阶段的地图替换为一条特殊的直道。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.GOLDEN_COMPASS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将第2阶段的地图替换为一条特殊的直道。",
+    "title": "黄金罗盘"
+  },
+  "RELIC.GOLDEN_PEARL": {
+    "canonical_text": "遗物｜金色珍珠｜稀有度Ancient｜效果：拾起时，获得150金币。",
+    "description": "拾起时，获得150金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.GOLDEN_PEARL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得150金币。",
+    "title": "金色珍珠"
+  },
+  "RELIC.GOLD_PLATED_CABLES": {
+    "canonical_text": "遗物｜镀金缆线｜稀有度Uncommon｜效果：你最右侧的充能球会额外触发一次被动效果。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "你最右侧的充能球会额外触发一次被动效果。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GOLD_PLATED_CABLES",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你最右侧的充能球会额外触发一次被动效果。",
+    "title": "镀金缆线"
+  },
+  "RELIC.GORGET": {
+    "canonical_text": "遗物｜护喉甲｜稀有度Common｜效果：在每场战斗开始时，获得4层覆甲。",
+    "description": "在每场战斗开始时，获得4层覆甲。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GORGET",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，获得4层覆甲。",
+    "title": "护喉甲"
+  },
+  "RELIC.GREMLIN_HORN": {
+    "canonical_text": "遗物｜地精之角｜稀有度Uncommon｜效果：每当有一名敌人死亡时，获得能量并抽1张牌。",
+    "description": "每当有一名敌人死亡时，获得能量并抽1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.GREMLIN_HORN",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当有一名敌人死亡时，获得能量并抽1张牌。",
+    "title": "地精之角"
+  },
+  "RELIC.HAND_DRILL": {
+    "canonical_text": "遗物｜手钻｜稀有度Event｜效果：每当你突破敌人的格挡时，给予其2层易伤。",
+    "description": "每当你突破敌人的格挡时，给予其2层易伤。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.HAND_DRILL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你突破敌人的格挡时，给予其2层易伤。",
+    "title": "手钻"
+  },
+  "RELIC.HAPPY_FLOWER": {
+    "canonical_text": "遗物｜开心小花｜稀有度Common｜效果：每3个回合，获得能量。",
+    "description": "每3个回合，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.HAPPY_FLOWER",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每3个回合，获得能量。",
+    "title": "开心小花"
+  },
+  "RELIC.HEFTY_TABLET": {
+    "canonical_text": "遗物｜沉重石板｜稀有度Ancient｜效果：拾起时，从3张稀有牌中选择1张加入你的牌组，同时将1张受伤加入你的牌组。",
+    "description": "拾起时，从3张稀有牌中选择1张加入你的牌组，同时将1张受伤加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.HEFTY_TABLET",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从3张稀有牌中选择1张加入你的牌组，同时将1张受伤加入你的牌组。",
+    "title": "沉重石板"
+  },
+  "RELIC.HELICAL_DART": {
+    "canonical_text": "遗物｜螺线飞镖｜稀有度Rare｜效果：你每打出一张小刀，就在本回合获得1点敏捷。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "你每打出一张小刀，就在本回合获得1点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.HELICAL_DART",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每打出一张小刀，就在本回合获得1点敏捷。",
+    "title": "螺线飞镖"
+  },
+  "RELIC.HISTORY_COURSE": {
+    "canonical_text": "遗物｜历史课｜稀有度Event｜效果：在你的回合开始时，打出一张你上一回合最后打出的攻击牌或技能牌的复制品。",
+    "description": "在你的回合开始时，打出一张你上一回合最后打出的攻击牌或技能牌的复制品。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.HISTORY_COURSE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在你的回合开始时，打出一张你上一回合最后打出的攻击牌或技能牌的复制品。",
+    "title": "历史课"
+  },
+  "RELIC.HORN_CLEAT": {
+    "canonical_text": "遗物｜船夹板｜稀有度Uncommon｜效果：在你的第二回合开始时，获得14点格挡。",
+    "description": "在你的第二回合开始时，获得14点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.HORN_CLEAT",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在你的第二回合开始时，获得14点格挡。",
+    "title": "船夹板"
+  },
+  "RELIC.ICE_CREAM": {
+    "canonical_text": "遗物｜冰淇淋｜稀有度Rare｜效果：多余的能量可以留到下一回合。",
+    "description": "多余的能量可以留到下一回合。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ICE_CREAM",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "多余的能量可以留到下一回合。",
+    "title": "冰淇淋"
+  },
+  "RELIC.INFUSED_CORE": {
+    "canonical_text": "遗物｜注能核心｜稀有度Starter｜效果：在每场战斗开始时，生成3个闪电充能球。",
+    "description": "在每场战斗开始时，生成3个闪电充能球。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.INFUSED_CORE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在每场战斗开始时，生成3个闪电充能球。",
+    "title": "注能核心"
+  },
+  "RELIC.INTIMIDATING_HELMET": {
+    "canonical_text": "遗物｜骇人头盔｜稀有度Rare｜效果：每当你打出一张耗能大于等于能量的牌，获得4点格挡。",
+    "description": "每当你打出一张耗能大于等于能量的牌，获得4点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.INTIMIDATING_HELMET",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你打出一张耗能大于等于能量的牌，获得4点格挡。",
+    "title": "骇人头盔"
+  },
+  "RELIC.IRON_CLUB": {
+    "canonical_text": "遗物｜铁棒｜稀有度Ancient｜效果：你每打出4张牌，就抽1张牌。",
+    "description": "你每打出4张牌，就抽1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.IRON_CLUB",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你每打出4张牌，就抽1张牌。",
+    "title": "铁棒"
+  },
+  "RELIC.IVORY_TILE": {
+    "canonical_text": "遗物｜象牙麻将牌｜稀有度Rare｜效果：每当你打出一张耗能大于等于能量的牌时，获得能量。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "每当你打出一张耗能大于等于能量的牌时，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.IVORY_TILE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你打出一张耗能大于等于能量的牌时，获得能量。",
+    "title": "象牙麻将牌"
+  },
+  "RELIC.JEWELED_MASK": {
+    "canonical_text": "遗物｜宝石面具｜稀有度Ancient｜效果：在每场战斗开始时，将一张随机能力牌从你的抽牌堆放入你的手牌，这张牌可以免费打出。",
+    "description": "在每场战斗开始时，将一张随机能力牌从你的抽牌堆放入你的手牌，这张牌可以免费打出。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.JEWELED_MASK",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每场战斗开始时，将一张随机能力牌从你的抽牌堆放入你的手牌，这张牌可以免费打出。",
+    "title": "宝石面具"
+  },
+  "RELIC.JEWELRY_BOX": {
+    "canonical_text": "遗物｜珠宝盒｜稀有度Ancient｜效果：拾起时，将1张神化加入你的牌组。",
+    "description": "拾起时，将1张神化加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.JEWELRY_BOX",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将1张神化加入你的牌组。",
+    "title": "珠宝盒"
+  },
+  "RELIC.JOSS_PAPER": {
+    "canonical_text": "遗物｜金纸｜稀有度Uncommon｜效果：你每消耗5张牌，就抽1张牌。",
+    "description": "你每消耗5张牌，就抽1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.JOSS_PAPER",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每消耗5张牌，就抽1张牌。",
+    "title": "金纸"
+  },
+  "RELIC.JUZU_BRACELET": {
+    "canonical_text": "遗物｜佛珠手链｜稀有度Common｜效果：你在?房间中不会再遭遇常规战斗。",
+    "description": "你在?房间中不会再遭遇常规战斗。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.JUZU_BRACELET",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "你在?房间中不会再遭遇常规战斗。",
+    "title": "佛珠手链"
+  },
+  "RELIC.KIFUDA": {
+    "canonical_text": "遗物｜木札｜稀有度Shop｜效果：拾起时，从你的牌组中选择至多3张牌，附魔：伶俐。",
+    "description": "拾起时，从你的牌组中选择至多3张牌，附魔：伶俐。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.KIFUDA",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，从你的牌组中选择至多3张牌，附魔：伶俐。",
+    "title": "木札"
+  },
+  "RELIC.KUNAI": {
+    "canonical_text": "遗物｜苦无｜稀有度Rare｜效果：你每在同一回合内打出3张攻击牌，就获得1点敏捷。",
+    "description": "你每在同一回合内打出3张攻击牌，就获得1点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.KUNAI",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每在同一回合内打出3张攻击牌，就获得1点敏捷。",
+    "title": "苦无"
+  },
+  "RELIC.KUSARIGAMA": {
+    "canonical_text": "遗物｜锁镰｜稀有度Uncommon｜效果：你每在同一回合内打出3张攻击牌，就随机对一名敌人造成6点伤害。",
+    "description": "你每在同一回合内打出3张攻击牌，就随机对一名敌人造成6点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.KUSARIGAMA",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每在同一回合内打出3张攻击牌，就随机对一名敌人造成6点伤害。",
+    "title": "锁镰"
+  },
+  "RELIC.LANTERN": {
+    "canonical_text": "遗物｜灯笼｜稀有度Common｜效果：在每场战斗的第一回合获得能量。",
+    "description": "在每场战斗的第一回合获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LANTERN",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗的第一回合获得能量。",
+    "title": "灯笼"
+  },
+  "RELIC.LARGE_CAPSULE": {
+    "canonical_text": "遗物｜巨大扭蛋｜稀有度Ancient｜效果：拾起时，获得2件随机遗物。额外将一对打击和防御，加入你的牌组。",
+    "description": "拾起时，获得2件随机遗物。额外将一对打击和防御，加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LARGE_CAPSULE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得2件随机遗物。额外将一对打击和防御，加入你的牌组。",
+    "title": "巨大扭蛋"
+  },
+  "RELIC.LASTING_CANDY": {
+    "canonical_text": "遗物｜吃不完的糖｜稀有度Uncommon｜效果：每两场战斗，你的卡牌奖励就会额外包含一张能力牌。",
+    "description": "每两场战斗，你的卡牌奖励就会额外包含一张能力牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LASTING_CANDY",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      },
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每两场战斗，你的卡牌奖励就会额外包含一张能力牌。",
+    "title": "吃不完的糖"
+  },
+  "RELIC.LAVA_LAMP": {
+    "canonical_text": "遗物｜熔岩灯｜稀有度Shop｜效果：在战斗结束时，如果你没有受伤，则升级你的所有卡牌奖励。",
+    "description": "在战斗结束时，如果你没有受伤，则升级你的所有卡牌奖励。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LAVA_LAMP",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在战斗结束时，如果你没有受伤，则升级你的所有卡牌奖励。",
+    "title": "熔岩灯"
+  },
+  "RELIC.LAVA_ROCK": {
+    "canonical_text": "遗物｜熔岩石｜稀有度Ancient｜效果：第一阶段的Boss敌人额外掉落2件遗物。",
+    "description": "第一阶段的Boss敌人额外掉落2件遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LAVA_ROCK",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "第一阶段的Boss敌人额外掉落2件遗物。",
+    "title": "熔岩石"
+  },
+  "RELIC.LEAD_PAPERWEIGHT": {
+    "canonical_text": "遗物｜铅制镇纸｜稀有度Ancient｜效果：拾起时，从2张无色牌中选择1张加入你的牌组。",
+    "description": "拾起时，从2张无色牌中选择1张加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LEAD_PAPERWEIGHT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从2张无色牌中选择1张加入你的牌组。",
+    "title": "铅制镇纸"
+  },
+  "RELIC.LEAFY_POULTICE": {
+    "canonical_text": "遗物｜树叶药膏｜稀有度Ancient｜效果：拾起时，变化你的1张打击和1张防御，然后失去12点最大生命。",
+    "description": "拾起时，变化你的1张打击和1张防御，然后失去12点最大生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LEAFY_POULTICE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，变化你的1张打击和1张防御，然后失去12点最大生命。",
+    "title": "树叶药膏"
+  },
+  "RELIC.LEES_WAFFLE": {
+    "canonical_text": "遗物｜李家华夫饼｜稀有度Shop｜效果：拾起时，将你的最大生命值提升7点，并回复所有生命。",
+    "description": "拾起时，将你的最大生命值提升7点，并回复所有生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.LEES_WAFFLE",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，将你的最大生命值提升7点，并回复所有生命。",
+    "title": "李家华夫饼"
+  },
+  "RELIC.LETTER_OPENER": {
+    "canonical_text": "遗物｜开信刀｜稀有度Uncommon｜效果：你每在同一回合内打出3张技能牌，就对所有敌人造成5点伤害。",
+    "description": "你每在同一回合内打出3张技能牌，就对所有敌人造成5点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LETTER_OPENER",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每在同一回合内打出3张技能牌，就对所有敌人造成5点伤害。",
+    "title": "开信刀"
+  },
+  "RELIC.LIZARD_TAIL": {
+    "canonical_text": "遗物｜蜥蜴尾巴｜稀有度Rare｜效果：当你的生命值将要降低至0或以下时，回复到最大生命值的50%（仅能起效一次）。",
+    "description": "当你的生命值将要降低至0或以下时，回复到最大生命值的50%（仅能起效一次）。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LIZARD_TAIL",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "当你的生命值将要降低至0或以下时，回复到最大生命值的50%（仅能起效一次）。",
+    "title": "蜥蜴尾巴"
+  },
+  "RELIC.LOOMING_FRUIT": {
+    "canonical_text": "遗物｜布质果实｜稀有度Ancient｜效果：拾起时，将你的最大生命值提升31。",
+    "description": "拾起时，将你的最大生命值提升31。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.LOOMING_FRUIT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将你的最大生命值提升31。",
+    "title": "布质果实"
+  },
+  "RELIC.LORDS_PARASOL": {
+    "canonical_text": "遗物｜领主阳伞｜稀有度Ancient｜效果：当你遇见商人时，立刻获得他所出售的所有物品。",
+    "description": "当你遇见商人时，立刻获得他所出售的所有物品。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LORDS_PARASOL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "当你遇见商人时，立刻获得他所出售的所有物品。",
+    "title": "领主阳伞"
+  },
+  "RELIC.LOST_COFFER": {
+    "canonical_text": "遗物｜失物盒｜稀有度Ancient｜效果：拾起时，获得1次卡牌奖励和1瓶随机药水。",
+    "description": "拾起时，获得1次卡牌奖励和1瓶随机药水。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.LOST_COFFER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得1次卡牌奖励和1瓶随机药水。",
+    "title": "失物盒"
+  },
+  "RELIC.LOST_WISP": {
+    "canonical_text": "遗物｜迷失鬼火｜稀有度Event｜效果：你每打出一张能力牌，就对所有敌人造成8点伤害。",
+    "description": "你每打出一张能力牌，就对所有敌人造成8点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LOST_WISP",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "你每打出一张能力牌，就对所有敌人造成8点伤害。",
+    "title": "迷失鬼火"
+  },
+  "RELIC.LUCKY_FYSH": {
+    "canonical_text": "遗物｜招财异鱼｜稀有度Uncommon｜效果：每当你将一张卡牌加入你的牌组时，获得15金币。",
+    "description": "每当你将一张卡牌加入你的牌组时，获得15金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LUCKY_FYSH",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当你将一张卡牌加入你的牌组时，获得15金币。",
+    "title": "招财异鱼"
+  },
+  "RELIC.LUNAR_PASTRY": {
+    "canonical_text": "遗物｜月亮糕点｜稀有度Rare｜效果：在你的回合结束时，获得星辉。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "在你的回合结束时，获得星辉。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.LUNAR_PASTRY",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在你的回合结束时，获得星辉。",
+    "title": "月亮糕点"
+  },
+  "RELIC.MANGO": {
+    "canonical_text": "遗物｜芒果｜稀有度Rare｜效果：拾起时，将你的最大生命值提升14。",
+    "description": "拾起时，将你的最大生命值提升14。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.MANGO",
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "拾起时，将你的最大生命值提升14。",
+    "title": "芒果"
+  },
+  "RELIC.MASSIVE_SCROLL": {
+    "canonical_text": "遗物｜巨大卷轴｜稀有度Ancient｜效果：拾起时，从3张多人游戏牌中选择1张加入你的牌组。",
+    "description": "拾起时，从3张多人游戏牌中选择1张加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MASSIVE_SCROLL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从3张多人游戏牌中选择1张加入你的牌组。",
+    "title": "巨大卷轴"
+  },
+  "RELIC.MAW_BANK": {
+    "canonical_text": "遗物｜巨口储蓄罐｜稀有度Event｜效果：每攀爬一层楼层，就获得12金币。一旦在商店中花费金币就会使其失效。",
+    "description": "每攀爬一层楼层，就获得12金币。一旦在商店中花费金币就会使其失效。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MAW_BANK",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每攀爬一层楼层，就获得12金币。一旦在商店中花费金币就会使其失效。",
+    "title": "巨口储蓄罐"
+  },
+  "RELIC.MEAL_TICKET": {
+    "canonical_text": "遗物｜餐券｜稀有度Common｜效果：每当你进入商店房间时，回复15点生命。",
+    "description": "每当你进入商店房间时，回复15点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MEAL_TICKET",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每当你进入商店房间时，回复15点生命。",
+    "title": "餐券"
+  },
+  "RELIC.MEAT_CLEAVER": {
+    "canonical_text": "遗物｜切肉刀｜稀有度Ancient｜效果：你可以在休息处进行烹饪。",
+    "description": "你可以在休息处进行烹饪。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MEAT_CLEAVER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你可以在休息处进行烹饪。",
+    "title": "切肉刀"
+  },
+  "RELIC.MEAT_ON_THE_BONE": {
+    "canonical_text": "遗物｜带骨肉｜稀有度Rare｜效果：如果你在战斗结束时生命值等于或低于50%，回复12点生命。",
+    "description": "如果你在战斗结束时生命值等于或低于50%，回复12点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MEAT_ON_THE_BONE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "如果你在战斗结束时生命值等于或低于50%，回复12点生命。",
+    "title": "带骨肉"
+  },
+  "RELIC.MEMBERSHIP_CARD": {
+    "canonical_text": "遗物｜会员卡｜稀有度Shop｜效果：所有商品打折50%！",
+    "description": "所有商品打折50%！",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MEMBERSHIP_CARD",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "所有商品打折50%！",
+    "title": "会员卡"
+  },
+  "RELIC.MERCURY_HOURGLASS": {
+    "canonical_text": "遗物｜水银沙漏｜稀有度Uncommon｜效果：在你的回合开始时，对所有敌人造成3点伤害。",
+    "description": "在你的回合开始时，对所有敌人造成3点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MERCURY_HOURGLASS",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在你的回合开始时，对所有敌人造成3点伤害。",
+    "title": "水银沙漏"
+  },
+  "RELIC.METRONOME": {
+    "canonical_text": "遗物｜节拍器｜稀有度Rare｜效果：每场战斗中你首次生成7个充能球时，对所有敌人造成30点伤害。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "每场战斗中你首次生成7个充能球时，对所有敌人造成30点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.METRONOME",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每场战斗中你首次生成7个充能球时，对所有敌人造成30点伤害。",
+    "title": "节拍器"
+  },
+  "RELIC.MINIATURE_CANNON": {
+    "canonical_text": "遗物｜微型大炮｜稀有度Uncommon｜效果：升级的攻击牌额外造成3点伤害。",
+    "description": "升级的攻击牌额外造成3点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MINIATURE_CANNON",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "升级的攻击牌额外造成3点伤害。",
+    "title": "微型大炮"
+  },
+  "RELIC.MINIATURE_TENT": {
+    "canonical_text": "遗物｜微型帐篷｜稀有度Shop｜效果：你可以在休息处选择任意数量的选项。",
+    "description": "你可以在休息处选择任意数量的选项。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MINIATURE_TENT",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "你可以在休息处选择任意数量的选项。",
+    "title": "微型帐篷"
+  },
+  "RELIC.MINI_REGENT": {
+    "canonical_text": "遗物｜迷你储君｜稀有度Rare｜效果：每回合你第一次花费点星辉时，获得1点力量。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "每回合你第一次花费点星辉时，获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MINI_REGENT",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每回合你第一次花费点星辉时，获得1点力量。",
+    "title": "迷你储君"
+  },
+  "RELIC.MOLTEN_EGG": {
+    "canonical_text": "遗物｜熔火之蛋｜稀有度Rare｜效果：每当你获得攻击牌时，将其升级。",
+    "description": "每当你获得攻击牌时，将其升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MOLTEN_EGG",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你获得攻击牌时，将其升级。",
+    "title": "熔火之蛋"
+  },
+  "RELIC.MR_STRUGGLES": {
+    "canonical_text": "遗物｜抱抱先生｜稀有度Event｜效果：在你的回合开始时，对所有敌人造成等量于当前回合数的伤害。",
+    "description": "在你的回合开始时，对所有敌人造成等量于当前回合数的伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MR_STRUGGLES",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在你的回合开始时，对所有敌人造成等量于当前回合数的伤害。",
+    "title": "抱抱先生"
+  },
+  "RELIC.MUMMIFIED_HAND": {
+    "canonical_text": "遗物｜干瘪之手｜稀有度Rare｜效果：你每打出一张能力牌，手牌中就有一张随机牌在这个回合可以免费打出。",
+    "description": "你每打出一张能力牌，手牌中就有一张随机牌在这个回合可以免费打出。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MUMMIFIED_HAND",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每打出一张能力牌，手牌中就有一张随机牌在这个回合可以免费打出。",
+    "title": "干瘪之手"
+  },
+  "RELIC.MUSIC_BOX": {
+    "canonical_text": "遗物｜音乐盒｜稀有度Ancient｜效果：将你每回合打出的第一张攻击牌的一张虚无复制品加入你的手牌。",
+    "description": "将你每回合打出的第一张攻击牌的一张虚无复制品加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MUSIC_BOX",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "将你每回合打出的第一张攻击牌的一张虚无复制品加入你的手牌。",
+    "title": "音乐盒"
+  },
+  "RELIC.MYSTIC_LIGHTER": {
+    "canonical_text": "遗物｜神秘打火机｜稀有度Shop｜效果：有附魔的攻击牌额外造成9点伤害。",
+    "description": "有附魔的攻击牌额外造成9点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.MYSTIC_LIGHTER",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "有附魔的攻击牌额外造成9点伤害。",
+    "title": "神秘打火机"
+  },
+  "RELIC.NEOWS_TALISMAN": {
+    "canonical_text": "遗物｜涅奥的护符｜稀有度Ancient｜效果：拾起时，升级你的1张打击和1张防御。",
+    "description": "拾起时，升级你的1张打击和1张防御。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.NEOWS_TALISMAN",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，升级你的1张打击和1张防御。",
+    "title": "涅奥的护符"
+  },
+  "RELIC.NEOWS_TORMENT": {
+    "canonical_text": "遗物｜涅奥的苦痛｜稀有度Ancient｜效果：拾起时，将1张涅奥之怒加入你的牌组。",
+    "description": "拾起时，将1张涅奥之怒加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.NEOWS_TORMENT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将1张涅奥之怒加入你的牌组。",
+    "title": "涅奥的苦痛"
+  },
+  "RELIC.NEW_LEAF": {
+    "canonical_text": "遗物｜新叶｜稀有度Ancient｜效果：拾起时，变化1张牌。",
+    "description": "拾起时，变化1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.NEW_LEAF",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，变化1张牌。",
+    "title": "新叶"
+  },
+  "RELIC.NINJA_SCROLL": {
+    "canonical_text": "遗物｜忍术卷轴｜稀有度Shop｜效果：每场战斗开始时，将3张小刀加入你的手牌。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "每场战斗开始时，将3张小刀加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.NINJA_SCROLL",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "每场战斗开始时，将3张小刀加入你的手牌。",
+    "title": "忍术卷轴"
+  },
+  "RELIC.NUNCHAKU": {
+    "canonical_text": "遗物｜双截棍｜稀有度Uncommon｜效果：你每打出10张攻击牌，获得能量。",
+    "description": "你每打出10张攻击牌，获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.NUNCHAKU",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每打出10张攻击牌，获得能量。",
+    "title": "双截棍"
+  },
+  "RELIC.NUTRITIOUS_OYSTER": {
+    "canonical_text": "遗物｜营养牡蛎｜稀有度Ancient｜效果：拾起时，将你的最大生命值提升11。",
+    "description": "拾起时，将你的最大生命值提升11。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.NUTRITIOUS_OYSTER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将你的最大生命值提升11。",
+    "title": "营养牡蛎"
+  },
+  "RELIC.NUTRITIOUS_SOUP": {
+    "canonical_text": "遗物｜营养汤｜稀有度Ancient｜效果：拾起时，为你牌组中的所有“打击”附魔：特兹卡塔拉的余烬",
+    "description": "拾起时，为你牌组中的所有“打击”附魔：特兹卡塔拉的余烬",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.NUTRITIOUS_SOUP",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，为你牌组中的所有“打击”附魔：特兹卡塔拉的余烬",
+    "title": "营养汤"
+  },
+  "RELIC.ODDLY_SMOOTH_STONE": {
+    "canonical_text": "遗物｜意外光滑的石头｜稀有度Common｜效果：在每场战斗开始时，获得1点敏捷。",
+    "description": "在每场战斗开始时，获得1点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ODDLY_SMOOTH_STONE",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，获得1点敏捷。",
+    "title": "意外光滑的石头"
+  },
+  "RELIC.OLD_COIN": {
+    "canonical_text": "遗物｜古钱币｜稀有度Rare｜效果：拾起时，获得300金币。",
+    "description": "拾起时，获得300金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.OLD_COIN",
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "拾起时，获得300金币。",
+    "title": "古钱币"
+  },
+  "RELIC.ORANGE_DOUGH": {
+    "canonical_text": "遗物｜橙色团块｜稀有度Rare｜效果：在每场战斗开始时，将2张随机无色牌加入你的手牌。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "在每场战斗开始时，将2张随机无色牌加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ORANGE_DOUGH",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每场战斗开始时，将2张随机无色牌加入你的手牌。",
+    "title": "橙色团块"
+  },
+  "RELIC.ORICHALCUM": {
+    "canonical_text": "遗物｜奥利哈钢｜稀有度Uncommon｜效果：如果你在回合结束时没有任何格挡，获得6点格挡。",
+    "description": "如果你在回合结束时没有任何格挡，获得6点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ORICHALCUM",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "如果你在回合结束时没有任何格挡，获得6点格挡。",
+    "title": "奥利哈钢"
+  },
+  "RELIC.ORNAMENTAL_FAN": {
+    "canonical_text": "遗物｜精致折扇｜稀有度Uncommon｜效果：你每在同一回合内打出3张攻击牌，就获得4点格挡。",
+    "description": "你每在同一回合内打出3张攻击牌，就获得4点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ORNAMENTAL_FAN",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每在同一回合内打出3张攻击牌，就获得4点格挡。",
+    "title": "精致折扇"
+  },
+  "RELIC.ORRERY": {
+    "canonical_text": "遗物｜星系仪｜稀有度Shop｜效果：拾起时，获得5次卡牌奖励",
+    "description": "拾起时，获得5次卡牌奖励",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.ORRERY",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，获得5次卡牌奖励",
+    "title": "星系仪"
+  },
+  "RELIC.PAELS_BLOOD": {
+    "canonical_text": "遗物｜佩尔之血｜稀有度Ancient｜效果：在你的回合开始时，额外抽1张牌",
+    "description": "在你的回合开始时，额外抽1张牌",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_BLOOD",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在你的回合开始时，额外抽1张牌",
+    "title": "佩尔之血"
+  },
+  "RELIC.PAELS_CLAW": {
+    "canonical_text": "遗物｜佩尔之爪｜稀有度Ancient｜效果：拾起时，为所有的“防御”附魔：0。",
+    "description": "拾起时，为所有的“防御”附魔：0。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_CLAW",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，为所有的“防御”附魔：0。",
+    "title": "佩尔之爪"
+  },
+  "RELIC.PAELS_EYE": {
+    "canonical_text": "遗物｜佩尔之眼｜稀有度Ancient｜效果：你在每场战斗中第一次没有打出任何牌就结束回合时，消耗所有手牌然后进行一个额外回合。",
+    "description": "你在每场战斗中第一次没有打出任何牌就结束回合时，消耗所有手牌然后进行一个额外回合。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_EYE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你在每场战斗中第一次没有打出任何牌就结束回合时，消耗所有手牌然后进行一个额外回合。",
+    "title": "佩尔之眼"
+  },
+  "RELIC.PAELS_FLESH": {
+    "canonical_text": "遗物｜佩尔之肉｜稀有度Ancient｜效果：从你的第3回合开始，在回合开始时额外获得能量。",
+    "description": "从你的第3回合开始，在回合开始时额外获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_FLESH",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "从你的第3回合开始，在回合开始时额外获得能量。",
+    "title": "佩尔之肉"
+  },
+  "RELIC.PAELS_GROWTH": {
+    "canonical_text": "遗物｜佩尔的增生组织｜稀有度Ancient｜效果：拾起时，从牌组中选择一张牌，为其附魔：0。",
+    "description": "拾起时，从牌组中选择一张牌，为其附魔：0。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_GROWTH",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从牌组中选择一张牌，为其附魔：0。",
+    "title": "佩尔的增生组织"
+  },
+  "RELIC.PAELS_HORN": {
+    "canonical_text": "遗物｜佩尔之角｜稀有度Ancient｜效果：拾起时，将2张放松加入你的牌组。",
+    "description": "拾起时，将2张放松加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_HORN",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将2张放松加入你的牌组。",
+    "title": "佩尔之角"
+  },
+  "RELIC.PAELS_LEGION": {
+    "adds_pet": true,
+    "canonical_text": "遗物｜佩尔的士兵｜稀有度Ancient｜效果：将你从一张卡牌中获得的格挡翻倍，然后此遗物会休眠2回合。",
+    "description": "将你从一张卡牌中获得的格挡翻倍，然后此遗物会休眠2回合。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_LEGION",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "将你从一张卡牌中获得的格挡翻倍，然后此遗物会休眠2回合。",
+    "title": "佩尔的士兵"
+  },
+  "RELIC.PAELS_TEARS": {
+    "canonical_text": "遗物｜佩尔之泪｜稀有度Ancient｜效果：如果你在拥有未花费的能量情况下结束回合，则下个回合额外获得能量。",
+    "description": "如果你在拥有未花费的能量情况下结束回合，则下个回合额外获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_TEARS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "如果你在拥有未花费的能量情况下结束回合，则下个回合额外获得能量。",
+    "title": "佩尔之泪"
+  },
+  "RELIC.PAELS_TOOTH": {
+    "canonical_text": "遗物｜佩尔之牙｜稀有度Ancient｜效果：拾起时，从你的牌组中选择5张牌移除。在每场战斗结束时，将其中随机1张牌升级然后返还。{CardTitles.StringValue:cond: 在牙中的牌： {}|}",
+    "description": "拾起时，从你的牌组中选择5张牌移除。在每场战斗结束时，将其中随机1张牌升级然后返还。{CardTitles.StringValue:cond:\n在牙中的牌：\n{}|}",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PAELS_TOOTH",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中选择5张牌移除。在每场战斗结束时，将其中随机1张牌升级然后返还。{CardTitles.StringValue:cond: / 在牙中的牌： / {}|}",
+    "title": "佩尔之牙"
+  },
+  "RELIC.PAELS_WING": {
+    "canonical_text": "遗物｜佩尔之翼｜稀有度Ancient｜效果：你可以将你的卡牌奖励献祭给佩尔。每献祭2次，就能获得一件遗物。",
+    "description": "你可以将你的卡牌奖励献祭给佩尔。每献祭2次，就能获得一件遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAELS_WING",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你可以将你的卡牌奖励献祭给佩尔。每献祭2次，就能获得一件遗物。",
+    "title": "佩尔之翼"
+  },
+  "RELIC.PANDORAS_BOX": {
+    "canonical_text": "遗物｜潘多拉魔盒｜稀有度Ancient｜效果：变化所有“打击”和“防御”。",
+    "description": "变化所有“打击”和“防御”。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PANDORAS_BOX",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "变化所有“打击”和“防御”。",
+    "title": "潘多拉魔盒"
+  },
+  "RELIC.PANTOGRAPH": {
+    "canonical_text": "遗物｜缩放仪｜稀有度Uncommon｜效果：在Boss战开始时，回复25点生命值。",
+    "description": "在Boss战开始时，回复25点生命值。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PANTOGRAPH",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在Boss战开始时，回复25点生命值。",
+    "title": "缩放仪"
+  },
+  "RELIC.PAPER_KRANE": {
+    "canonical_text": "遗物｜纸鹤｜稀有度Rare｜效果：有虚弱状态的敌人造成的伤害降低40%而非25%。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "有虚弱状态的敌人造成的伤害降低40%而非25%。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAPER_KRANE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "有虚弱状态的敌人造成的伤害降低40%而非25%。",
+    "title": "纸鹤"
+  },
+  "RELIC.PAPER_PHROG": {
+    "canonical_text": "遗物｜纸蛙｜稀有度Uncommon｜效果：有易伤状态的敌人受到的伤害增加75%而非50%。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "有易伤状态的敌人受到的伤害增加75%而非50%。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PAPER_PHROG",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "有易伤状态的敌人受到的伤害增加75%而非50%。",
+    "title": "纸蛙"
+  },
+  "RELIC.PARRYING_SHIELD": {
+    "canonical_text": "遗物｜招架盾｜稀有度Uncommon｜效果：如果你在回合结束时拥有至少10点格挡，则对随机敌人造成6点伤害。",
+    "description": "如果你在回合结束时拥有至少10点格挡，则对随机敌人造成6点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PARRYING_SHIELD",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "如果你在回合结束时拥有至少10点格挡，则对随机敌人造成6点伤害。",
+    "title": "招架盾"
+  },
+  "RELIC.PEAR": {
+    "canonical_text": "遗物｜梨子｜稀有度Uncommon｜效果：拾起时，将你的最大生命值提升10。",
+    "description": "拾起时，将你的最大生命值提升10。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PEAR",
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "拾起时，将你的最大生命值提升10。",
+    "title": "梨子"
+  },
+  "RELIC.PENDULUM": {
+    "canonical_text": "遗物｜摆动球｜稀有度Common｜效果：每3个回合，抽1张牌",
+    "description": "每3个回合，抽1张牌",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PENDULUM",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每3个回合，抽1张牌",
+    "title": "摆动球"
+  },
+  "RELIC.PEN_NIB": {
+    "canonical_text": "遗物｜钢笔尖｜稀有度Uncommon｜效果：你每打出的第10张攻击牌将会造成双倍伤害。",
+    "description": "你每打出的第10张攻击牌将会造成双倍伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PEN_NIB",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每打出的第10张攻击牌将会造成双倍伤害。",
+    "title": "钢笔尖"
+  },
+  "RELIC.PERMAFROST": {
+    "canonical_text": "遗物｜永冻冰晶｜稀有度Uncommon｜效果：当你在战斗中第一次打出能力牌时，获得7点格挡。",
+    "description": "当你在战斗中第一次打出能力牌时，获得7点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PERMAFROST",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "当你在战斗中第一次打出能力牌时，获得7点格挡。",
+    "title": "永冻冰晶"
+  },
+  "RELIC.PETRIFIED_TOAD": {
+    "canonical_text": "遗物｜石化蟾蜍｜稀有度Uncommon｜效果：在每场战斗开始时，获得一瓶药水形状的石头",
+    "description": "在每场战斗开始时，获得一瓶药水形状的石头",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PETRIFIED_TOAD",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，获得一瓶药水形状的石头",
+    "title": "石化蟾蜍"
+  },
+  "RELIC.PHILOSOPHERS_STONE": {
+    "canonical_text": "遗物｜贤者之石｜稀有度Ancient｜效果：在每回合开始时获得能量。所有敌人初始获得1点力量。",
+    "description": "在每回合开始时获得能量。所有敌人初始获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PHILOSOPHERS_STONE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每回合开始时获得能量。所有敌人初始获得1点力量。",
+    "title": "贤者之石"
+  },
+  "RELIC.PHYLACTERY_UNBOUND": {
+    "canonical_text": "遗物｜无界命匣｜稀有度Starter｜效果：在每场战斗开始时，召唤5。在你的回合开始时，召唤2。",
+    "description": "在每场战斗开始时，召唤5。在你的回合开始时，召唤2。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PHYLACTERY_UNBOUND",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "spawns_pets": true,
+    "summary": "在每场战斗开始时，召唤5。在你的回合开始时，召唤2。",
+    "title": "无界命匣"
+  },
+  "RELIC.PLANISPHERE": {
+    "canonical_text": "遗物｜活动星图｜稀有度Uncommon｜效果：每当你进入？房间的时候，回复5点生命。",
+    "description": "每当你进入？房间的时候，回复5点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PLANISPHERE",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当你进入？房间的时候，回复5点生命。",
+    "title": "活动星图"
+  },
+  "RELIC.POCKETWATCH": {
+    "canonical_text": "遗物｜怀表｜稀有度Rare｜效果：当你在本回合打出的牌少于等于3张时，则在你的下个回合开始时额外抽3张牌。",
+    "description": "当你在本回合打出的牌少于等于3张时，则在你的下个回合开始时额外抽3张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.POCKETWATCH",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "当你在本回合打出的牌少于等于3张时，则在你的下个回合开始时额外抽3张牌。",
+    "title": "怀表"
+  },
+  "RELIC.POLLINOUS_CORE": {
+    "canonical_text": "遗物｜花粉核心｜稀有度Event｜效果：每4个回合，额外抽2张牌。",
+    "description": "每4个回合，额外抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.POLLINOUS_CORE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每4个回合，额外抽2张牌。",
+    "title": "花粉核心"
+  },
+  "RELIC.POMANDER": {
+    "canonical_text": "遗物｜橙型香盒｜稀有度Ancient｜效果：拾起时，升级一张牌。",
+    "description": "拾起时，升级一张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.POMANDER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，升级一张牌。",
+    "title": "橙型香盒"
+  },
+  "RELIC.POTION_BELT": {
+    "canonical_text": "遗物｜药水腰带｜稀有度Common｜效果：拾起时，获得2个药水栏位。",
+    "description": "拾起时，获得2个药水栏位。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.POTION_BELT",
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "拾起时，获得2个药水栏位。",
+    "title": "药水腰带"
+  },
+  "RELIC.POWER_CELL": {
+    "canonical_text": "遗物｜能量电池｜稀有度Rare｜效果：在每场战斗开始时，将2张耗能为0的卡牌从你的抽牌堆放入你的手牌。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "在每场战斗开始时，将2张耗能为0的卡牌从你的抽牌堆放入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.POWER_CELL",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每场战斗开始时，将2张耗能为0的卡牌从你的抽牌堆放入你的手牌。",
+    "title": "能量电池"
+  },
+  "RELIC.PRAYER_WHEEL": {
+    "canonical_text": "遗物｜转经轮｜稀有度Rare｜效果：普通敌人额外掉落一次卡牌奖励。",
+    "description": "普通敌人额外掉落一次卡牌奖励。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PRAYER_WHEEL",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "普通敌人额外掉落一次卡牌奖励。",
+    "title": "转经轮"
+  },
+  "RELIC.PRECARIOUS_SHEARS": {
+    "canonical_text": "遗物｜松动羊毛剪｜稀有度Ancient｜效果：拾起时，从你的牌组中移除2张牌并失去16点生命。",
+    "description": "拾起时，从你的牌组中移除2张牌并失去16点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PRECARIOUS_SHEARS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中移除2张牌并失去16点生命。",
+    "title": "松动羊毛剪"
+  },
+  "RELIC.PRECISE_SCISSORS": {
+    "canonical_text": "遗物｜精准剪刀｜稀有度Ancient｜效果：拾起时，从你的牌组中移除1张牌。",
+    "description": "拾起时，从你的牌组中移除1张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PRECISE_SCISSORS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中移除1张牌。",
+    "title": "精准剪刀"
+  },
+  "RELIC.PRESERVED_FOG": {
+    "canonical_text": "遗物｜腌制活雾｜稀有度Ancient｜效果：拾起时，从你的牌组中移除3张牌。将一张愚行加入你的牌组。",
+    "description": "拾起时，从你的牌组中移除3张牌。将一张愚行加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PRESERVED_FOG",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，从你的牌组中移除3张牌。将一张愚行加入你的牌组。",
+    "title": "腌制活雾"
+  },
+  "RELIC.PRISMATIC_GEM": {
+    "canonical_text": "遗物｜棱彩宝石｜稀有度Ancient｜效果：在每个回合开始时获得能量。卡牌奖励现在会包含其他颜色的卡牌。",
+    "description": "在每个回合开始时获得能量。卡牌奖励现在会包含其他颜色的卡牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.PRISMATIC_GEM",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每个回合开始时获得能量。卡牌奖励现在会包含其他颜色的卡牌。",
+    "title": "棱彩宝石"
+  },
+  "RELIC.PUMPKIN_CANDLE": {
+    "canonical_text": "遗物｜南瓜蜡烛｜稀有度Ancient｜效果：在每个回合开始时获得能量。这件遗物将在第3阶段开始时熄灭。",
+    "description": "在每个回合开始时获得能量。这件遗物将在第3阶段开始时熄灭。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PUMPKIN_CANDLE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每个回合开始时获得能量。这件遗物将在第3阶段开始时熄灭。",
+    "title": "南瓜蜡烛"
+  },
+  "RELIC.PUNCH_DAGGER": {
+    "canonical_text": "遗物｜拳刃｜稀有度Shop｜效果：拾起时，选择一张攻击牌为它附魔：动量5。",
+    "description": "拾起时，选择一张攻击牌为它附魔：动量5。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.PUNCH_DAGGER",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，选择一张攻击牌为它附魔：动量5。",
+    "title": "拳刃"
+  },
+  "RELIC.RADIANT_PEARL": {
+    "canonical_text": "遗物｜发光珍珠｜稀有度Ancient｜效果：在每场战斗开始时，将1张冷光加入你的手牌。",
+    "description": "在每场战斗开始时，将1张冷光加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RADIANT_PEARL",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每场战斗开始时，将1张冷光加入你的手牌。",
+    "title": "发光珍珠"
+  },
+  "RELIC.RAINBOW_RING": {
+    "canonical_text": "遗物｜彩虹戒指｜稀有度Rare｜效果：每回合，你第一次打出攻击牌、技能牌和能力牌各一张时，获得1点力量和1点敏捷。",
+    "description": "每回合，你第一次打出攻击牌、技能牌和能力牌各一张时，获得1点力量和1点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RAINBOW_RING",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每回合，你第一次打出攻击牌、技能牌和能力牌各一张时，获得1点力量和1点敏捷。",
+    "title": "彩虹戒指"
+  },
+  "RELIC.RAZOR_TOOTH": {
+    "canonical_text": "遗物｜剃刀牙｜稀有度Rare｜效果：你打出攻击牌和技能牌时，将其在本场战斗内升级。",
+    "description": "你打出攻击牌和技能牌时，将其在本场战斗内升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RAZOR_TOOTH",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      },
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你打出攻击牌和技能牌时，将其在本场战斗内升级。",
+    "title": "剃刀牙"
+  },
+  "RELIC.RED_MASK": {
+    "canonical_text": "遗物｜红面具｜稀有度Common｜效果：在每场战斗开始时，给于所有敌人1层虚弱。",
+    "description": "在每场战斗开始时，给于所有敌人1层虚弱。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RED_MASK",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，给于所有敌人1层虚弱。",
+    "title": "红面具"
+  },
+  "RELIC.RED_SKULL": {
+    "canonical_text": "遗物｜红头骨｜稀有度Common｜效果：当你的生命值低于或等于50%时，你额外获得3点力量",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "当你的生命值低于或等于50%时，你额外获得3点力量",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RED_SKULL",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "当你的生命值低于或等于50%时，你额外获得3点力量",
+    "title": "红头骨"
+  },
+  "RELIC.REGALITE": {
+    "canonical_text": "遗物｜君王矿石｜稀有度Uncommon｜效果：每当你生成一张无色牌时，获得2点格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "每当你生成一张无色牌时，获得2点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.REGALITE",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当你生成一张无色牌时，获得2点格挡。",
+    "title": "君王矿石"
+  },
+  "RELIC.REGAL_PILLOW": {
+    "canonical_text": "遗物｜皇家枕头｜稀有度Common｜效果：在休息时，额外回复15点生命。",
+    "description": "在休息时，额外回复15点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.REGAL_PILLOW",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在休息时，额外回复15点生命。",
+    "title": "皇家枕头"
+  },
+  "RELIC.REPTILE_TRINKET": {
+    "canonical_text": "遗物｜爬行动物饰品｜稀有度Uncommon｜效果：当你使用药水时，在本回合获得3力量。",
+    "description": "当你使用药水时，在本回合获得3力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.REPTILE_TRINKET",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "当你使用药水时，在本回合获得3力量。",
+    "title": "爬行动物饰品"
+  },
+  "RELIC.RINGING_TRIANGLE": {
+    "canonical_text": "遗物｜三角铃鼓｜稀有度Shop｜效果：在每场战斗的第一回合保留你的手牌。",
+    "description": "在每场战斗的第一回合保留你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RINGING_TRIANGLE",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在每场战斗的第一回合保留你的手牌。",
+    "title": "三角铃鼓"
+  },
+  "RELIC.RING_OF_THE_DRAKE": {
+    "canonical_text": "遗物｜长蛇戒指｜稀有度Starter｜效果：在战斗开始时的前3个回合，你额外抽2张牌。",
+    "description": "在战斗开始时的前3个回合，你额外抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RING_OF_THE_DRAKE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在战斗开始时的前3个回合，你额外抽2张牌。",
+    "title": "长蛇戒指"
+  },
+  "RELIC.RING_OF_THE_SNAKE": {
+    "canonical_text": "遗物｜蛇之戒指｜稀有度Starter｜效果：在每场战斗开始时，额外抽2张牌。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "在每场战斗开始时，额外抽2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RING_OF_THE_SNAKE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Starter",
+    "summary": "在每场战斗开始时，额外抽2张牌。",
+    "title": "蛇之戒指"
+  },
+  "RELIC.RIPPLE_BASIN": {
+    "canonical_text": "遗物｜波纹水盆｜稀有度Uncommon｜效果：如果你在本回合中没有打出过攻击牌，则获得4点格挡。",
+    "description": "如果你在本回合中没有打出过攻击牌，则获得4点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RIPPLE_BASIN",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "如果你在本回合中没有打出过攻击牌，则获得4点格挡。",
+    "title": "波纹水盆"
+  },
+  "RELIC.ROYAL_POISON": {
+    "canonical_text": "遗物｜王室猛毒｜稀有度Event｜效果：在每场战斗开始时，失去4点生命。",
+    "description": "在每场战斗开始时，失去4点生命。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.ROYAL_POISON",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在每场战斗开始时，失去4点生命。",
+    "title": "王室猛毒"
+  },
+  "RELIC.ROYAL_STAMP": {
+    "canonical_text": "遗物｜王室印章｜稀有度Shop｜效果：拾起时，从牌组中选择一张攻击牌或技能牌，为它附魔：0。",
+    "description": "拾起时，从牌组中选择一张攻击牌或技能牌，为它附魔：0。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.ROYAL_STAMP",
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "拾起时，从牌组中选择一张攻击牌或技能牌，为它附魔：0。",
+    "title": "王室印章"
+  },
+  "RELIC.RUINED_HELMET": {
+    "canonical_text": "遗物｜损毁头盔｜稀有度Rare｜效果：你在每场战斗中第一次获得的力量值翻倍。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "你在每场战斗中第一次获得的力量值翻倍。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RUINED_HELMET",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你在每场战斗中第一次获得的力量值翻倍。",
+    "title": "损毁头盔"
+  },
+  "RELIC.RUNIC_CAPACITOR": {
+    "canonical_text": "遗物｜符文电容器｜稀有度Shop｜效果：每场战斗开始时，获得3个额外充能球栏位。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "每场战斗开始时，获得3个额外充能球栏位。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RUNIC_CAPACITOR",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "每场战斗开始时，获得3个额外充能球栏位。",
+    "title": "符文电容器"
+  },
+  "RELIC.RUNIC_PYRAMID": {
+    "canonical_text": "遗物｜符文金字塔｜稀有度Ancient｜效果：你在回合结束时不再自动丢弃所有手牌。",
+    "description": "你在回合结束时不再自动丢弃所有手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.RUNIC_PYRAMID",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你在回合结束时不再自动丢弃所有手牌。",
+    "title": "符文金字塔"
+  },
+  "RELIC.SAI": {
+    "canonical_text": "遗物｜钗｜稀有度Ancient｜效果：在你的回合开始时，获得7点格挡。",
+    "description": "在你的回合开始时，获得7点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SAI",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在你的回合开始时，获得7点格挡。",
+    "title": "钗"
+  },
+  "RELIC.SAND_CASTLE": {
+    "canonical_text": "遗物｜沙堡｜稀有度Ancient｜效果：拾起时，随机升级6张牌。",
+    "description": "拾起时，随机升级6张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.SAND_CASTLE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，随机升级6张牌。",
+    "title": "沙堡"
+  },
+  "RELIC.SCREAMING_FLAGON": {
+    "canonical_text": "遗物｜尖叫酒壶｜稀有度Shop｜效果：如果你在回合结束时没有任何手牌，则对所有敌人造成20点伤害。",
+    "description": "如果你在回合结束时没有任何手牌，则对所有敌人造成20点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SCREAMING_FLAGON",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "如果你在回合结束时没有任何手牌，则对所有敌人造成20点伤害。",
+    "title": "尖叫酒壶"
+  },
+  "RELIC.SCROLL_BOXES": {
+    "canonical_text": "遗物｜卷轴箱｜稀有度Ancient｜效果：拾起时，失去所有金币，并从2个卡牌包中选择1包加入你的牌组。",
+    "description": "拾起时，失去所有金币，并从2个卡牌包中选择1包加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SCROLL_BOXES",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，失去所有金币，并从2个卡牌包中选择1包加入你的牌组。",
+    "title": "卷轴箱"
+  },
+  "RELIC.SEAL_OF_GOLD": {
+    "canonical_text": "遗物｜黄金印｜稀有度Ancient｜效果：在你的回合开始时，花费5金币来获得能量。",
+    "description": "在你的回合开始时，花费5金币来获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SEAL_OF_GOLD",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在你的回合开始时，花费5金币来获得能量。",
+    "title": "黄金印"
+  },
+  "RELIC.SEA_GLASS": {
+    "canonical_text": "遗物｜海玻璃｜稀有度Ancient｜效果：查看15张来自{Character.StringValue:cond:{}|其他角色}的牌。从中选择任意数量的卡牌加入你的牌组。",
+    "description": "查看15张来自{Character.StringValue:cond:{}|其他角色}的牌。从中选择任意数量的卡牌加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.SEA_GLASS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "查看15张来自{Character.StringValue:cond:{}|其他角色}的牌。从中选择任意数量的卡牌加入你的牌组。",
+    "title": "海玻璃"
+  },
+  "RELIC.SELF_FORMING_CLAY": {
+    "canonical_text": "遗物｜自成型黏土｜稀有度Uncommon｜效果：每当你在战斗中失去生命，就在下回合获得3点格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.IRONCLAD",
+        "name": "铁甲战士"
+      }
+    ],
+    "description": "每当你在战斗中失去生命，就在下回合获得3点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SELF_FORMING_CLAY",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "ironclad",
+        "id": "RELIC_POOL.IRONCLAD_RELIC_POOL",
+        "name": "IroncladRelicPool",
+        "type": "IroncladRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当你在战斗中失去生命，就在下回合获得3点格挡。",
+    "title": "自成型黏土"
+  },
+  "RELIC.SERE_TALON": {
+    "canonical_text": "遗物｜原初之爪｜稀有度Ancient｜效果：拾起时，将2张随机诅咒牌和3张许愿加入你的牌组。",
+    "description": "拾起时，将2张随机诅咒牌和3张许愿加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.SERE_TALON",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将2张随机诅咒牌和3张许愿加入你的牌组。",
+    "title": "原初之爪"
+  },
+  "RELIC.SHOVEL": {
+    "canonical_text": "遗物｜铲子｜稀有度Rare｜效果：现在你可以在休息处挖掘遗物。",
+    "description": "现在你可以在休息处挖掘遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SHOVEL",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "现在你可以在休息处挖掘遗物。",
+    "title": "铲子"
+  },
+  "RELIC.SHURIKEN": {
+    "canonical_text": "遗物｜手里剑｜稀有度Rare｜效果：你每在同一回合内打出3张攻击牌，获得1点力量。",
+    "description": "你每在同一回合内打出3张攻击牌，获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SHURIKEN",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每在同一回合内打出3张攻击牌，获得1点力量。",
+    "title": "手里剑"
+  },
+  "RELIC.SIGNET_RING": {
+    "canonical_text": "遗物｜图章戒指｜稀有度Ancient｜效果：拾起时，获得999金币。",
+    "description": "拾起时，获得999金币。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SIGNET_RING",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得999金币。",
+    "title": "图章戒指"
+  },
+  "RELIC.SILVER_CRUCIBLE": {
+    "canonical_text": "遗物｜白银熔炉｜稀有度Ancient｜效果：你遇到的前3次卡牌奖励将是被升级过的。你打开的第一个宝箱将是空的",
+    "description": "你遇到的前3次卡牌奖励将是被升级过的。你打开的第一个宝箱将是空的",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SILVER_CRUCIBLE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你遇到的前3次卡牌奖励将是被升级过的。你打开的第一个宝箱将是空的",
+    "title": "白银熔炉"
+  },
+  "RELIC.SLING_OF_COURAGE": {
+    "canonical_text": "遗物｜勇气投石索｜稀有度Shop｜效果：在与精英敌人战斗时，获得2点力量。",
+    "description": "在与精英敌人战斗时，获得2点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SLING_OF_COURAGE",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在与精英敌人战斗时，获得2点力量。",
+    "title": "勇气投石索"
+  },
+  "RELIC.SMALL_CAPSULE": {
+    "canonical_text": "遗物｜小型扭蛋｜稀有度Ancient｜效果：拾起时，获得一件随机遗物。",
+    "description": "拾起时，获得一件随机遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SMALL_CAPSULE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得一件随机遗物。",
+    "title": "小型扭蛋"
+  },
+  "RELIC.SNECKO_EYE": {
+    "canonical_text": "遗物｜异蛇之眼｜稀有度Ancient｜效果：每回合多抽2张牌。每场战斗开始时获得混乱效果。",
+    "description": "每回合多抽2张牌。每场战斗开始时获得混乱效果。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SNECKO_EYE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "每回合多抽2张牌。每场战斗开始时获得混乱效果。",
+    "title": "异蛇之眼"
+  },
+  "RELIC.SNECKO_SKULL": {
+    "canonical_text": "遗物｜异蛇头骨｜稀有度Common｜效果：每当你给予敌人中毒时，所给予的中毒层数增加1层。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "每当你给予敌人中毒时，所给予的中毒层数增加1层。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SNECKO_SKULL",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "每当你给予敌人中毒时，所给予的中毒层数增加1层。",
+    "title": "异蛇头骨"
+  },
+  "RELIC.SOZU": {
+    "canonical_text": "遗物｜添水｜稀有度Ancient｜效果：你无法再获得药水。在每回合开始时获得能量。",
+    "description": "你无法再获得药水。在每回合开始时获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SOZU",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你无法再获得药水。在每回合开始时获得能量。",
+    "title": "添水"
+  },
+  "RELIC.SPARKLING_ROUGE": {
+    "canonical_text": "遗物｜闪亮口红｜稀有度Uncommon｜效果：在你的第3回合开始时，获得1点力量和1点敏捷。",
+    "description": "在你的第3回合开始时，获得1点力量和1点敏捷。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SPARKLING_ROUGE",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      },
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在你的第3回合开始时，获得1点力量和1点敏捷。",
+    "title": "闪亮口红"
+  },
+  "RELIC.SPIKED_GAUNTLETS": {
+    "canonical_text": "遗物｜带刺手甲｜稀有度Ancient｜效果：在每回合开始时获得能量。能力牌的耗能增加1能量。",
+    "description": "在每回合开始时获得能量。能力牌的耗能增加1能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SPIKED_GAUNTLETS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每回合开始时获得能量。能力牌的耗能增加1能量。",
+    "title": "带刺手甲"
+  },
+  "RELIC.STONE_CALENDAR": {
+    "canonical_text": "遗物｜历石｜稀有度Rare｜效果：在第7回合结束时，对所有敌人造成52点伤害。",
+    "description": "在第7回合结束时，对所有敌人造成52点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STONE_CALENDAR",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在第7回合结束时，对所有敌人造成52点伤害。",
+    "title": "历石"
+  },
+  "RELIC.STONE_CRACKER": {
+    "canonical_text": "遗物｜碎石钻｜稀有度Uncommon｜效果：在每场战斗开始时，在本场战斗中随机升级你抽牌堆中的2张牌。",
+    "description": "在每场战斗开始时，在本场战斗中随机升级你抽牌堆中的2张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STONE_CRACKER",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，在本场战斗中随机升级你抽牌堆中的2张牌。",
+    "title": "碎石钻"
+  },
+  "RELIC.STONE_HUMIDIFIER": {
+    "canonical_text": "遗物｜石炉加湿器｜稀有度Ancient｜效果：每当你在休息处休息时，将你的最大生命值提升5点。",
+    "description": "每当你在休息处休息时，将你的最大生命值提升5点。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STONE_HUMIDIFIER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "每当你在休息处休息时，将你的最大生命值提升5点。",
+    "title": "石炉加湿器"
+  },
+  "RELIC.STORYBOOK": {
+    "canonical_text": "遗物｜故事书｜稀有度Ancient｜效果：拾起时，将1张至亮之焰添加到你的牌组中。",
+    "description": "拾起时，将1张至亮之焰添加到你的牌组中。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STORYBOOK",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将1张至亮之焰添加到你的牌组中。",
+    "title": "故事书"
+  },
+  "RELIC.STRAWBERRY": {
+    "canonical_text": "遗物｜草莓｜稀有度Common｜效果：拾起时，将你的最大生命值提升7。",
+    "description": "拾起时，将你的最大生命值提升7。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.STRAWBERRY",
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "拾起时，将你的最大生命值提升7。",
+    "title": "草莓"
+  },
+  "RELIC.STRIKE_DUMMY": {
+    "canonical_text": "遗物｜打击木偶｜稀有度Common｜效果：名字中有“打击”的卡牌造成3点额外伤害。",
+    "description": "名字中有“打击”的卡牌造成3点额外伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STRIKE_DUMMY",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "名字中有“打击”的卡牌造成3点额外伤害。",
+    "title": "打击木偶"
+  },
+  "RELIC.STURDY_CLAMP": {
+    "canonical_text": "遗物｜坚固钳子｜稀有度Rare｜效果：可以跨回合保留最多10点格挡。",
+    "description": "可以跨回合保留最多10点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.STURDY_CLAMP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "可以跨回合保留最多10点格挡。",
+    "title": "坚固钳子"
+  },
+  "RELIC.SWORD_OF_JADE": {
+    "canonical_text": "遗物｜玉之剑｜稀有度Event｜效果：在每场战斗开始时，获得3点力量。",
+    "description": "在每场战斗开始时，获得3点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SWORD_OF_JADE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在每场战斗开始时，获得3点力量。",
+    "title": "玉之剑"
+  },
+  "RELIC.SWORD_OF_STONE": {
+    "canonical_text": "遗物｜石之剑｜稀有度Event｜效果：在击败5名精英敌人之后将变化为一件强力遗物。",
+    "description": "在击败5名精英敌人之后将变化为一件强力遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SWORD_OF_STONE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在击败5名精英敌人之后将变化为一件强力遗物。",
+    "title": "石之剑"
+  },
+  "RELIC.SYMBIOTIC_VIRUS": {
+    "canonical_text": "遗物｜共生病毒｜稀有度Uncommon｜效果：在每场战斗开始时，生成1个黑暗充能球。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.DEFECT",
+        "name": "故障机器人"
+      }
+    ],
+    "description": "在每场战斗开始时，生成1个黑暗充能球。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.SYMBIOTIC_VIRUS",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "defect",
+        "id": "RELIC_POOL.DEFECT_RELIC_POOL",
+        "name": "DefectRelicPool",
+        "type": "DefectRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，生成1个黑暗充能球。",
+    "title": "共生病毒"
+  },
+  "RELIC.TANXS_WHISTLE": {
+    "canonical_text": "遗物｜坦克斯的哨子｜稀有度Ancient｜效果：拾起时，将1张吹哨加入你的牌组。",
+    "description": "拾起时，将1张吹哨加入你的牌组。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TANXS_WHISTLE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将1张吹哨加入你的牌组。",
+    "title": "坦克斯的哨子"
+  },
+  "RELIC.TEA_OF_DISCOURTESY": {
+    "canonical_text": "遗物｜无礼之茶｜稀有度Event｜效果：在下一场战斗开始时，将2张晕眩放入你的抽牌堆。",
+    "description": "在下一场战斗开始时，将2张晕眩放入你的抽牌堆。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TEA_OF_DISCOURTESY",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在下一场战斗开始时，将2张晕眩放入你的抽牌堆。",
+    "title": "无礼之茶"
+  },
+  "RELIC.THE_ABACUS": {
+    "canonical_text": "遗物｜算盘｜稀有度Shop｜效果：你每次将抽牌堆洗牌时，获得6点格挡。",
+    "description": "你每次将抽牌堆洗牌时，获得6点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.THE_ABACUS",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "你每次将抽牌堆洗牌时，获得6点格挡。",
+    "title": "算盘"
+  },
+  "RELIC.THE_BOOT": {
+    "canonical_text": "遗物｜发条靴｜稀有度Event｜效果：每当你造成小于等于4点未被格挡的攻击伤害时，将伤害提升为5。",
+    "description": "每当你造成小于等于4点未被格挡的攻击伤害时，将伤害提升为5。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.THE_BOOT",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "每当你造成小于等于4点未被格挡的攻击伤害时，将伤害提升为5。",
+    "title": "发条靴"
+  },
+  "RELIC.THE_COURIER": {
+    "canonical_text": "遗物｜送货员｜稀有度Rare｜效果：商人的卡牌、遗物和药水不再会卖光，并且所有商品打折20%。",
+    "description": "商人的卡牌、遗物和药水不再会卖光，并且所有商品打折20%。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.THE_COURIER",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "商人的卡牌、遗物和药水不再会卖光，并且所有商品打折20%。",
+    "title": "送货员"
+  },
+  "RELIC.THROWING_AXE": {
+    "canonical_text": "遗物｜投斧｜稀有度Ancient｜效果：你在每场战斗中打出的第一张牌会多打出一次。",
+    "description": "你在每场战斗中打出的第一张牌会多打出一次。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.THROWING_AXE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "你在每场战斗中打出的第一张牌会多打出一次。",
+    "title": "投斧"
+  },
+  "RELIC.TINGSHA": {
+    "canonical_text": "遗物｜铜钹｜稀有度Uncommon｜效果：你每在你的回合丢弃一张牌，就对一名随机敌人造成3点伤害。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "你每在你的回合丢弃一张牌，就对一名随机敌人造成3点伤害。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TINGSHA",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每在你的回合丢弃一张牌，就对一名随机敌人造成3点伤害。",
+    "title": "铜钹"
+  },
+  "RELIC.TINY_MAILBOX": {
+    "canonical_text": "遗物｜小邮箱｜稀有度Uncommon｜效果：每当你休息时，获得2瓶随机药水。",
+    "description": "每当你休息时，获得2瓶随机药水。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TINY_MAILBOX",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每当你休息时，获得2瓶随机药水。",
+    "title": "小邮箱"
+  },
+  "RELIC.TOASTY_MITTENS": {
+    "canonical_text": "遗物｜烘焙手套｜稀有度Ancient｜效果：在你的回合开始时，消耗你抽牌堆顶部的牌并获得1点力量。",
+    "description": "在你的回合开始时，消耗你抽牌堆顶部的牌并获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TOASTY_MITTENS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在你的回合开始时，消耗你抽牌堆顶部的牌并获得1点力量。",
+    "title": "烘焙手套"
+  },
+  "RELIC.TOOLBOX": {
+    "canonical_text": "遗物｜工具箱｜稀有度Shop｜效果：在每场战斗开始时，从3张随机无色牌中选择1张加入你的手牌。",
+    "description": "在每场战斗开始时，从3张随机无色牌中选择1张加入你的手牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TOOLBOX",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "在每场战斗开始时，从3张随机无色牌中选择1张加入你的手牌。",
+    "title": "工具箱"
+  },
+  "RELIC.TOUCH_OF_OROBAS": {
+    "canonical_text": "遗物｜欧洛巴斯之触｜稀有度Ancient｜效果：拾起时，将{StarterRelic.StringValue:cond:{StarterRelic}替换为{UpgradedRelic}|你的初始遗物替换为先古版本}。",
+    "description": "拾起时，将{StarterRelic.StringValue:cond:{StarterRelic}替换为{UpgradedRelic}|你的初始遗物替换为先古版本}。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TOUCH_OF_OROBAS",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，将{StarterRelic.StringValue:cond:{StarterRelic}替换为{UpgradedRelic}|你的初始遗物替换为先古版本}。",
+    "title": "欧洛巴斯之触"
+  },
+  "RELIC.TOUGH_BANDAGES": {
+    "canonical_text": "遗物｜结实绷带｜稀有度Rare｜效果：你每在你的回合丢弃一张牌，就获得3点格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "你每在你的回合丢弃一张牌，就获得3点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TOUGH_BANDAGES",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每在你的回合丢弃一张牌，就获得3点格挡。",
+    "title": "结实绷带"
+  },
+  "RELIC.TOXIC_EGG": {
+    "canonical_text": "遗物｜毒素之蛋｜稀有度Rare｜效果：每当你获得技能牌时，将其升级。",
+    "description": "每当你获得技能牌时，将其升级。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TOXIC_EGG",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "每当你获得技能牌时，将其升级。",
+    "title": "毒素之蛋"
+  },
+  "RELIC.TOY_BOX": {
+    "canonical_text": "遗物｜玩具盒｜稀有度Ancient｜效果：拾起时，获得4件蜡制遗物。每经过3场战斗，你最左侧的蜡制遗物将会融化。",
+    "description": "拾起时，获得4件蜡制遗物。每经过3场战斗，你最左侧的蜡制遗物将会融化。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.TOY_BOX",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，获得4件蜡制遗物。每经过3场战斗，你最左侧的蜡制遗物将会融化。",
+    "title": "玩具盒"
+  },
+  "RELIC.TRI_BOOMERANG": {
+    "canonical_text": "遗物｜三刃回旋镖｜稀有度Ancient｜效果：从你的牌组中选择3张攻击牌。为这些牌附魔：本能。",
+    "description": "从你的牌组中选择3张攻击牌。为这些牌附魔：本能。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TRI_BOOMERANG",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "从你的牌组中选择3张攻击牌。为这些牌附魔：本能。",
+    "title": "三刃回旋镖"
+  },
+  "RELIC.TUNGSTEN_ROD": {
+    "canonical_text": "遗物｜钨合金棍｜稀有度Rare｜效果：你每次失去生命时，减少失去的生命值1点。",
+    "description": "你每次失去生命时，减少失去的生命值1点。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TUNGSTEN_ROD",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你每次失去生命时，减少失去的生命值1点。",
+    "title": "钨合金棍"
+  },
+  "RELIC.TUNING_FORK": {
+    "canonical_text": "遗物｜音叉｜稀有度Uncommon｜效果：你每打出10张技能牌，获得7点格挡。",
+    "description": "你每打出10张技能牌，获得7点格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TUNING_FORK",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "你每打出10张技能牌，获得7点格挡。",
+    "title": "音叉"
+  },
+  "RELIC.TWISTED_FUNNEL": {
+    "canonical_text": "遗物｜扭曲漏斗｜稀有度Uncommon｜效果：在每场战斗开始时，给予所有敌人4层中毒。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.SILENT",
+        "name": "静默猎手"
+      }
+    ],
+    "description": "在每场战斗开始时，给予所有敌人4层中毒。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.TWISTED_FUNNEL",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "silent",
+        "id": "RELIC_POOL.SILENT_RELIC_POOL",
+        "name": "SilentRelicPool",
+        "type": "SilentRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "在每场战斗开始时，给予所有敌人4层中毒。",
+    "title": "扭曲漏斗"
+  },
+  "RELIC.UNCEASING_TOP": {
+    "canonical_text": "遗物｜不休陀螺｜稀有度Rare｜效果：在你的回合，当你没有手牌时，抽一张牌。",
+    "description": "在你的回合，当你没有手牌时，抽一张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.UNCEASING_TOP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在你的回合，当你没有手牌时，抽一张牌。",
+    "title": "不休陀螺"
+  },
+  "RELIC.UNDYING_SIGIL": {
+    "canonical_text": "遗物｜不死符文｜稀有度Shop｜效果：当敌人的灾厄层数大于等于其生命值时，它造成的伤害降低50%。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.NECROBINDER",
+        "name": "亡灵契约师"
+      }
+    ],
+    "description": "当敌人的灾厄层数大于等于其生命值时，它造成的伤害降低50%。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.UNDYING_SIGIL",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "necrobinder",
+        "id": "RELIC_POOL.NECROBINDER_RELIC_POOL",
+        "name": "NecrobinderRelicPool",
+        "type": "NecrobinderRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "当敌人的灾厄层数大于等于其生命值时，它造成的伤害降低50%。",
+    "title": "不死符文"
+  },
+  "RELIC.UNSETTLING_LAMP": {
+    "canonical_text": "遗物｜不安油灯｜稀有度Rare｜效果：你在每场战斗中第一次打出能给予敌人负面状态的牌时，将其效果翻倍。",
+    "description": "你在每场战斗中第一次打出能给予敌人负面状态的牌时，将其效果翻倍。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.UNSETTLING_LAMP",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "你在每场战斗中第一次打出能给予敌人负面状态的牌时，将其效果翻倍。",
+    "title": "不安油灯"
+  },
+  "RELIC.VAJRA": {
+    "canonical_text": "遗物｜金刚杵｜稀有度Common｜效果：在每场战斗开始时，获得1点力量。",
+    "description": "在每场战斗开始时，获得1点力量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VAJRA",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "在每场战斗开始时，获得1点力量。",
+    "title": "金刚杵"
+  },
+  "RELIC.VAMBRACE": {
+    "canonical_text": "遗物｜臂甲｜稀有度Uncommon｜效果：每场战斗中，你第一次从卡牌中获得的格挡值翻倍。",
+    "description": "每场战斗中，你第一次从卡牌中获得的格挡值翻倍。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VAMBRACE",
+    "is_tradable": true,
+    "merchant_cost": 225,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Uncommon",
+    "summary": "每场战斗中，你第一次从卡牌中获得的格挡值翻倍。",
+    "title": "臂甲"
+  },
+  "RELIC.VELVET_CHOKER": {
+    "canonical_text": "遗物｜天鹅绒颈圈｜稀有度Ancient｜效果：在每回合开始时获得能量。你每回合不能打出超过6张牌。",
+    "description": "在每回合开始时获得能量。你每回合不能打出超过6张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VELVET_CHOKER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每回合开始时获得能量。你每回合不能打出超过6张牌。",
+    "title": "天鹅绒颈圈"
+  },
+  "RELIC.VENERABLE_TEA_SET": {
+    "canonical_text": "遗物｜古茶具套装｜稀有度Common｜效果：到达休息处后的下一场战斗开始时额外获得能量。",
+    "description": "到达休息处后的下一场战斗开始时额外获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VENERABLE_TEA_SET",
+    "is_tradable": true,
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "到达休息处后的下一场战斗开始时额外获得能量。",
+    "title": "古茶具套装"
+  },
+  "RELIC.VERY_HOT_COCOA": {
+    "canonical_text": "遗物｜烫嘴可可｜稀有度Ancient｜效果：在每场战斗的第一回合额外获得能量。",
+    "description": "在每场战斗的第一回合额外获得能量。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VERY_HOT_COCOA",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每场战斗的第一回合额外获得能量。",
+    "title": "烫嘴可可"
+  },
+  "RELIC.VEXING_PUZZLEBOX": {
+    "canonical_text": "遗物｜烦人机关盒｜稀有度Rare｜效果：在每场战斗开始时，将一张随机卡牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "description": "在每场战斗开始时，将一张随机卡牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VEXING_PUZZLEBOX",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "在每场战斗开始时，将一张随机卡牌加入你的手牌。这张牌在本回合可以免费打出。",
+    "title": "烦人机关盒"
+  },
+  "RELIC.VITRUVIAN_MINION": {
+    "canonical_text": "遗物｜维特鲁威仆从｜稀有度Shop｜效果：名字中有“仆从”的卡牌造成双倍的伤害与格挡。",
+    "character_owners": [
+      {
+        "id": "CHARACTER.REGENT",
+        "name": "储君"
+      }
+    ],
+    "description": "名字中有“仆从”的卡牌造成双倍的伤害与格挡。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.VITRUVIAN_MINION",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "regent",
+        "id": "RELIC_POOL.REGENT_RELIC_POOL",
+        "name": "RegentRelicPool",
+        "type": "RegentRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "名字中有“仆从”的卡牌造成双倍的伤害与格挡。",
+    "title": "维特鲁威仆从"
+  },
+  "RELIC.WAR_HAMMER": {
+    "canonical_text": "遗物｜战锤｜稀有度Ancient｜效果：每当你击败一名精英敌人的时候，随机升级4张牌。",
+    "description": "每当你击败一名精英敌人的时候，随机升级4张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WAR_HAMMER",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "每当你击败一名精英敌人的时候，随机升级4张牌。",
+    "title": "战锤"
+  },
+  "RELIC.WAR_PAINT": {
+    "canonical_text": "遗物｜战纹涂料｜稀有度Common｜效果：拾起时，随机升级2张技能牌。",
+    "description": "拾起时，随机升级2张技能牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.WAR_PAINT",
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "拾起时，随机升级2张技能牌。",
+    "title": "战纹涂料"
+  },
+  "RELIC.WHETSTONE": {
+    "canonical_text": "遗物｜磨刀石｜稀有度Common｜效果：拾起时，随机升级2张攻击牌。",
+    "description": "拾起时，随机升级2张攻击牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.WHETSTONE",
+    "merchant_cost": 175,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Common",
+    "summary": "拾起时，随机升级2张攻击牌。",
+    "title": "磨刀石"
+  },
+  "RELIC.WHISPERING_EARRING": {
+    "canonical_text": "遗物｜低语耳环｜稀有度Ancient｜效果：在每个回合开始时，获得能量。瓦库将接管你的第一回合。",
+    "description": "在每个回合开始时，获得能量。瓦库将接管你的第一回合。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WHISPERING_EARRING",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "在每个回合开始时，获得能量。瓦库将接管你的第一回合。",
+    "title": "低语耳环"
+  },
+  "RELIC.WHITE_BEAST_STATUE": {
+    "canonical_text": "遗物｜白兽雕像｜稀有度Rare｜效果：战斗结束后必定掉落药水。",
+    "description": "战斗结束后必定掉落药水。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WHITE_BEAST_STATUE",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "战斗结束后必定掉落药水。",
+    "title": "白兽雕像"
+  },
+  "RELIC.WHITE_STAR": {
+    "canonical_text": "遗物｜白星｜稀有度Rare｜效果：精英敌人额外掉落一次稀有卡牌奖励。",
+    "description": "精英敌人额外掉落一次稀有卡牌奖励。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WHITE_STAR",
+    "is_tradable": true,
+    "merchant_cost": 275,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Rare",
+    "summary": "精英敌人额外掉落一次稀有卡牌奖励。",
+    "title": "白星"
+  },
+  "RELIC.WING_CHARM": {
+    "canonical_text": "遗物｜羽翼护符｜稀有度Shop｜效果：每次卡牌奖励中，都会有随机一张牌被附魔：迅捷1。",
+    "description": "每次卡牌奖励中，都会有随机一张牌被附魔：迅捷1。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WING_CHARM",
+    "is_tradable": true,
+    "merchant_cost": 200,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.SHARED_RELIC_POOL",
+        "name": "SharedRelicPool",
+        "type": "SharedRelicPool"
+      }
+    ],
+    "rarity": "Shop",
+    "summary": "每次卡牌奖励中，都会有随机一张牌被附魔：迅捷1。",
+    "title": "羽翼护符"
+  },
+  "RELIC.WONGOS_MYSTERY_TICKET": {
+    "canonical_text": "遗物｜旺购神秘券｜稀有度Event｜效果：在5场战斗后，获得随机3件遗物。",
+    "description": "在5场战斗后，获得随机3件遗物。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WONGOS_MYSTERY_TICKET",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "在5场战斗后，获得随机3件遗物。",
+    "title": "旺购神秘券"
+  },
+  "RELIC.WONGO_CUSTOMER_APPRECIATION_BADGE": {
+    "canonical_text": "遗物｜旺购客户感恩徽章｜稀有度Event｜效果：没有任何作用。",
+    "description": "没有任何作用。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "id": "RELIC.WONGO_CUSTOMER_APPRECIATION_BADGE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Event",
+    "summary": "没有任何作用。",
+    "title": "旺购客户感恩徽章"
+  },
+  "RELIC.YUMMY_COOKIE": {
+    "canonical_text": "遗物｜美味饼干｜稀有度Ancient｜效果：拾起时，升级4张牌。",
+    "description": "拾起时，升级4张牌。",
+    "flavor": "这个遗物的细节将在未来揭晓……",
+    "has_upon_pickup_effect": true,
+    "id": "RELIC.YUMMY_COOKIE",
+    "merchant_cost": 999,
+    "pools": [
+      {
+        "energyColorName": "colorless",
+        "id": "RELIC_POOL.EVENT_RELIC_POOL",
+        "name": "EventRelicPool",
+        "type": "EventRelicPool"
+      }
+    ],
+    "rarity": "Ancient",
+    "summary": "拾起时，升级4张牌。",
+    "title": "美味饼干"
+  },
+  "__meta__": {
+    "entity_count": 291,
+    "generated_at_utc": "2026-04-05T05:15:38+00:00",
+    "generator": "import_sts2_exporter_items.py",
+    "mod": {
+      "game_assembly_version": "0.1.0.0",
+      "id": "sts2-bridge",
+      "name": "STS2 MCP Bridge",
+      "version": "0.7.12"
+    },
+    "source": "sts2-exporter",
+    "source_items_json": "sts2-export/items.json"
+  }
+}

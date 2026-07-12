@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from muzero.demo_dataset import load_demo_dataset
 from sts2_env.human_demo_recorder import HumanDemoRecorder
@@ -10,7 +11,7 @@ from sts2_env.human_demo_recorder import HumanDemoRecorder
 
 class HumanDemoRecorderTests(unittest.TestCase):
     def test_recorded_decision_loads_as_demo_sample(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"STS2_ARTIFACT_ROOT": tmp}):
             recorder = HumanDemoRecorder(output_dir=tmp, session_id="human_test")
             try:
                 obs = {
@@ -62,7 +63,7 @@ class HumanDemoRecorderTests(unittest.TestCase):
             self.assertEqual(samples[0].reason_tags, ["lethal"])
 
     def test_terminal_decision_records_hp_loss_and_turns(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"STS2_ARTIFACT_ROOT": tmp}):
             recorder = HumanDemoRecorder(output_dir=tmp, session_id="human_terminal")
             try:
                 obs = {

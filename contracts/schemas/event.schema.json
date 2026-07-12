@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/event.schema.json",
+  "title": "Player-visible frontier revision event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "event_type",
+    "api_version",
+    "schema_version",
+    "session_id",
+    "state_version",
+    "captured_at_utc",
+    "visibility",
+    "screen"
+  ],
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "event_type": {
+      "const": "frontier"
+    },
+    "api_version": {
+      "const": "2.0.0"
+    },
+    "schema_version": {
+      "const": "2026-07-11.1"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "captured_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "visibility": {
+      "const": "player"
+    },
+    "screen": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}

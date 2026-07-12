@@ -3,11 +3,31 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv-wsl-rocm}"
+CHECKOUT_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+ARTIFACT_ROOT="${STS2_ARTIFACT_ROOT:-$HOME/.sts2-artifacts}"
+if [[ "$ARTIFACT_ROOT" != /* ]]; then
+  echo "[wsl-rocm] STS2_ARTIFACT_ROOT must be an absolute WSL path: $ARTIFACT_ROOT" >&2
+  exit 2
+fi
+ARTIFACT_ROOT="$(realpath -m -- "$ARTIFACT_ROOT")"
+if [[ "$ARTIFACT_ROOT" == "/" ||
+      "$ARTIFACT_ROOT" == "$CHECKOUT_ROOT" ||
+      "$ARTIFACT_ROOT" == "$CHECKOUT_ROOT/"* ||
+      "$CHECKOUT_ROOT" == "$ARTIFACT_ROOT/"* ]]; then
+  echo "[wsl-rocm] artifact root must be disjoint from the source checkout: $ARTIFACT_ROOT" >&2
+  exit 2
+fi
+export STS2_ARTIFACT_ROOT="$ARTIFACT_ROOT"
+VENV_DIR="${VENV_DIR:-$ARTIFACT_ROOT/environments/wsl-rocm}"
 BOOTSTRAP_SCRIPT="$SCRIPT_DIR/bootstrap_wsl_rocm.sh"
 RELAY_PS_SCRIPT="$SCRIPT_DIR/start_wsl_bridge_relay.ps1"
 
-DEFAULT_SESSION_DIR_WSL="/mnt/c/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge"
+windows_appdata_win="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)' | tr -d '\r')"
+if [[ -z "$windows_appdata_win" ]]; then
+  echo "[wsl-rocm] Could not resolve the Windows roaming AppData directory." >&2
+  exit 2
+fi
+DEFAULT_SESSION_DIR_WSL="${STS2_BRIDGE_SESSION_DIR:-$(wslpath -u "$windows_appdata_win")/SlayTheSpire2/bridge}"
 # Prefer the indexed bridge session produced by the current multi-instance
 # bridge.  The unindexed session.json can be stale and has caused 401s during
 # long-running MuZero restarts; keep it only as a fallback for older setups.
@@ -63,7 +83,11 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     data = json.load(handle)
-print(data["token"])
+tokens = data.get("capability_tokens") or {}
+token = str(tokens.get("training") or "")
+if not token:
+    raise SystemExit("Session descriptor has no scoped training capability token")
+print(token)
 PY
 )"
 
@@ -74,7 +98,7 @@ import urllib.request
 port = int(os.environ["BRIDGE_PORT"])
 token = os.environ["BRIDGE_TOKEN"]
 req = urllib.request.Request(
-    f"http://127.0.0.1:{port}/health",
+    f"http://127.0.0.1:{port}/v2/health",
     headers={"Authorization": f"Bearer {token}"},
 )
 with urllib.request.urlopen(req, timeout=5) as resp:
@@ -84,12 +108,22 @@ then
   export STS2_BRIDGE_BASE_URL="http://127.0.0.1:${bridge_port}/"
 else
   relay_port="${STS2_BRIDGE_RELAY_PORT:-$((bridge_port + 1000))}"
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$relay_ps_win" \
-    -SessionFile "$session_file_win" \
-    -ListenHost '0.0.0.0' \
-    -ListenPort "$relay_port" \
-    >/dev/null
-  export STS2_BRIDGE_BASE_URL="http://host.docker.internal:${relay_port}/"
+  relay_host="${STS2_BRIDGE_RELAY_HOST:-$(awk '/^nameserver[[:space:]]+/{print $2; exit}' /etc/resolv.conf)}"
+  if [[ ! "$relay_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "[wsl-rocm] Could not resolve the explicit Windows WSL-interface IPv4 address; set STS2_BRIDGE_RELAY_HOST." >&2
+    exit 2
+  fi
+  relay_args=(
+    -NoProfile -ExecutionPolicy Bypass -File "$relay_ps_win"
+    -SessionFile "$session_file_win"
+    -ListenHost "$relay_host"
+    -ListenPort "$relay_port"
+  )
+  if [[ -n "${STS2_BRIDGE_RELAY_CLIENT_CIDR:-}" ]]; then
+    relay_args+=( -AllowClientCidr "$STS2_BRIDGE_RELAY_CLIENT_CIDR" )
+  fi
+  powershell.exe "${relay_args[@]}" >/dev/null
+  export STS2_BRIDGE_BASE_URL="http://${relay_host}:${relay_port}/"
 fi
 
 echo "[wsl-rocm] STS2_BRIDGE_SESSION_FILE=$STS2_BRIDGE_SESSION_FILE"
@@ -101,7 +135,7 @@ import urllib.request
 
 base_url = os.environ["STS2_BRIDGE_BASE_URL"].rstrip("/")
 token = os.environ["BRIDGE_TOKEN"]
-req = urllib.request.Request(f"{base_url}/health", headers={"Authorization": f"Bearer {token}"})
+req = urllib.request.Request(f"{base_url}/v2/health", headers={"Authorization": f"Bearer {token}"})
 with urllib.request.urlopen(req, timeout=5) as resp:
     print(f"[wsl-rocm] final bridge health={resp.status}")
 PY

@@ -1,8 +1,8 @@
 """Convert exported STS2 offline JSONL datasets into a mirrored Parquet tree.
 
 Examples:
-    python convert_offline_datasets_to_parquet.py E:/game/project/sts2_mcp/datasets
-    python convert_offline_datasets_to_parquet.py E:/game/project/sts2_mcp/datasets --output-root E:/game/project/sts2_mcp/datasets/parquet
+    python convert_offline_datasets_to_parquet.py <ARTIFACT_ROOT>/datasets
+    python convert_offline_datasets_to_parquet.py <ARTIFACT_ROOT>/datasets --output-root <ARTIFACT_ROOT>/datasets/parquet
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -105,8 +107,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_root = Path(args.input_root)
-    output_root = Path(args.output_root) if args.output_root else input_root / "parquet"
+    input_root = resolve_external_input_path(args.input_root)
+    output_root = resolve_artifact_path(args.output_root, default="datasets/parquet")
     output_root.mkdir(parents=True, exist_ok=True)
 
     jsonl_files = _collect_jsonl_files(input_root, output_root)

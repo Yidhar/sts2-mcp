@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "sts2-contracts",
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "action_schema_version": "2.0.0",
+  "legal_action_ordering_version": "2.0.0",
+  "observation_schema_version": "5.0.0",
+  "reward_schema_version": "2.0.0",
+  "capabilities": [
+    "player-control",
+    "training",
+    "legacy-privileged"
+  ],
+  "schemas": [
+    "schemas/session-descriptor.schema.json",
+    "schemas/health.schema.json",
+    "schemas/state.schema.json",
+    "schemas/event.schema.json",
+    "schemas/command.schema.json",
+    "schemas/command-result.schema.json",
+    "schemas/environment.schema.json",
+    "schemas/transition.schema.json"
+  ],
+  "fixtures": {
+    "fixtures/session.player-control.json": "schemas/session-descriptor.schema.json",
+    "fixtures/session.training-enabled.json": "schemas/session-descriptor.schema.json",
+    "fixtures/session.legacy-enabled.json": "schemas/session-descriptor.schema.json",
+    "fixtures/health.public.json": "schemas/health.schema.json#/$defs/public",
+    "fixtures/health.ok.json": "schemas/health.schema.json#/$defs/authenticated_v2",
+    "fixtures/state.player-control.json": "schemas/state.schema.json",
+    "fixtures/event.frontier.json": "schemas/event.schema.json",
+    "fixtures/command.play-card.json": "schemas/command.schema.json",
+    "fixtures/command-result.committed.json": "schemas/command-result.schema.json",
+    "fixtures/command-result.accepted.json": "schemas/command-result.schema.json",
+    "fixtures/command-result.executing.json": "schemas/command-result.schema.json",
+    "fixtures/command-result.outcome-unknown.json": "schemas/command-result.schema.json",
+    "fixtures/command-result.rejected.json": "schemas/command-result.schema.json",
+    "fixtures/environment.reset-request.json": "schemas/environment.schema.json#/$defs/reset_request",
+    "fixtures/environment.step-request.json": "schemas/environment.schema.json#/$defs/step_request",
+    "fixtures/environment.result.json": "schemas/environment.schema.json#/$defs/result",
+    "fixtures/environment.spec.json": "schemas/environment.schema.json#/$defs/spec_response",
+    "fixtures/environment.state.json": "schemas/environment.schema.json#/$defs/state_response",
+    "fixtures/environment.combat-catalog.json": "schemas/environment.schema.json#/$defs/combat_catalog_response",
+    "fixtures/environment.command-result.json": "schemas/environment.schema.json#/$defs/operation_result",
+    "fixtures/transition.combat-victory.json": "schemas/transition.schema.json"
+  }
+}

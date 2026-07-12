@@ -8,31 +8,22 @@ hard-coded ``Path(...) / ...`` snippets to training, strategy, or search wiring.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from sts2_rl.artifacts import artifact_root as default_artifact_root
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+
+DEFAULT_TRAINING_LOG_DIR = "runs"
+DEFAULT_TRAINING_CHECKPOINT_DIR = "checkpoints"
 
 
 def _expand_path(value: str | os.PathLike[str] | Path) -> Path:
     """Expand env vars and ``~`` without resolving symlinks or requiring exist."""
 
     return Path(os.path.expandvars(os.fspath(value))).expanduser()
-
-
-def _resolve_under(base: Path, value: str | os.PathLike[str] | Path | None) -> Path | None:
-    """Resolve a possibly-relative path under ``base``.
-
-    ``Path.resolve`` is intentionally avoided because many training paths are
-    created lazily and may not exist when configuration is parsed.
-    """
-
-    if value in (None, ""):
-        return None
-    path = _expand_path(value)
-    if path.is_absolute():
-        return path
-    return base / path
 
 
 def _module_file(directory: Path, module_name: str | os.PathLike[str] | Path) -> Path:
@@ -88,12 +79,13 @@ def default_package_root() -> Path:
 class RunPaths:
     """Runtime artifact paths for one MuZero training run.
 
-    Relative CLI paths are interpreted under ``package_root`` to preserve the
-    current launch-script behavior from ``packages/rl-agent``.
+    Relative CLI paths are interpreted under ``artifact_root``.  Package and
+    repository roots remain source-code discovery boundaries only.
     """
 
     repo_root: Path
     package_root: Path
+    artifact_root: Path
     log_dir: Path
     checkpoint_dir: Path
     resume_from: Path | None = None
@@ -105,7 +97,8 @@ class RunPaths:
         *,
         package_root: str | os.PathLike[str] | Path | None = None,
         repo_root: str | os.PathLike[str] | Path | None = None,
-    ) -> "RunPaths":
+        artifact_root: str | os.PathLike[str] | Path | None = None,
+    ) -> RunPaths:
         """Build paths from an argparse-like object.
 
         Expected attributes are ``log_dir``, ``checkpoint_dir`` and optional
@@ -115,18 +108,28 @@ class RunPaths:
 
         pkg = _expand_path(package_root) if package_root is not None else default_package_root()
         repo = _expand_path(repo_root) if repo_root is not None else _find_repo_root(pkg)
-        log_dir = _resolve_under(pkg, getattr(args, "log_dir", None))
-        checkpoint_dir = _resolve_under(pkg, getattr(args, "checkpoint_dir", None))
-        if log_dir is None:
-            raise ValueError("RunPaths.from_args requires args.log_dir")
-        if checkpoint_dir is None:
-            raise ValueError("RunPaths.from_args requires args.checkpoint_dir")
+        raw_artifacts = _expand_path(artifact_root) if artifact_root is not None else default_artifact_root()
+        artifacts = resolve_artifact_path(".", root=raw_artifacts)
+        raw_log_dir = getattr(args, "log_dir", None)
+        raw_checkpoint_dir = getattr(args, "checkpoint_dir", None)
+        log_dir = resolve_artifact_path(raw_log_dir, default=DEFAULT_TRAINING_LOG_DIR, root=artifacts)
+        checkpoint_dir = resolve_artifact_path(
+            raw_checkpoint_dir,
+            default=DEFAULT_TRAINING_CHECKPOINT_DIR,
+            root=artifacts,
+        )
+        raw_resume_from = getattr(args, "resume_from", None)
         return cls(
             repo_root=repo,
             package_root=pkg,
+            artifact_root=artifacts,
             log_dir=log_dir,
             checkpoint_dir=checkpoint_dir,
-            resume_from=_resolve_under(pkg, getattr(args, "resume_from", None)),
+            resume_from=(
+                resolve_external_input_path(raw_resume_from, root=artifacts)
+                if raw_resume_from not in (None, "")
+                else None
+            ),
         )
 
     @property
@@ -151,7 +154,11 @@ class RunPaths:
         return self.checkpoint_dir / "async_actor_scratch" / f"actor_{int(actor_index)}"
 
     def replay_buffer_path(self, checkpoint_dir: str | os.PathLike[str] | Path | None = None) -> Path:
-        base = _expand_path(checkpoint_dir) if checkpoint_dir is not None else self.checkpoint_dir
+        base = (
+            resolve_artifact_path(checkpoint_dir, root=self.artifact_root)
+            if checkpoint_dir is not None
+            else self.checkpoint_dir
+        )
         return base / "replay_buffer.pkl"
 
     def diagnostic_jsonl(self, filename: str) -> Path:
@@ -185,7 +192,7 @@ class StrategyModulePaths:
     def from_package_root(
         cls,
         package_root: str | os.PathLike[str] | Path | None = None,
-    ) -> "StrategyModulePaths":
+    ) -> StrategyModulePaths:
         pkg = _expand_path(package_root) if package_root is not None else default_package_root()
         muzero_root = pkg / "muzero"
         return cls(
@@ -244,7 +251,7 @@ class HeuristicSearchModulePaths:
     def from_package_root(
         cls,
         package_root: str | os.PathLike[str] | Path | None = None,
-    ) -> "HeuristicSearchModulePaths":
+    ) -> HeuristicSearchModulePaths:
         pkg = _expand_path(package_root) if package_root is not None else default_package_root()
         muzero_root = pkg / "muzero"
         return cls(
@@ -290,7 +297,7 @@ class PolicyModulePaths:
     def from_package_root(
         cls,
         package_root: str | os.PathLike[str] | Path | None = None,
-    ) -> "PolicyModulePaths":
+    ) -> PolicyModulePaths:
         pkg = _expand_path(package_root) if package_root is not None else default_package_root()
         muzero_root = pkg / "muzero"
         strategy = StrategyModulePaths.from_package_root(pkg)
@@ -348,6 +355,8 @@ class PolicyModulePaths:
 
 
 __all__ = [
+    "DEFAULT_TRAINING_CHECKPOINT_DIR",
+    "DEFAULT_TRAINING_LOG_DIR",
     "HeuristicSearchModulePaths",
     "PolicyModulePaths",
     "RunPaths",

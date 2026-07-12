@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/health.schema.json",
+  "title": "Bridge public and authenticated health envelopes",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/public"
+    },
+    {
+      "$ref": "#/$defs/authenticated_v2"
+    }
+  ],
+  "$defs": {
+    "public": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "ready",
+        "bridge_name",
+        "bridge_version",
+        "api_version",
+        "schema_version",
+        "api_versions"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "bridge_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bridge_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "api_version": {
+          "const": "2.0.0"
+        },
+        "schema_version": {
+          "const": "2026-07-11.1"
+        },
+        "api_versions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {
+            "const": "2.0.0"
+          },
+          "items": {
+            "enum": [
+              "2.0.0",
+              "legacy-v1"
+            ]
+          }
+        }
+      }
+    },
+    "authenticated_v2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport_alive",
+        "game_thread_alive",
+        "session_id",
+        "authorized_capability",
+        "api_version",
+        "schema_version",
+        "pump_tick",
+        "ms_since_last_pump",
+        "queue_depth",
+        "active_operation",
+        "last_snapshot_age_ms",
+        "capabilities",
+        "bridge_name",
+        "bridge_version",
+        "process_id",
+        "process_started_at_utc",
+        "heartbeat_timeout_ms",
+        "coordinator",
+        "mutation_gate",
+        "command_store",
+        "http"
+      ],
+      "properties": {
+        "transport_alive": {
+          "type": "boolean"
+        },
+        "game_thread_alive": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 128
+        },
+        "api_version": {
+          "const": "2.0.0"
+        },
+        "schema_version": {
+          "const": "2026-07-11.1"
+        },
+        "pump_tick": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ms_since_last_pump": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queue_depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active_operation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_snapshot_age_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "player-control",
+              "training",
+              "legacy-privileged"
+            ]
+          }
+        },
+        "bridge_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bridge_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "process_started_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "heartbeat_timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "coordinator": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "mutation_gate": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "command_store": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "in_flight_requests",
+            "max_concurrent_requests",
+            "max_concurrent_event_streams",
+            "max_request_body_bytes"
+          ],
+          "properties": {
+            "in_flight_requests": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_concurrent_requests": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_concurrent_event_streams": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_request_body_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "authorized_capability": {
+          "enum": [
+            "player-control",
+            "training",
+            "legacy-privileged"
+          ]
+        }
+      }
+    }
+  }
+}

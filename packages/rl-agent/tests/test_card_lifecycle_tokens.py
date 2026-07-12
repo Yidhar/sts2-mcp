@@ -29,13 +29,15 @@ RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_ROOT))
 
+from sts2_rl.game_data import resolve_game_data_file
+
 from sts2_env.card_lifecycle_tokens import (
     build_action_lifecycle_features,
     build_pile_summary_features,
 )
 
 
-PROFILES_PATH = RL_AGENT_ROOT / "content" / "card_effect_profiles.generated.json"
+PROFILES_PATH = resolve_game_data_file("card_effect_profiles.generated.json", required=True)
 
 
 def _load_profile(card_id: str) -> dict[str, Any]:

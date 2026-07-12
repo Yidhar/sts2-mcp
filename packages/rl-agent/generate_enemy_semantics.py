@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from content_registry import humanize_game_id
+from sts2_rl.game_data import repository_root, resolve_generated_game_data_output
 
-
-_DEFAULT_OUTPUT = Path(__file__).with_name("content") / "enemies.static.generated.json"
+_DEFAULT_OUTPUT = repository_root() / "game-data" / "generated" / "enemies.static.generated.json"
 _DISCOVERY_FALLBACK_IDS: tuple[str, ...] = (
     "MONSTER.BYRDONIS",
     "MONSTER.CEREMONIAL_BEAST",
@@ -621,12 +621,12 @@ def main() -> None:
     args = parser.parse_args()
 
     registry = build_enemy_registry(args.repo_root)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    output_path = resolve_generated_game_data_output(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(
+        (json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
     )
-    print(f"Wrote {len(registry)} enemy entries to {args.output}")
+    print(f"Wrote {len(registry)} enemy entries to {output_path}")
 
 
 if __name__ == "__main__":

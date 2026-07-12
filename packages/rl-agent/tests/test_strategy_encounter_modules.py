@@ -98,4 +98,3 @@ def test_insatiable_sandpit_countdown_context_and_raw_fallback():
         }
     }
     assert insatiable.sandpit_countdown_from_context({}, raw_obs) == 3.0
-

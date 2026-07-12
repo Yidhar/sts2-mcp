@@ -29,6 +29,7 @@ from muzero.demo_dataset import DemoSample, load_demo_dataset
 from muzero.sts2_env.muzero_buffer import MuZeroReplayBuffer
 from sts2_env.observation_common import MAX_ACTIONS
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
+from sts2_rl.artifacts import resolve_external_input_path
 
 
 def parse_human_demo_paths(raw: str | Sequence[str | Path] | None) -> tuple[Path, ...]:
@@ -45,7 +46,11 @@ def parse_human_demo_paths(raw: str | Sequence[str | Path] | None) -> tuple[Path
         parts = str(raw).replace(";", ",").split(",")
     else:
         parts = [str(part) for part in raw]
-    return tuple(Path(part.strip()) for part in parts if part and str(part).strip())
+    return tuple(
+        resolve_external_input_path(part.strip())
+        for part in parts
+        if part and str(part).strip()
+    )
 
 
 def _expand_jsonl_paths(paths: Iterable[Path]) -> tuple[Path, ...]:

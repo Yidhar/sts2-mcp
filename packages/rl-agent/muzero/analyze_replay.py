@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from combat_snapshot_dataset import infer_encounter_tier
+from sts2_rl.artifacts import resolve_external_input_path
 
 
 def load_replay_buffer(path: Path) -> list[Any]:
@@ -61,6 +62,8 @@ def main() -> None:
     parser.add_argument("--sample-negative", type=int, default=6)
     parser.add_argument("--trace-steps", type=int, default=12)
     args = parser.parse_args()
+
+    args.replay_buffer = resolve_external_input_path(args.replay_buffer)
 
     trajectories = load_replay_buffer(args.replay_buffer)
     print(json.dumps({"trajectory_count": len(trajectories)}, ensure_ascii=False))

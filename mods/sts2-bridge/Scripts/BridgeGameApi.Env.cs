@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Net;
 using System.Diagnostics;
 using System.Text.Json.Serialization;
@@ -119,6 +119,10 @@ internal static partial class BridgeGameApi
             },
             reward = new
             {
+                authority = "bridge-legacy-v1-only",
+                deprecated = true,
+                v2_authority = "external-rl",
+                v2_output = "transition_facts",
                 scalar = "room_settlement_milestone_v2",
                 optimized_components = new[]
                 {
@@ -771,6 +775,35 @@ internal static partial class BridgeGameApi
         }
 
         return episode;
+    }
+
+    public static void ValidateEnvEpisodeStepV2(string episodeId, int expectedStepIndex)
+    {
+        lock (EnvEpisodeSync)
+        {
+            if (_activeEnvEpisode is null ||
+                !_activeEnvEpisode.Id.Equals(episodeId, StringComparison.Ordinal))
+            {
+                throw new BridgeRequestException(
+                    HttpStatusCode.Conflict,
+                    "unknown_episode_id",
+                    $"Episode '{episodeId}' is not active. Call /v2/env/reset to start a new episode.");
+            }
+
+            if (_activeEnvEpisode.StepIndex != expectedStepIndex)
+            {
+                throw new BridgeRequestException(
+                    HttpStatusCode.Conflict,
+                    "step_index_conflict",
+                    $"Expected step_index {expectedStepIndex}, but the active episode is at {_activeEnvEpisode.StepIndex}.",
+                    new
+                    {
+                        episode_id = episodeId,
+                        expected_step_index = expectedStepIndex,
+                        current_step_index = _activeEnvEpisode.StepIndex
+                    });
+            }
+        }
     }
 
     private static BridgeEnvEpisode RequireActiveEnvEpisode(string episodeId)

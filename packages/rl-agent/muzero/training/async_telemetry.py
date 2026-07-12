@@ -24,6 +24,7 @@ from muzero.diagnostics.rest_site_metrics import REST_SITE_TB_KEYS
 from muzero.diagnostics.shop_metrics import SHOP_TB_KEYS
 from muzero.diagnostics.summoner_targeting import SUMMONER_TARGETING_TB_KEYS
 from muzero.diagnostics.target_priority import TARGET_PRIORITY_TB_KEYS
+from muzero.diagnostics.intent_combat_quality import INTENT_COMBAT_QUALITY_TB_KEYS
 from muzero.combat_quality.summoner_target_guard import SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES
 from muzero.combat_quality.target_priority_guard import TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES
 from muzero.training.card_reward_guard import CARD_REWARD_GUARD_SEARCH_SUFFIXES
@@ -412,6 +413,18 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
             trainer.writer.add_scalar(
                 f"combat/target_priority_{tag_suffix}",
                 _to_float(target_priority_metrics.get(meta_key)),
+                trainer.episode_count,
+            )
+
+    # Verify-first (Step 0): replay the UNBIASED intent_combat_quality metrics on the async
+    # learner writer so combat/intent_quality_* (play_card vs end_turn split, missed-lethal,
+    # no-block-under-pressure) survive the async path -- the sync path already emits these.
+    intent_combat_quality_metrics = episode_metrics.get("intent_combat_quality_metrics")
+    if isinstance(intent_combat_quality_metrics, dict):
+        for tag_suffix, meta_key in INTENT_COMBAT_QUALITY_TB_KEYS:
+            trainer.writer.add_scalar(
+                f"combat/intent_quality_{tag_suffix}",
+                _to_float(intent_combat_quality_metrics.get(meta_key)),
                 trainer.episode_count,
             )
 

@@ -1,0 +1,22 @@
+{
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "replayed_result": false,
+  "accepted_at_utc": "2026-07-11T12:00:00Z",
+  "committed_state_version": null,
+  "ok": false,
+  "request_id": "7da07b98-170b-4561-941b-d1a8fb53286d",
+  "status": "outcome_unknown",
+  "started_at_utc": "2026-07-11T12:00:00.010Z",
+  "completed_at_utc": "2026-07-11T12:00:05Z",
+  "error_code": "action_outcome_unknown",
+  "error_message": "The action may have started, but its final outcome could not be confirmed.",
+  "result": null,
+  "error": {
+    "code": "action_outcome_unknown",
+    "message": "The action may have started, but its final outcome could not be confirmed.",
+    "details": {
+      "action_handle": "combat:end-turn"
+    }
+  }
+}

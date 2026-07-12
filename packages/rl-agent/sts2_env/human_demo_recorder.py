@@ -21,9 +21,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sts2_rl.artifacts import resolve_artifact_path, validate_artifact_component
+
 
 SCHEMA_VERSION = 1
-DEFAULT_DEMO_DIR = Path(__file__).resolve().parents[1] / "human_demos"
+DEFAULT_DEMO_SUBDIR = "human_demos"
+DEFAULT_DEMO_DIR = resolve_artifact_path(None, default=DEFAULT_DEMO_SUBDIR)
+
+
+def default_demo_dir() -> Path:
+    """Return the current environment-scoped human-demo directory."""
+
+    return resolve_artifact_path(None, default=DEFAULT_DEMO_SUBDIR)
 
 
 def utc_timestamp() -> str:
@@ -31,7 +40,8 @@ def utc_timestamp() -> str:
 
 
 def local_session_id(prefix: str = "human") -> str:
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    safe_prefix = validate_artifact_component(prefix, label="human demo source")
+    return f"{safe_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
 def _jsonable(value: Any) -> Any:
@@ -260,9 +270,13 @@ class HumanDemoRecorder:
         source: str = "human",
         flush_each: bool = True,
     ) -> None:
-        self.session_id = session_id or local_session_id(source)
-        self.source = source
-        base = Path(output_dir or DEFAULT_DEMO_DIR)
+        self.source = validate_artifact_component(source, label="human demo source")
+        self.session_id = (
+            validate_artifact_component(session_id, label="human demo session_id")
+            if session_id is not None
+            else local_session_id(self.source)
+        )
+        base = resolve_artifact_path(output_dir, default=DEFAULT_DEMO_SUBDIR)
         # If the caller points at a .jsonl file, use it directly for decisions
         # and put sidecar files next to it.  Otherwise create a session dir.
         if base.suffix.lower() == ".jsonl":

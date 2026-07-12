@@ -14,19 +14,17 @@ Output:
 Usage:
   python probe_sim_vs_live_mechanics.py \\
     --encounter ENCOUNTER.LAGAVULIN_MATRIARCH_BOSS \\
-    --snapshot-pool E:/game/.../curated_combat_ironclad_mixed_provenance \\
+    --snapshot-pool <ARTIFACT_ROOT>/datasets/curated_combat_ironclad_mixed_provenance \\
     --curated-subset bootstrap_human_plus_local_all_roomwin_only_minus_combat_reset_failures \\
     --snapshot-seed 0 \\
-    --session-file C:/Users/.../bridge/session.json \\
+    --session-file <SESSION_FILE> \\
     --n-steps 15 \\
     --output-dir analysis/probes/mechanics_YYYYMMDD
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +33,7 @@ import numpy as np
 from combat_snapshot_dataset import CombatSnapshotPool, snapshot_row_to_reset_kwargs
 from sts2_env.bridge_client import BridgeClient
 from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def _obs_enemies(obs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -192,13 +191,13 @@ def run_bridge(bridge, bridge_name: str, snapshot: dict, n_steps: int, out_path:
     rows: list[dict[str, Any]] = []
     rows.append(snapshot_step(reset_res, bridge_name, 0, None))
     episode_id = reset_res.get("episode_id")
+    legal = reset_res.get("legal_actions") or []
 
     for step in range(1, n_steps + 1):
         last = rows[-1]
         if last.get("done"):
             print(f"[{bridge_name}] terminal at step {step-1}, stopping")
             break
-        legal = reset_res.get("legal_actions") if step == 1 else prev_legal
         et_idx = find_end_turn_idx({"legal_actions": legal})
         if et_idx is None:
             # fall back to first action
@@ -208,7 +207,7 @@ def run_bridge(bridge, bridge_name: str, snapshot: dict, n_steps: int, out_path:
             action_label = "end_turn"
         step_res = bridge.step(episode_id=episode_id, action_index=et_idx)
         rows.append(snapshot_step(step_res, bridge_name, step, action_label))
-        prev_legal = step_res.get("legal_actions") or []
+        legal = step_res.get("legal_actions") or []
 
     with out_path.open("w", encoding="utf-8") as fh:
         for r in rows:
@@ -290,6 +289,18 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
+    args.snapshot_pool = str(resolve_external_input_path(args.snapshot_pool))
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
+    args.sim_exe_path = (
+        str(resolve_external_input_path(args.sim_exe_path))
+        if args.sim_exe_path
+        else None
+    )
+
     pool = CombatSnapshotPool.from_path(
         args.snapshot_pool,
         curated_subset=args.curated_subset,
@@ -301,7 +312,7 @@ def main() -> None:
           f"max_hp={snapshot.get('snapshot_max_hp')} deck_len={len(snapshot.get('deck_card_ids') or [])} "
           f"relics={len(snapshot.get('relic_ids_before') or [])}")
 
-    outdir = Path(args.output_dir)
+    outdir = resolve_artifact_path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     print("[probe] driving LIVE bridge...")

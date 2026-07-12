@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sts2_env.deck_quality import deck_quality_v2
-
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 DEFAULT_INPUTS = (
     "analysis/bootstrap_human_plus_local_act1clear.no_combat_reset_failed_rows.jsonl",
@@ -261,14 +261,14 @@ def main() -> None:
     parser.add_argument("--min-group-rows", type=int, default=10)
     args = parser.parse_args()
 
-    paths = [Path(p) for p in (args.input or DEFAULT_INPUTS)]
+    paths = [resolve_external_input_path(p) for p in (args.input or DEFAULT_INPUTS)]
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
         raise SystemExit(f"missing input(s): {missing}")
 
     report = build_report(paths, min_group_rows=max(int(args.min_group_rows), 1))
     if args.out:
-        out = Path(args.out)
+        out = resolve_artifact_path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 

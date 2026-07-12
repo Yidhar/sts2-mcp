@@ -122,7 +122,11 @@ def test_route_safety_guard_cli_and_metric_plumbing_present():
     self_play_src = (ROOT / "muzero" / "training" / "self_play.py").read_text(encoding="utf-8-sig")
     combined_src = train_src + "\n" + trainer_src + "\n" + cli_src + "\n" + cli_args_src + "\n" + async_telemetry_src + "\n" + self_play_src
     assert "--route-safety-guard" in cli_args_src
-    assert "route_safety_guard=args.route_safety_guard" in cli_src
+    # The typed configuration owns CLI-to-trainer plumbing; the old 94-key
+    # constructor call is intentionally gone.
+    assert "TrainingConfig.from_namespace(args)" in cli_src
+    assert "build_legacy_trainer(" in cli_src
+    assert "config=training_config" in cli_src
     assert "self.route_safety_guard_enabled = bool(route_safety_guard)" in trainer_src
     for key in (
         "route_safety_guard_applied",

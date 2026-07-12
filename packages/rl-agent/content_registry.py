@@ -1,6 +1,6 @@
 """Lightweight semantic text registry hooks for offline STS2 training.
 
-The registry merges optional layers under ``packages/rl-agent/content``:
+The registry merges optional layers under the repository ``game-data`` package:
 
 1. generated metadata, e.g. ``cards.generated.json``
 2. static extracted metadata, e.g. ``cards.static.generated.json``
@@ -17,8 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-
-_CONTENT_DIR = Path(__file__).with_name("content")
+from sts2_rl.game_data import resolve_game_data_file
 _CARD_SIGNAL_ORDER = (
     "damage",
     "hits",
@@ -146,7 +145,7 @@ def _load_registry(kind: str) -> dict[str, dict[str, Any]]:
         f"{kind}.static.generated.json",
         f"{kind}.json",
     ):
-        path = _CONTENT_DIR / filename
+        path = resolve_game_data_file(filename)
         if not path.exists():
             continue
         try:

@@ -1,0 +1,18 @@
+{
+  "episode_id": "episode-example-0001",
+  "step_index": 17,
+  "before_state_version": 100,
+  "after_state_version": 101,
+  "facts": {
+    "hp_delta": -2,
+    "gold_delta": 12,
+    "floor_delta": 0,
+    "cards_added": [],
+    "cards_removed": [],
+    "potions_added": [],
+    "potions_removed": [],
+    "room_entered": null,
+    "combat_result": "victory",
+    "terminal_reason": null
+  }
+}

@@ -15,6 +15,8 @@ from typing import Iterable
 
 import numpy as np
 
+from sts2_rl.artifacts import resolve_artifact_path
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # bge-small-zh-v1.5 output dimension
@@ -23,22 +25,9 @@ TEXT_DIM: int = 512
 _DEFAULT_MODEL = "BAAI/bge-small-zh-v1.5"
 
 def _resolve_default_cache_dir() -> str:
-    """Pick a writable cache directory. Prefer project-local, fallback to temp."""
-    # Try project-local first
-    local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".text_cache")
-    try:
-        os.makedirs(local, exist_ok=True)
-        # Quick write test
-        test = os.path.join(local, ".write_test")
-        with open(test, "w") as f:
-            f.write("ok")
-        os.remove(test)
-        return local
-    except OSError:
-        pass
-    # Fallback to temp dir
-    import tempfile
-    return os.path.join(tempfile.gettempdir(), "sts2_text_cache")
+    """Return the canonical persistent embedding-cache directory."""
+
+    return str(resolve_artifact_path(None, default="cache/text_embeddings"))
 
 
 def _candidate_hf_cache_roots() -> Iterable[Path]:
@@ -151,8 +140,7 @@ class TextEncoder:
         self.embed_dim: int = TEXT_DIM
 
         # Persistent cache directory
-        resolved_dir = cache_dir or _resolve_default_cache_dir()
-        self._cache_dir = Path(resolved_dir)
+        self._cache_dir = resolve_artifact_path(cache_dir if cache_dir is not None else _resolve_default_cache_dir())
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError:

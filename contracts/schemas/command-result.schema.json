@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/command-result.schema.json",
+  "title": "Bridge command result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "api_version",
+    "schema_version",
+    "request_id",
+    "status",
+    "replayed_result",
+    "accepted_at_utc",
+    "started_at_utc",
+    "completed_at_utc",
+    "committed_state_version",
+    "error_code",
+    "error_message",
+    "result",
+    "error"
+  ],
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "api_version": {
+      "const": "2.0.0"
+    },
+    "schema_version": {
+      "const": "2026-07-11.1"
+    },
+    "request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "status": {
+      "enum": [
+        "rejected_before_execution",
+        "accepted",
+        "executing",
+        "committed",
+        "outcome_unknown"
+      ]
+    },
+    "replayed_result": {
+      "type": "boolean"
+    },
+    "accepted_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "completed_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "committed_state_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Actual committed frontier revision when the operation surface publishes one; null is reserved for operation types without a trustworthy revision."
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error_message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/error"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/rejected"
+    },
+    {
+      "$ref": "#/$defs/accepted"
+    },
+    {
+      "$ref": "#/$defs/executing"
+    },
+    {
+      "$ref": "#/$defs/committed"
+    },
+    {
+      "$ref": "#/$defs/outcome_unknown"
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "details"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {}
+      }
+    },
+    "rejected": {
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "status": {
+          "const": "rejected_before_execution"
+        },
+        "started_at_utc": {
+          "type": "null"
+        },
+        "completed_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "committed_state_version": {
+          "type": "null"
+        },
+        "error_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error_message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      },
+      "type": "object"
+    },
+    "accepted": {
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "status": {
+          "const": "accepted"
+        },
+        "started_at_utc": {
+          "type": "null"
+        },
+        "completed_at_utc": {
+          "type": "null"
+        },
+        "committed_state_version": {
+          "type": "null"
+        },
+        "error_code": {
+          "type": "null"
+        },
+        "error_message": {
+          "type": "null"
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "type": "null"
+        }
+      },
+      "type": "object"
+    },
+    "executing": {
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "status": {
+          "const": "executing"
+        },
+        "started_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completed_at_utc": {
+          "type": "null"
+        },
+        "committed_state_version": {
+          "type": "null"
+        },
+        "error_code": {
+          "type": "null"
+        },
+        "error_message": {
+          "type": "null"
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "type": "null"
+        }
+      },
+      "type": "object"
+    },
+    "committed": {
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "status": {
+          "const": "committed"
+        },
+        "started_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completed_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "committed_state_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "error_code": {
+          "type": "null"
+        },
+        "error_message": {
+          "type": "null"
+        },
+        "result": {
+          "type": "object"
+        },
+        "error": {
+          "type": "null"
+        }
+      },
+      "type": "object"
+    },
+    "outcome_unknown": {
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "status": {
+          "const": "outcome_unknown"
+        },
+        "started_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completed_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "committed_state_version": {
+          "type": "null"
+        },
+        "error_code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error_message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "result": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/error"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

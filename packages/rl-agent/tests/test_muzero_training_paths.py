@@ -18,19 +18,26 @@ from muzero.training.paths import (
 )
 
 
-def test_run_paths_from_args_resolves_relative_paths_under_package_root(tmp_path: Path) -> None:
+def test_run_paths_from_args_resolves_relative_paths_under_artifact_root(tmp_path: Path) -> None:
     package_root = tmp_path / "repo" / "packages" / "rl-agent"
+    artifact_root = tmp_path / "artifacts"
     args = SimpleNamespace(
         log_dir="logs_muzero/run_a",
         checkpoint_dir="checkpoints_muzero/run_a",
         resume_from="checkpoints_muzero/base/muzero_step_00000042",
     )
 
-    paths = RunPaths.from_args(args, package_root=package_root, repo_root=tmp_path / "repo")
+    paths = RunPaths.from_args(
+        args,
+        package_root=package_root,
+        repo_root=tmp_path / "repo",
+        artifact_root=artifact_root,
+    )
 
-    assert paths.log_dir == package_root / "logs_muzero" / "run_a"
-    assert paths.checkpoint_dir == package_root / "checkpoints_muzero" / "run_a"
-    assert paths.resume_from == package_root / "checkpoints_muzero" / "base" / "muzero_step_00000042"
+    assert paths.artifact_root == artifact_root
+    assert paths.log_dir == artifact_root / "logs_muzero" / "run_a"
+    assert paths.checkpoint_dir == artifact_root / "checkpoints_muzero" / "run_a"
+    assert paths.resume_from == artifact_root / "checkpoints_muzero" / "base" / "muzero_step_00000042"
     assert paths.diagnostic_jsonl("loss_spikes") == paths.log_dir / "diagnostics" / "loss_spikes.jsonl"
     assert paths.checkpoint_step_dir(42) == paths.checkpoint_dir / "muzero_step_00000042"
     assert paths.async_actor_log_dir(2) == paths.log_dir / "async_actor_scratch" / "actor_2"
@@ -41,6 +48,7 @@ def test_run_paths_ensure_dirs_creates_artifact_directories(tmp_path: Path) -> N
     paths = RunPaths(
         repo_root=tmp_path,
         package_root=tmp_path / "packages" / "rl-agent",
+        artifact_root=tmp_path / "artifacts",
         log_dir=tmp_path / "logs" / "run_a",
         checkpoint_dir=tmp_path / "checkpoints" / "run_a",
     )
@@ -84,7 +92,7 @@ def test_strategy_and_heuristic_paths_reject_escape_paths(tmp_path: Path) -> Non
         heuristic.route_heuristic_file("score.txt")
 
 
-def test_file_budget_guard_allows_only_documented_legacy_debt(tmp_path: Path) -> None:
+def test_file_budget_guard_rejects_every_oversized_source(tmp_path: Path) -> None:
     package_root = tmp_path / "repo" / "packages" / "rl-agent"
     legacy_file = package_root / "muzero" / "sts2_env" / "muzero_model.py"
     new_file = package_root / "muzero" / "combat_quality" / "giant_policy.py"
@@ -97,9 +105,10 @@ def test_file_budget_guard_allows_only_documented_legacy_debt(tmp_path: Path) ->
 
     violations = find_file_budget_violations(package_root, roots=("muzero",))
 
-    assert [record.relative_path.as_posix() for record in violations] == [
-        "muzero/combat_quality/giant_policy.py"
-    ]
+    assert {record.relative_path.as_posix() for record in violations} == {
+        "muzero/sts2_env/muzero_model.py",
+        "muzero/combat_quality/giant_policy.py",
+    }
 
     all_over_budget = find_file_budget_violations(package_root, roots=("muzero",), include_legacy=True)
     assert {record.relative_path.as_posix() for record in all_over_budget} == {
@@ -113,13 +122,13 @@ def test_current_package_has_no_unbudgeted_large_python_files() -> None:
     violations = find_file_budget_violations(package_root)
 
     assert violations == []
-    legacy_records = [
+    over_budget_records = [
         record
         for record in collect_file_budget_records(package_root)
-        if record.over_budget and record.legacy_allowed
+        if record.over_budget
     ]
-    assert legacy_records
-    assert all(record.relative_path.as_posix() in DEFAULT_LEGACY_ALLOWLIST for record in legacy_records)
+    assert over_budget_records == []
+    assert DEFAULT_LEGACY_ALLOWLIST == {}
 
 
 def test_muzero_train_remains_thin_compatibility_entrypoint() -> None:

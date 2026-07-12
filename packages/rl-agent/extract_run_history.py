@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from run_history_parser import extract_run_history, write_extracted_run_history
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def _collect_run_files(input_path: Path) -> list[Path]:
@@ -40,12 +41,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_path = Path(args.input)
+    input_path = resolve_external_input_path(args.input)
     run_files = _collect_run_files(input_path)
     if not run_files:
         raise SystemExit(f"No .run files found under: {input_path}")
 
-    output_root = Path(args.output_dir) if args.output_dir else None
+    output_root = resolve_artifact_path(args.output_dir) if args.output_dir else None
 
     for run_file in run_files:
         bundle = extract_run_history(run_file)

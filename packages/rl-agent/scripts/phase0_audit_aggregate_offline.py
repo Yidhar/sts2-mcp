@@ -23,12 +23,16 @@ if str(ROOT) not in sys.path:
 
 # Reuse the same thresholds + key list as the live audit so output matches.
 from scripts.phase0_audit import (  # type: ignore
-    THRESHOLD,
-    SOFT_THRESHOLD,
     MIN_MAP_ACTIONS_FOR_PASS,
     MIN_MAP_STEPS_FOR_PASS,
     MIN_UNIQUE_CARDS_FOR_PASS,
-    ROUTE_SUMMARY_FULL_KEYS,
+    SOFT_THRESHOLD,
+    THRESHOLD,
+)
+from sts2_rl.artifacts import (
+    resolve_artifact_path,
+    resolve_external_input_path,
+    validate_artifact_component,
 )
 
 
@@ -228,12 +232,20 @@ def main() -> int:
 
     audit_paths: list[Path] = []
     for d in args.audit_dirs:
-        p = Path(d) / "audit.jsonl"
+        p = resolve_external_input_path(d) / "audit.jsonl"
         if not p.exists():
             print(f"missing {p}", file=sys.stderr)
             return 2
         audit_paths.append(p)
-    out_path = Path(args.out) if args.out else (Path(args.audit_dirs[0]) / "summary_offline.json")
+    default_name = validate_artifact_component(
+        f"{audit_paths[0].parent.name}-summary-offline.json",
+        label="phase-0 aggregate report name",
+    )
+    out_path = resolve_artifact_path(
+        args.out,
+        default=f"reports/phase0/{default_name}",
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     summary = aggregate_offline(audit_paths)
     summary["audit_paths"] = [str(p) for p in audit_paths]

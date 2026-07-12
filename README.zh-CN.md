@@ -1,153 +1,265 @@
-# sts2-mcp 🌌
+# sts2-mcp
 
-[![Chinese](https://img.shields.io/badge/lang-中文-red.svg)](#) [![English](https://img.shields.io/badge/lang-English-blue.svg)](./README.md)
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](#)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](./README.md)
 
-`sts2-mcp` 是一个为 **《杀戮尖塔 2》(Slay the Spire 2)** 打造的高性能本地控制栈。它利用 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 协议，在游戏的内部状态与外部 AI Agent 之间搭建了一座桥梁。
+`sts2-mcp` 是一个面向 **《杀戮尖塔 2》** 的本地控制与强化学习工程。
+C# Bridge 模组负责读取游戏事实并执行显式合法动作，TypeScript 服务通过
+Model Context Protocol（MCP）提供工具，Python 包负责当前 MuZero/token-memory
+智能体的训练与评估。
 
-与传统的截图识别 (Screen-scraping) 或 OCR 方案不同，`sts2-mcp` 通过一个**原生 C# 桥接模组 (Bridge Mod)** 直接提取精确的游戏数据并暴露合法动作，确保了 100% 的准确性和毫秒级的响应延迟。
+仓库目前处于 **architecture-v2 切换期**。v2 契约和能力模型是唯一的新开发
+目标；legacy v1 端点默认关闭，与剩余 Python 兼容包装一样，仅为显式迁移
+保留，禁止继续向其中增加新功能。
 
----
+> [!WARNING]
+> 本项目为非官方研究项目，与 Mega Crit 无隶属或背书关系。Bridge 在游戏
+> 进程内运行并能够改变存档状态。请备份存档和训练资产，仅在你有权使用的
+> 游戏版本上运行；游戏更新后可能需要重新适配。
 
-## 🏗️ 项目架构
+## 当前组件
 
-项目主要由两个核心组件组成：
+| 组件 | 版本 | 职责 |
+|---|---:|---|
+| [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema、OpenAPI、fixture 与跨语言版本常量 |
+| [`game-data/`](./game-data/README.md) | `1.0.0` | 有版本的卡牌、敌人、遗物、药水和效果资料 |
+| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | 游戏适配、可见状态、合法动作、串行命令与会话发现 |
+| [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | 使用官方 SDK 的 TypeScript MCP 服务；默认 `minimal` |
+| [`packages/rl-agent/`](./packages/rl-agent/muzero/README.md) | `0.2.0` | MuZero/token-memory、类型化环境、reward 与 checkpoint 迁移 |
+| [`tools/`](./tools) | — | 契约、数据、资产、发布、许可证和仓库检查 |
 
-### 1. `mods/sts2-bridge` (传感器与执行器)
-一个直接注入到《杀戮尖塔 2》进程中的 C#/.NET 9 模组。
-- **状态序列化**：将复杂的内部游戏对象（运行数据、战斗、奖励、地图等）转换为干净的 JSON。
-- **动作执行**：直接调用游戏方法执行出牌、选择和地图移动。
-- **自动发现**：自动创建 session 文件，方便 MCP 服务定位并连接。
+组件版本由 [`release-manifest.json`](./release-manifest.json) 协调。线协议以
+`contracts/manifest.json` 为准；组件行为以对应包 README 为准。
 
-### 2. `packages/mcp-server` (交互界面)
-基于 Node.js 22 的标准 MCP 协议实现。
-- **工具映射**：将桥接器的 HTTP 接口转换为标准的 MCP Tools。
-- **操作安全**：引入 `state_version` 保护机制，防止执行“过时”动作（例如尝试打出一张已经消耗掉的牌）。
-- **流程优化**：针对奖励、商店、营火等复杂场景实现批量化处理，大幅减少 LLM 的往返调用。
+## 架构与所有权
 
----
+```mermaid
+flowchart LR
+    A[MCP 客户端] --> M[TypeScript MCP 服务]
+    M -->|本机 HTTP/SSE；player-control token| B["C# Bridge 模组"]
+    B --> G[杀戮尖塔 2]
+    R[Python RL 训练器] --> L[LiveBackend]
+    R --> H[HeadlessBackend]
+    L -->|training token| B
+    H --> S[固定版本的 HeadlessSim]
+    C[contracts 2.0] --> M
+    C --> B
+    C --> R
+    D[game-data] --> M
+    D --> B
+    D --> R
+```
 
-## 🛠️ MCP 工具参考 (Tools)
+依赖和职责边界是强约束：
 
-该服务向任何兼容 MCP 的 Agent（如 Claude Desktop 或 Antigravity）暴露以下工具：
+- `contracts` 和 `game-data` 是所有运行时共同依赖的叶子包。
+- Bridge 只拥有游戏事实适配、合法动作、状态 revision、幂等突变仲裁、
+  session 生命周期和有界事件。
+- MCP 服务只拥有协议、输入校验、表现层和小型玩家控制 workflow；不拥有
+  reward、RL 状态、journal 或任意知识文件读取。
+- RL 包是 episode、observation、action encoding、reward、curriculum、replay、
+  model、checkpoint 和实验元数据的唯一所有者。
+- Bridge 与 MCP 不得通过 RL 包路径导入数据或代码。
+- checkpoint、数据集、日志、虚拟环境和发布二进制不属于源码仓。
 
-| 工具名称 | 功能描述 |
-| :--- | :--- |
-| `sts2_get_state` | 获取完整的当前游戏状态（界面、血量、卡组、遗物等）。 |
-| `sts2_get_deck` | 返回完整主牌组，适合商店、升级和 Boss 前的低频策略判断。 |
-| `sts2_list_actions` | 列出当前玩家所有合法的可选动作。 |
-| `sts2_perform_action` | 通过唯一的 Action ID 执行单个动作，并可通过 `return_state_after` 一并返回完整的后置原始状态。 |
-| `sts2_play_card_sequence` | 按顺序打出多张卡牌，并自动处理手牌索引重排。 |
-| `sts2_execute_combat_sequence` | 在一次调用中混合执行出牌、喝药和 `end_turn`，并自动处理重匹配。 |
-| `sts2_resolve_room_rewards` | 一键领取金币/药水，并可选择性地拿取卡牌奖励。 |
-| `sts2_resolve_rest_site` | 执行休息/锻造操作，并自动返回地图。 |
-| `sts2_resolve_card_selection` | 完美处理选牌、跳过或转化的弹出界面。 |
-| `sts2_pick_option` | 以统一索引方式选择奖励/事件/营火/选牌项，不再依赖原始 Action ID。 |
-| `sts2_travel_to_coordinate` | 自动吸收奖励/营火收尾并等待地图稳定后，再移动到指定坐标。 |
-| `sts2_resolve_shop_visit` | 在单次批量操作中购买多个物品并执行移除卡牌。 |
+详见 [`docs/architecture.md`](./docs/architecture.md)、已接受的
+[ADR](./docs/adr) 以及 [v2 切换门禁](./docs/migration/v2-cutover.md)。
 
----
+## v2 安全模型
 
-## 🚀 快速上手
+Bridge 发布相互独立的能力：
 
-### 环境要求
-- **操作系统**: Windows (目前《杀戮尖塔 2》仅支持 Windows)。
-- **运行环境**: [Node.js 22+](https://nodejs.org/)。
-- **游戏**: 已安装的正版《杀戮尖塔 2》。
+- **`player-control`**：仅玩家可见状态和显式合法动作；不能 reset、指定 seed、
+  启动 sandbox、导出 catalog 或暴露隐藏抽牌顺序。
+- **`training`**：使用独立 token 的特权 reset/step/sandbox。Bridge 默认关闭，
+  MCP 中只由显式 `debug` profile 暴露。
+- **catalog 工具**：静态导出和生成属于离线工具，不属于玩家控制 HTTP 突变。
 
-### 选项 A: 使用预编译版本 (推荐)
-1. 从 Releases 页面下载最新的 `sts2-bridge` 预编译包 (包含 DLL 等文件)。
-2. 在游戏的 `mods` 目录下创建一个名为 `sts2-bridge` 的文件夹。
-   - 例如: `<杀戮尖塔2安装目录>\mods\sts2-bridge`
-3. 将下载的文件放入该文件夹中。
+每个 v2 突变都必须携带调用方生成的 `request_id`、当前 `session_id`、能力、
+预期状态 revision 和 deadline。Bridge 串行处理全部游戏突变，在游戏主线程
+针对当前状态重新解析动作，并在协议公布的保留窗口内保留 identity/result。
+未过期的 request identity 绝不会为了腾出容量而被淘汰；容量满时会明确拒绝
+新请求。
 
-### 选项 B: 从源码编译
-如果你想自行编译桥接模组，你还需要安装 [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)。
-设置你的游戏安装路径并构建项目：
+legacy v1 突变不提供同等幂等保证。新版 MCP 对 legacy 突变只发送一次；
+timeout 被视为 `outcome_unknown`，不会自动重试。
+
+## 环境要求
+
+- 完整 Bridge 构建和 live-game 测试：Windows、你有权使用的《杀戮尖塔 2》。
+- Bridge core 测试与构建：[.NET SDK 9.0.308](https://dotnet.microsoft.com/)。
+- MCP 服务：[Node.js 22.14.0](https://nodejs.org/)，npm 10.9.2。
+- RL 与仓库工具：Python 3.11 及以上；可复现 CI 使用 3.13.3。
+
+[`global.json`](./global.json)、[`.nvmrc`](./.nvmrc)、MCP `packageManager` 与
+[`.python-version`](./.python-version) 分别精确固定 .NET、Node、npm 与 CI Python。
+
+## 快速开始：MCP 玩家控制
+
+### 1. 构建并测试 MCP
 
 ```powershell
-$env:STS2_DIR = "<杀戮尖塔2安装目录>"
+Set-Location .\packages\mcp-server
+npm ci
+npm run typecheck
+npm test
+Set-Location ..\..
+```
+
+### 2. 构建 Bridge
+
+完整构建需要已安装游戏的程序集：
+
+```powershell
+$env:STS2_DIR = '<PATH_TO_STS2>'
 dotnet build .\mods\sts2-bridge\sts2-bridge.csproj
 ```
-*注意：构建脚本会自动将生成的文件拷贝到游戏的 `mods\sts2-bridge` 文件夹中。*
 
-### 后续步骤...
+普通 build 不会部署到游戏；部署必须显式开启：
 
-1. **启动游戏**: 运行《杀戮尖塔 2》。桥接模组将初始化并在 `%APPDATA%\SlayTheSpire2\bridge\session.json` 生成会话文件。
-2. **启动 MCP 服务**:
 ```powershell
+dotnet build .\mods\sts2-bridge\sts2-bridge.csproj -p:Sts2Deploy=true
+```
+
+命令、幂等、环境和生命周期 core 测试不需要商业游戏程序集：
+
+```powershell
+dotnet run --project .\mods\sts2-bridge\tests\BridgeCore.Tests\BridgeCore.Tests.csproj --configuration Release
+```
+
+### 3. 启动游戏和 MCP
+
+Bridge 加载后会在当前用户 application-data 下的 STS2 `bridge` 目录写入
+session descriptor。不要打印或提交该文件，其中包含 bearer credential。
+
+正常使用必须启动默认最小 profile：
+
+```powershell
+$env:STS2_MCP_PROFILE = 'minimal'
 node .\packages\mcp-server\index.js
 ```
 
----
+配置 MCP host 时，复制 [`.mcp.example.json`](./.mcp.example.json)，把
+`<REPOSITORY_ROOT>` 替换成该 host 所需的 checkout 绝对路径，并保留
+`STS2_MCP_PROFILE=minimal`。默认 session 发现不需要写开发者目录；多实例时
+可显式设置 `STS2_BRIDGE_SESSION_FILE`。
 
-## 🗺️ 路线图 & TODO
+| Profile | 用途 |
+|---|---|
+| `minimal` | 默认玩家可见状态、合法动作、严格控制和安全等待 |
+| `strategic` | `minimal` 加 deck/map 视图和有序动作序列 |
+| `debug` | 特权本地开发与训练环境工具；禁止作为普通玩家配置 |
 
-- [ ] **更完善的 Tools**: 扩展 MCP 工具集，支持更细粒度的状态查询和复杂的动作序列。
-- [ ] **联机支持**: 允许 Agent 交互或管理游戏内的联机/合作模式机制。
-- [ ] **游戏内对话注入**: 将 AI 的策略文本和思考过程直接作为对话框内容注入到游戏中，提升交互的沉浸感。
+## RL 开发与训练
 
----
-
-## 📝 配置说明
-
-MCP 服务会自动寻找桥接会话文件。你可以通过环境变量手动覆盖：
-- `STS2_BRIDGE_SESSION_FILE`: 指向自定义会话 JSON 的路径。
-
-战斗调用说明：
-- 不要把连续出牌拆成并行的 `sts2_perform_action`。
-- 纯出牌回合优先使用 `sts2_play_card_sequence`。
-- 如果同一回合要混合出牌、喝药或结束回合，优先使用 `sts2_execute_combat_sequence`。
-
----
-
-## 🤖 统一 RL 流水线
-
-RL 分支现在使用同一条 checkpoint 链路贯穿三个阶段：
-
-1. 战斗沙盒 PPO
-2. 离线构筑 / 路线预训练
-3. 全流程 PPO
-
-正式入口是 [packages/rl-agent/train_pipeline.py](./packages/rl-agent/train_pipeline.py)。它会把每一阶段产出的 checkpoint 自动传给下一阶段。
-
-示例：
+当前受维护的正式入口是 **MuZero**，不是已归档 PPO `train_pipeline.py`：
 
 ```powershell
-python .\packages\rl-agent\train_pipeline.py `
-  --dataset-root .\datasets\parquet `
-  --character ironclad `
-  --session-file "$env:APPDATA\SlayTheSpire2\bridge\session.json" `
-  --stage2-partition-kind build_family `
-  --stage2-partition-value v0.98_to_v0.99.1
+Set-Location .\packages\rl-agent
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+$env:PIP_EXTRA_INDEX_URL = 'https://download.pytorch.org/whl/cpu'
+python -m pip install -r requirements-bootstrap.lock
+python -m pip install -r requirements-dev.lock
+python -m pip install -e . --no-deps --no-build-isolation
+python -m pytest tests -q -p no:cacheprovider
+python -m muzero.train --help
 ```
 
-如果不传 `--stage1-encounter-pool`，第一阶段现在会默认使用一组更贴近初始牌组难度的一幕前几层弱怪池。这个集合是根据已导出的 run 历史统计出来的：
-
-- `ENCOUNTER.SLIMES_WEAK`
-- `ENCOUNTER.SHRINKER_BEETLE_WEAK`
-- `ENCOUNTER.FUZZY_WURM_CRAWLER_WEAK`
-- `ENCOUNTER.NIBBITS_WEAK`
-
-固定评估的 holdout 池也默认切到未参与训练的一幕前几层弱怪：
-
-- `ENCOUNTER.CORPSE_SLUGS_WEAK`
-- `ENCOUNTER.SLUDGE_SPINNER_WEAK`
-- `ENCOUNTER.SEAPUNK_WEAK`
-- `ENCOUNTER.TOADPOLES_WEAK`
-
-如果你已经有战斗沙盒 checkpoint，想直接跳过第一阶段：
+token-memory 启动参数示例：
 
 ```powershell
-python .\packages\rl-agent\train_pipeline.py `
-  --dataset-root .\datasets\parquet `
-  --start-checkpoint .\pipeline_runs\some_run\stage1_sandbox\checkpoints\final `
-  --stop-after offline
+python -m muzero.train `
+  --obs-mode token_v3 `
+  --model-arch token_memory_v1 `
+  --mixed-precision auto
 ```
 
----
+正式实验必须显式选择 backend、scenario、seed、checkpoint、artifact 路径和
+资源上限。所选 backend 的 v2 环境与 parity 门禁未通过前，不要启动长训练。
+PPO 与历史 attention 路径已从受支持源码树移除；归档设计文档仅供参考，不能执行。
 
-## ⚖️ 免责声明与许可证
+## 契约与 game-data
 
-**免责声明**: 这是一个非官方的社区项目。它与 Mega Crit 或《杀戮尖塔 2》的开发者没有隶属关系、背书或关联。使用风险自负。
+当前契约标识：
 
-**许可证**: [MIT](./LICENSE)
+- API：`2.0.0`
+- schema：`2026-07-11.1`
+- action ordering：`2.0.0`
+- observation schema：`5.0.0`
+- reward schema：`2.0.0`
+
+在仓库根目录验证契约、生成文件、game-data、发布版本和仓库卫生：
+
+```powershell
+python .\tools\contracts\check_contracts.py
+python .\tools\game_data\verify_manifest.py
+python .\tools\release\check_versions.py
+python .\tools\ci\check_generated.py
+python .\tools\ci\check_repository.py
+```
+
+有意修改 game-data 后，重建确定性 manifest：
+
+```powershell
+python .\tools\game_data\build_manifest.py
+python .\tools\game_data\verify_manifest.py
+```
+
+消费者默认解析仓库内 [`game-data/`](./game-data)，也可使用
+`STS2_GAME_DATA_ROOT`。禁止新增对 `packages/rl-agent/content` 的依赖。
+
+## Artifact 边界
+
+checkpoint、optimizer、replay、dataset、log、虚拟环境、发布二进制、PID 和
+临时反编译文件必须位于源码 checkout 外，并通过 `STS2_ARTIFACT_ROOT` 配置。
+
+移动已有资产前必须停止所有 writer 并生成 inventory：
+
+```powershell
+python .\tools\artifacts\inventory.py --output '<ARTIFACT_ROOT>\pre-move-inventory.json'
+.\tools\artifacts\move_to_artifact_root.ps1 -ArtifactRoot '<ARTIFACT_ROOT>' -Mode DryRun
+```
+
+PowerShell 命令必须显式指定模式；先使用 `-Mode DryRun`，审核通过后才可使用 `-Mode Execute`。必须先审核
+inventory、备份、源路径和目标路径。工具拒绝覆盖已有目标。详见
+[`docs/runbooks/artifacts.md`](./docs/runbooks/artifacts.md)。
+
+## 测试矩阵
+
+| 层 | 命令 | 需要游戏？ |
+|---|---|---:|
+| 契约/数据/仓库 | 上述 `python tools/...` 检查 | 否 |
+| MCP | 在 `packages/mcp-server` 执行 `npm ci && npm run typecheck && npm test` | 否 |
+| Bridge core | `dotnet run --project mods/sts2-bridge/tests/BridgeCore.Tests/BridgeCore.Tests.csproj --configuration Release` | 否 |
+| Bridge 完整构建 | `dotnet build mods/sts2-bridge/sts2-bridge.csproj` | 是，需要引用程序集 |
+| RL | 在 `packages/rl-agent` 执行 `python -m pytest tests -q -p no:cacheprovider` | 多数测试不需要；live 测试需要 |
+| Live E2E | Bridge + MCP/player 或 RL backend smoke | 是 |
+
+CI 运行不依赖游戏的契约、卫生、MCP、Bridge-core 和 RL suite。由于零售游戏
+程序集不能提交，live-game 兼容性仍是显式的自托管/人工门禁。
+
+## 兼容与迁移警告
+
+- `legacy-v1` 只是双栈迁移面，不是最终安全或可靠性边界。
+- legacy 突变 timeout 的结果未知；应刷新状态并核对，禁止重发相同意图。
+- 普通 MCP 默认从历史 `debug` 改为 `minimal`。
+- 游戏突变必须提供严格的 `expected_state_version`。
+- training reset/step 需要 training capability；step 与 `episode_id`、
+  `expected_step_index` 绑定。
+- 旧 replay/checkpoint 不假定兼容。迁移必须校验 contract、action ordering、
+  observation、reward 和 game-data hash；不支持时 fail closed。
+- 历史 journal/knowledge、AutoSlay runner、Draft Tracker、PPO pipeline 文档、
+  已提交日志和发布二进制均不属于 v2 control-plane 源码。
+
+转换 live 环境或恢复旧实验前，必须阅读
+[`docs/migration/README.md`](./docs/migration/README.md)。
+
+## 文档
+
+[`docs/README.md`](./docs/README.md) 定义文档权威与归档规则。除非被规范文档
+明确引用为当前内容，带日期的实验计划均视为历史研究记录。
+
+## 许可证
+
+[MIT](./LICENSE)

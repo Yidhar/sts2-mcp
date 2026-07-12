@@ -6,14 +6,13 @@ sandbox training only samples rows that the current bridge contract can
 faithfully reconstruct as an opening combat state.
 
 Example:
-    python clean_combat_snapshot_dataset.py E:/game/project/sts2_mcp/datasets
+    python clean_combat_snapshot_dataset.py <ARTIFACT_ROOT>/datasets
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ import pyarrow.parquet as pq
 
 from combat_snapshot_dataset import clean_combat_snapshot_rows
 from convert_offline_datasets_to_parquet import _prepare_rows_for_arrow
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -73,7 +73,6 @@ def _update_manifest(
     manifest["combat_snapshot_filter_scope"] = "basic_filters_plus_strict_playable_rows"
     manifest["combat_snapshot_cleaning"] = {
         **clean_report,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
     if manifest_path.parent == dataset_root:
@@ -137,7 +136,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dataset_root = Path(args.dataset_root)
+    dataset_root = resolve_artifact_path(args.dataset_root)
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
     if not dataset_root.exists():
         raise SystemExit(f"Dataset root does not exist: {dataset_root}")
 
@@ -175,7 +179,6 @@ def main() -> None:
             "kept_rows": 0,
             "dropped_rows": 0,
         },
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     parquet_row_counts: dict[str, int] = {}
     global_source_runs: set[str] = set()

@@ -34,8 +34,10 @@ import collections
 import json
 from pathlib import Path
 
-SP_DIR = Path("data/skada_clean/sp")
-DEFAULT_OUT = Path("data/skada_bc/samples.jsonl")
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+
+SP_DIR = resolve_external_input_path(None, default="datasets/skada_clean/sp")
+DEFAULT_OUT = resolve_artifact_path(None, default="datasets/skada_bc/samples.jsonl")
 
 # Canonical STS2 starter decks. Validated against early-abandon runs where
 # final_deck ≈ starter. Per-character curses (Ascension 10+ = ASCENDERS_BANE)
@@ -337,10 +339,10 @@ def process_run(run_obj: dict) -> list[dict]:
     return samples
 
 
-def iter_sp_runs(limit: int):
+def iter_sp_runs(limit: int, *, sp_dir: Path = SP_DIR):
     count = 0
     for outcome in ("victory", "failure"):
-        for shard in sorted((SP_DIR / outcome).glob("*.jsonl")):
+        for shard in sorted((sp_dir / outcome).glob("*.jsonl")):
             with open(shard, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -358,10 +360,12 @@ def iter_sp_runs(limit: int):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0, help="0 = all SP runs")
-    parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--sp-dir", default=None, help="Cleaned Skada SP input root (default: artifact datasets).")
+    parser.add_argument("--out", default=None, help="BC JSONL output (default: artifact datasets).")
     args = parser.parse_args()
 
-    out_path = Path(args.out)
+    sp_dir = resolve_external_input_path(args.sp_dir, default="datasets/skada_clean/sp")
+    out_path = resolve_artifact_path(args.out, default="datasets/skada_bc/samples.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     stats = collections.Counter()
@@ -369,7 +373,7 @@ def main() -> None:
     chosen_idx_bad = collections.Counter()
 
     with open(out_path, "w", encoding="utf-8") as fout:
-        for run_obj, outcome in iter_sp_runs(args.limit):
+        for run_obj, outcome in iter_sp_runs(args.limit, sp_dir=sp_dir):
             stats[f"runs_{outcome}"] += 1
             samples = process_run(run_obj)
             for s in samples:

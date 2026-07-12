@@ -17,6 +17,12 @@ import sys
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
+
 
 DEFAULT_SCALAR_TAGS = (
     "buffer/size",
@@ -499,17 +505,20 @@ def render_report(run_dir: Path, *, recent_window: int, top_n: int) -> str:
     return "\n".join(lines)
 
 
-def resolve_run_dir(repo_dir: Path, run_dir_arg: str | None) -> Path:
+def resolve_run_dir(logs_root: Path, run_dir_arg: str | None) -> Path:
     if run_dir_arg:
-        path = Path(run_dir_arg).expanduser()
-        return path if path.is_absolute() else repo_dir / path
-    latest = (repo_dir / "logs_muzero/latest_lowmem_run_id.txt").read_text(encoding="utf-8").strip()
-    return repo_dir / "logs_muzero" / latest
+        return resolve_external_input_path(run_dir_arg, root=logs_root)
+    latest = (logs_root / "latest_lowmem_run_id.txt").read_text(encoding="utf-8").strip()
+    return logs_root / latest
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-dir", default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--logs-dir",
+        default=None,
+        help="Training logs root (default: <STS2_ARTIFACT_ROOT>/runs).",
+    )
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--recent-window", type=int, default=2000)
     parser.add_argument("--top-n", type=int, default=12)
@@ -519,13 +528,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    repo_dir = Path(args.repo_dir).expanduser().resolve()
-    run_dir = resolve_run_dir(repo_dir, args.run_dir)
+    logs_root = resolve_external_input_path(args.logs_dir, default="runs")
+    run_dir = resolve_run_dir(logs_root, args.run_dir)
     report = render_report(run_dir, recent_window=args.recent_window, top_n=args.top_n)
     if args.output:
-        output = Path(args.output).expanduser()
-        if not output.is_absolute():
-            output = repo_dir / output
+        output = resolve_artifact_path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report, encoding="utf-8")
         print(output)

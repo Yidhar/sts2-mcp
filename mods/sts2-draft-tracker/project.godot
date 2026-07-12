@@ -1,9 +1,0 @@
-; Engine configuration file.
-config_version=5
-
-[application]
-config/name="sts2-draft-tracker"
-config/features=PackedStringArray("4.5", "C#")
-
-[dotnet]
-project/assembly_name="sts2-draft-tracker"

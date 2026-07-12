@@ -3,9 +3,9 @@
 The Act1 recovery work should stop turning every tactical/build concern into
 an unconditional rule.  These tests lock the new split:
 
-* ``full`` keeps legacy overrides by default for backwards compatibility;
+* ``full`` is an explicit behavior-rule ablation mode;
 * ``emergency`` keeps only narrow survival/protocol guards;
-* ``off`` records telemetry but never rewrites the selected action.
+* ``off`` is the fail-closed default and never rewrites the selected action.
 """
 
 from __future__ import annotations
@@ -56,6 +56,38 @@ def test_cli_accepts_hard_guard_policy_modes():
 
     assert args.combat_hard_guard_policy == "emergency"
     assert args.build_hard_guard_policy == "off"
+
+
+def test_cli_defaults_disable_post_search_action_rewrites():
+    from muzero.training.cli_args import build_arg_parser
+
+    args = build_arg_parser().parse_args([])
+    assert args.combat_hard_guard_policy == "off"
+    assert args.build_hard_guard_policy == "off"
+    assert args.hard_guard_target_rewrite == "off"
+    assert args.route_safety_guard is False
+
+
+def test_dispatcher_default_never_calls_rewrite_guards():
+    trainer = _trainer()
+    cases = (
+        ("combat", "_apply_combat_action_hard_guards"),
+        ("build", "_apply_build_action_hard_guards"),
+        ("route", "_apply_route_action_hard_guards"),
+    )
+    for domain, method_name in cases:
+        stats: dict[str, float] = {}
+        with patch.object(trainer, method_name, side_effect=AssertionError("rewrite guard called")):
+            executed = trainer._apply_post_search_action_hard_guards(
+                decision_domain=domain,
+                action_idx=1,
+                legal_actions=[{"kind": "first"}, {"kind": "selected"}],
+                action_mask=np.array([1, 1], dtype=np.float32),
+                obs={},
+                info={},
+                search_stats=stats,
+            )
+        assert executed == 1
 
 
 def test_combat_hard_guard_off_returns_original_without_calling_guards():

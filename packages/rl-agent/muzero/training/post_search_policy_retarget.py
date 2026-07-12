@@ -8,6 +8,7 @@ from sts2_env.observation_v2 import MAX_ACTIONS
 
 
 POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES: dict[str, str] = {
+    "post_search_hard_guard_override_applied": "post_search_hard_guard_override_applied_rate",
     "post_search_hard_guard_policy_retargeted": "post_search_hard_guard_policy_retargeted_rate",
     "post_search_hard_guard_original_action_idx": "post_search_hard_guard_original_action_idx_mean",
     "post_search_hard_guard_final_action_idx": "post_search_hard_guard_final_action_idx_mean",
@@ -130,10 +131,51 @@ def retarget_search_policy_after_hard_guard(
     return rewritten, True
 
 
+def resolve_hard_guard_policy_target(
+    search_policy: Any,
+    *,
+    original_action_idx: int,
+    final_action_idx: int,
+    rewrite_target: bool,
+    max_actions: int = MAX_ACTIONS,
+) -> tuple[Any, bool, bool]:
+    """Decide the stored policy training target after a post-search hard guard (RC-4).
+
+    Returns ``(target_policy, policy_retargeted, override_applied)``.
+
+    * ``override_applied`` is True when the guard changed the executed action
+      (``original_action_idx != final_action_idx``).
+    * When ``rewrite_target`` is True (legacy), the target becomes a one-hot on the
+      guard's final action via :func:`retarget_search_policy_after_hard_guard`.
+    * When ``rewrite_target`` is False (default), the model's OWN pre-guard soft
+      search distribution is kept unchanged as the training target -- the guard is
+      a pure behaviour/safety wrapper and the executed (guard) action is still
+      stored separately as the replay ``action``. This keeps policy/value credit
+      assignment on-policy instead of training the network to imitate the guards.
+    """
+
+    try:
+        override_applied = int(original_action_idx) != int(final_action_idx)
+    except (TypeError, ValueError):
+        override_applied = False
+
+    if not rewrite_target:
+        return search_policy, False, override_applied
+
+    policy, retargeted = retarget_search_policy_after_hard_guard(
+        search_policy,
+        original_action_idx=original_action_idx,
+        final_action_idx=final_action_idx,
+        max_actions=max_actions,
+    )
+    return policy, retargeted, override_applied
+
+
 __all__ = [
     "POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES",
     "annotate_card_reward_final_selection",
     "compact_final_action_for_diagnostic",
     "final_action_is_skip",
+    "resolve_hard_guard_policy_target",
     "retarget_search_policy_after_hard_guard",
 ]

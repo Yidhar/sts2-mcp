@@ -49,6 +49,10 @@ class ActionHardGuardDispatchMixin:
             return action_idx
 
         if domain == "build":
+            policy = str(getattr(self, "build_hard_guard_policy", "off") or "off").strip().lower()
+            if policy not in {"full", "emergency"}:
+                stats["build_hard_guard_policy_off"] = 1.0
+                return idx
             guard = getattr(self, "_apply_build_action_hard_guards", None)
             if not callable(guard):
                 return idx
@@ -66,6 +70,8 @@ class ActionHardGuardDispatchMixin:
                 return idx
 
         if domain == "route":
+            if not bool(getattr(self, "route_safety_guard_enabled", False)):
+                return idx
             guard = getattr(self, "_apply_route_action_hard_guards", None)
             if not callable(guard):
                 return idx
@@ -83,6 +89,10 @@ class ActionHardGuardDispatchMixin:
                 return idx
 
         if domain == "combat":
+            policy = str(getattr(self, "combat_hard_guard_policy", "off") or "off").strip().lower()
+            if policy not in {"full", "emergency"}:
+                stats["combat_hard_guard_policy_off"] = 1.0
+                return idx
             guard = getattr(self, "_apply_combat_action_hard_guards", None)
             if not callable(guard):
                 return idx

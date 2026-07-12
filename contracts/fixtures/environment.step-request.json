@@ -1,0 +1,10 @@
+{
+  "request_id": "e497939c-d893-4f19-bfcf-59486855416a",
+  "session_id": "example-session-0001",
+  "episode_id": "episode-example-0001",
+  "expected_step_index": 17,
+  "action": {
+    "action_handle": "combat:end-turn",
+    "timeout_ms": 15000
+  }
+}

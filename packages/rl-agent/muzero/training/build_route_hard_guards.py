@@ -373,9 +373,9 @@ class BuildRouteHardGuardMixin:
         for key in deck_upgrade_target_guard_metric_keys():
             search_stats.setdefault(key, 0.0)
 
-        policy = str(getattr(self, "build_hard_guard_policy", "full") or "full").strip().lower()
+        policy = str(getattr(self, "build_hard_guard_policy", "off") or "off").strip().lower()
         if policy not in {"full", "emergency", "off"}:
-            policy = "full"
+            policy = "off"
         search_stats["build_hard_guard_policy_full"] = 1.0 if policy == "full" else 0.0
         search_stats["build_hard_guard_policy_emergency"] = 1.0 if policy == "emergency" else 0.0
         search_stats["build_hard_guard_policy_off"] = 1.0 if policy == "off" else 0.0

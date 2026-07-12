@@ -215,4 +215,3 @@ def aggregate_concrete_policy_to_semantic(
     if total > 1e-9:
         out /= total
     return out
-

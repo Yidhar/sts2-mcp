@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "release_channel": "architecture-v2",
+  "components": {
+    "bridge": "0.8.0",
+    "mcp_server": "0.5.0",
+    "rl_trainer": "0.2.0",
+    "contracts": "2.0.0",
+    "game_data": "1.0.0"
+  }
+}

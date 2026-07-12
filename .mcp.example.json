@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sts2": {
+      "command": "node",
+      "args": ["<REPOSITORY_ROOT>/packages/mcp-server/index.js"],
+      "env": {
+        "STS2_MCP_PROFILE": "minimal"
+      }
+    }
+  }
+}

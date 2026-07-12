@@ -1,0 +1,17 @@
+{
+  "name": "sts2-ai",
+  "url": "https://github.com/frankqwang/sts2-ai.git",
+  "commit": "459f30873eac374c160f0b409d2d8167e7eead7c",
+  "tree": "0712bffbcd18348eb81479c4f3c65b94b254a646",
+  "observed_branch": "sim-upgrade-0.103.2",
+  "destination": "dependencies/sts2-ai",
+  "license_status": "review-required",
+  "distribution_allowed": false,
+  "notes": [
+    "The audited local checkout did not expose a LICENSE, COPYING, or NOTICE file.",
+    "Do not publish source or bundled ONNX Runtime binaries until license review is complete.",
+    "HeadlessSim must have one canonical project before it is used in release builds."
+  ],
+  "canonical_headless_project": "STS2AI/ENV/Sim/HeadlessSim/HeadlessSim.csproj",
+  "excluded_duplicate_project": "STS2AI/ENV/Sim/Runtime/HeadlessSim/HeadlessSim.csproj"
+}

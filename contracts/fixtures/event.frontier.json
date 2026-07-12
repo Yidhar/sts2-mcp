@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "event_type": "frontier",
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "session_id": "example-session-0001",
+  "state_version": 42,
+  "captured_at_utc": "2026-07-11T12:00:00Z",
+  "visibility": "player",
+  "screen": "map"
+}

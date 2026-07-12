@@ -1,0 +1,53 @@
+{
+  "ok": true,
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "capability": "training",
+  "env_api_version": "bridge-env-v2-seed",
+  "scenarios": [
+    "full-run",
+    "combat"
+  ],
+  "single_env": true,
+  "direct_bridge": true,
+  "model_oriented": true,
+  "reset": {
+    "requires_expected_state_version": true,
+    "supports_seed": true,
+    "supported_run_modes": [
+      "standard"
+    ]
+  },
+  "observation": {
+    "root_fields": [
+      "phase",
+      "decision_domain",
+      "logic_hash",
+      "run",
+      "player",
+      "combat",
+      "decision"
+    ]
+  },
+  "action_encoding": {
+    "default_encoding": "legal_action_idx",
+    "supported": [
+      "legal_action_idx",
+      "action_handle"
+    ],
+    "legal_action_shape": [
+      "idx",
+      "action_handle",
+      "kind"
+    ]
+  },
+  "reward": {
+    "authority": "external-rl",
+    "output": "transition_facts",
+    "scalar_computed_by_bridge": false
+  },
+  "done_conditions": [
+    "run_game_over",
+    "step_timeout"
+  ]
+}

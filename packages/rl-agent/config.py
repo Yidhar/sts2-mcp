@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from pathlib import Path
+
+from sts2_rl.artifacts import resolve_artifact_path
 
 
 @dataclass
@@ -40,8 +41,8 @@ class TrainConfig:
     use_action_text: bool = True
 
     # Logging
-    log_dir: str = "runs"
-    checkpoint_dir: str = "checkpoints"
+    log_dir: str | None = None
+    checkpoint_dir: str | None = None
     checkpoint_freq: int = 1000
     tensorboard: bool = True
     verbose: int = 1
@@ -49,6 +50,10 @@ class TrainConfig:
     # Device
     device: str = "cpu"
 
-    def __post_init__(self):
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    def __post_init__(self) -> None:
+        log_dir = resolve_artifact_path(self.log_dir, default="runs")
+        checkpoint_dir = resolve_artifact_path(self.checkpoint_dir, default="checkpoints")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = str(log_dir)
+        self.checkpoint_dir = str(checkpoint_dir)

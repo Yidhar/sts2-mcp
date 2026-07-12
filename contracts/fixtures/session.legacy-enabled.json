@@ -1,0 +1,133 @@
+{
+  "session_id": "example-session-legacy-0001",
+  "pid": 4242,
+  "process_started_at_utc": "2026-07-11T11:59:00Z",
+  "base_url": "http://127.0.0.1:27100/",
+  "token": "example-legacy-privileged-token-000000000000000",
+  "capability_tokens": {
+    "player-control": "example-player-control-token-0000000000000000",
+    "legacy-privileged": "example-legacy-privileged-token-000000000000000"
+  },
+  "api_versions": [
+    "2.0.0",
+    "legacy-v1"
+  ],
+  "schema_version": "2026-07-11.1",
+  "action_schema_version": "2.0.0",
+  "legal_action_ordering_version": "2.0.0",
+  "capabilities": [
+    "player-control",
+    "legacy-privileged"
+  ],
+  "capability_details": {
+    "player_control": {
+      "enabled": true,
+      "scope": "player-control",
+      "api_version": "2.0.0",
+      "privileged": false
+    },
+    "training": {
+      "enabled": false,
+      "scope": "training",
+      "api_version": "2.0.0",
+      "privileged": true
+    },
+    "legacy_v1": {
+      "enabled": true,
+      "scope": "legacy-privileged",
+      "api_version": "legacy-v1",
+      "privileged": true,
+      "deprecation": "Migration-only privileged API; explicitly enabled.",
+      "default_enabled": false
+    }
+  },
+  "created_at_utc": "2026-07-11T11:59:00Z",
+  "bridge_name": "sts2-mcp-bridge",
+  "bridge_version": "0.8.0",
+  "port": 27100,
+  "preferred_port": 27100,
+  "max_port": 27109,
+  "visible_only": false,
+  "game_assembly_version": "0.1.0.0",
+  "game_compatibility": {
+    "health": "ready",
+    "startup_allowed": true,
+    "error_code": "",
+    "error_message": "",
+    "profile_id": "retail-2026-06-23-5926027",
+    "assembly": {
+      "name": "sts2",
+      "assembly_version": "0.1.0.0",
+      "informational_version": "0.1.0+59260271157f76a2896f0eab5bc6ea1245d8b314",
+      "module_version_id": "97f10687-c306-4798-ab75-8b9f23f34dfb"
+    },
+    "probes": [
+      {
+        "capability": "lifecycle.game.ready",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "lifecycle.game.exit",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "lifecycle.game.instance",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "lifecycle.controller.process",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "lifecycle.run.process",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "combat.manager.instance",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "combat.manager.in_progress",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "combat.manager.player_turn",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "run.manager.instance",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "run.manager.singleplayer_setup",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      },
+      {
+        "capability": "card_reward.skip_action",
+        "passed": true,
+        "code": "capability_present",
+        "detail": "Required capability matched the audited profile."
+      }
+    ]
+  }
+}

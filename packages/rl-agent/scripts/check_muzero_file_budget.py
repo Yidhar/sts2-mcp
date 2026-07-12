@@ -2,20 +2,16 @@
 """Check MuZero Python files against the 2,000-line refactor budget.
 
 Default behavior:
-  * scans muzero/, sts2_env/, scripts/, tests/, legacy/
-  * fails only for new/non-allowlisted files above the line budget
-  * still prints legacy over-budget files so the remaining debt is visible
-
-Use ``--fail-on-legacy`` when you want the future strict state where every file
-must be below the budget.
+  * scans muzero/, sts2_env/, scripts/, tests/, and legacy/ when present
+  * fails for every file above the line budget
+  * has no repository legacy exceptions
 """
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
@@ -34,11 +30,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES)
     parser.add_argument("--root", action="append", dest="roots", default=None)
     parser.add_argument(
-        "--fail-on-legacy",
-        action="store_true",
-        help="Treat allowlisted legacy files as blocking failures too.",
-    )
-    parser.add_argument(
         "--quiet-ok",
         action="store_true",
         help="Suppress the success line when no blocking violations are found.",
@@ -55,18 +46,12 @@ def main() -> int:
         max_lines=args.max_lines,
     )
     over_budget = [record for record in records if record.over_budget]
-    blocking = [
-        record
-        for record in over_budget
-        if args.fail_on_legacy or not record.legacy_allowed
-    ]
+    blocking = list(over_budget)
 
     if over_budget:
         print(f"Python files over {args.max_lines} lines:")
         for record in over_budget:
-            label = "LEGACY" if record.legacy_allowed else "BLOCK"
-            reason = f"  # {record.legacy_reason}" if record.legacy_reason else ""
-            print(f"  [{label}] {record.line_count:6d} {record.relative_path.as_posix()}{reason}")
+            print(f"  [BLOCK] {record.line_count:6d} {record.relative_path.as_posix()}")
 
     if blocking:
         print(
@@ -77,7 +62,7 @@ def main() -> int:
         return 1
 
     if not args.quiet_ok:
-        print(f"OK: no non-allowlisted Python file exceeds {args.max_lines} lines.")
+        print(f"OK: no Python file exceeds {args.max_lines} lines.")
     return 0
 
 

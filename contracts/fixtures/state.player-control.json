@@ -1,0 +1,45 @@
+{
+  "session_id": "example-session-0001",
+  "state_version": 42,
+  "captured_at_utc": "2026-07-11T12:00:00Z",
+  "visibility": "player",
+  "state": {
+    "screen": "map",
+    "run": {
+      "active": true
+    },
+    "players": [
+      {
+        "hp": 65,
+        "max_hp": 80
+      }
+    ]
+  },
+  "legal_actions": [
+    {
+      "handle": "map:1,2",
+      "kind": "map",
+      "label": "Travel to (1, 2)",
+      "target_handle": null,
+      "coord": {
+        "x": 1,
+        "y": 2
+      },
+      "option_index": null,
+      "selection_id": null,
+      "card_ref": null,
+      "slot_index": null
+    },
+    {
+      "handle": "event_option:0",
+      "kind": "event_option",
+      "label": "Choose option 1",
+      "target_handle": null,
+      "coord": null,
+      "option_index": 0,
+      "selection_id": null,
+      "card_ref": null,
+      "slot_index": null
+    }
+  ]
+}

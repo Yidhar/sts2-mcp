@@ -3,7 +3,7 @@
 Preferred entrypoint:
     python -m muzero.evaluate CHECKPOINT_DIR [--flags...]
 
-``evaluate_muzero.py`` remains available as a compatibility wrapper.
+Invoke with ``python -m muzero.evaluate``.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import torch
 
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from muzero.sts2_env.mcts import MCTS
+from muzero.training.env_factory import create_environment_backend
 from muzero.sts2_env.muzero_model import MuZeroNetwork
 from muzero.sts2_env.planner_memory_profile import (
     VALID_PLANNER_MEMORY_PROFILES,
@@ -25,6 +26,7 @@ from muzero.sts2_env.planner_memory_profile import (
 from sts2_env.observation_v2 import DictObservationEncoder
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
 from sts2_env.path_utils import normalize_path_str, resolve_torch_device, running_in_wsl
+from sts2_rl.artifacts import resolve_external_input_path
 
 
 def load_muzero_network(
@@ -33,7 +35,7 @@ def load_muzero_network(
     *,
     planner_memory_profile: str = "eval",
 ) -> tuple[MuZeroNetwork, dict[str, object]]:
-    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path = resolve_external_input_path(checkpoint_dir)
     network_path = checkpoint_path / "network.pt"
     metadata_path = checkpoint_path / "metadata.json"
     if not network_path.exists():
@@ -73,6 +75,8 @@ def evaluate_full_run(
     disable_semantic_rollout: bool,
     obs_mode: str | None,
     planner_memory_profile: str,
+    environment_backend: str = "live",
+    sim_exe_path: str | None = None,
 ) -> None:
     network, profile_report = load_muzero_network(
         checkpoint_dir,
@@ -84,6 +88,11 @@ def evaluate_full_run(
         obs_encoder = WorldTokenObservationEncoder(use_text=False)
     else:
         obs_encoder = DictObservationEncoder(use_text=False)
+    backend = create_environment_backend(
+        kind=environment_backend,
+        session_file=session_file,
+        sim_exe_path=sim_exe_path,
+    )
     env = SlayTheSpire2EnvV2(
         session_file=session_file,
         character=character,
@@ -91,6 +100,7 @@ def evaluate_full_run(
         obs_encoder=obs_encoder,
         include_debug_info=True,
         render_mode="human",
+        backend=backend,
     )
     mcts = MCTS(num_simulations=num_simulations)
     mcts.set_training_step(mcts.root_bias_decay_steps)
@@ -205,6 +215,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate MuZero checkpoints on live STS2.")
     parser.add_argument("checkpoint", type=str, help="Checkpoint directory containing network.pt")
     parser.add_argument("--session-file", type=str, default=None)
+    parser.add_argument("--environment-backend", choices=("live", "headless"), default="live")
+    parser.add_argument("--sim-exe-path", type=str, default=None)
     parser.add_argument("--character", type=str, default="ironclad")
     parser.add_argument("--defensive-buffs", action="store_true")
     parser.add_argument("--max-steps", type=int, default=200)
@@ -231,6 +243,7 @@ def main() -> None:
     args = parse_args()
     args.checkpoint = normalize_path_str(args.checkpoint) or args.checkpoint
     args.session_file = normalize_path_str(args.session_file)
+    args.sim_exe_path = normalize_path_str(args.sim_exe_path)
     args.device = resolve_torch_device(args.device)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Requested GPU evaluation but torch.cuda.is_available() is False.")
@@ -260,6 +273,8 @@ def main() -> None:
         disable_semantic_rollout=args.disable_semantic_rollout,
         obs_mode=args.obs_mode,
         planner_memory_profile=args.planner_memory_profile,
+        environment_backend=args.environment_backend,
+        sim_exe_path=args.sim_exe_path,
     )
 
 

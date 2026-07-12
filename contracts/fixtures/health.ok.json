@@ -1,0 +1,38 @@
+{
+  "transport_alive": true,
+  "game_thread_alive": true,
+  "session_id": "example-session-0001",
+  "authorized_capability": "training",
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "pump_tick": 1234,
+  "ms_since_last_pump": 12,
+  "queue_depth": 0,
+  "active_operation": null,
+  "last_snapshot_age_ms": 18,
+  "capabilities": [
+    "player-control",
+    "training"
+  ],
+  "bridge_name": "sts2-mcp-bridge",
+  "bridge_version": "0.8.0",
+  "process_id": 4242,
+  "process_started_at_utc": "2026-07-11T11:59:00Z",
+  "heartbeat_timeout_ms": 5000,
+  "coordinator": {
+    "ready": true,
+    "queue_depth": 0
+  },
+  "mutation_gate": {
+    "active_operation": null
+  },
+  "command_store": {
+    "entry_count": 1
+  },
+  "http": {
+    "in_flight_requests": 1,
+    "max_concurrent_requests": 32,
+    "max_concurrent_event_streams": 8,
+    "max_request_body_bytes": 1048576
+  }
+}

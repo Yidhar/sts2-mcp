@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from collections import Counter
@@ -53,11 +52,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from content_registry import get_card_metadata
 from sts2_env.env_v2 import SlayTheSpire2EnvV2
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
-from sts2_env import observation_common as obs_common
-from content_registry import get_card_metadata
-
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 THRESHOLD = 0.98
 SOFT_THRESHOLD = 0.95
@@ -568,7 +566,12 @@ def main() -> int:
     parser.add_argument("--step-timeout-ms", type=int, default=20000)
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_artifact_path(args.output_dir)
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_path = output_dir / "audit.jsonl"
     summary_path = output_dir / "summary.json"

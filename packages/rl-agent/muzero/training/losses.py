@@ -833,4 +833,3 @@ class TrainingLossMixin:
             "decision_domain_acc": float(domain_acc),
             "phase_acc": float(phase_acc),
         }
-

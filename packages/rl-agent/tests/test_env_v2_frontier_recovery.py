@@ -119,7 +119,7 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
             {
                 "obs": {"phase": "combat"},
                 "legal_actions": [
-                    {"action_id": "automation:start_autoslay", "kind": "automation"},
+                    {"action_id": "automation:unsupported_external_control", "kind": "automation"},
                     {"action_id": "discard_potion:0", "kind": "discard_potion"},
                     {"action_id": "end_turn", "kind": "end_turn"},
                 ],
@@ -489,7 +489,7 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
         env = _env_stub()
         blocked_state: dict[str, Any] = {
             "available_actions": [
-                {"action_id": "automation:start_autoslay", "kind": "automation"},
+                {"action_id": "automation:unsupported_external_control", "kind": "automation"},
             ]
         }
         self.assertTrue(env._state_has_only_blocked_actions(blocked_state))
@@ -693,7 +693,7 @@ class EnvV2FrontierHelpersTests(unittest.TestCase):
     def test_recovery_returns_false_for_blocked_only_without_stall(self):
         env = _env_stub()
         env._safe_get_state = lambda: {
-            "available_actions": [{"action_id": "automation:start_autoslay", "kind": "automation"}]
+            "available_actions": [{"action_id": "automation:unsupported_external_control", "kind": "automation"}]
         }
         env._safe_reset_into_current_run = lambda _timeout_ms: None
         self.assertFalse(env._recover_filtered_action_window(timeout_ms=1))

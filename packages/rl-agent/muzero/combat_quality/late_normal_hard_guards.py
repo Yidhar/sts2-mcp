@@ -460,4 +460,3 @@ class LateNormalHardGuardMixin:
                                 else:
                                     search_stats["combat_quality_late_normal_race_potion_guard_no_alternative"] = 1.0
         return int(action_idx)
-

@@ -27,6 +27,8 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+
 from muzero.sts2_env.muzero_buffer import _batched_observations_to_numpy
 from muzero.sts2_env.muzero_model import MuZeroNetwork
 from muzero.sts2_env.planner_memory_profile import (
@@ -127,10 +129,10 @@ ROLE_COUNT_LABELS = (
 
 def _resolve_checkpoint_paths(checkpoint: str | None, network_state: str | None, replay_buffer: str | None) -> tuple[Path | None, Path | None, Path | None]:
     checkpoint_dir: Path | None = None
-    network_path: Path | None = Path(network_state) if network_state else None
-    replay_path: Path | None = Path(replay_buffer) if replay_buffer else None
+    network_path: Path | None = resolve_external_input_path(network_state) if network_state else None
+    replay_path: Path | None = resolve_external_input_path(replay_buffer) if replay_buffer else None
     if checkpoint:
-        checkpoint_path = Path(checkpoint)
+        checkpoint_path = resolve_external_input_path(checkpoint)
         if checkpoint_path.is_file():
             network_path = network_path or checkpoint_path
             checkpoint_dir = checkpoint_path.parent
@@ -519,11 +521,15 @@ def main() -> None:
         slot_banks=slot_bank_names,
     )
     if args.output:
-        Path(args.output).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[probe] wrote JSON: {args.output}")
+        output_path = resolve_artifact_path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[probe] wrote JSON: {output_path}")
     if args.markdown_output:
-        Path(args.markdown_output).write_text(markdown, encoding="utf-8")
-        print(f"[probe] wrote Markdown: {args.markdown_output}")
+        markdown_path = resolve_artifact_path(args.markdown_output)
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(markdown, encoding="utf-8")
+        print(f"[probe] wrote Markdown: {markdown_path}")
     print(markdown)
 
 

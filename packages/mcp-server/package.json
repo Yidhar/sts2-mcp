@@ -1,17 +1,36 @@
 {
   "name": "sts2-mcp-server",
-  "version": "0.4.20",
+  "version": "0.5.0",
   "private": true,
   "description": "Local MCP server for the Slay the Spire 2 bridge mod.",
   "license": "MIT",
   "type": "commonjs",
+  "packageManager": "npm@10.9.2",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.14.0 <23"
   },
   "scripts": {
+    "sync:contracts": "node scripts/sync-contracts.js",
+    "verify:contracts": "node scripts/sync-contracts.js --check",
+    "prebuild": "npm run sync:contracts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "pretypecheck": "npm run sync:contracts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node index.js",
+    "start:direct": "node dist/src/server.js",
     "smoke:test": "node smoke-test.js",
-    "autoslay:run": "node autoslay-runner.js",
-    "rl:smoke": "node rl-smoke-runner.js"
-  }
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "posttest": "npm run clean"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.14.0",
+    "typescript": "7.0.2"
+  },
+  "main": "index.js",
+  "types": "dist/src/server.d.ts"
 }

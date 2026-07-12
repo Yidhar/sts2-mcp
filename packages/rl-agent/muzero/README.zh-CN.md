@@ -75,7 +75,7 @@ packages/rl-agent/muzero/
 
 ### 文件治理硬规则
 
-- 新代码默认不能再写进 `train.py`；`train.py` 现在只保留 CLI delegation + legacy import compatibility。
+- 新代码默认不能再写进 train.py；train.py 只保留 CLI delegation 与历史参数/导入兼容接线。
 - 新 Python 文件必须 `< 2000` 行；超过 1500 行时先拆子模块，再继续实现。
 - 运行期路径（log、checkpoint、diagnostics、replay buffer）统一走 `training.paths.RunPaths`。
 - 策略源码路径统一走 `training.paths.StrategyModulePaths`：
@@ -90,7 +90,9 @@ packages/rl-agent/muzero/
 
 ```bash
 cd packages/rl-agent
-./.venv-wsl-rocm/bin/python scripts/check_muzero_file_budget.py --quiet-ok
+: "${STS2_ARTIFACT_ROOT:?请将 STS2_ARTIFACT_ROOT 设为源码仓库外的绝对路径}"
+"$STS2_ARTIFACT_ROOT/environments/wsl-rocm/bin/python" \
+  scripts/check_muzero_file_budget.py --quiet-ok
 ```
 
 当前只有历史债务文件在 allowlist 中；新超限文件会让检查失败。
@@ -117,6 +119,13 @@ cd packages/rl-agent
 python -m muzero.train --obs-mode token_v3 --model-arch token_memory_v1 \
   --mixed-precision auto --batch-size 32 --unroll-steps 3 ...
 
+# 精确续训：必须通过 atomic manifest、每文件 SHA-256 与全部 identity 校验。
+python -m muzero.train --resume-from <checkpoint_dir> ...
+
+# 仅用兼容权重开启新 lineage；不会载入 optimizer/replay/counter。
+python -m muzero.train --resume-from <old_checkpoint_dir> --warm-start \
+  --checkpoint-migration-id sts2-weights-only-v1 ...
+
 # 显式启用战斗 search-free direct policy
 python -m muzero.train --combat-sandbox --combat-direct-policy \
   --combat-rollout-steps 3 --combat-rollout-beam-width 2 \
@@ -133,6 +142,9 @@ python -m muzero.analyze_replay ...
 python -m muzero.eval_latent_probes --checkpoint <checkpoint_dir> \
   --markdown-output runs/latent_probe.md
 ```
+
+完整规则见 `docs/runbooks/checkpoint-resume.md`。精确 resume 一律 fail closed；旧格式
+checkpoint 还必须显式传 `--allow-legacy-checkpoint`，且只能走 weights-only warm-start。
 
 ## 当前模型方法
 
@@ -221,23 +233,17 @@ direct combat policy 会把这些 Q/uncertainty bias 融入 policy logits，从�
 
 ## 兼容层策略
 
-旧路径仍保留为 wrapper/兼容导入，实际实现以 `muzero/` 为准：
+本轮重构已删除 legacy 包和公共 sts2_env 下的 MuZero wrapper；实际实现、
+导入路径和模块入口统一以 muzero/ 为准。旧路径不存在是有意的 fail-fast 行为，
+不能再作为兼容 API 使用。
 
-- 顶层 wrapper：
-  - `train_muzero.py`
-  - `evaluate_muzero.py`
-  - `analyze_muzero_replay.py`
-- `legacy/` wrapper
-- `sts2_env/` 下的 `mcts.py`、`muzero_model.py`、`muzero_buffer.py`、`semantic_rollout.py`
+仅保留顶层工具 wrapper analyze_muzero_replay.py，它委托到
+muzero.analyze_replay。新代码和新文档必须使用：
 
-新代码和新文档优先使用：
-
-```bash
-python -m muzero.train
-python -m muzero.evaluate
-python -m muzero.analyze_replay
-python -m muzero.eval_latent_probes
-```
+- python -m muzero.train
+- python -m muzero.evaluate
+- python -m muzero.analyze_replay
+- python -m muzero.eval_latent_probes
 
 ## 训练建议
 

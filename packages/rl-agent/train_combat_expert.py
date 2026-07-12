@@ -28,6 +28,7 @@ from sts2_env.combat_exact_search import ExactCombatSearch
 from sts2_env.combat_fixed_action import END_TURN_SLOT, NUM_FIXED_COMBAT_ACTIONS
 from sts2_env.combat_small_model import SmallCombatPolicyValueNet
 from sts2_env.combat_template_env import COMBAT_STATE_VECTOR_DIM, CombatTemplateEnv
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 @dataclass
@@ -202,13 +203,21 @@ def main() -> None:
     parser.add_argument("--search-depth", type=int, default=0)
     parser.add_argument("--c-puct", type=float, default=1.5)
     parser.add_argument("--total-episodes", type=int, default=200)
-    parser.add_argument("--checkpoint-dir", default="checkpoints/combat-expert-latest")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "Checkpoint directory (default: <STS2_ARTIFACT_ROOT>/checkpoints/combat-expert-latest). "
+            "Relative paths use the artifact root."
+        ),
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--reset-timeout-ms", type=int, default=15000)
     parser.add_argument("--step-timeout-ms", type=int, default=20000)
     args = parser.parse_args()
+    args.combat_snapshot_dataset = str(resolve_external_input_path(args.combat_snapshot_dataset))
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
@@ -251,7 +260,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir = resolve_artifact_path(args.checkpoint_dir, default="checkpoints/combat-expert-latest")
     total_steps = 0
     completed_episodes = 0
     if args.resume and checkpoint_dir.exists():

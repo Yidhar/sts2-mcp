@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from typing import Any
 
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import artifact_root, resolve_external_input_path
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CATALOG_PATH = REPO_ROOT / "third_party" / "sts2-ai" / "Assets" / "datasets" / "game_knowledge_catalog" / "cards.jsonl"
-SOURCE_ROOT = REPO_ROOT / "third_party" / "sts2-ai"
-OUT_PATH = REPO_ROOT / "packages" / "rl-agent" / "content" / "card_effect_profiles.generated.json"
+SOURCE_ROOT = resolve_external_input_path(
+    os.environ.get("STS2_AI_ROOT"),
+    default="dependencies/sts2-ai",
+    root=artifact_root(),
+)
+CATALOG_PATH = SOURCE_ROOT / "Assets" / "datasets" / "game_knowledge_catalog" / "cards.jsonl"
+OUT_PATH = REPO_ROOT / "game-data" / "generated" / "card_effect_profiles.generated.json"
 SCHEMA_VERSION = 1
 
 
@@ -905,16 +916,17 @@ def main() -> None:
         cards[profile["id"]] = profile
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "source": {
-            "catalog": str(CATALOG_PATH.relative_to(REPO_ROOT)).replace("\\", "/"),
-            "source_root": str(SOURCE_ROOT.relative_to(REPO_ROOT)).replace("\\", "/"),
+            "catalog": "third_party/sts2-ai/Assets/datasets/game_knowledge_catalog/cards.jsonl",
+            "source_root": "third_party/sts2-ai",
             "method": "catalog_internal_fields_plus_csharp_source_facts_no_localized_text_regex",
         },
         "cards": dict(sorted(cards.items())),
     }
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    OUT_PATH.write_bytes(
+        (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
     curated_count = sum(1 for p in cards.values() if "curated_internal_id" in p.get("training_tags", []))
     op_count = sum(len(p.get("operations") or []) for p in cards.values())
     profiled = sum(1 for p in cards.values() if p.get("operations"))

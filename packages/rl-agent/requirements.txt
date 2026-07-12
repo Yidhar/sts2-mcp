@@ -1,19 +1,2 @@
-# Core RL
-torch==2.11.0+cpu
-gymnasium==1.2.3
-stable-baselines3==2.7.1
-sb3-contrib==2.7.1
-
-# Utilities
-numpy==2.4.3
-requests==2.33.0
-tensorboard==2.20.0
-pyarrow==23.0.1
-safetensors==0.7.0
-
-# Text embeddings (Chinese: BAAI/bge-small-zh-v1.5, 512-d)
-sentence-transformers>=3.0
-
-# Note: AMD GPU support
-# torch-directml is not yet available for Python 3.13
-# CPU training is sufficient for RL where game interaction is the bottleneck
+# Compatibility entry point. The authoritative CPU runtime lock is requirements.lock.
+-r requirements.lock

@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/state.schema.json",
+  "title": "Canonical game state envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "state_version",
+    "captured_at_utc",
+    "visibility",
+    "state",
+    "legal_actions"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "captured_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "visibility": {
+      "enum": [
+        "player",
+        "training"
+      ]
+    },
+    "state": {
+      "$ref": "#/$defs/player_state"
+    },
+    "legal_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/action"
+      }
+    }
+  },
+  "$defs": {
+    "player_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "screen"
+      ],
+      "properties": {
+        "screen": {},
+        "run": {},
+        "combat": {},
+        "players": {},
+        "rewards": {},
+        "card_reward_selection": {},
+        "card_selection": {},
+        "character_selection": {},
+        "run_mode_selection": {},
+        "event_options": {},
+        "crystal_sphere": {},
+        "map": {},
+        "rest_site": {},
+        "deck_upgrade_selection": {},
+        "shop": {},
+        "main_menu": {}
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handle",
+        "kind",
+        "label"
+      ],
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        },
+        "target_handle": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        },
+        "coord": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/coord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "option_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "selection_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        },
+        "card_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        },
+        "slot_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "coord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y"
+      ],
+      "properties": {
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

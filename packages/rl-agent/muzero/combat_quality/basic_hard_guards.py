@@ -370,4 +370,3 @@ class BasicCombatHardGuardMixin:
                         search_stats["combat_quality_wasteful_end_turn_selected"] = 0.0
                         search_stats["combat_quality_end_turn_selected"] = 0.0
         return int(action_idx)
-

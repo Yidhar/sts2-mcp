@@ -219,6 +219,7 @@ def test_build_guard_integration_runs_pick_quality_after_skip_guard():
     good_block = _card("good_block", type_="Skill", block=14)
     actions = [_skip_action(), _pick_action(weak_attack, 0), _pick_action(good_block, 1)]
     trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+    trainer.build_hard_guard_policy = "full"
     trainer.env = SimpleNamespace(
         unwrapped=SimpleNamespace(
             _last_obs_raw=_raw(_thin_low_block_deck()),

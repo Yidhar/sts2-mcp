@@ -36,6 +36,7 @@ from offline_training_data import (
     SHOP_BUNDLE_AUX_FIELDS,
     load_task_rows,
 )
+from sts2_rl.artifacts import resolve_external_input_path
 from sts2_env.observation_common import MAX_ACTIONS
 
 
@@ -338,10 +339,11 @@ def audit_offline_alignment_from_disk(
     max_rows_per_task: int | None = None,
     max_actions: int = MAX_ACTIONS,
 ) -> dict[str, Any]:
+    resolved_root = resolve_external_input_path(root)
     task_reports: dict[str, Any] = {}
     for task in tasks:
         rows = load_task_rows(
-            root,
+            resolved_root,
             task,
             fmt=fmt,
             partition_kind=partition_kind,
@@ -353,7 +355,7 @@ def audit_offline_alignment_from_disk(
         report = audit_offline_task_alignment(task, rows, max_actions=max_actions)
         task_reports[task] = report.to_dict()
     return {
-        "root": str(root),
+        "root": str(resolved_root),
         "fmt": fmt,
         "split": split,
         "max_actions": int(max_actions),
@@ -473,7 +475,12 @@ def _parse_tasks(raw: str) -> tuple[str, ...]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit offline action/index alignment before policy BC.")
-    parser.add_argument("--root", type=Path, default=Path("tmp/offline_build_v2_full/parquet"))
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Offline dataset root (default: artifact datasets/offline_build_v2_full/parquet).",
+    )
     parser.add_argument(
         "--tasks",
         type=str,
@@ -488,7 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     payload = audit_offline_alignment_from_disk(
-        args.root,
+        resolve_external_input_path(args.root, default="datasets/offline_build_v2_full/parquet"),
         _parse_tasks(args.tasks),
         fmt=args.fmt,
         split=args.split,

@@ -751,6 +751,7 @@ def test_build_guard_integration_runs_card_reward_before_hp_rest_guard():
 
     actions = [_skip_action(), _pick_action(_card("good_block", type_="Skill", block=12), 0)]
     trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+    trainer.build_hard_guard_policy = "full"
     trainer.env = SimpleNamespace(
         unwrapped=SimpleNamespace(
             _last_obs_raw=_raw(_thin_low_block_deck()),

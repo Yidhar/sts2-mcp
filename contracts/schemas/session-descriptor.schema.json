@@ -1,0 +1,508 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/session-descriptor.schema.json",
+  "title": "Bridge session descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "pid",
+    "process_started_at_utc",
+    "base_url",
+    "capability_tokens",
+    "api_versions",
+    "schema_version",
+    "action_schema_version",
+    "legal_action_ordering_version",
+    "capabilities",
+    "capability_details",
+    "game_compatibility",
+    "created_at_utc"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "process_started_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "base_url": {
+      "type": "string",
+      "pattern": "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]{1,5}/?$"
+    },
+    "token": {
+      "type": "string",
+      "minLength": 32,
+      "writeOnly": true,
+      "deprecated": true,
+      "description": "Legacy-v1 compatibility token. Absent unless legacy-v1 is explicitly enabled; identical in authority to legacy-privileged."
+    },
+    "capability_tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "required": [
+        "player-control"
+      ],
+      "properties": {
+        "player-control": {
+          "type": "string",
+          "minLength": 32,
+          "writeOnly": true
+        },
+        "training": {
+          "type": "string",
+          "minLength": 32,
+          "writeOnly": true
+        },
+        "legacy-privileged": {
+          "type": "string",
+          "minLength": 32,
+          "writeOnly": true
+        }
+      }
+    },
+    "api_versions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "contains": {
+        "const": "2.0.0"
+      },
+      "items": {
+        "enum": [
+          "2.0.0",
+          "legacy-v1"
+        ]
+      }
+    },
+    "schema_version": {
+      "const": "2026-07-11.1"
+    },
+    "action_schema_version": {
+      "const": "2.0.0"
+    },
+    "legal_action_ordering_version": {
+      "const": "2.0.0"
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "contains": {
+        "const": "player-control"
+      },
+      "items": {
+        "enum": [
+          "player-control",
+          "training",
+          "legacy-privileged"
+        ]
+      }
+    },
+    "capability_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "player_control",
+        "training",
+        "legacy_v1"
+      ],
+      "properties": {
+        "player_control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "scope",
+            "api_version",
+            "privileged"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "scope": {
+              "const": "player-control"
+            },
+            "api_version": {
+              "const": "2.0.0"
+            },
+            "privileged": {
+              "const": false
+            }
+          }
+        },
+        "training": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "scope",
+            "api_version",
+            "privileged"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "scope": {
+              "const": "training"
+            },
+            "api_version": {
+              "const": "2.0.0"
+            },
+            "privileged": {
+              "const": true
+            }
+          }
+        },
+        "legacy_v1": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "scope",
+            "api_version",
+            "privileged",
+            "default_enabled",
+            "deprecation"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "scope": {
+              "const": "legacy-privileged"
+            },
+            "api_version": {
+              "const": "legacy-v1"
+            },
+            "privileged": {
+              "const": true
+            },
+            "deprecation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "default_enabled": {
+              "const": false
+            }
+          }
+        }
+      }
+    },
+    "created_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "bridge_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bridge_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "preferred_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "max_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "visible_only": {
+      "type": "boolean"
+    },
+    "game_assembly_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "game_compatibility": {
+      "$ref": "#/$defs/ready_game_compatibility"
+    }
+  },
+  "$defs": {
+    "ready_game_compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "health",
+        "startup_allowed",
+        "error_code",
+        "error_message",
+        "profile_id",
+        "assembly",
+        "probes"
+      ],
+      "properties": {
+        "health": {
+          "const": "ready"
+        },
+        "startup_allowed": {
+          "const": true
+        },
+        "error_code": {
+          "const": ""
+        },
+        "error_message": {
+          "const": ""
+        },
+        "profile_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "assembly": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "assembly_version",
+            "informational_version",
+            "module_version_id"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "assembly_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "informational_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "module_version_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        "probes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "capability",
+              "passed",
+              "code",
+              "detail"
+            ],
+            "properties": {
+              "capability": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "passed": {
+                "const": true
+              },
+              "code": {
+                "const": "capability_present"
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "capabilities": {
+            "contains": {
+              "const": "training"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "capabilities"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capability_tokens": {
+            "required": [
+              "training"
+            ],
+            "type": "object",
+            "properties": {
+              "training": {}
+            }
+          },
+          "capability_details": {
+            "properties": {
+              "training": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "capability_tokens": {
+            "not": {
+              "required": [
+                "training"
+              ],
+              "type": "object",
+              "properties": {
+                "training": {}
+              }
+            },
+            "type": "object"
+          },
+          "capability_details": {
+            "properties": {
+              "training": {
+                "properties": {
+                  "enabled": {
+                    "const": false
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "api_versions": {
+            "contains": {
+              "const": "legacy-v1"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "api_versions"
+        ]
+      },
+      "then": {
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "capabilities": {
+            "contains": {
+              "const": "legacy-privileged"
+            },
+            "type": "array"
+          },
+          "capability_tokens": {
+            "required": [
+              "legacy-privileged"
+            ],
+            "type": "object",
+            "properties": {
+              "legacy-privileged": {}
+            }
+          },
+          "capability_details": {
+            "properties": {
+              "legacy_v1": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
+          "token": {}
+        },
+        "type": "object"
+      },
+      "else": {
+        "not": {
+          "required": [
+            "token"
+          ],
+          "type": "object",
+          "properties": {
+            "token": {}
+          }
+        },
+        "properties": {
+          "capabilities": {
+            "not": {
+              "contains": {
+                "const": "legacy-privileged"
+              }
+            },
+            "type": "array"
+          },
+          "capability_tokens": {
+            "not": {
+              "required": [
+                "legacy-privileged"
+              ],
+              "type": "object",
+              "properties": {
+                "legacy-privileged": {}
+              }
+            },
+            "type": "object"
+          },
+          "capability_details": {
+            "properties": {
+              "legacy_v1": {
+                "properties": {
+                  "enabled": {
+                    "const": false
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    }
+  ]
+}

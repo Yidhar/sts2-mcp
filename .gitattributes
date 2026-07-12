@@ -1,0 +1,25 @@
+* text=auto eol=lf
+
+*.cs text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.ts text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.sln text eol=crlf
+*.csproj text eol=lf
+
+*.dll binary
+*.zip binary
+*.pt binary
+*.pkl binary
+*.onnx binary
+*.safetensors binary
+
+# Preserve the pre-refactor dirty-worktree evidence byte-for-byte and keep its
+# intentionally raw patch whitespace out of normal source diffs.
+docs/migration/baseline-2026-07-11/** -text -diff

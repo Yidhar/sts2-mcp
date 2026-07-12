@@ -1,16 +1,15 @@
-"""Line-count budget helpers for the MuZero refactor.
+"""Line-count budget helpers for the MuZero architecture.
 
-The project currently has several legacy Python files above the 2,000 line
-target.  This module makes that debt explicit while preventing new oversized
-files from silently appearing during future strategy/search work.
+Every active Python source and test module must remain within the 2,000-line
+hard limit.  The compatibility mapping intentionally stays empty: oversized
+files are decomposed instead of grandfathered as permanent legacy debt.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
-
 
 DEFAULT_MAX_LINES = 2_000
 DEFAULT_SCAN_ROOTS = ("muzero", "sts2_env", "scripts", "tests", "legacy")
@@ -30,19 +29,9 @@ DEFAULT_EXCLUDED_DIR_NAMES = {
     "venv",
 }
 
-# Existing over-budget files are tracked here so the guard can be adopted before
-# the large refactor is complete.  Do not add to this list for new work; split
-# the file instead.
-DEFAULT_LEGACY_ALLOWLIST: dict[str, str] = {
-    "legacy/train_offline_multitask.py": "legacy offline trainer; archived until legacy/ is split or removed",
-    "muzero/sts2_env/muzero_model.py": "legacy network definitions; split after trainer extraction",
-    "muzero/sts2_env/token_memory.py": "legacy token-memory implementation; split encoder/heads/state helpers",
-    "sts2_env/_sim_translate.py": "legacy bridge translation layer",
-    "sts2_env/combat_env.py": "legacy environment wrapper",
-    "sts2_env/env_v2.py": "legacy full-run environment wrapper",
-    "sts2_env/observation_v3.py": "legacy token observation encoder",
-    "tests/test_combat_action_hard_guards.py": "legacy broad regression suite; split by guard family",
-}
+# Kept as an explicit public compatibility seam for callers that provide a
+# custom mapping.  Repository CI never grants built-in exceptions.
+DEFAULT_LEGACY_ALLOWLIST: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -139,9 +128,9 @@ def find_file_budget_violations(
 ) -> list[FileBudgetRecord]:
     """Return over-budget files.
 
-    By default only non-allowlisted files are returned, which makes this usable
-    as a CI guard before the historical debt has been paid down.  Set
-    ``include_legacy=True`` to print the full decomposition debt table.
+    Repository defaults grant no exemptions.  Callers may still provide an
+    explicit compatibility allowlist; ``include_legacy=True`` then returns
+    those custom-allowlisted records as well as blocking violations.
     """
 
     records = collect_file_budget_records(
@@ -156,8 +145,8 @@ def find_file_budget_violations(
 
 
 __all__ = [
-    "DEFAULT_LEGACY_ALLOWLIST",
     "DEFAULT_EXCLUDED_DIR_NAMES",
+    "DEFAULT_LEGACY_ALLOWLIST",
     "DEFAULT_MAX_LINES",
     "DEFAULT_SCAN_ROOTS",
     "FileBudgetRecord",

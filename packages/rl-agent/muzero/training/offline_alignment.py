@@ -42,6 +42,7 @@ from offline_training_data import (
     load_task_rows,
     make_collate_fn,
 )
+from sts2_rl.artifacts import resolve_external_input_path
 
 
 DEFAULT_ALIGNMENT_TASKS: tuple[str, ...] = (
@@ -76,7 +77,7 @@ class OfflineAlignmentConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "root", Path(self.root))
+        object.__setattr__(self, "root", resolve_external_input_path(self.root))
         object.__setattr__(self, "tasks", tuple(str(task) for task in self.tasks))
         unknown = sorted(set(self.tasks) - set(SUPERVISED_TASKS))
         if unknown:
@@ -460,7 +461,12 @@ def _parse_tasks(raw: str | None) -> tuple[str, ...]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit offline alignment task distributions.")
-    parser.add_argument("--root", type=Path, default=Path("tmp/offline_build_v2_full/parquet"))
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Offline dataset root (default: artifact datasets/offline_build_v2_full/parquet).",
+    )
     parser.add_argument("--tasks", type=str, default=",".join(DEFAULT_ALIGNMENT_TASKS))
     parser.add_argument("--fmt", type=str, default="parquet")
     parser.add_argument("--split", type=str, default=None)
@@ -469,7 +475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = OfflineAlignmentConfig(
-        root=args.root,
+        root=resolve_external_input_path(args.root, default="datasets/offline_build_v2_full/parquet"),
         tasks=_parse_tasks(args.tasks),
         fmt=args.fmt,
         split=args.split,

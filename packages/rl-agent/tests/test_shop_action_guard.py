@@ -25,6 +25,7 @@ def _trainer(raw_obs: dict, full_actions: list[dict]):
     from muzero.train import MuZeroTrainer
 
     trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+    trainer.build_hard_guard_policy = "full"
     trainer.env = SimpleNamespace(
         unwrapped=SimpleNamespace(
             _last_obs_raw=raw_obs,

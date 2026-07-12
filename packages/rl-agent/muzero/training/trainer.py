@@ -21,7 +21,6 @@ import re
 import signal
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -280,10 +279,11 @@ class MuZeroTrainer(
         recent_tail_min_samples: int = 4,
         route_heuristic_bias: float = 0.0,
         route_safety_guard: bool = False,
-        combat_hard_guard_policy: str = "full",
-        build_hard_guard_policy: str = "full",
-        log_dir: str = "runs",
-        checkpoint_dir: str = "checkpoints",
+        combat_hard_guard_policy: str = "off",
+        build_hard_guard_policy: str = "off",
+        hard_guard_target_rewrite: str | bool = "off",
+        log_dir: str | None = None,
+        checkpoint_dir: str | None = None,
         checkpoint_keep_last: int = 3,
         mixed_precision: str = "auto",
         amp_init_scale: float = 65536.0,
@@ -409,12 +409,19 @@ class MuZeroTrainer(
         # launch scripts opt in with ``--route-safety-guard``.
         self.route_safety_guard_enabled = bool(route_safety_guard)
         valid_guard_policies = {"full", "emergency", "off"}
-        self.combat_hard_guard_policy = str(combat_hard_guard_policy or "full").strip().lower()
+        self.combat_hard_guard_policy = str(combat_hard_guard_policy or "off").strip().lower()
         if self.combat_hard_guard_policy not in valid_guard_policies:
-            self.combat_hard_guard_policy = "full"
-        self.build_hard_guard_policy = str(build_hard_guard_policy or "full").strip().lower()
+            self.combat_hard_guard_policy = "off"
+        self.build_hard_guard_policy = str(build_hard_guard_policy or "off").strip().lower()
         if self.build_hard_guard_policy not in valid_guard_policies:
-            self.build_hard_guard_policy = "full"
+            self.build_hard_guard_policy = "off"
+        # RC-4: target-rewrite is independent of which guard SET runs. Default off so a guard
+        # override no longer rewrites the policy target to a one-hot (keeps learning on-policy).
+        self.hard_guard_target_rewrite = (
+            bool(hard_guard_target_rewrite)
+            if isinstance(hard_guard_target_rewrite, bool)
+            else str(hard_guard_target_rewrite or "off").strip().lower() in {"on", "true", "1", "yes"}
+        )
         self.recent_tail_tracked_encounters = [
             str(encounter_id).strip()
             for encounter_id in (recent_tail_tracked_encounters or [])
@@ -535,25 +542,6 @@ class MuZeroTrainer(
             return None
         with torch.no_grad():
             return self.token_target_encoder(obs)
-
-    def load_target_encoder_checkpoint(self, checkpoint_path: str | Path) -> None:
-        if self.token_target_encoder is None:
-            return
-        target_path = Path(checkpoint_path) / "token_target_encoder.pt"
-        if not target_path.exists():
-            self._sync_token_target_encoder(hard=True)
-            return
-        target_state = torch.load(target_path, map_location=self.device)
-        current_state = self.token_target_encoder.state_dict()
-        merged_state = dict(current_state)
-        merged_state.update(
-            {
-                key: value
-                for key, value in target_state.items()
-                if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
-            }
-        )
-        self.token_target_encoder.load_state_dict(merged_state)
 
     def _resolve_mixed_precision(
         self,

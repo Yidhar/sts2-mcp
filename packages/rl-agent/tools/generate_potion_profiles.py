@@ -1,6 +1,6 @@
 """Generator for potions.timing.generated.json — Phase 1 of potion-timing-modeling-plan.md.
 
-Reads `content/potions.static.generated.json` (auto-exported from the game's
+Reads `game-data/generated/potions.static.generated.json` (auto-exported from the game's
 items.json) and applies regex-driven heuristics on each potion's Chinese
 description/summary to fill a baseline timing profile.
 
@@ -18,7 +18,7 @@ Design (per plan §3, §4):
     file owns the deprecation flag for `POTION.DEPRECATED_POTION`.
 
 Usage:
-    python tools/generate_potion_profiles.py            # writes content/potions.timing.generated.json
+    python tools/generate_potion_profiles.py            # writes game-data/generated/potions.timing.generated.json
     python tools/generate_potion_profiles.py --check    # diff-only, non-zero exit if stale
 """
 
@@ -29,14 +29,21 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_RL_AGENT_DIR = os.path.dirname(_HERE)
-_CONTENT_DIR = os.path.join(_RL_AGENT_DIR, "content")
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
 
-STATIC_INPUT = os.path.join(_CONTENT_DIR, "potions.static.generated.json")
-GENERATED_OUTPUT = os.path.join(_CONTENT_DIR, "potions.timing.generated.json")
+from sts2_rl.game_data import resolve_generated_game_data_output
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_GAME_DATA_ROOT = Path(os.environ.get("STS2_GAME_DATA_ROOT", _PROJECT_ROOT / "game-data")).expanduser()
+_GENERATED_DIR = _GAME_DATA_ROOT / "generated"
+
+STATIC_INPUT = str(_GENERATED_DIR / "potions.static.generated.json")
+GENERATED_OUTPUT = str(_GENERATED_DIR / "potions.timing.generated.json")
 
 
 _DAMAGE_RE = re.compile(r"造成\s*(\d+)\s*点伤害")
@@ -282,7 +289,7 @@ def generate(static: dict[str, Any]) -> dict[str, Any]:
         "__meta__": {
             "_doc": "Auto-generated baseline potion timing profiles.",
             "_generator": "tools/generate_potion_profiles.py",
-            "_source": "content/potions.static.generated.json",
+            "_source": "game-data/generated/potions.static.generated.json",
             "_schema_version": 1,
             "_note": "Curated overrides live in potions.timing.overrides.json.",
         }
@@ -315,30 +322,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    with open(args.input, "r", encoding="utf-8") as fh:
+    input_path = resolve_generated_game_data_output(args.input)
+    output_path = resolve_generated_game_data_output(args.output)
+
+    with input_path.open("r", encoding="utf-8") as fh:
         static = json.load(fh)
 
     generated = generate(static)
     payload = json.dumps(generated, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     if args.check:
-        if not os.path.exists(args.output):
-            print(f"[generate_potion_profiles] STALE: {args.output} missing", file=sys.stderr)
+        if not output_path.exists():
+            print(f"[generate_potion_profiles] STALE: {output_path} missing", file=sys.stderr)
             return 1
-        with open(args.output, "r", encoding="utf-8") as fh:
+        with output_path.open("r", encoding="utf-8") as fh:
             current = fh.read()
         if current != payload:
-            print(f"[generate_potion_profiles] STALE: {args.output} differs", file=sys.stderr)
+            print(f"[generate_potion_profiles] STALE: {output_path} differs", file=sys.stderr)
             return 1
-        print(f"[generate_potion_profiles] OK: {args.output} up to date "
+        print(f"[generate_potion_profiles] OK: {output_path} up to date "
               f"({len([k for k in generated if k != '__meta__'])} potions)")
         return 0
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as fh:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fh:
         fh.write(payload)
     n = len([k for k in generated if k != "__meta__"])
-    print(f"[generate_potion_profiles] wrote {n} potions -> {args.output}")
+    print(f"[generate_potion_profiles] wrote {n} potions -> {output_path}")
     return 0
 
 

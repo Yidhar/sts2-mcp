@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "capability": "training",
+  "state_version": 42,
+  "episode_id": "episode-example-0001",
+  "step_index": 18,
+  "scenario": "full-run",
+  "phase": "reward",
+  "screen": "rewards",
+  "actionable": true,
+  "terminated": false,
+  "observation": {
+    "phase": "reward",
+    "decision_domain": "build"
+  },
+  "legal_actions": [
+    {
+      "idx": 0,
+      "action_handle": "reward:continue",
+      "kind": "continue",
+      "label": "Continue",
+      "selection": "proceed"
+    }
+  ],
+  "captured_at_utc": "2026-07-11T12:00:00Z"
+}

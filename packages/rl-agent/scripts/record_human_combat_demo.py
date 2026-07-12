@@ -23,6 +23,7 @@ if str(RL_ROOT) not in sys.path:
 
 from sts2_env.combat_env import CombatSandboxEnv  # noqa: E402
 from sts2_env.human_demo_recorder import HumanDemoRecorder  # noqa: E402
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
 
 
 def _parse_csv(value: str | None) -> list[str] | None:
@@ -123,7 +124,11 @@ def _print_state(env: CombatSandboxEnv, reward_total: float) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-file", default=None)
-    parser.add_argument("--output-dir", default=str(RL_ROOT / "human_demos"))
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Demo directory (default: <STS2_ARTIFACT_ROOT>/human_demos). Relative paths use the artifact root.",
+    )
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--source", default="human")
     parser.add_argument("--character", default=None)
@@ -145,6 +150,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
+    args.output_dir = str(resolve_artifact_path(args.output_dir, default="human_demos"))
     recorder = HumanDemoRecorder(
         output_dir=args.output_dir,
         session_id=args.session_id,

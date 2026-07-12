@@ -1,0 +1,532 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "STS2 Bridge API",
+    "version": "2.0.0",
+    "description": "Capability-scoped loopback control and privileged training API. legacy-v1 is disabled by default and is not part of this v2 surface."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:{port}",
+      "variables": {
+        "port": {
+          "default": "27100"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getPublicHealth",
+        "summary": "Minimal unauthenticated process liveness",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Minimal public health. It intentionally omits session identity, ports, capabilities, process metadata, and diagnostics.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/health.schema.json#/$defs/public"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v2/health": {
+      "get": {
+        "operationId": "getAuthenticatedHealth",
+        "summary": "Authenticated transport and game-thread health",
+        "security": [
+          {
+            "PlayerControlBearer": []
+          },
+          {
+            "TrainingBearer": []
+          },
+          {
+            "LegacyPrivilegedBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Detailed health for any currently published scoped capability token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/health.schema.json#/$defs/authenticated_v2"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/state": {
+      "get": {
+        "operationId": "getPlayerState",
+        "summary": "Get the player-visible canonical state",
+        "security": [
+          {
+            "PlayerControlBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Canonical player-visible state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/state.schema.json"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/commands": {
+      "post": {
+        "operationId": "submitPlayerCommand",
+        "summary": "Submit an idempotent player-control command",
+        "security": [
+          {
+            "PlayerControlBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/command.schema.json"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command result. Rejected commands and uncertain outcomes are represented by status and ok in this envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/command-result.schema.json"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v2/commands/{requestId}": {
+      "get": {
+        "operationId": "getCommandResult",
+        "summary": "Read an idempotent command result",
+        "description": "The bearer capability must exactly match the stored command entry capability. A training token cannot read a player-control result, and a player token cannot read a training result.",
+        "security": [
+          {
+            "PlayerControlBearer": []
+          },
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "requestId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Known command result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/command-result.schema.json"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/v2/events": {
+      "get": {
+        "operationId": "streamPlayerEvents",
+        "summary": "Stream player-visible state revision events",
+        "security": [
+          {
+            "PlayerControlBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-sent state revision events",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "x-sse-data-schema": {
+                  "$ref": "../schemas/event.schema.json"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/env/spec": {
+      "get": {
+        "operationId": "getEnvironmentSpec",
+        "summary": "Get the privileged training environment contract",
+        "security": [
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Environment capabilities, including the action_handle-only legal-action shape, transition facts, and reward ownership",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/environment.schema.json#/$defs/spec_response"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/env/state": {
+      "get": {
+        "operationId": "getEnvironmentState",
+        "summary": "Inspect the active privileged training episode",
+        "security": [
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current environment state; every legal action uses action_handle as its sole wire identity, and episode fields are null when no episode is active.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/environment.schema.json#/$defs/state_response"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/env/combat_catalog": {
+      "get": {
+        "operationId": "getCombatCatalog",
+        "summary": "List combat sandbox encounters",
+        "security": [
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Versioned combat encounter catalog envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/environment.schema.json#/$defs/combat_catalog_response"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v2/env/reset": {
+      "post": {
+        "operationId": "resetEnvironment",
+        "summary": "Idempotently reset a privileged training episode",
+        "description": "expected_state_version is validated on the game thread before any reset mutation. A successful committed result carries transition facts and the actual post-reset frontier revision.",
+        "security": [
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/environment.schema.json#/$defs/reset_request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent environment reset command result whose legal actions use action_handle only",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/environment.schema.json#/$defs/operation_result"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v2/env/step": {
+      "post": {
+        "operationId": "stepEnvironment",
+        "summary": "Idempotently advance a privileged training episode",
+        "description": "episode_id and expected_step_index are atomically validated before executing the action selected by action_index or action_handle. Scalar reward is never computed by the Bridge, and returned legal actions use action_handle only.",
+        "security": [
+          {
+            "TrainingBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/environment.schema.json#/$defs/step_request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent environment step command result whose legal actions use action_handle only",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/environment.schema.json#/$defs/operation_result"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "PlayerControlBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "description": "Token published under capability_tokens.player-control."
+      },
+      "TrainingBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "description": "Privileged token published only when the training capability is explicitly enabled."
+      },
+      "LegacyPrivilegedBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "description": "Deprecated privileged token published only when legacy-v1 is explicitly enabled. It may authenticate detailed health but does not authorize v2 command result access."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "error",
+          "message"
+        ],
+        "properties": {
+          "ok": {
+            "const": false
+          },
+          "error": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "details": {}
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed or semantically invalid request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token",
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string",
+              "const": "Bearer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Bearer token does not grant the required capability",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Unknown or expired request id",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "State revision, episode id, or step index conflict",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "Mutation queue is full or the Bridge is shutting down",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

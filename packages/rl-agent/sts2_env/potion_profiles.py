@@ -25,16 +25,15 @@ This module does NOT compute per-step timing (`use_quality / waste_risk
 from __future__ import annotations
 
 import json
-import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
-_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CONTENT_DIR = os.path.join(_HERE, "content")
+from sts2_rl.game_data import resolve_game_data_file
 
-GENERATED_PATH = os.path.join(_CONTENT_DIR, "potions.timing.generated.json")
-OVERRIDES_PATH = os.path.join(_CONTENT_DIR, "potions.timing.overrides.json")
-STATIC_POTIONS_PATH = os.path.join(_CONTENT_DIR, "potions.static.generated.json")
+GENERATED_PATH = resolve_game_data_file("potions.timing.generated.json")
+OVERRIDES_PATH = resolve_game_data_file("potions.timing.overrides.json")
+STATIC_POTIONS_PATH = resolve_game_data_file("potions.static.generated.json")
 
 
 DEFAULT_EFFECT_PROFILE: dict[str, Any] = {
@@ -81,11 +80,12 @@ DEFAULT_PROFILE_ENTRY: dict[str, Any] = {
 }
 
 
-def _load_json_if_exists(path: str) -> dict[str, Any]:
-    if not os.path.exists(path):
+def _load_json_if_exists(path: str | Path) -> dict[str, Any]:
+    source = Path(path)
+    if not source.is_file():
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with source.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception:
         return {}

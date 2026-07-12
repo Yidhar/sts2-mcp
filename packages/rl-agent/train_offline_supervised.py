@@ -7,7 +7,6 @@ import json
 import random
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -32,6 +31,7 @@ from offline_training_data import (
     make_collate_fn,
 )
 from offline_training_models import MultiTaskOfflineModel, OfflineStateEncoder
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path, validate_artifact_component
 
 
 @dataclass
@@ -41,7 +41,7 @@ class OfflineTrainConfig:
     dataset_format: str = "parquet"
     partition_kind: str | None = None
     partition_value: str | None = None
-    out_dir: str = "offline_runs"
+    out_dir: str | None = None
     batch_size: int = 64
     epochs: int = 20
     learning_rate: float = 1e-3
@@ -155,9 +155,10 @@ def evaluate_model(model: MultiTaskOfflineModel, loader: DataLoader, task: str, 
 def train(config: OfflineTrainConfig) -> dict[str, Any]:
     set_seed(config.seed)
     device = torch.device(config.device)
+    dataset_root = str(resolve_external_input_path(config.dataset_root))
 
     train_rows = load_task_rows(
-        config.dataset_root,
+        dataset_root,
         config.task,
         fmt=config.dataset_format,
         partition_kind=config.partition_kind,
@@ -165,7 +166,7 @@ def train(config: OfflineTrainConfig) -> dict[str, Any]:
         split="train",
     )
     eval_rows = load_task_rows(
-        config.dataset_root,
+        dataset_root,
         config.task,
         fmt=config.dataset_format,
         partition_kind=config.partition_kind,
@@ -174,7 +175,7 @@ def train(config: OfflineTrainConfig) -> dict[str, Any]:
     )
     if not eval_rows:
         eval_rows = load_task_rows(
-            config.dataset_root,
+            dataset_root,
             config.task,
             fmt=config.dataset_format,
             partition_kind=config.partition_kind,
@@ -218,8 +219,14 @@ def train(config: OfflineTrainConfig) -> dict[str, Any]:
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
-    run_name = f"{config.task}-{config.partition_kind or 'root'}-{config.partition_value or 'all'}-{time.strftime('%Y%m%d-%H%M%S')}"
-    run_dir = Path(config.out_dir) / run_name
+    partition_value = (
+        validate_artifact_component(config.partition_value, label="offline partition_value")
+        if config.partition_value
+        else "all"
+    )
+    run_name = f"{config.task}-{config.partition_kind or 'root'}-{partition_value}-{time.strftime('%Y%m%d-%H%M%S')}"
+    output_root = resolve_artifact_path(config.out_dir, default="offline_runs")
+    run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
 
@@ -278,7 +285,7 @@ def train(config: OfflineTrainConfig) -> dict[str, Any]:
                         "state_vocabs": {name: vocab.to_dict() for name, vocab in state_vocabs.items()},
                         "output_vocabs": {name: vocab.to_dict() for name, vocab in output_vocabs.items()},
                         "task_meta": task_meta,
-                        "config": asdict(config),
+                        "config": {**asdict(config), "out_dir": str(output_root)},
                         "best_eval_accuracy": best_eval_acc,
                         "epoch": epoch,
                     },
@@ -306,7 +313,12 @@ def main() -> None:
     parser.add_argument("--dataset-format", default="parquet", choices=["parquet", "jsonl"])
     parser.add_argument("--partition-kind", default=None, choices=["build_id", "build_family"])
     parser.add_argument("--partition-value", default=None, type=str)
-    parser.add_argument("--out-dir", default="offline_runs", type=str)
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        type=str,
+        help="Output directory (default: <STS2_ARTIFACT_ROOT>/offline_runs). Relative paths use the artifact root.",
+    )
     parser.add_argument("--batch-size", default=64, type=int)
     parser.add_argument("--epochs", default=20, type=int)
     parser.add_argument("--learning-rate", default=1e-3, type=float)

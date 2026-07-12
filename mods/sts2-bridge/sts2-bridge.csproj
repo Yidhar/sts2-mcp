@@ -6,6 +6,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Sts2McpBridge</RootNamespace>
     <AssemblyName>sts2-bridge</AssemblyName>
+    <Version>0.8.0</Version>
+    <AssemblyVersion>0.8.0.0</AssemblyVersion>
+    <FileVersion>0.8.0.0</FileVersion>
+    <InformationalVersion>0.8.0</InformationalVersion>
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
 
@@ -13,19 +17,24 @@
     <Sts2Dir Condition="'$(Sts2Dir)' == '' and '$(SLAY_THE_SPIRE_2_DIR)' != ''">$(SLAY_THE_SPIRE_2_DIR)</Sts2Dir>
     <Sts2DataDir Condition="'$(Sts2DataDir)' == '' and '$(Sts2Dir)' != ''">$(Sts2Dir)\data_sts2_windows_x86_64</Sts2DataDir>
     <Sts2ModDir Condition="'$(Sts2ModDir)' == '' and '$(Sts2Dir)' != ''">$(Sts2Dir)\mods\sts2-bridge</Sts2ModDir>
-    <Sts2SkipDeploy Condition="'$(Sts2SkipDeploy)' == ''">false</Sts2SkipDeploy>
+    <Sts2Deploy Condition="'$(Sts2Deploy)' == ''">false</Sts2Deploy>
   </PropertyGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="..\..\packages\rl-agent\content\card_effect_profiles.generated.json">
+    <Compile Remove="tests\**\*.cs" />
+    <Compile Include="..\..\contracts\generated\csharp\ContractVersions.g.cs" Link="Generated\ContractVersions.g.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\game-data\generated\card_effect_profiles.generated.json">
       <LogicalName>Sts2McpBridge.Content.card_effect_profiles.generated.json</LogicalName>
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </EmbeddedResource>
-    <EmbeddedResource Include="..\..\packages\rl-agent\content\potions.timing.generated.json">
+    <EmbeddedResource Include="..\..\game-data\generated\potions.timing.generated.json">
       <LogicalName>Sts2McpBridge.Content.potions.timing.generated.json</LogicalName>
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </EmbeddedResource>
-    <EmbeddedResource Include="..\..\packages\rl-agent\content\potions.timing.overrides.json">
+    <EmbeddedResource Include="..\..\game-data\raw\potions.timing.overrides.json">
       <LogicalName>Sts2McpBridge.Content.potions.timing.overrides.json</LogicalName>
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
     </EmbeddedResource>
@@ -46,7 +55,7 @@
     </Reference>
   </ItemGroup>
 
-  <Target Name="CopyBuiltDllToModsDir" AfterTargets="Build" Condition="'$(Sts2SkipDeploy)' != 'true'">
+  <Target Name="CopyBuiltDllToModsDir" AfterTargets="Build" Condition="'$(Sts2Deploy)' == 'true' and '$(Sts2SkipDeploy)' != 'true'">
     <MakeDir Directories="$(Sts2ModDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(Sts2ModDir)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\sts2-bridge.json" DestinationFolder="$(Sts2ModDir)" SkipUnchangedFiles="true" />

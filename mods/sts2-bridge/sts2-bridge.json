@@ -2,10 +2,11 @@
   "id": "sts2-bridge",
   "name": "STS2 MCP Bridge",
   "author": "yidhar",
-  "description": "Local bridge mod that exposes Slay the Spire 2 state and legal actions to the sts2 MCP server.",
-  "version": "0.7.12",
+  "description": "Local gameplay bridge with capability-scoped player control and privileged training APIs.",
+  "version": "0.8.0",
   "has_pck": false,
   "has_dll": true,
   "dependencies": [],
-  "affects_gameplay": false
+  "affects_gameplay": true,
+  "visible_only": false
 }

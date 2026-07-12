@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from combat_snapshot_dataset import infer_encounter_tier
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -61,6 +62,20 @@ def main() -> None:
     parser.add_argument("--allow-run-ids-file", type=Path, default=None)
     parser.add_argument("--exclude-run-ids-file", type=Path, default=None)
     args = parser.parse_args()
+
+    args.combat_snapshots = resolve_external_input_path(args.combat_snapshots)
+    args.runs_summary = resolve_external_input_path(args.runs_summary)
+    args.allow_run_ids_file = (
+        resolve_external_input_path(args.allow_run_ids_file)
+        if args.allow_run_ids_file is not None
+        else None
+    )
+    args.exclude_run_ids_file = (
+        resolve_external_input_path(args.exclude_run_ids_file)
+        if args.exclude_run_ids_file is not None
+        else None
+    )
+    args.output = resolve_artifact_path(args.output)
 
     combat_rows = read_jsonl(args.combat_snapshots)
     run_rows = read_jsonl(args.runs_summary)

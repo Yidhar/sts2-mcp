@@ -1,0 +1,27 @@
+version = "sts2-training-config-v1"
+profile = "combat"
+
+[model]
+obs_mode = "token_v3"
+model_arch = "token_memory_v1"
+
+[environment]
+environment_backend = "live"
+combat_sandbox = true
+combat_sandbox_potions = true
+
+[optimization]
+learning_rate = 0.0001
+batch_size = 64
+discount = 0.997
+n_step_return = 10
+
+[runtime]
+device = "auto"
+total_timesteps = 100000
+n_envs = 1
+
+[guards]
+combat_hard_guard_policy = "off"
+build_hard_guard_policy = "off"
+hard_guard_target_rewrite = "off"

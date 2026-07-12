@@ -7,21 +7,34 @@ trainer core directly; ``muzero.train`` is now only a compatibility wrapper.
 
 from __future__ import annotations
 
+from muzero.sts2_env.planner_memory_profile import apply_planner_memory_profile_to_args
+from muzero.training.async_telemetry import log_async_episode_scalars
+from muzero.training.checkpointing import (
+    WEIGHTS_ONLY_MIGRATION_ID,
+    load_warm_start_checkpoint,
+)
+from muzero.training.cli_args import build_arg_parser
+from muzero.training.cli_parsing import resolve_combat_sandbox_encounter_pool
+
 # Import the trainer namespace explicitly from the core module; do not route
 # through ``muzero.train`` or the compatibility wrapper can become monolithic
 # again.
 from muzero.training.trainer import *  # noqa: F401,F403
 from muzero.training.trainer import _get_live_supported_encounter_ids  # noqa: F401
-from muzero.training.cli_args import build_arg_parser
-from muzero.training.cli_parsing import resolve_combat_sandbox_encounter_pool
-from muzero.training.async_telemetry import log_async_episode_scalars
-from muzero.sts2_env.planner_memory_profile import apply_planner_memory_profile_to_args
+from sts2_rl.artifacts import resolve_external_input_path
+from sts2_rl.training import (
+    TrainingConfig,
+    TrainingResources,
+    TrainingRuntime,
+    build_legacy_trainer,
+    parse_args_with_config,
+)
 
 
 def main():
     """Main training loop."""
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parse_args_with_config(parser)
     activation_checkpointing_mode = str(args.activation_checkpointing or "auto").strip().lower()
     args.activation_checkpointing_enabled = bool(
         activation_checkpointing_mode == "on"
@@ -47,13 +60,42 @@ def main():
     args.checkpoint_dir = normalize_path_str(args.checkpoint_dir) or args.checkpoint_dir
     args.resume_from = normalize_path_str(args.resume_from)
     args.combat_snapshot_dataset = normalize_path_str(args.combat_snapshot_dataset)
+    if args.combat_snapshot_dataset:
+        args.combat_snapshot_dataset = str(resolve_external_input_path(args.combat_snapshot_dataset))
+    if args.offline_alignment_root:
+        args.offline_alignment_root = str(resolve_external_input_path(args.offline_alignment_root))
     args.session_file = normalize_path_str(args.session_file)
+    args.sim_exe_path = normalize_path_str(args.sim_exe_path)
     run_paths = RunPaths.from_args(args)
     run_paths.ensure_dirs()
     PolicyModulePaths.from_package_root(run_paths.package_root).ensure_package_dirs()
     args.log_dir = str(run_paths.log_dir)
     args.checkpoint_dir = str(run_paths.checkpoint_dir)
     args.resume_from = str(run_paths.resume_from) if run_paths.resume_from is not None else None
+    if args.warm_start:
+        if not args.resume_from:
+            parser.error("--warm-start requires --resume-from")
+        if args.checkpoint_migration_id != WEIGHTS_ONLY_MIGRATION_ID:
+            parser.error(
+                "--warm-start requires --checkpoint-migration-id "
+                f"{WEIGHTS_ONLY_MIGRATION_ID}"
+            )
+        if not args.resume_load_buffer or not args.resume_load_optimizer:
+            parser.error(
+                "--no-resume-load-buffer/--no-resume-load-optimizer are not warm-start flags; "
+                "omit them because --warm-start is always weights-only"
+            )
+    elif args.checkpoint_migration_id or args.allow_legacy_checkpoint:
+        parser.error(
+            "--checkpoint-migration-id and --allow-legacy-checkpoint require --warm-start"
+        )
+    elif args.resume_from and (
+        not args.resume_load_buffer or not args.resume_load_optimizer
+    ):
+        parser.error(
+            "exact resume cannot disable replay or optimizer restoration; use the explicit "
+            "--warm-start --checkpoint-migration-id sts2-weights-only-v1 workflow instead"
+        )
     if args.obs_mode == "token_v3" and args.model_arch != "token_memory_v1":
         raise ValueError("--obs-mode token_v3 requires --model-arch token_memory_v1.")
     if args.model_arch == "token_memory_v1" and args.obs_mode != "token_v3":
@@ -78,12 +120,16 @@ def main():
         print(f"[setup] STS2_BRIDGE_SESSION_FILE={os.environ.get('STS2_BRIDGE_SESSION_FILE', '<default>')}")
         print(f"[setup] STS2_BRIDGE_BASE_URL={os.environ.get('STS2_BRIDGE_BASE_URL', '<session.json base_url>')}")
 
-    # Resolve session files
-    session_files = resolve_training_session_files(
-        n_envs=args.n_envs,
-        session_file=args.session_file,
-        session_files=parse_session_files(args.session_files),
-    )
+    # Resolve backend endpoints. Headless workers own simulator processes and
+    # therefore do not consume live bridge session descriptors.
+    if args.environment_backend == "headless":
+        session_files = [None for _ in range(args.n_envs)]
+    else:
+        session_files = resolve_training_session_files(
+            n_envs=args.n_envs,
+            session_file=args.session_file,
+            session_files=parse_session_files(args.session_files),
+        )
 
     combat_multi_env = bool(args.combat_sandbox and args.n_envs > 1)
     if not args.combat_sandbox and args.n_envs != 1:
@@ -139,7 +185,11 @@ def main():
     # Setup snapshot pool if provided
     if args.combat_sandbox and args.combat_snapshot_dataset:
         print(f"[setup] Loading combat snapshot dataset from {args.combat_snapshot_dataset}...")
-        supported_encounter_ids = _get_live_supported_encounter_ids(session_file)
+        supported_encounter_ids = _get_live_supported_encounter_ids(
+            session_file,
+            backend_kind=args.environment_backend,
+            sim_exe_path=args.sim_exe_path,
+        )
         print(f"[setup] Live combat catalog supports {len(supported_encounter_ids)} encounters")
         snapshot_pool = CombatSnapshotPool.from_path(
             args.combat_snapshot_dataset,
@@ -172,6 +222,8 @@ def main():
             obs_mode=args.obs_mode,
             seed_pool=resolved_seed_pool,
             seed_strategy=args.seed_strategy,
+            environment_backend=args.environment_backend,
+            sim_exe_path=args.sim_exe_path,
         )
 
     def close_env_safely(train_env: gym.Env | None, env_index: int) -> None:
@@ -303,7 +355,7 @@ def main():
 
     optimizer = optim.Adam(
         network.parameters(),
-        lr=args.lr,
+        lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
 
@@ -390,125 +442,63 @@ def main():
     else:
         print("[setup] Offline policy alignment: off", flush=True)
 
-    trainer = MuZeroTrainer(
-        network=network,
-        mcts=mcts,
-        buffer=buffer,
-        env=env,
-        optimizer=optimizer,
-        device=args.device,
-        discount=args.discount,
-        n_step_return=args.n_step_return,
-        latent_policy_distill_weight=args.latent_policy_distill_weight,
-        latent_policy_target_weight=args.latent_policy_target_weight,
-        planner_q_loss_weight=args.planner_q_loss_weight,
-        planner_objective_q_loss_weight=args.planner_objective_q_loss_weight,
-        objective_value_weight=args.objective_value_weight,
-        objective_reward_weight=args.objective_reward_weight,
-        combat_hp_preservation_aux_weight=args.combat_hp_preservation_aux_weight,
-        human_demo_policy_alignment=human_demo_policy_alignment,
-        human_demo_alignment_weight=args.human_demo_alignment_weight,
-        human_demo_alignment_shadow_only=not args.human_demo_alignment_enable_loss,
-        human_demo_alignment_every_n_train_steps=args.human_demo_alignment_every_n_train_steps,
-        offline_policy_alignment=offline_policy_alignment,
-        offline_alignment_weight=args.offline_alignment_weight,
-        offline_alignment_shadow_only=not args.offline_alignment_enable_loss,
-        offline_alignment_every_n_train_steps=args.offline_alignment_every_n_train_steps,
-        semantic_policy_weight=0.0 if args.disable_semantic_training else args.semantic_policy_weight,
-        semantic_value_weight=0.0 if args.disable_semantic_training else args.semantic_value_weight,
-        semantic_reward_weight=0.0 if args.disable_semantic_training else args.semantic_reward_weight,
-        semantic_state_consistency_weight=0.0 if args.disable_semantic_training else args.semantic_state_consistency_weight,
-        objective_diversity_weight=0.0 if args.disable_semantic_training else args.objective_diversity_weight,
-        semantic_policy_label_smoothing=args.semantic_policy_label_smoothing,
-        state_consistency_weight=args.state_consistency_weight,
-        future_world_aux_weight=args.future_world_aux_weight,
-        future_bank_state_weight=args.future_bank_state_weight,
-        future_bank_delta_weight=args.future_bank_delta_weight,
-        future_bank_occupancy_weight=args.future_bank_occupancy_weight,
-        future_bank_token_presence_weight=args.future_bank_token_presence_weight,
-        future_bank_token_distribution_weight=args.future_bank_token_distribution_weight,
-        future_bank_token_slot_state_weight=args.future_bank_token_slot_state_weight,
-        future_bank_token_slot_mask_weight=args.future_bank_token_slot_mask_weight,
-        future_bank_token_slot_type_weight=args.future_bank_token_slot_type_weight,
-        future_bank_token_slot_zone_weight=args.future_bank_token_slot_zone_weight,
-        future_bank_token_slot_source_weight=args.future_bank_token_slot_source_weight,
-        token_teacher_ema_decay=args.token_teacher_ema_decay,
-        future_world_rollout_weight=args.future_world_rollout_weight,
-        future_world_rollout_steps=args.future_world_rollout_steps,
-        future_world_rollout_decay=args.future_world_rollout_decay,
-        latent_gaussian_reg_weight=args.latent_gaussian_reg_weight,
-        latent_gaussian_reg_projections=args.latent_gaussian_reg_projections,
-        latent_gaussian_reg_slot_weight=args.latent_gaussian_reg_slot_weight,
-        latent_gaussian_reg_dynamics_weight=args.latent_gaussian_reg_dynamics_weight,
-        latent_gaussian_reg_cov_weight=args.latent_gaussian_reg_cov_weight,
-        surprise_loss_weight=args.surprise_loss_weight,
-        surprise_hidden_scale=args.surprise_hidden_scale,
-        surprise_surface_scale=args.surprise_surface_scale,
-        surprise_future_aux_scale=args.surprise_future_aux_scale,
-        surprise_target_cap=args.surprise_target_cap,
-        surface_mask_weight=args.surface_mask_weight,
-        surface_count_weight=args.surface_count_weight,
-        surface_domain_weight=args.surface_domain_weight,
-        surface_phase_weight=args.surface_phase_weight,
-        combat_direct_policy=args.combat_direct_policy,
-        combat_rollout_q_blend=args.combat_rollout_q_blend,
-        combat_rollout_objective_q_blend=args.combat_rollout_objective_q_blend,
-        combat_rollout_risk_blend=args.combat_rollout_risk_blend,
-        combat_rollout_steps=args.combat_rollout_steps,
-        combat_rollout_beam_width=args.combat_rollout_beam_width,
-        combat_rollout_legal_logit_scale=args.combat_rollout_legal_logit_scale,
-        combat_rollout_uncertainty_blend=args.combat_rollout_uncertainty_blend,
-        combat_rollout_uncertainty_surprise_weight=args.combat_rollout_uncertainty_surprise_weight,
-        combat_rollout_uncertainty_surface_weight=args.combat_rollout_uncertainty_surface_weight,
-        combat_rollout_uncertainty_latent_weight=args.combat_rollout_uncertainty_latent_weight,
-        combat_rollout_uncertainty_disagreement_weight=args.combat_rollout_uncertainty_disagreement_weight,
-        combat_rollout_continuation_uncertainty_penalty=args.combat_rollout_continuation_uncertainty_penalty,
-        combat_num_simulations=args.combat_num_simulations,
-        build_num_simulations=args.build_num_simulations,
-        route_num_simulations=args.route_num_simulations,
-        settlement_weight=args.settlement_weight,
-        settlement_decay=args.settlement_decay,
-        settlement_max_steps=args.settlement_max_steps,
-        trivial_build_fast_path=not args.disable_trivial_build_fast_path,
-        potion_reward_fast_path=not args.disable_potion_reward_fast_path,
-        recent_tail_windows=recent_tail_windows,
-        recent_tail_tracked_encounters=recent_tail_tracked_encounters,
-        recent_tail_min_samples=args.recent_tail_min_samples,
-        route_heuristic_bias=args.route_heuristic_bias,
-        route_safety_guard=args.route_safety_guard,
-        combat_hard_guard_policy=args.combat_hard_guard_policy,
-        build_hard_guard_policy=args.build_hard_guard_policy,
-        log_dir=args.log_dir,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_keep_last=args.checkpoint_keep_last,
-        mixed_precision=args.mixed_precision,
-        amp_init_scale=args.amp_init_scale,
+    training_config = TrainingConfig.from_namespace(args)
+    trainer = build_legacy_trainer(
+        MuZeroTrainer,
+        resources=TrainingResources(
+            network=network,
+            mcts=mcts,
+            replay=buffer,
+            environment=env,
+            optimizer=optimizer,
+        ),
+        config=training_config,
+        overrides={
+            "human_demo_policy_alignment": human_demo_policy_alignment,
+            "human_demo_alignment_shadow_only": not args.human_demo_alignment_enable_loss,
+            "offline_policy_alignment": offline_policy_alignment,
+            "offline_alignment_shadow_only": not args.offline_alignment_enable_loss,
+            "recent_tail_windows": recent_tail_windows,
+            "recent_tail_tracked_encounters": recent_tail_tracked_encounters,
+        },
     )
+    training_runtime = TrainingRuntime.from_legacy(trainer, training_config)
 
     if args.resume_from:
-        print(f"[resume] Loading checkpoint from {args.resume_from}...")
-        resume_metadata = load_resume_checkpoint(
-            args.resume_from,
-            network=network,
-            optimizer=optimizer,
-            buffer=buffer,
-            device=args.device,
-            load_buffer=not args.resume_without_buffer,
-            load_optimizer=not args.resume_without_optimizer,
-            token_target_encoder=trainer.token_target_encoder,
-            amp_grad_scaler=trainer.amp_grad_scaler,
-        )
-        trainer.total_steps = int(resume_metadata.get("total_steps", 0))
-        trainer.episode_count = int(resume_metadata.get("episode_count", 0))
-        print(
-            f"[resume] Loaded total_steps={trainer.total_steps} "
-            f"episode_count={trainer.episode_count} buffer={len(buffer)}"
-        )
-        if args.total_timesteps <= trainer.total_steps:
-            raise ValueError(
-                f"--total-timesteps ({args.total_timesteps}) must be greater than resumed total_steps "
-                f"({trainer.total_steps})."
+        if args.warm_start:
+            print(f"[warm-start] Loading weights from {args.resume_from}...")
+            warm_start_report = load_warm_start_checkpoint(
+                args.resume_from,
+                network=network,
+                device=args.device,
+                migration_id=str(args.checkpoint_migration_id),
+                allow_legacy_checkpoint=bool(args.allow_legacy_checkpoint),
+                token_target_encoder=trainer.token_target_encoder,
             )
+            print(
+                "[warm-start] New training lineage starts at total_steps=0, episode_count=0, "
+                f"buffer=0; source_checkpoint_id={warm_start_report['source_checkpoint_id']}"
+            )
+        else:
+            print(f"[resume] Loading exact checkpoint from {args.resume_from}...")
+            resume_metadata = load_resume_checkpoint(
+                args.resume_from,
+                network=network,
+                optimizer=optimizer,
+                buffer=buffer,
+                device=args.device,
+                load_buffer=bool(args.resume_load_buffer),
+                load_optimizer=bool(args.resume_load_optimizer),
+                token_target_encoder=trainer.token_target_encoder,
+                amp_grad_scaler=trainer.amp_grad_scaler,
+            )
+            trainer.total_steps = int(resume_metadata.get("total_steps", 0))
+            trainer.episode_count = int(resume_metadata.get("episode_count", 0))
+            if args.total_timesteps <= trainer.total_steps:
+                raise ValueError(
+                    f"--total-timesteps ({args.total_timesteps}) must be greater than resumed "
+                    f"total_steps ({trainer.total_steps})."
+                )
 
     mode_name = "combat_sandbox" if args.combat_sandbox else "full_run"
     async_combat_actor_learner = bool(args.combat_sandbox and len(envs) > 1)
@@ -554,6 +544,7 @@ def main():
         "[setup] Hard guards: "
         f"combat={args.combat_hard_guard_policy} "
         f"build={args.build_hard_guard_policy} "
+        f"target_rewrite={args.hard_guard_target_rewrite} "
         f"route_safety={'on' if args.route_safety_guard else 'off'}"
     )
     print(
@@ -774,92 +765,29 @@ def main():
         actor_buffer = EpisodeCaptureBuffer()
         actor_log_dir = str(run_paths.async_actor_log_dir(actor_index))
         actor_ckpt_dir = str(run_paths.async_actor_checkpoint_dir(actor_index))
-        actor_trainer = MuZeroTrainer(
-            network=actor_network,
-            mcts=build_mcts_instance(),
-            buffer=actor_buffer,  # type: ignore[arg-type]
-            env=envs[actor_index],
-            optimizer=actor_optimizer,
-            device=args.device,
-            discount=args.discount,
-            n_step_return=args.n_step_return,
-            latent_policy_distill_weight=args.latent_policy_distill_weight,
-            latent_policy_target_weight=args.latent_policy_target_weight,
-            planner_q_loss_weight=args.planner_q_loss_weight,
-            planner_objective_q_loss_weight=args.planner_objective_q_loss_weight,
-            objective_value_weight=args.objective_value_weight,
-            objective_reward_weight=args.objective_reward_weight,
-            combat_hp_preservation_aux_weight=args.combat_hp_preservation_aux_weight,
-            semantic_policy_weight=0.0 if args.disable_semantic_training else args.semantic_policy_weight,
-            semantic_value_weight=0.0 if args.disable_semantic_training else args.semantic_value_weight,
-            semantic_reward_weight=0.0 if args.disable_semantic_training else args.semantic_reward_weight,
-            semantic_state_consistency_weight=0.0 if args.disable_semantic_training else args.semantic_state_consistency_weight,
-            objective_diversity_weight=0.0 if args.disable_semantic_training else args.objective_diversity_weight,
-            semantic_policy_label_smoothing=args.semantic_policy_label_smoothing,
-            state_consistency_weight=args.state_consistency_weight,
-            future_world_aux_weight=args.future_world_aux_weight,
-            future_bank_state_weight=args.future_bank_state_weight,
-            future_bank_delta_weight=args.future_bank_delta_weight,
-            future_bank_occupancy_weight=args.future_bank_occupancy_weight,
-            future_bank_token_presence_weight=args.future_bank_token_presence_weight,
-            future_bank_token_distribution_weight=args.future_bank_token_distribution_weight,
-            future_bank_token_slot_state_weight=args.future_bank_token_slot_state_weight,
-            future_bank_token_slot_mask_weight=args.future_bank_token_slot_mask_weight,
-            future_bank_token_slot_type_weight=args.future_bank_token_slot_type_weight,
-            future_bank_token_slot_zone_weight=args.future_bank_token_slot_zone_weight,
-            future_bank_token_slot_source_weight=args.future_bank_token_slot_source_weight,
-            token_teacher_ema_decay=args.token_teacher_ema_decay,
-            future_world_rollout_weight=args.future_world_rollout_weight,
-            future_world_rollout_steps=args.future_world_rollout_steps,
-            future_world_rollout_decay=args.future_world_rollout_decay,
-            latent_gaussian_reg_weight=args.latent_gaussian_reg_weight,
-            latent_gaussian_reg_projections=args.latent_gaussian_reg_projections,
-            latent_gaussian_reg_slot_weight=args.latent_gaussian_reg_slot_weight,
-            latent_gaussian_reg_dynamics_weight=args.latent_gaussian_reg_dynamics_weight,
-            latent_gaussian_reg_cov_weight=args.latent_gaussian_reg_cov_weight,
-            surprise_loss_weight=args.surprise_loss_weight,
-            surprise_hidden_scale=args.surprise_hidden_scale,
-            surprise_surface_scale=args.surprise_surface_scale,
-            surprise_future_aux_scale=args.surprise_future_aux_scale,
-            surprise_target_cap=args.surprise_target_cap,
-            surface_mask_weight=args.surface_mask_weight,
-            surface_count_weight=args.surface_count_weight,
-            surface_domain_weight=args.surface_domain_weight,
-            surface_phase_weight=args.surface_phase_weight,
-            combat_direct_policy=args.combat_direct_policy,
-            combat_rollout_q_blend=args.combat_rollout_q_blend,
-            combat_rollout_objective_q_blend=args.combat_rollout_objective_q_blend,
-            combat_rollout_risk_blend=args.combat_rollout_risk_blend,
-            combat_rollout_steps=args.combat_rollout_steps,
-            combat_rollout_beam_width=args.combat_rollout_beam_width,
-            combat_rollout_legal_logit_scale=args.combat_rollout_legal_logit_scale,
-            combat_rollout_uncertainty_blend=args.combat_rollout_uncertainty_blend,
-            combat_rollout_uncertainty_surprise_weight=args.combat_rollout_uncertainty_surprise_weight,
-            combat_rollout_uncertainty_surface_weight=args.combat_rollout_uncertainty_surface_weight,
-            combat_rollout_uncertainty_latent_weight=args.combat_rollout_uncertainty_latent_weight,
-            combat_rollout_uncertainty_disagreement_weight=args.combat_rollout_uncertainty_disagreement_weight,
-            combat_rollout_continuation_uncertainty_penalty=args.combat_rollout_continuation_uncertainty_penalty,
-            combat_num_simulations=args.combat_num_simulations,
-            build_num_simulations=args.build_num_simulations,
-            route_num_simulations=args.route_num_simulations,
-            settlement_weight=args.settlement_weight,
-            settlement_decay=args.settlement_decay,
-            settlement_max_steps=args.settlement_max_steps,
-            trivial_build_fast_path=not args.disable_trivial_build_fast_path,
-            potion_reward_fast_path=not args.disable_potion_reward_fast_path,
-            recent_tail_windows=recent_tail_windows,
-            recent_tail_tracked_encounters=recent_tail_tracked_encounters,
-            recent_tail_min_samples=args.recent_tail_min_samples,
-            route_heuristic_bias=args.route_heuristic_bias,
-            route_safety_guard=args.route_safety_guard,
-            combat_hard_guard_policy=args.combat_hard_guard_policy,
-            build_hard_guard_policy=args.build_hard_guard_policy,
-            log_dir=actor_log_dir,
-            checkpoint_dir=actor_ckpt_dir,
-            checkpoint_keep_last=0,
-            mixed_precision=args.mixed_precision,
-            amp_init_scale=args.amp_init_scale,
+        actor_trainer = build_legacy_trainer(
+            MuZeroTrainer,
+            resources=TrainingResources(
+                network=actor_network,
+                mcts=build_mcts_instance(),
+                replay=actor_buffer,
+                environment=envs[actor_index],
+                optimizer=actor_optimizer,
+            ),
+            config=training_config,
+            overrides={
+                "human_demo_policy_alignment": None,
+                "human_demo_alignment_weight": 0.0,
+                "offline_policy_alignment": None,
+                "offline_alignment_weight": 0.0,
+                "recent_tail_windows": recent_tail_windows,
+                "recent_tail_tracked_encounters": recent_tail_tracked_encounters,
+                "log_dir": actor_log_dir,
+                "checkpoint_dir": actor_ckpt_dir,
+                "checkpoint_keep_last": 0,
+            },
         )
+        actor_runtime = TrainingRuntime.from_legacy(actor_trainer, training_config)
         try:
             actor_trainer.writer.close()
         except Exception:
@@ -890,8 +818,8 @@ def main():
                     loaded_weight_version = weight_version
 
                 actor_trainer.total_steps = int(latest_total_steps)
-                temperature = actor_trainer.compute_temperature(latest_total_steps, args.total_timesteps)
-                ep_reward, ep_length = actor_trainer.self_play_episode(temperature=temperature)
+                temperature = actor_runtime.collector.temperature(latest_total_steps, args.total_timesteps)
+                ep_reward, ep_length = actor_runtime.collector.collect_episode(temperature=temperature)
                 trajectory = actor_buffer.pop_latest()
                 if trajectory is None:
                     raise RuntimeError(f"Async combat actor {actor_index} produced no trajectory")
@@ -982,7 +910,7 @@ def main():
 
         while trainer.total_steps < args.total_timesteps:
             active_env_index = 0
-            temperature = trainer.compute_temperature(trainer.total_steps, args.total_timesteps)
+            temperature = training_runtime.collector.temperature(trainer.total_steps, args.total_timesteps)
             if async_combat_actor_learner:
                 try:
                     packet = async_episode_queue.get(timeout=5.0)
@@ -1017,7 +945,7 @@ def main():
                 if not isinstance(trajectory, GameTrajectory):
                     raise RuntimeError(f"Async combat actor[{active_env_index}] returned invalid trajectory payload")
 
-                buffer.save_episode(
+                training_runtime.replay_store.save_episode(
                     trajectory,
                     discount=trainer.discount,
                     n_steps=trainer.n_step_return,
@@ -1045,7 +973,7 @@ def main():
                     actor_completed_episodes=actor_completed_episodes,
                 )
             else:
-                ep_reward, ep_length = trainer.self_play_episode(temperature=temperature)
+                ep_reward, ep_length = training_runtime.collector.collect_episode(temperature=temperature)
                 trainer.total_steps += ep_length
                 trainer.writer.add_scalar("episode/reward", ep_reward, trainer.episode_count)
                 trainer.writer.add_scalar("episode/length", ep_length, trainer.episode_count)
@@ -1055,7 +983,7 @@ def main():
             train_updates_triggered = 0
             while len(buffer) >= args.min_buffer_size and (trainer.total_steps - last_train_step) >= args.train_every:
                 for _ in range(args.updates_per_train):
-                    losses = trainer.train_step(
+                    losses = training_runtime.learner.update(
                         batch_size=args.batch_size,
                         unroll_steps=args.unroll_steps,
                     )
@@ -1187,7 +1115,7 @@ def main():
 
             # Checkpointing
             if (trainer.total_steps % args.checkpoint_freq) < ep_length:
-                trainer.save_checkpoint()
+                training_runtime.checkpoints.save()
 
             trainer.writer.add_scalar("buffer/size", len(buffer), trainer.total_steps)
             if (trainer.episode_count % 5) == 0:
@@ -1195,15 +1123,15 @@ def main():
 
     except KeyboardInterrupt:
         print("[interrupt] Caught KeyboardInterrupt, saving emergency checkpoint...")
-        trainer.save_checkpoint(tag="crash")
+        training_runtime.checkpoints.save(tag="crash")
         raise
     else:
         print(f"[train] Finished training after {trainer.total_steps} steps")
-        trainer.save_checkpoint(tag="final")
+        training_runtime.checkpoints.save(tag="final")
     finally:
         actor_stop_event.set()
         for actor_thread in actor_threads:
             actor_thread.join(timeout=5.0)
         for env_index, train_env in enumerate(envs):
             close_env_safely(train_env, env_index)
-        trainer.writer.close()
+        training_runtime.telemetry.close()

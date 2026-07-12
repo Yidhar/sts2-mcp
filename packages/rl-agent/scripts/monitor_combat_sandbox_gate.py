@@ -20,9 +20,16 @@ import argparse
 import collections
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import mean
 from typing import Any
+
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
 
 try:
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -33,7 +40,7 @@ except Exception as exc:  # pragma: no cover - operator-facing failure
     )
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "logs_muzero"
+DEFAULT_ROOT = resolve_artifact_path(None, default="runs")
 
 
 CORE_TAGS: tuple[str, ...] = (
@@ -799,7 +806,7 @@ def print_human(payload: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="logs_muzero root")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="runs root")
     parser.add_argument("--run-dir", type=Path, default=None, help="specific TensorBoard run directory")
     parser.add_argument("--tail", type=int, default=20, help="tail window for averages/min/max")
     parser.add_argument("--min-buffer", type=float, default=3000.0, help="minimum replay buffer size before judging")
@@ -833,7 +840,8 @@ def main() -> int:
     parser.add_argument("--fail-on-red", action="store_true", help="exit nonzero on FAIL/MISSING_TAGS")
     args = parser.parse_args()
 
-    run_dir = args.run_dir or latest_run(args.root)
+    root = resolve_external_input_path(args.root, default="runs")
+    run_dir = resolve_external_input_path(args.run_dir, root=root) if args.run_dir else latest_run(root)
     summaries, tags = load_scalars(run_dir, tail=max(int(args.tail), 1))
     payload = {
         "run_dir": str(run_dir),

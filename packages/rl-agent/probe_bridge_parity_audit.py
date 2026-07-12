@@ -30,17 +30,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
 import requests
 
-sys.path.insert(0, str(Path(__file__).parent))
-from sts2_env.bridge_client import BridgeClient
-from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
 
 # ----------------------------------------------------------------------
 # Raw endpoint callers — bypass Python wrapper normalization so we see the
@@ -277,21 +277,31 @@ def run_audit(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session-file", default=None,
-                        help="Live session.json path (default C:/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session.json)")
+    default_session = os.environ.get("STS2_BRIDGE_SESSION_FILE")
+    if default_session is None and os.environ.get("APPDATA"):
+        default_session = str(Path(os.environ["APPDATA"]) / "SlayTheSpire2" / "bridge" / "session.json")
+    parser.add_argument("--session-file", default=default_session,
+                        help="Live session.json path (default: STS2_BRIDGE_SESSION_FILE or APPDATA discovery)")
     parser.add_argument("--sim-exe-path", default=None)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
-    session_path = args.session_file or "C:/Users/yidhar/AppData/Roaming/SlayTheSpire2/bridge/session.json"
+    if not args.session_file:
+        parser.error("--session-file is required when APPDATA and STS2_BRIDGE_SESSION_FILE are unset")
+    session_path = str(resolve_external_input_path(args.session_file))
+    sim_exe_path = (
+        str(resolve_external_input_path(args.sim_exe_path))
+        if args.sim_exe_path
+        else None
+    )
     sess = json.loads(Path(session_path).read_text(encoding="utf-8"))
     base_url = sess["base_url"]
     token = sess["token"]
     print(f"[audit] live base_url={base_url}")
     print("[audit] starting sim...")
-    sim = HeadlessSimBridgeClient(exe_path=args.sim_exe_path)
+    sim = HeadlessSimBridgeClient(exe_path=sim_exe_path)
 
-    outdir = Path(args.output_dir)
+    outdir = resolve_artifact_path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Run the audit as a series of explicit steps to avoid variable shadow

@@ -1,0 +1,84 @@
+[build-system]
+requires = [
+  "setuptools==75.8.0",
+  "wheel==0.45.1",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sts2-rl"
+version = "0.2.0"
+description = "Typed environment contracts and composable training runtime for Slay the Spire 2"
+requires-python = ">=3.11"
+dependencies = [
+  "gymnasium==1.2.3",
+  "numpy==2.4.3",
+  "requests==2.33.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "torch==2.11.0+cpu",
+  "tensorboard==2.20.0",
+  "pyarrow==23.0.1",
+  "safetensors==0.7.0",
+]
+text = [
+  "sentence-transformers==3.3.1",
+]
+test = [
+  "pytest==8.3.4",
+  "jsonschema==4.25.1",
+]
+dev = [
+  "mypy==1.13.0",
+  "ruff==0.8.4",
+  "types-requests==2.32.0.20241016",
+]
+
+[tool.setuptools]
+py-modules = [
+  "combat_snapshot_dataset",
+  "content_registry",
+  "launcher",
+  "offline_training_data",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sts2_rl*", "sts2_env*", "muzero*"]
+exclude = ["tests*", "legacy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+  "analysis",
+  "logs_*",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["sts2_rl"]
+pretty = true
+show_error_codes = true
+warn_unused_configs = true
+[[tool.mypy.overrides]]
+module = [
+  "sts2_env.*",
+]
+follow_imports = "skip"
+ignore_missing_imports = true

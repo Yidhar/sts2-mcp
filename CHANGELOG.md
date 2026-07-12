@@ -1,5 +1,71 @@
 # Changelog
 
+## [Unreleased] — architecture-v2
+
+This release line is an intentional contract and ownership reset. See
+`docs/migration/README.md` before upgrading a live Bridge/MCP pair or resuming
+historical RL artifacts.
+
+### Breaking changes
+
+- Changed the normal MCP default from the historical debug-sized surface to the
+  `minimal` player-control profile. `strategic` and privileged `debug` are explicit.
+- Require strict `expected_state_version` for gameplay mutation; `strict=false` is rejected.
+- Removed automatic retry of legacy, non-idempotent mutations. A timeout is an unknown
+  outcome and must be reconciled from current state.
+- Moved privileged reset/step behind the separate `training` capability; step is bound
+  to `episode_id` and `expected_step_index`.
+- Disabled `legacy-v1` by default. It is published only when the operator explicitly
+  sets `STS2_BRIDGE_ENABLE_LEGACY_V1=true`; canonical v2 environment step accepts
+  exactly one `action_handle` or `action_index` and no `action_id` alias.
+- Declared `python -m muzero.train` as the maintained RL entry point. The three-stage
+  PPO, obsolete attention/MuZero wrappers, and duplicate training launch paths were
+  removed; archived design notes are non-executable reference material.
+- Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
+
+### Added
+
+- Added contract API `2.0.0` with JSON Schema 2020-12, OpenAPI, fixtures, and generated
+  C#/TypeScript/Python version constants.
+- Added a versioned `game-data` package and deterministic provenance/hash manifest.
+- Added Bridge v2 session descriptors, scoped tokens, player-visible state, bounded
+  events/health, a single mutation gate, idempotent result retention, command-status
+  lookup, and serialized environment operations.
+- Added the TypeScript MCP 0.5 server using the official SDK, Zod validation, loopback-
+  only session forwarding, credential redaction, profile-owned tools, and one-shot
+  legacy mutation semantics.
+- Added the typed Python `sts2_rl` contract/backend/reward/checkpoint foundation, atomic
+  checkpoint helpers, portable game-data lookup, scoped live/headless backends, external
+  reward ownership, process-identity checks, and stricter lifecycle tests in RL 0.2.
+- Added Bridge core tests, MCP SDK/unit tests, contract/repository/data/release gates,
+  GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
+- Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub
+  Actions, deterministic CycloneDX SBOM generation, and source/artifact provenance.
+
+### Removed or archived
+
+- Removed the separate in-game Draft Tracker in favor of an external event recorder.
+- Removed checked-in release binaries, audit/launcher logs, PID/command state, gate
+  output, decompilations, and source slices.
+- Removed AutoSlay/RL smoke runners and journal/knowledge/observation persistence from
+  the MCP control-plane runtime.
+- Removed Bridge static-export execution, duplicate in-game Draft Tracker ownership,
+  legacy PPO/attention packages, obsolete supervisors/probes, and checked-in RL-owned
+  game-data copies.
+- Archived pre-v2 architecture and implementation history under `docs/archive/v1`.
+
+### Compatibility
+
+- Bridge keeps an opt-in, disabled-by-default `legacy-v1` migration surface. It is not
+  advertised unless explicitly enabled; legacy mutations remain non-idempotent and are
+  not the final security boundary.
+- Old replay/checkpoint compatibility is never inferred from filenames. A supported
+  migration validates contract, action-ordering, observation, reward, game-data, model,
+  optimizer, replay, and scheduler identities and fails closed otherwise.
+- V1 removal is gated by contract, idempotency, concurrency, capability, live/headless
+  parity, checkpoint migration, CI, live end-to-end, and zero-v1-client evidence.
+
+
 ## v0.7.12 - 2026-03-22
 
 Repository release: `v0.7.12`

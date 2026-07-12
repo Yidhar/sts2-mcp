@@ -1,156 +1,291 @@
-# sts2-mcp 🌌
+# sts2-mcp
 
-[![English](https://img.shields.io/badge/lang-English-blue.svg)](#) [![Chinese](https://img.shields.io/badge/lang-中文-red.svg)](./README.zh-CN.md)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](#)
+[![Chinese](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](./README.zh-CN.md)
 
-`sts2-mcp` is a high-performance, local control stack for **Slay the Spire 2**. It bridges the gap between the game's internal state and external AI agents using the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+`sts2-mcp` is a local control and reinforcement-learning stack for **Slay the Spire 2**.
+A C# mod observes the game and executes explicit legal actions, a TypeScript server
+exposes a Model Context Protocol (MCP) surface, and the Python package trains and
+evaluates the active MuZero/token-memory agent.
 
-Unlike traditional screen-scraping or OCR-based solutions, `sts2-mcp` uses a **native C# bridge mod** to extract precise game data and expose legal actions directly, ensuring 100% accuracy and sub-millisecond latency.
+This repository is in the **architecture-v2 cutover**. The v2 contract and capability
+model are the development target. Legacy v1 endpoints are disabled by default and,
+together with remaining compatibility wrappers, exist only for an explicit migration;
+they must not receive new features.
 
----
+> [!WARNING]
+> This is an unofficial research project. It is not affiliated with or endorsed by
+> Mega Crit. The Bridge runs inside the game process and can mutate a run. Back up
+> saves and training artifacts, use only a game build you are authorized to run, and
+> expect game updates to require adapter changes.
 
-## 🏗️ Architecture
+## Current components
 
-The project consists of two primary components:
+| Component | Version | Responsibility |
+|---|---:|---|
+| [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema, OpenAPI, fixtures, generated cross-language version constants |
+| [`game-data/`](./game-data/README.md) | `1.0.0` | Versioned card, enemy, relic, potion, and effect-profile data |
+| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | Game adapter, visible snapshots, legal handles, command serialization, session discovery |
+| [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | TypeScript MCP server using the official SDK; default `minimal` control surface |
+| [`packages/rl-agent/`](./packages/rl-agent/muzero/README.md) | `0.2.0` | MuZero/token-memory training, typed environments, reward and checkpoint migration |
+| [`tools/`](./tools) | — | Contract, data, artifact, release, license, and repository checks |
 
-### 1. `mods/sts2-bridge` (The "Sensors & Actuators")
-A C#/.NET 9 mod that injects directly into the Slay the Spire 2 process.
-- **State Serialization**: Converts complex in-game objects (Run, Combat, Rewards, Maps) into clean JSON.
-- **Action Execution**: Directly invokes game methods to perform cards plays, selections, and navigation.
-- **Discovery**: Automatically creates a session file for the MCP server to find and connect to.
+Component versions are coordinated through [`release-manifest.json`](./release-manifest.json).
+The contract manifest is the wire-format authority; package READMEs describe
+component-specific behavior.
 
-### 2. `packages/mcp-server` (The "Interface")
-A Node.js 22 server that implements the standard MCP.
-- **Tool Mapping**: Translates bridge HTTP endpoints into standard MCP tools.
-- **Safety**: Implements `state_version` guarding to prevent "stale" actions (e.g., trying to play a card that was already exhausted).
-- **Optimization**: Handles complex batching for rewards, shops, and campfires to minimize LLM round trips.
+## Architecture and ownership
 
----
+```mermaid
+flowchart LR
+    A[MCP client] --> M[TypeScript MCP server]
+    M -->|loopback HTTP/SSE; player-control token| B["C# Bridge mod"]
+    B --> G[Slay the Spire 2]
+    R[Python RL trainer] --> L[LiveBackend]
+    R --> H[HeadlessBackend]
+    L -->|training token| B
+    H --> S[Pinned HeadlessSim]
+    C[contracts 2.0] --> M
+    C --> B
+    C --> R
+    D[game-data] --> M
+    D --> B
+    D --> R
+```
 
-## 🛠️ MCP Tools Reference
+The dependency and ownership rules are deliberate:
 
-The server exposes the following tools to any MCP-compliant agent (like Claude Desktop or Antigravity):
+- `contracts` and `game-data` are leaf dependencies shared by all runtimes.
+- The Bridge owns factual game adaptation, legal actions, state revision, idempotent
+  mutation arbitration, session lifecycle, and bounded events.
+- The MCP server owns protocol framing, input validation, presentation, and small
+  player-control workflows. It does not own reward, RL state, journal storage, or
+  arbitrary knowledge-file access.
+- The RL package owns episode semantics, observations, actions, reward, curriculum,
+  replay, models, checkpoints, and experiment metadata.
+- The Bridge and MCP server must not import data or code through an RL package path.
+- Runtime artifacts do not belong in the source checkout.
 
-| Tool | Description |
-| :--- | :--- |
-| `sts2_get_state` | Fetches the full current game state (Screen, Health, Deck, Relics, etc.). |
-| `sts2_get_deck` | Returns the full master deck for lower-frequency strategic planning. |
-| `sts2_list_actions` | Lists all currently legal actions available to the player. |
-| `sts2_perform_action` | Executes a single action by its unique ID, with optional `return_state_after` for the full raw post-action bridge state. |
-| `sts2_play_card_sequence` | Plays multiple cards in order, with automatic hand re-indexing. |
-| `sts2_execute_combat_sequence` | Runs mixed combat sequences that can combine card plays, potion use, and `end_turn` in one call. |
-| `sts2_resolve_room_rewards` | Claims all gold/potions and optionally picks a card in one call. |
-| `sts2_resolve_rest_site` | Performs a rest/smith and proceeds back to the map. |
-| `sts2_resolve_card_selection` | Handles card pick/skip/transform screens perfectly. |
-| `sts2_pick_option` | Picks indexed reward/event/rest/card-selection options without raw action-id guessing. |
-| `sts2_travel_to_coordinate` | Resolves cleanup, waits for a stable map snapshot, and then travels to a coordinate. |
-| `sts2_resolve_shop_visit` | Buys multiple items and removes a card in a single batch. |
-| `sts2_env_spec` | Describes the compact RL-oriented environment contract exposed by the RL branch, including observation layout, action encoding, and reward shaping. |
-| `sts2_env_reset` | Starts a fresh standard run from the main menu and returns the first actionable RL observation plus legal actions. |
-| `sts2_env_step` | Executes one RL step, waits for the next stable actionable or terminal state, and returns `obs/reward/done/truncated/legal_actions`. |
+See [`docs/architecture.md`](./docs/architecture.md), the accepted
+[`docs/adr/`](./docs/adr) decisions, and the
+[v2 cutover gates](./docs/migration/v2-cutover.md).
 
----
+## V2 safety model
 
-## 🚀 Getting Started
+The Bridge publishes separate capabilities:
 
-### Prerequisites
-- **OS**: Windows (Slay the Spire 2 is currently Windows-only).
-- **Runtime**: [Node.js 22+](https://nodejs.org/).
-- **Game**: A legal copy of Slay the Spire 2.
+- **`player-control`**: player-visible state and explicit legal actions. It cannot
+  reset a run, select a seed, start a sandbox, export catalogs, or expose hidden
+  draw order.
+- **`training`**: privileged reset/step/sandbox operations under a distinct token.
+  It is disabled by default in the Bridge and exposed only by the MCP `debug` profile.
+- **catalog tooling**: static export and generation are offline tools, not
+  player-control HTTP mutations.
 
-### Option A: Using Pre-compiled Release (Recommended)
-1. Download the latest `sts2-bridge` release (DLL and associated files) from the Releases page.
-2. Create a folder named `sts2-bridge` inside your game's `mods` directory.
-   - Example: `<PATH_TO_STS2>\mods\sts2-bridge`
-3. Place the downloaded files into that folder.
+Every v2 mutation carries a caller-generated `request_id`, active `session_id`,
+capability, expected state revision, and deadline. The Bridge serializes game
+mutations, resolves the action against the current state on the game thread, and
+retains its identity/result for the advertised retention window. It never evicts an
+unexpired identity to make room; admission fails explicitly at capacity.
 
-### Option B: Building from Source
-If you prefer to compile it yourself, you will also need the [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0).
-Set your game installation path and build the project:
+Legacy v1 mutations do **not** provide the same idempotency guarantee. The new MCP
+client sends them once and reports timeouts as `outcome_unknown`; it does not invent
+a retry.
+
+## Requirements
+
+- Windows and a legal local installation of Slay the Spire 2 for full Bridge builds
+  and live-game tests.
+- [.NET SDK 9.0.308](https://dotnet.microsoft.com/) for Bridge core tests and builds.
+- [Node.js 22.14.0](https://nodejs.org/) with npm 10.9.2 for the MCP server.
+- Python 3.11 or newer for RL and repository tooling; reproducible CI uses 3.13.3.
+
+The repository pins exact .NET, Node, npm, and CI Python versions in
+[`global.json`](./global.json), [`.nvmrc`](./.nvmrc), the MCP `packageManager`, and
+[`.python-version`](./.python-version), respectively.
+
+## Quick start: MCP player control
+
+### 1. Build and test the MCP server
 
 ```powershell
-$env:STS2_DIR = "<PATH_TO_STS2>"
+Set-Location .\packages\mcp-server
+npm ci
+npm run typecheck
+npm test
+Set-Location ..\..
+```
+
+### 2. Build the Bridge
+
+The complete build needs assemblies from the installed game:
+
+```powershell
+$env:STS2_DIR = '<PATH_TO_STS2>'
 dotnet build .\mods\sts2-bridge\sts2-bridge.csproj
 ```
-*Note: This will automatically copy the build output to the game's `mods\sts2-bridge` folder.*
 
-### Next Steps...
+A normal build does not deploy. Deployment is explicit:
 
-1. **Launch the Game**: Run Slay the Spire 2. The bridge will initialize and create a session file at `%APPDATA%\SlayTheSpire2\bridge\session.json`.
-2. **Start the MCP Server**:
 ```powershell
+dotnet build .\mods\sts2-bridge\sts2-bridge.csproj -p:Sts2Deploy=true
+```
+
+Core command, idempotency, environment, and lifecycle tests do not require the
+commercial game assemblies:
+
+```powershell
+dotnet run --project .\mods\sts2-bridge\tests\BridgeCore.Tests\BridgeCore.Tests.csproj --configuration Release
+```
+
+### 3. Start the game and MCP server
+
+After the Bridge loads, it writes a session descriptor under the current user's
+application-data STS2 `bridge` directory. Do not print or commit that descriptor:
+it contains bearer credentials.
+
+Run the normal minimal profile:
+
+```powershell
+$env:STS2_MCP_PROFILE = 'minimal'
 node .\packages\mcp-server\index.js
 ```
 
----
+For an MCP host, copy [`.mcp.example.json`](./.mcp.example.json), replace
+`<REPOSITORY_ROOT>` with the absolute checkout path required by that host, and keep
+`STS2_MCP_PROFILE=minimal`. Session discovery uses the current user's application-data
+directory by default; `STS2_BRIDGE_SESSION_FILE` is available for explicit
+multi-instance configurations.
 
-## 🗺️ Roadmap & TODO
+| Profile | Intended use |
+|---|---|
+| `minimal` | Default player-visible status, state, legal actions, strict control, and safe waits |
+| `strategic` | `minimal` plus deck/map views and deliberately ordered action sequences |
+| `debug` | Privileged local development/training tools; never the normal player profile |
 
-- [ ] **Better Tools**: Expanding the MCP toolset for more granular state queries and complex action sequences.
-- [ ] **Multiplayer Support**: Enabling agents to interact with or manage cooperative/multiplayer gameplay mechanics.
-- [ ] **In-Game Dialogue Integration**: Injecting AI strategy text and reasoning directly into the game's dialogue boxes for a more immersive, visual experience.
+## RL development and training
 
----
-
-## 📝 Configuration
-
-The MCP server looks for the bridge session file automatically. You can override it via environment variables:
-- `STS2_BRIDGE_SESSION_FILE`: Path to a custom session JSON.
-
-Combat usage note:
-- Do not parallelize consecutive combat plays with repeated `sts2_perform_action` calls.
-- Use `sts2_play_card_sequence` for card-only turns.
-- Use `sts2_execute_combat_sequence` when a turn mixes card plays, potion use, or `end_turn`.
-
----
-
-## 🤖 Unified RL Pipeline
-
-The RL branch now uses one checkpoint lineage across all training stages:
-
-1. combat sandbox PPO
-2. offline build/route pretraining
-3. full-run PPO
-
-The entry point is [packages/rl-agent/train_pipeline.py](./packages/rl-agent/train_pipeline.py). It passes the output checkpoint of each stage directly into the next one.
-
-Example:
+The maintained training entry point is **MuZero**, not the archived PPO
+`train_pipeline.py` flow:
 
 ```powershell
-python .\packages\rl-agent\train_pipeline.py `
-  --dataset-root .\datasets\parquet `
-  --character ironclad `
-  --session-file "$env:APPDATA\SlayTheSpire2\bridge\session.json" `
-  --stage2-partition-kind build_family `
-  --stage2-partition-value v0.98_to_v0.99.1
+Set-Location .\packages\rl-agent
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+$env:PIP_EXTRA_INDEX_URL = 'https://download.pytorch.org/whl/cpu'
+python -m pip install -r requirements-bootstrap.lock
+python -m pip install -r requirements-dev.lock
+python -m pip install -e . --no-deps --no-build-isolation
+python -m pytest tests -q -p no:cacheprovider
+python -m muzero.train --help
 ```
 
-If you do not pass `--stage1-encounter-pool`, stage 1 now defaults to a starter-deck-friendly early Act 1 weak pool derived from exported run history:
-
-- `ENCOUNTER.SLIMES_WEAK`
-- `ENCOUNTER.SHRINKER_BEETLE_WEAK`
-- `ENCOUNTER.FUZZY_WURM_CRAWLER_WEAK`
-- `ENCOUNTER.NIBBITS_WEAK`
-
-The fixed eval holdout pool also defaults to unseen early Act 1 weak encounters:
-
-- `ENCOUNTER.CORPSE_SLUGS_WEAK`
-- `ENCOUNTER.SLUDGE_SPINNER_WEAK`
-- `ENCOUNTER.SEAPUNK_WEAK`
-- `ENCOUNTER.TOADPOLES_WEAK`
-
-If you already have a sandbox checkpoint and want to skip stage 1:
+An illustrative token-memory launch starts with:
 
 ```powershell
-python .\packages\rl-agent\train_pipeline.py `
-  --dataset-root .\datasets\parquet `
-  --start-checkpoint .\pipeline_runs\some_run\stage1_sandbox\checkpoints\final `
-  --stop-after offline
+python -m muzero.train `
+  --obs-mode token_v3 `
+  --model-arch token_memory_v1 `
+  --mixed-precision auto
 ```
 
----
+Choose backend, scenario, seed, checkpoint, artifact paths, and resource limits
+explicitly for a real experiment. Do not start a long run until the v2
+environment/parity checks for the selected backend are green. PPO and historical
+attention paths have been removed from the supported source tree; their archived
+design notes are non-executable reference material only.
 
-## ⚖️ Disclaimer & License
+## Contracts and game data
 
-**Disclaimer**: This is an unofficial community project. It is not affiliated with, endorsed by, or associated with Mega Crit or the developers of Slay the Spire 2. Use at your own risk.
+The current contract identity is:
 
-**License**: [MIT](./LICENSE)
+- API: `2.0.0`
+- schema: `2026-07-11.1`
+- action ordering: `2.0.0`
+- observation schema: `5.0.0`
+- reward schema: `2.0.0`
+
+Validate contracts, generated versions, game data, release versions, and repository
+hygiene from the repository root:
+
+```powershell
+python .\tools\contracts\check_contracts.py
+python .\tools\game_data\verify_manifest.py
+python .\tools\release\check_versions.py
+python .\tools\ci\check_generated.py
+python .\tools\ci\check_repository.py
+```
+
+After an intentional game-data change, rebuild its deterministic manifest:
+
+```powershell
+python .\tools\game_data\build_manifest.py
+python .\tools\game_data\verify_manifest.py
+```
+
+Consumers resolve [`game-data/`](./game-data) from the repository by default or
+from `STS2_GAME_DATA_ROOT`. They must not add dependencies on
+`packages/rl-agent/content`.
+
+## Artifact boundary
+
+Checkpoints, optimizer state, replay, datasets, logs, virtual environments, release
+binaries, PIDs, and temporary decompilations must live outside the source checkout.
+Configure an external directory through `STS2_ARTIFACT_ROOT`.
+
+Before moving existing artifacts, stop writers and create an inventory:
+
+```powershell
+python .\tools\artifacts\inventory.py --output '<ARTIFACT_ROOT>\pre-move-inventory.json'
+.\tools\artifacts\move_to_artifact_root.ps1 -ArtifactRoot '<ARTIFACT_ROOT>' -Mode DryRun
+```
+
+The PowerShell command requires an explicit mode. Use `-Mode DryRun` first and `-Mode Execute` only after approval. Review the
+inventory, backup, source and destination paths first. The migration tool refuses
+to overwrite an existing destination. See
+[`docs/runbooks/artifacts.md`](./docs/runbooks/artifacts.md).
+
+## Test matrix
+
+| Layer | Command | Needs the game? |
+|---|---|---:|
+| Contracts/data/repository | `python tools/...` checks shown above | No |
+| MCP | `npm ci && npm run typecheck && npm test` in `packages/mcp-server` | No |
+| Bridge core | `dotnet run --project mods/sts2-bridge/tests/BridgeCore.Tests/BridgeCore.Tests.csproj --configuration Release` | No |
+| Bridge full build | `dotnet build mods/sts2-bridge/sts2-bridge.csproj` | Yes, for referenced assemblies |
+| RL | `python -m pytest tests -q -p no:cacheprovider` in `packages/rl-agent` | Most tests do not; live tests do |
+| Live end-to-end | Bridge + MCP/player or RL backend smoke | Yes |
+
+CI runs dependency-free contract, hygiene, MCP, Bridge-core, and RL suites.
+Live-game compatibility remains an explicit self-hosted/manual gate because retail
+game assemblies are not committed.
+
+## Compatibility and migration warning
+
+- `legacy-v1` endpoints are dual-stack migration surfaces, not the security or
+  reliability target.
+- A legacy mutation timeout has an unknown outcome. Refresh state and reconcile
+  rather than sending the same intent again.
+- The normal MCP profile changed from historical `debug` behavior to `minimal`.
+- Strict `expected_state_version` is required for gameplay mutation.
+- Training reset/step requires the training capability; step is bound to
+  `episode_id` and `expected_step_index`.
+- Old replay and checkpoint files are not assumed compatible. Migration must
+  validate contract, action-ordering, observation, reward, and game-data hashes
+  and fail closed on unsupported formats.
+- Historical journal/knowledge persistence, AutoSlay runners, Draft Tracker, PPO
+  pipeline descriptions, checked-in logs, and release binaries are outside the v2
+  control-plane source tree.
+
+Read [`docs/migration/README.md`](./docs/migration/README.md) before converting a
+live setup or resuming an old experiment.
+
+## Documentation
+
+The documentation authority and archive policy are indexed in
+[`docs/README.md`](./docs/README.md). Dated experiment plans are historical research
+records unless a canonical page explicitly links them as current.
+
+## License
+
+[MIT](./LICENSE)

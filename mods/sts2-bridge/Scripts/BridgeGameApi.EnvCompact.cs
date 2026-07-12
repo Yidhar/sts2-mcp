@@ -705,4 +705,3 @@ internal static partial class BridgeGameApi
         }
     }
 }
-

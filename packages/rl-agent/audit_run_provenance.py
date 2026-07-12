@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -26,6 +28,9 @@ def main() -> None:
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--character", type=str, default=None)
     args = parser.parse_args()
+
+    args.runs_summary = resolve_external_input_path(args.runs_summary)
+    args.output_csv = resolve_artifact_path(args.output_csv)
 
     rows = read_jsonl(args.runs_summary)
     out_rows: list[dict[str, Any]] = []

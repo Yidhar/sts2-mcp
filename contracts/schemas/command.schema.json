@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/command.schema.json",
+  "title": "Idempotent player-control command",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "session_id",
+    "capability",
+    "expected_state_version",
+    "deadline_utc",
+    "command"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "capability": {
+      "const": "player-control"
+    },
+    "expected_state_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deadline_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Required absolute command deadline. The Bridge rejects deadlines more than 120 seconds in the future."
+    },
+    "command": {
+      "$ref": "#/$defs/player_command"
+    }
+  },
+  "$defs": {
+    "player_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "action_handle"
+      ],
+      "properties": {
+        "kind": {
+          "const": "perform_action"
+        },
+        "action_handle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "wait_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 5000
+        }
+      }
+    }
+  }
+}

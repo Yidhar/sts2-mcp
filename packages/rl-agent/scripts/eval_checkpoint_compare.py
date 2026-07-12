@@ -49,6 +49,7 @@ if str(RL_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(RL_AGENT_DIR))
 
 from sts2_env.combat_env import CombatSandboxEnv
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 from sts2_env.observation_v3 import WorldTokenObservationEncoder
 from sts2_env.observation_v2 import DictObservationEncoder
 from muzero.evaluate import load_muzero_network
@@ -540,8 +541,11 @@ def main() -> int:
         print("[eval] CUDA requested but unavailable; falling back to cpu", flush=True)
         args.device = "cpu"
 
-    report_dir = Path(args.report_dir).resolve()
+    report_dir = resolve_artifact_path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
+
+    args.checkpoints = [str(resolve_external_input_path(path)) for path in args.checkpoints]
+    args.snapshot_dataset = str(resolve_external_input_path(args.snapshot_dataset))
 
     tags = args.checkpoint_tags or [Path(p).name for p in args.checkpoints]
     if len(tags) != len(args.checkpoints):

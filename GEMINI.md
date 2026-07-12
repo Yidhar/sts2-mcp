@@ -1,58 +1,146 @@
-# GEMINI.md - Project Context
+# GEMINI.md — project context
 
-## Project Overview
-`sts2-mcp` is a high-performance, local control stack for **Slay the Spire 2 (STS2)**. It provides a bridge between the game's internal state and external AI agents using the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+## Project state
 
-The project consists of three main components:
-1.  **`mods/sts2-bridge` (C#/.NET 9)**: A native mod that injects into STS2 to extract state (Run, Combat, Rewards, Maps) and execute actions (Card plays, selections, navigation).
-2.  **`packages/mcp-server` (Node.js 22)**: A server that implements the MCP, translating bridge HTTP/JSON endpoints into standardized MCP tools for AI agents.
-3.  **`packages/rl-agent` (Python)**: A Reinforcement Learning (RL) agent using Stable Baselines 3 (PPO). It features a unified three-stage training pipeline:
-    *   Stage 1: Combat sandbox PPO.
-    *   Stage 2: Offline build/route pretraining.
-    *   Stage 3: Full-run PPO.
+`sts2-mcp` is a local Slay the Spire 2 control and RL monorepo. The repository
+is in the architecture-v2 cutover. New work targets contract API `2.0.0`;
+`legacy-v1` exists only for an explicit compatibility window.
 
-## Architecture
-- **State Extraction**: 100% accurate, sub-millisecond latency extraction via direct memory/object access in C#.
-- **Action Execution**: Direct invocation of game methods, bypassing UI/OCR limitations.
-- **MCP Tooling**: Exposes tools for state retrieval (`sts2_get_state`), deck management (`sts2_get_deck`), action listing (`sts2_list_actions`), and batch action execution (`sts2_execute_combat_sequence`).
-- **RL Environment**: A custom Gymnasium environment (`packages/rl-agent/sts2_env/env_v2.py`) that interacts with the bridge.
+Do not describe or extend the archived three-stage PPO `train_pipeline.py` flow.
+The maintained training entry point is:
 
-## Building and Running
+```text
+python -m muzero.train
+```
 
-### 1. `sts2-bridge` (Mod)
-Requires [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) and the environment variable `STS2_DIR` set to your game's installation path.
+## Canonical components
+
+1. `contracts/`: the wire-format source of truth. JSON Schema 2020-12, OpenAPI,
+   fixtures, and generated C#/TypeScript/Python version constants.
+2. `game-data/`: the shared versioned card/enemy/relic/potion/effect data.
+3. `mods/sts2-bridge/`: C#/.NET 9 game adapter. It owns factual snapshots, legal
+   action handles, state revision, session lifecycle, bounded events, and the
+   single-writer mutation gate.
+4. `packages/mcp-server/`: Node 22 + TypeScript MCP server using the official
+   `@modelcontextprotocol/sdk`. Its default tool profile is `minimal`.
+5. `packages/rl-agent/`: Python 3.11+ MuZero/token-memory trainer and the typed
+   v2 environment/reward/checkpoint migration layer.
+6. `tools/`: contract, game-data, artifact, release, third-party, and repository
+   validation utilities.
+
+Component versions come from `release-manifest.json`. Architecture decisions
+come from `docs/adr/`; migration status and removal gates come from
+`docs/migration/v2-cutover.md`.
+
+## Required dependency direction
+
+```text
+contracts + game-data -> bridge / mcp-server / rl-agent
+```
+
+- Bridge and MCP must never import through an RL package path.
+- Godot, Harmony, and private game reflection belong behind the Bridge game
+  adapter boundary.
+- Bridge emits facts; it does not own policy, observation encoding, route
+  strategy, or training reward.
+- RL owns episode, observation, action encoding, reward, curriculum, replay,
+  model, checkpoint, and experiment semantics.
+- MCP owns protocol, validation, presentation, and small control workflows. It
+  does not own RL state, journal persistence, or arbitrary knowledge files.
+
+## Security and mutation invariants
+
+- `player-control` and `training` use separate capability tokens.
+- The normal MCP profile is `minimal`; `debug` is privileged and explicit.
+- Player-control state must not expose hidden draw-pile order.
+- Every v2 mutation requires `request_id`, `session_id`, capability, expected
+  revision, and deadline.
+- One mutation gate serializes game mutations. Validation, current-handle
+  resolution, execution start, and result recording occur as one game-thread
+  transaction.
+- Replaying an identical request ID returns its retained result and never
+  executes twice.
+- A legacy mutation is sent once. A timeout is an unknown outcome, not a retry
+  invitation.
+- Never print session descriptors, bearer tokens, Authorization headers, or
+  capability-token maps.
+- Session URLs must remain loopback-only.
+
+## Compatibility policy
+
+- Unknown major contract versions and unsupported checkpoint/replay identities
+  fail closed.
+- Replay and checkpoints must record contract, action ordering, observation,
+  reward, and game-data hashes.
+- Architecture-v2 code must use maintained module entry points directly and must
+  not depend on deleted wrappers or `legacy/`.
+- Historical PPO, attention, AutoSlay, Draft Tracker, journal/knowledge, checked-
+  in logs, and release binaries are not architecture-v2 control-plane features.
+
+## Artifact policy
+
+Checkpoint, optimizer state, replay, datasets, logs, virtual environments,
+release binaries, PIDs, and decompilations live outside the checkout under an
+operator-selected `STS2_ARTIFACT_ROOT`. Never delete or move existing training
+assets without first stopping writers, producing an inventory, verifying the
+destination, and keeping a backup. `tools/artifacts/move_to_artifact_root.ps1`
+is dry-run unless `-Execute` is supplied.
+
+## Build and verification
+
+Repository root:
+
 ```powershell
-$env:STS2_DIR = "<PATH_TO_STS2>"
+python .\tools\contracts\check_contracts.py
+python .\tools\game_data\verify_manifest.py
+python .\tools\release\check_versions.py
+python .\tools\ci\check_dependency_locks.py
+python .\tools\ci\check_markdown_links.py
+python .\tools\ci\check_generated.py
+python .\tools\ci\check_repository.py
+```
+
+MCP:
+
+```powershell
+Set-Location .\packages\mcp-server
+npm ci
+npm run typecheck
+npm test
+```
+
+Bridge core, without retail game assemblies:
+
+```powershell
+dotnet run --project .\mods\sts2-bridge\tests\BridgeCore.Tests\BridgeCore.Tests.csproj --configuration Release
+```
+
+Full Bridge build, with an authorized local game installation:
+
+```powershell
+$env:STS2_DIR = '<PATH_TO_STS2>'
 dotnet build .\mods\sts2-bridge\sts2-bridge.csproj
 ```
-The build output is automatically copied to the game's `mods\sts2-bridge` folder.
 
-### 2. `mcp-server` (Server)
-Requires [Node.js 22+](https://nodejs.org/).
+Deployment is opt-in with `-p:Sts2Deploy=true`.
+
+RL:
+
 ```powershell
-# From packages/mcp-server
-npm install
-npm start
+Set-Location .\packages\rl-agent
+python -m pip install -r requirements-bootstrap.lock
+python -m pip install -r requirements-dev.lock
+python -m pip install -e . --no-deps
+python -m pytest tests -q -p no:cacheprovider
+python -m muzero.train --help
 ```
 
-### 3. `rl-agent` (AI)
-Requires Python 3.11+ and dependencies from `packages/rl-agent/requirements.txt`.
-```powershell
-# From packages/rl-agent
-pip install -r requirements.txt
-python train_pipeline.py --dataset-root ..\..\datasets\parquet --character ironclad
-```
+## Documentation rules
 
-## Key Files and Directories
-- `mods/sts2-bridge/Scripts/Entry.cs`: Mod entry point and initialization logic.
-- `packages/mcp-server/index.js`: Core MCP server implementation.
-- `packages/rl-agent/train_pipeline.py`: Main entry point for the three-stage RL training.
-- `packages/rl-agent/sts2_env/env_v2.py`: The RL environment definition.
-- `datasets/`: Storage for offline training data (parquet format).
-- `schemas/`: Definitions for communication between the bridge and the server.
-
-## Development Conventions
-- **Accuracy First**: Rely on the bridge for state data; avoid OCR or screen-scraping.
-- **Atomic Actions**: Prefer high-level, batchable actions (like `sts2_execute_combat_sequence`) to minimize LLM round trips and prevent state staleness.
-- **Modularity**: Maintain strict separation between the game-level bridge, the interface-level MCP server, and the agent-level RL logic.
-- **Safety**: Use `state_version` in the bridge/MCP to ensure actions are only applied to the state for which they were generated.
+- `README.md`, `docs/architecture.md`, `contracts/README.md`, component READMEs,
+  accepted ADRs, and migration pages are normative.
+- Dated experiment documents are historical unless a canonical page explicitly
+  marks them active.
+- `docs/generated/` is generated; do not hand-edit it.
+- Portable examples use placeholders or environment variables, never a
+  developer-specific absolute path.

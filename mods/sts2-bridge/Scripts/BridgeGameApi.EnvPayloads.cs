@@ -407,7 +407,7 @@ internal static partial class BridgeGameApi
                 !context.MapScreen.IsTraveling &&
                 HasBlockingMapOverlaySurface(context, actions);
 
-            return context.CombatManager.IsPlayPhase &&
+            return IsCombatPlayPhase(context.CombatManager, context.CombatState) &&
                    !context.CombatManager.IsPaused &&
                    !context.CombatManager.PlayerActionsDisabled &&
                    context.CardSelectionScreen is null &&
@@ -610,7 +610,7 @@ internal static partial class BridgeGameApi
         {
             round = context.CombatState.RoundNumber,
             side = context.CombatState.CurrentSide.ToString(),
-            play_phase = context.CombatManager.IsPlayPhase,
+            play_phase = IsCombatPlayPhase(context.CombatManager, context.CombatState),
             can_act = !context.CombatManager.PlayerActionsDisabled,
             self_inflicted_hp_loss_cumulative = ObserveSelfInflictedHpLossCumulative(
                 context.CombatState,

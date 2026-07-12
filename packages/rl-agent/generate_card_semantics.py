@@ -8,6 +8,8 @@ from typing import Any
 
 from content_registry import humanize_game_id
 from offline_dataset_loader import load_dataset
+from sts2_rl.artifacts import resolve_external_input_path
+from sts2_rl.game_data import repository_root, resolve_generated_game_data_output
 
 _CURSE_CARD_TOKENS = {
     "ASCENDERS_BANE",
@@ -50,7 +52,7 @@ _MIN_SUPPORT_FOR_BUCKET = {
     "transform": 3,
     "keep": 5,
 }
-_DEFAULT_OUTPUT = Path(__file__).with_name("content") / "cards.generated.json"
+_DEFAULT_OUTPUT = repository_root() / "game-data" / "generated" / "cards.generated.json"
 
 
 def _card_tail(card_id: str | None) -> str:
@@ -372,15 +374,19 @@ def main() -> None:
     parser.add_argument("--output", default=str(_DEFAULT_OUTPUT), type=str)
     args = parser.parse_args()
 
+    args.dataset_root = str(resolve_external_input_path(args.dataset_root))
+
     output = build_card_registry(
         args.dataset_root,
         dataset_format=args.dataset_format,
         partition_kind=args.partition_kind,
         partition_value=args.partition_value,
     )
-    output_path = Path(args.output)
+    output_path = resolve_generated_game_data_output(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_bytes(
+        (json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
     print(f"wrote {len(output)} card semantic entries -> {output_path}")
 
 

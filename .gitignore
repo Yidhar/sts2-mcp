@@ -14,65 +14,72 @@
 Thumbs.db
 .DS_Store
 
-# Local Codex / MCP config
+# Local Codex / MCP configuration
 .mcp.json
 .claude/
+.codex/
 
-# Local research and temporary files
-scratch/
-tmp/
-datasets/
-新建游戏项目/
-release-assets/
-
-# Python virtual environments
+# Python caches and virtual environments
 **/venv/
+**/.venv/
+**/.venv-*/
 **/__pycache__/
+.pytest_cache/
 pytest-cache-files-*/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# RL training artifacts
-packages/rl-agent/runs/
-packages/rl-agent/.text_cache/
-packages/rl-agent/checkpoints/
-packages/rl-agent/logs/
-packages/rl-agent/wandb/
+# Repository-local scratch space
+/scratch/
+/tmp/
+/tmp_audit_slices/
+/.tmp_observations_*/
+/_tmp*.sh
+/.tmp*.sh
+/tmp_*.txt
+/新建游戏项目/
+/.switchyard/
 
-# Docs are intentionally excluded from the public code repo
-docs/
-schemas/
-packages/**/README.md
-mods/**/README.md
-!/README.md
-!/README.zh-CN.md
-packages/rl-agent/checkpoints_v2/
-packages/rl-agent/.text_cache_download_test
-packages/rl-agent/.text_cache_offline_check
-packages/rl-agent/.text_cache_strict_fail
-packages/rl-agent/.tmp_text_cache
-packages/rl-agent/runs_v2
-packages/mcp-server/rl-smoke-logs
-packages/rl-agent/tmp/
+# Training data, runtime state, and artifacts
+/artifacts/
+/checkpoints/
+/datasets/
+/train_logs/
+packages/rl-agent/checkpoints*/
+packages/rl-agent/data/
+packages/rl-agent/artifacts/
+packages/rl-agent/logs*/
+packages/rl-agent/runs*/
 packages/rl-agent/train_logs/
 packages/rl-agent/offline_runs/
-packages/rl-agent/.venv-wsl-rocm/
-packages/rl-agent/analysis/
-.switchyard/
-packages/rl-agent/logs_attention/
-packages/rl-agent/checkpoints_attention/
-*.sh
-packages/rl-agent/checkpoints_muzero/
-packages/rl-agent/logs_muzero/
+packages/rl-agent/eval_reports/
 packages/rl-agent/cleanup_reports/
 packages/rl-agent/human_demos/
+packages/rl-agent/analysis/
+packages/rl-agent/tmp_audit_slices/
 packages/rl-agent/.trash_training_artifacts/
-packages/rl-agent/_tmp_*
+packages/rl-agent/.text_cache*/
+packages/rl-agent/.tmp_text_cache/
+packages/rl-agent/tmp/
+packages/rl-agent/tmp_gate*
 packages/rl-agent/sp_out.txt
 packages/rl-agent/sp_err.txt
 packages/rl-agent/startprocess_*_marker.txt
 packages/rl-agent/startprocess_marker*.txt
+packages/mcp-server/rl-smoke-logs/
+**/train.pid
+**/launch_command.txt
 
-tmp_audit_slices/
-packages/rl-agent/eval_reports/
+# Generated release packages belong in CI release artifacts, not Git
+/release-assets/
+
+# Pinned third-party source is restored by tools/third_party scripts.
+/third_party/sts2-ai/
+
+# Canonical architecture docs, schemas, component READMEs, and shell scripts
+# are intentionally tracked. Do not add broad docs/, schemas/, README, or *.sh
+# ignore rules here.

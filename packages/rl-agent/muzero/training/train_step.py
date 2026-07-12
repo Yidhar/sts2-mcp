@@ -151,7 +151,7 @@ class TrainStepMixin:
             hidden_state = initial.hidden_state
             policy_logits = initial.policy_logits
             value_logits = initial.value_logits
-    
+
             # Losses
             total_loss = 0.0
             # P0-7 hardening (recovery 2026-05-07): hard-skip optimizer step
@@ -248,7 +248,7 @@ class TrainStepMixin:
                 or self.semantic_state_consistency_weight > 0.0
                 or self.objective_diversity_weight > 0.0
             )
-    
+
             # Initial step loss
             policy_loss = self._policy_loss(policy_logits, policy_target[:, 0], action_mask_batch[:, 0])
             latent_policy_loss = self._policy_loss(
@@ -382,17 +382,17 @@ class TrainStepMixin:
             planner_risk_q_mae_sum += planner_risk_q_mae
             teacher_entropy_sum += latent_policy_distill_metrics["teacher_entropy"]
             student_entropy_sum += latent_policy_distill_metrics["student_entropy"]
-    
+
             # Unrolled steps
             for step_k in range(unroll_steps):
                 next_obs_torch = get_obs_step(step_k + 1)
                 next_teacher_token_encoded = get_teacher_token_step(step_k + 1)
                 action_embeddings = self.network.encode_actions(current_obs_torch)  # [B, 80, 64]
-    
+
                 # Select action embeddings
                 action_indices = action_batch[:, step_k]  # [B]
                 action_emb = action_embeddings[batch_indices, action_indices]  # [B, 64]
-    
+
                 # Recurrent inference
                 recurrent = self.network.recurrent_inference(
                     hidden_state,
@@ -410,7 +410,7 @@ class TrainStepMixin:
                         semantic_action_batch[:, step_k],
                         next_obs=next_obs_torch,
                     )
-    
+
                 # Losses for this step
                 policy_loss = self._policy_loss(
                     recurrent.policy_logits,
@@ -579,7 +579,7 @@ class TrainStepMixin:
                 future_bank_token_slot_source_loss = future_aux_terms["future_bank_token_slot_source_loss"]
                 future_bank_token_slot_source_acc = float(future_aux_terms["future_bank_token_slot_source_acc"])
                 future_world_aux_loss = future_aux_terms["loss_total"]
-    
+
                 future_world_rollout_aux_loss = value_logits.new_zeros(())
                 rollout_applied_horizons = 0.0
                 if (
@@ -677,7 +677,7 @@ class TrainStepMixin:
                     recurrent.next_phase_logits,
                     next_obs_torch["scalars"],
                 )
-    
+
                 loss = (
                     policy_loss
                     + value_loss
@@ -822,11 +822,11 @@ class TrainStepMixin:
                 surface_count_mae_sum += surface_metrics["legal_count_mae"]
                 surface_domain_acc_sum += surface_metrics["decision_domain_acc"]
                 surface_phase_acc_sum += surface_metrics["phase_acc"]
-    
+
                 hidden_state = recurrent.next_hidden_state
                 current_obs_torch = next_obs_torch
                 current_teacher_token_encoded = next_teacher_token_encoded
-    
+
         human_demo_alignment_metrics: dict[str, float] = {
             "human_demo_alignment/active": 0.0,
             "human_demo_alignment/loss_applied": 0.0,
@@ -914,6 +914,15 @@ class TrainStepMixin:
             if not getattr(self, "_loss_spike_skip_count", None):
                 self._loss_spike_skip_count = 0
             self._loss_spike_skip_count += 1
+            # Verify-first (Step 0): surface the silent optimizer-step skip in TensorBoard
+            # so its rate is threshold-able, not just printed. Guard for the async null writer.
+            _spike_writer = getattr(self, "writer", None)
+            if _spike_writer is not None:
+                _spike_step = int(getattr(self, "total_steps", 0))
+                _spike_writer.add_scalar("train/loss_spike_skipped", 1.0, _spike_step)
+                _spike_writer.add_scalar(
+                    "train/loss_spike_skip_count", float(self._loss_spike_skip_count), _spike_step
+                )
             print(
                 f"[loss_spike] SKIP optimizer step #{self._loss_spike_skip_count} "
                 f"total_steps={int(getattr(self, 'total_steps', 0))} "

@@ -31,6 +31,7 @@ def trainer_stub():
     from muzero.train import MuZeroTrainer
 
     trainer = MuZeroTrainer.__new__(MuZeroTrainer)
+    trainer.combat_hard_guard_policy = "full"
     trainer.log_dir = None
     trainer.episode_count = 0
     trainer.total_steps = 0

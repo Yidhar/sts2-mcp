@@ -25,7 +25,13 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_LOG_BASE = SCRIPT_DIR.parent / "logs_muzero"
+RL_AGENT_ROOT = SCRIPT_DIR.parent
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
+
+DEFAULT_LOG_BASE = resolve_artifact_path(None, default="runs")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -84,12 +90,9 @@ def _newest_run_with_deaths(base: Path) -> Path | None:
 
 
 def resolve_run_dir(args: argparse.Namespace) -> Path:
-    base = Path(args.log_base).expanduser().resolve()
+    base = resolve_external_input_path(args.log_base, default="runs")
     if args.run_dir:
-        run_dir = Path(args.run_dir).expanduser()
-        if not run_dir.is_absolute():
-            run_dir = (base / run_dir).resolve()
-        return run_dir
+        return resolve_external_input_path(args.run_dir, root=base)
 
     pointer_order: list[str] = []
     if args.latest_fullrun:
@@ -390,7 +393,7 @@ def build_json_payload(rows: list[dict[str, Any]], run_dir: Path) -> dict[str, A
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--log-base", default=str(DEFAULT_LOG_BASE), help="logs_muzero directory")
+    parser.add_argument("--log-base", default=str(DEFAULT_LOG_BASE), help="runs directory")
     parser.add_argument("--run-dir", help="Run id or run directory. Defaults to latest pass-large/fullrun pointer.")
     parser.add_argument("--latest-fullrun", action="store_true", help="Prefer latest_fullrun_run_id.txt over pass-large pointer.")
     parser.add_argument("--tail", type=int, default=8, help="Number of recent death rows to show.")

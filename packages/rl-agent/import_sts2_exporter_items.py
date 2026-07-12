@@ -4,10 +4,10 @@ This script is the bridge between OceanUwU/sts2-exporter and our own RL/content
 pipeline. It reads the exporter-produced ``items.json`` and writes two kinds of
 outputs:
 
-1. Project content overlays consumed by ``content_registry.py``:
-   - ``packages/rl-agent/content/cards.static.generated.json``
-   - ``packages/rl-agent/content/relics.static.generated.json``
-   - ``packages/rl-agent/content/potions.static.generated.json``
+1. Shared generated game data consumed by ``content_registry.py``:
+   - ``game-data/generated/cards.static.generated.json``
+   - ``game-data/generated/relics.static.generated.json``
+   - ``game-data/generated/potions.static.generated.json``
 2. Normalized dataset-side exports for future offline tasks:
    - ``datasets/static_export/cards.normalized.json``
    - ``datasets/static_export/relics.normalized.json``
@@ -25,29 +25,38 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sts2_rl.artifacts import artifact_root, resolve_artifact_path
+from sts2_rl.game_data import resolve_generated_game_data_output
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONTENT_DIR = Path(__file__).with_name("content")
-DEFAULT_DATASET_DIR = PROJECT_ROOT / "datasets" / "static_export"
-
-COMMON_EXPORT_PATHS = (
-    Path.cwd() / "export" / "items.json",
-    PROJECT_ROOT / "tmp" / "export" / "items.json",
-    Path(r"E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\export\items.json"),
-    Path(r"C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\export\items.json"),
-)
+GAME_DATA_ROOT = Path(os.environ.get("STS2_GAME_DATA_ROOT", PROJECT_ROOT / "game-data")).expanduser()
+DEFAULT_CONTENT_DIR = GAME_DATA_ROOT / "generated"
+ARTIFACT_ROOT = artifact_root()
+DEFAULT_DATASET_DIR = resolve_artifact_path("datasets/static_export", root=ARTIFACT_ROOT)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _common_export_paths() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    configured = os.environ.get("STS2_EXPORT_ITEMS")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend((Path.cwd() / "export" / "items.json", PROJECT_ROOT / "tmp" / "export" / "items.json"))
+    for variable in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.append(Path(base) / "Steam" / "steamapps" / "common" / "Slay the Spire 2" / "export" / "items.json")
+    return tuple(dict.fromkeys(candidates))
+
+
+COMMON_EXPORT_PATHS = _common_export_paths()
 
 
 def _normalize_text(value: Any) -> str:
@@ -131,7 +140,7 @@ def _safe_int(value: Any, *, default: int = 0) -> int:
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_bytes((json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def _is_effectively_empty(value: Any) -> bool:
@@ -142,6 +151,17 @@ def _is_effectively_empty(value: Any) -> bool:
     if isinstance(value, (dict, list)) and len(value) == 0:
         return True
     return False
+
+
+def _portable_source_label(_path: Path) -> str:
+    """Return the logical input identity, never its invocation-time location.
+
+    The exporter contract always calls this payload ``items.json``.  Recording
+    the path used to reach it would make identical exporter bytes differ across
+    checkouts and developer machines; the concrete path remains visible in the
+    command's console output instead.
+    """
+    return "sts2-export/items.json"
 
 
 def _resolve_items_path(explicit_path: str | None) -> Path:
@@ -160,7 +180,7 @@ def _resolve_items_path(explicit_path: str | None) -> Path:
         "Could not auto-detect sts2-exporter items.json.\n"
         "Pass --items explicitly, for example:\n"
         "  python packages/rl-agent/import_sts2_exporter_items.py --items "
-        "\"E:\\Program Files (x86)\\Steam\\steamapps\\common\\Slay the Spire 2\\export\\items.json\"\n"
+        "\"<PATH_TO_STS2>\\export\\items.json\"\n"
         f"Auto-detect paths checked:\n  - {candidates}"
     )
 
@@ -226,10 +246,9 @@ def _normalize_cards(raw_cards: list[dict[str, Any]], *, source_path: Path, mod_
 
     normalized: dict[str, Any] = {
         "__meta__": {
-            "generated_at_utc": _utc_now(),
             "generator": "import_sts2_exporter_items.py",
             "source": "sts2-exporter",
-            "source_items_json": str(source_path),
+            "source_items_json": _portable_source_label(source_path),
             "mod": mod_info or {},
             "entity_count": len(grouped),
         }
@@ -303,10 +322,9 @@ def _normalize_cards(raw_cards: list[dict[str, Any]], *, source_path: Path, mod_
 def _normalize_relics(raw_relics: list[dict[str, Any]], *, source_path: Path, mod_info: dict[str, Any] | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "__meta__": {
-            "generated_at_utc": _utc_now(),
             "generator": "import_sts2_exporter_items.py",
             "source": "sts2-exporter",
-            "source_items_json": str(source_path),
+            "source_items_json": _portable_source_label(source_path),
             "mod": mod_info or {},
             "entity_count": 0,
         }
@@ -347,10 +365,9 @@ def _normalize_relics(raw_relics: list[dict[str, Any]], *, source_path: Path, mo
 def _normalize_potions(raw_potions: list[dict[str, Any]], *, source_path: Path, mod_info: dict[str, Any] | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "__meta__": {
-            "generated_at_utc": _utc_now(),
             "generator": "import_sts2_exporter_items.py",
             "source": "sts2-exporter",
-            "source_items_json": str(source_path),
+            "source_items_json": _portable_source_label(source_path),
             "mod": mod_info or {},
             "entity_count": 0,
         }
@@ -388,10 +405,9 @@ def _normalize_simple_map(
     compact_fields = compact_fields or set()
     payload: dict[str, Any] = {
         "__meta__": {
-            "generated_at_utc": _utc_now(),
             "generator": "import_sts2_exporter_items.py",
             "source": "sts2-exporter",
-            "source_items_json": str(source_path),
+            "source_items_json": _portable_source_label(source_path),
             "mod": mod_info or {},
             "entity_count": 0,
         }
@@ -461,10 +477,9 @@ def _write_dataset_outputs(
         _write_json(path, payload)
 
     manifest = {
-        "generated_at_utc": _utc_now(),
         "generator": "import_sts2_exporter_items.py",
         "source": "sts2-exporter",
-        "source_items_json": str(raw_items_path),
+        "source_items_json": _portable_source_label(raw_items_path),
         "mod": mod_info or {},
         "counts": {
             "cards": max(len(cards) - 1, 0),
@@ -584,7 +599,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--items", type=str, default=None, help="Path to sts2-exporter export/items.json")
     parser.add_argument("--content-dir", type=str, default=str(DEFAULT_CONTENT_DIR))
     parser.add_argument("--dataset-dir", type=str, default=str(DEFAULT_DATASET_DIR))
-    parser.add_argument("--no-content", action="store_true", help="Skip writing content/*.static.generated.json")
+    parser.add_argument("--no-content", action="store_true", help="Skip writing game-data/generated/*.static.generated.json")
     parser.add_argument("--no-datasets", action="store_true", help="Skip writing datasets/static_export outputs")
     parser.add_argument("--no-copy-raw", action="store_true", help="Do not copy raw items.json into dataset export directory")
     return parser.parse_args(argv)
@@ -599,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_content:
         written_paths.extend(
             _write_content_outputs(
-                Path(args.content_dir),
+                resolve_generated_game_data_output(args.content_dir),
                 outputs["cards"],
                 outputs["relics"],
                 outputs["potions"],
@@ -609,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_datasets:
         written_paths.extend(
             _write_dataset_outputs(
-                Path(args.dataset_dir),
+                resolve_artifact_path(args.dataset_dir),
                 raw_items_path=items_path,
                 cards=outputs["cards"],
                 relics=outputs["relics"],

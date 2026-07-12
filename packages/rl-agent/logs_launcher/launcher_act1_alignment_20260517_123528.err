@@ -1,9 +1,0 @@
-usage: launcher.py [-h] [--instances INSTANCES] --game-exe GAME_EXE [--kill]
-                   [--watchdog]
-                   [--watchdog-strike-threshold WATCHDOG_STRIKE_THRESHOLD]
-                   [--watchdog-interval-s WATCHDOG_INTERVAL_S]
-                   [--watchdog-probe-timeout-s WATCHDOG_PROBE_TIMEOUT_S]
-                   [--watchdog-log-flood-mb-per-s WATCHDOG_LOG_FLOOD_MB_PER_S]
-                   [--watchdog-state-stall-s WATCHDOG_STATE_STALL_S]
-                   [--watchdog-state-probe-timeout-s WATCHDOG_STATE_PROBE_TIMEOUT_S]
-launcher.py: error: unrecognized arguments: Files (x86)\Steam\steamapps\common\Slay the Spire 2\SlayTheSpire2.exe

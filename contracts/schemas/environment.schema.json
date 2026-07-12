@@ -1,0 +1,545 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/environment.schema.json",
+  "title": "Privileged training environment contracts",
+  "$defs": {
+    "reset_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "session_id",
+        "expected_state_version",
+        "scenario"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_state_version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Validated on the game thread before reset performs any mutation."
+        },
+        "scenario": {
+          "enum": [
+            "full-run",
+            "combat"
+          ]
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "step_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "session_id",
+        "episode_id",
+        "expected_step_index",
+        "action"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "episode_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expected_step_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "$ref": "#/$defs/step_action"
+        }
+      }
+    },
+    "step_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action_handle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "action_index": {}
+          },
+          "required": [
+            "action_index"
+          ]
+        },
+        {
+          "properties": {
+            "action_handle": {}
+          },
+          "required": [
+            "action_handle"
+          ]
+        }
+      ]
+    },
+    "legal_action": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "A Contract-v2 training action. action_handle is the sole wire identity; the legacy action_id field is forbidden.",
+      "required": [
+        "idx",
+        "action_handle",
+        "kind"
+      ],
+      "properties": {
+        "idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action_handle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "action_id": false,
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "episode_id",
+        "step_index",
+        "state_version_before",
+        "state_version_after",
+        "observation",
+        "terminated",
+        "truncated",
+        "terminal_reason",
+        "legal_actions",
+        "transition",
+        "transition_facts",
+        "reward",
+        "reward_status",
+        "reward_authority",
+        "info"
+      ],
+      "properties": {
+        "episode_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "terminated": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "terminal_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "legal_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/legal_action"
+          }
+        },
+        "transition": {
+          "$ref": "transition.schema.json"
+        },
+        "transition_facts": {
+          "$ref": "transition.schema.json"
+        },
+        "reward": {
+          "type": "null",
+          "description": "V2 Bridge does not compute scalar reward."
+        },
+        "reward_status": {
+          "const": "not_computed"
+        },
+        "reward_authority": {
+          "const": "external-rl"
+        },
+        "info": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "state_version_before": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state_version_after": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "operation_result": {
+      "allOf": [
+        {
+          "$ref": "command-result.schema.json"
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "committed"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "$ref": "#/$defs/result"
+              },
+              "committed_state_version": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "spec_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "api_version",
+        "schema_version",
+        "capability",
+        "env_api_version",
+        "scenarios",
+        "reset",
+        "observation",
+        "action_encoding",
+        "reward",
+        "done_conditions"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "api_version": {
+          "const": "2.0.0"
+        },
+        "schema_version": {
+          "const": "2026-07-11.1"
+        },
+        "capability": {
+          "const": "training"
+        },
+        "env_api_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scenarios": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "contains": {
+            "const": "full-run"
+          },
+          "items": {
+            "enum": [
+              "full-run",
+              "combat"
+            ]
+          }
+        },
+        "single_env": {
+          "type": "boolean"
+        },
+        "direct_bridge": {
+          "type": "boolean"
+        },
+        "model_oriented": {
+          "type": "boolean"
+        },
+        "reset": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "action_encoding": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "default_encoding",
+            "supported",
+            "legal_action_shape"
+          ],
+          "properties": {
+            "default_encoding": {
+              "const": "legal_action_idx"
+            },
+            "supported": {
+              "type": "array",
+              "contains": {
+                "const": "action_handle"
+              },
+              "items": {
+                "type": "string"
+              }
+            },
+            "legal_action_shape": {
+              "const": [
+                "idx",
+                "action_handle",
+                "kind"
+              ]
+            }
+          }
+        },
+        "reward": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "authority",
+            "scalar_computed_by_bridge",
+            "output"
+          ],
+          "properties": {
+            "authority": {
+              "const": "external-rl"
+            },
+            "scalar_computed_by_bridge": {
+              "const": false
+            },
+            "output": {
+              "const": "transition_facts"
+            }
+          }
+        },
+        "done_conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "state_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "api_version",
+        "schema_version",
+        "capability",
+        "state_version",
+        "episode_id",
+        "step_index",
+        "scenario",
+        "phase",
+        "screen",
+        "actionable",
+        "terminated",
+        "observation",
+        "legal_actions",
+        "captured_at_utc"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "api_version": {
+          "const": "2.0.0"
+        },
+        "schema_version": {
+          "const": "2026-07-11.1"
+        },
+        "capability": {
+          "const": "training"
+        },
+        "episode_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "step_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "scenario": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "full-run",
+            "combat",
+            null
+          ]
+        },
+        "phase": {
+          "type": "string",
+          "minLength": 1
+        },
+        "screen": {
+          "type": "string"
+        },
+        "actionable": {
+          "type": "boolean"
+        },
+        "terminated": {
+          "type": "boolean"
+        },
+        "observation": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "legal_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/legal_action"
+          }
+        },
+        "state_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "captured_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "combat_catalog_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "api_version",
+        "schema_version",
+        "capability",
+        "encounters"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "api_version": {
+          "const": "2.0.0"
+        },
+        "schema_version": {
+          "const": "2026-07-11.1"
+        },
+        "capability": {
+          "const": "training"
+        },
+        "encounters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/combat_catalog_entry"
+          }
+        }
+      }
+    },
+    "combat_catalog_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "encounter_id",
+        "display_name",
+        "type_name",
+        "category",
+        "is_mock"
+      ],
+      "properties": {
+        "encounter_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "enum": [
+            "normal",
+            "elite",
+            "boss",
+            "event",
+            "test"
+          ]
+        },
+        "is_mock": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

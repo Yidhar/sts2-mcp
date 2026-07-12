@@ -33,6 +33,8 @@ from export_offline_run_datasets import (
     _load_source_payload,
 )
 from run_history_parser import build_offline_training_samples
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
+
 # BridgeClient is imported lazily (inside _get_live_supported_encounter_ids)
 # because importing sts2_env/__init__.py drags in torch via AuxMaskablePPO.
 # This build script can run fine without torch when --session-file isn't
@@ -348,9 +350,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    human_inputs = [Path(value) for value in args.human_source]
-    local_inputs = [Path(value) for value in args.local_source]
-    output_dir: Path = args.output_dir
+    human_inputs = [resolve_external_input_path(value) for value in args.human_source]
+    local_inputs = [resolve_external_input_path(value) for value in args.local_source]
+    args.exclude_sample_ids_file = (
+        resolve_external_input_path(args.exclude_sample_ids_file)
+        if args.exclude_sample_ids_file is not None
+        else None
+    )
+    args.session_file = (
+        str(resolve_external_input_path(args.session_file))
+        if args.session_file
+        else None
+    )
+    output_dir = resolve_artifact_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     excluded_sample_ids = _load_excluded_sample_ids(args.exclude_sample_ids_file)
     supported_encounter_ids: set[str] | None = None

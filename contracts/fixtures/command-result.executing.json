@@ -1,0 +1,16 @@
+{
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "replayed_result": false,
+  "accepted_at_utc": "2026-07-11T12:00:00Z",
+  "committed_state_version": null,
+  "ok": true,
+  "request_id": "bc1fd72a-e21f-4c1d-b455-267319259bc7",
+  "status": "executing",
+  "started_at_utc": "2026-07-11T12:00:00.010Z",
+  "completed_at_utc": null,
+  "error_code": null,
+  "error_message": null,
+  "result": null,
+  "error": null
+}

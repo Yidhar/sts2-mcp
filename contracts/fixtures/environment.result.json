@@ -1,0 +1,65 @@
+{
+  "episode_id": "episode-example-0001",
+  "step_index": 18,
+  "state_version_before": 100,
+  "state_version_after": 101,
+  "observation": {
+    "phase": "reward",
+    "decision_domain": "build"
+  },
+  "terminated": false,
+  "truncated": false,
+  "terminal_reason": null,
+  "legal_actions": [
+    {
+      "idx": 0,
+      "action_handle": "reward:continue",
+      "kind": "continue",
+      "label": "Continue",
+      "selection": "proceed"
+    }
+  ],
+  "transition": {
+    "episode_id": "episode-example-0001",
+    "step_index": 18,
+    "before_state_version": 100,
+    "after_state_version": 101,
+    "facts": {
+      "hp_delta": -2,
+      "gold_delta": 12,
+      "floor_delta": 0,
+      "cards_added": [],
+      "cards_removed": [],
+      "potions_added": [],
+      "potions_removed": [],
+      "room_entered": null,
+      "combat_result": "victory",
+      "terminal_reason": null
+    }
+  },
+  "transition_facts": {
+    "episode_id": "episode-example-0001",
+    "step_index": 18,
+    "before_state_version": 100,
+    "after_state_version": 101,
+    "facts": {
+      "hp_delta": -2,
+      "gold_delta": 12,
+      "floor_delta": 0,
+      "cards_added": [],
+      "cards_removed": [],
+      "potions_added": [],
+      "potions_removed": [],
+      "room_entered": null,
+      "combat_result": "victory",
+      "terminal_reason": null
+    }
+  },
+  "reward": null,
+  "reward_status": "not_computed",
+  "reward_authority": "external-rl",
+  "info": {
+    "reward_authority": "external-rl",
+    "legacy_bridge_reward_omitted": true
+  }
+}

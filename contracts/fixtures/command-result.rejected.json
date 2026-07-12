@@ -1,0 +1,23 @@
+{
+  "ok": false,
+  "api_version": "2.0.0",
+  "schema_version": "2026-07-11.1",
+  "request_id": "71bf292a-c6c5-46fb-a5fd-1c59da424f34",
+  "status": "rejected_before_execution",
+  "replayed_result": false,
+  "accepted_at_utc": "2026-07-11T12:00:00Z",
+  "started_at_utc": null,
+  "completed_at_utc": "2026-07-11T12:00:00.001Z",
+  "committed_state_version": null,
+  "error_code": "state_version_conflict",
+  "error_message": "Expected state version 41 but current version is 42.",
+  "result": null,
+  "error": {
+    "code": "state_version_conflict",
+    "message": "Expected state version 41 but current version is 42.",
+    "details": {
+      "expected_state_version": 41,
+      "current_state_version": 42
+    }
+  }
+}

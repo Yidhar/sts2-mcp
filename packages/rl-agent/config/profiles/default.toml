@@ -1,0 +1,28 @@
+version = "sts2-training-config-v1"
+profile = "default"
+
+[model]
+obs_mode = "token_v3"
+model_arch = "token_memory_v1"
+token_memory_slot_layout = "pass_large_v1"
+
+[optimization]
+learning_rate = 0.0001
+batch_size = 64
+discount = 0.997
+n_step_return = 10
+
+[environment]
+environment_backend = "live"
+
+[runtime]
+device = "auto"
+total_timesteps = 100000
+n_envs = 1
+mixed_precision = "auto"
+
+[guards]
+combat_hard_guard_policy = "off"
+build_hard_guard_policy = "off"
+hard_guard_target_rewrite = "off"
+route_safety_guard = false

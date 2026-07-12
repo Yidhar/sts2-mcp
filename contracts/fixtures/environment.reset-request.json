@@ -1,0 +1,12 @@
+{
+  "request_id": "d2f69d93-8f27-4541-bab7-2e0be9fe3120",
+  "session_id": "example-session-0001",
+  "expected_state_version": 42,
+  "scenario": "full-run",
+  "seed": "ABCDE12345",
+  "options": {
+    "character": "ironclad",
+    "force_fresh": true,
+    "timeout_ms": 30000
+  }
+}

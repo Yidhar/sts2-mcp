@@ -23,14 +23,16 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import sys
+import os
 import time
 import zipfile
 from pathlib import Path
 
+from sts2_rl.artifacts import artifact_root, resolve_artifact_path, resolve_external_input_path
 
-DEFAULT_ZIP = "/mnt/c/Users/yidhar/Downloads/runs_full_detail.zip/runs_full_detail.zip"
-DEFAULT_OUT = "data/skada_clean"
+ARTIFACT_ROOT = artifact_root()
+DEFAULT_ZIP = os.environ.get("STS2_SKADA_RUNS_ZIP")
+DEFAULT_OUT = resolve_artifact_path("datasets/skada_clean", root=ARTIFACT_ROOT)
 
 # Locale / display blobs — redundant with id fields, drop to shrink payload.
 STRIP_KEYS: set[str] = {
@@ -111,15 +113,21 @@ class ShardWriter:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--zip", default=DEFAULT_ZIP)
-    parser.add_argument("--out", default=DEFAULT_OUT)
+    parser.add_argument(
+        "--zip",
+        default=DEFAULT_ZIP,
+        required=DEFAULT_ZIP is None,
+        help="Input archive (or set STS2_SKADA_RUNS_ZIP)",
+    )
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--shard-size", type=int, default=500,
                         help="runs per output shard file")
     parser.add_argument("--limit", type=int, default=0,
                         help="stop after N raw lines (0 = no limit, for smoke tests)")
     args = parser.parse_args()
 
-    out_root = Path(args.out)
+    input_zip = resolve_external_input_path(args.zip)
+    out_root = resolve_artifact_path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
     stats: collections.Counter[str] = collections.Counter()
@@ -131,7 +139,7 @@ def main() -> None:
     writer = ShardWriter(out_root, shard_size=args.shard_size)
     t_start = time.time()
 
-    with zipfile.ZipFile(args.zip) as z:
+    with zipfile.ZipFile(input_zip) as z:
         for entry in z.infolist():
             if not entry.filename.endswith(".jsonl"):
                 continue

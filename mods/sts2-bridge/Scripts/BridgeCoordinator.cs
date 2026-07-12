@@ -9,16 +9,24 @@ namespace Sts2McpBridge.Scripts;
 
 internal static class BridgeCoordinator
 {
+    private const int MaxQueuedMainThreadWorkItems = 256;
+    private const int MaxWorkItemsPerPump = 32;
+    private const int MaxPumpWorkMilliseconds = 4;
+
     private static readonly object Sync = new();
     private static readonly ConcurrentQueue<IMainThreadWorkItem> Queue = new();
     private static readonly List<PumpTickWaiter> PumpTickWaiters = new();
     private static bool _isAttached;
     private static long _pumpTick;
     private static long _lastPumpAtMs = System.Environment.TickCount64;
+    private static int _queuedWorkItems;
+    private static int _pumpActive;
 
     private interface IMainThreadWorkItem
     {
         void TryExecute();
+
+        void TryFail(Exception exception);
     }
 
     private sealed class MainThreadWorkItem<T> : IMainThreadWorkItem
@@ -71,6 +79,24 @@ internal static class BridgeCoordinator
                 _cancellationRegistration.Dispose();
             }
         }
+
+        public void TryFail(Exception exception)
+        {
+            if (Interlocked.Exchange(ref _completionState, 1) != 0)
+            {
+                _cancellationRegistration.Dispose();
+                return;
+            }
+
+            try
+            {
+                _completionSource.TrySetException(exception);
+            }
+            finally
+            {
+                _cancellationRegistration.Dispose();
+            }
+        }
     }
 
     private sealed class PumpTickWaiter
@@ -107,6 +133,30 @@ internal static class BridgeCoordinator
         }
     }
 
+    public static long PumpTick
+    {
+        get
+        {
+            lock (Sync)
+            {
+                return _pumpTick;
+            }
+        }
+    }
+
+    public static long MillisecondsSinceLastPump
+    {
+        get
+        {
+            lock (Sync)
+            {
+                return Math.Max(0, System.Environment.TickCount64 - _lastPumpAtMs);
+            }
+        }
+    }
+
+    public static int QueueDepth => Math.Max(0, Volatile.Read(ref _queuedWorkItems));
+
     public static object GetDiagnosticsSnapshot()
     {
         lock (Sync)
@@ -120,7 +170,10 @@ internal static class BridgeCoordinator
                         GodotObject.IsInstanceValid(NGame.Instance),
                 pump_tick = _pumpTick,
                 ms_since_last_pump = Math.Max(0, nowMs - _lastPumpAtMs),
-                queued_main_thread_work = Queue.Count,
+                queued_main_thread_work = Math.Max(0, Volatile.Read(ref _queuedWorkItems)),
+                max_queued_main_thread_work = MaxQueuedMainThreadWorkItems,
+                max_work_items_per_pump = MaxWorkItemsPerPump,
+                max_pump_work_ms = MaxPumpWorkMilliseconds,
                 waiting_for_pump_tick = PumpTickWaiters.Count
             };
         }
@@ -169,11 +222,16 @@ internal static class BridgeCoordinator
     public static void Detach()
     {
         List<PumpTickWaiter>? waitersToCancel = null;
+        var detachException = new InvalidOperationException(
+            "Bridge coordinator detached before queued main-thread work could execute.");
 
         lock (Sync)
         {
-            while (Queue.TryDequeue(out _))
+            _isAttached = false;
+            while (Queue.TryDequeue(out var workItem))
             {
+                Interlocked.Decrement(ref _queuedWorkItems);
+                workItem.TryFail(detachException);
             }
 
             if (PumpTickWaiters.Count > 0)
@@ -183,7 +241,6 @@ internal static class BridgeCoordinator
             }
 
             BridgeDebugTrace.Write("coordinator detached");
-            _isAttached = false;
         }
 
         BridgeGameApi.ResetFrontierState();
@@ -196,8 +253,7 @@ internal static class BridgeCoordinator
         foreach (var waiter in waitersToCancel)
         {
             waiter.CancellationRegistration.Dispose();
-            waiter.CompletionSource.TrySetException(
-                new InvalidOperationException("Bridge coordinator detached before the requested pump ticks completed."));
+            waiter.CompletionSource.TrySetException(detachException);
         }
     }
 
@@ -210,19 +266,29 @@ internal static class BridgeCoordinator
             return Task.FromResult(action());
         }
 
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (Sync)
         {
             if (!_isAttached)
             {
                 throw new InvalidOperationException("Bridge coordinator is not attached yet.");
             }
+
+            var queued = Interlocked.Increment(ref _queuedWorkItems);
+            if (queued > MaxQueuedMainThreadWorkItems)
+            {
+                Interlocked.Decrement(ref _queuedWorkItems);
+                throw new InvalidOperationException(
+                    $"Bridge main-thread queue is full ({MaxQueuedMainThreadWorkItems} work items). Try again later.");
+            }
+
+            // Enqueue under the same lock used by Detach. This guarantees that
+            // detach either rejects this work or dequeues and completes it with
+            // an exception; a Task can no longer be orphaned between the checks.
+            Queue.Enqueue(new MainThreadWorkItem<T>(action, tcs, cancellationToken));
         }
 
-        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         BridgeDebugTrace.Write("coordinator enqueue");
-
-        Queue.Enqueue(new MainThreadWorkItem<T>(action, tcs, cancellationToken));
-
         return tcs.Task;
     }
 
@@ -268,51 +334,63 @@ internal static class BridgeCoordinator
 
     public static void Pump()
     {
-        var processedAny = false;
-        List<PumpTickWaiter>? readyWaiters = null;
-
-        while (Queue.TryDequeue(out var workItem))
+        if (Interlocked.Exchange(ref _pumpActive, 1) != 0)
         {
-            processedAny = true;
-            workItem.TryExecute();
+            return;
         }
 
-        lock (Sync)
+        var processedAny = false;
+        List<PumpTickWaiter>? readyWaiters = null;
+        try
         {
-            _pumpTick++;
-            _lastPumpAtMs = System.Environment.TickCount64;
-
-            if (PumpTickWaiters.Count > 0)
+            var pumpStartedAtMs = System.Environment.TickCount64;
+            var processedCount = 0;
+            while (processedCount < MaxWorkItemsPerPump &&
+                   System.Environment.TickCount64 - pumpStartedAtMs < MaxPumpWorkMilliseconds &&
+                   Queue.TryDequeue(out var workItem))
             {
-                readyWaiters = PumpTickWaiters
-                    .Where(waiter => waiter.TargetTick <= _pumpTick)
-                    .ToList();
+                Interlocked.Decrement(ref _queuedWorkItems);
+                processedAny = true;
+                processedCount++;
+                workItem.TryExecute();
+            }
 
-                if (readyWaiters.Count > 0)
+            lock (Sync)
+            {
+                _pumpTick++;
+                _lastPumpAtMs = System.Environment.TickCount64;
+
+                if (PumpTickWaiters.Count > 0)
                 {
+                    readyWaiters = PumpTickWaiters
+                        .Where(waiter => waiter.TargetTick <= _pumpTick)
+                        .ToList();
+
                     foreach (var waiter in readyWaiters)
                     {
                         PumpTickWaiters.Remove(waiter);
                     }
                 }
             }
+
+            if (processedAny)
+            {
+                BridgeDebugTrace.Write("coordinator processed queued work");
+            }
+
+            BridgeGameApi.NotifyFrontierPumpTick();
+
+            if (readyWaiters is not null)
+            {
+                foreach (var waiter in readyWaiters)
+                {
+                    waiter.Complete();
+                }
+            }
         }
-
-        if (processedAny)
+        finally
         {
-            BridgeDebugTrace.Write("coordinator processed queued work");
-        }
-
-        BridgeGameApi.NotifyFrontierPumpTick();
-
-        if (readyWaiters is null)
-        {
-            return;
-        }
-
-        foreach (var waiter in readyWaiters)
-        {
-            waiter.Complete();
+            Volatile.Write(ref _pumpActive, 0);
         }
     }
 

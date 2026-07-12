@@ -10,6 +10,8 @@ import json
 import statistics
 from pathlib import Path
 
+from sts2_rl.artifacts import resolve_external_input_path
+
 
 def load_traces(directory: Path) -> dict[str, list[dict]]:
     by_enc: dict[str, list[dict]] = collections.defaultdict(list)
@@ -187,7 +189,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", help="Directory produced by probe_stuck_boss_obs.py")
     args = parser.parse_args()
-    by_enc = load_traces(Path(args.directory))
+    by_enc = load_traces(resolve_external_input_path(args.directory))
     print(f"loaded traces: {len(by_enc)} encounters, "
           f"{sum(len(v) for v in by_enc.values())} episodes")
     analyze(by_enc)

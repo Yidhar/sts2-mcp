@@ -27,8 +27,12 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+RL_AGENT_ROOT = SCRIPT_DIR.parent
+for import_root in (SCRIPT_DIR, RL_AGENT_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
 
 try:
     import monitor_combat_sandbox_gate as sandbox_monitor
@@ -48,7 +52,7 @@ except Exception as exc:  # pragma: no cover - operator-facing failure
     )
 
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "logs_muzero"
+DEFAULT_ROOT = resolve_artifact_path(None, default="runs")
 
 
 PROGRESS_TAGS: tuple[str, ...] = (
@@ -1349,7 +1353,7 @@ def print_human(payload: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="logs_muzero root")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="runs root")
     parser.add_argument("--run-dir", type=Path, default=None, help="specific TensorBoard run directory")
     parser.add_argument("--tail", type=int, default=50, help="tail window for averages/min/max")
     parser.add_argument("--mode", choices=("early", "strong"), default="early")
@@ -1367,7 +1371,8 @@ def main() -> int:
     parser.add_argument("--fail-on-red", action="store_true", help="exit nonzero on FAIL/MISSING_TAGS")
     args = parser.parse_args()
 
-    run_dir = args.run_dir or latest_fullrun(args.root)
+    root = resolve_external_input_path(args.root, default="runs")
+    run_dir = resolve_external_input_path(args.run_dir, root=root) if args.run_dir else latest_fullrun(root)
     summaries, tags = load_scalars(run_dir, tail=max(int(args.tail), 1))
     payload: dict[str, Any] = {
         "run_dir": str(run_dir),

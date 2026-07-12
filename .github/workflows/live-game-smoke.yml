@@ -1,0 +1,63 @@
+name: live-game-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      live_action_handle:
+        description: Operator-reviewed legal action handle prepared on the current game screen
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    runs-on: [self-hosted, Windows, sts2]
+    timeout-minutes: 30
+    env:
+      STS2_LIVE_SMOKE_ACTION_HANDLE: ${{ inputs.live_action_handle }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: packages/mcp-server/package-lock.json
+      - run: node -e "const {execSync}=require('node:child_process'); const expected=require('./packages/mcp-server/package.json').packageManager.split('@')[1]; const actual=execSync('npm --version',{encoding:'utf8'}).trim(); if(actual!==expected) throw new Error('npm '+actual+' != '+expected)"
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          global-json-file: global.json
+      - name: Validate runner and build Bridge without deployment
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:STS2_DIR)) {
+            throw 'The self-hosted runner must define STS2_DIR.'
+          }
+          dotnet build .\mods\sts2-bridge\sts2-bridge.csproj --configuration Release -p:Sts2Deploy=false
+      - name: Require the running installation to match this checkout
+        shell: pwsh
+        run: |
+          $builtDll = Resolve-Path '.\mods\sts2-bridge\bin\Release\net9.0\sts2-bridge.dll'
+          $installedDll = Join-Path $env:STS2_DIR 'mods\sts2-bridge\sts2-bridge.dll'
+          $sourceManifest = Resolve-Path '.\mods\sts2-bridge\sts2-bridge.json'
+          $installedManifest = Join-Path $env:STS2_DIR 'mods\sts2-bridge\sts2-bridge.json'
+          foreach ($path in @($installedDll, $installedManifest)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required installed Bridge file is missing: $path"
+            }
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $builtDll).Hash -ne
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $installedDll).Hash) {
+            throw 'The installed Bridge DLL does not match the build from this checkout. Stop the game, deploy intentionally, restart it, and rerun.'
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $sourceManifest).Hash -ne
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $installedManifest).Hash) {
+            throw 'The installed Bridge manifest does not match this checkout.'
+          }
+      - run: npm ci --prefix packages/mcp-server
+      - run: npm run verify:contracts --prefix packages/mcp-server
+      - run: npm run typecheck --prefix packages/mcp-server
+      - run: npm test --prefix packages/mcp-server
+      - run: npm run build --prefix packages/mcp-server
+      - run: npm run smoke:test --prefix packages/mcp-server

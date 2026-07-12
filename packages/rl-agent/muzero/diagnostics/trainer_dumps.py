@@ -10,14 +10,89 @@ from __future__ import annotations
 import json
 import math
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from sts2_env.boss_mechanics import build_boss_mechanics_context
 from sts2_env.observation_v2 import MAX_ACTIONS
 
 from muzero.diagnostics.death_slice_dumps import DeathSliceDumpMixin
+
+
+def _diagnostic_jsonl_path_for(owner: Any, filename: str) -> Path | None:
+    """Resolve a diagnostics path without requiring a fully-built trainer.
+
+    Diagnostic helpers are intentionally usable as bound methods on a tiny
+    test/analysis object. Keeping path resolution standalone makes that
+    compatibility explicit instead of losing records behind a broad exception.
+    """
+
+    run_paths = getattr(owner, "run_paths", None)
+    if run_paths is not None and hasattr(run_paths, "diagnostic_jsonl"):
+        try:
+            return run_paths.diagnostic_jsonl(str(filename))
+        except (OSError, TypeError, ValueError, AttributeError):
+            pass
+    log_dir = getattr(owner, "log_dir", None)
+    if not log_dir:
+        return None
+    name = str(filename)
+    if not name.endswith(".jsonl"):
+        name = f"{name}.jsonl"
+    return Path(log_dir) / "diagnostics" / name
+
+
+def _report_diagnostic_failure(owner: Any, diagnostic: str, exc: Exception) -> None:
+    """Make best-effort dump failures observable without stopping training."""
+
+    failures = getattr(owner, "_diagnostic_dump_failures", None)
+    if not isinstance(failures, dict):
+        failures = {}
+        try:
+            setattr(owner, "_diagnostic_dump_failures", failures)
+        except (AttributeError, TypeError):
+            pass
+    failures[str(diagnostic)] = int(failures.get(str(diagnostic), 0) or 0) + 1
+    warnings.warn(
+        f"diagnostic dump {diagnostic!r} failed: {type(exc).__name__}: {exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _progress_values_from_obs(owner: Any, raw_obs: Any) -> tuple[float, float]:
+    """Extract stable numeric floor/act values for diagnostic records."""
+
+    obs = raw_obs if isinstance(raw_obs, dict) else {}
+    run = obs.get("run") if isinstance(obs.get("run"), dict) else {}
+    if not run and isinstance(obs.get("transition_state"), dict):
+        candidate = obs["transition_state"].get("run")
+        if isinstance(candidate, dict):
+            run = candidate
+
+    def _number(value: Any) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return out if math.isfinite(out) else 0.0
+
+    floor = _number(
+        run.get("floor", run.get("total_floor", obs.get("floor", obs.get("current_floor", 0.0))))
+    )
+    act_raw = run.get("act_id", run.get("act", obs.get("act_id", obs.get("act", 0.0))))
+    parse_act = getattr(owner, "_parse_progress_act_id", None)
+    if callable(parse_act):
+        try:
+            act = _number(parse_act(act_raw, run))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            act = _number(act_raw)
+    else:
+        act = _number(act_raw)
+    return floor, act
 
 
 class DiagnosticDumpMixin(DeathSliceDumpMixin):
@@ -31,19 +106,7 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
         full trainer instance.
         """
 
-        run_paths = getattr(self, "run_paths", None)
-        if run_paths is not None and hasattr(run_paths, "diagnostic_jsonl"):
-            try:
-                return run_paths.diagnostic_jsonl(str(filename))
-            except Exception:
-                pass
-        log_dir = getattr(self, "log_dir", None)
-        if not log_dir:
-            return None
-        name = str(filename)
-        if not name.endswith(".jsonl"):
-            name = f"{name}.jsonl"
-        return Path(log_dir) / "diagnostics" / name
+        return _diagnostic_jsonl_path_for(self, filename)
 
     def _dump_card_reward_choice_diagnostic(self, payload: dict[str, Any] | None) -> None:
         """Append one card-reward choice diagnostic record.
@@ -989,7 +1052,8 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
             self._end_turn_context_dump_count += 1
-        except Exception:
+        except Exception as exc:
+            _report_diagnostic_failure(self, "end_turn_contexts", exc)
             return
 
     def _dump_loss_spike(
@@ -1131,7 +1195,7 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
             if tier_summary:
                 payload["sample_tier"] = tier_summary
 
-            path = self._diagnostic_jsonl_path("loss_spikes.jsonl")
+            path = _diagnostic_jsonl_path_for(self, "loss_spikes.jsonl")
             if path is None:
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1146,7 +1210,8 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
                 flush=True,
             )
             return True
-        except Exception:
+        except Exception as exc:
+            _report_diagnostic_failure(self, "loss_spikes", exc)
             return False
 
     def _dump_episode_end_anomaly(
@@ -1580,6 +1645,7 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
             raw_player = raw_obs.get("player") if isinstance(raw_obs, dict) and isinstance(raw_obs.get("player"), dict) else {}
             if not raw_player and isinstance(raw_combat.get("player"), dict):
                 raw_player = raw_combat.get("player")
+            floor_value, act_id_value = _progress_values_from_obs(self, raw_obs)
             incoming, block, hp = self._incoming_damage_pressure(raw_obs)
             family = self._semantic_family(chosen_action) if isinstance(chosen_action, dict) else ""
             card = chosen_action.get("card") if isinstance(chosen_action, dict) and isinstance(chosen_action.get("card"), dict) else {}
@@ -1832,5 +1898,6 @@ class DiagnosticDumpMixin(DeathSliceDumpMixin):
                 self._action_offender_dump_count = int(getattr(self, "_action_offender_dump_count", 0)) + 1
                 if cap > 0 and self._action_offender_dump_count >= cap:
                     return
-        except Exception:
+        except Exception as exc:
+            _report_diagnostic_failure(self, "action_offenders", exc)
             return

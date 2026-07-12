@@ -6,4 +6,3 @@ remain free of STS2-specific strategy rules.
 """
 
 __all__: list[str] = []
-

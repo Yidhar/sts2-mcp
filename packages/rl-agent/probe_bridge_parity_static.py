@@ -8,7 +8,7 @@ but costs 0 game processes.
 
 Inputs:
   LIVE_SRC  = ../../mods/sts2-bridge/Scripts  (bridge mod C#)
-  SIM_SRC   = ../../third_party/sts2-ai/STS2AI/ENV/Sim/HeadlessSim  (sim RPC C#)
+  SIM_SRC   = <STS2_AI_ROOT>/STS2AI/ENV/Sim/HeadlessSim  (sim RPC C#)
   SIM_TRANSLATE = sts2_env/_sim_translate.py  (Python-side sim->bridge shape mapper)
 
 Outputs:
@@ -25,15 +25,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import sys
 from collections import Counter
 from pathlib import Path
 
+from sts2_rl.artifacts import artifact_root, resolve_artifact_path, resolve_external_input_path
 
 REPO_ROOT = Path(__file__).parent
 LIVE_BRIDGE_CS = (REPO_ROOT / "../../mods/sts2-bridge/Scripts").resolve()
-SIM_PROGRAM_CS = (REPO_ROOT / "../../third_party/sts2-ai/STS2AI/ENV/Sim/HeadlessSim").resolve()
+STS2_AI_ROOT = resolve_external_input_path(
+    os.environ.get("STS2_AI_ROOT"),
+    default="dependencies/sts2-ai",
+    root=artifact_root(),
+)
+SIM_PROGRAM_CS = STS2_AI_ROOT / "STS2AI" / "ENV" / "Sim" / "HeadlessSim"
 SIM_TRANSLATE_PY = REPO_ROOT / "sts2_env" / "_sim_translate.py"
 
 
@@ -149,7 +155,7 @@ def main() -> None:
                         help="show top-N most-frequent keys in the diff summary")
     args = parser.parse_args()
 
-    outdir = Path(args.output_dir)
+    outdir = resolve_artifact_path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[static] live bridge src: {LIVE_BRIDGE_CS}")
@@ -192,7 +198,6 @@ def main() -> None:
     # (only relevant for keys also emitted by sim; if sim doesn't emit it at
     # all, translate has nothing to read. Still flag both as separate findings.)
     live_not_in_sim_emit = sorted(live_set - sim_set)
-    live_not_in_sim_reads = sorted(live_set - sim_read_set)
     sim_not_in_live_emit = sorted(sim_set - live_set)
     sim_not_read_by_translate = sorted(sim_set - sim_read_set)
 

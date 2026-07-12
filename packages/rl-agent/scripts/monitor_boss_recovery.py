@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Monitor MuZero boss-recovery runs.
 
-Reads TensorBoard scalar events from the latest logs_muzero run (or a supplied
+Reads TensorBoard scalar events from the latest runs run (or a supplied
 run directory) and prints the exact gate metrics required by
 ``docs/muzero-boss-winrate-50-execution-plan-20260503.md``.
 
@@ -14,9 +14,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import mean
 from typing import Iterable
+
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path  # noqa: E402
 
 try:
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -26,7 +33,7 @@ except Exception as exc:  # pragma: no cover - operator-facing failure
         f"Original error: {exc}"
     )
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "logs_muzero"
+DEFAULT_ROOT = resolve_artifact_path(None, default="runs")
 
 EXACT_TAGS: list[str] = [
     "recent_tail/64/boss_win_rate",
@@ -130,14 +137,15 @@ def fuzzy_matches(tags: set[str], missing_tag: str, max_items: int = 8) -> list[
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="logs_muzero root")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="runs root")
     parser.add_argument("--run-dir", type=Path, default=None, help="specific run directory")
     parser.add_argument("--tail", type=int, default=20, help="tail window for means")
     parser.add_argument("--json", action="store_true", help="emit JSON only")
     parser.add_argument("--list-fuzzy", action="store_true", help="list all tags matching fuzzy needles")
     args = parser.parse_args()
 
-    run_dir = args.run_dir or latest_run(args.root)
+    root = resolve_external_input_path(args.root, default="runs")
+    run_dir = resolve_external_input_path(args.run_dir, root=root) if args.run_dir else latest_run(root)
     if not run_dir.exists():
         raise SystemExit(f"Run directory does not exist: {run_dir}")
 

@@ -1,0 +1,490 @@
+diff --git a/packages/rl-agent/muzero/training/async_telemetry.py b/packages/rl-agent/muzero/training/async_telemetry.py
+index 976f527..511abd1 100644
+--- a/packages/rl-agent/muzero/training/async_telemetry.py
++++ b/packages/rl-agent/muzero/training/async_telemetry.py
+@@ -24,6 +24,7 @@ from muzero.diagnostics.rest_site_metrics import REST_SITE_TB_KEYS
+ from muzero.diagnostics.shop_metrics import SHOP_TB_KEYS
+ from muzero.diagnostics.summoner_targeting import SUMMONER_TARGETING_TB_KEYS
+ from muzero.diagnostics.target_priority import TARGET_PRIORITY_TB_KEYS
++from muzero.diagnostics.intent_combat_quality import INTENT_COMBAT_QUALITY_TB_KEYS
+ from muzero.combat_quality.summoner_target_guard import SUMMONER_TARGET_GUARD_SEARCH_SUFFIXES
+ from muzero.combat_quality.target_priority_guard import TARGET_PRIORITY_GUARD_SEARCH_SUFFIXES
+ from muzero.training.card_reward_guard import CARD_REWARD_GUARD_SEARCH_SUFFIXES
+@@ -415,6 +416,18 @@ def log_async_episode_scalars(*, trainer: Any, actor_index: int, episode_metrics
+                 trainer.episode_count,
+             )
+ 
++    # Verify-first (Step 0): replay the UNBIASED intent_combat_quality metrics on the async
++    # learner writer so combat/intent_quality_* (play_card vs end_turn split, missed-lethal,
++    # no-block-under-pressure) survive the async path -- the sync path already emits these.
++    intent_combat_quality_metrics = episode_metrics.get("intent_combat_quality_metrics")
++    if isinstance(intent_combat_quality_metrics, dict):
++        for tag_suffix, meta_key in INTENT_COMBAT_QUALITY_TB_KEYS:
++            trainer.writer.add_scalar(
++                f"combat/intent_quality_{tag_suffix}",
++                _to_float(intent_combat_quality_metrics.get(meta_key)),
++                trainer.episode_count,
++            )
++
+     if _to_float(episode_metrics.get("death_floor"), 0.0) > 0.0 and isinstance(deck_quality, dict):
+         for tag_suffix, quality_key in DEATH_DECK_QUALITY_TB_KEYS:
+             trainer.writer.add_scalar(
+diff --git a/packages/rl-agent/muzero/training/checkpointing.py b/packages/rl-agent/muzero/training/checkpointing.py
+index 121d1fc..eeefb39 100644
+--- a/packages/rl-agent/muzero/training/checkpointing.py
++++ b/packages/rl-agent/muzero/training/checkpointing.py
+@@ -46,6 +46,41 @@ def _checkpoint_schema_metadata(network: MuZeroNetwork) -> dict[str, Any]:
+     }
+ 
+ 
++# ---------------------------------------------------------------------------
++# Replay-buffer compatibility-version migrations (RC-1).
++#
++# A checkpoint_compatibility_version bump normally discards old replay buffers.
++# Register an *identity* migration when a bump only shifts the SEMANTICS of
++# learned targets (e.g. a reward / value-target change from the RC-5 / RC-3
++# fixes) without changing the on-disk observation/transition tensor layout, so
++# old buffers warm-start (with a warning) instead of being thrown away.
++# ---------------------------------------------------------------------------
++_REPLAY_IDENTITY_MIGRATIONS: set[tuple[int, int]] = set()
++
++
++def register_replay_identity_migration(from_version: int, to_version: int) -> None:
++    """Mark (from_version -> to_version) as an as-is (identity) replay migration."""
++
++    _REPLAY_IDENTITY_MIGRATIONS.add((int(from_version), int(to_version)))
++
++
++def _compat_version_loadable(saved_version: Any, current_version: Any) -> bool:
++    """True if a replay buffer at ``saved_version`` may load under ``current_version``.
++
++    Equal versions always load; a differing version loads only when an explicit
++    identity migration has been registered for that exact transition.
++    """
++
++    if saved_version == current_version:
++        return True
++    if saved_version is None or current_version is None:
++        return False
++    try:
++        return (int(saved_version), int(current_version)) in _REPLAY_IDENTITY_MIGRATIONS
++    except (TypeError, ValueError):
++        return False
++
++
+ def _metadata_replay_compatible(saved_metadata: dict[str, Any], current_schema: dict[str, Any]) -> tuple[bool, list[str]]:
+     """Check whether a checkpoint's replay buffer can be safely loaded."""
+ 
+@@ -56,7 +91,15 @@ def _metadata_replay_compatible(saved_metadata: dict[str, Any], current_schema:
+         "replay_schema_version",
+         "observation_shape_caps",
+     ):
+-        if saved_metadata.get(key) != current_schema.get(key):
++        saved_value = saved_metadata.get(key)
++        current_value = current_schema.get(key)
++        # The compatibility-version field may differ yet still be loadable when an
++        # identity migration is registered (a value-target/reward semantics bump that
++        # does not change the on-disk layout). All other fields must match exactly.
++        if key == "checkpoint_compatibility_version":
++            if not _compat_version_loadable(saved_value, current_value):
++                mismatches.append(key)
++        elif saved_value != current_value:
+             mismatches.append(key)
+     return (not mismatches, mismatches)
+ 
+@@ -67,13 +110,60 @@ def _replay_state_compatible(replay_state: dict[str, Any], current_schema: dict[
+     mismatches: list[str] = []
+     if replay_state.get("schema_version") != current_schema.get("replay_schema_version"):
+         mismatches.append("replay_buffer.schema_version")
+-    if replay_state.get("checkpoint_compatibility_version") != current_schema.get("checkpoint_compatibility_version"):
++    if not _compat_version_loadable(
++        replay_state.get("checkpoint_compatibility_version"),
++        current_schema.get("checkpoint_compatibility_version"),
++    ):
+         mismatches.append("replay_buffer.checkpoint_compatibility_version")
+     if replay_state.get("observation_shape_caps") != current_schema.get("observation_shape_caps"):
+         mismatches.append("replay_buffer.observation_shape_caps")
+     return (not mismatches, mismatches)
+ 
+ 
++def _load_optimizer_compatible(
++    optimizer: optim.Optimizer,
++    saved_state: dict[str, Any],
++) -> tuple[int, int]:
++    """Per-parameter optimizer warm-start (RC-1).
++
++    Copies Adam moments (exp_avg / exp_avg_sq / step) for params whose live tensor
++    shape matches the saved moment shape, and leaves the rest as freshly-initialized
++    moments. This preserves momentum for the unchanged ~99% of the network when a
++    guard/aux edit only resizes or adds one head, instead of the previous
++    all-or-nothing reset. Returns (loaded_count, reinitialized_count).
++
++    Matching is positional in optimizer param order with a shape guard, so any
++    misalignment from added/removed params degrades to fresh moments for the
++    affected params -- never a corrupt update applied to the wrong tensor.
++    """
++
++    saved_param_state = saved_state.get("state", {}) if isinstance(saved_state, dict) else {}
++
++    def _saved_entry(index: int) -> dict[str, Any] | None:
++        if index in saved_param_state:
++            return saved_param_state[index]
++        if str(index) in saved_param_state:
++            return saved_param_state[str(index)]
++        return None
++
++    live_params = [param for group in optimizer.param_groups for param in group["params"]]
++    loaded = 0
++    reinit = 0
++    for index, param in enumerate(live_params):
++        entry = _saved_entry(index)
++        exp_avg = entry.get("exp_avg") if isinstance(entry, dict) else None
++        if torch.is_tensor(exp_avg) and tuple(exp_avg.shape) == tuple(param.shape):
++            restored: dict[str, Any] = {}
++            for key, value in entry.items():
++                restored[key] = value.detach().clone().to(param.device) if torch.is_tensor(value) else value
++            optimizer.state[param] = restored
++            loaded += 1
++        else:
++            optimizer.state.pop(param, None)
++            reinit += 1
++    return (loaded, reinit)
++
++
+ def dict_obs_to_torch(obs: dict[str, Any], device: str = "cpu") -> dict[str, torch.Tensor]:
+     """Convert dict observation to torch tensors with batch dimension 1."""
+     torch_obs = {}
+@@ -159,28 +249,40 @@ def load_resume_checkpoint(
+     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+     current_schema = _checkpoint_schema_metadata(network)
+     replay_schema_ok, replay_schema_mismatches = _metadata_replay_compatible(metadata, current_schema)
+-    allow_exact_resume = not (skipped_keys or missing_keys)
+-
+-    if allow_exact_resume and load_optimizer:
+-        try:
+-            optimizer.load_state_dict(optimizer_state)
+-        except Exception as exc:
+-            print(f"[resume] Optimizer state not loaded ({exc}); starting with fresh optimizer.")
+-    elif allow_exact_resume and not load_optimizer:
+-        print("[resume] Skipping optimizer warm-start by request; starting with fresh optimizer.")
++    # RC-1: the optimizer and replay buffer no longer require an exact network match.
++    # A guard/aux/head edit changes network.state_dict() keys but NOT the replay schema,
++    # so the buffer is gated on the dedicated replay-schema check alone, and the optimizer
++    # restores momentum per-parameter for the unchanged tensors.
++    if load_optimizer:
++        loaded_count, reinit_count = _load_optimizer_compatible(optimizer, optimizer_state)
++        if reinit_count == 0:
++            print(f"[resume] Optimizer state fully restored ({loaded_count} param tensors).")
++        elif loaded_count == 0:
++            print(
++                "[resume] Optimizer momentum could not be matched to any current parameter "
++                f"({reinit_count} reinitialized); starting with fresh optimizer."
++            )
++        else:
++            print(
++                "[resume] Optimizer momentum partially restored: "
++                f"loaded={loaded_count} reinitialized={reinit_count} "
++                "(only changed/added params get fresh moments)."
++            )
+     else:
+-        print(
+-            "[resume] Skipping optimizer warm-start because network state was only partially restored; "
+-            "starting with fresh optimizer."
+-        )
++        print("[resume] Skipping optimizer warm-start by request; starting with fresh optimizer.")
+ 
+-    allow_replay_buffer_load = allow_exact_resume and load_buffer and replay_schema_ok
++    allow_replay_buffer_load = load_buffer and replay_schema_ok
+     if replay_buffer_path.exists() and allow_replay_buffer_load:
+         with replay_buffer_path.open("rb") as handle:
+             replay_buffer_state = pickle.load(handle)
+         replay_state_ok, replay_state_mismatches = _replay_state_compatible(replay_buffer_state, current_schema)
+         if replay_state_ok:
+             buffer.load_state_dict(replay_buffer_state)
++            if skipped_keys or missing_keys:
++                print(
++                    f"[resume] Replay buffer loaded ({len(buffer)} transitions) despite a partial network "
++                    "warm-start; the replay schema is unchanged (a guard/head edit does not invalidate the buffer)."
++                )
+         else:
+             print(
+                 "[resume] Skipping replay buffer warm-start because replay_buffer.pkl schema is incompatible "
+@@ -190,13 +292,9 @@ def load_resume_checkpoint(
+         print("[resume] Skipping replay buffer warm-start by request; starting with empty buffer.")
+     elif replay_buffer_path.exists() and not replay_schema_ok:
+         print(
+-            "[resume] Skipping replay buffer warm-start because checkpoint replay schema is incompatible "
+-            f"({', '.join(replay_schema_mismatches)}); starting with empty buffer."
+-        )
+-    elif replay_buffer_path.exists():
+-        print(
+-            "[resume] Skipping replay buffer warm-start because observation/model schema changed; "
+-            "starting with empty buffer."
++            "[resume] Skipping replay buffer warm-start because the checkpoint replay schema is incompatible "
++            f"({', '.join(replay_schema_mismatches)}); starting with empty buffer. If this was only a "
++            "value-target/reward change, register an identity migration via register_replay_identity_migration()."
+         )
+     else:
+         print(f"[resume] replay_buffer.pkl not found in {checkpoint_path}; resuming with empty buffer.")
+@@ -217,8 +315,7 @@ def load_resume_checkpoint(
+         else:
+             token_target_encoder.load_state_dict(network.token_encoder.state_dict())
+     if (
+-        allow_exact_resume
+-        and load_optimizer
++        load_optimizer
+         and amp_grad_scaler is not None
+         and amp_scaler_path.exists()
+         and bool(amp_grad_scaler.is_enabled())
+diff --git a/packages/rl-agent/muzero/training/cli_args.py b/packages/rl-agent/muzero/training/cli_args.py
+index bdbeae6..cc4e8ba 100644
+--- a/packages/rl-agent/muzero/training/cli_args.py
++++ b/packages/rl-agent/muzero/training/cli_args.py
+@@ -80,6 +80,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
+                             "low-HP campfire heal safety guard; off disables build hard overrides "
+                             "while preserving telemetry defaults."
+                         ))
++    parser.add_argument("--hard-guard-target-rewrite", type=str, default="off",
++                        choices=["off", "on"],
++                        help=(
++                            "RC-4: whether a post-search hard-guard OVERRIDE also rewrites the stored "
++                            "policy training target to a one-hot on the guard action (legacy=on). "
++                            "off (default, recommended): guards stay a behavior/safety wrapper -- the "
++                            "guard action is still executed, but the model trains on its OWN pre-guard "
++                            "search distribution so credit assignment stays on-policy. on restores the "
++                            "legacy one-hot rewrite (for A/B comparison)."
++                        ))
+     parser.add_argument("--root-progressive-widening-init", type=int, default=2,
+                         help="Initially selectable root children before visit-based widening grows the frontier.")
+     parser.add_argument("--child-progressive-widening-init", type=int, default=1,
+@@ -130,12 +140,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
+                         help="Auto-prune old muzero_step_* checkpoints in the current run directory after each save; 0 disables pruning.")
+     parser.add_argument("--resume-from", type=str, default=None,
+                         help="Resume MuZero training from a checkpoint directory")
+-    parser.add_argument("--resume-without-buffer", action="store_true", default=False,
+-                        help="Resume weights/optimizer from checkpoint but start with an empty replay buffer.")
+-    parser.add_argument("--resume-without-optimizer", action="store_true", default=False,
+-                        help="Resume model weights only; re-initialize the optimizer (Adam moments). "
+-                             "Use this when the aux-target schema changed mid-run and the old momentum "
+-                             "is steering away from the new objective.")
++    parser.add_argument("--resume-load-buffer", action=argparse.BooleanOptionalAction, default=True,
++                        help="Load the saved replay buffer on resume (DEFAULT, RC-1). The buffer now "
++                             "survives guard/head edits (gated on the replay schema, not exact network "
++                             "keys) and is schema-migrated rather than dropped. Use --no-resume-load-buffer "
++                             "only for a deliberate cold buffer.")
++    parser.add_argument("--resume-load-optimizer", action=argparse.BooleanOptionalAction, default=True,
++                        help="Load saved optimizer (Adam) moments on resume (DEFAULT, RC-1). Momentum is "
++                             "restored per-parameter; only params whose shape changed get fresh moments. "
++                             "Use --no-resume-load-optimizer to force fresh moments.")
++    # Deprecated pre-RC-1 aliases. Still honored: they force-SKIP loading (same dest, store_false).
++    parser.add_argument("--resume-without-buffer", dest="resume_load_buffer", action="store_false",
++                        help=argparse.SUPPRESS)
++    parser.add_argument("--resume-without-optimizer", dest="resume_load_optimizer", action="store_false",
++                        help=argparse.SUPPRESS)
+     parser.add_argument("--latent-policy-distill-weight", type=float, default=0.25,
+                         help="Distill latent search policy toward observation-conditioned policy.")
+     parser.add_argument("--latent-policy-target-weight", type=float, default=0.5,
+diff --git a/packages/rl-agent/muzero/training/cli_main.py b/packages/rl-agent/muzero/training/cli_main.py
+index 8dd10f7..07da67c 100644
+--- a/packages/rl-agent/muzero/training/cli_main.py
++++ b/packages/rl-agent/muzero/training/cli_main.py
+@@ -478,6 +478,7 @@ def main():
+         route_safety_guard=args.route_safety_guard,
+         combat_hard_guard_policy=args.combat_hard_guard_policy,
+         build_hard_guard_policy=args.build_hard_guard_policy,
++        hard_guard_target_rewrite=args.hard_guard_target_rewrite,
+         log_dir=args.log_dir,
+         checkpoint_dir=args.checkpoint_dir,
+         checkpoint_keep_last=args.checkpoint_keep_last,
+@@ -493,8 +494,8 @@ def main():
+             optimizer=optimizer,
+             buffer=buffer,
+             device=args.device,
+-            load_buffer=not args.resume_without_buffer,
+-            load_optimizer=not args.resume_without_optimizer,
++            load_buffer=bool(args.resume_load_buffer),
++            load_optimizer=bool(args.resume_load_optimizer),
+             token_target_encoder=trainer.token_target_encoder,
+             amp_grad_scaler=trainer.amp_grad_scaler,
+         )
+@@ -504,6 +505,12 @@ def main():
+             f"[resume] Loaded total_steps={trainer.total_steps} "
+             f"episode_count={trainer.episode_count} buffer={len(buffer)}"
+         )
++        if args.resume_load_buffer and len(buffer) == 0:
++            print(
++                "[resume][WARN] Buffer load was requested but the buffer is EMPTY -- see the [resume] "
++                "reason line above. Learning will restart cold; if this was only a guard/reward edit, "
++                "check the replay-schema mismatch or register an identity migration."
++            )
+         if args.total_timesteps <= trainer.total_steps:
+             raise ValueError(
+                 f"--total-timesteps ({args.total_timesteps}) must be greater than resumed total_steps "
+@@ -554,6 +561,7 @@ def main():
+         "[setup] Hard guards: "
+         f"combat={args.combat_hard_guard_policy} "
+         f"build={args.build_hard_guard_policy} "
++        f"target_rewrite={args.hard_guard_target_rewrite} "
+         f"route_safety={'on' if args.route_safety_guard else 'off'}"
+     )
+     print(
+@@ -854,6 +862,7 @@ def main():
+             route_safety_guard=args.route_safety_guard,
+             combat_hard_guard_policy=args.combat_hard_guard_policy,
+             build_hard_guard_policy=args.build_hard_guard_policy,
++            hard_guard_target_rewrite=args.hard_guard_target_rewrite,
+             log_dir=actor_log_dir,
+             checkpoint_dir=actor_ckpt_dir,
+             checkpoint_keep_last=0,
+diff --git a/packages/rl-agent/muzero/training/post_search_policy_retarget.py b/packages/rl-agent/muzero/training/post_search_policy_retarget.py
+index c595148..028f2b6 100644
+--- a/packages/rl-agent/muzero/training/post_search_policy_retarget.py
++++ b/packages/rl-agent/muzero/training/post_search_policy_retarget.py
+@@ -8,6 +8,7 @@ from sts2_env.observation_v2 import MAX_ACTIONS
+ 
+ 
+ POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES: dict[str, str] = {
++    "post_search_hard_guard_override_applied": "post_search_hard_guard_override_applied_rate",
+     "post_search_hard_guard_policy_retargeted": "post_search_hard_guard_policy_retargeted_rate",
+     "post_search_hard_guard_original_action_idx": "post_search_hard_guard_original_action_idx_mean",
+     "post_search_hard_guard_final_action_idx": "post_search_hard_guard_final_action_idx_mean",
+@@ -130,10 +131,51 @@ def retarget_search_policy_after_hard_guard(
+     return rewritten, True
+ 
+ 
++def resolve_hard_guard_policy_target(
++    search_policy: Any,
++    *,
++    original_action_idx: int,
++    final_action_idx: int,
++    rewrite_target: bool,
++    max_actions: int = MAX_ACTIONS,
++) -> tuple[Any, bool, bool]:
++    """Decide the stored policy training target after a post-search hard guard (RC-4).
++
++    Returns ``(target_policy, policy_retargeted, override_applied)``.
++
++    * ``override_applied`` is True when the guard changed the executed action
++      (``original_action_idx != final_action_idx``).
++    * When ``rewrite_target`` is True (legacy), the target becomes a one-hot on the
++      guard's final action via :func:`retarget_search_policy_after_hard_guard`.
++    * When ``rewrite_target`` is False (default), the model's OWN pre-guard soft
++      search distribution is kept unchanged as the training target -- the guard is
++      a pure behaviour/safety wrapper and the executed (guard) action is still
++      stored separately as the replay ``action``. This keeps policy/value credit
++      assignment on-policy instead of training the network to imitate the guards.
++    """
++
++    try:
++        override_applied = int(original_action_idx) != int(final_action_idx)
++    except (TypeError, ValueError):
++        override_applied = False
++
++    if not rewrite_target:
++        return search_policy, False, override_applied
++
++    policy, retargeted = retarget_search_policy_after_hard_guard(
++        search_policy,
++        original_action_idx=original_action_idx,
++        final_action_idx=final_action_idx,
++        max_actions=max_actions,
++    )
++    return policy, retargeted, override_applied
++
++
+ __all__ = [
+     "POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES",
+     "annotate_card_reward_final_selection",
+     "compact_final_action_for_diagnostic",
+     "final_action_is_skip",
++    "resolve_hard_guard_policy_target",
+     "retarget_search_policy_after_hard_guard",
+ ]
+diff --git a/packages/rl-agent/muzero/training/self_play.py b/packages/rl-agent/muzero/training/self_play.py
+index 44d9922..242418d 100644
+--- a/packages/rl-agent/muzero/training/self_play.py
++++ b/packages/rl-agent/muzero/training/self_play.py
+@@ -75,7 +75,7 @@ from muzero.training.async_telemetry import log_environment_episode_telemetry
+ from muzero.training.post_search_policy_retarget import (
+     POST_SEARCH_HARD_GUARD_SEARCH_SUFFIXES,
+     annotate_card_reward_final_selection,
+-    retarget_search_policy_after_hard_guard,
++    resolve_hard_guard_policy_target,
+ )
+ from muzero.training.rest_site_smith_guard import REST_SITE_SMITH_GUARD_SEARCH_SUFFIXES
+ from muzero.training.shop_action_guard import SHOP_ACTION_GUARD_SEARCH_SUFFIXES
+@@ -948,12 +948,19 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
+                 search_stats=search_stats if isinstance(search_stats, dict) else {},
+             )
+             if isinstance(search_stats, dict):
+-                search_policy, policy_retargeted = retarget_search_policy_after_hard_guard(
++                # RC-4: by default (rewrite_target off) the guard stays a behavior/safety wrapper --
++                # the guard action is still EXECUTED and stored as the replay 'action', but the
++                # policy/value target keeps the model's OWN pre-guard soft search distribution so
++                # credit assignment stays on-policy. --hard-guard-target-rewrite on restores the
++                # legacy one-hot rewrite for A/B comparison.
++                search_policy, policy_retargeted, guard_override = resolve_hard_guard_policy_target(
+                     search_policy,
+                     original_action_idx=pre_guard_action_idx,
+                     final_action_idx=int(action_idx),
++                    rewrite_target=getattr(self, "hard_guard_target_rewrite", False),
+                     max_actions=MAX_ACTIONS,
+                 )
++                search_stats["post_search_hard_guard_override_applied"] = 1.0 if guard_override else 0.0
+                 search_stats["post_search_hard_guard_policy_retargeted"] = 1.0 if policy_retargeted else 0.0
+                 search_stats["post_search_hard_guard_original_action_idx"] = float(pre_guard_action_idx)
+                 search_stats["post_search_hard_guard_final_action_idx"] = float(action_idx)
+@@ -2306,6 +2313,7 @@ class SelfPlayMixin(ActionHardGuardDispatchMixin, RouteHeuristicTelemetryMixin):
+             "deck_upgrade_metrics": deck_upgrade_meta,
+             "summoner_targeting_metrics": summoner_targeting_meta,
+             "target_priority_metrics": target_priority_meta,
++            "intent_combat_quality_metrics": intent_combat_quality_meta,
+             "episode_telemetry": dict(episode_telemetry),
+             "episode_reward": float(episode_reward),
+             "episode_length": int(episode_length),
+diff --git a/packages/rl-agent/muzero/training/train_step.py b/packages/rl-agent/muzero/training/train_step.py
+index 352492a..3d0dde2 100644
+--- a/packages/rl-agent/muzero/training/train_step.py
++++ b/packages/rl-agent/muzero/training/train_step.py
+@@ -914,6 +914,15 @@ class TrainStepMixin:
+             if not getattr(self, "_loss_spike_skip_count", None):
+                 self._loss_spike_skip_count = 0
+             self._loss_spike_skip_count += 1
++            # Verify-first (Step 0): surface the silent optimizer-step skip in TensorBoard
++            # so its rate is threshold-able, not just printed. Guard for the async null writer.
++            _spike_writer = getattr(self, "writer", None)
++            if _spike_writer is not None:
++                _spike_step = int(getattr(self, "total_steps", 0))
++                _spike_writer.add_scalar("train/loss_spike_skipped", 1.0, _spike_step)
++                _spike_writer.add_scalar(
++                    "train/loss_spike_skip_count", float(self._loss_spike_skip_count), _spike_step
++                )
+             print(
+                 f"[loss_spike] SKIP optimizer step #{self._loss_spike_skip_count} "
+                 f"total_steps={int(getattr(self, 'total_steps', 0))} "
+diff --git a/packages/rl-agent/muzero/training/trainer.py b/packages/rl-agent/muzero/training/trainer.py
+index a078a4c..016ce76 100644
+--- a/packages/rl-agent/muzero/training/trainer.py
++++ b/packages/rl-agent/muzero/training/trainer.py
+@@ -282,6 +282,7 @@ class MuZeroTrainer(
+         route_safety_guard: bool = False,
+         combat_hard_guard_policy: str = "full",
+         build_hard_guard_policy: str = "full",
++        hard_guard_target_rewrite: str | bool = "off",
+         log_dir: str = "runs",
+         checkpoint_dir: str = "checkpoints",
+         checkpoint_keep_last: int = 3,
+@@ -415,6 +416,13 @@ class MuZeroTrainer(
+         self.build_hard_guard_policy = str(build_hard_guard_policy or "full").strip().lower()
+         if self.build_hard_guard_policy not in valid_guard_policies:
+             self.build_hard_guard_policy = "full"
++        # RC-4: target-rewrite is independent of which guard SET runs. Default off so a guard
++        # override no longer rewrites the policy target to a one-hot (keeps learning on-policy).
++        self.hard_guard_target_rewrite = (
++            bool(hard_guard_target_rewrite)
++            if isinstance(hard_guard_target_rewrite, bool)
++            else str(hard_guard_target_rewrite or "off").strip().lower() in {"on", "true", "1", "yes"}
++        )
+         self.recent_tail_tracked_encounters = [
+             str(encounter_id).strip()
+             for encounter_id in (recent_tail_tracked_encounters or [])

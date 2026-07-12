@@ -1,8 +1,13 @@
 """Export Ironclad/Colorless base cards and audit mechanism coverage.
 
-The audit is intentionally local-data driven: it reads the game's
-``export/items.json`` rather than hard-coding card names.  Outputs are written
-under ``docs/generated`` plus a human-readable Markdown report.
+The runtime audit is intentionally local-data driven: it reads the game's
+``export/items.json`` rather than hard-coding card names, and writes mutable
+reports below ``STS2_ARTIFACT_ROOT``.  The explicit
+``--publish-checked-in-docs`` mode instead uses only the repository's canonical
+card data plus the pinned, read-only artifact dependency and can write only to
+the fixed ``docs/generated`` publication directory.  A separate migration-only
+switch can read the fixed legacy ``third_party/sts2-ai`` checkout while that
+checkout is being externalized; it never accepts an arbitrary path.
 
 This is not a simulator.  Its job is to answer: "which card mechanisms appear
 in Ironclad + Colorless cards, and are those mechanisms currently represented
@@ -15,29 +20,57 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import subprocess
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+RL_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(RL_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(RL_AGENT_ROOT))
+
+from sts2_rl.artifacts import (  # noqa: E402
+    artifact_root,
+    resolve_artifact_path,
+    resolve_external_input_path,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OUT_DIR = PROJECT_ROOT / "docs" / "generated"
-DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "card-mechanism-coverage-audit.md"
-COMMON_ITEMS_PATHS = (
-    PROJECT_ROOT / "tmp" / "export" / "items.json",
-    PROJECT_ROOT / "export" / "items.json",
-    Path(r"E:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\export\items.json"),
-    Path(r"C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\export\items.json"),
+ARTIFACT_ROOT = artifact_root()
+DEFAULT_OUT_DIR = resolve_artifact_path("reports/card-mechanism", root=ARTIFACT_ROOT)
+DEFAULT_REPORT_PATH = DEFAULT_OUT_DIR / "card-mechanism-coverage-audit.md"
+CHECKED_IN_OUT_DIR = PROJECT_ROOT / "docs" / "generated"
+CHECKED_IN_REPORT_PATH = CHECKED_IN_OUT_DIR / "card-mechanism-coverage-audit.md"
+CHECKED_IN_ITEMS_PATH = PROJECT_ROOT / "game-data" / "generated" / "cards.static.generated.json"
+CHECKED_IN_STS2_AI_ROOT = PROJECT_ROOT / "third_party" / "sts2-ai"
+CATALOG_RELATIVE_PATH = Path("Assets/datasets/game_knowledge_catalog/cards.jsonl")
+
+
+def _items_paths() -> tuple[Path, ...]:
+    paths = [PROJECT_ROOT / "tmp" / "export" / "items.json", PROJECT_ROOT / "export" / "items.json"]
+    if os.environ.get("STS2_EXPORT_ITEMS"):
+        paths.insert(0, Path(os.environ["STS2_EXPORT_ITEMS"]).expanduser())
+    for variable in ("ProgramFiles(x86)", "ProgramFiles"):
+        base = os.environ.get(variable)
+        if base:
+            paths.append(Path(base) / "Steam" / "steamapps" / "common" / "Slay the Spire 2" / "export" / "items.json")
+    return tuple(dict.fromkeys(paths))
+
+
+COMMON_ITEMS_PATHS = _items_paths()
+STS2_AI_ROOT = resolve_external_input_path(
+    os.environ.get("STS2_AI_ROOT"),
+    default="dependencies/sts2-ai",
+    root=ARTIFACT_ROOT,
 )
 COMMON_CATALOG_PATHS = (
-    PROJECT_ROOT / "third_party" / "sts2-ai" / "Assets" / "datasets" / "game_knowledge_catalog" / "cards.jsonl",
+    STS2_AI_ROOT / CATALOG_RELATIVE_PATH,
 )
-COMMON_SOURCE_ROOTS = (
-    PROJECT_ROOT / "third_party" / "sts2-ai",
-)
+COMMON_SOURCE_ROOTS = (STS2_AI_ROOT,)
 
 
 @dataclass(frozen=True)
@@ -232,8 +265,22 @@ COVERAGE_DEFS: dict[str, CoverageDef] = {
 }
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _logical_source_label(path: Path | str | None, *, kind: str) -> str:
+    """Return stable logical provenance without recording an invocation path."""
+    if not path:
+        return ""
+    labels = {
+        "game-export": "external://game-export/items.json",
+        "checked-in-card-data": "repo://game-data/generated/cards.static.generated.json",
+        "source-catalog": (
+            "artifact://dependencies/sts2-ai/Assets/datasets/"
+            "game_knowledge_catalog/cards.jsonl"
+        ),
+    }
+    try:
+        return labels[kind]
+    except KeyError as exc:
+        raise ValueError(f"unknown logical source kind: {kind}") from exc
 
 
 def _resolve_items_path(explicit: str | None) -> Path:
@@ -249,6 +296,116 @@ def _resolve_items_path(explicit: str | None) -> Path:
     raise FileNotFoundError(f"items.json not found. Checked:\n  - {checked}")
 
 
+def _static_card_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand canonical ``cards.static.generated.json`` into exporter rows."""
+
+    rows: list[dict[str, Any]] = []
+    for identifier, card in sorted(payload.items()):
+        if identifier == "__meta__":
+            continue
+        if not isinstance(card, dict) or not str(identifier).startswith("CARD."):
+            raise ValueError("Expected the canonical card-id mapping")
+        levels = card.get("upgrade_level_texts")
+        if not isinstance(levels, dict) or "0" not in levels:
+            raise ValueError(f"Missing upgrade_level_texts[0] for {identifier}")
+        for level_text, level_payload in sorted(levels.items(), key=lambda item: int(item[0])):
+            if not isinstance(level_payload, dict):
+                raise ValueError(f"Invalid upgrade level {level_text!r} for {identifier}")
+            energy_cost_text = level_payload.get("energy_cost_text")
+            if energy_cost_text == "":
+                energy_cost_text = level_payload.get("energy_cost")
+            rows.append(
+                {
+                    "id": identifier,
+                    "name": card.get("title") or identifier,
+                    "color": card.get("color"),
+                    "rarity": card.get("rarity"),
+                    "type": card.get("type"),
+                    "target": card.get("target"),
+                    "cost": energy_cost_text,
+                    "upgrades": int(level_text),
+                    "description": level_payload.get("description") or "",
+                    "effect": level_payload.get("effect") or "",
+                    "canonicalText": level_payload.get("canonical_text") or "",
+                    "keywords": level_payload.get("keywords") or [],
+                    "semanticTags": level_payload.get("semantic_tags") or [],
+                    "semanticSignals": level_payload.get("semantic_signals") or {},
+                }
+            )
+    return rows
+
+
+def _card_rows(payload: Any) -> tuple[list[dict[str, Any]], str]:
+    """Normalize either an exporter document or canonical checked-in data."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("Expected a JSON object containing card data")
+    exported = payload.get("cards")
+    if isinstance(exported, list):
+        return exported, "game-export"
+    card_ids = [identifier for identifier in payload if identifier != "__meta__"]
+    if card_ids and all(str(identifier).startswith("CARD.") for identifier in card_ids):
+        return _static_card_rows(payload), "checked-in-card-data"
+    raise ValueError("Expected exporter cards list or canonical card-id mapping")
+
+
+def _checked_in_output_paths() -> tuple[Path, Path]:
+    """Return the sole source-tree destination allowed for publication."""
+
+    project_root = PROJECT_ROOT.resolve(strict=False)
+    docs_dir = PROJECT_ROOT / "docs"
+    if docs_dir.resolve(strict=False) != project_root / "docs":
+        raise ValueError("checked-in publication refuses a redirected docs directory")
+    out_dir = docs_dir / "generated"
+    if out_dir.exists() and out_dir.resolve(strict=False) != project_root / "docs" / "generated":
+        raise ValueError("checked-in publication refuses a redirected docs/generated directory")
+    return out_dir, out_dir / CHECKED_IN_REPORT_PATH.name
+
+
+def _resolve_output_paths(
+    *,
+    publish_checked_in_docs: bool,
+    out_dir: str | None,
+    report: str | None,
+) -> tuple[Path, Path, str]:
+    if publish_checked_in_docs:
+        if out_dir is not None or report is not None:
+            raise ValueError(
+                "--publish-checked-in-docs cannot be combined with --out-dir or --report"
+            )
+        checked_out, checked_report = _checked_in_output_paths()
+        return checked_out, checked_report, "repo://docs/generated"
+
+    runtime_root = artifact_root()
+    runtime_out = resolve_artifact_path(
+        out_dir,
+        default="reports/card-mechanism",
+        root=runtime_root,
+    )
+    runtime_report = resolve_artifact_path(
+        report,
+        default=runtime_out / DEFAULT_REPORT_PATH.name,
+        root=runtime_root,
+    )
+    return runtime_out, runtime_report, "artifact://reports/card-mechanism"
+
+
+def _verify_pinned_catalog_source(source_root: Path) -> None:
+    """Reuse the repository lock verifier before publishing committed output."""
+
+    verifier = PROJECT_ROOT / "tools" / "third_party" / "restore_sts2_ai.py"
+    subprocess.check_call(
+        [
+            sys.executable,
+            str(verifier),
+            "--verify-only",
+            "--destination",
+            str(source_root.resolve(strict=False)),
+        ],
+        cwd=PROJECT_ROOT,
+    )
+
+
 def _normalize_card_id(card_id: Any) -> str:
     text = str(card_id or "").strip()
     if text.upper().startswith("CARD."):
@@ -256,7 +413,11 @@ def _normalize_card_id(card_id: Any) -> str:
     return text.lower()
 
 
-def _load_catalog(path: Path | None = None) -> dict[str, dict[str, Any]]:
+def _load_catalog(
+    path: Path | None = None,
+    *,
+    source_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
     """Load optional decompiled/source catalog facts keyed by normalized card id.
 
     The exporter ``items.json`` already provides stable card IDs plus coarse
@@ -266,9 +427,15 @@ def _load_catalog(path: Path | None = None) -> dict[str, dict[str, Any]]:
     and the source file.  These are internal IDs, not localized card text.
     """
 
+    selected_source_root = source_root or STS2_AI_ROOT
     catalog_path = path
     if catalog_path is None:
-        catalog_path = next((p for p in COMMON_CATALOG_PATHS if p.exists()), None)
+        candidates = (
+            (selected_source_root / CATALOG_RELATIVE_PATH,)
+            if source_root is not None
+            else COMMON_CATALOG_PATHS
+        )
+        catalog_path = next((p for p in candidates if p.exists()), None)
     if catalog_path is None or not catalog_path.exists():
         return {}
 
@@ -286,6 +453,7 @@ def _load_catalog(path: Path | None = None) -> dict[str, dict[str, Any]]:
             if cid:
                 entry = dict(entry)
                 entry["_catalog_path"] = str(catalog_path)
+                entry["_source_root"] = str(selected_source_root)
                 out[cid] = entry
     return out
 
@@ -296,7 +464,16 @@ def _resolve_source_path(catalog_entry: dict[str, Any] | None) -> Path | None:
     rel = str(catalog_entry.get("source_path") or "").strip()
     if not rel:
         return None
-    for root in COMMON_SOURCE_ROOTS:
+    hinted_root = str(catalog_entry.get("_source_root") or "").strip()
+    roots = tuple(
+        dict.fromkeys(
+            [
+                *((Path(hinted_root),) if hinted_root else ()),
+                *COMMON_SOURCE_ROOTS,
+            ]
+        )
+    )
+    for root in roots:
         candidate = root / rel
         if candidate.exists():
             return candidate
@@ -624,7 +801,7 @@ def _card_record(
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_bytes((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
 def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
@@ -650,8 +827,8 @@ def _write_csv(path: Path, records: list[dict[str, Any]]) -> None:
         "upgrade_descriptions",
         "coverage_notes",
     ]
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         for rec in records:
             statuses = rec.get("category_statuses") or {}
@@ -727,8 +904,6 @@ def _emit_roster(path: Path, records: list[dict[str, Any]], title: str) -> None:
         [
             f"# {title}",
             "",
-            f"Generated: {_utc_now()}",
-            "",
             _md_table(
                 ["ID", "名称", "稀有度", "类型", "费用", "覆盖", "机制分类", "基础描述"],
                 rows,
@@ -737,13 +912,13 @@ def _emit_roster(path: Path, records: list[dict[str, Any]], title: str) -> None:
         ]
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_bytes((text.rstrip() + "\n").encode("utf-8"))
 
 
 def _write_report(
     path: Path,
     *,
-    source_path: Path,
+    output_uri: str,
     all_records: list[dict[str, Any]],
     ironclad_records: list[dict[str, Any]],
     colorless_records: list[dict[str, Any]],
@@ -838,27 +1013,34 @@ def _write_report(
 
     text = f"""# Ironclad / Colorless 卡牌机制覆盖审计
 
-Generated: {_utc_now()}
-
-Source: `{source_path}`
+Source: `{summary['source_items_json']}`
 
 ## 结论摘要
 
-1. 本地游戏导出的 **Ironclad 基础牌是 {len(ironclad_records)} 张**，不是 88 张。这里没有强行丢牌：`Ancient`/`Event`/`Basic` 也一起导出。若后续要严格对齐“奖励池 88 张”，需要再按奖励池/掉落池规则过滤。
-2. 本地游戏导出的 **Colorless 基础牌是 {len(colorless_records)} 张**；其中剔除 Status/Curse/Quest/Token 后的可主动使用无色牌为 **{summary['colorless_playable_non_status_curse_quest_token']} 张**，Uncommon/Rare 常规无色牌为 **{summary['colorless_uncommon_rare']} 张**。
+1. 规范化游戏数据中的 **Ironclad 基础牌是 {len(ironclad_records)} 张**，不是 88 张。这里没有强行丢牌：`Ancient`/`Event`/`Basic` 也一起导出。若后续要严格对齐“奖励池 88 张”，需要再按奖励池/掉落池规则过滤。
+2. 规范化游戏数据中的 **Colorless 基础牌是 {len(colorless_records)} 张**；其中剔除 Status/Curse/Quest/Token 后的可主动使用无色牌为 **{summary['colorless_playable_non_status_curse_quest_token']} 张**，Uncommon/Rare 常规无色牌为 **{summary['colorless_uncommon_rare']} 张**。
 3. 基础伤害/格挡/抽牌/回费/生命代价/X 费/消耗/虚无/保留/运行时附魔，已经有明确 bridge + observation 特征路径。
 4. 最大风险不是“模型完全看不到”，而是当前 `semanticTags/semanticSignals` 和 source catalog 只能给粗粒度内部族群（例如 `Upgrade`/`Exhaust`/`Transform`/`AddGeneratedCardToCombat`/`EnergyCost.Set*`），还缺 **zone/scope/filter/selection/count/destination/duration/modifier/result_card** 等 typed operation 参数。文本匹配只保留离线告警，不能作为训练主契约。
 
 ## 输出文件
 
-- `docs/generated/ironclad-cards-base.json`：Ironclad 基础牌完整导出 + 分类。
-- `docs/generated/colorless-cards-base.json`：Colorless 基础牌完整导出 + 分类。
-- `docs/generated/card-mechanism-coverage.csv`：Ironclad + Colorless 全量机制覆盖表，适合 Excel/TB 外部检查。
-- `docs/generated/ironclad-card-roster.md`：Ironclad 全表。
-- `docs/generated/colorless-card-roster.md`：Colorless 全表。
-- `packages/rl-agent/tools/audit_card_mechanism_coverage.py`：可重复生成脚本。
+- `{output_uri}/ironclad-cards-base.json`：Ironclad 基础牌完整导出 + 分类。
+- `{output_uri}/colorless-cards-base.json`：Colorless 基础牌完整导出 + 分类。
+- `{output_uri}/card-mechanism-coverage.csv`：Ironclad + Colorless 全量机制覆盖表，适合 Excel/TB 外部检查。
+- `{output_uri}/ironclad-card-roster.md`：Ironclad 全表。
+- `{output_uri}/colorless-card-roster.md`：Colorless 全表。
+- `repo://packages/rl-agent/tools/audit_card_mechanism_coverage.py`：可重复生成脚本。
 
 Internal source catalog: `{summary.get('source_catalog_path') or 'not found'}`；本次审计中有 source profile 的卡：**{catalog_available}/{len(all_records)}**。
+
+Checked-in 文件只能通过固定边界发布；该模式拒绝 `--items`、`--out-dir` 和 `--report` 覆盖：
+
+```powershell
+python tools/third_party/restore_sts2_ai.py
+python packages/rl-agent/tools/audit_card_mechanism_coverage.py --publish-checked-in-docs
+```
+
+不带该开关的运行时审计始终写入 `STS2_ARTIFACT_ROOT/reports/card-mechanism`，不能写回源码树。
 
 ## 牌数与分布
 
@@ -899,19 +1081,19 @@ Internal source catalog: `{summary.get('source_catalog_path') or 'not found'}`�
 
 ### 仍然不够硬的部分
 
-1. **内部 ID 已经存在，但粒度还不够**  
-   `third_party/sts2-ai/.../cards.jsonl` 与 C# 源码能提供 `commands`、`powers`、`PileType.Hand/Draw/Discard/Exhaust`、`CardSelectCmd.FromHand*`、`CardCmd.Upgrade/Exhaust/Transform`、`CardPileCmd.AddGeneratedCardToCombat`、`EnergyCost.Set*`、`CreateClone`、`Replay`、`AddKeyword/AddEnchantment/AddAffliction` 等内部事实。这比文本正则可靠得多。当前缺口不是“识别不到升级/消耗/变化这些词”，而是还没把这些内部调用编译成可训练的 `card_effect_profile.operations`。
+1. **内部 ID 已经存在，但粒度还不够**
+   `artifact://dependencies/sts2-ai/.../cards.jsonl` 与 C# 源码能提供 `commands`、`powers`、`PileType.Hand/Draw/Discard/Exhaust`、`CardSelectCmd.FromHand*`、`CardCmd.Upgrade/Exhaust/Transform`、`CardPileCmd.AddGeneratedCardToCombat`、`EnergyCost.Set*`、`CreateClone`、`Replay`、`AddKeyword/AddEnchantment/AddAffliction` 等内部事实。这比文本正则可靠得多。当前缺口不是“识别不到升级/消耗/变化这些词”，而是还没把这些内部调用编译成可训练的 `card_effect_profile.operations`。
 
-2. **action -> pile transition 还不够结构化**  
+2. **action -> pile transition 还不够结构化**
    头槌、破灭、倾泻、秘密武器/技法、探寻打击、战鼓、好勇斗狠、怀旧等会读/写抽牌堆或弃牌堆。现在模型可以通过 pile tokens 和 source facts 知道访问了哪些 pile，但缺少统一的 `source_zone/destination_zone/topdeck_target/play_top_count/fetch_filter`。
 
-3. **消耗牌堆依赖需要显式条件特征**  
+3. **消耗牌堆依赖需要显式条件特征**
    灰烬打击、契约终结、被遗忘的仪式、邪眼、黑暗之拥、腐化、恶魔之焰、添柴、重振精神等都要求模型理解“当前消耗堆数量 / 本回合是否消耗过 / 消耗后触发”。现在有消耗堆 token 和 `PileType.Exhaust` 访问事实，但每张牌的条件依赖还没有变成 typed feature。
 
-4. **未来规则 / 下一张牌修饰需要 temporal rule token**  
+4. **未来规则 / 下一张牌修饰需要 temporal rule token**
    腐化、无情猛攻、连环拳、怀旧、神气制胜、自动化/地狱狂徒等会改变后续出牌规则。search-free planner 要可靠，需要把“下一张攻击免费/重放/技能 0 费并消耗/每回合第一张置顶”等规则从文本提升为 rule token。
 
-5. **Status/Curse 硬约束缺 typed profile**  
+5. **Status/Curse 硬约束缺 typed profile**
    虚空、灼伤、遗憾、腐朽、普通、懒惰、执迷等不是普通收益牌；有抽到触发、回合末触发、出牌数限制、必须优先打出等硬规则。法律动作 mask 会处理“能不能打”，但策略层需要提前知道“为什么必须处理/为什么不能拖”。
 
 ## 建议的目标态补齐顺序
@@ -924,22 +1106,64 @@ Internal source catalog: `{summary.get('source_catalog_path') or 'not found'}`�
 6. **Status/Curse/硬约束单独做 aux head**：预测本回合/下回合由状态牌导致的 HP/energy/play-limit 风险，避免只从 reward 后验学习。
 """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_bytes((text.rstrip() + "\n").encode("utf-8"))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--items", default=None, help="Path to sts2-exporter items.json")
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Generated docs output directory")
-    parser.add_argument("--report", default=str(DEFAULT_REPORT_PATH), help="Markdown report path")
+    parser.add_argument("--out-dir", default=None, help="Mutable report directory below STS2_ARTIFACT_ROOT")
+    parser.add_argument("--report", default=None, help="Markdown report path below STS2_ARTIFACT_ROOT")
+    parser.add_argument(
+        "--publish-checked-in-docs",
+        action="store_true",
+        help=(
+            "Publish from fixed canonical inputs to the fixed docs/generated directory; "
+            "cannot be combined with path overrides"
+        ),
+    )
+    parser.add_argument(
+        "--use-pinned-migration-checkout",
+        action="store_true",
+        help=(
+            "During repository cleanup only, read the fixed third_party/sts2-ai checkout "
+            "instead of the canonical artifact dependency; requires checked-in publication"
+        ),
+    )
     args = parser.parse_args()
 
-    source_path = _resolve_items_path(args.items)
+    if args.publish_checked_in_docs and args.items is not None:
+        parser.error("--publish-checked-in-docs cannot be combined with --items")
+    if args.use_pinned_migration_checkout and not args.publish_checked_in_docs:
+        parser.error("--use-pinned-migration-checkout requires --publish-checked-in-docs")
+    try:
+        out_dir, report_path, output_uri = _resolve_output_paths(
+            publish_checked_in_docs=args.publish_checked_in_docs,
+            out_dir=args.out_dir,
+            report=args.report,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    source_path = (
+        CHECKED_IN_ITEMS_PATH
+        if args.publish_checked_in_docs
+        else _resolve_items_path(args.items)
+    )
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
     payload = json.loads(source_path.read_text(encoding="utf-8-sig"))
-    raw_cards = payload.get("cards")
-    if not isinstance(raw_cards, list):
-        raise ValueError(f"Expected cards list in {source_path}")
-    catalog = _load_catalog()
+    raw_cards, source_kind = _card_rows(payload)
+    if args.publish_checked_in_docs:
+        catalog_source_root = (
+            CHECKED_IN_STS2_AI_ROOT
+            if args.use_pinned_migration_checkout
+            else STS2_AI_ROOT
+        )
+        _verify_pinned_catalog_source(catalog_source_root)
+        catalog = _load_catalog(source_root=catalog_source_root)
+    else:
+        catalog = _load_catalog()
     catalog_path = next((entry.get("_catalog_path") for entry in catalog.values() if entry.get("_catalog_path")), None)
 
     by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -982,13 +1206,11 @@ def main() -> None:
         if str(rec.get("rarity")) in {"Uncommon", "Rare"}
     ]
 
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary = {
-        "generated_at_utc": _utc_now(),
-        "source_items_json": str(source_path),
-        "source_catalog_path": str(catalog_path or ""),
+        "source_items_json": _logical_source_label(source_path, kind=source_kind),
+        "source_catalog_path": _logical_source_label(catalog_path, kind="source-catalog"),
         "catalog_cards_loaded": len(catalog),
         "catalog_source_available_for_audited_cards": sum(
             1
@@ -1025,8 +1247,8 @@ def main() -> None:
     _emit_roster(out_dir / "ironclad-card-roster.md", ironclad_records, "Ironclad base cards")
     _emit_roster(out_dir / "colorless-card-roster.md", colorless_records, "Colorless base cards")
     _write_report(
-        Path(args.report),
-        source_path=source_path,
+        report_path,
+        output_uri=output_uri,
         all_records=all_records,
         ironclad_records=ironclad_records,
         colorless_records=colorless_records,
@@ -1044,7 +1266,7 @@ def main() -> None:
                 "colorless_uncommon_rare": len(colorless_uncommon_rare),
                 "catalog_cards_loaded": len(catalog),
                 "out_dir": str(out_dir),
-                "report": str(Path(args.report)),
+                "report": str(report_path),
             },
             ensure_ascii=False,
             indent=2,

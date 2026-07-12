@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sts2.local/contracts/transition.schema.json",
+  "title": "Canonical transition facts",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["episode_id", "step_index", "before_state_version", "after_state_version", "facts"],
+  "properties": {
+    "episode_id": { "type": "string", "minLength": 1 },
+    "step_index": { "type": "integer", "minimum": 0 },
+    "before_state_version": { "type": "integer", "minimum": 0 },
+    "after_state_version": { "type": "integer", "minimum": 0 },
+    "facts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "hp_delta": { "type": "number" },
+        "gold_delta": { "type": "number" },
+        "floor_delta": { "type": "integer" },
+        "cards_added": { "type": "array", "items": { "type": "string" } },
+        "cards_removed": { "type": "array", "items": { "type": "string" } },
+        "potions_added": { "type": "array", "items": { "type": "string" } },
+        "potions_removed": { "type": "array", "items": { "type": "string" } },
+        "room_entered": { "type": ["string", "null"] },
+        "combat_result": { "enum": ["none", "victory", "defeat", "escaped"] },
+        "terminal_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

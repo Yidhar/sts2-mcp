@@ -1,0 +1,11 @@
+{
+  "request_id": "4d764ec5-0738-44e5-a383-96764fd1e31f",
+  "session_id": "example-session-0001",
+  "capability": "player-control",
+  "expected_state_version": 42,
+  "deadline_utc": "2026-07-11T12:00:00Z",
+  "command": {
+    "kind": "perform_action",
+    "action_handle": "combat:play-card:instance-7:target-enemy-2"
+  }
+}
