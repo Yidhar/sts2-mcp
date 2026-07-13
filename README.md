@@ -27,7 +27,7 @@ they must not receive new features.
 | [`game-data/`](./game-data/README.md) | `2.0.0` | Policy-free static card, relic, and potion facts |
 | [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | Game adapter, visible snapshots, legal handles, command serialization, session discovery |
 | [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | TypeScript MCP server using the official SDK; default `minimal` control surface |
-| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | Grounded-candidate model, typed backends, fixed reward, replay, learner and checkpoints |
+| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | Recurrent grounded-candidate model, typed backends, fixed task reward, FIFO unrolls, V-trace and checkpoints |
 | [`tools/`](./tools) | — | Contract, data, artifact, release, license, and repository checks |
 
 Component versions are coordinated through [`release-manifest.json`](./release-manifest.json).
@@ -61,7 +61,7 @@ The dependency and ownership rules are deliberate:
   player-control workflows. It does not own reward, RL state, journal storage, or
   arbitrary knowledge-file access.
 - The RL package owns episode semantics, observations, actions, reward, curriculum,
-  replay, models, checkpoints, and experiment metadata.
+  FIFO rollout data, models, checkpoints, and experiment metadata.
 - The Bridge and MCP server must not import data or code through an RL package path.
 - Runtime artifacts do not belong in the source checkout.
 
@@ -164,7 +164,7 @@ multi-instance configurations.
 
 ## RL development and training
 
-The maintained entry point is the **grounded-candidate actor-critic baseline**.
+The maintained entry point is the **recurrent grounded-candidate V-trace v2 baseline**.
 The failed MuZero/token-memory/MCTS line, PPO paths, planners and hand-written
 action guards have been removed:
 
@@ -193,21 +193,22 @@ source, and hash-mismatched binaries are rejected before the simulator starts.
 See [HeadlessSim build identity](./docs/headless-simulator-identity.md) for the
 build and verification procedure.
 
-The default model has 3,642,824 parameters, scores only currently grounded legal
-candidates, and uses no latent dynamics, MCTS, planner or game-specific action
-rewrite. Reward is fixed and normalized; replay mixes coverage, recent data and
-refreshable priorities. Collector encodings are retained as compact sparse replay
-snapshots, so learner updates collate model inputs without re-parsing raw JSON. See
+The default model has 3,971,778 parameters, scores only currently grounded legal
+candidates, and uses a 256-wide GRU state with no latent dynamics, MCTS, planner
+or game-specific action rewrite. Reward is fixed and normalized. Actors stream
+64-decision recurrent unrolls through a bounded FIFO; the V-trace learner consumes
+each unroll once, with no replay sampling or priorities. Encodings remain compact
+sparse snapshots, so learner updates do not re-parse raw JSON. See
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md).
 
-Formal profiles keep collector and learner synchronous. A bounded one-episode
-overlap mode is available only for profiling; ROCm/CPU-actor experiments improved
-the new synchronous control by 10.4% but introduced 3–28 update policy lag, so it
-is not the default long-run path.
+Collector and learner now overlap by construction. A dedicated actor model on the
+configured collector device publishes versioned unrolls into a capacity-256 queue;
+the learner applies bounded-lag V-trace correction and republishes parameters only
+at actor episode boundaries.
 
-The software path is tested, but no new long-run checkpoint or Act 1 clear-rate
-claim exists yet. Do not start a long run until the v2 environment/parity checks
-for the selected backend are green.
+The v1 run is retained only as failure evidence and is not a model or replay
+initialization source. No v2 Act 1 clear-rate claim exists until fixed odd-seed
+evaluations at steps 0, 10k, 25k and 50k complete.
 
 ## Contracts and game data
 
@@ -244,7 +245,7 @@ from `STS2_GAME_DATA_ROOT`. They must not add dependencies on
 
 ## Artifact boundary
 
-Checkpoints, optimizer state, replay, datasets, logs, virtual environments, release
+Checkpoints, optimizer state, pending rollout queues, datasets, logs, virtual environments, release
 binaries, PIDs, and temporary decompilations must live outside the source checkout.
 Configure an external directory through `STS2_ARTIFACT_ROOT`.
 
@@ -285,9 +286,9 @@ game assemblies are not committed.
 - Strict `expected_state_version` is required for gameplay mutation.
 - Training reset/step requires the training capability; step is bound to
   `episode_id` and `expected_step_index`.
-- Old replay and checkpoint files are not compatible. Grounded exact resume
+- Old replay and checkpoint files are not compatible. Recurrent-v2 exact resume
   validates contract, action ordering, observation/reward identity, dependency
-  locks, encoding fingerprint, model/optimizer/replay and stochastic state, and
+  locks, encoding fingerprint, learner/actor/optimizer/rollout-queue and stochastic state, and
   fails closed on unsupported formats. Valid static game-data is optional audit
   provenance, not a runtime or model compatibility input.
 - Historical journal/knowledge persistence, AutoSlay runners, Draft Tracker, PPO

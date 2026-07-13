@@ -1,8 +1,8 @@
-version = "sts2-grounded-baseline-config-v2"
+version = "sts2-recurrent-vtrace-config-v1"
 profile = "default"
 
 [model]
-architecture = "grounded_candidate_v1"
+architecture = "recurrent_candidate_v2"
 token_feature_dim = 160
 d_model = 128
 n_heads = 4
@@ -12,6 +12,7 @@ latent_slots = 12
 latent_layers = 2
 local_layers = 1
 candidate_layers = 1
+recurrent_hidden_dim = 256
 dropout = 0.05
 type_vocab_size = 128
 role_vocab_size = 64
@@ -27,27 +28,23 @@ max_candidate_local_tokens = 16
 [optimization]
 learning_rate = 0.0003
 weight_decay = 0.0001
-batch_size = 32
+batch_unrolls = 8
 discount = 0.997
 gradient_clip_norm = 1.0
-importance_ratio_clip = 1.0
+vtrace_rho_clip = 1.0
+vtrace_c_clip = 1.0
+policy_rho_clip = 1.0
 policy_weight = 1.0
 value_weight = 0.5
-q_weight = 0.5
-reward_weight = 0.25
-terminal_weight = 0.10
 entropy_weight = 0.01
 
-[replay]
-capacity = 100000
-recent_window = 10000
-coverage_fraction = 0.50
-recent_fraction = 0.25
-priority_fraction = 0.25
-alpha = 0.6
-beta = 0.4
-priority_epsilon = 0.000001
-minimum_size = 1024
+[rollout]
+unroll_length = 64
+queue_capacity = 256
+minimum_unrolls = 8
+collector_workers = 1
+policy_sync_interval_unrolls = 8
+max_policy_lag = 1024
 
 [environment]
 backend = "headless"
@@ -55,7 +52,7 @@ scenario = "full-run"
 max_episode_steps = 10000
 
 [curriculum]
-reward_objective = "run"
+reward_objective = "act1"
 epsilon_start = 0.30
 epsilon_end = 0.05
 epsilon_decay_steps = 250000
@@ -63,14 +60,15 @@ epsilon_decay_steps = 250000
 [runtime]
 device = "auto"
 collector_device = "cpu"
-execution_mode = "synchronous"
 total_environment_steps = 1000000
-train_every_steps = 4
-updates_per_cycle = 1
-warmup_credit_policy = "discard"
 seed = 0
-log_dir = "runs/grounded-baseline"
-checkpoint_dir = "checkpoints/grounded-baseline"
-checkpoint_interval_steps = 50000
-evaluation_interval_steps = 50000
+log_dir = "runs/recurrent-vtrace"
+checkpoint_dir = "checkpoints/recurrent-vtrace"
+checkpoint_interval_steps = 25000
+evaluation_steps = [0, 10000, 25000, 50000]
 evaluation_episodes = 20
+
+[diagnostics]
+deadlock_window = 128
+deadlock_repeat_threshold = 8
+journal_policy_topk = 5

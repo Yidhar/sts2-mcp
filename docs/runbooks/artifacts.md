@@ -10,7 +10,7 @@ supported lineage.
 Runtime artifacts include:
 
 - checkpoint and optimizer directories;
-- replay buffers contained in complete current atomic checkpoints and current datasets;
+- pending rollout queues contained in complete current atomic checkpoints and current datasets;
 - TensorBoard and diagnostic logs;
 - virtual environments and downloaded runtimes;
 - PIDs and launch-command files;

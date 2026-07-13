@@ -1,6 +1,6 @@
 # WSL ROCm training for `rl-agent`
 
-This repo can run grounded-baseline training from WSL while the STS2 game +
+This repo can run recurrent V-trace baseline training from WSL while the STS2 game +
 bridge stay on Windows.
 
 ## System networking prerequisite
@@ -78,7 +78,7 @@ This installs:
 - this project in editable mode without build isolation, using the already locked
   `setuptools`/`wheel`, followed by `pip check` and a real GPU visibility check
 
-## Launch grounded-baseline training from WSL
+## Launch recurrent v2 training from WSL
 
 ```bash
 export REPO_ROOT='/mnt/<drive>/path/to/sts2_mcp'

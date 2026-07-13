@@ -506,7 +506,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "container_keys": sorted(_FACT_CONTAINER_KEYS),
         "source_keys": list(_SOURCE_KEYS),
         "candidate_local_roots": sorted(_CANDIDATE_LOCAL_ROOTS),
-        "replay_snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
+        "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
     return {

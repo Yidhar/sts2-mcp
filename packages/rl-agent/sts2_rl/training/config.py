@@ -1,4 +1,4 @@
-"""Strict versioned configuration for the grounded-candidate baseline."""
+"""Strict configuration ABI for the recurrent V-trace v2 baseline."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from sts2_baseline import BASELINE_REWARD_SPEC
+from sts2_baseline import TASK_REWARD_SPEC
 from sts2_rl.encoding import GroundedEncodingConfig
 from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-grounded-baseline-config-v2"
+CONFIG_VERSION = "sts2-recurrent-vtrace-config-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -60,7 +60,7 @@ def _require_optional_text(value: object, *, label: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    architecture: str = "grounded_candidate_v1"
+    architecture: str = "recurrent_candidate_v2"
     token_feature_dim: int = 160
     d_model: int = 128
     n_heads: int = 4
@@ -70,6 +70,7 @@ class ModelConfig:
     latent_layers: int = 2
     local_layers: int = 1
     candidate_layers: int = 1
+    recurrent_hidden_dim: int = 256
     dropout: float = 0.05
     type_vocab_size: int = 128
     role_vocab_size: int = 64
@@ -93,6 +94,7 @@ class ModelConfig:
             "latent_layers",
             "local_layers",
             "candidate_layers",
+            "recurrent_hidden_dim",
             "type_vocab_size",
             "role_vocab_size",
             "owner_vocab_size",
@@ -110,8 +112,8 @@ class ModelConfig:
             label="model.dropout",
             minimum=0.0,
         )
-        if self.architecture != "grounded_candidate_v1":
-            raise ValueError("only architecture='grounded_candidate_v1' is supported")
+        if self.architecture != "recurrent_candidate_v2":
+            raise ValueError("only architecture='recurrent_candidate_v2' is supported")
         # Reuse the model's own shape validation as the single source of truth.
         self.to_model_config()
         if min(
@@ -132,6 +134,7 @@ class ModelConfig:
             latent_layers=self.latent_layers,
             local_layers=self.local_layers,
             candidate_layers=self.candidate_layers,
+            recurrent_hidden_dim=self.recurrent_hidden_dim,
             dropout=self.dropout,
             domain_count=self.domain_count,
             type_vocab_size=self.type_vocab_size,
@@ -155,15 +158,14 @@ class ModelConfig:
 class OptimizationConfig:
     learning_rate: float = 3.0e-4
     weight_decay: float = 1.0e-4
-    batch_size: int = 32
+    batch_unrolls: int = 8
     discount: float = 0.997
     gradient_clip_norm: float = 1.0
-    importance_ratio_clip: float = 1.0
+    vtrace_rho_clip: float = 1.0
+    vtrace_c_clip: float = 1.0
+    policy_rho_clip: float = 1.0
     policy_weight: float = 1.0
     value_weight: float = 0.5
-    q_weight: float = 0.5
-    reward_weight: float = 0.25
-    terminal_weight: float = 0.10
     entropy_weight: float = 0.01
 
     def __post_init__(self) -> None:
@@ -176,8 +178,8 @@ class OptimizationConfig:
             label="optimization.weight_decay",
         )
         _require_int(
-            self.batch_size,
-            label="optimization.batch_size",
+            self.batch_unrolls,
+            label="optimization.batch_unrolls",
             minimum=1,
         )
         discount = _require_finite_number(
@@ -188,24 +190,22 @@ class OptimizationConfig:
             self.gradient_clip_norm,
             label="optimization.gradient_clip_norm",
         )
-        importance_ratio_clip = _require_finite_number(
-            self.importance_ratio_clip,
-            label="optimization.importance_ratio_clip",
-        )
         if learning_rate <= 0.0 or weight_decay < 0.0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative")
         if not 0.0 < discount <= 1.0:
             raise ValueError("discount must be in (0, 1]")
         if gradient_clip_norm <= 0.0:
             raise ValueError("gradient_clip_norm must be positive")
-        if importance_ratio_clip < 1.0:
-            raise ValueError("importance_ratio_clip must be finite and >= 1")
+        for name in ("vtrace_rho_clip", "vtrace_c_clip", "policy_rho_clip"):
+            value = _require_finite_number(
+                getattr(self, name),
+                label=f"optimization.{name}",
+            )
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive")
         for name in (
             "policy_weight",
             "value_weight",
-            "q_weight",
-            "reward_weight",
-            "terminal_weight",
             "entropy_weight",
         ):
             value = _require_finite_number(
@@ -217,55 +217,36 @@ class OptimizationConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayConfig:
-    capacity: int = 100_000
-    recent_window: int = 10_000
-    coverage_fraction: float = 0.50
-    recent_fraction: float = 0.25
-    priority_fraction: float = 0.25
-    alpha: float = 0.6
-    beta: float = 0.4
-    priority_epsilon: float = 1.0e-6
-    minimum_size: int = 1_024
+class RolloutConfig:
+    """Short-lived FIFO data plane; every unroll is consumed at most once."""
+
+    unroll_length: int = 64
+    queue_capacity: int = 256
+    minimum_unrolls: int = 8
+    collector_workers: int = 1
+    policy_sync_interval_unrolls: int = 8
+    max_policy_lag: int = 1_024
 
     def __post_init__(self) -> None:
-        for name in ("capacity", "recent_window", "minimum_size"):
+        for name in (
+            "unroll_length",
+            "queue_capacity",
+            "minimum_unrolls",
+            "collector_workers",
+            "policy_sync_interval_unrolls",
+            "max_policy_lag",
+        ):
             _require_int(
                 getattr(self, name),
-                label=f"replay.{name}",
+                label=f"rollout.{name}",
                 minimum=1,
             )
-        if self.minimum_size > self.capacity:
-            raise ValueError("replay minimum_size cannot exceed capacity")
-        fractions = (
-            _require_finite_number(
-                self.coverage_fraction,
-                label="replay.coverage_fraction",
-                minimum=0.0,
-            ),
-            _require_finite_number(
-                self.recent_fraction,
-                label="replay.recent_fraction",
-                minimum=0.0,
-            ),
-            _require_finite_number(
-                self.priority_fraction,
-                label="replay.priority_fraction",
-                minimum=0.0,
-            ),
-        )
-        if not math.isclose(sum(fractions), 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            raise ValueError("replay source fractions must be non-negative and sum to 1")
-        alpha = _require_finite_number(self.alpha, label="replay.alpha")
-        beta = _require_finite_number(self.beta, label="replay.beta")
-        priority_epsilon = _require_finite_number(
-            self.priority_epsilon,
-            label="replay.priority_epsilon",
-        )
-        if not 0.0 <= alpha <= 1.0 or not 0.0 <= beta <= 1.0:
-            raise ValueError("replay alpha/beta must be in [0, 1]")
-        if priority_epsilon <= 0.0:
-            raise ValueError("priority_epsilon must be positive")
+        if self.minimum_unrolls > self.queue_capacity:
+            raise ValueError("rollout minimum_unrolls cannot exceed queue_capacity")
+        if self.collector_workers != 1:
+            raise ValueError(
+                "v2 currently requires one collector worker per typed backend session"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,16 +284,16 @@ class EnvironmentConfig:
 
 @dataclass(frozen=True, slots=True)
 class CurriculumConfig:
-    """Data schedule without boss/card rules or heuristic gates."""
+    """Task horizon and exploration schedule without mechanics rules."""
 
-    reward_objective: Literal["combat", "run"] = "run"
+    reward_objective: Literal["combat", "act1", "run"] = "act1"
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 250_000
 
     def __post_init__(self) -> None:
-        if self.reward_objective not in {"combat", "run"}:
-            raise ValueError("reward_objective must be combat or run")
+        if self.reward_objective not in {"combat", "act1", "run"}:
+            raise ValueError("reward_objective must be combat, act1, or run")
         epsilon_start = _require_finite_number(
             self.epsilon_start,
             label="curriculum.epsilon_start",
@@ -334,25 +315,18 @@ class CurriculumConfig:
 class RuntimeConfig:
     device: str = "auto"
     collector_device: str = "cpu"
-    execution_mode: Literal["synchronous", "overlap"] = "synchronous"
     total_environment_steps: int = 1_000_000
-    train_every_steps: int = 4
-    updates_per_cycle: int = 1
-    warmup_credit_policy: Literal["discard", "accrue"] = "discard"
     seed: int = 0
-    log_dir: str = "runs/grounded-baseline"
-    checkpoint_dir: str = "checkpoints/grounded-baseline"
-    checkpoint_interval_steps: int = 50_000
-    evaluation_interval_steps: int = 50_000
+    log_dir: str = "runs/recurrent-vtrace"
+    checkpoint_dir: str = "checkpoints/recurrent-vtrace"
+    checkpoint_interval_steps: int = 25_000
+    evaluation_steps: tuple[int, ...] = (0, 10_000, 25_000, 50_000)
     evaluation_episodes: int = 20
 
     def __post_init__(self) -> None:
         for name in (
             "total_environment_steps",
-            "train_every_steps",
-            "updates_per_cycle",
             "checkpoint_interval_steps",
-            "evaluation_interval_steps",
         ):
             _require_int(
                 getattr(self, name),
@@ -369,14 +343,14 @@ class RuntimeConfig:
             label="runtime.evaluation_episodes",
             minimum=0,
         )
-        if self.warmup_credit_policy not in {"discard", "accrue"}:
-            raise ValueError(
-                "runtime.warmup_credit_policy must be 'discard' or 'accrue'"
-            )
-        if self.execution_mode not in {"synchronous", "overlap"}:
-            raise ValueError(
-                "runtime.execution_mode must be 'synchronous' or 'overlap'"
-            )
+        if not isinstance(self.evaluation_steps, tuple):
+            object.__setattr__(self, "evaluation_steps", tuple(self.evaluation_steps))
+        previous = -1
+        for index, step in enumerate(self.evaluation_steps):
+            _require_int(step, label=f"runtime.evaluation_steps[{index}]", minimum=0)
+            if step <= previous:
+                raise ValueError("runtime.evaluation_steps must be strictly increasing")
+            previous = step
         if not isinstance(self.device, str) or not self.device.strip():
             raise TypeError("runtime.device must be a non-empty string")
         if (
@@ -399,15 +373,43 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DiagnosticsConfig:
+    deadlock_window: int = 128
+    deadlock_repeat_threshold: int = 8
+    journal_policy_topk: int = 5
+
+    def __post_init__(self) -> None:
+        for name in (
+            "deadlock_window",
+            "deadlock_repeat_threshold",
+            "journal_policy_topk",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"diagnostics.{name}",
+                minimum=1,
+            )
+        if self.deadlock_window < 2:
+            raise ValueError("diagnostics.deadlock_window must be at least 2")
+        if self.deadlock_repeat_threshold < 2:
+            raise ValueError("diagnostics.deadlock_repeat_threshold must be at least 2")
+        if self.deadlock_repeat_threshold > self.deadlock_window:
+            raise ValueError(
+                "diagnostics.deadlock_repeat_threshold cannot exceed deadlock_window"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class TrainingConfig:
     version: str = CONFIG_VERSION
     profile: str = "default"
     model: ModelConfig = field(default_factory=ModelConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
-    replay: ReplayConfig = field(default_factory=ReplayConfig)
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.version, str):
@@ -421,33 +423,29 @@ class TrainingConfig:
         for name, expected_type in (
             ("model", ModelConfig),
             ("optimization", OptimizationConfig),
-            ("replay", ReplayConfig),
+            ("rollout", RolloutConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
             ("runtime", RuntimeConfig),
+            ("diagnostics", DiagnosticsConfig),
         ):
             if not isinstance(getattr(self, name), expected_type):
                 raise TypeError(
                     f"training config {name} must be {expected_type.__name__}"
                 )
-        expected = "combat" if self.environment.scenario == "combat" else "run"
-        if self.curriculum.reward_objective != expected:
+        if self.environment.scenario == "combat" and self.curriculum.reward_objective != "combat":
             raise ValueError(
                 "reward objective must match the environment horizon: "
-                f"scenario={self.environment.scenario!r} requires {expected!r}"
+                "combat scenarios require objective='combat'"
             )
-        if self.optimization.discount != BASELINE_REWARD_SPEC.discount:
+        if self.environment.scenario == "full-run" and self.curriculum.reward_objective == "combat":
             raise ValueError(
-                "optimization.discount must equal the immutable reward-spec discount "
-                f"{BASELINE_REWARD_SPEC.discount}"
+                "full-run scenarios require objective='act1' or objective='run'"
             )
-        if (
-            self.runtime.execution_mode == "overlap"
-            and self.runtime.updates_per_cycle != 1
-        ):
+        if self.optimization.discount != TASK_REWARD_SPEC.discount:
             raise ValueError(
-                "overlap execution currently requires runtime.updates_per_cycle=1 "
-                "so interrupt checkpoints preserve an exact pipeline phase"
+                "optimization.discount must equal the immutable v2 reward discount "
+                f"{TASK_REWARD_SPEC.discount}"
             )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -457,9 +455,8 @@ class TrainingConfig:
         """Return only immutable training semantics for exact-resume identity.
 
         Execution horizon, output locations, and observation-only schedules may
-        change when continuing a checkpoint.  Device, seed, learner cadence,
-        model/reward/environment semantics, and every replay/optimizer setting
-        remain part of the exact lineage identity.
+        change when continuing a checkpoint.  Model, task, rollout, optimizer,
+        seed, and environment semantics remain part of exact lineage identity.
         """
 
         payload = self.to_mapping()
@@ -471,7 +468,7 @@ class TrainingConfig:
             "log_dir",
             "checkpoint_dir",
             "checkpoint_interval_steps",
-            "evaluation_interval_steps",
+            "evaluation_steps",
             "evaluation_episodes",
         ):
             runtime.pop(key)
@@ -550,7 +547,7 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
         optimization=_construct(
             OptimizationConfig, _table(payload, "optimization"), label="optimization"
         ),
-        replay=_construct(ReplayConfig, _table(payload, "replay"), label="replay"),
+        rollout=_construct(RolloutConfig, _table(payload, "rollout"), label="rollout"),
         environment=_construct(
             EnvironmentConfig, _table(payload, "environment"), label="environment"
         ),
@@ -558,6 +555,9 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
             CurriculumConfig, _table(payload, "curriculum"), label="curriculum"
         ),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
+        diagnostics=_construct(
+            DiagnosticsConfig, _table(payload, "diagnostics"), label="diagnostics"
+        ),
     )
 
 
@@ -596,10 +596,11 @@ __all__ = [
     "CONFIG_VERSION",
     "PROFILE_DIR",
     "CurriculumConfig",
+    "DiagnosticsConfig",
     "EnvironmentConfig",
     "ModelConfig",
     "OptimizationConfig",
-    "ReplayConfig",
+    "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
     "load_training_config",

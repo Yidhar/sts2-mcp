@@ -1,4 +1,4 @@
-"""CLI entrypoint for the grounded-candidate baseline."""
+"""CLI entrypoint for the recurrent V-trace v2 baseline."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m sts2_rl.train",
         description=(
-            "Train the small grounded legal-candidate actor-critic baseline "
-            "(no MuZero, MCTS, planner, or heuristic action guards)."
+            "Train the recurrent legal-candidate V-trace baseline with a "
+            "bounded asynchronous rollout queue."
         ),
     )
     parser.add_argument("--profile", default="default", help="built-in TOML profile")
@@ -40,12 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", help="override runtime device (auto/cpu/cuda)")
     parser.add_argument(
         "--collector-device",
-        help="overlap actor device (default: cpu; ignored by synchronous mode)",
-    )
-    parser.add_argument(
-        "--execution-mode",
-        choices=("synchronous", "overlap"),
-        help="collector/learner pipeline (overlap remains experimental)",
+        help="asynchronous actor device (default: cpu)",
     )
     parser.add_argument("--steps", type=int, help="override total environment steps")
     parser.add_argument("--seed", type=int, help="override deterministic seed")
@@ -59,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", help="exact baseline checkpoint directory")
     parser.add_argument(
         "--initialize-from",
-        help="valid RL 0.3 checkpoint model for a new profile/horizon lineage",
+        help="same-ABI v2 checkpoint model for a new profile/horizon lineage",
     )
     parser.add_argument(
         "--dry-run",
@@ -76,8 +71,6 @@ def _cli_overrides(config: TrainingConfig, args: argparse.Namespace) -> Training
         runtime = replace(runtime, device=str(args.device))
     if args.collector_device is not None:
         runtime = replace(runtime, collector_device=str(args.collector_device))
-    if args.execution_mode is not None:
-        runtime = replace(runtime, execution_mode=args.execution_mode)
     if args.steps is not None:
         runtime = replace(runtime, total_environment_steps=int(args.steps))
     if args.seed is not None:

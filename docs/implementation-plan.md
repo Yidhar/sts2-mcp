@@ -102,7 +102,7 @@ Exit: both backends pass the same contract suite and parity gate.
 ## Phase 7 — trainer and artifact migration
 
 - Replaced the old trainer with the typed grounded encoder/model, direct Collector,
-  Learner, Evaluator, stratified ReplayStore and atomic CheckpointManager.
+  recurrent VTraceLearner, Evaluator, bounded FIFO RolloutQueue and atomic CheckpointManager.
 - Checkpoints are written atomically with checksums and completion markers.
 - Checkpoints record Git state plus contract, optional static-data provenance, reward,
   observation, action,
@@ -112,8 +112,8 @@ Exit: both backends pass the same contract suite and parity gate.
 - PPO, MuZero/token-memory/MCTS, planners, heuristics, duplicate wrappers,
   hard-coded launchers and obsolete probes were deleted.
 
-Exit: deterministic resume restores model, optimizer, replay, counters, pending update
-credit, collector seed/RNG, Python/NumPy/Torch RNG and experiment identity;
+Exit: deterministic resume restores learner/actor models, optimizer, pending rollout
+queue, counters, policy versions, collector seed/RNG, Python/NumPy/Torch RNG and experiment identity;
 unsupported formats fail closed.
 
 ## Phase 8 — cutover and removal

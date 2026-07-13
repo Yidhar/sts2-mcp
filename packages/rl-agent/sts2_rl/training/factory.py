@@ -1,4 +1,4 @@
-"""Composition root for the grounded baseline; no legacy trainer facade."""
+"""Composition root for the recurrent actor/V-trace learner pipeline."""
 
 from __future__ import annotations
 
@@ -9,36 +9,34 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from sts2_baseline import ReplayMix, StratifiedReplayBuffer
+from sts2_baseline import BoundedRolloutQueue
 from sts2_rl.backends import HeadlessBackend, LiveBackend
 from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.encoding import GroundedObservationEncoder
-from sts2_rl.models import GroundedCandidateModel
+from sts2_rl.models import RecurrentCandidateModel
 
 from .collector import GroundedCollector
 from .config import TrainingConfig
-from .learner import GroundedLearner
+from .learner import VTraceLearner
 
 
 @dataclass(slots=True)
 class TrainingResources:
-    model: GroundedCandidateModel
-    collector_model: GroundedCandidateModel
+    model: RecurrentCandidateModel
+    collector_model: RecurrentCandidateModel
     encoder: GroundedObservationEncoder
-    replay: StratifiedReplayBuffer
+    rollout_queue: BoundedRolloutQueue
     backend: EnvironmentBackend
     optimizer: torch.optim.Optimizer
     collector: GroundedCollector
-    learner: GroundedLearner
+    learner: VTraceLearner
     device: torch.device
 
     def publish_collector_policy(self) -> float:
         """Publish one consistent learner snapshot to the idle collector model.
 
-        The synchronous pipeline intentionally aliases both models and therefore
-        has nothing to copy.  The overlap pipeline owns a separate model so the
-        learner can update parameters while collection performs inference.
-        Callers must only publish between collector episodes.
+        Actor and learner never mutate the same module.  Callers publish only
+        between actor episodes, giving every unroll one exact policy version.
         """
 
         if self.collector_model is self.model:
@@ -58,6 +56,7 @@ class TrainingResources:
         return (time.perf_counter_ns() - started_ns) / 1_000_000.0
 
     def close(self) -> None:
+        self.rollout_queue.close()
         self.backend.close()
 
 
@@ -92,14 +91,14 @@ def build_backend(config: TrainingConfig) -> EnvironmentBackend:
 def _build_collector_model(
     config: TrainingConfig,
     *,
-    learner_model: GroundedCandidateModel,
-) -> GroundedCandidateModel:
+    learner_model: RecurrentCandidateModel,
+) -> RecurrentCandidateModel:
     """Build a replica without advancing the checkpointed Torch RNG streams."""
 
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
     try:
-        collector_model = GroundedCandidateModel(config.model.to_model_config()).to(
+        collector_model = RecurrentCandidateModel(config.model.to_model_config()).to(
             resolve_device(config.runtime.collector_device)
         )
         collector_model.load_state_dict(learner_model.state_dict(), strict=True)
@@ -117,25 +116,11 @@ def build_training_resources(
 ) -> TrainingResources:
     seed_everything(config.runtime.seed)
     device = resolve_device(config.runtime.device)
-    model = GroundedCandidateModel(config.model.to_model_config()).to(device)
-    collector_model = (
-        _build_collector_model(config, learner_model=model)
-        if config.runtime.execution_mode == "overlap"
-        else model
-    )
+    model = RecurrentCandidateModel(config.model.to_model_config()).to(device)
+    collector_model = _build_collector_model(config, learner_model=model)
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
-    replay = StratifiedReplayBuffer(
-        config.replay.capacity,
-        recent_window=config.replay.recent_window,
-        mix=ReplayMix(
-            coverage=config.replay.coverage_fraction,
-            recent=config.replay.recent_fraction,
-            per=config.replay.priority_fraction,
-        ),
-        alpha=config.replay.alpha,
-        beta=config.replay.beta,
-        priority_epsilon=config.replay.priority_epsilon,
-        seed=config.runtime.seed,
+    rollout_queue = BoundedRolloutQueue(
+        config.rollout.queue_capacity,
     )
     environment_backend = backend or build_backend(config)
     optimizer = torch.optim.AdamW(
@@ -154,18 +139,24 @@ def build_training_resources(
         character=config.environment.character,
         encounter_id=config.environment.encounter_id,
         seed=config.runtime.seed,
+        unroll_length=config.rollout.unroll_length,
+        deadlock_window=config.diagnostics.deadlock_window,
+        deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
+        journal_policy_topk=config.diagnostics.journal_policy_topk,
     )
-    learner = GroundedLearner(
+    learner = VTraceLearner(
         model=model,
         encoder=encoder,
         optimizer=optimizer,
         config=config.optimization,
+        maximum_unroll_length=config.rollout.unroll_length,
+        maximum_policy_lag=config.rollout.max_policy_lag,
     )
     return TrainingResources(
         model=model,
         collector_model=collector_model,
         encoder=encoder,
-        replay=replay,
+        rollout_queue=rollout_queue,
         backend=environment_backend,
         optimizer=optimizer,
         collector=collector,

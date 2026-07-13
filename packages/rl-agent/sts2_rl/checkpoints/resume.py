@@ -2,7 +2,7 @@
 
 This module intentionally performs only JSON, filesystem, and SHA-256 work. It
 can therefore establish checkpoint identity before a caller invokes
-``torch.load`` or unpickles replay state.
+``torch.load`` or unpickles rollout-queue state.
 """
 
 from __future__ import annotations
@@ -24,8 +24,9 @@ EXACT_RESUME_REQUIRED_FILES = frozenset(
     {
         "metadata.json",
         "network.pt",
+        "actor_network.pt",
         "optimizer.pt",
-        "replay_buffer.pkl",
+        "rollout_queue.pkl",
         "stochastic_state.pkl",
     }
 )

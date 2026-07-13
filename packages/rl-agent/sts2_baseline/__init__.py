@@ -1,50 +1,37 @@
-"""Minimal, auditable foundations for the restarted STS2 learning baseline.
+"""Minimal data and objective contracts for the recurrent V-trace baseline."""
 
-This package deliberately does not import the legacy MuZero trainer.  It owns a
-small canonical transition/target vocabulary, one fixed normalized reward
-specification, and a stratified replay buffer whose sampling bias is explicit.
-"""
-
-from .replay import (
-    ReplayBatch,
-    ReplayMix,
-    ReplaySample,
-    ReplayStratum,
-    StratifiedReplayBuffer,
+from .objective import (
+    TASK_REWARD_SPEC,
+    TaskObjective,
+    TaskOutcome,
+    TaskReward,
+    TaskRewardCalculator,
+    TaskRewardSpec,
+    task_reward_identity,
 )
-from .reward import (
-    BASELINE_REWARD_SPEC,
-    BASELINE_TRANSITION_PROJECTION_SPEC,
-    BaselineRewardCalculator,
-    BaselineRewardSpec,
-    BaselineTransitionProjectionSpec,
-    RewardBreakdown,
-    baseline_reward_identity,
-)
-from .transition import (
-    BASELINE_TARGET_VERSION,
-    BASELINE_TRANSITION_VERSION,
-    BaselineTargets,
-    BaselineTransition,
-    PotentialState,
+from .rollout import (
+    ROLLOUT_QUEUE_VERSION,
+    ROLLOUT_STEP_VERSION,
+    SEQUENCE_UNROLL_VERSION,
+    BoundedRolloutQueue,
+    RolloutQueueClosed,
+    RolloutStep,
+    SequenceUnroll,
 )
 
 __all__ = [
-    "BASELINE_REWARD_SPEC",
-    "BASELINE_TARGET_VERSION",
-    "BASELINE_TRANSITION_PROJECTION_SPEC",
-    "BASELINE_TRANSITION_VERSION",
-    "BaselineRewardCalculator",
-    "BaselineRewardSpec",
-    "BaselineTargets",
-    "BaselineTransition",
-    "BaselineTransitionProjectionSpec",
-    "PotentialState",
-    "ReplayBatch",
-    "ReplayMix",
-    "ReplaySample",
-    "ReplayStratum",
-    "RewardBreakdown",
-    "StratifiedReplayBuffer",
-    "baseline_reward_identity",
+    "ROLLOUT_QUEUE_VERSION",
+    "ROLLOUT_STEP_VERSION",
+    "SEQUENCE_UNROLL_VERSION",
+    "TASK_REWARD_SPEC",
+    "BoundedRolloutQueue",
+    "RolloutQueueClosed",
+    "RolloutStep",
+    "SequenceUnroll",
+    "TaskObjective",
+    "TaskOutcome",
+    "TaskReward",
+    "TaskRewardCalculator",
+    "TaskRewardSpec",
+    "task_reward_identity",
 ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clean disposable grounded-baseline runtime artifacts.
+"""Clean disposable recurrent-v2 runtime artifacts.
 
 The default mode is a dry-run.  Actual mutation requires ``--execute`` and is
 conservative by design:

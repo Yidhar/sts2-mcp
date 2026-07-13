@@ -1,10 +1,9 @@
-"""Compact replay snapshots for grounded structural decisions.
+"""Compact rollout snapshots for grounded structural decisions.
 
 The online collector already pays the cost of structural encoding before it
-chooses an action.  Replaying the raw JSON and repeating that Python walk for
-every sampled update dominated training time.  This module stores the exact
-encoded token facts as canonical sparse CPU arrays and materializes a whole
-learner batch in one collate operation.
+chooses an action. Repeating the raw JSON walk during sequence learning is
+unnecessary. This module stores the exact encoded token facts as canonical
+sparse CPU arrays and materializes a learner batch in one collate operation.
 
 Snapshots contain no dispatch handles and no policy output.  They are model
 inputs only, bound to both the structural encoding fingerprint and the full
@@ -313,7 +312,7 @@ def sparse_token_table(
 
 @dataclass(frozen=True, slots=True)
 class EncodedDecisionSnapshot:
-    """Replay-owned sparse model input for one legal-action decision."""
+    """Rollout-owned sparse model input for one legal-action decision."""
 
     config: GroundedEncodingConfig
     encoding_fingerprint: str
@@ -479,7 +478,7 @@ def collate_encoded_snapshots(
     expected_fingerprint: str,
     device: torch.device | str | None,
 ) -> GroundedCandidateBatch:
-    """Materialize fixed-capacity tensors for a whole replay batch at once."""
+    """Materialize fixed-capacity tensors for a whole decision batch at once."""
 
     if not snapshots:
         raise ValueError("at least one encoded decision snapshot is required")

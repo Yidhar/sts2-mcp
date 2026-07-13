@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sts2_baseline import baseline_reward_identity
+from sts2_baseline import task_reward_identity
 from sts2_rl.contracts.versions import (
     ACTION_SCHEMA_VERSION,
     API_VERSION,
@@ -55,7 +55,7 @@ def contract_metadata() -> dict[str, str]:
 def reward_spec_metadata() -> dict[str, Any]:
     """Return the complete, stable identity of the active reward specification."""
 
-    return baseline_reward_identity()
+    return task_reward_identity()
 
 
 def _sha256(path: Path) -> str:

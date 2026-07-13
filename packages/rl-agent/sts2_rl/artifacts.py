@@ -1,7 +1,7 @@
 """Canonical filesystem boundary for mutable RL runtime artifacts.
 
 Source modules and checked-in configuration are discovered from the package or
-repository roots.  Logs, checkpoints, replay buffers, demonstrations, and
+repository roots.  Logs, checkpoints, rollout queues, demonstrations, and
 other mutable runtime output must instead pass through this module so a launch
 from inside the checkout never writes into the source tree by accident.
 """

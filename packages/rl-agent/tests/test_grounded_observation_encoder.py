@@ -13,7 +13,7 @@ from sts2_rl.encoding import (
     GroundedObservationEncoder,
     grounding_encoding_identity,
 )
-from sts2_rl.models import GroundedCandidateConfig, GroundedCandidateModel
+from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 
 
 def _small_model_config() -> GroundedCandidateConfig:
@@ -101,7 +101,7 @@ def test_encoder_contract_runs_through_grounded_model() -> None:
     encoded = _encoder(model_config).encode(_observation(), _actions())
     encoded.batch.validate(model_config)
 
-    model = GroundedCandidateModel(model_config).eval()
+    model = RecurrentCandidateModel(model_config).eval()
     with torch.no_grad():
         output = model(encoded.batch)
 

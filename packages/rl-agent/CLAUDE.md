@@ -1,6 +1,6 @@
 # RL agent contributor guide
 
-This package contains the restarted grounded legal-candidate actor-critic
+This package contains the recurrent grounded legal-candidate V-trace v2
 baseline. The only maintained training entry point is:
 
 ```text
@@ -36,10 +36,10 @@ build.
 sts2_rl.train
   -> typed LiveBackend or HeadlessBackend
   -> structural GroundedObservationEncoder
-  -> GroundedCandidateModel
-  -> fixed sts2_baseline reward
-  -> coverage/recent/PER replay
-  -> GroundedLearner
+  -> RecurrentCandidateModel (GRU + masked policy + scalar value)
+  -> fixed sts2_baseline task reward
+  -> bounded FIFO SequenceUnroll queue
+  -> VTraceLearner
   -> atomic checkpoint
 ```
 
@@ -49,7 +49,7 @@ sts2_rl.train
   interpret boss/card/route strategy.
 - `sts2_rl/models/` owns the candidate-independent world encoder and grounded
   candidate scorer.
-- `sts2_baseline/` owns immutable transitions, reward and replay policy.
+- `sts2_baseline/` owns the immutable task reward, sequence-unroll and FIFO contracts.
 - `sts2_rl/training/` owns configuration, collection, learning, evaluation and
   checkpoint composition.
 - `sts2_env/` is transport-only. It must not contain Gym environments,
@@ -66,9 +66,12 @@ sts2_rl.train
   targets (the headless adapter strips them and may retain a diagnostic); objective
   vectors and settlement bonuses are rejected.
 - Forced singleton actions generate no policy target or policy-gradient term.
-- Replay priorities are refreshed from current error and never replace
-  stratum-first coverage sampling.
-- Combat and run horizons use separate value heads and terminal semantics.
+- Training data is consumed once in FIFO order; replay sampling, PER and
+  long-lived sample retention are forbidden.
+- The recurrent model has exactly a legal-candidate policy head and one scalar
+  value head. Q, reward-prediction and terminal-prediction heads are forbidden.
+- Evaluation uses generic semantic state/action recurrence detection and writes
+  diagnostic trajectories; diagnostics never become training samples.
 
 ## Contracts, artifacts and checkpoints
 
@@ -78,7 +81,8 @@ new identity. Player-control and training credentials remain separate and must
 never appear in logs.
 
 All mutable output lives below `STS2_ARTIFACT_ROOT`, outside the checkout.
-Checkpoint publication is atomic and hashes model, optimizer, replay and
+Checkpoint publication is atomic and hashes learner model, actor model, optimizer,
+the pending rollout queue and
 metadata. Exact resume rejects contract, reward projection, dependency lock,
 encoding, model/config or payload drift; optional static catalog provenance is not a
 gate. Old model checkpoints are not migration inputs.

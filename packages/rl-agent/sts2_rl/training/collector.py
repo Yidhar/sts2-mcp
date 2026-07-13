@@ -1,10 +1,10 @@
-"""Direct typed-backend collector for the grounded baseline."""
+"""Typed recurrent actor collecting fixed-length v2 sequence unrolls."""
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal
@@ -13,13 +13,7 @@ from uuid import uuid4
 import numpy as np
 import torch
 
-from sts2_baseline import (
-    BaselineRewardCalculator,
-    BaselineTargets,
-    BaselineTransition,
-    ReplaySample,
-    ReplayStratum,
-)
+from sts2_baseline import RolloutStep, SequenceUnroll, TaskRewardCalculator
 from sts2_rl.contracts import (
     CombatResetRequest,
     EnvironmentBackend,
@@ -28,13 +22,17 @@ from sts2_rl.contracts import (
     StepRequest,
 )
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
-from sts2_rl.models import GroundedCandidateModel
+from sts2_rl.models import RecurrentCandidateModel
 
-from .experience import DecisionExperience, baseline_transition, compact_decision, replay_stratum
 from .seeding import (
     EVALUATION_SEED_PARITY,
     SIGNED_INT32_MAX,
     training_seed_start,
+)
+from .trajectory import (
+    SemanticDeadlockDetector,
+    TrajectoryJournal,
+    semantic_projection,
 )
 
 
@@ -57,11 +55,12 @@ class EpisodeMetrics:
     max_floor: int
     policy_decisions: int
     forced_decisions: int
+    deadlocked: bool
 
 
 @dataclass(frozen=True, slots=True)
 class CollectedEpisode:
-    samples: tuple[ReplaySample, ...]
+    unrolls: tuple[SequenceUnroll, ...]
     metrics: EpisodeMetrics
     timings: CollectorTimings | None = None
 
@@ -94,6 +93,19 @@ class CollectorTimings:
             name: timing.to_mapping()
             for name, timing in sorted(self.stages.items())
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ActionChoice:
+    action_index: int
+    behavior_log_probability: float
+    valid_count: int
+    snapshot: EncodedDecisionSnapshot
+    recurrent_state: torch.Tensor
+    policy: np.ndarray
+    value: float
+    encoding_ms: float
+    policy_forward_ms: float
 
 
 @dataclass(slots=True)
@@ -135,15 +147,6 @@ class _CollectorTimingAccumulator:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _Pending:
-    transition: BaselineTransition
-    reward: float
-    experience: DecisionExperience
-    stratum: ReplayStratum
-    objective_terminal: bool
-
-
 def _number(value: object, default: float = 0.0) -> float:
     if not isinstance(value, str | int | float):
         return float(default)
@@ -167,23 +170,29 @@ class GroundedCollector:
     def __init__(
         self,
         *,
-        model: GroundedCandidateModel,
+        model: RecurrentCandidateModel,
         encoder: GroundedObservationEncoder,
         backend: EnvironmentBackend,
         scenario: Literal["full-run", "combat"],
-        objective: Literal["combat", "run"],
+        objective: Literal["combat", "act1", "run"],
         discount: float,
         max_episode_steps: int,
         character: str | None = None,
         encounter_id: str | None = None,
         seed: int = 0,
+        unroll_length: int = 64,
+        deadlock_window: int = 128,
+        deadlock_repeat_threshold: int = 8,
+        journal_policy_topk: int = 5,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
-        if objective not in {"combat", "run"}:
-            raise ValueError("objective must be combat or run")
-        if (scenario == "combat") != (objective == "combat"):
-            raise ValueError("combat scenario and combat objective must be selected together")
+        if objective not in {"combat", "act1", "run"}:
+            raise ValueError("objective must be combat, act1, or run")
+        if scenario == "combat" and objective != "combat":
+            raise ValueError("combat scenario requires the combat objective")
+        if scenario == "full-run" and objective == "combat":
+            raise ValueError("full-run scenario requires the act1 or run objective")
         if (
             isinstance(discount, bool)
             or not isinstance(discount, int | float)
@@ -199,6 +208,16 @@ class GroundedCollector:
             raise ValueError("max_episode_steps must be positive")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("collector seed must be a non-negative integer")
+        if isinstance(unroll_length, bool) or not isinstance(unroll_length, int):
+            raise TypeError("unroll_length must be an integer")
+        if unroll_length <= 0:
+            raise ValueError("unroll_length must be positive")
+        if isinstance(journal_policy_topk, bool) or not isinstance(
+            journal_policy_topk, int
+        ):
+            raise TypeError("journal_policy_topk must be an integer")
+        if journal_policy_topk <= 0:
+            raise ValueError("journal_policy_topk must be positive")
         self.model = model
         self.encoder = encoder
         self.backend = backend
@@ -208,10 +227,16 @@ class GroundedCollector:
         self.max_episode_steps = int(max_episode_steps)
         self.character = character
         self.encounter_id = encounter_id
+        self.unroll_length = unroll_length
+        self.journal_policy_topk = journal_policy_topk
         self._rng = np.random.default_rng(int(seed))
         self._episode_seed = training_seed_start(int(seed))
         self._active_state_version: int | None = None
-        self.reward_calculator = BaselineRewardCalculator(objective)
+        self.reward_calculator = TaskRewardCalculator(objective, discount=discount)
+        self.deadlock_detector = SemanticDeadlockDetector(
+            window_size=deadlock_window,
+            repeat_threshold=deadlock_repeat_threshold,
+        )
 
     @property
     def device(self) -> torch.device:
@@ -226,7 +251,7 @@ class GroundedCollector:
         """
 
         return {
-            "version": "sts2-grounded-collector-state-v2",
+            "version": "sts2-recurrent-collector-state-v3",
             "episode_seed": self._episode_seed,
             "rng_state": deepcopy(self._rng.bit_generator.state),
         }
@@ -242,7 +267,7 @@ class GroundedCollector:
                 f"missing={sorted(expected_keys - actual_keys)} "
                 f"unknown={sorted(actual_keys - expected_keys)}"
             )
-        if payload["version"] != "sts2-grounded-collector-state-v2":
+        if payload["version"] != "sts2-recurrent-collector-state-v3":
             raise ValueError("unsupported collector checkpoint state")
         episode_seed = payload["episode_seed"]
         if isinstance(episode_seed, bool) or not isinstance(episode_seed, int):
@@ -451,10 +476,11 @@ class GroundedCollector:
     def _choose_action(
         self,
         state: EnvironmentResult,
+        recurrent_state: torch.Tensor,
         *,
         epsilon: float,
         deterministic: bool,
-    ) -> tuple[int, float, int, EncodedDecisionSnapshot, float, float]:
+    ) -> _ActionChoice:
         normalized_epsilon = float(epsilon)
         if not math.isfinite(normalized_epsilon) or not 0.0 <= normalized_epsilon <= 1.0:
             raise ValueError("exploration epsilon must be finite and in [0, 1]")
@@ -472,9 +498,15 @@ class GroundedCollector:
         self.model.eval()
         try:
             with torch.no_grad():
-                output = self.model(encoded.batch, validate=False)
+                output = self.model(
+                    encoded.batch,
+                    recurrent_state,
+                    validate=False,
+                )
                 policy = output.policy_probabilities()[0].float().cpu().numpy()
                 valid = output.action_mask[0].cpu().numpy().astype(bool)
+                next_recurrent_state = output.recurrent_state.detach()
+                value = float(output.value[0].item())
         finally:
             self.model.train(was_training)
         policy_forward_ms = (time.perf_counter_ns() - policy_started_ns) / 1_000_000.0
@@ -492,13 +524,18 @@ class GroundedCollector:
             raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
         if deterministic:
             selected = int(valid_indices[int(np.argmax(valid_policy))])
-            return (
-                selected,
-                0.0,
-                valid_count,
-                encoded.snapshot,
-                encoding_ms,
-                policy_forward_ms,
+            return _ActionChoice(
+                action_index=selected,
+                behavior_log_probability=float(
+                    math.log(max(float(valid_policy.max() / policy_mass), 1e-30))
+                ),
+                valid_count=valid_count,
+                snapshot=encoded.snapshot,
+                recurrent_state=next_recurrent_state,
+                policy=policy,
+                value=value,
+                encoding_ms=encoding_ms,
+                policy_forward_ms=policy_forward_ms,
             )
 
         behavior = np.zeros_like(policy, dtype=np.float64)
@@ -510,13 +547,18 @@ class GroundedCollector:
         if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0):
             raise CollectionProtocolError("collector produced an invalid behavior policy")
         selected = int(self._rng.choice(len(behavior), p=behavior))
-        return (
-            selected,
-            float(math.log(max(float(behavior[selected]), 1e-30))),
-            valid_count,
-            encoded.snapshot,
-            encoding_ms,
-            policy_forward_ms,
+        return _ActionChoice(
+            action_index=selected,
+            behavior_log_probability=float(
+                math.log(max(float(behavior[selected]), 1e-30))
+            ),
+            valid_count=valid_count,
+            snapshot=encoded.snapshot,
+            recurrent_state=next_recurrent_state,
+            policy=policy,
+            value=value,
+            encoding_ms=encoding_ms,
+            policy_forward_ms=policy_forward_ms,
         )
 
     def _step(
@@ -547,144 +589,207 @@ class GroundedCollector:
         deterministic: bool = False,
         record: bool = True,
         evaluation_seed: int | None = None,
+        policy_version: int = 0,
+        trajectory_journal: TrajectoryJournal | None = None,
+        maximum_steps: int | None = None,
+        unroll_sink: Callable[[SequenceUnroll], None] | None = None,
     ) -> CollectedEpisode:
+        if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+            raise TypeError("policy_version must be an integer")
+        if policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+        episode_limit = self.max_episode_steps
+        if maximum_steps is not None:
+            if isinstance(maximum_steps, bool) or not isinstance(maximum_steps, int):
+                raise TypeError("maximum_steps must be an integer or null")
+            if maximum_steps <= 0:
+                raise ValueError("maximum_steps must be positive")
+            episode_limit = min(episode_limit, maximum_steps)
         timings = _CollectorTimingAccumulator()
         reset_seed = self._episode_seed if evaluation_seed is None else evaluation_seed
         reset_started_ns = time.perf_counter_ns()
         state = self.reset(evaluation_seed=evaluation_seed)
         timings.record("reset", reset_started_ns)
-        pending: list[_Pending] = []
+        self.deadlock_detector.reset()
+        recurrent_state = self.model.initial_state(1, device=self.device)
+        segment_initial_state = (
+            recurrent_state[0].detach().float().cpu().numpy().copy()
+        )
+        segment_start_step = state.step_index
+        segment_steps: list[RolloutStep] = []
+        unrolls: list[SequenceUnroll] = []
         reward_total = 0.0
         max_act, max_floor = _run_position(state.observation)
         policy_decisions = 0
         forced_decisions = 0
-        final_transition: BaselineTransition | None = None
         steps_taken = 0
+        final_outcome = "ongoing"
+        deadlocked = False
+        forced_horizon = False
 
-        for step_offset in range(self.max_episode_steps):
+        for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
                 break
             if not state.legal_actions:
                 raise CollectionProtocolError(
                     f"episode={state.episode_id!r} step={state.step_index} returned zero legal actions"
                 )
-            (
-                action_index,
-                behavior_log_probability,
-                valid_count,
-                encoded_snapshot,
-                encoding_ms,
-                policy_forward_ms,
-            ) = self._choose_action(
+            choice = self._choose_action(
                 state,
+                recurrent_state,
                 epsilon=epsilon,
                 deterministic=deterministic,
             )
-            timings.add("observation_encoding", encoding_ms)
-            timings.add("policy_forward", policy_forward_ms)
-            policy_decisions += int(valid_count > 1)
-            forced_decisions += int(valid_count == 1)
+            timings.add("observation_encoding", choice.encoding_ms)
+            timings.add("policy_forward", choice.policy_forward_ms)
+            policy_decisions += int(choice.valid_count > 1)
+            forced_decisions += int(choice.valid_count == 1)
+            selected_action = state.legal_actions[choice.action_index]
+            deadlock_evidence = self.deadlock_detector.observe(
+                step_index=state.step_index,
+                observation=state.observation,
+                legal_actions=state.legal_actions,
+                selected_action=selected_action,
+            )
             sim_step_started_ns = time.perf_counter_ns()
-            next_state, action_handle = self._step(state, action_index=action_index)
+            next_state, _ = self._step(state, action_index=choice.action_index)
             timings.record("sim_step", sim_step_started_ns)
             steps_taken += 1
             if next_state.truncated:
                 raise CollectionProtocolError(
-                    "transport/outcome-unknown truncation discarded before replay"
+                    "transport/outcome-unknown truncation discarded before rollout"
                 )
-            forced_truncation = (
-                step_offset + 1 >= self.max_episode_steps
+            forced_horizon = (
+                step_offset + 1 >= episode_limit
                 and not next_state.terminated
                 and not next_state.truncated
             )
-            transition_started_ns = time.perf_counter_ns()
-            transition = baseline_transition(
-                before=state,
-                after=next_state,
-                action_handle=action_handle,
-                objective=self.objective,
-                forced_truncation=forced_truncation,
+            reward_started_ns = time.perf_counter_ns()
+            breakdown = self.reward_calculator.evaluate(
+                state,
+                next_state,
+                deadlock=deadlock_evidence is not None,
             )
-            breakdown = self.reward_calculator.evaluate(transition)
-            reward_total += breakdown.total
-            task_terminal = (
-                transition.combat_result != "none"
-                if self.objective == "combat"
-                else transition.run_result != "none"
-            )
-            terminal_class = 1 if task_terminal else int(
-                bool(next_state.info.get("chance_boundary", False))
-            ) * 2
+            reward_total += breakdown.reward
+            final_outcome = breakdown.outcome
+            deadlocked = breakdown.outcome == "deadlock"
             if record:
-                experience = compact_decision(
-                    state.observation,
-                    state.legal_actions,
-                    encoded_snapshot=encoded_snapshot,
-                    action_index=action_index,
-                    behavior_log_probability=behavior_log_probability,
-                    terminal_class=terminal_class,
-                    objective=self.objective,
-                )
-                pending.append(
-                    _Pending(
-                        transition=transition,
-                        reward=breakdown.total,
-                        experience=experience,
-                        stratum=replay_stratum(state.observation, transition),
-                        objective_terminal=task_terminal,
+                segment_steps.append(
+                    RolloutStep(
+                        snapshot=choice.snapshot,
+                        action_index=choice.action_index,
+                        behavior_log_probability=choice.behavior_log_probability,
+                        reward=breakdown.reward,
+                        discount=breakdown.discount,
+                        policy_decision=choice.valid_count > 1,
                     )
                 )
-            timings.record(
-                "transition_reward_compaction",
-                transition_started_ns,
-            )
-            final_transition = transition
+            if trajectory_journal is not None:
+                valid_indices = np.flatnonzero(choice.snapshot.action_mask)
+                ranked = sorted(
+                    valid_indices.tolist(),
+                    key=lambda index: float(choice.policy[index]),
+                    reverse=True,
+                )[: self.journal_policy_topk]
+                trajectory_journal.write(
+                    {
+                        "event": "decision",
+                        "episode_id": state.episode_id,
+                        "reset_seed": reset_seed,
+                        "step_index": state.step_index,
+                        "observation": semantic_projection(state.observation),
+                        "legal_actions": semantic_projection(state.legal_actions),
+                        "selected_index": choice.action_index,
+                        "selected_action": semantic_projection(selected_action),
+                        "policy_topk": [
+                            {
+                                "index": index,
+                                "probability": float(choice.policy[index]),
+                            }
+                            for index in ranked
+                        ],
+                        "value": choice.value,
+                        "reward": breakdown.reward,
+                        "terminal_reward": breakdown.terminal_reward,
+                        "potential_reward": breakdown.potential_reward,
+                        "outcome": breakdown.outcome,
+                        "deadlock": (
+                            deadlock_evidence.to_mapping()
+                            if deadlock_evidence is not None
+                            else None
+                        ),
+                    }
+                )
+            timings.record("reward_and_diagnostics", reward_started_ns)
+            recurrent_state = choice.recurrent_state
             state = next_state
             act, floor = _run_position(state.observation)
             max_act = max(max_act, act)
             max_floor = max(max_floor, floor)
-            if state.terminated or task_terminal or forced_truncation:
-                break
 
-        target_finalize_started_ns = time.perf_counter_ns()
-        samples: list[ReplaySample] = []
-        running_return = 0.0
-        for item in reversed(pending):
-            if item.objective_terminal:
-                running_return = 0.0
-            running_return = float(item.reward) + self.discount * running_return
-            samples.append(
-                ReplaySample(
-                    transition=item.transition,
-                    targets=BaselineTargets(reward=float(item.reward), value=running_return),
-                    stratum=item.stratum,
-                    payload=item.experience,
+            flush_segment = bool(
+                record
+                and segment_steps
+                and (
+                    len(segment_steps) >= self.unroll_length
+                    or breakdown.task_terminal
+                    or forced_horizon
                 )
             )
-        samples.reverse()
-        timings.record("target_finalize", target_finalize_started_ns)
+            if flush_segment:
+                bootstrap_snapshot: EncodedDecisionSnapshot | None = None
+                if segment_steps[-1].discount > 0.0:
+                    bootstrap_started_ns = time.perf_counter_ns()
+                    bootstrap_snapshot = self.encoder.encode(
+                        state.observation,
+                        state.legal_actions,
+                        device="cpu",
+                    ).snapshot
+                    timings.record("bootstrap_encoding", bootstrap_started_ns)
+                completed_unroll = SequenceUnroll(
+                    episode_id=state.episode_id,
+                    start_step=segment_start_step,
+                    policy_version=policy_version,
+                    initial_recurrent_state=segment_initial_state,
+                    steps=tuple(segment_steps),
+                    bootstrap_snapshot=bootstrap_snapshot,
+                )
+                if unroll_sink is None:
+                    unrolls.append(completed_unroll)
+                else:
+                    unroll_sink(completed_unroll)
+                segment_steps = []
+                segment_initial_state = (
+                    recurrent_state[0].detach().float().cpu().numpy().copy()
+                )
+                segment_start_step = state.step_index
 
-        run_won = bool(final_transition is not None and final_transition.run_result == "win")
-        combat_won = bool(
-            final_transition is not None and final_transition.combat_result == "win"
-        )
-        truncated = bool(final_transition is not None and final_transition.truncated)
+            if state.terminated or breakdown.task_terminal or forced_horizon:
+                break
+
+        if segment_steps:
+            raise RuntimeError("collector exited with an unflushed rollout segment")
+        run_won = self.objective == "run" and final_outcome == "success"
+        combat_won = self.objective == "combat" and final_outcome == "success"
         return CollectedEpisode(
-            samples=tuple(samples),
+            unrolls=tuple(unrolls),
             metrics=EpisodeMetrics(
                 episode_id=state.episode_id,
                 reset_seed=reset_seed,
                 steps=steps_taken,
                 reward_total=reward_total,
-                terminal_reason=state.terminal_reason,
-                truncated=truncated,
+                terminal_reason=(
+                    "semantic_deadlock" if deadlocked else state.terminal_reason
+                ),
+                truncated=forced_horizon,
                 run_won=run_won,
                 combat_won=combat_won,
-                act1_cleared=bool(run_won or max_act >= 2),
+                act1_cleared=bool(max_act >= 2),
                 max_act=max_act,
                 max_floor=max_floor,
                 policy_decisions=policy_decisions,
                 forced_decisions=forced_decisions,
+                deadlocked=deadlocked,
             ),
             timings=timings.snapshot(),
         )

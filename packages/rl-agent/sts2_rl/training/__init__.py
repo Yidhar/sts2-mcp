@@ -1,4 +1,4 @@
-"""Grounded baseline collection, learning, evaluation and checkpointing."""
+"""Recurrent v2 collection, V-trace learning, evaluation and checkpointing."""
 
 from .checkpointing import (
     TrainingState,
@@ -18,16 +18,16 @@ from .collector import (
 from .config import (
     CONFIG_VERSION,
     CurriculumConfig,
+    DiagnosticsConfig,
     EnvironmentConfig,
     ModelConfig,
     OptimizationConfig,
-    ReplayConfig,
+    RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
     load_training_config,
     training_config_from_mapping,
 )
-from .experience import DecisionExperience
 from .factory import (
     TrainingResources,
     build_backend,
@@ -35,7 +35,8 @@ from .factory import (
     resolve_device,
     seed_everything,
 )
-from .learner import GroundedLearner, LearnerMetrics
+from .learner import LearnerMetrics, VTraceLearner
+from .pipeline import ActorLearnerPipeline
 from .runtime import (
     evaluate_policy,
     exploration_epsilon,
@@ -43,28 +44,26 @@ from .runtime import (
     run_training,
     summarize_evaluation,
 )
-from .update_schedule import WarmupCreditPolicy, advance_update_credit
 
 __all__ = [
     "CONFIG_VERSION",
+    "ActorLearnerPipeline",
     "CollectedEpisode",
     "CollectionProtocolError",
     "CurriculumConfig",
-    "DecisionExperience",
+    "DiagnosticsConfig",
     "EnvironmentConfig",
     "EpisodeMetrics",
     "GroundedCollector",
-    "GroundedLearner",
     "LearnerMetrics",
     "ModelConfig",
     "OptimizationConfig",
-    "ReplayConfig",
+    "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
     "TrainingResources",
     "TrainingState",
-    "WarmupCreditPolicy",
-    "advance_update_credit",
+    "VTraceLearner",
     "build_backend",
     "build_training_resources",
     "checkpoint_summary",

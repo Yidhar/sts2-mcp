@@ -4,13 +4,12 @@ from dataclasses import replace
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from sts2_rl.models import (
     CandidateTokenBatch,
     GroundedCandidateBatch,
     GroundedCandidateConfig,
-    GroundedCandidateModel,
+    RecurrentCandidateModel,
     WorldEncoding,
     WorldTokenBatch,
 )
@@ -107,7 +106,7 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
 
 
 def test_candidate_permutation_equivariance(config: GroundedCandidateConfig) -> None:
-    model = GroundedCandidateModel(config).eval()
+    model = RecurrentCandidateModel(config).eval()
     batch = _make_batch(config)
     permutation = torch.tensor([2, 4, 0, 3, 1])
 
@@ -117,31 +116,22 @@ def test_candidate_permutation_equivariance(config: GroundedCandidateConfig) -> 
 
     torch.testing.assert_close(permuted.world_latents, output.world_latents)
     torch.testing.assert_close(permuted.state_embedding, output.state_embedding)
-    torch.testing.assert_close(permuted.combat_value, output.combat_value)
-    torch.testing.assert_close(permuted.run_value, output.run_value)
+    torch.testing.assert_close(permuted.recurrent_state, output.recurrent_state)
+    torch.testing.assert_close(permuted.value, output.value)
     for actual, expected in (
         (permuted.candidate_embeddings, output.candidate_embeddings[:, permutation]),
         (permuted.policy_logits, output.policy_logits[:, permutation]),
-        (permuted.candidate_q, output.candidate_q[:, permutation]),
-        (permuted.candidate_reward, output.candidate_reward[:, permutation]),
-        (
-            permuted.candidate_terminal_logits,
-            output.candidate_terminal_logits[:, permutation],
-        ),
     ):
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
 
 def test_masked_candidates_are_inert(config: GroundedCandidateConfig) -> None:
-    model = GroundedCandidateModel(config).eval()
+    model = RecurrentCandidateModel(config).eval()
     output = model(_make_batch(config))
     invalid = ~output.action_mask
 
     assert torch.equal(output.policy_logits[invalid], torch.full_like(output.policy_logits[invalid], torch.finfo(output.policy_logits.dtype).min))
     assert torch.count_nonzero(output.candidate_embeddings[invalid]) == 0
-    assert torch.count_nonzero(output.candidate_q[invalid]) == 0
-    assert torch.count_nonzero(output.candidate_reward[invalid]) == 0
-    assert torch.count_nonzero(output.candidate_terminal_logits[invalid]) == 0
 
     probabilities = output.policy_probabilities()
     assert torch.count_nonzero(probabilities[invalid]) == 0
@@ -149,7 +139,7 @@ def test_masked_candidates_are_inert(config: GroundedCandidateConfig) -> None:
 
 
 def test_all_masked_policy_is_safe(config: GroundedCandidateConfig) -> None:
-    model = GroundedCandidateModel(config).eval()
+    model = RecurrentCandidateModel(config).eval()
     batch = _make_batch(config)
     all_masked = replace(
         batch,
@@ -166,7 +156,7 @@ def test_all_masked_policy_is_safe(config: GroundedCandidateConfig) -> None:
 def test_world_encoding_and_state_values_do_not_read_candidates(
     config: GroundedCandidateConfig,
 ) -> None:
-    model = GroundedCandidateModel(config).eval()
+    model = RecurrentCandidateModel(config).eval()
     batch = _make_batch(config)
     altered_candidates = replace(
         batch.candidates,
@@ -186,43 +176,36 @@ def test_world_encoding_and_state_values_do_not_read_candidates(
     torch.testing.assert_close(world_a.latents, world_b.latents)
     torch.testing.assert_close(world_a.state_embedding, world_b.state_embedding)
     torch.testing.assert_close(output_a.state_embedding, output_b.state_embedding)
-    torch.testing.assert_close(output_a.combat_value, output_b.combat_value)
-    torch.testing.assert_close(output_a.run_value, output_b.run_value)
+    torch.testing.assert_close(output_a.recurrent_state, output_b.recurrent_state)
+    torch.testing.assert_close(output_a.value, output_b.value)
 
 
 def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     config: GroundedCandidateConfig,
 ) -> None:
-    model = GroundedCandidateModel(config).train()
+    model = RecurrentCandidateModel(config).train()
     batch = _make_batch(config)
     output = model(batch)
     probabilities = output.policy_probabilities()
     selected = torch.tensor([0, 2], dtype=torch.long)
     policy_loss = -torch.log(probabilities[torch.arange(2), selected].clamp_min(1e-8)).mean()
-    legal = output.action_mask
-    terminal_targets = torch.zeros(legal.sum(), dtype=torch.long)
-    loss = (
-        policy_loss
-        + output.candidate_q[legal].square().mean()
-        + output.candidate_reward[legal].square().mean()
-        + output.combat_value.square().mean()
-        + output.run_value.square().mean()
-        + F.cross_entropy(output.candidate_terminal_logits[legal], terminal_targets)
-    )
+    loss = policy_loss + output.value.square().mean()
     loss.backward()
 
     assert torch.isfinite(loss)
     world_grad = model.world_encoder.layers[0].self_attn.in_proj_weight.grad
     candidate_grad = model.policy_head[-1].weight.grad
     shared_embedding_grad = model.token_embedder.entity_embedding.weight.grad
+    recurrent_grad = model.recurrent_cell.weight_hh.grad
     assert world_grad is not None and torch.isfinite(world_grad).all()
     assert candidate_grad is not None and torch.isfinite(candidate_grad).all()
     assert shared_embedding_grad is not None and torch.isfinite(shared_embedding_grad).all()
+    assert recurrent_grad is not None and torch.isfinite(recurrent_grad).all()
 
 
 def test_default_model_stays_small() -> None:
-    model = GroundedCandidateModel()
-    assert model.parameter_count == 3_642_824
+    model = RecurrentCandidateModel()
+    assert model.parameter_count == 3_971_778
 
 
 def test_batch_shape_contract_rejects_misaligned_candidate_local_axis(
@@ -281,7 +264,7 @@ def test_batch_contract_rejects_out_of_range_ids(
 def test_model_respects_requested_floating_dtype(
     config: GroundedCandidateConfig,
 ) -> None:
-    model = GroundedCandidateModel(config).double().eval()
+    model = RecurrentCandidateModel(config).double().eval()
     batch = _make_batch(config)
     double_batch = replace(
         batch,
@@ -305,7 +288,7 @@ def test_model_respects_requested_floating_dtype(
         ({"domain_count": 3}, "six fixed"),
         ({"entity_vocab_size": 1}, "at least 4"),
         ({"order_vocab_size": 1}, "at least 2"),
-        ({"terminal_classes": 2}, "terminal_classes"),
+        ({"recurrent_hidden_dim": 0}, "positive"),
     ],
 )
 def test_model_config_matches_encoder_minimum_contract(
@@ -374,7 +357,7 @@ def test_tensor_contract_rejects_zero_sized_batch(
 def test_public_candidate_encoder_rejects_broadcastable_world_state(
     config: GroundedCandidateConfig,
 ) -> None:
-    model = GroundedCandidateModel(config).eval()
+    model = RecurrentCandidateModel(config).eval()
     batch = _make_batch(config)
     world = model.encode_world(batch.world, batch.domain_ids)
     malformed = WorldEncoding(

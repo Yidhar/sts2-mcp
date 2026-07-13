@@ -1,4 +1,4 @@
-"""Small grounded-candidate policy/value baseline.
+"""Grounded recurrent legal-candidate policy/value model.
 
 The model deliberately separates a candidate-independent world representation
 from candidate-conditioned action scoring:
@@ -13,9 +13,10 @@ from candidate-conditioned action scoring:
     permuting the candidate axis permutes every candidate output in the same
     way without changing state values.
 
-The module has no dependency on the legacy observation encoders, boss mechanics,
-combat heuristics, reward shaping, replay, or MuZero.  A future raw-state encoder
-only needs to construct the typed tensor batches defined below.
+The recurrent state is the only cross-decision memory.  There are no Q,
+next-reward, terminal-class, search, or heuristic heads.  The module has no
+dependency on boss mechanics, card rules, reward shaping, replay, or MuZero.  A
+future raw-state encoder only needs to construct the typed tensor batches below.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ from typing import Final, cast
 import torch
 from torch import Tensor, nn
 
-TERMINAL_CLASS_NAMES = ("ongoing", "terminal", "chance_boundary")
 # The structural encoder owns a versioned, collision-free region for all
 # reviewed numeric facts, followed by disjoint categorical and dynamic-value
 # hash regions.  Keep the minimum here so model and encoder cannot silently
@@ -82,7 +82,7 @@ def _candidate_axis(value: Tensor, permutation: Tensor) -> Tensor:
 
 @dataclass(frozen=True, slots=True)
 class GroundedCandidateConfig:
-    """Shape and capacity contract for :class:`GroundedCandidateModel`.
+    """Shape and capacity contract for :class:`RecurrentCandidateModel`.
 
     Vocabulary sizes intentionally live here instead of importing a legacy
     observation schema.  Encoders may use a smaller or larger generic contract
@@ -98,12 +98,12 @@ class GroundedCandidateConfig:
     latent_layers: int = 2
     local_layers: int = 1
     candidate_layers: int = 1
+    recurrent_hidden_dim: int = 256
     dropout: float = 0.05
     # unknown/combat/build/route/terminal/chance plus two reserved domains.
     # Keeping this generic vocabulary here avoids importing any environment
     # heuristic schema into the model.
     domain_count: int = 8
-    terminal_classes: int = 3
     type_vocab_size: int = 128
     role_vocab_size: int = 64
     owner_vocab_size: int = 128
@@ -122,8 +122,8 @@ class GroundedCandidateConfig:
             "latent_layers": self.latent_layers,
             "local_layers": self.local_layers,
             "candidate_layers": self.candidate_layers,
+            "recurrent_hidden_dim": self.recurrent_hidden_dim,
             "domain_count": self.domain_count,
-            "terminal_classes": self.terminal_classes,
             "type_vocab_size": self.type_vocab_size,
             "role_vocab_size": self.role_vocab_size,
             "owner_vocab_size": self.owner_vocab_size,
@@ -171,10 +171,6 @@ class GroundedCandidateConfig:
             raise ValueError("order_vocab_size must be at least 2")
         if self.domain_count <= 5:
             raise ValueError("domain_count must cover the six fixed baseline domains")
-        if self.terminal_classes != len(TERMINAL_CLASS_NAMES):
-            raise ValueError(
-                "terminal_classes must match the fixed ongoing/terminal/chance contract"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,18 +476,20 @@ class CandidateEncoding:
 
 
 @dataclass(frozen=True, slots=True)
-class GroundedCandidateOutput:
-    """Policy, Q, dual values, and action-conditioned outcome predictions."""
+class RecurrentCandidateOutput:
+    """One recurrent policy/value decision.
+
+    ``recurrent_state`` is the state *after* consuming the current observation.
+    It must be passed to the next decision in the same episode and reset at an
+    environment/task terminal.
+    """
 
     world_latents: Tensor  # [B, S, D]
     state_embedding: Tensor  # [B, D]
+    recurrent_state: Tensor  # [B, H]
     candidate_embeddings: Tensor  # [B, A, D]
     policy_logits: Tensor  # [B, A], invalid candidates use dtype minimum
-    candidate_q: Tensor  # [B, A], invalid candidates are zero
-    combat_value: Tensor  # [B]
-    run_value: Tensor  # [B]
-    candidate_reward: Tensor  # [B, A], invalid candidates are zero
-    candidate_terminal_logits: Tensor  # [B, A, C], invalid candidates are zero
+    value: Tensor  # [B]
     action_mask: Tensor  # [B, A] bool
 
     def policy_probabilities(self) -> Tensor:
@@ -635,8 +633,8 @@ class _StructuredTokenEmbedder(nn.Module):
         return cast(Tensor, self.output_norm(x))
 
 
-class GroundedCandidateModel(nn.Module):
-    """Candidate-order-equivariant actor/Q/dual-value baseline."""
+class RecurrentCandidateModel(nn.Module):
+    """Candidate-order-equivariant recurrent actor/value baseline."""
 
     def __init__(self, config: GroundedCandidateConfig | None = None) -> None:
         super().__init__()
@@ -705,29 +703,63 @@ class GroundedCandidateModel(nn.Module):
         )
         self.candidate_norm = nn.LayerNorm(cfg.d_model)
 
-        self.policy_head = self._scalar_head()
-        self.candidate_q_head = self._scalar_head()
-        self.reward_head = self._scalar_head()
-        self.terminal_head = nn.Sequential(
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
+        self.recurrent_cell = nn.GRUCell(cfg.d_model, cfg.recurrent_hidden_dim)
+        self.recurrent_norm = nn.LayerNorm(cfg.recurrent_hidden_dim)
+        self.memory_to_candidate = nn.Sequential(
+            nn.LayerNorm(cfg.recurrent_hidden_dim),
+            nn.Linear(cfg.recurrent_hidden_dim, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.terminal_classes),
+            nn.Linear(cfg.d_model, cfg.d_model),
         )
-        self.combat_value_head = self._scalar_head()
-        self.run_value_head = self._scalar_head()
+        self.policy_feature_norm = nn.LayerNorm(cfg.d_model)
+        self.policy_head = self._scalar_head(cfg.d_model)
+        self.value_head = self._scalar_head(cfg.recurrent_hidden_dim)
 
         nn.init.normal_(self.world_null_token, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_queries, mean=0.0, std=0.02)
 
-    def _scalar_head(self) -> nn.Sequential:
-        cfg = self.config
+    @staticmethod
+    def _scalar_head(input_dim: int) -> nn.Sequential:
         return nn.Sequential(
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
             nn.GELU(),
-            nn.Linear(cfg.d_model, 1),
+            nn.Linear(input_dim, 1),
         )
+
+    def initial_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> Tensor:
+        """Return an all-zero recurrent state using model dtype/device."""
+
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError("recurrent batch_size must be an integer")
+        if batch_size <= 0:
+            raise ValueError("recurrent batch_size must be positive")
+        reference = next(self.parameters())
+        return torch.zeros(
+            (batch_size, self.config.recurrent_hidden_dim),
+            device=reference.device if device is None else device,
+            dtype=reference.dtype,
+        )
+
+    def _validate_recurrent_state(
+        self,
+        recurrent_state: Tensor,
+        *,
+        batch_size: int,
+        reference: Tensor,
+    ) -> None:
+        _require_shape(
+            "recurrent_state",
+            recurrent_state,
+            (batch_size, self.config.recurrent_hidden_dim),
+        )
+        _require_finite_floating("recurrent_state", recurrent_state)
+        _require_same_device("recurrent_state", reference, recurrent_state)
 
     @property
     def parameter_count(self) -> int:
@@ -881,9 +913,10 @@ class GroundedCandidateModel(nn.Module):
     def forward(
         self,
         batch: GroundedCandidateBatch,
+        recurrent_state: Tensor | None = None,
         *,
         validate: bool = True,
-    ) -> GroundedCandidateOutput:
+    ) -> RecurrentCandidateOutput:
         """Run the model, validating untrusted tensor contracts by default.
 
         The production encoder creates typed tensors at the data boundary and
@@ -894,6 +927,18 @@ class GroundedCandidateModel(nn.Module):
 
         if validate:
             batch.validate(self.config)
+        batch_size = int(batch.domain_ids.shape[0])
+        if recurrent_state is None:
+            recurrent_state = self.initial_state(
+                batch_size,
+                device=batch.world.features.device,
+            )
+        elif validate:
+            self._validate_recurrent_state(
+                recurrent_state,
+                batch_size=batch_size,
+                reference=batch.world.features,
+            )
         world = self.encode_world(batch.world, batch.domain_ids, _validated=True)
         candidates = self.encode_candidates(
             batch.candidates,
@@ -901,38 +946,38 @@ class GroundedCandidateModel(nn.Module):
             _validated=True,
         )
         mask = candidates.action_mask
-        mask_float = mask.to(dtype=candidates.embeddings.dtype)
-
-        raw_policy_logits = self.policy_head(candidates.embeddings).squeeze(-1)
+        next_recurrent_state = self.recurrent_norm(
+            self.recurrent_cell(world.state_embedding, recurrent_state)
+        )
+        memory_context = self.memory_to_candidate(next_recurrent_state).unsqueeze(1)
+        policy_features = self.policy_feature_norm(
+            candidates.embeddings + memory_context
+        )
+        policy_features = policy_features * mask.unsqueeze(-1).to(
+            dtype=policy_features.dtype
+        )
+        raw_policy_logits = self.policy_head(policy_features).squeeze(-1)
         invalid_logit = torch.finfo(raw_policy_logits.dtype).min
         policy_logits = raw_policy_logits.masked_fill(~mask, invalid_logit)
-        candidate_q = self.candidate_q_head(candidates.embeddings).squeeze(-1) * mask_float
-        candidate_reward = self.reward_head(candidates.embeddings).squeeze(-1) * mask_float
-        candidate_terminal_logits = self.terminal_head(candidates.embeddings)
-        candidate_terminal_logits = candidate_terminal_logits * mask_float.unsqueeze(-1)
 
-        return GroundedCandidateOutput(
+        return RecurrentCandidateOutput(
             world_latents=world.latents,
             state_embedding=world.state_embedding,
-            candidate_embeddings=candidates.embeddings,
+            recurrent_state=next_recurrent_state,
+            candidate_embeddings=policy_features,
             policy_logits=policy_logits,
-            candidate_q=candidate_q,
-            combat_value=self.combat_value_head(world.state_embedding).squeeze(-1),
-            run_value=self.run_value_head(world.state_embedding).squeeze(-1),
-            candidate_reward=candidate_reward,
-            candidate_terminal_logits=candidate_terminal_logits,
+            value=self.value_head(next_recurrent_state).squeeze(-1),
             action_mask=mask,
         )
 
 
 __all__ = [
-    "TERMINAL_CLASS_NAMES",
     "CandidateEncoding",
     "CandidateTokenBatch",
     "GroundedCandidateBatch",
     "GroundedCandidateConfig",
-    "GroundedCandidateModel",
-    "GroundedCandidateOutput",
+    "RecurrentCandidateModel",
+    "RecurrentCandidateOutput",
     "WorldEncoding",
     "WorldTokenBatch",
 ]

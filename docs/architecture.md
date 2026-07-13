@@ -12,7 +12,7 @@ is not the target security, concurrency, or training contract.
 - Keep player control, privileged training, and catalog generation in separate
   capability domains.
 - Give C#, TypeScript, Python, and HeadlessSim one versioned contract.
-- Make reward, replay, checkpoints, and experiments reproducible.
+- Make reward, FIFO rollout data, checkpoints, and experiments reproducible.
 - Bound game-thread work, queues, HTTP resources, events, logs, and artifacts.
 - Fail closed when the game adapter or a contract major version is incompatible.
 
@@ -145,7 +145,7 @@ The Python package exclusively owns:
 - canonical observation and action encoding;
 - the immutable normalized reward calculator;
 - the horizon/data curriculum;
-- replay, learner, model, evaluation, and telemetry;
+- bounded rollout queue, recurrent V-trace learner, model, evaluation, and telemetry;
 - checkpoint identity and exact resume;
 - experiment metadata and artifact paths.
 
@@ -237,7 +237,7 @@ Environment reset/step is serialized with other game mutations. Step validates
 explicitly.
 
 The Bridge and headless adapter emit canonical transition facts. A pure versioned
-RL reward calculator consumes those facts. Replay and checkpoints record reward,
+RL reward calculator consumes those facts. Rollout unrolls and checkpoints record reward,
 contract, action-ordering, observation, dependency-lock and grounded-encoding
 identities plus exact stochastic continuation state. A valid static game-data
 manifest is optional audit provenance only because the baseline does not read it.
@@ -263,7 +263,7 @@ processes must have a real startup deadline and be killed/reaped on failure.
 ## Artifact and release boundary
 
 `STS2_ARTIFACT_ROOT` is outside the checkout and contains checkpoints, optimizer
-state, replay, datasets, logs, exports, and experiment reports. Git contains only
+state, pending rollout queues, datasets, logs, exports, and experiment reports. Git contains only
 small fixtures, schemas, source, migrations, and manifests.
 
 `release-manifest.json` coordinates Bridge, MCP, RL, contract, and game-data
