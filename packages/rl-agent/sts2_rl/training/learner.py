@@ -189,19 +189,15 @@ class GroundedLearner:
                 raise ValueError("replay decision uses a different encoding contract")
             if sample.payload.reward_fingerprint != active_reward_fingerprint:
                 raise ValueError("replay decision uses a different reward contract")
+            sample.payload.validate(validate_snapshot=False)
             experiences.append(sample.payload)
             targets.append(float(sample.targets.value))
             rewards.append(float(sample.targets.reward))
 
-        decisions = [
-            self.encoder.encode(
-                experience.observation,
-                experience.legal_actions,
-                device=self.device,
-            )
-            for experience in experiences
-        ]
-        model_batch = self.encoder.stack(decisions)
+        model_batch = self.encoder.collate_snapshots(
+            tuple(experience.encoded_snapshot for experience in experiences),
+            device=self.device,
+        )
         action_indices = torch.tensor(
             [experience.action_index for experience in experiences],
             dtype=torch.long,

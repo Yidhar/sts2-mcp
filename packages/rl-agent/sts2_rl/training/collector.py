@@ -27,7 +27,7 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
-from sts2_rl.encoding import GroundedObservationEncoder
+from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.models import GroundedCandidateModel
 
 from .experience import DecisionExperience, baseline_transition, compact_decision, replay_stratum
@@ -454,7 +454,7 @@ class GroundedCollector:
         *,
         epsilon: float,
         deterministic: bool,
-    ) -> tuple[int, float, int, float, float]:
+    ) -> tuple[int, float, int, EncodedDecisionSnapshot, float, float]:
         normalized_epsilon = float(epsilon)
         if not math.isfinite(normalized_epsilon) or not 0.0 <= normalized_epsilon <= 1.0:
             raise ValueError("exploration epsilon must be finite and in [0, 1]")
@@ -492,7 +492,14 @@ class GroundedCollector:
             raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
         if deterministic:
             selected = int(valid_indices[int(np.argmax(valid_policy))])
-            return selected, 0.0, valid_count, encoding_ms, policy_forward_ms
+            return (
+                selected,
+                0.0,
+                valid_count,
+                encoded.snapshot,
+                encoding_ms,
+                policy_forward_ms,
+            )
 
         behavior = np.zeros_like(policy, dtype=np.float64)
         behavior[valid_indices] = (
@@ -507,6 +514,7 @@ class GroundedCollector:
             selected,
             float(math.log(max(float(behavior[selected]), 1e-30))),
             valid_count,
+            encoded.snapshot,
             encoding_ms,
             policy_forward_ms,
         )
@@ -564,6 +572,7 @@ class GroundedCollector:
                 action_index,
                 behavior_log_probability,
                 valid_count,
+                encoded_snapshot,
                 encoding_ms,
                 policy_forward_ms,
             ) = self._choose_action(
@@ -610,6 +619,7 @@ class GroundedCollector:
                 experience = compact_decision(
                     state.observation,
                     state.legal_actions,
+                    encoded_snapshot=encoded_snapshot,
                     action_index=action_index,
                     behavior_log_probability=behavior_log_probability,
                     terminal_class=terminal_class,

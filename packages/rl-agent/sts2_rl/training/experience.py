@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -16,7 +17,7 @@ from sts2_baseline import (
     baseline_reward_identity,
 )
 from sts2_rl.contracts import EnvironmentResult
-from sts2_rl.encoding import grounding_encoding_identity
+from sts2_rl.encoding import EncodedDecisionSnapshot, grounding_encoding_identity
 
 RewardObjective = Literal["combat", "run"]
 RUN_PROGRESS_FLOOR_CAP = BASELINE_TRANSITION_PROJECTION_SPEC.run_progress_floor_cap
@@ -71,10 +72,10 @@ _DROP_REPLAY_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class DecisionExperience:
-    """Compact raw decision data encoded only when sampled for learning."""
+    """Compact encoded decision stored by replay for direct batch collation."""
 
-    observation: dict[str, Any]
-    legal_actions: tuple[dict[str, Any], ...]
+    encoded_snapshot: EncodedDecisionSnapshot
+    source_fingerprint: str
     action_index: int
     behavior_log_probability: float
     terminal_class: int
@@ -83,10 +84,17 @@ class DecisionExperience:
     reward_fingerprint: str
 
     def __post_init__(self) -> None:
-        if not self.legal_actions:
-            raise ValueError("decision experience requires at least one legal action")
-        if not 0 <= self.action_index < len(self.legal_actions):
-            raise ValueError("decision action_index is outside legal_actions")
+        self.validate()
+
+    def validate(self, *, validate_snapshot: bool = True) -> None:
+        """Validate live and unpickled replay payloads without trusting __post_init__."""
+
+        if not isinstance(self.encoded_snapshot, EncodedDecisionSnapshot):
+            raise TypeError("decision experience requires an encoded snapshot")
+        if not 0 <= self.action_index < self.encoded_snapshot.candidate_count:
+            raise ValueError("decision action_index is outside encoded candidates")
+        if not bool(self.encoded_snapshot.action_mask[self.action_index]):
+            raise ValueError("decision action_index selects a disabled encoded candidate")
         if self.objective not in {"combat", "run"}:
             raise ValueError("decision objective must be combat or run")
         if self.terminal_class not in {0, 1, 2}:
@@ -95,22 +103,21 @@ class DecisionExperience:
             "fingerprint_sha256"
         ]:
             raise ValueError("decision experience encoding fingerprint does not match")
+        if validate_snapshot:
+            self.encoded_snapshot.validate(
+                expected_config=self.encoded_snapshot.config,
+                expected_fingerprint=self.encoding_fingerprint,
+            )
         if self.reward_fingerprint != baseline_reward_identity()["fingerprint_sha256"]:
             raise ValueError("decision experience reward fingerprint does not match")
         if not math.isfinite(float(self.behavior_log_probability)):
             raise ValueError("behavior_log_probability must be finite")
         if self.behavior_log_probability > 0.0:
             raise ValueError("behavior_log_probability cannot exceed log(1)=0")
-        if not isinstance(self.observation, dict):
-            raise TypeError("decision observation must be a dictionary")
-        if not all(isinstance(action, dict) for action in self.legal_actions):
-            raise TypeError("decision legal actions must be dictionaries")
-        object.__setattr__(self, "observation", deepcopy(self.observation))
-        object.__setattr__(
-            self,
-            "legal_actions",
-            tuple(deepcopy(action) for action in self.legal_actions),
-        )
+        if len(self.source_fingerprint) != 64 or any(
+            char not in "0123456789abcdef" for char in self.source_fingerprint
+        ):
+            raise ValueError("decision source fingerprint must be lowercase SHA-256")
 
 
 def _mapping(value: Any, *, label: str, required: bool = False) -> Mapping[str, Any]:
@@ -419,6 +426,7 @@ def compact_decision(
     observation: Mapping[str, Any],
     legal_actions: Sequence[Mapping[str, Any]],
     *,
+    encoded_snapshot: EncodedDecisionSnapshot,
     action_index: int,
     behavior_log_probability: float,
     terminal_class: int,
@@ -432,9 +440,22 @@ def compact_decision(
         isinstance(action, dict) for action in compact_actions
     ):
         raise TypeError("compacted decision must remain object-shaped")
+    typed_actions = cast(tuple[dict[str, Any], ...], compact_actions)
+    if encoded_snapshot.candidate_count != len(typed_actions):
+        raise ValueError("encoded snapshot candidate count differs from legal actions")
+    canonical_source = json.dumps(
+        {
+            "observation": compact_observation,
+            "legal_actions": typed_actions,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
     return DecisionExperience(
-        observation=compact_observation,
-        legal_actions=cast(tuple[dict[str, Any], ...], compact_actions),
+        encoded_snapshot=encoded_snapshot,
+        source_fingerprint=hashlib.sha256(canonical_source.encode("utf-8")).hexdigest(),
         action_index=action_index,
         behavior_log_probability=float(behavior_log_probability),
         terminal_class=terminal_class,

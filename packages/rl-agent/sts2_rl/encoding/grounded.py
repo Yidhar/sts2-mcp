@@ -27,14 +27,20 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
+import numpy as np
 import torch
 
 from sts2_rl.models.grounded_candidate import (
     MIN_TOKEN_FEATURE_DIM,
-    CandidateTokenBatch,
     GroundedCandidateBatch,
-    GroundedCandidateConfig,
-    WorldTokenBatch,
+)
+
+from .snapshot import (
+    ENCODED_DECISION_SNAPSHOT_VERSION,
+    EncodedDecisionSnapshot,
+    GroundedEncodingConfig,
+    collate_encoded_snapshots,
+    sparse_token_table,
 )
 
 _DOMAIN_IDS: Final[dict[str, int]] = {
@@ -454,7 +460,7 @@ _CATEGORY_SLOT_START: Final = _SUMMARY_SLOT_COUNT + len(_FIXED_NUMERIC_KEYS)
 _DYNAMIC_SLOT_COUNT: Final = 16
 _DYNAMIC_SLOT_START: Final = _CATEGORY_SLOT_START + _CATEGORY_SLOT_COUNT
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-structural-encoding-v1"
+GROUNDING_ENCODING_VERSION: Final = "grounded-structural-encoding-v2"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -500,6 +506,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "container_keys": sorted(_FACT_CONTAINER_KEYS),
         "source_keys": list(_SOURCE_KEYS),
         "candidate_local_roots": sorted(_CANDIDATE_LOCAL_ROOTS),
+        "replay_snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
     return {
@@ -513,99 +520,6 @@ def grounding_encoding_identity() -> dict[str, Any]:
 def _normalize_key(value: Any) -> str:
     text = str(value).strip().replace("-", "_")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", text).lower()
-
-
-@dataclass(frozen=True, slots=True)
-class GroundedEncodingConfig:
-    """Fixed-shape tensor and hashing contract for the new baseline."""
-
-    feature_dim: int = 160
-    max_world_tokens: int = 256
-    max_candidates: int = 96
-    max_candidate_local_tokens: int = 16
-    type_vocab_size: int = 128
-    role_vocab_size: int = 64
-    owner_vocab_size: int = 128
-    entity_vocab_size: int = 8192
-    zone_vocab_size: int = 32
-    max_order_id: int = 128
-    domain_count: int = 8
-
-    @classmethod
-    def from_model_config(
-        cls,
-        model: GroundedCandidateConfig,
-        *,
-        max_world_tokens: int = 256,
-        max_candidates: int = 96,
-        max_candidate_local_tokens: int = 16,
-    ) -> GroundedEncodingConfig:
-        """Create an encoder whose tensor IDs are valid for ``model``."""
-
-        return cls(
-            feature_dim=model.token_feature_dim,
-            max_world_tokens=max_world_tokens,
-            max_candidates=max_candidates,
-            max_candidate_local_tokens=max_candidate_local_tokens,
-            type_vocab_size=model.type_vocab_size,
-            role_vocab_size=model.role_vocab_size,
-            owner_vocab_size=model.owner_vocab_size,
-            entity_vocab_size=model.entity_vocab_size,
-            zone_vocab_size=model.zone_vocab_size,
-            max_order_id=model.order_vocab_size,
-            domain_count=model.domain_count,
-        )
-
-    def __post_init__(self) -> None:
-        integer_fields = (
-            "feature_dim",
-            "max_world_tokens",
-            "max_candidates",
-            "max_candidate_local_tokens",
-            "type_vocab_size",
-            "role_vocab_size",
-            "owner_vocab_size",
-            "entity_vocab_size",
-            "zone_vocab_size",
-            "max_order_id",
-            "domain_count",
-        )
-        wrong_types = [
-            name
-            for name in integer_fields
-            if isinstance(getattr(self, name), bool)
-            or not isinstance(getattr(self, name), int)
-        ]
-        if wrong_types:
-            raise TypeError(
-                "grounded encoding dimensions must be exact integers: "
-                + ", ".join(wrong_types)
-            )
-        if self.feature_dim < MIN_TOKEN_FEATURE_DIM:
-            raise ValueError(
-                "feature_dim must be at least "
-                f"{MIN_TOKEN_FEATURE_DIM} for the grounded feature ABI"
-            )
-        for name in (
-            "max_world_tokens",
-            "max_candidates",
-            "max_candidate_local_tokens",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        for name in (
-            "type_vocab_size",
-            "role_vocab_size",
-            "owner_vocab_size",
-            "entity_vocab_size",
-            "zone_vocab_size",
-        ):
-            if getattr(self, name) < 4:
-                raise ValueError(f"{name} must be at least 4")
-        if self.max_order_id < 2:
-            raise ValueError("max_order_id must be at least 2")
-        if self.domain_count <= max(_DOMAIN_IDS.values()):
-            raise ValueError("domain_count is too small for the fixed domain vocabulary")
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,6 +537,7 @@ class EncodedDecision:
 
     batch: GroundedCandidateBatch
     actions: tuple[ActionReference, ...]
+    snapshot: EncodedDecisionSnapshot
     encoding_fingerprint: str
 
     def action(self, position: int) -> ActionReference:
@@ -1277,17 +1192,23 @@ class GroundedObservationEncoder:
                 ActionReference(position=position, handle=handle, enabled=candidate.enabled)
             )
         domain_id = self._domain_id(model_observation)
-        batch = self._materialize(world_tokens, candidates, domain_id, device=device)
+        fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+        snapshot = self._snapshot(
+            world_tokens,
+            candidates,
+            domain_id=domain_id,
+            encoding_fingerprint=fingerprint,
+        )
+        batch = self.collate_snapshots((snapshot,), device=device)
         return EncodedDecision(
             batch=batch,
             actions=tuple(references),
-            encoding_fingerprint=grounding_encoding_identity()[
-                "fingerprint_sha256"
-            ],
+            snapshot=snapshot,
+            encoding_fingerprint=fingerprint,
         )
 
     def stack(self, decisions: Sequence[EncodedDecision]) -> GroundedCandidateBatch:
-        """Stack fixed-shape single-decision batches for learning."""
+        """Collate decision snapshots without repeating structural encoding."""
 
         if not decisions:
             raise ValueError("at least one decision is required")
@@ -1299,93 +1220,104 @@ class GroundedObservationEncoder:
             raise ValueError("cannot stack decisions from different encoding contracts")
         if expected_fingerprint != grounding_encoding_identity()["fingerprint_sha256"]:
             raise ValueError("decision encoding contract differs from the active encoder")
-        return GroundedCandidateBatch(
-            world=WorldTokenBatch(
-                features=torch.cat([item.batch.world.features for item in decisions], dim=0),
-                mask=torch.cat([item.batch.world.mask for item in decisions], dim=0),
-                type_ids=torch.cat([item.batch.world.type_ids for item in decisions], dim=0),
-                role_ids=torch.cat([item.batch.world.role_ids for item in decisions], dim=0),
-                owner_ids=torch.cat([item.batch.world.owner_ids for item in decisions], dim=0),
-                entity_ids=torch.cat([item.batch.world.entity_ids for item in decisions], dim=0),
-                entity_aux_ids=torch.cat(
-                    [item.batch.world.entity_aux_ids for item in decisions],
-                    dim=0,
-                ),
-                zone_ids=torch.cat([item.batch.world.zone_ids for item in decisions], dim=0),
-                order_ids=torch.cat([item.batch.world.order_ids for item in decisions], dim=0),
+        return self.collate_snapshots(
+            tuple(item.snapshot for item in decisions),
+            device=decisions[0].batch.world.features.device,
+        )
+
+    def collate_snapshots(
+        self,
+        snapshots: Sequence[EncodedDecisionSnapshot],
+        *,
+        device: torch.device | str | None = None,
+    ) -> GroundedCandidateBatch:
+        return collate_encoded_snapshots(
+            tuple(snapshots),
+            expected_config=self.config,
+            expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
+            device=device,
+        )
+
+    def _snapshot(
+        self,
+        world_tokens: Sequence[_Token],
+        candidates: Sequence[_Candidate],
+        *,
+        domain_id: int,
+        encoding_fingerprint: str,
+    ) -> EncodedDecisionSnapshot:
+        world = sparse_token_table(
+            features=tuple(token.features for token in world_tokens),
+            ids=tuple(
+                (
+                    token.type_id,
+                    token.role_id,
+                    token.owner_id,
+                    token.entity_id,
+                    token.entity_aux_id,
+                    token.zone_id,
+                    token.order_id,
+                )
+                for token in world_tokens
             ),
-            candidates=CandidateTokenBatch(
-                features=torch.cat(
-                    [item.batch.candidates.features for item in decisions], dim=0
-                ),
-                type_ids=torch.cat(
-                    [item.batch.candidates.type_ids for item in decisions], dim=0
-                ),
-                role_ids=torch.cat(
-                    [item.batch.candidates.role_ids for item in decisions], dim=0
-                ),
-                owner_ids=torch.cat(
-                    [item.batch.candidates.owner_ids for item in decisions], dim=0
-                ),
-                entity_ids=torch.cat(
-                    [item.batch.candidates.entity_ids for item in decisions], dim=0
-                ),
-                entity_aux_ids=torch.cat(
-                    [item.batch.candidates.entity_aux_ids for item in decisions],
-                    dim=0,
-                ),
-                zone_ids=torch.cat(
-                    [item.batch.candidates.zone_ids for item in decisions], dim=0
-                ),
-                target_owner_ids=torch.cat(
-                    [item.batch.candidates.target_owner_ids for item in decisions], dim=0
-                ),
-                target_entity_ids=torch.cat(
-                    [item.batch.candidates.target_entity_ids for item in decisions], dim=0
-                ),
-                target_entity_aux_ids=torch.cat(
-                    [
-                        item.batch.candidates.target_entity_aux_ids
-                        for item in decisions
-                    ],
-                    dim=0,
-                ),
-                local_features=torch.cat(
-                    [item.batch.candidates.local_features for item in decisions], dim=0
-                ),
-                local_mask=torch.cat(
-                    [item.batch.candidates.local_mask for item in decisions], dim=0
-                ),
-                local_type_ids=torch.cat(
-                    [item.batch.candidates.local_type_ids for item in decisions], dim=0
-                ),
-                local_role_ids=torch.cat(
-                    [item.batch.candidates.local_role_ids for item in decisions], dim=0
-                ),
-                local_owner_ids=torch.cat(
-                    [item.batch.candidates.local_owner_ids for item in decisions], dim=0
-                ),
-                local_entity_ids=torch.cat(
-                    [item.batch.candidates.local_entity_ids for item in decisions], dim=0
-                ),
-                local_entity_aux_ids=torch.cat(
-                    [
-                        item.batch.candidates.local_entity_aux_ids
-                        for item in decisions
-                    ],
-                    dim=0,
-                ),
-                local_zone_ids=torch.cat(
-                    [item.batch.candidates.local_zone_ids for item in decisions], dim=0
-                ),
-                local_order_ids=torch.cat(
-                    [item.batch.candidates.local_order_ids for item in decisions], dim=0
-                ),
-                action_mask=torch.cat(
-                    [item.batch.candidates.action_mask for item in decisions], dim=0
-                ),
+            feature_dim=self.config.feature_dim,
+            id_width=7,
+        )
+        candidate_tokens = tuple(candidate.token for candidate in candidates)
+        candidate_table = sparse_token_table(
+            features=tuple(token.features for token in candidate_tokens),
+            ids=tuple(
+                (
+                    token.type_id,
+                    token.role_id,
+                    token.owner_id,
+                    token.entity_id,
+                    token.entity_aux_id,
+                    token.zone_id,
+                    candidate.target_owner_id,
+                    candidate.target_entity_id,
+                    candidate.target_entity_aux_id,
+                )
+                for token, candidate in zip(candidate_tokens, candidates, strict=True)
             ),
-            domain_ids=torch.cat([item.batch.domain_ids for item in decisions], dim=0),
+            feature_dim=self.config.feature_dim,
+            id_width=9,
+        )
+        flattened_locals = tuple(
+            local for candidate in candidates for local in candidate.locals
+        )
+        local_table = sparse_token_table(
+            features=tuple(token.features for token in flattened_locals),
+            ids=tuple(
+                (
+                    token.type_id,
+                    token.role_id,
+                    token.owner_id,
+                    token.entity_id,
+                    token.entity_aux_id,
+                    token.zone_id,
+                    token.order_id,
+                )
+                for token in flattened_locals
+            ),
+            feature_dim=self.config.feature_dim,
+            id_width=7,
+        )
+        local_offsets = [0]
+        for candidate in candidates:
+            local_offsets.append(local_offsets[-1] + len(candidate.locals))
+        return EncodedDecisionSnapshot(
+            config=self.config,
+            encoding_fingerprint=encoding_fingerprint,
+            world=world,
+            candidates=candidate_table,
+            locals=local_table,
+            local_offsets=np.asarray(local_offsets, dtype=np.uint32),
+            action_mask=np.asarray(
+                [candidate.enabled for candidate in candidates],
+                dtype=np.bool_,
+            ),
+            domain_id=domain_id,
         )
 
     def _domain_id(self, observation: Mapping[str, Any]) -> int:
@@ -1813,139 +1745,13 @@ class GroundedObservationEncoder:
             features[5] = true_count / numeric_count
         return tuple(features)
 
-    def _materialize(
-        self,
-        world_tokens: Sequence[_Token],
-        candidates: Sequence[_Candidate],
-        domain_id: int,
-        *,
-        device: torch.device | str | None,
-    ) -> GroundedCandidateBatch:
-        cfg = self.config
-        dev = torch.device(device) if device is not None else torch.device("cpu")
-        world_features = torch.zeros((1, cfg.max_world_tokens, cfg.feature_dim), dtype=torch.float32, device=dev)
-        world_mask = torch.zeros((1, cfg.max_world_tokens), dtype=torch.bool, device=dev)
-        world_ids = [
-            torch.zeros((1, cfg.max_world_tokens), dtype=torch.long, device=dev)
-            for _ in range(7)
-        ]
-        for index, token in enumerate(world_tokens[: cfg.max_world_tokens]):
-            world_features[0, index] = torch.tensor(token.features, dtype=torch.float32, device=dev)
-            world_mask[0, index] = True
-            for tensor, value in zip(
-                world_ids,
-                (
-                    token.type_id,
-                    token.role_id,
-                    token.owner_id,
-                    token.entity_id,
-                    token.entity_aux_id,
-                    token.zone_id,
-                    token.order_id,
-                ),
-                strict=True,
-            ):
-                tensor[0, index] = value
-
-        shape = (1, cfg.max_candidates)
-        candidate_features = torch.zeros((*shape, cfg.feature_dim), dtype=torch.float32, device=dev)
-        candidate_ids = [
-            torch.zeros(shape, dtype=torch.long, device=dev) for _ in range(9)
-        ]
-        action_mask = torch.zeros(shape, dtype=torch.bool, device=dev)
-        local_shape = (1, cfg.max_candidates, cfg.max_candidate_local_tokens)
-        local_features = torch.zeros((*local_shape, cfg.feature_dim), dtype=torch.float32, device=dev)
-        local_mask = torch.zeros(local_shape, dtype=torch.bool, device=dev)
-        local_ids = [
-            torch.zeros(local_shape, dtype=torch.long, device=dev) for _ in range(7)
-        ]
-        for action_index, candidate in enumerate(candidates[: cfg.max_candidates]):
-            token = candidate.token
-            candidate_features[0, action_index] = torch.tensor(
-                token.features, dtype=torch.float32, device=dev
-            )
-            for tensor, value in zip(
-                candidate_ids,
-                (
-                    token.type_id,
-                    token.role_id,
-                    token.owner_id,
-                    token.entity_id,
-                    token.entity_aux_id,
-                    token.zone_id,
-                    candidate.target_owner_id,
-                    candidate.target_entity_id,
-                    candidate.target_entity_aux_id,
-                ),
-                strict=True,
-            ):
-                tensor[0, action_index] = value
-            action_mask[0, action_index] = candidate.enabled
-            for local_index, local in enumerate(
-                candidate.locals[: cfg.max_candidate_local_tokens]
-            ):
-                local_features[0, action_index, local_index] = torch.tensor(
-                    local.features, dtype=torch.float32, device=dev
-                )
-                local_mask[0, action_index, local_index] = True
-                for tensor, value in zip(
-                    local_ids,
-                    (
-                        local.type_id,
-                        local.role_id,
-                        local.owner_id,
-                        local.entity_id,
-                        local.entity_aux_id,
-                        local.zone_id,
-                        local.order_id,
-                    ),
-                    strict=True,
-                ):
-                    tensor[0, action_index, local_index] = value
-
-        return GroundedCandidateBatch(
-            world=WorldTokenBatch(
-                features=world_features,
-                mask=world_mask,
-                type_ids=world_ids[0],
-                role_ids=world_ids[1],
-                owner_ids=world_ids[2],
-                entity_ids=world_ids[3],
-                entity_aux_ids=world_ids[4],
-                zone_ids=world_ids[5],
-                order_ids=world_ids[6],
-            ),
-            candidates=CandidateTokenBatch(
-                features=candidate_features,
-                type_ids=candidate_ids[0],
-                role_ids=candidate_ids[1],
-                owner_ids=candidate_ids[2],
-                entity_ids=candidate_ids[3],
-                entity_aux_ids=candidate_ids[4],
-                zone_ids=candidate_ids[5],
-                target_owner_ids=candidate_ids[6],
-                target_entity_ids=candidate_ids[7],
-                target_entity_aux_ids=candidate_ids[8],
-                local_features=local_features,
-                local_mask=local_mask,
-                local_type_ids=local_ids[0],
-                local_role_ids=local_ids[1],
-                local_owner_ids=local_ids[2],
-                local_entity_ids=local_ids[3],
-                local_entity_aux_ids=local_ids[4],
-                local_zone_ids=local_ids[5],
-                local_order_ids=local_ids[6],
-                action_mask=action_mask,
-            ),
-            domain_ids=torch.tensor([domain_id], dtype=torch.long, device=dev),
-        )
-
 
 __all__ = [
     "GROUNDING_ENCODING_VERSION",
     "MODEL_ACTION_KIND_VOCABULARY",
     "ActionReference",
     "EncodedDecision",
+    "EncodedDecisionSnapshot",
     "GroundedEncodingConfig",
     "GroundedObservationEncoder",
     "grounding_encoding_identity",

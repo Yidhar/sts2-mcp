@@ -13,7 +13,6 @@ import pytest
 import torch
 
 import sts2_rl.training.checkpointing as checkpointing_module
-from sts2_baseline import baseline_reward_identity
 from sts2_rl.contracts import (
     BackendCapabilities,
     CombatResetRequest,
@@ -22,7 +21,7 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
-from sts2_rl.encoding import GroundedObservationEncoder, grounding_encoding_identity
+from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.models import GroundedCandidateModel
 from sts2_rl.training import (
     CurriculumConfig,
@@ -42,7 +41,11 @@ from sts2_rl.training import (
     save_training_checkpoint,
 )
 from sts2_rl.training.checkpointing import TrainingState
-from sts2_rl.training.experience import baseline_transition, potential_state
+from sts2_rl.training.experience import (
+    baseline_transition,
+    compact_decision,
+    potential_state,
+)
 from sts2_rl.training.seeding import training_seed_start
 
 
@@ -420,7 +423,7 @@ def test_terminal_outcome_and_reward_facts_are_exact_and_fail_closed() -> None:
         potential_state(invalid_hp, objective="combat")
 
 
-def test_decision_experience_owns_nested_observation_and_action_state() -> None:
+def test_decision_experience_owns_encoded_snapshot_and_source_identity() -> None:
     observation = {
         "player": {"hp": 50, "max_hp": 80},
         "nested": {"values": [1]},
@@ -433,21 +436,26 @@ def test_decision_experience_owns_nested_observation_and_action_state() -> None:
             "target": {"id": "enemy", "tags": ["original"]},
         },
     )
-    experience = DecisionExperience(
-        observation=observation,
-        legal_actions=actions,
+    config = _small_config()
+    encoder = GroundedObservationEncoder(config.model.to_encoding_config())
+    encoded = encoder.encode(observation, actions)
+    experience = compact_decision(
+        observation,
+        actions,
+        encoded_snapshot=encoded.snapshot,
         action_index=0,
         behavior_log_probability=0.0,
         terminal_class=0,
         objective="combat",
-        encoding_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
-        reward_fingerprint=baseline_reward_identity()["fingerprint_sha256"],
     )
+    source_fingerprint = experience.source_fingerprint
+    world_ids = experience.encoded_snapshot.world.ids.copy()
 
     observation["nested"]["values"].append(2)
     actions[0]["target"]["tags"].append("caller-mutation")
-    assert experience.observation["nested"]["values"] == [1]
-    assert experience.legal_actions[0]["target"]["tags"] == ["original"]
+    assert experience.source_fingerprint == source_fingerprint
+    assert np.array_equal(experience.encoded_snapshot.world.ids, world_ids)
+    assert experience.encoded_snapshot.world.ids.flags.writeable is False
 
 
 class StatefulEvaluationCollector:
@@ -523,7 +531,9 @@ def test_evaluate_policy_preserves_grounded_training_collector_rng_and_seed() ->
         resources.close()
 
 
-def test_learner_updates_model_and_refreshes_replay_priority() -> None:
+def test_learner_updates_model_without_reencoding_raw_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _small_config()
     backend = FakeCombatBackend()
     resources = build_training_resources(config, backend=backend)
@@ -531,6 +541,13 @@ def test_learner_updates_model_and_refreshes_replay_priority() -> None:
     resources.replay.extend(episode.samples)
     batch = resources.replay.sample(2)
     before = next(resources.model.parameters()).detach().clone()
+    monkeypatch.setattr(
+        resources.learner.encoder,
+        "encode",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("learner must collate replay snapshots, not re-encode raw JSON")
+        ),
+    )
 
     metrics = resources.learner.update(batch, replay=resources.replay)
 
@@ -703,6 +720,28 @@ def test_checkpoint_rejects_config_drift(tmp_path: Path) -> None:
     finally:
         resources.close()
         other.close()
+
+
+def test_checkpoint_refuses_invalid_encoded_replay_snapshot(tmp_path: Path) -> None:
+    config = _small_config()
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        episode = resources.collector.collect_episode(epsilon=1.0)
+        resources.replay.extend(episode.samples)
+        payload = resources.replay.samples[0].payload
+        assert isinstance(payload, DecisionExperience)
+        object.__setattr__(payload, "source_fingerprint", "not-a-sha256")
+
+        with pytest.raises(ValueError, match="source fingerprint"):
+            save_training_checkpoint(
+                tmp_path / "invalid-snapshot",
+                config=config,
+                resources=resources,
+                state=TrainingState(environment_steps=2, episodes=1),
+            )
+        assert not (tmp_path / "invalid-snapshot").exists()
+    finally:
+        resources.close()
 
 
 def test_checkpoint_rejects_grounding_encoder_drift(

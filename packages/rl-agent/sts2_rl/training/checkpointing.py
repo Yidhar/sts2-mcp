@@ -24,10 +24,11 @@ from sts2_rl.checkpoints import (
 from sts2_rl.encoding import grounding_encoding_identity
 
 from .config import TrainingConfig
+from .experience import DecisionExperience
 from .factory import TrainingResources
 from .seeding import SIGNED_INT32_MAX
 
-_CHECKPOINT_FORMAT = "sts2-grounded-baseline-checkpoint-v1"
+_CHECKPOINT_FORMAT = "sts2-grounded-baseline-checkpoint-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,10 +92,15 @@ def _optimizer_spec(
     }
 
 
-def _replay_spec(replay: StratifiedReplayBuffer) -> dict[str, Any]:
+def _replay_spec(
+    replay: StratifiedReplayBuffer,
+    *,
+    config: TrainingConfig,
+) -> dict[str, Any]:
+    _validate_replay_samples(replay, config=config)
     indices = replay.indices
     return {
-        "version": "sts2-grounded-replay-pickle-v1",
+        "version": "sts2-grounded-replay-pickle-v2",
         "size": len(replay),
         "capacity": replay.capacity,
         "recent_window": replay.recent_window,
@@ -105,6 +111,30 @@ def _replay_spec(replay: StratifiedReplayBuffer) -> dict[str, Any]:
         "min_index": min(indices) if indices else None,
         "max_index": max(indices) if indices else None,
     }
+
+
+def _validate_replay_samples(
+    replay: StratifiedReplayBuffer,
+    *,
+    config: TrainingConfig,
+) -> None:
+    for position, sample in enumerate(replay.samples):
+        if not isinstance(sample.payload, DecisionExperience):
+            raise TypeError(
+                f"checkpoint replay sample {position} payload is not DecisionExperience"
+            )
+        try:
+            sample.payload.validate()
+            sample.payload.encoded_snapshot.validate(
+                expected_config=config.model.to_encoding_config(),
+                expected_fingerprint=grounding_encoding_identity()[
+                    "fingerprint_sha256"
+                ],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"checkpoint replay sample {position} encoded payload is invalid: {exc}"
+            ) from exc
 
 
 def _validate_metadata(
@@ -324,7 +354,7 @@ def _validate_replay_payload(
     indices = replay.indices
     if len(indices) != len(set(indices)) or tuple(sorted(indices)) != indices:
         raise ValueError("checkpoint replay indices must be unique and increasing")
-    actual_spec = _replay_spec(replay)
+    actual_spec = _replay_spec(replay, config=config)
     if expected_spec != actual_spec:
         raise ValueError("checkpoint replay metadata does not match replay payload")
     if indices:
@@ -409,7 +439,7 @@ def save_training_checkpoint(
             "encoding_contract": grounding_encoding_identity(),
             "model_state_spec": _tensor_spec(network_state),
             "optimizer_spec": _optimizer_spec(resources.optimizer, optimizer_state),
-            "replay_spec": _replay_spec(resources.replay),
+            "replay_spec": _replay_spec(resources.replay, config=config),
             "resolved_device": str(resources.device),
             "total_steps": state.environment_steps,
         }

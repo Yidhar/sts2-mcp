@@ -196,7 +196,8 @@ build and verification procedure.
 The default model has 3,642,824 parameters, scores only currently grounded legal
 candidates, and uses no latent dynamics, MCTS, planner or game-specific action
 rewrite. Reward is fixed and normalized; replay mixes coverage, recent data and
-refreshable priorities. See
+refreshable priorities. Collector encodings are retained as compact sparse replay
+snapshots, so learner updates collate model inputs without re-parsing raw JSON. See
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md).
 
 The software path is tested, but no new long-run checkpoint or Act 1 clear-rate

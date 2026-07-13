@@ -23,6 +23,8 @@ Before `torch.load` or replay deserialization, the loader verifies:
 - the immutable lineage portion of the typed training configuration;
 - strict model state keys/shapes;
 - optimizer state/specification and replay type/specification;
+- checkpoint-v2 sparse encoded replay payloads, including their canonical CSR
+  arrays, capacities, vocabulary bounds and source/encoding fingerprints;
 - environment steps, learner updates, episode/evaluation counters and pending
   update credit; and
 - Python, NumPy, Torch CPU/CUDA and collector RNG/seed state.
@@ -46,6 +48,14 @@ stochastic_state.pkl
 Missing files, changed bytes or any identity/config mismatch stop loading. There
 is no partial key load, empty replay fallback, fresh optimizer fallback, legacy
 risk flag or automatic tensor remapping.
+
+The current internal trainer format is
+`sts2-grounded-baseline-checkpoint-v2`, with
+`sts2-grounded-replay-pickle-v2` and
+`grounded-structural-encoding-v2`. Pre-snapshot grounded checkpoints are
+rejected before replay deserialization. Do not use a profiling checkpoint from
+the earlier raw-observation replay path as an exact-resume or model-
+initialization parent.
 
 Each invocation writes to a fresh unique run directory; every atomically published
 checkpoint child is immutable:

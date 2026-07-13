@@ -183,6 +183,12 @@ class StratifiedReplayBuffer:
     def indices(self) -> tuple[int, ...]:
         return tuple(self._entries)
 
+    @property
+    def samples(self) -> tuple[ReplaySample, ...]:
+        """Read-only ordered replay payload view for checkpoint validation."""
+
+        return tuple(entry.sample for entry in self._entries.values())
+
     def add(self, sample: ReplaySample, *, priority: float = 1.0) -> int:
         normalized_priority = self._normalize_priority(priority)
         owned_sample = deepcopy(sample)

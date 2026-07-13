@@ -180,7 +180,8 @@ python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE
 
 默认模型有 3,642,824 个参数，只对当前合法候选评分；没有 latent dynamics、MCTS、
 planner 或游戏特定 action rewrite。Reward 固定且归一化，replay 混合 coverage、
-recent 与可刷新的 priority。详见
+recent 与可刷新的 priority。Collector 编码会以紧凑稀疏 snapshot 保存在 replay
+中，因此 learner 更新只需 collate 模型输入，不再重复解析原始 JSON。详见
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md)。
 
 软件闭环已有测试，但目前还没有新架构长期训练 checkpoint 或 Act 1 clear-rate

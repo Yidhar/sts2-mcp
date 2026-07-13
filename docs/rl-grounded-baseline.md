@@ -126,6 +126,20 @@ Sampling returns stable replay IDs, exact mixture probabilities and importance
 weights. The learner refreshes priorities from current TD error after every
 update.
 
+The collector reuses the structural encoding it already computed for action
+selection. Replay stores that decision as a versioned sparse snapshot: exact
+non-zero float features, categorical IDs, candidate-local offsets, action mask,
+domain ID, the complete encoding configuration, and the encoding fingerprint.
+Dispatch handles and raw policy output never enter the snapshot. A SHA-256 of
+the policy-free compact source facts is retained for audit, while the raw
+observation/action JSON is not duplicated in replay.
+
+Learner batches collate these sparse CPU snapshots directly into the fixed
+model tensor contract. They do not walk or re-encode raw observations when a
+sample is drawn. Checkpoint replay format v2 validates every snapshot after
+deserialization, including sparse-array canonical form, vocabulary bounds,
+capacities, source fingerprint, reward fingerprint and encoding identity.
+
 Online trajectories receive auditable discounted Monte Carlo targets. Forced
 single-action protocol decisions are stored but make no policy-gradient
 contribution. The learner jointly trains masked policy, selected-candidate Q,
@@ -207,6 +221,21 @@ lock, resolved-device, model tensor, encoding fingerprint, optimizer, replay or
 immutable-lineage drift. Static `game-data` is optional audit provenance when a valid
 catalog manifest is present; it is neither a runtime dependency nor an exact-resume
 identity because this baseline does not read it.
+
+The sparse replay cutover uses `grounded-structural-encoding-v2` and
+`sts2-grounded-baseline-checkpoint-v2`. Checkpoints created before this cutover
+are intentionally rejected rather than lazily converting raw replay during
+training. No pre-cutover checkpoint is an official baseline parent.
+
+### Encoding-path performance evidence
+
+A controlled 536-step ROCm/Release-HeadlessSim A/B run used identical seeds,
+episodes, learner-update schedule and learner metrics. Reusing sparse snapshots
+reduced learner encoding from 1,574.8 ms to 23.1 ms per update, total learner
+time from 1,724.4 ms to 151.5 ms, and end-to-end runtime from 249.4 s to 40.5 s.
+Throughput increased from 2.15 to 13.25 environment steps/s. The 536-sample
+replay pickle also fell from 3.85 MiB to 2.20 MiB. These are engineering
+throughput measurements, not Act 1 or policy-quality claims.
 
 ## Validation
 

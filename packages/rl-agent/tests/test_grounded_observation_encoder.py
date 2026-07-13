@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import pickle
 from dataclasses import replace
 
 import pytest
@@ -887,6 +888,64 @@ def test_encoder_stack_preserves_fixed_shape_batches() -> None:
                 replace(second, encoding_fingerprint="0" * 64),
             ]
         )
+
+
+def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
+    encoder = _encoder()
+    encoded = encoder.encode(_observation(), _actions())
+    serialized = pickle.dumps(encoded.snapshot, protocol=pickle.HIGHEST_PROTOCOL)
+    restored = pickle.loads(serialized)
+
+    restored_batch = encoder.collate_snapshots((restored,))
+    original = encoded.batch
+    for left, right in (
+        (original.world.features, restored_batch.world.features),
+        (original.world.mask, restored_batch.world.mask),
+        (original.world.type_ids, restored_batch.world.type_ids),
+        (original.world.entity_ids, restored_batch.world.entity_ids),
+        (original.candidates.features, restored_batch.candidates.features),
+        (original.candidates.local_features, restored_batch.candidates.local_features),
+        (original.candidates.local_mask, restored_batch.candidates.local_mask),
+        (original.candidates.action_mask, restored_batch.candidates.action_mask),
+        (original.domain_ids, restored_batch.domain_ids),
+    ):
+        assert torch.equal(left, right)
+
+    dense_tensors = (
+        original.world.features,
+        original.world.mask,
+        original.world.type_ids,
+        original.world.role_ids,
+        original.world.owner_ids,
+        original.world.entity_ids,
+        original.world.entity_aux_ids,
+        original.world.zone_ids,
+        original.world.order_ids,
+        original.candidates.features,
+        original.candidates.type_ids,
+        original.candidates.role_ids,
+        original.candidates.owner_ids,
+        original.candidates.entity_ids,
+        original.candidates.entity_aux_ids,
+        original.candidates.zone_ids,
+        original.candidates.target_owner_ids,
+        original.candidates.target_entity_ids,
+        original.candidates.target_entity_aux_ids,
+        original.candidates.local_features,
+        original.candidates.local_mask,
+        original.candidates.local_type_ids,
+        original.candidates.local_role_ids,
+        original.candidates.local_owner_ids,
+        original.candidates.local_entity_ids,
+        original.candidates.local_entity_aux_ids,
+        original.candidates.local_zone_ids,
+        original.candidates.local_order_ids,
+        original.candidates.action_mask,
+        original.domain_ids,
+    )
+    dense_bytes = sum(tensor.numel() * tensor.element_size() for tensor in dense_tensors)
+    assert encoded.snapshot.storage_nbytes() < dense_bytes // 10
+    assert len(serialized) < dense_bytes // 5
 
 
 def test_encoder_never_silently_truncates_legal_candidates() -> None:

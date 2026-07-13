@@ -46,6 +46,9 @@ historical RL artifacts.
 - Added episode-aggregated collector/learner stage timings, a warm-up credit policy
   that avoids synchronous replay-debt catch-up, and a fail-closed HeadlessSim build
   identity gate binding formal training to the locked source commit and binary hash.
+- Replaced replay-time raw observation re-encoding with versioned sparse encoded
+  decision snapshots and whole-batch collation. The checkpoint/replay and encoding
+  ABIs advance to v2 and intentionally reject pre-snapshot profiling checkpoints.
 - Added Bridge core tests, MCP SDK/unit tests, contract/repository/data/release gates,
   GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub
