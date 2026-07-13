@@ -1,8 +1,9 @@
-"""Single auditable task reward for the recurrent v2 baseline.
+"""Auditable, versioned task rewards for the recurrent v2 training line.
 
-The reward contains no card, boss, encounter, deck, route, or action-specific
-rules.  It consists of a task terminal (+1/-1) and a bounded potential delta
-derived from generic HP, enemy HP, and run progress facts.
+The normal reward contains no card, boss, encounter, deck, route, or
+action-specific rules.  The optional native-revival preheat reward adds only an
+exact relic-consumption event and a bounded per-step pace cost.  Neither reward
+uses backend-provided reward scalars or inferred healing/HP-jump heuristics.
 """
 
 from __future__ import annotations
@@ -38,6 +39,26 @@ class TaskRewardSpec:
 TASK_REWARD_SPEC: Final = TaskRewardSpec()
 
 
+@dataclass(frozen=True, slots=True)
+class RevivalEfficiencyRewardSpec:
+    """Bounded lexicographic curriculum layered over the normal combat task.
+
+    For the preheat profile the episode horizon is at most 512 steps.  The
+    terminal margin dominates every possible revival/pace cost, and one native
+    revival costs more than the entire pace budget.  The resulting preference
+    is therefore: win first, then avoid revival, then finish in fewer steps.
+    """
+
+    version: str = field(default="sts2-native-revival-efficiency-v1", init=False)
+    terminal_margin: float = field(default=3.0, init=False)
+    native_revival_penalty: float = field(default=-1.0, init=False)
+    pace_penalty_per_step: float = field(default=-1.0 / 2048.0, init=False)
+    maximum_episode_steps: int = field(default=512, init=False)
+
+
+REVIVAL_EFFICIENCY_REWARD_SPEC: Final = RevivalEfficiencyRewardSpec()
+
+
 def task_reward_identity() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": TASK_REWARD_SPEC.version,
@@ -49,6 +70,22 @@ def task_reward_identity() -> dict[str, Any]:
         "terminal_reason_policy": "transition/result exact equality",
         "transport_truncation": "reject",
         "collector_horizon": "bootstrap",
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["fingerprint"] = serialized
+    payload["fingerprint_sha256"] = hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def revival_efficiency_reward_identity() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "version": REVIVAL_EFFICIENCY_REWARD_SPEC.version,
+        "base": task_reward_identity(),
+        "spec": asdict(REVIVAL_EFFICIENCY_REWARD_SPEC),
+        "revival_event_source": "typed_transition.facts.relics_used",
+        "ordering": "task_outcome>native_revival_count>environment_steps",
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
@@ -156,6 +193,8 @@ class TaskReward:
     potential_reward: float
     task_terminal: bool
     outcome: TaskOutcome
+    revival_penalty: float = 0.0
+    pace_penalty: float = 0.0
 
 
 class TaskRewardCalculator:
@@ -224,12 +263,73 @@ class TaskRewardCalculator:
         )
 
 
+class RevivalEfficiencyRewardCalculator:
+    """Combat preheat reward using exact native relic-consumption events."""
+
+    def __init__(
+        self,
+        *,
+        revival_relic_id: str,
+        discount: float = 0.997,
+        maximum_episode_steps: int = 512,
+    ) -> None:
+        if not isinstance(revival_relic_id, str) or not revival_relic_id.strip():
+            raise TypeError("revival_relic_id must be non-empty text")
+        if maximum_episode_steps > REVIVAL_EFFICIENCY_REWARD_SPEC.maximum_episode_steps:
+            raise ValueError(
+                "native revival preheat horizon exceeds the reward ordering proof"
+            )
+        self.revival_relic_id = revival_relic_id.strip().upper()
+        self.base = TaskRewardCalculator("combat", discount=discount)
+
+    def evaluate(
+        self,
+        before: EnvironmentResult,
+        after: EnvironmentResult,
+        *,
+        deadlock: bool = False,
+    ) -> TaskReward:
+        base = self.base.evaluate(before, after, deadlock=deadlock)
+        facts = after.transition.facts if after.transition is not None else {}
+        raw_used = facts.get("relics_used", ()) if isinstance(facts, Mapping) else ()
+        used = {
+            str(item).upper()
+            for item in raw_used
+        } if isinstance(raw_used, list | tuple) else set()
+        revival_penalty = (
+            REVIVAL_EFFICIENCY_REWARD_SPEC.native_revival_penalty
+            if self.revival_relic_id in used
+            else 0.0
+        )
+        pace_penalty = REVIVAL_EFFICIENCY_REWARD_SPEC.pace_penalty_per_step
+        terminal_margin = {
+            "ongoing": 0.0,
+            "success": REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
+            "failure": -REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
+            "deadlock": -REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
+        }[base.outcome]
+        return TaskReward(
+            reward=float(base.reward + terminal_margin + revival_penalty + pace_penalty),
+            discount=base.discount,
+            terminal_reward=float(base.terminal_reward + terminal_margin),
+            potential_reward=base.potential_reward,
+            task_terminal=base.task_terminal,
+            outcome=base.outcome,
+            revival_penalty=float(revival_penalty),
+            pace_penalty=float(pace_penalty),
+        )
+
+
 __all__ = [
+    "REVIVAL_EFFICIENCY_REWARD_SPEC",
     "TASK_REWARD_SPEC",
+    "RevivalEfficiencyRewardCalculator",
+    "RevivalEfficiencyRewardSpec",
     "TaskObjective",
     "TaskOutcome",
     "TaskReward",
     "TaskRewardCalculator",
     "TaskRewardSpec",
+    "revival_efficiency_reward_identity",
     "task_reward_identity",
 ]

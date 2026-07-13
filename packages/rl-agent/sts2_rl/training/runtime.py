@@ -13,7 +13,10 @@ from uuid import uuid4
 
 import torch
 
-from sts2_baseline import task_reward_identity
+from sts2_baseline import (
+    revival_efficiency_reward_identity,
+    task_reward_identity,
+)
 from sts2_rl.artifacts import resolve_artifact_path
 from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.encoding import GroundedObservationEncoder, grounding_encoding_identity
@@ -77,6 +80,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "maximum_floor": 0,
             "mean_max_act": 0.0,
             "mean_undiscounted_reward_total": 0.0,
+            "mean_environment_steps": 0.0,
+            "mean_revivals_used": 0.0,
+            "revival_free_combat_win_rate": 0.0,
         }
     count = len(episodes)
     return {
@@ -90,6 +96,13 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "mean_max_act": statistics.fmean(item.max_act for item in episodes),
         "mean_undiscounted_reward_total": statistics.fmean(
             item.reward_total for item in episodes
+        ),
+        "mean_environment_steps": statistics.fmean(item.steps for item in episodes),
+        "mean_revivals_used": statistics.fmean(
+            item.revivals_used for item in episodes
+        ),
+        "revival_free_combat_win_rate": (
+            sum(item.revival_free_combat_win for item in episodes) / count
         ),
     }
 
@@ -152,7 +165,11 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     decision.batch.validate(model_config)
     with torch.no_grad():
         output = model(decision.batch, model.initial_state(1))
-    reward_identity = task_reward_identity()
+    reward_identity = (
+        revival_efficiency_reward_identity()
+        if config.curriculum.mode == "native-revival-preheat"
+        else task_reward_identity()
+    )
     return {
         "config_version": config.version,
         "profile": config.profile,
@@ -175,6 +192,8 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "world_shape": list(decision.batch.world.features.shape),
         "candidate_shape": list(decision.batch.candidates.features.shape),
         "reward_objective": config.curriculum.reward_objective,
+        "curriculum_mode": config.curriculum.mode,
+        "revival_relic_id": config.curriculum.revival_relic_id,
     }
 
 

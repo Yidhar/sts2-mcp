@@ -178,7 +178,13 @@ class HeadlessBackend:
     @staticmethod
     def _facts_payload(facts: TransitionFacts) -> dict[str, Any]:
         payload = asdict(facts)
-        for key in ("cards_added", "cards_removed", "potions_added", "potions_removed"):
+        for key in (
+            "cards_added",
+            "cards_removed",
+            "potions_added",
+            "potions_removed",
+            "relics_used",
+        ):
             payload[key] = list(payload[key])
         return payload
 

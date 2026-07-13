@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -84,6 +85,33 @@ def _verify_checkout(source: Path, lock: dict[str, Any]) -> None:
         raise SystemExit("sts2-ai submodule state does not match the pinned checkout")
 
 
+def _locked_patches(lock: dict[str, Any]) -> list[dict[str, str]]:
+    raw = lock.get("patches", [])
+    if not isinstance(raw, list):
+        raise SystemExit("sts2-ai lock patches must be an array")
+    records: list[dict[str, str]] = []
+    repository_root = PACKAGE_ROOT.parents[1]
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise SystemExit(f"sts2-ai lock patch {index} must be an object")
+        relative = str(item.get("path") or "")
+        expected = str(item.get("sha256") or "").lower()
+        patch = (repository_root / relative).resolve(strict=False)
+        try:
+            patch.relative_to(repository_root)
+        except ValueError as exc:
+            raise SystemExit(f"sts2-ai patch escapes repository: {relative!r}") from exc
+        if not patch.is_file():
+            raise SystemExit(f"sts2-ai patch is missing: {patch}")
+        actual = hashlib.sha256(patch.read_bytes()).hexdigest()
+        if actual != expected:
+            raise SystemExit(
+                f"sts2-ai patch hash mismatch for {relative}: {actual} != {expected}"
+            )
+        records.append({"path": relative, "sha256": actual})
+    return records
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -116,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     if not source.is_absolute() or source == Path(source.anchor):
         raise SystemExit(f"source must be an absolute non-root path: {source}")
     _verify_checkout(source, lock)
+    patch_records = _locked_patches(lock)
     project = source / str(lock["canonical_headless_project"])
     if not project.is_file():
         raise SystemExit(f"canonical HeadlessSim project is missing: {project}")
@@ -131,8 +160,28 @@ def main(argv: list[str] | None = None) -> int:
         REQUIRED_TARGET_FRAMEWORK,
         "--nologo",
     )
-    if not args.no_build:
-        subprocess.check_call(build_command, cwd=source)
+    applied: list[dict[str, str]] = []
+    try:
+        if patch_records:
+            repository_root = PACKAGE_ROOT.parents[1]
+            for record in patch_records:
+                patch = repository_root / record["path"]
+                subprocess.check_call(
+                    ["git", "apply", "--check", str(patch)],
+                    cwd=source,
+                )
+                subprocess.check_call(["git", "apply", str(patch)], cwd=source)
+                applied.append(record)
+        if not args.no_build:
+            subprocess.check_call(build_command, cwd=source)
+    finally:
+        repository_root = PACKAGE_ROOT.parents[1]
+        for record in reversed(applied):
+            patch = repository_root / record["path"]
+            subprocess.check_call(
+                ["git", "apply", "--reverse", str(patch)],
+                cwd=source,
+            )
 
     executable = (
         project.parent
@@ -152,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             "commit": lock["commit"],
             "tree": lock["tree"],
             "project": lock["canonical_headless_project"],
+            "patches": patch_records,
         },
         "build": {
             "configuration": REQUIRED_BUILD_CONFIGURATION,

@@ -41,6 +41,7 @@ def _simulator(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
             "commit": lock["commit"],
             "tree": lock["tree"],
             "project": lock["canonical_headless_project"],
+            "patches": lock.get("patches", []),
         },
         "build": {
             "configuration": "Release",
@@ -72,6 +73,7 @@ def _simulator_for_repository_lock(tmp_path: Path) -> Path:
             "commit": lock["commit"],
             "tree": lock["tree"],
             "project": lock["canonical_headless_project"],
+            "patches": lock.get("patches", []),
         },
         "build": {
             "configuration": "Release",

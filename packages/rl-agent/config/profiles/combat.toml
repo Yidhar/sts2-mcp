@@ -1,4 +1,4 @@
-version = "sts2-recurrent-vtrace-config-v1"
+version = "sts2-recurrent-curriculum-config-v2"
 profile = "combat"
 
 [model]
@@ -52,6 +52,7 @@ scenario = "combat"
 max_episode_steps = 3000
 
 [curriculum]
+mode = "standard"
 reward_objective = "combat"
 epsilon_start = 0.30
 epsilon_end = 0.05

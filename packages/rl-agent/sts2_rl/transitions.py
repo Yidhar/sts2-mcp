@@ -36,6 +36,7 @@ class TransitionFacts:
     cards_removed: tuple[str, ...] = ()
     potions_added: tuple[str, ...] = ()
     potions_removed: tuple[str, ...] = ()
+    relics_used: tuple[str, ...] = ()
     room_entered: str | None = None
     combat_result: CombatResult = "none"
     terminal_reason: str | None = None
@@ -58,6 +59,7 @@ class TransitionFacts:
             cards_removed=_ids(data.get("cards_removed")),
             potions_added=_ids(data.get("potions_added")),
             potions_removed=_ids(data.get("potions_removed")),
+            relics_used=_ids(data.get("relics_used")),
             room_entered=(
                 str(data["room_entered"]) if data.get("room_entered") is not None else None
             ),
@@ -111,6 +113,40 @@ def _multiset_delta(before: tuple[str, ...], after: tuple[str, ...]) -> tuple[st
         else:
             added.append(value)
     return tuple(added)
+
+
+def _relic_used_state(value: Any) -> dict[str, bool]:
+    """Return exact native relic consumption state keyed by stable relic ID.
+
+    The simulator exports ``is_used_up`` from the game model.  Missing values
+    are deliberately ignored rather than inferred from HP changes, counters or
+    descriptions: a healing action must never be mislabeled as a revival.
+    """
+
+    if not isinstance(value, list | tuple):
+        return {}
+    result: dict[str, bool] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        raw_id = item.get("id", item.get("relic_id"))
+        used = item.get("is_used_up")
+        if raw_id is None or not isinstance(used, bool):
+            continue
+        result[str(raw_id)] = used
+    return result
+
+
+def _newly_used_relics(before: Any, after: Any) -> tuple[str, ...]:
+    before_state = _relic_used_state(before)
+    after_state = _relic_used_state(after)
+    return tuple(
+        sorted(
+            relic_id
+            for relic_id, is_used in after_state.items()
+            if is_used and before_state.get(relic_id) is False
+        )
+    )
 
 
 def _enemy_hp_total(observation: Mapping[str, Any]) -> float:
@@ -169,6 +205,10 @@ def derive_transition_facts(
         cards_removed=_multiset_delta(after_deck, before_deck),
         potions_added=_multiset_delta(before_potions, after_potions),
         potions_removed=_multiset_delta(after_potions, before_potions),
+        relics_used=_newly_used_relics(
+            before_player.get("relics"),
+            after_player.get("relics"),
+        ),
         room_entered=(
             str(after_run.get("room_type") or after.get("room_type"))
             if (after_run.get("room_type") or after.get("room_type")) is not None

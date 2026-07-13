@@ -26,9 +26,10 @@ python -m sts2_rl.train --dry-run
 ```
 
 WSL/ROCm uses the externally pinned artifacts installed by
-`scripts/bootstrap_wsl_rocm.sh`; launch with
-`scripts/train_grounded_wsl_rocm.sh`. Never silently substitute a Torch/ROCm
-build.
+`scripts/bootstrap_wsl_rocm.sh`. Launch the live baseline with
+`scripts/train_grounded_wsl_rocm.sh` and the headless native-revival preheat
+with `scripts/train_preheat_wsl_rocm.sh`. Never silently substitute a
+Torch/ROCm build or fall back to CPU.
 
 ## Runtime ownership
 
@@ -37,7 +38,7 @@ sts2_rl.train
   -> typed LiveBackend or HeadlessBackend
   -> structural GroundedObservationEncoder
   -> RecurrentCandidateModel (GRU + masked policy + scalar value)
-  -> fixed sts2_baseline task reward
+  -> fixed, profile-selected sts2_baseline reward contract
   -> bounded FIFO SequenceUnroll queue
   -> VTraceLearner
   -> atomic checkpoint
@@ -49,7 +50,8 @@ sts2_rl.train
   interpret boss/card/route strategy.
 - `sts2_rl/models/` owns the candidate-independent world encoder and grounded
   candidate scorer.
-- `sts2_baseline/` owns the immutable task reward, sequence-unroll and FIFO contracts.
+- `sts2_baseline/` owns immutable, versioned task rewards plus sequence-unroll
+  and FIFO contracts.
 - `sts2_rl/training/` owns configuration, collection, learning, evaluation and
   checkpoint composition.
 - `sts2_env/` is transport-only. It must not contain Gym environments,
@@ -62,9 +64,12 @@ sts2_rl.train
 - Only the authoritative environment legality mask can suppress an action.
 - No MCTS, planner, root bias, action rewrite or policy distillation is allowed
   in the baseline.
-- Reward has one immutable normalized version. Backend scalars are never accepted as
-  targets (the headless adapter strips them and may retain a diagnostic); objective
-  vectors and settlement bonuses are rejected.
+- Each profile selects exactly one immutable reward identity. Backend scalars
+  are never accepted as targets (the headless adapter strips them and may
+  retain a diagnostic); objective vectors and settlement bonuses are rejected.
+- Native-revival preheat may inject only the configured native revival relic.
+  Revival is counted from the exact `is_used_up: false -> true` transition,
+  never from HP changes or a hand-written combat policy.
 - Forced singleton actions generate no policy target or policy-gradient term.
 - Training data is consumed once in FIFO order; replay sampling, PER and
   long-lived sample retention are forbidden.

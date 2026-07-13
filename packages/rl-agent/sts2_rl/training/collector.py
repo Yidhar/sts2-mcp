@@ -7,13 +7,19 @@ import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import uuid4
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
-from sts2_baseline import RolloutStep, SequenceUnroll, TaskRewardCalculator
+from sts2_baseline import (
+    RolloutStep,
+    SequenceUnroll,
+    TaskReward,
+    TaskRewardCalculator,
+)
 from sts2_rl.contracts import (
     CombatResetRequest,
     EnvironmentBackend,
@@ -40,6 +46,16 @@ class CollectionProtocolError(RuntimeError):
     """The environment exposed no dispatchable legal candidate."""
 
 
+class RewardCalculator(Protocol):
+    def evaluate(
+        self,
+        before: EnvironmentResult,
+        after: EnvironmentResult,
+        *,
+        deadlock: bool = False,
+    ) -> TaskReward: ...
+
+
 @dataclass(frozen=True, slots=True)
 class EpisodeMetrics:
     episode_id: str
@@ -56,6 +72,8 @@ class EpisodeMetrics:
     policy_decisions: int
     forced_decisions: int
     deadlocked: bool
+    revivals_used: int
+    revival_free_combat_win: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +120,7 @@ class _ActionChoice:
     valid_count: int
     snapshot: EncodedDecisionSnapshot
     recurrent_state: torch.Tensor
-    policy: np.ndarray
+    policy: NDArray[np.float32]
     value: float
     encoding_ms: float
     policy_forward_ms: float
@@ -184,6 +202,9 @@ class GroundedCollector:
         deadlock_window: int = 128,
         deadlock_repeat_threshold: int = 8,
         journal_policy_topk: int = 5,
+        reward_calculator: RewardCalculator | None = None,
+        additional_relics: tuple[str, ...] = (),
+        revival_relic_id: str | None = None,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -229,10 +250,25 @@ class GroundedCollector:
         self.encounter_id = encounter_id
         self.unroll_length = unroll_length
         self.journal_policy_topk = journal_policy_topk
+        self.additional_relics = tuple(str(item) for item in additional_relics)
+        self.revival_relic_id = (
+            revival_relic_id.strip().upper()
+            if isinstance(revival_relic_id, str) and revival_relic_id.strip()
+            else None
+        )
+        if self.additional_relics and scenario != "combat":
+            raise ValueError("additional reset relics are only supported for combat collection")
+        if self.revival_relic_id is not None and self.revival_relic_id not in {
+            item.upper() for item in self.additional_relics
+        }:
+            raise ValueError("revival_relic_id must be one of the injected additional relics")
         self._rng = np.random.default_rng(int(seed))
         self._episode_seed = training_seed_start(int(seed))
         self._active_state_version: int | None = None
-        self.reward_calculator = TaskRewardCalculator(objective, discount=discount)
+        self.reward_calculator = reward_calculator or TaskRewardCalculator(
+            objective,
+            discount=discount,
+        )
         self.deadlock_detector = SemanticDeadlockDetector(
             window_size=deadlock_window,
             repeat_threshold=deadlock_repeat_threshold,
@@ -444,6 +480,7 @@ class GroundedCollector:
                     character=self.character,
                     encounter_id=self.encounter_id,
                     seed=seed,
+                    additional_relics=self.additional_relics or None,
                 )
             )
         else:
@@ -626,6 +663,7 @@ class GroundedCollector:
         final_outcome = "ongoing"
         deadlocked = False
         forced_horizon = False
+        revivals_used = 0
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -671,6 +709,7 @@ class GroundedCollector:
                 deadlock=deadlock_evidence is not None,
             )
             reward_total += breakdown.reward
+            revivals_used += int(breakdown.revival_penalty < 0.0)
             final_outcome = breakdown.outcome
             deadlocked = breakdown.outcome == "deadlock"
             if record:
@@ -712,6 +751,9 @@ class GroundedCollector:
                         "reward": breakdown.reward,
                         "terminal_reward": breakdown.terminal_reward,
                         "potential_reward": breakdown.potential_reward,
+                        "revival_penalty": breakdown.revival_penalty,
+                        "pace_penalty": breakdown.pace_penalty,
+                        "revivals_used": revivals_used,
                         "outcome": breakdown.outcome,
                         "deadlock": (
                             deadlock_evidence.to_mapping()
@@ -790,6 +832,8 @@ class GroundedCollector:
                 policy_decisions=policy_decisions,
                 forced_decisions=forced_decisions,
                 deadlocked=deadlocked,
+                revivals_used=revivals_used,
+                revival_free_combat_win=bool(combat_won and revivals_used == 0),
             ),
             timings=timings.snapshot(),
         )

@@ -180,6 +180,7 @@ class CombatResetRequest:
     deck: tuple[str, ...] | None = None
     deck_entries: tuple[Mapping[str, Any], ...] | None = None
     relics: tuple[str, ...] | None = None
+    additional_relics: tuple[str, ...] | None = None
     potions: tuple[str, ...] | None = None
     gold: int | None = None
     timeout_ms: int = 15_000
@@ -216,6 +217,11 @@ class CombatResetRequest:
             "deck": list(self.deck) if self.deck is not None else None,
             "deck_entries": [dict(entry) for entry in self.deck_entries] if self.deck_entries is not None else None,
             "relics": list(self.relics) if self.relics is not None else None,
+            "additional_relics": (
+                list(self.additional_relics)
+                if self.additional_relics is not None
+                else None
+            ),
             "potions": list(self.potions) if self.potions is not None else None,
             "gold": self.gold,
             "timeout_ms": self.timeout_ms,
@@ -232,6 +238,11 @@ class CombatResetRequest:
             "deck": list(self.deck) if self.deck is not None else None,
             "deck_entries": [dict(entry) for entry in self.deck_entries] if self.deck_entries is not None else None,
             "relics": list(self.relics) if self.relics is not None else None,
+            "additional_relics": (
+                list(self.additional_relics)
+                if self.additional_relics is not None
+                else None
+            ),
             "potions": list(self.potions) if self.potions is not None else None,
             "gold": self.gold,
             "timeout_ms": self.timeout_ms,

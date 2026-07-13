@@ -21,6 +21,7 @@
         "cards_removed": { "type": "array", "items": { "type": "string" } },
         "potions_added": { "type": "array", "items": { "type": "string" } },
         "potions_removed": { "type": "array", "items": { "type": "string" } },
+        "relics_used": { "type": "array", "items": { "type": "string" } },
         "room_entered": { "type": ["string", "null"] },
         "combat_result": { "enum": ["none", "victory", "defeat", "escaped"] },
         "terminal_reason": { "type": ["string", "null"] }

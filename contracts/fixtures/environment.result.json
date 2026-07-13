@@ -33,6 +33,7 @@
       "cards_removed": [],
       "potions_added": [],
       "potions_removed": [],
+      "relics_used": [],
       "room_entered": null,
       "combat_result": "victory",
       "terminal_reason": null
@@ -51,6 +52,7 @@
       "cards_removed": [],
       "potions_added": [],
       "potions_removed": [],
+      "relics_used": [],
       "room_entered": null,
       "combat_result": "victory",
       "terminal_reason": null

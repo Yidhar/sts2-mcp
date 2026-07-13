@@ -20,7 +20,7 @@ from typing import Any
 
 from sts2_rl.artifacts import resolve_artifact_path
 
-IDENTITY_SCHEMA_VERSION = "1.0.0"
+IDENTITY_SCHEMA_VERSION = "1.1.0"
 IDENTITY_SUFFIX = ".identity.json"
 REQUIRED_BUILD_CONFIGURATION = "Release"
 REQUIRED_TARGET_FRAMEWORK = "net9.0"
@@ -94,6 +94,32 @@ def load_sts2_ai_lock(path: str | os.PathLike[str] | None = None) -> dict[str, A
     if len(str(payload["commit"])) != 40 or len(str(payload["tree"])) != 40:
         raise SimulatorIdentityError(f"simulator source lock commit/tree must be full 40-character Git identities: {lock_path}")
     return payload
+
+
+def _patch_records(lock: dict[str, Any]) -> list[dict[str, str]]:
+    raw = lock.get("patches", [])
+    if not isinstance(raw, list):
+        raise SimulatorIdentityError("simulator source lock patches must be an array")
+    root = repository_root()
+    records: list[dict[str, str]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise SimulatorIdentityError(f"simulator source patch {index} must be an object")
+        relative = str(item.get("path") or "")
+        expected = str(item.get("sha256") or "").lower()
+        path = (root / relative).resolve(strict=False)
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise SimulatorIdentityError(
+                f"simulator source patch escapes repository: {relative!r}"
+            ) from exc
+        if not path.is_file() or sha256_file(path) != expected:
+            raise SimulatorIdentityError(
+                f"simulator source patch is missing or has the wrong hash: {relative}"
+            )
+        records.append({"path": relative, "sha256": expected})
+    return records
 
 
 def simulator_identity_path(executable: str | os.PathLike[str]) -> Path:
@@ -179,6 +205,13 @@ def verify_headless_simulator(
             raise SimulatorIdentityError(
                 f"HeadlessSim source {key} mismatch: identity={actual!r}, lock={expected!r}"
             )
+
+    expected_patches = _patch_records(lock)
+    recorded_patches = source.get("patches", [])
+    if recorded_patches != expected_patches:
+        raise SimulatorIdentityError(
+            "HeadlessSim source patch set differs from the locked curriculum patch set"
+        )
 
     recorded_name = _text(binary, "file_name", label="binary")
     if recorded_name != exe.name:

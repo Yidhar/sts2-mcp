@@ -132,6 +132,35 @@ No human-data cold start is required for the first v2 baseline. Human trajectori
 may be evaluated later as a separately versioned experiment; they must not be
 silently mixed into this baseline.
 
+The optional `preheat` profile is a separate, versioned combat curriculum. It
+adds the game's native `RELIC.LIZARD_TAIL` to the normal starter relic set at
+combat reset and reads the simulator's authoritative `is_used_up` state. A
+revival event exists only when that field changes from `false` to `true`; HP
+increases, healing and transport omissions do not imply revival.
+
+`sts2-native-revival-efficiency-v1` layers three bounded terms over the normal
+combat task reward:
+
+- a terminal margin that makes every victory rank above every failure;
+- a cost for each exact native revival consumption;
+- a small cost per environment decision.
+
+The profile caps episodes at 512 decisions. At that horizon, the complete pace
+budget is smaller than one revival cost, and the terminal margin dominates all
+revival/pace costs. The intended preference is therefore lexicographic:
+
+1. win the combat;
+2. among wins, consume fewer revivals;
+3. at equal revival count, finish in fewer decisions.
+
+This is not an invincibility/no-consequence dataset and it does not supervise
+random actions as correct. Epsilon exploration supplies broad state/action
+coverage, while V-trace trains policy and value from outcome, revival and pace
+consequences. Evaluation reports mean decision count, mean revivals used and
+revival-free combat win rate. A revival-free win leaves the injected relic
+unused and is the primary gate before switching to the normal combat/full-run
+curriculum.
+
 ## Deadlock diagnostics
 
 Evaluation canonicalizes the complete observation and legal candidates after
@@ -192,6 +221,12 @@ python -m sts2_rl.train --dry-run
 
 # Optional combat bootstrap
 python -m sts2_rl.train --profile combat --sim-exe <PINNED_RELEASE_EXE>
+
+# Native-revival knowledge preheat (Windows CPU)
+python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
+
+# Native-revival knowledge preheat (WSL/ROCm; refuses CPU fallback)
+wsl.exe -- bash -lc 'export STS2_ARTIFACT_ROOT=/mnt/e/game/project/sts2_mcp_artifacts/runtime; cd /mnt/e/game/project/sts2_mcp/packages/rl-agent; bash scripts/train_preheat_wsl_rocm.sh'
 
 # Main Act 1 baseline
 python -m sts2_rl.train --profile default --sim-exe <PINNED_RELEASE_EXE>

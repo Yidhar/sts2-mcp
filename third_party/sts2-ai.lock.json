@@ -13,5 +13,11 @@
     "HeadlessSim must have one canonical project before it is used in release builds."
   ],
   "canonical_headless_project": "STS2AI/ENV/Sim/HeadlessSim/HeadlessSim.csproj",
-  "excluded_duplicate_project": "STS2AI/ENV/Sim/Runtime/HeadlessSim/HeadlessSim.csproj"
+  "excluded_duplicate_project": "STS2AI/ENV/Sim/Runtime/HeadlessSim/HeadlessSim.csproj",
+  "patches": [
+    {
+      "path": "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
+      "sha256": "deaddcffea1d2921941fbc232c3fe036844afbb9a5f4fcb3cb2afe8fb2665ea2"
+    }
+  ]
 }

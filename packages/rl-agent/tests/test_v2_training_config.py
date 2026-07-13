@@ -21,10 +21,14 @@ from sts2_rl.training import (
 def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
-    assert CONFIG_VERSION == "sts2-recurrent-vtrace-config-v1"
+    preheat = load_training_config(profile="preheat")
+    assert CONFIG_VERSION == "sts2-recurrent-curriculum-config-v2"
     assert default.model.architecture == "recurrent_candidate_v2"
     assert default.curriculum.reward_objective == "act1"
     assert combat.curriculum.reward_objective == "combat"
+    assert preheat.curriculum.mode == "native-revival-preheat"
+    assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
+    assert preheat.environment.max_episode_steps == 512
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
     mapping = default.to_mapping()
     assert "rollout" in mapping
@@ -58,6 +62,18 @@ def test_environment_and_task_horizons_must_match() -> None:
     base = TrainingConfig()
     with pytest.raises(ValueError, match="full-run"):
         replace(base, curriculum=CurriculumConfig(reward_objective="combat"))
+
+
+def test_native_revival_preheat_is_a_bounded_headless_combat_curriculum() -> None:
+    with pytest.raises(ValueError, match="requires revival_relic_id"):
+        CurriculumConfig(mode="native-revival-preheat", reward_objective="combat")
+    curriculum = CurriculumConfig(
+        mode="native-revival-preheat",
+        reward_objective="combat",
+        revival_relic_id="RELIC.LIZARD_TAIL",
+    )
+    with pytest.raises(ValueError, match="full-run|combat scenario"):
+        replace(TrainingConfig(), curriculum=curriculum)
 
 
 def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> None:

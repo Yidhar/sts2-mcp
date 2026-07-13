@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from sts2_baseline import BoundedRolloutQueue
+from sts2_baseline import BoundedRolloutQueue, RevivalEfficiencyRewardCalculator
 from sts2_rl.backends import HeadlessBackend, LiveBackend
 from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.encoding import GroundedObservationEncoder
@@ -128,6 +128,17 @@ def build_training_resources(
         lr=config.optimization.learning_rate,
         weight_decay=config.optimization.weight_decay,
     )
+    revival_relic_id = config.curriculum.revival_relic_id
+    reward_calculator = (
+        RevivalEfficiencyRewardCalculator(
+            revival_relic_id=revival_relic_id,
+            discount=config.optimization.discount,
+            maximum_episode_steps=config.environment.max_episode_steps,
+        )
+        if config.curriculum.mode == "native-revival-preheat"
+        and revival_relic_id is not None
+        else None
+    )
     collector = GroundedCollector(
         model=collector_model,
         encoder=encoder,
@@ -143,6 +154,14 @@ def build_training_resources(
         deadlock_window=config.diagnostics.deadlock_window,
         deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
         journal_policy_topk=config.diagnostics.journal_policy_topk,
+        reward_calculator=reward_calculator,
+        additional_relics=(
+            (revival_relic_id,)
+            if config.curriculum.mode == "native-revival-preheat"
+            and revival_relic_id is not None
+            else ()
+        ),
+        revival_relic_id=revival_relic_id,
     )
     learner = VTraceLearner(
         model=model,

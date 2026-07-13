@@ -1,0 +1,80 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 76abc62..fab8e72 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -695,7 +695,9 @@ public static class FullRunApiStateBuilder
+ 			name = SafeGetText(() => relic.Title),
+ 			rarity = relic.Rarity.ToString(),
+ 			description = SafeGetText(() => relic.DynamicDescription),
+-			counter = relic.ShowCounter ? relic.DisplayAmount : null
++			counter = relic.ShowCounter ? relic.DisplayAmount : null,
++			is_used_up = relic.IsUsedUp,
++			status = relic.Status.ToString()
+ 		};
+ 	}
+ 
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+index 15bb206..26bb610 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+@@ -166,6 +166,10 @@ public sealed class FullRunApiRelicOption
+ 	public string? description { get; set; }
+ 
+ 	public int? counter { get; set; }
++
++	public bool is_used_up { get; set; }
++
++	public string? status { get; set; }
+ }
+ 
+ public sealed class FullRunApiPlayerState
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
+index 6f1ecf4..fba2e6f 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
+@@ -30,6 +30,9 @@ public sealed class SimulationBuildSpec
+ 	[JsonPropertyName("relics")]
+ 	public List<SimulationBuildRelicSpec>? Relics { get; set; }
+ 
++	[JsonPropertyName("additional_relics")]
++	public List<SimulationBuildRelicSpec>? AdditionalRelics { get; set; }
++
+ 	[JsonPropertyName("current_hp")]
+ 	public int? CurrentHp { get; set; }
+ 
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
+index 658be06..cfa38e9 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
+@@ -29,6 +29,7 @@ internal static class SimulationBuildSupport
+ 
+ 		return build.Deck != null
+ 			|| build.Relics != null
++			|| build.AdditionalRelics != null
+ 			|| build.CurrentHp.HasValue
+ 			|| build.MaxHp.HasValue
+ 			|| build.MaxEnergy.HasValue
+@@ -89,6 +90,23 @@ internal static class SimulationBuildSupport
+ 			AddDiscoveredRelics(save, save.Relics);
+ 		}
+ 
++		if (build.AdditionalRelics != null)
++		{
++			List<SerializableRelic> additions = build.AdditionalRelics
++				.Select(CreateSerializableRelic)
++				.ToList();
++			HashSet<ModelId?> ownedIds = save.Relics.Select(static relic => relic.Id).ToHashSet();
++			foreach (SerializableRelic addition in additions)
++			{
++				RelicModel canonical = ModelDb.GetById<RelicModel>(addition.Id!);
++				if (canonical.IsStackable || ownedIds.Add(addition.Id))
++				{
++					save.Relics.Add(addition);
++				}
++			}
++			AddDiscoveredRelics(save, additions);
++		}
++
+ 		if (build.MaxHp.HasValue)
+ 		{
+ 			save.MaxHp = Math.Max(1, build.MaxHp.Value);

@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from sts2_baseline import TaskRewardCalculator, task_reward_identity
+from sts2_baseline import (
+    REVIVAL_EFFICIENCY_REWARD_SPEC,
+    RevivalEfficiencyRewardCalculator,
+    TaskRewardCalculator,
+    revival_efficiency_reward_identity,
+    task_reward_identity,
+)
 from sts2_rl.contracts import EnvironmentResult, EnvironmentTransition
+from sts2_rl.transitions import derive_transition_facts
 
 
 def _result(
@@ -16,6 +23,7 @@ def _result(
     terminated: bool = False,
     combat_result: str = "none",
     truncated: bool = False,
+    relics_used: tuple[str, ...] = (),
 ) -> EnvironmentResult:
     return EnvironmentResult(
         episode_id="episode",
@@ -33,6 +41,7 @@ def _result(
             facts={
                 "combat_result": combat_result,
                 "terminal_reason": "terminal" if terminated else None,
+                "relics_used": list(relics_used),
             },
         ),
         terminated=terminated,
@@ -107,3 +116,74 @@ def test_combat_objective_uses_typed_terminal_outcome() -> None:
     )
     assert victory.outcome == "success"
     assert defeat.outcome == "failure"
+
+
+def test_native_revival_reward_is_exact_and_lexicographically_bounded() -> None:
+    identity = revival_efficiency_reward_identity()
+    assert identity["version"] == "sts2-native-revival-efficiency-v1"
+    calculator = RevivalEfficiencyRewardCalculator(
+        revival_relic_id="RELIC.LIZARD_TAIL",
+        maximum_episode_steps=512,
+    )
+    ordinary = calculator.evaluate(_result(step=0), _result(step=1))
+    revived = calculator.evaluate(
+        _result(step=0),
+        _result(step=1, relics_used=("RELIC.LIZARD_TAIL",)),
+    )
+    assert ordinary.revival_penalty == 0.0
+    assert revived.revival_penalty == -1.0
+    assert ordinary.pace_penalty == revived.pace_penalty < 0.0
+    assert ordinary.reward - revived.reward == pytest.approx(1.0)
+    assert abs(512 * REVIVAL_EFFICIENCY_REWARD_SPEC.pace_penalty_per_step) < abs(
+        REVIVAL_EFFICIENCY_REWARD_SPEC.native_revival_penalty
+    )
+
+
+def test_native_revival_preheat_still_prioritizes_winning() -> None:
+    calculator = RevivalEfficiencyRewardCalculator(
+        revival_relic_id="RELIC.LIZARD_TAIL",
+        maximum_episode_steps=512,
+    )
+    victory = calculator.evaluate(
+        _result(step=0),
+        _result(
+            step=1,
+            terminated=True,
+            combat_result="victory",
+            enemy_hp=0,
+            relics_used=("RELIC.LIZARD_TAIL",),
+        ),
+    )
+    defeat = calculator.evaluate(
+        _result(step=0),
+        _result(step=1, terminated=True, combat_result="defeat", hp=0),
+    )
+    assert victory.outcome == "success"
+    assert defeat.outcome == "failure"
+    assert victory.reward > defeat.reward
+
+
+def test_relic_consumption_fact_uses_native_used_state_not_hp_heuristics() -> None:
+    before = {
+        "player": {
+            "hp": 1,
+            "max_hp": 80,
+            "relics": [
+                {"id": "RELIC.LIZARD_TAIL", "is_used_up": False},
+            ],
+        }
+    }
+    after = {
+        "player": {
+            "hp": 40,
+            "max_hp": 80,
+            "relics": [
+                {"id": "RELIC.LIZARD_TAIL", "is_used_up": True},
+            ],
+        }
+    }
+    assert derive_transition_facts(before, after).relics_used == (
+        "RELIC.LIZARD_TAIL",
+    )
+    after["player"]["relics"] = []  # type: ignore[index]
+    assert derive_transition_facts(before, after).relics_used == ()

@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-recurrent-vtrace-config-v1"
+CONFIG_VERSION = "sts2-recurrent-curriculum-config-v2"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -286,14 +286,26 @@ class EnvironmentConfig:
 class CurriculumConfig:
     """Task horizon and exploration schedule without mechanics rules."""
 
+    mode: Literal["standard", "native-revival-preheat"] = "standard"
     reward_objective: Literal["combat", "act1", "run"] = "act1"
+    revival_relic_id: str | None = None
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 250_000
 
     def __post_init__(self) -> None:
+        if self.mode not in {"standard", "native-revival-preheat"}:
+            raise ValueError("unsupported curriculum mode")
         if self.reward_objective not in {"combat", "act1", "run"}:
             raise ValueError("reward_objective must be combat, act1, or run")
+        _require_optional_text(
+            self.revival_relic_id,
+            label="curriculum.revival_relic_id",
+        )
+        if self.mode == "standard" and self.revival_relic_id is not None:
+            raise ValueError("standard curriculum cannot inject a revival relic")
+        if self.mode == "native-revival-preheat" and self.revival_relic_id is None:
+            raise ValueError("native revival preheat requires revival_relic_id")
         epsilon_start = _require_finite_number(
             self.epsilon_start,
             label="curriculum.epsilon_start",
@@ -442,6 +454,15 @@ class TrainingConfig:
             raise ValueError(
                 "full-run scenarios require objective='act1' or objective='run'"
             )
+        if self.curriculum.mode == "native-revival-preheat":
+            if self.environment.backend != "headless":
+                raise ValueError("native revival preheat requires the headless backend")
+            if self.environment.scenario != "combat":
+                raise ValueError("native revival preheat requires the combat scenario")
+            if self.environment.max_episode_steps > 512:
+                raise ValueError(
+                    "native revival preheat max_episode_steps cannot exceed 512"
+                )
         if self.optimization.discount != TASK_REWARD_SPEC.discount:
             raise ValueError(
                 "optimization.discount must equal the immutable v2 reward discount "

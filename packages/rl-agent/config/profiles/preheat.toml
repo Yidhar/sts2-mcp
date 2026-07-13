@@ -1,5 +1,5 @@
 version = "sts2-recurrent-curriculum-config-v2"
-profile = "default"
+profile = "preheat"
 
 [model]
 architecture = "recurrent_candidate_v2"
@@ -36,7 +36,7 @@ vtrace_c_clip = 1.0
 policy_rho_clip = 1.0
 policy_weight = 1.0
 value_weight = 0.5
-entropy_weight = 0.01
+entropy_weight = 0.02
 
 [rollout]
 unroll_length = 64
@@ -48,26 +48,27 @@ max_policy_lag = 1024
 
 [environment]
 backend = "headless"
-scenario = "full-run"
-max_episode_steps = 10000
+scenario = "combat"
+max_episode_steps = 512
 
 [curriculum]
-mode = "standard"
-reward_objective = "act1"
-epsilon_start = 0.30
-epsilon_end = 0.05
-epsilon_decay_steps = 250000
+mode = "native-revival-preheat"
+reward_objective = "combat"
+revival_relic_id = "RELIC.LIZARD_TAIL"
+epsilon_start = 0.70
+epsilon_end = 0.10
+epsilon_decay_steps = 100000
 
 [runtime]
 device = "auto"
 collector_device = "cpu"
-total_environment_steps = 1000000
+total_environment_steps = 250000
 seed = 0
-log_dir = "runs/recurrent-vtrace"
-checkpoint_dir = "checkpoints/recurrent-vtrace"
+log_dir = "runs/native-revival-preheat"
+checkpoint_dir = "checkpoints/native-revival-preheat"
 checkpoint_interval_steps = 25000
 evaluation_steps = [0, 10000, 25000, 50000]
-evaluation_episodes = 20
+evaluation_episodes = 50
 
 [diagnostics]
 deadlock_window = 128

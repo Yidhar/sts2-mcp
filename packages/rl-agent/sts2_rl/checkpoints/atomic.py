@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sts2_baseline import task_reward_identity
+from sts2_baseline import (
+    revival_efficiency_reward_identity,
+    task_reward_identity,
+)
 from sts2_rl.contracts.versions import (
     ACTION_SCHEMA_VERSION,
     API_VERSION,
@@ -55,7 +58,17 @@ def contract_metadata() -> dict[str, str]:
 def reward_spec_metadata() -> dict[str, Any]:
     """Return the complete, stable identity of the active reward specification."""
 
-    return task_reward_identity()
+    payload: dict[str, Any] = {
+        "version": "sts2-reward-catalog-v3",
+        "standard": task_reward_identity(),
+        "native_revival_preheat": revival_efficiency_reward_identity(),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["fingerprint"] = serialized
+    payload["fingerprint_sha256"] = hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _sha256(path: Path) -> str:

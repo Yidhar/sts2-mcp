@@ -610,6 +610,7 @@ class HeadlessSimBridgeClient:
         deck: list[str] | None = None,
         deck_entries: list[dict[str, Any]] | None = None,
         relics: list[str] | None = None,
+        additional_relics: list[str] | None = None,
         potions: list[str] | None = None,
         gold: int | None = None,
         timeout_ms: int = 15_000,
@@ -676,6 +677,12 @@ class HeadlessSimBridgeClient:
         if relics is not None:
             build["relics"] = [
                 {"id": _strip_prefix(rid, "RELIC.")} for rid in relics if rid
+            ]
+        if additional_relics is not None:
+            build["additional_relics"] = [
+                {"id": _strip_prefix(rid, "RELIC.")}
+                for rid in additional_relics
+                if rid
             ]
         if potions is not None:
             # SimulationBuildSpec may or may not have potions; include under
