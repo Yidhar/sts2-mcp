@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from typing import Any
@@ -25,6 +26,10 @@ class HeadlessProtocolError(RuntimeError):
     """A typed headless request violated session/idempotency/step ordering."""
 
 
+DEFAULT_REQUEST_CACHE_SIZE = 65_536
+DEFAULT_REQUEST_CACHE_TTL_S = 600.0
+
+
 class HeadlessBackend:
     """Typed, process-local projection over ``HeadlessSimBridgeClient``.
 
@@ -39,8 +44,8 @@ class HeadlessBackend:
         client: Any | None = None,
         *,
         session_id: str | None = None,
-        request_cache_size: int = 2048,
-        request_cache_ttl_s: float = 600.0,
+        request_cache_size: int = DEFAULT_REQUEST_CACHE_SIZE,
+        request_cache_ttl_s: float = DEFAULT_REQUEST_CACHE_TTL_S,
         clock: Callable[[], float] | None = None,
         **client_kwargs: Any,
     ) -> None:
@@ -66,6 +71,7 @@ class HeadlessBackend:
         self._request_cache_ttl_s = float(request_cache_ttl_s)
         self._clock = clock or time.monotonic
         self._request_cache: dict[str, tuple[str, EnvironmentResult, float]] = {}
+        self._request_expiry: deque[tuple[float, str]] = deque()
         self._lock = threading.RLock()
         self._closed = False
         self._logical_step_index = 0
@@ -107,6 +113,8 @@ class HeadlessBackend:
             "supports_combat_reset": True,
             "supports_seed": True,
             "request_id_dedupe": True,
+            "request_id_dedupe_capacity": self._request_cache_size,
+            "request_id_dedupe_ttl_s": self._request_cache_ttl_s,
             "expected_step_index": True,
             "reward_authority": "external-rl",
         }
@@ -137,13 +145,11 @@ class HeadlessBackend:
 
     def _purge_expired(self) -> None:
         now = self._clock()
-        expired = [
-            request_id
-            for request_id, (_, _, expires_at) in self._request_cache.items()
-            if expires_at <= now
-        ]
-        for request_id in expired:
-            del self._request_cache[request_id]
+        while self._request_expiry and self._request_expiry[0][0] <= now:
+            expires_at, request_id = self._request_expiry.popleft()
+            cached = self._request_cache.get(request_id)
+            if cached is not None and cached[2] == expires_at:
+                del self._request_cache[request_id]
 
     def _cached(self, request_id: str, fingerprint: str) -> EnvironmentResult | None:
         self._purge_expired()
@@ -165,11 +171,9 @@ class HeadlessBackend:
     def _remember(self, request_id: str, fingerprint: str, result: EnvironmentResult) -> None:
         if request_id not in self._request_cache:
             self._require_cache_capacity()
-        self._request_cache[request_id] = (
-            fingerprint,
-            result,
-            self._clock() + self._request_cache_ttl_s,
-        )
+        expires_at = self._clock() + self._request_cache_ttl_s
+        self._request_cache[request_id] = (fingerprint, result, expires_at)
+        self._request_expiry.append((expires_at, request_id))
 
     @staticmethod
     def _facts_payload(facts: TransitionFacts) -> dict[str, Any]:

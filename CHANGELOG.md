@@ -60,6 +60,13 @@ historical RL artifacts.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub
   Actions, deterministic CycloneDX SBOM generation, and source/artifact provenance.
 
+### Fixed
+
+- Increased the headless backend's bounded ten-minute request-id replay store from
+  2,048 to 65,536 entries and exposed its capacity/TTL in the backend spec. The old
+  default exhausted before any identity could expire during normal online collection
+  and terminated the first formal baseline run after 1,971 environment steps.
+
 ### Removed or archived
 
 - Removed the separate in-game Draft Tracker in favor of an external event recorder.

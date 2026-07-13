@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from sts2_rl.backends import HeadlessBackend, HeadlessProtocolError
+from sts2_rl.backends.headless import DEFAULT_REQUEST_CACHE_SIZE, DEFAULT_REQUEST_CACHE_TTL_S
 from sts2_rl.contracts import ResetRequest, StepRequest
 
 RESET_ID = "11111111-1111-4111-8111-111111111111"
@@ -95,6 +96,30 @@ def test_headless_request_id_replays_and_conflicts_fail_closed() -> None:
     with pytest.raises(HeadlessProtocolError, match="different request body"):
         backend.reset(reset_request(character="SILENT"))
     assert client.reset_calls == 1
+
+
+def test_default_request_store_is_sized_for_sustained_online_collection() -> None:
+    client = FakeHeadlessClient()
+    backend = HeadlessBackend(client=client)
+    spec = backend.get_spec()
+
+    assert DEFAULT_REQUEST_CACHE_SIZE == 65_536
+    assert DEFAULT_REQUEST_CACHE_TTL_S == 600.0
+    assert spec["request_id_dedupe_capacity"] == DEFAULT_REQUEST_CACHE_SIZE
+    assert spec["request_id_dedupe_ttl_s"] == DEFAULT_REQUEST_CACHE_TTL_S
+
+    # The previous 2,048-entry default failed after only 1,971 environment
+    # steps in a real online run, long before the ten-minute TTL could expire.
+    for index in range(2_049):
+        request_id = f"{index:08x}-0000-4000-8000-000000000000"
+        backend.reset(
+            reset_request(
+                request_id=request_id,
+                expected_state_version=index,
+            )
+        )
+
+    assert client.reset_calls == 2_049
 
 
 def test_headless_session_and_expected_step_are_enforced_before_mutation() -> None:
