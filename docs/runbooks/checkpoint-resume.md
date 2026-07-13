@@ -18,7 +18,7 @@ Before `torch.load` or replay deserialization, the loader verifies:
 - `hash_files=true`, SHA-256 for every payload, and no unlisted payload;
 - current API/schema/action-ordering/observation/reward identities;
 - the immutable grounded reward-spec fingerprint;
-- dependency-lock identities and the resolved device;
+- dependency-lock identities and the resolved learner/collector devices;
 - the grounded encoding ABI version and fingerprint;
 - the immutable lineage portion of the typed training configuration;
 - strict model state keys/shapes;
@@ -78,7 +78,18 @@ Exact resume may change only the total execution budget and output/evaluation
 schedule: total environment steps, log/checkpoint roots, checkpoint/evaluation
 intervals and evaluation episode count. Model, reward, environment scenario,
 optimization, replay, seed, device, collection cadence and update cadence remain
-immutable. The new total step target must exceed the restored step count.
+immutable. Execution mode and overlap collector device are also lineage values:
+an overlap run cannot be resumed as synchronous (or vice versa). The new total
+step target must exceed the restored step count.
+
+Overlap checkpoints are emitted only at quiescent episode boundaries. The actor
+replica is not a second checkpoint authority: only the learner network is saved,
+and a validated load republishes that network to the collector replica. An
+interrupt first joins and ingests any in-flight episode before reading collector
+RNG/seed state and publishing the checkpoint. It settles only the remaining
+single-update cycles from the preceding episode, leaving the drained episode's
+credit deferred so resume preserves the one-episode publication phase. For this
+reason overlap mode rejects `updates_per_cycle` values other than one.
 
 The referenced checkpoint must remain immutable during verification. Never edit
 its manifest or metadata to bypass an incompatibility. Preflight hashes and

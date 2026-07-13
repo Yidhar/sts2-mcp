@@ -28,13 +28,14 @@ from .checkpointing import (
     save_training_checkpoint,
     training_state_from_metadata,
 )
-from .collector import EpisodeMetrics
+from .collector import CollectedEpisode, EpisodeMetrics
 from .config import TrainingConfig
 from .factory import (
     TrainingResources,
     build_training_resources,
     resolve_device,
 )
+from .overlap import OverlappedCollector
 from .seeding import held_out_evaluation_seeds
 from .update_schedule import advance_update_credit
 
@@ -142,6 +143,12 @@ class _EpisodeTimings:
         }
 
 
+@dataclass(slots=True)
+class _UpdateProgress:
+    state: TrainingState
+    latest_learner: dict[str, float] | None = None
+
+
 def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | int]:
     if not episodes:
         return {
@@ -173,6 +180,7 @@ def evaluate_policy(
     episodes: int,
     base_seed: int = 0,
 ) -> tuple[list[EpisodeMetrics], dict[str, float | int]]:
+    resources.publish_collector_policy()
     evaluation_seeds = held_out_evaluation_seeds(base_seed, int(episodes))
     collector_state = deepcopy(resources.collector.state_dict())
     try:
@@ -223,6 +231,8 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     return {
         "config_version": config.version,
         "profile": config.profile,
+        "execution_mode": config.runtime.execution_mode,
+        "collector_device": config.runtime.collector_device,
         "architecture": config.model.architecture,
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
@@ -267,6 +277,76 @@ def _save(
     )
 
 
+def _ingest_episode(
+    *,
+    config: TrainingConfig,
+    resources: TrainingResources,
+    state: TrainingState,
+    episode: CollectedEpisode,
+    timings: _EpisodeTimings,
+) -> TrainingState:
+    if not episode.samples:
+        raise RuntimeError("collector produced an empty training episode")
+    replay_size_before = len(resources.replay)
+    replay_extend_started_ns = time.perf_counter_ns()
+    resources.replay.extend(episode.samples)
+    timings.record("replay_extend", replay_extend_started_ns)
+    return replace(
+        state,
+        environment_steps=state.environment_steps + episode.metrics.steps,
+        episodes=state.episodes + 1,
+        update_credit=advance_update_credit(
+            current_credit=state.update_credit,
+            collected_steps=episode.metrics.steps,
+            replay_size_before=replay_size_before,
+            replay_size_after=len(resources.replay),
+            minimum_replay_size=config.replay.minimum_size,
+            warmup_policy=config.runtime.warmup_credit_policy,
+        ),
+    )
+
+
+def _run_due_updates(
+    *,
+    config: TrainingConfig,
+    resources: TrainingResources,
+    progress: _UpdateProgress,
+    timings: _EpisodeTimings,
+    max_cycles: int | None = None,
+) -> None:
+    completed_cycles = 0
+    while (
+        len(resources.replay) >= config.replay.minimum_size
+        and progress.state.update_credit >= config.runtime.train_every_steps
+        and (max_cycles is None or completed_cycles < max_cycles)
+    ):
+        for update_index in range(config.runtime.updates_per_cycle):
+            replay_sample_started_ns = time.perf_counter_ns()
+            replay_batch = resources.replay.sample(config.optimization.batch_size)
+            timings.record("replay_sample", replay_sample_started_ns)
+            learner_update_started_ns = time.perf_counter_ns()
+            learner_metrics = resources.learner.update(
+                replay_batch,
+                replay=resources.replay,
+            )
+            timings.record("learner_update", learner_update_started_ns)
+            if learner_metrics.timings is not None:
+                for stage, duration_ms in learner_metrics.timings.to_mapping().items():
+                    timings.add(f"learner.{stage}", duration_ms)
+            progress.latest_learner = learner_metrics.to_mapping()
+            cycle_complete = update_index + 1 == config.runtime.updates_per_cycle
+            progress.state = replace(
+                progress.state,
+                learner_updates=progress.state.learner_updates + 1,
+                update_credit=(
+                    progress.state.update_credit - config.runtime.train_every_steps
+                    if cycle_complete
+                    else progress.state.update_credit
+                ),
+            )
+        completed_cycles += 1
+
+
 def run_training(
     config: TrainingConfig,
     *,
@@ -277,11 +357,17 @@ def run_training(
     if resume_from is not None and initialize_from is not None:
         raise ValueError("resume_from and initialize_from are mutually exclusive")
     resolved_device = resolve_device(config.runtime.device)
+    resolved_collector_device = (
+        resolve_device(config.runtime.collector_device)
+        if config.runtime.execution_mode == "overlap"
+        else resolved_device
+    )
     if resume_from is not None:
         validated_resume = preflight_training_checkpoint(
             resume_from,
             config=config,
             resolved_device=str(resolved_device),
+            resolved_collector_device=str(resolved_collector_device),
         )
         preflight_state = training_state_from_metadata(validated_resume.metadata)
         if preflight_state.environment_steps >= config.runtime.total_environment_steps:
@@ -301,6 +387,11 @@ def run_training(
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     metrics = JsonlMetrics(log_root / "metrics.jsonl")
     resources = build_training_resources(config, backend=backend)
+    overlapped_collector = (
+        OverlappedCollector(resources)
+        if config.runtime.execution_mode == "overlap"
+        else None
+    )
     try:
         state = TrainingState()
         if resume_from is not None:
@@ -327,6 +418,13 @@ def run_training(
                 "state": asdict(state),
                 "config": config.to_mapping(),
                 "device": str(resources.device),
+                "collector_device": str(
+                    next(resources.collector_model.parameters()).device
+                ),
+                "execution_mode": config.runtime.execution_mode,
+                "collector_model_is_independent": (
+                    resources.collector_model is not resources.model
+                ),
                 "parameters": sum(
                     parameter.numel() for parameter in resources.model.parameters()
                 ),
@@ -349,18 +447,50 @@ def run_training(
             else "fresh"
         )
         parent_relation = "loaded_parent" if last_checkpoint is not None else None
+        collector_rollback_state: dict[str, object] | None = None
 
         try:
             while state.environment_steps < config.runtime.total_environment_steps:
                 episode_timings = _EpisodeTimings()
-                epsilon = exploration_epsilon(config, state.environment_steps)
-                collect_started_ns = time.perf_counter_ns()
-                episode = resources.collector.collect_episode(
-                    epsilon=epsilon,
-                    deterministic=False,
-                    record=True,
+                if overlapped_collector is None:
+                    epsilon = exploration_epsilon(config, state.environment_steps)
+                    collector_policy_version = state.learner_updates
+                    collector_rollback_state = deepcopy(
+                        resources.collector.state_dict()
+                    )
+                    collect_started_ns = time.perf_counter_ns()
+                    episode = resources.collector.collect_episode(
+                        epsilon=epsilon,
+                        deterministic=False,
+                        record=True,
+                    )
+                    episode_timings.record("collect_episode", collect_started_ns)
+                else:
+                    if not overlapped_collector.has_pending:
+                        overlapped_collector.start(
+                            epsilon=exploration_epsilon(
+                                config,
+                                state.environment_steps,
+                            ),
+                            policy_version=state.learner_updates,
+                        )
+                    collected = overlapped_collector.wait()
+                    episode = collected.episode
+                    epsilon = collected.epsilon
+                    collector_policy_version = collected.policy_version
+                    episode_timings.add(
+                        "collector_policy_publish",
+                        collected.policy_publish_ms,
+                    )
+                    episode_timings.add("collect_episode", collected.collector_ms)
+                    episode_timings.add("collector_wait", collected.wait_ms)
+                    episode_timings.add(
+                        "collector_pre_wait",
+                        collected.collector_pre_wait_ms,
+                    )
+                collector_policy_lag_updates = (
+                    state.learner_updates - collector_policy_version
                 )
-                episode_timings.record("collect_episode", collect_started_ns)
                 if episode.timings is not None:
                     for stage, timing in episode.timings.stages.items():
                         episode_timings.merge(
@@ -370,65 +500,45 @@ def run_training(
                             min_ms=timing.min_ms,
                             max_ms=timing.max_ms,
                         )
-                if not episode.samples:
-                    raise RuntimeError("collector produced an empty training episode")
-                replay_size_before = len(resources.replay)
-                replay_extend_started_ns = time.perf_counter_ns()
-                resources.replay.extend(episode.samples)
-                episode_timings.record("replay_extend", replay_extend_started_ns)
-                state = replace(
-                    state,
-                    environment_steps=state.environment_steps + episode.metrics.steps,
-                    episodes=state.episodes + 1,
-                    update_credit=advance_update_credit(
-                        current_credit=state.update_credit,
-                        collected_steps=episode.metrics.steps,
-                        replay_size_before=replay_size_before,
-                        replay_size_after=len(resources.replay),
-                        minimum_replay_size=config.replay.minimum_size,
-                        warmup_policy=config.runtime.warmup_credit_policy,
-                    ),
+                state = _ingest_episode(
+                    config=config,
+                    resources=resources,
+                    state=state,
+                    episode=episode,
+                    timings=episode_timings,
                 )
-                latest_learner: dict[str, float] | None = None
-                while (
-                    len(resources.replay) >= config.replay.minimum_size
-                    and state.update_credit >= config.runtime.train_every_steps
-                ):
-                    state = replace(
-                        state,
-                        update_credit=(
-                            state.update_credit - config.runtime.train_every_steps
-                        ),
+                collector_rollback_state = None
+                evaluation_due = (
+                    config.runtime.evaluation_episodes > 0
+                    and state.environment_steps >= next_evaluation
+                )
+                checkpoint_due = state.environment_steps >= next_checkpoint
+                prefetched_next_episode = bool(
+                    overlapped_collector is not None
+                    and state.environment_steps
+                    < config.runtime.total_environment_steps
+                    and not evaluation_due
+                    and not checkpoint_due
+                )
+                if prefetched_next_episode:
+                    assert overlapped_collector is not None
+                    overlapped_collector.start(
+                        epsilon=exploration_epsilon(config, state.environment_steps),
+                        policy_version=state.learner_updates,
                     )
-                    for _ in range(config.runtime.updates_per_cycle):
-                        replay_sample_started_ns = time.perf_counter_ns()
-                        replay_batch = resources.replay.sample(
-                            config.optimization.batch_size
-                        )
-                        episode_timings.record(
-                            "replay_sample",
-                            replay_sample_started_ns,
-                        )
-                        learner_update_started_ns = time.perf_counter_ns()
-                        learner_metrics = resources.learner.update(
-                            replay_batch,
-                            replay=resources.replay,
-                        )
-                        episode_timings.record(
-                            "learner_update",
-                            learner_update_started_ns,
-                        )
-                        if learner_metrics.timings is not None:
-                            for (
-                                stage,
-                                duration_ms,
-                            ) in learner_metrics.timings.to_mapping().items():
-                                episode_timings.add(f"learner.{stage}", duration_ms)
-                        latest_learner = learner_metrics.to_mapping()
-                        state = replace(
-                            state,
-                            learner_updates=state.learner_updates + 1,
-                        )
+                update_progress = _UpdateProgress(state=state)
+                try:
+                    _run_due_updates(
+                        config=config,
+                        resources=resources,
+                        progress=update_progress,
+                        timings=episode_timings,
+                    )
+                except KeyboardInterrupt:
+                    state = update_progress.state
+                    raise
+                state = update_progress.state
+                latest_learner = update_progress.latest_learner
 
                 metrics.write(
                     "train_episode",
@@ -439,16 +549,17 @@ def run_training(
                         "update_credit": state.update_credit,
                         "replay_size": len(resources.replay),
                         "epsilon": epsilon,
+                        "execution_mode": config.runtime.execution_mode,
+                        "collector_policy_version": collector_policy_version,
+                        "collector_policy_lag_updates": collector_policy_lag_updates,
+                        "prefetched_next_episode": prefetched_next_episode,
                         "episode": asdict(episode.metrics),
                         "learner": latest_learner,
                         "timings": episode_timings.to_mapping(),
                     },
                 )
 
-                if (
-                    config.runtime.evaluation_episodes > 0
-                    and state.environment_steps >= next_evaluation
-                ):
+                if evaluation_due:
                     evaluated, summary = evaluate_policy(
                         resources,
                         episodes=config.runtime.evaluation_episodes,
@@ -475,7 +586,7 @@ def run_training(
                         config.runtime.evaluation_interval_steps,
                     )
 
-                if state.environment_steps >= next_checkpoint:
+                if checkpoint_due:
                     saved = _save(
                         checkpoint_root=checkpoint_root,
                         name=f"step-{state.environment_steps:09d}",
@@ -520,6 +631,78 @@ def run_training(
                 },
             )
         except KeyboardInterrupt:
+            prior_credit = state.update_credit
+            prior_cycles = prior_credit // config.runtime.train_every_steps
+            if overlapped_collector is None and collector_rollback_state is not None:
+                resources.collector.load_state_dict(collector_rollback_state)
+                metrics.write(
+                    "interrupt_collector_rollback",
+                    {
+                        "run_id": run_id,
+                        "state": asdict(state),
+                    },
+                )
+            if overlapped_collector is not None and overlapped_collector.has_pending:
+                # A learner-side interrupt may leave the next episode running.
+                # Join and ingest it before reading collector RNG/seed state so
+                # the interrupt checkpoint is a quiescent continuation point.
+                drained = overlapped_collector.wait()
+                drain_timings = _EpisodeTimings()
+                drain_timings.add("collector_policy_publish", drained.policy_publish_ms)
+                drain_timings.add("collect_episode", drained.collector_ms)
+                drain_timings.add("collector_wait", drained.wait_ms)
+                drain_timings.add(
+                    "collector_pre_wait",
+                    drained.collector_pre_wait_ms,
+                )
+                state = _ingest_episode(
+                    config=config,
+                    resources=resources,
+                    state=state,
+                    episode=drained.episode,
+                    timings=drain_timings,
+                )
+                if prior_cycles > 0:
+                    interrupt_progress = _UpdateProgress(state=state)
+                    _run_due_updates(
+                        config=config,
+                        resources=resources,
+                        progress=interrupt_progress,
+                        timings=drain_timings,
+                        max_cycles=prior_cycles,
+                    )
+                    state = interrupt_progress.state
+                metrics.write(
+                    "interrupt_drain",
+                    {
+                        "run_id": run_id,
+                        "state": asdict(state),
+                        "collector_policy_version": drained.policy_version,
+                        "completed_prior_update_cycles": prior_cycles,
+                        "episode": asdict(drained.episode.metrics),
+                        "timings": drain_timings.to_mapping(),
+                    },
+                )
+            elif prior_cycles > 0:
+                settle_timings = _EpisodeTimings()
+                interrupt_progress = _UpdateProgress(state=state)
+                _run_due_updates(
+                    config=config,
+                    resources=resources,
+                    progress=interrupt_progress,
+                    timings=settle_timings,
+                    max_cycles=prior_cycles,
+                )
+                state = interrupt_progress.state
+                metrics.write(
+                    "interrupt_update_settle",
+                    {
+                        "run_id": run_id,
+                        "state": asdict(state),
+                        "completed_prior_update_cycles": prior_cycles,
+                        "timings": settle_timings.to_mapping(),
+                    },
+                )
             saved = _save(
                 checkpoint_root=checkpoint_root,
                 name=f"interrupt-step-{state.environment_steps:09d}",
@@ -540,6 +723,8 @@ def run_training(
         metrics.write("run_complete", {"run_id": run_id, "state": asdict(state)})
         return state
     finally:
+        if overlapped_collector is not None:
+            overlapped_collector.shutdown()
         resources.close()
 
 

@@ -38,6 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="strict dotted config override; repeatable",
     )
     parser.add_argument("--device", help="override runtime device (auto/cpu/cuda)")
+    parser.add_argument(
+        "--collector-device",
+        help="overlap actor device (default: cpu; ignored by synchronous mode)",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("synchronous", "overlap"),
+        help="collector/learner pipeline (overlap remains experimental)",
+    )
     parser.add_argument("--steps", type=int, help="override total environment steps")
     parser.add_argument("--seed", type=int, help="override deterministic seed")
     parser.add_argument("--backend", choices=("live", "headless"))
@@ -65,6 +74,10 @@ def _cli_overrides(config: TrainingConfig, args: argparse.Namespace) -> Training
     runtime = config.runtime
     if args.device is not None:
         runtime = replace(runtime, device=str(args.device))
+    if args.collector_device is not None:
+        runtime = replace(runtime, collector_device=str(args.collector_device))
+    if args.execution_mode is not None:
+        runtime = replace(runtime, execution_mode=args.execution_mode)
     if args.steps is not None:
         runtime = replace(runtime, total_environment_steps=int(args.steps))
     if args.seed is not None:

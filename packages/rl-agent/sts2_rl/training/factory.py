@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,6 +23,7 @@ from .learner import GroundedLearner
 @dataclass(slots=True)
 class TrainingResources:
     model: GroundedCandidateModel
+    collector_model: GroundedCandidateModel
     encoder: GroundedObservationEncoder
     replay: StratifiedReplayBuffer
     backend: EnvironmentBackend
@@ -29,6 +31,31 @@ class TrainingResources:
     collector: GroundedCollector
     learner: GroundedLearner
     device: torch.device
+
+    def publish_collector_policy(self) -> float:
+        """Publish one consistent learner snapshot to the idle collector model.
+
+        The synchronous pipeline intentionally aliases both models and therefore
+        has nothing to copy.  The overlap pipeline owns a separate model so the
+        learner can update parameters while collection performs inference.
+        Callers must only publish between collector episodes.
+        """
+
+        if self.collector_model is self.model:
+            return 0.0
+        started_ns = time.perf_counter_ns()
+        learner_device = next(self.model.parameters()).device
+        collector_device = next(self.collector_model.parameters()).device
+        if learner_device.type == "cuda":
+            torch.cuda.synchronize(learner_device)
+        self.collector_model.load_state_dict(self.model.state_dict(), strict=True)
+        if collector_device.type == "cuda":
+            torch.cuda.synchronize(collector_device)
+        elif learner_device.type == "cuda":
+            # Host copies from a CUDA/ROCm source must be complete before the
+            # worker can read the CPU replica.
+            torch.cuda.synchronize(learner_device)
+        return (time.perf_counter_ns() - started_ns) / 1_000_000.0
 
     def close(self) -> None:
         self.backend.close()
@@ -62,6 +89,27 @@ def build_backend(config: TrainingConfig) -> EnvironmentBackend:
     return HeadlessBackend(exe_path=environment.sim_exe_path)
 
 
+def _build_collector_model(
+    config: TrainingConfig,
+    *,
+    learner_model: GroundedCandidateModel,
+) -> GroundedCandidateModel:
+    """Build a replica without advancing the checkpointed Torch RNG streams."""
+
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    try:
+        collector_model = GroundedCandidateModel(config.model.to_model_config()).to(
+            resolve_device(config.runtime.collector_device)
+        )
+        collector_model.load_state_dict(learner_model.state_dict(), strict=True)
+    finally:
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    return collector_model
+
+
 def build_training_resources(
     config: TrainingConfig,
     *,
@@ -70,6 +118,11 @@ def build_training_resources(
     seed_everything(config.runtime.seed)
     device = resolve_device(config.runtime.device)
     model = GroundedCandidateModel(config.model.to_model_config()).to(device)
+    collector_model = (
+        _build_collector_model(config, learner_model=model)
+        if config.runtime.execution_mode == "overlap"
+        else model
+    )
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
     replay = StratifiedReplayBuffer(
         config.replay.capacity,
@@ -91,7 +144,7 @@ def build_training_resources(
         weight_decay=config.optimization.weight_decay,
     )
     collector = GroundedCollector(
-        model=model,
+        model=collector_model,
         encoder=encoder,
         backend=environment_backend,
         scenario=config.environment.scenario,
@@ -110,6 +163,7 @@ def build_training_resources(
     )
     return TrainingResources(
         model=model,
+        collector_model=collector_model,
         encoder=encoder,
         replay=replay,
         backend=environment_backend,

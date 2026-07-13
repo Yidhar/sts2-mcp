@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +47,7 @@ from sts2_rl.training.experience import (
     compact_decision,
     potential_state,
 )
+from sts2_rl.training.learner import GroundedLearner
 from sts2_rl.training.seeding import training_seed_start
 
 
@@ -212,6 +214,24 @@ class TransportTruncationBackend(FakeCombatBackend):
                 facts={"combat_result": "none", "terminal_reason": reason},
             ),
         )
+
+
+class OverlapProbeBackend(FakeCombatBackend):
+    """Require learner work to begin while the second episode is in flight."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.learner_started = threading.Event()
+        self.observed_overlap = False
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        if self._episode >= 2 and self._step == 0:
+            self.observed_overlap = self.learner_started.wait(timeout=5.0)
+            if not self.observed_overlap:
+                raise AssertionError(
+                    "second collection did not overlap the first episode's learner work"
+                )
+        return super().step(request)
 
 
 def _small_config() -> TrainingConfig:
@@ -500,7 +520,10 @@ def test_evaluate_policy_restores_all_collector_state_on_success_or_failure(
     fail: bool,
 ) -> None:
     collector = StatefulEvaluationCollector(fail=fail)
-    resources: Any = SimpleNamespace(collector=collector)
+    resources: Any = SimpleNamespace(
+        collector=collector,
+        publish_collector_policy=lambda: 0.0,
+    )
     before = deepcopy(collector.state)
 
     if fail:
@@ -568,6 +591,209 @@ def test_learner_updates_model_without_reencoding_raw_observation(
     assert all(value >= 0.0 for value in metrics.timings.to_mapping().values())
     assert "timings" not in metrics.to_mapping()
     assert all(resources.replay.priority(int(index)) > 0.0 for index in batch.indices)
+
+
+def test_overlap_uses_an_independent_published_collector_model() -> None:
+    base = _small_config()
+    config = replace(
+        base,
+        runtime=replace(base.runtime, execution_mode="overlap"),
+    )
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        assert resources.collector_model is not resources.model
+        learner_parameter = next(resources.model.parameters())
+        collector_parameter = next(resources.collector_model.parameters())
+        assert torch.equal(learner_parameter, collector_parameter)
+        with torch.no_grad():
+            learner_parameter.add_(1.0)
+        assert not torch.equal(learner_parameter, collector_parameter)
+
+        publish_ms = resources.publish_collector_policy()
+
+        assert publish_ms >= 0.0
+        assert torch.equal(learner_parameter, collector_parameter)
+    finally:
+        resources.close()
+
+
+def test_overlap_replica_construction_does_not_advance_torch_rng() -> None:
+    base = _small_config()
+    synchronous = build_training_resources(base, backend=FakeCombatBackend())
+    try:
+        synchronous_next = torch.rand(8)
+    finally:
+        synchronous.close()
+
+    overlap_config = replace(
+        base,
+        runtime=replace(base.runtime, execution_mode="overlap"),
+    )
+    overlap = build_training_resources(overlap_config, backend=FakeCombatBackend())
+    try:
+        overlap_next = torch.rand(8)
+    finally:
+        overlap.close()
+
+    assert torch.equal(synchronous_next, overlap_next)
+
+
+def test_runtime_overlaps_one_bounded_episode_with_learner_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    backend = OverlapProbeBackend()
+    original_update = GroundedLearner.update
+
+    def observed_update(self: GroundedLearner, *args: Any, **kwargs: Any) -> Any:
+        backend.learner_started.set()
+        return original_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(GroundedLearner, "update", observed_update)
+    base = _small_config()
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            execution_mode="overlap",
+            total_environment_steps=4,
+            warmup_credit_policy="accrue",
+            checkpoint_interval_steps=100,
+            evaluation_interval_steps=100,
+        ),
+    )
+
+    state = run_training(config, backend=backend)
+
+    assert backend.observed_overlap
+    assert backend.closed
+    assert state.environment_steps == 4
+    assert state.episodes == 2
+    assert state.learner_updates == 4
+    metric_directory = next((tmp_path / "tests" / "run").glob("run-*"))
+    records = [
+        json.loads(line)
+        for line in (metric_directory / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    start = next(record for record in records if record["event"] == "run_start")
+    episodes = [record for record in records if record["event"] == "train_episode"]
+    assert start["execution_mode"] == "overlap"
+    assert start["collector_model_is_independent"] is True
+    assert [record["collector_policy_version"] for record in episodes] == [0, 0]
+    assert [record["collector_policy_lag_updates"] for record in episodes] == [0, 2]
+    assert [record["prefetched_next_episode"] for record in episodes] == [True, False]
+    for record in episodes:
+        stages = record["timings"]["stages"]
+        assert stages["collector_policy_publish"]["count"] == 1
+        assert stages["collector_wait"]["count"] == 1
+        assert stages["collector_pre_wait"]["count"] == 1
+
+
+def test_overlap_interrupt_drains_inflight_episode_before_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+
+    original_update = GroundedLearner.update
+    interrupted_once = False
+
+    def interrupt_update(self: GroundedLearner, *args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted_once
+        if not interrupted_once:
+            interrupted_once = True
+            raise KeyboardInterrupt
+        return original_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(GroundedLearner, "update", interrupt_update)
+    base = _small_config()
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            execution_mode="overlap",
+            total_environment_steps=4,
+            warmup_credit_policy="accrue",
+            checkpoint_interval_steps=100,
+            evaluation_interval_steps=100,
+        ),
+    )
+    backend = FakeCombatBackend()
+
+    with pytest.raises(KeyboardInterrupt):
+        run_training(config, backend=backend)
+
+    assert backend.closed
+    metric_directory = next((tmp_path / "tests" / "run").glob("run-*"))
+    records = [
+        json.loads(line)
+        for line in (metric_directory / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    drained = next(record for record in records if record["event"] == "interrupt_drain")
+    interrupted = next(record for record in records if record["event"] == "interrupted")
+    assert drained["state"]["environment_steps"] == 4
+    assert drained["state"]["episodes"] == 2
+    assert drained["state"]["learner_updates"] == 2
+    assert drained["state"]["update_credit"] == 2
+    assert drained["completed_prior_update_cycles"] == 2
+    assert interrupted["state"]["environment_steps"] == 4
+    assert Path(interrupted["path"]).name == "interrupt-step-000000004"
+
+
+def test_synchronous_interrupt_rolls_back_partial_collector_rng_and_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+
+    def interrupt_collection(
+        self: GroundedCollector,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        self._episode_seed += 2
+        self._rng.random()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(GroundedCollector, "collect_episode", interrupt_collection)
+    config = _small_config()
+    backend = FakeCombatBackend()
+
+    with pytest.raises(KeyboardInterrupt):
+        run_training(config, backend=backend)
+
+    assert backend.closed
+    metric_directory = next((tmp_path / "tests" / "run").glob("run-*"))
+    records = [
+        json.loads(line)
+        for line in (metric_directory / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert any(
+        record["event"] == "interrupt_collector_rollback" for record in records
+    )
+    interrupted = next(record for record in records if record["event"] == "interrupted")
+    checkpoint = Path(interrupted["path"])
+    monkeypatch.undo()
+    restored = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        state = load_training_checkpoint(
+            checkpoint,
+            config=config,
+            resources=restored,
+        )
+        assert state == TrainingState()
+        assert restored.collector.state_dict()["episode_seed"] == training_seed_start(
+            config.runtime.seed
+        )
+    finally:
+        restored.close()
 
 
 def test_learner_rejects_replay_reward_contract_drift() -> None:
@@ -720,6 +946,49 @@ def test_checkpoint_rejects_config_drift(tmp_path: Path) -> None:
     finally:
         resources.close()
         other.close()
+
+
+def test_overlap_checkpoint_restores_and_publishes_authoritative_model(
+    tmp_path: Path,
+) -> None:
+    base = _small_config()
+    config = replace(
+        base,
+        runtime=replace(base.runtime, execution_mode="overlap"),
+    )
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    target = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        with torch.no_grad():
+            next(source.model.parameters()).fill_(0.25)
+            next(source.collector_model.parameters()).fill_(0.75)
+        checkpoint = save_training_checkpoint(
+            tmp_path / "overlap-authority",
+            config=config,
+            resources=source,
+            state=TrainingState(),
+        )
+        metadata = json.loads(
+            (checkpoint / "metadata.json").read_text(encoding="utf-8")
+        )
+        assert metadata["resolved_collector_device"] == "cpu"
+
+        load_training_checkpoint(checkpoint, config=config, resources=target)
+
+        for learner_value, collector_value in zip(
+            target.model.state_dict().values(),
+            target.collector_model.state_dict().values(),
+            strict=True,
+        ):
+            assert torch.equal(learner_value, collector_value)
+        target_parameter = next(target.model.parameters())
+        assert torch.equal(
+            target_parameter,
+            torch.full_like(target_parameter, 0.25),
+        )
+    finally:
+        source.close()
+        target.close()
 
 
 def test_checkpoint_refuses_invalid_encoded_replay_snapshot(tmp_path: Path) -> None:

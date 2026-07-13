@@ -1,4 +1,4 @@
-version = "sts2-grounded-baseline-config-v1"
+version = "sts2-grounded-baseline-config-v2"
 profile = "combat"
 
 [model]
@@ -62,6 +62,8 @@ epsilon_decay_steps = 100000
 
 [runtime]
 device = "auto"
+collector_device = "cpu"
+execution_mode = "synchronous"
 total_environment_steps = 250000
 train_every_steps = 4
 updates_per_cycle = 1

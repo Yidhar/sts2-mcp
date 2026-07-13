@@ -184,6 +184,10 @@ recent 与可刷新的 priority。Collector 编码会以紧凑稀疏 snapshot �
 中，因此 learner 更新只需 collate 模型输入，不再重复解析原始 JSON。详见
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md)。
 
+正式 profile 仍采用同步 collector/learner。仓库提供了仅用于受控 profiling 的
+单 episode 有界重叠模式；ROCm learner + CPU actor 相比新的同步对照只提升约
+10.4%，同时出现 3–28 次 update 的策略滞后，因此尚未作为长期训练默认路径。
+
 软件闭环已有测试，但目前还没有新架构长期训练 checkpoint 或 Act 1 clear-rate
 成绩，不能把 dry-run/单元测试误报为模型效果。所选 backend 的 v2 parity 未通过前，
 不要启动长训练。

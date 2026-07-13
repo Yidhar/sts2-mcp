@@ -30,6 +30,11 @@ def test_default_and_combat_profiles_select_matching_horizons() -> None:
     assert default.model.architecture == combat.model.architecture == "grounded_candidate_v1"
     assert default.runtime.warmup_credit_policy == "discard"
     assert combat.runtime.warmup_credit_policy == "discard"
+    assert default.runtime.execution_mode == "synchronous"
+    assert combat.runtime.execution_mode == "synchronous"
+    assert default.runtime.collector_device == "cpu"
+    assert combat.runtime.collector_device == "cpu"
+    assert RuntimeConfig().execution_mode == "synchronous"
 
 
 def test_strict_dotted_overrides_accept_known_and_reject_retired_keys() -> None:
@@ -44,6 +49,10 @@ def test_strict_dotted_overrides_accept_known_and_reject_retired_keys() -> None:
 
 
 def test_old_architecture_and_mutable_reward_discount_fail_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(
+            {"version": "sts2-grounded-baseline-config-v1"}
+        )
     with pytest.raises(ValueError, match="grounded_candidate_v1"):
         training_config_from_mapping(
             {
@@ -114,6 +123,29 @@ def test_warmup_credit_policy_is_strict_and_legacy_mode_is_explicit() -> None:
     assert RuntimeConfig(warmup_credit_policy="accrue").warmup_credit_policy == "accrue"
     with pytest.raises(ValueError, match="warmup_credit_policy"):
         RuntimeConfig(warmup_credit_policy="catch-up")  # type: ignore[arg-type]
+
+
+def test_execution_mode_is_strict_and_part_of_training_lineage() -> None:
+    assert RuntimeConfig(execution_mode="overlap").execution_mode == "overlap"
+    with pytest.raises(ValueError, match="execution_mode"):
+        RuntimeConfig(execution_mode="queue")  # type: ignore[arg-type]
+
+    config = TrainingConfig()
+    overlapped = replace(
+        config,
+        runtime=replace(config.runtime, execution_mode="overlap"),
+    )
+    assert overlapped.lineage_mapping() != config.lineage_mapping()
+
+    with pytest.raises(TypeError, match="collector_device"):
+        RuntimeConfig(collector_device="")
+    with pytest.raises(ValueError, match="updates_per_cycle=1"):
+        TrainingConfig(
+            runtime=RuntimeConfig(
+                execution_mode="overlap",
+                updates_per_cycle=2,
+            )
+        )
 
 
 def test_lineage_mapping_excludes_only_mutable_execution_controls() -> None:

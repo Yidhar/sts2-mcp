@@ -145,6 +145,48 @@ single-action protocol decisions are stored but make no policy-gradient
 contribution. The learner jointly trains masked policy, selected-candidate Q,
 the active horizon value, immediate reward and terminal classification.
 
+### Execution pipeline and overlap experiment
+
+The maintained profiles use the `synchronous` execution mode. An opt-in
+`overlap` mode exists for bounded systems work, but it is not a free-running
+actor queue:
+
+- the learner owns the authoritative model, optimizer, replay and counters;
+- the collector owns a separate read-only actor model, optionally on a separate
+  device;
+- exactly one episode may be in flight;
+- replay is extended, sampled and reprioritized only by the main thread;
+- actor parameters are published only between episodes;
+- evaluation, periodic checkpoint and final-checkpoint boundaries do not launch
+  another episode; and
+- Ctrl-C joins and ingests an in-flight episode before publishing an interrupt
+  checkpoint.
+
+Overlap currently requires `updates_per_cycle=1`. On Ctrl-C, the runtime also
+finishes only the update cycles that belonged to the preceding episode before
+saving; update credit from the drained episode remains deferred. This preserves
+the same one-episode policy-publication phase on exact resume. Synchronous
+collection instead restores its pre-episode collector RNG/seed snapshot if it is
+interrupted before producing a complete episode.
+
+This gives a race-free one-episode pipeline: learner work for episode N can run
+while the collector produces episode N+1. The tradeoff is explicit off-policy
+lag. Metrics record `collector_policy_version`,
+`collector_policy_lag_updates`, parameter-publication time, collector wait time,
+and `collector_pre_wait` (collector work completed before the main thread began
+or completed its wait). Behavior probabilities are still recorded per decision,
+but the current experiment does not refresh the actor within a long episode.
+
+Opt in only for controlled profiling:
+
+```powershell
+python -m sts2_rl.train `
+  --profile default `
+  --execution-mode overlap `
+  --collector-device cpu `
+  --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
+```
+
 ## Training curriculum
 
 There are two configurations, not an A/B comparison or an attempt to preserve
@@ -217,13 +259,16 @@ so a resume never overwrites its parent. Each published checkpoint child is immu
 Checkpoints atomically publish model,
 optimizer, replay, training counters, update credit, Python/NumPy/Torch RNG and
 collector RNG/seed state. Exact resume rejects contract, reward, dependency
-lock, resolved-device, model tensor, encoding fingerprint, optimizer, replay or
+lock, resolved learner/collector device, model tensor, encoding fingerprint,
+optimizer, replay or
 immutable-lineage drift. Static `game-data` is optional audit provenance when a valid
 catalog manifest is present; it is neither a runtime dependency nor an exact-resume
 identity because this baseline does not read it.
 
-The sparse replay cutover uses `grounded-structural-encoding-v2` and
-`sts2-grounded-baseline-checkpoint-v2`. Checkpoints created before this cutover
+The current execution/config cutover uses
+`sts2-grounded-baseline-config-v2`; the sparse replay cutover uses
+`grounded-structural-encoding-v2` and
+`sts2-grounded-baseline-checkpoint-v2`. Checkpoints created before either cutover
 are intentionally rejected rather than lazily converting raw replay during
 training. No pre-cutover checkpoint is an official baseline parent.
 
@@ -236,6 +281,32 @@ time from 1,724.4 ms to 151.5 ms, and end-to-end runtime from 249.4 s to 40.5 s.
 Throughput increased from 2.15 to 13.25 environment steps/s. The 536-sample
 replay pickle also fell from 3.85 MiB to 2.20 MiB. These are engineering
 throughput measurements, not Act 1 or policy-quality claims.
+
+### Collector/learner overlap evidence
+
+A second controlled ROCm/Release-HeadlessSim investigation used the same 512-step
+target, seed, replay warm-up, update ratio and disabled evaluation. Episode-level
+policy lag changes trajectories, so these are throughput comparisons rather than
+identical-policy or learning-quality comparisons:
+
+| pipeline | actor device | realized steps | elapsed | throughput |
+|---|---:|---:|---:|---:|
+| synchronous | ROCm | 536 | 38.44 s | 13.94 steps/s |
+| one-episode overlap | ROCm | 556 | 38.56 s | 14.42 steps/s |
+| one-episode overlap | CPU | 556 | 36.12 s | 15.39 steps/s |
+
+Same-device overlap caused severe contention: aggregate collector time rose from
+18.1 s to 30.6 s and mean learner time rose from 146.6 ms to 208.8 ms/update.
+Moving the actor to CPU reduced wall time, but the resulting 10.4% throughput
+gain over the new synchronous control is far below the theoretical two-stage
+pipeline ceiling. Observed episode-level policy lag ranged from 3 to 28 learner
+updates after warm-up; full-run episodes can be longer. Therefore overlap remains
+opt-in and the formal profiles remain synchronous. A future attempt should test
+process/core isolation and decision-boundary actor refresh before considering
+multiple collectors. These measurements are not Act 1 performance claims.
+The ROCm CPU-actor processes also emitted a two-signal `SharedSignalPool`
+shutdown warning after otherwise successful checkpoint publication; this is an
+additional reason not to treat the thread experiment as production-ready.
 
 ## Validation
 

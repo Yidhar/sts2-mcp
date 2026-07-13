@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-grounded-baseline-config-v1"
+CONFIG_VERSION = "sts2-grounded-baseline-config-v2"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -333,6 +333,8 @@ class CurriculumConfig:
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     device: str = "auto"
+    collector_device: str = "cpu"
+    execution_mode: Literal["synchronous", "overlap"] = "synchronous"
     total_environment_steps: int = 1_000_000
     train_every_steps: int = 4
     updates_per_cycle: int = 1
@@ -371,8 +373,17 @@ class RuntimeConfig:
             raise ValueError(
                 "runtime.warmup_credit_policy must be 'discard' or 'accrue'"
             )
+        if self.execution_mode not in {"synchronous", "overlap"}:
+            raise ValueError(
+                "runtime.execution_mode must be 'synchronous' or 'overlap'"
+            )
         if not isinstance(self.device, str) or not self.device.strip():
             raise TypeError("runtime.device must be a non-empty string")
+        if (
+            not isinstance(self.collector_device, str)
+            or not self.collector_device.strip()
+        ):
+            raise TypeError("runtime.collector_device must be a non-empty string")
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -429,6 +440,14 @@ class TrainingConfig:
             raise ValueError(
                 "optimization.discount must equal the immutable reward-spec discount "
                 f"{BASELINE_REWARD_SPEC.discount}"
+            )
+        if (
+            self.runtime.execution_mode == "overlap"
+            and self.runtime.updates_per_cycle != 1
+        ):
+            raise ValueError(
+                "overlap execution currently requires runtime.updates_per_cycle=1 "
+                "so interrupt checkpoints preserve an exact pipeline phase"
             )
 
     def to_mapping(self) -> dict[str, Any]:

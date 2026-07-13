@@ -200,6 +200,11 @@ refreshable priorities. Collector encodings are retained as compact sparse repla
 snapshots, so learner updates collate model inputs without re-parsing raw JSON. See
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md).
 
+Formal profiles keep collector and learner synchronous. A bounded one-episode
+overlap mode is available only for profiling; ROCm/CPU-actor experiments improved
+the new synchronous control by 10.4% but introduced 3–28 update policy lag, so it
+is not the default long-run path.
+
 The software path is tested, but no new long-run checkpoint or Act 1 clear-rate
 claim exists yet. Do not start a long run until the v2 environment/parity checks
 for the selected backend are green.

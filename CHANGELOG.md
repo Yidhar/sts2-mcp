@@ -49,6 +49,12 @@ historical RL artifacts.
 - Replaced replay-time raw observation re-encoding with versioned sparse encoded
   decision snapshots and whole-batch collation. The checkpoint/replay and encoding
   ABIs advance to v2 and intentionally reject pre-snapshot profiling checkpoints.
+- Added a bounded, opt-in collector/learner overlap pipeline with an independent
+  actor model, single in-flight episode, main-thread-owned replay, quiescent
+  checkpoint/evaluation barriers, interrupt draining, policy-version lag metrics,
+  and configurable collector device. Controlled ROCm profiling found only a 3.4%
+  same-device gain and a 10.4% CPU-actor gain with 3–28 update policy lag, so the
+  maintained profiles remain synchronous and the typed config ABI advances to v2.
 - Added Bridge core tests, MCP SDK/unit tests, contract/repository/data/release gates,
   GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub

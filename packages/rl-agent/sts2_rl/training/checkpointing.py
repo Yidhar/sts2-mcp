@@ -143,6 +143,7 @@ def _validate_metadata(
     config: TrainingConfig,
     resolved_device: str | None,
     model_only: bool,
+    resolved_collector_device: str | None = None,
 ) -> None:
     metadata = validated.metadata
     if metadata.get("format") != _CHECKPOINT_FORMAT:
@@ -171,6 +172,16 @@ def _validate_metadata(
             "exact resume requires the same resolved device: "
             f"checkpoint={metadata.get('resolved_device')!r} runtime={resolved_device!r}"
         )
+    if (
+        resolved_collector_device is not None
+        and metadata.get("resolved_collector_device")
+        != resolved_collector_device
+    ):
+        raise ValueError(
+            "exact resume requires the same resolved collector device: "
+            f"checkpoint={metadata.get('resolved_collector_device')!r} "
+            f"runtime={resolved_collector_device!r}"
+        )
 
 
 def preflight_training_checkpoint(
@@ -178,6 +189,7 @@ def preflight_training_checkpoint(
     *,
     config: TrainingConfig,
     resolved_device: str,
+    resolved_collector_device: str,
 ) -> ValidatedResumeCheckpoint:
     """Read/hash/validate resume metadata before any backend or artifact side effect."""
 
@@ -186,6 +198,7 @@ def preflight_training_checkpoint(
         validated,
         config=config,
         resolved_device=resolved_device,
+        resolved_collector_device=resolved_collector_device,
         model_only=False,
     )
     return validated
@@ -441,6 +454,9 @@ def save_training_checkpoint(
             "optimizer_spec": _optimizer_spec(resources.optimizer, optimizer_state),
             "replay_spec": _replay_spec(resources.replay, config=config),
             "resolved_device": str(resources.device),
+            "resolved_collector_device": str(
+                next(resources.collector_model.parameters()).device
+            ),
             "total_steps": state.environment_steps,
         }
         (staging / "metadata.json").write_text(
@@ -465,6 +481,9 @@ def load_training_checkpoint(
         checkpoint,
         config=config,
         resolved_device=str(resources.device),
+        resolved_collector_device=str(
+            next(resources.collector_model.parameters()).device
+        ),
     )
 
     network_state = torch.load(
@@ -519,6 +538,7 @@ def load_training_checkpoint(
     resources.optimizer.load_state_dict(optimizer_state)
     resources.replay = replay
     _restore_stochastic_state(stochastic_state, resources=resources)
+    resources.publish_collector_policy()
     return state
 
 
@@ -549,6 +569,7 @@ def initialize_model_from_checkpoint(
     temporary_model.load_state_dict(network_state, strict=True)
     del temporary_model
     resources.model.load_state_dict(network_state, strict=True)
+    resources.publish_collector_policy()
     return validated.root
 
 
