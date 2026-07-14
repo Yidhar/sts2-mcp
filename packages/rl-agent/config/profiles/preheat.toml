@@ -49,7 +49,10 @@ max_policy_lag = 1024
 [environment]
 backend = "headless"
 scenario = "full-run"
-max_episode_steps = 10000
+# A complete successful run is expected to fit comfortably inside this
+# budget.  The bound also prevents an untrained recurrent policy from spending
+# tens of thousands of decisions oscillating in a reversible selection UI.
+max_episode_steps = 3000
 
 [curriculum]
 mode = "native-revival-preheat"
@@ -65,11 +68,14 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-preheat-v3"
-checkpoint_dir = "checkpoints/full-run-revival-preheat-v3"
+log_dir = "runs/full-run-revival-preheat-v4"
+checkpoint_dir = "checkpoints/full-run-revival-preheat-v4"
 checkpoint_interval_steps = 25000
-evaluation_steps = [0, 10000, 25000, 50000]
-evaluation_episodes = 20
+# Do not block actor/learner startup on a deterministic evaluation of the
+# randomly initialized policy.  The fail-closed simulator gate and GPU smoke
+# test cover step zero; fixed held-out evaluation begins after learning starts.
+evaluation_steps = [10000, 25000, 50000]
+evaluation_episodes = 5
 
 [diagnostics]
 deadlock_window = 128
