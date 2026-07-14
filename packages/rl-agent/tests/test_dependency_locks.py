@@ -38,7 +38,7 @@ def test_package_version_matches_project_metadata() -> None:
     import sts2_rl
 
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert sts2_rl.__version__ == pyproject["project"]["version"] == "0.3.0"
+    assert sts2_rl.__version__ == pyproject["project"]["version"] == "0.4.0"
 
 
 def test_project_direct_dependencies_and_build_tools_are_exact() -> None:

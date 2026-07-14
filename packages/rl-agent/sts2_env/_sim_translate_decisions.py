@@ -6,7 +6,11 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
-from ._sim_translate_entities import _translate_card, _translate_relic
+from ._sim_translate_entities import (
+    _translate_card,
+    _translate_potion,
+    _translate_relic,
+)
 
 
 def _mapping_sequence(value: Any, *, label: str) -> list[dict[str, Any]]:
@@ -43,7 +47,10 @@ def _translate_rewards_block(
     translated = deepcopy(dict(rewards))
     translated.pop("player", None)
     if "items" in rewards:
-        translated["items"] = _mapping_sequence(rewards.get("items"), label="reward items")
+        translated["items"] = [
+            _translate_reward_item(item, index=index)
+            for index, item in enumerate(_mapping_sequence(rewards.get("items"), label="reward items"))
+        ]
     if card_reward:
         translated["card_reward"] = _translate_card_reward_sel_block(card_reward)
     if treasure:
@@ -51,17 +58,46 @@ def _translate_rewards_block(
         if not isinstance(raw_relics, list | tuple):
             raise TypeError("simulator treasure relics must be a sequence")
         translated["treasure"] = {
-            key: deepcopy(value)
-            for key, value in treasure.items()
-            if key not in {"player", "relics"}
+            key: deepcopy(value) for key, value in treasure.items() if key not in {"player", "relics"}
         }
         translated["treasure"]["relics"] = [_translate_relic(item) for item in raw_relics]
     if relic_select:
-        translated["relic_select"] = {
-            key: deepcopy(value)
-            for key, value in relic_select.items()
-            if key != "player"
-        }
+        translated["relic_select"] = {key: deepcopy(value) for key, value in relic_select.items() if key != "player"}
+    return translated
+
+
+def _translate_reward_payload(
+    reward: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    """Normalize one explicit reward while preserving its claim slot."""
+
+    translated = deepcopy(dict(reward))
+    translated.setdefault("slot_index", index)
+    raw_card = reward.get("card")
+    if raw_card is not None:
+        translated["card"] = _translate_card(raw_card, pile="Reward")
+    raw_relic = reward.get("relic")
+    if raw_relic is not None:
+        translated["relic"] = _translate_relic(raw_relic)
+    raw_potion = reward.get("potion")
+    if raw_potion is not None:
+        translated["potion"] = _translate_potion(raw_potion)
+    return translated
+
+
+def _translate_reward_item(item: Mapping[str, Any], *, index: int) -> dict[str, Any]:
+    """Preserve a simulator reward wrapper and normalize its nested entity."""
+
+    translated = deepcopy(dict(item))
+    translated.setdefault("slot_index", index)
+    raw_reward = item.get("reward")
+    if raw_reward is None:
+        return _translate_reward_payload(item, index=index)
+    if not isinstance(raw_reward, Mapping):
+        raise TypeError("simulator reward item reward must be a mapping")
+    translated["reward"] = _translate_reward_payload(raw_reward, index=index)
     return translated
 
 
@@ -77,7 +113,25 @@ def _translate_shop_block(shop: Mapping[str, Any]) -> dict[str, Any]:
     translated = deepcopy(dict(shop))
     translated.pop("player", None)
     if "items" in shop:
-        translated["items"] = _mapping_sequence(shop.get("items"), label="shop items")
+        translated["items"] = [
+            _translate_shop_item(item, index=index)
+            for index, item in enumerate(_mapping_sequence(shop.get("items"), label="shop items"))
+        ]
+    return translated
+
+
+def _translate_shop_item(item: Mapping[str, Any], *, index: int) -> dict[str, Any]:
+    translated = deepcopy(dict(item))
+    translated.setdefault("slot_index", index)
+    raw_card = item.get("card")
+    if raw_card is not None:
+        translated["card"] = _translate_card(raw_card, pile="Shop")
+    raw_relic = item.get("relic")
+    if raw_relic is not None:
+        translated["relic"] = _translate_relic(raw_relic)
+    raw_potion = item.get("potion")
+    if raw_potion is not None:
+        translated["potion"] = _translate_potion(raw_potion)
     return translated
 
 

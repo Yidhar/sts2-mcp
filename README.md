@@ -25,9 +25,9 @@ they must not receive new features.
 |---|---:|---|
 | [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema, OpenAPI, fixtures, generated cross-language version constants |
 | [`game-data/`](./game-data/README.md) | `2.0.0` | Policy-free static card, relic, and potion facts |
-| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | Game adapter, visible snapshots, legal handles, command serialization, session discovery |
+| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.9.0` | Game adapter, visible snapshots, legal handles, command serialization, session discovery |
 | [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | TypeScript MCP server using the official SDK; default `minimal` control surface |
-| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | Recurrent grounded-candidate model, typed backends, fixed task reward, FIFO unrolls, V-trace and checkpoints |
+| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.4.0` | Relational legal-candidate model, typed backends, dual-scale memory, fixed task reward, FIFO unrolls, V-trace and checkpoints |
 | [`tools/`](./tools) | — | Contract, data, artifact, release, license, and repository checks |
 
 Component versions are coordinated through [`release-manifest.json`](./release-manifest.json).
@@ -164,7 +164,7 @@ multi-instance configurations.
 
 ## RL development and training
 
-The maintained entry point is the **recurrent grounded-candidate V-trace v2 baseline**.
+The maintained entry point is the **relational grounded-candidate V-trace v3 baseline**.
 The failed MuZero/token-memory/MCTS line, PPO paths, planners and hand-written
 action guards have been removed:
 
@@ -193,9 +193,10 @@ source, and hash-mismatched binaries are rejected before the simulator starts.
 See [HeadlessSim build identity](./docs/headless-simulator-identity.md) for the
 build and verification procedure.
 
-The default model has 3,971,778 parameters, scores only currently grounded legal
-candidates, and uses a 256-wide GRU state with no latent dynamics, MCTS, planner
-or game-specific action rewrite. Reward is fixed and normalized. Actors stream
+The default model has 4,014,146 parameters, scores only currently grounded legal
+candidates, and splits its 256-wide GRU state into run- and combat-scale memory.
+It learns from factual definition/instance/zone/source/target relationships with
+no latent dynamics, MCTS, planner or game-specific action rewrite. Reward is fixed and normalized. Actors stream
 64-decision recurrent unrolls through a bounded FIFO; the V-trace learner consumes
 each unroll once, with no replay sampling or priorities. Encodings remain compact
 sparse snapshots, so learner updates do not re-parse raw JSON. See
@@ -206,8 +207,8 @@ configured collector device publishes versioned unrolls into a capacity-256 queu
 the learner applies bounded-lag V-trace correction and republishes parameters only
 at actor episode boundaries.
 
-The v1 run is retained only as failure evidence and is not a model or replay
-initialization source. No v2 Act 1 clear-rate claim exists until fixed odd-seed
+The v1/v2 runs are retained only as failure evidence and are not model or replay
+initialization sources. No v3 Act 1 clear-rate claim exists until fixed odd-seed
 evaluations at steps 0, 10k, 25k and 50k complete.
 
 ## Contracts and game data

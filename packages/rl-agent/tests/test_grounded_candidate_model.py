@@ -80,8 +80,20 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         ),
         local_mask=torch.tensor(
             [
-                [[True, True, False], [True, False, False], [True, True, True], [False, False, False], [True, True, False]],
-                [[True, False, False], [True, True, False], [False, False, False], [True, True, True], [True, False, False]],
+                [
+                    [True, True, False],
+                    [True, False, False],
+                    [True, True, True],
+                    [False, False, False],
+                    [True, True, False],
+                ],
+                [
+                    [True, False, False],
+                    [True, True, False],
+                    [False, False, False],
+                    [True, True, True],
+                    [True, False, False],
+                ],
             ]
         ),
         local_type_ids=_ids((batch_size, action_count, local_count), config.type_vocab_size),
@@ -94,9 +106,7 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         ),
         local_zone_ids=_ids((batch_size, action_count, local_count), config.zone_vocab_size),
         local_order_ids=_ids((batch_size, action_count, local_count), config.order_vocab_size),
-        action_mask=torch.tensor(
-            [[True, True, False, True, True], [True, False, True, True, False]]
-        ),
+        action_mask=torch.tensor([[True, True, False, True, True], [True, False, True, True, False]]),
     )
     return GroundedCandidateBatch(
         world=world,
@@ -130,7 +140,10 @@ def test_masked_candidates_are_inert(config: GroundedCandidateConfig) -> None:
     output = model(_make_batch(config))
     invalid = ~output.action_mask
 
-    assert torch.equal(output.policy_logits[invalid], torch.full_like(output.policy_logits[invalid], torch.finfo(output.policy_logits.dtype).min))
+    assert torch.equal(
+        output.policy_logits[invalid],
+        torch.full_like(output.policy_logits[invalid], torch.finfo(output.policy_logits.dtype).min),
+    )
     assert torch.count_nonzero(output.candidate_embeddings[invalid]) == 0
 
     probabilities = output.policy_probabilities()
@@ -184,7 +197,12 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     config: GroundedCandidateConfig,
 ) -> None:
     model = RecurrentCandidateModel(config).train()
-    batch = _make_batch(config)
+    batch = replace(
+        _make_batch(config),
+        # Exercise one tactical and one run-scale memory update so both halves
+        # of the maintained recurrent state participate in backpropagation.
+        domain_ids=torch.tensor([1, 2], dtype=torch.long),
+    )
     output = model(batch)
     probabilities = output.policy_probabilities()
     selected = torch.tensor([0, 2], dtype=torch.long)
@@ -196,16 +214,22 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     world_grad = model.world_encoder.layers[0].self_attn.in_proj_weight.grad
     candidate_grad = model.policy_head[-1].weight.grad
     shared_embedding_grad = model.token_embedder.entity_embedding.weight.grad
-    recurrent_grad = model.recurrent_cell.weight_hh.grad
+    target_entity_grad = model.token_embedder.target_entity_projection.weight.grad
+    target_relation_grad = model.token_embedder.target_relation_projection.weight.grad
+    run_recurrent_grad = model.run_recurrent_cell.weight_hh.grad
+    combat_recurrent_grad = model.combat_recurrent_cell.weight_hh.grad
     assert world_grad is not None and torch.isfinite(world_grad).all()
     assert candidate_grad is not None and torch.isfinite(candidate_grad).all()
     assert shared_embedding_grad is not None and torch.isfinite(shared_embedding_grad).all()
-    assert recurrent_grad is not None and torch.isfinite(recurrent_grad).all()
+    assert target_entity_grad is not None and torch.isfinite(target_entity_grad).all()
+    assert target_relation_grad is not None and torch.isfinite(target_relation_grad).all()
+    assert run_recurrent_grad is not None and torch.isfinite(run_recurrent_grad).all()
+    assert combat_recurrent_grad is not None and torch.isfinite(combat_recurrent_grad).all()
 
 
 def test_default_model_stays_small() -> None:
     model = RecurrentCandidateModel()
-    assert model.parameter_count == 3_980_098
+    assert model.parameter_count == 4_014_146
 
 
 def test_batch_shape_contract_rejects_misaligned_candidate_local_axis(
@@ -289,6 +313,7 @@ def test_model_respects_requested_floating_dtype(
         ({"entity_vocab_size": 1}, "at least 4"),
         ({"order_vocab_size": 1}, "at least 2"),
         ({"recurrent_hidden_dim": 0}, "positive"),
+        ({"recurrent_hidden_dim": 255}, "must be even"),
     ],
 )
 def test_model_config_matches_encoder_minimum_contract(
@@ -363,7 +388,64 @@ def test_public_candidate_encoder_rejects_broadcastable_world_state(
     malformed = WorldEncoding(
         latents=world.latents,
         state_embedding=world.state_embedding[:1],
+        tokens=world.tokens,
         world_mask=world.world_mask,
+        entity_ids=world.entity_ids,
+        entity_aux_ids=world.entity_aux_ids,
     )
     with pytest.raises(ValueError, match="state_embedding"):
         model.encode_candidates(batch.candidates, malformed)
+
+
+def test_relation_pool_separates_runtime_instance_from_shared_definition(
+    config: GroundedCandidateConfig,
+) -> None:
+    token_a = torch.arange(config.d_model, dtype=torch.float32)
+    token_b = token_a + 100.0
+    token_other = token_a + 1000.0
+    tokens = torch.stack([token_a, token_b, token_other]).unsqueeze(0)
+    world = WorldEncoding(
+        latents=torch.zeros(1, config.latent_slots, config.d_model),
+        state_embedding=torch.zeros(1, config.d_model),
+        tokens=tokens,
+        world_mask=torch.ones(1, 3, dtype=torch.bool),
+        entity_ids=torch.tensor([[10, 10, 11]], dtype=torch.long),
+        entity_aux_ids=torch.tensor([[21, 22, 23]], dtype=torch.long),
+    )
+
+    exact, definition = RecurrentCandidateModel._matched_world_contexts(
+        definition_ids=torch.tensor([[10, 10, 0]], dtype=torch.long),
+        relation_ids=torch.tensor([[21, 22, 0]], dtype=torch.long),
+        world_encoding=world,
+    )
+
+    torch.testing.assert_close(exact[0, 0], token_a)
+    torch.testing.assert_close(exact[0, 1], token_b)
+    torch.testing.assert_close(definition[0, 0], (token_a + token_b) / 2.0)
+    torch.testing.assert_close(definition[0, 1], (token_a + token_b) / 2.0)
+    assert torch.count_nonzero(exact[0, 2]) == 0
+    assert torch.count_nonzero(definition[0, 2]) == 0
+
+
+def test_run_and_combat_memory_have_separate_update_scales(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+    base = _make_batch(config)
+    half = config.recurrent_hidden_dim // 2
+
+    with torch.no_grad():
+        macro = model(replace(base, domain_ids=torch.full_like(base.domain_ids, 2))).recurrent_state
+        combat = model(
+            replace(base, domain_ids=torch.full_like(base.domain_ids, 1)),
+            macro,
+        ).recurrent_state
+        after_combat = model(
+            replace(base, domain_ids=torch.full_like(base.domain_ids, 2)),
+            combat,
+        ).recurrent_state
+
+    torch.testing.assert_close(combat[:, :half], macro[:, :half])
+    assert torch.count_nonzero(combat[:, half:]) > 0
+    assert torch.count_nonzero(after_combat[:, half:]) == 0
+    assert not torch.equal(after_combat[:, :half], macro[:, :half])

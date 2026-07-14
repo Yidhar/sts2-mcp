@@ -351,7 +351,7 @@ internal static partial class BridgeGameApi
         }
     }
 
-    private static object? CompactRewardPayload(JsonElement? element)
+    private static object? CompactRewardPayload(JsonElement? element, int? slotIndex = null)
     {
         if (element is null || element.Value.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
@@ -360,8 +360,13 @@ internal static partial class BridgeGameApi
 
         return new
         {
+            slot_index = slotIndex,
             type = TryGetNestedString(element.Value, "reward_type"),
             amount = TryGetNestedInt(element.Value, "amount"),
+            rarity = TryGetNestedString(element.Value, "rarity"),
+            option_count = TryGetNestedInt(element.Value, "option_count"),
+            can_skip = TryGetNestedBool(element.Value, "can_skip"),
+            can_reroll = TryGetNestedBool(element.Value, "can_reroll"),
             relic = CompactRelicPayload(TryGetNestedElement(element.Value, "relic")),
             potion = CompactPotionPayload(TryGetNestedElement(element.Value, "potion")),
             card_count = TryGetNestedArrayLength(element.Value, "cards")
@@ -386,6 +391,12 @@ internal static partial class BridgeGameApi
         if (!string.IsNullOrWhiteSpace(potionId))
         {
             payload["id"] = potionId;
+        }
+
+        var slotIndex = TryGetNestedInt(element.Value, "slot_index");
+        if (slotIndex.HasValue)
+        {
+            payload["slot_index"] = slotIndex.Value;
         }
 
         if (!string.IsNullOrWhiteSpace(title))
@@ -548,10 +559,18 @@ internal static partial class BridgeGameApi
         var desc = TryGetNestedString(element.Value, "description") ?? "";
         return new
         {
+            index = TryGetNestedInt(element.Value, "index"),
+            slot_index = TryGetNestedInt(element.Value, "index"),
             kind = itemKind,
+            item_kind = itemKind,
+            slot_type = TryGetNestedString(element.Value, "slot_type"),
             title,
             cost,
-            affordable = TryGetNestedBool(element.Value, "is_affordable"),
+            enough_gold = TryGetNestedBool(element.Value, "enough_gold"),
+            is_stocked = TryGetNestedBool(element.Value, "is_stocked"),
+            is_affordable = TryGetNestedBool(element.Value, "is_affordable"),
+            is_on_sale = TryGetNestedBool(element.Value, "is_on_sale"),
+            used = TryGetNestedBool(element.Value, "used"),
             card = CompactCardPayload(TryGetNestedElement(element.Value, "card")),
             relic = CompactRelicPayload(TryGetNestedElement(element.Value, "relic")),
             potion = CompactPotionPayload(TryGetNestedElement(element.Value, "potion")),
@@ -571,7 +590,8 @@ internal static partial class BridgeGameApi
             option_id = TryGetNestedString(element.Value, "option_id"),
             option_type = TryGetNestedString(element.Value, "option_type"),
             title = TryGetNestedString(element.Value, "title"),
-            enabled = TryGetNestedBool(element.Value, "is_enabled")
+            heal_amount = TryGetNestedInt(element.Value, "heal_amount"),
+            is_enabled = TryGetNestedBool(element.Value, "is_enabled")
         };
     }
 

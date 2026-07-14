@@ -23,4 +23,4 @@ __all__ = [
     "validate_artifact_component",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -82,7 +82,10 @@ internal static partial class BridgeGameApi
             is_secondary_enemy = creature.IsSecondaryEnemy,
             is_stunned = creature.IsStunned,
             is_pet = creature.IsPet,
-            shows_infinite_hp = creature.ShowsInfiniteHp,
+            shows_infinite_hp = TryGetBoolFromPropertyOrField(
+                creature,
+                "ShowsInfiniteHp",
+                "_showsInfiniteHp") ?? false,
             can_receive_powers = creature.CanReceivePowers,
             slot_name = creature.SlotName,
             powers = creature.Powers.Select(BuildPowerPayload).ToArray(),
@@ -336,7 +339,10 @@ internal static partial class BridgeGameApi
             type = power.Type.ToString(),
             stack_type = power.StackType.ToString(),
             type_for_current_amount = power.TypeForCurrentAmount.ToString(),
-            is_instanced = power.IsInstanced,
+            is_instanced = TryGetBoolFromPropertyOrField(
+                power,
+                "IsInstanced",
+                "_isInstanced") ?? false,
             is_visible = power.IsVisible,
             allow_negative = power.AllowNegative,
             skip_next_duration_tick = power.SkipNextDurationTick,

@@ -23,9 +23,9 @@ actor-critic baseline 的训练与评估。
 |---|---:|---|
 | [`contracts/`](./contracts/README.md) | API `2.0.0` | JSON Schema、OpenAPI、fixture 与跨语言版本常量 |
 | [`game-data/`](./game-data/README.md) | `2.0.0` | 不含策略标注的卡牌、遗物与药水静态事实 |
-| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.8.0` | 游戏适配、可见状态、合法动作、串行命令与会话发现 |
+| [`mods/sts2-bridge/`](./mods/sts2-bridge/README.md) | `0.9.0` | 游戏适配、可见状态、合法动作、串行命令与会话发现 |
 | [`packages/mcp-server/`](./packages/mcp-server/README.md) | `0.5.0` | 使用官方 SDK 的 TypeScript MCP 服务；默认 `minimal` |
-| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.3.0` | grounded candidate 模型、类型化 backend、固定 reward、replay、learner 与 checkpoint |
+| [`packages/rl-agent/`](./docs/rl-grounded-baseline.md) | `0.4.0` | 关系化合法候选模型、类型化 backend、双时间尺度记忆、固定 reward、FIFO unroll、V-trace 与 checkpoint |
 | [`tools/`](./tools) | — | 契约、数据、资产、发布、许可证和仓库检查 |
 
 组件版本由 [`release-manifest.json`](./release-manifest.json) 协调。线协议以
@@ -151,7 +151,7 @@ node .\packages\mcp-server\index.js
 
 ## RL 开发与训练
 
-当前唯一受维护的训练入口是 **grounded-candidate actor-critic baseline**。
+当前唯一受维护的训练入口是 **关系化 grounded-candidate V-trace v3 baseline**。
 失败的 MuZero/token-memory/MCTS、PPO、planner 与手写 action guard 已删除：
 
 ```powershell
@@ -178,15 +178,16 @@ python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE
 模拟器启动前被拒绝。构建和验证流程见
 [HeadlessSim 构建身份](./docs/headless-simulator-identity.md)。
 
-默认模型有 3,642,824 个参数，只对当前合法候选评分；没有 latent dynamics、MCTS、
-planner 或游戏特定 action rewrite。Reward 固定且归一化，replay 混合 coverage、
-recent 与可刷新的 priority。Collector 编码会以紧凑稀疏 snapshot 保存在 replay
-中，因此 learner 更新只需 collate 模型输入，不再重复解析原始 JSON。详见
+默认模型有 4,014,146 个参数，只对当前合法候选评分；256 维循环状态拆为全局流程
+与局内战斗两个时间尺度。模型接收事实性的定义、实例、牌堆区域、动作来源和目标关系，
+不包含 latent dynamics、MCTS、planner 或游戏特定 action rewrite。Reward 固定且归一化。
+Actor 将 64 步连续 recurrent unroll 写入有界 FIFO，V-trace learner 每条只消费一次，
+没有 replay sampling 或 priority。紧凑稀疏 snapshot 使 learner 无需重复解析原始 JSON。详见
 [`docs/rl-grounded-baseline.md`](./docs/rl-grounded-baseline.md)。
 
-正式 profile 仍采用同步 collector/learner。仓库提供了仅用于受控 profiling 的
-单 episode 有界重叠模式；ROCm learner + CPU actor 相比新的同步对照只提升约
-10.4%，同时出现 3–28 次 update 的策略滞后，因此尚未作为长期训练默认路径。
+Collector 与 learner 默认异步重叠。独立 actor 模型在 collector device 上生成带策略
+版本的 unroll，容量 256 的队列提供反压；learner 进行有界策略滞后的 V-trace 修正，
+并只在 actor 的 episode 边界发布新参数。
 
 软件闭环已有测试，但目前还没有新架构长期训练 checkpoint 或 Act 1 clear-rate
 成绩，不能把 dry-run/单元测试误报为模型效果。所选 backend 的 v2 parity 未通过前，

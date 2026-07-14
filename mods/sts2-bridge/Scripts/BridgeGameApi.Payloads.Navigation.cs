@@ -233,6 +233,16 @@ internal static partial class BridgeGameApi
             };
         }
 
+        object? healAmount = null;
+        if (option is HealRestSiteOption healOption)
+        {
+            var owner = GetHiddenPropertyObjectValue(healOption, "Owner") as Player;
+            if (owner is not null)
+            {
+                healAmount = HealRestSiteOption.GetHealAmount(owner);
+            }
+        }
+
         return new
         {
             index,
@@ -240,6 +250,7 @@ internal static partial class BridgeGameApi
             option_type = option.GetType().Name,
             title = TryGetTitle(option),
             description = BuildRestSiteOptionDescription(option),
+            heal_amount = healAmount,
             is_enabled = option.IsEnabled
         };
     }
@@ -381,7 +392,7 @@ internal static partial class BridgeGameApi
         };
     }
 
-    private static object BuildPotionPayload(PotionModel? potion)
+    private static object BuildPotionPayload(PotionModel? potion, int? slotIndex = null)
     {
         if (potion is null)
         {
@@ -395,6 +406,7 @@ internal static partial class BridgeGameApi
         {
             id = potion.Id.ToString(),
             model_id = potion.Id.ToString(),
+            slot_index = slotIndex,
             class_name = potion.GetType().Name,
             title = TryGetTitle(potion),
             description = TryGetDescription(potion),

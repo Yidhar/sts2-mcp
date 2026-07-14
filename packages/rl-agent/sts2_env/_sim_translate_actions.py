@@ -6,6 +6,11 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 
+from ._sim_translate_decisions import (
+    _translate_reward_item,
+    _translate_reward_payload,
+    _translate_shop_item,
+)
 from ._sim_translate_entities import (
     _translate_card,
     _translate_enemy,
@@ -62,6 +67,7 @@ def _translate_legal_actions(
     event: Mapping[str, Any],
     rest_site: Mapping[str, Any],
     shop: Mapping[str, Any],
+    rewards: Mapping[str, Any],
     card_reward: Mapping[str, Any],
     card_select: Mapping[str, Any],
     treasure: Mapping[str, Any],
@@ -74,9 +80,7 @@ def _translate_legal_actions(
     filtering, sorting, score, safety mask, or confirm-action hoist.
     """
 
-    if isinstance(sim_legal_actions, str | bytes) or not isinstance(
-        sim_legal_actions, Sequence
-    ):
+    if isinstance(sim_legal_actions, str | bytes) or not isinstance(sim_legal_actions, Sequence):
         raise TypeError("simulator legal_actions must be a sequence")
 
     output: list[dict[str, Any]] = []
@@ -125,6 +129,12 @@ def _translate_legal_actions(
                 "_sim_raw": deepcopy(dict(raw_action)),
             }
         )
+        if sim_kind == "shop_purchase":
+            action["model_action_variant"] = "buy"
+            action["shop_action"] = "buy"
+        elif sim_kind == "shop_skip":
+            action["model_action_variant"] = "leave"
+            action["shop_action"] = "leave"
         if selection_operation is not None:
             # The policy vocabulary intentionally shares one card-selection
             # family, while this variant preserves the exact state mutation.
@@ -141,9 +151,7 @@ def _translate_legal_actions(
                 "remaining_select": ("remaining_select", "remaining_picks"),
                 "confirm_ready": ("confirm_ready", "can_confirm"),
                 "cancelable": ("cancelable", "can_cancel"),
-                "requires_manual_confirmation": (
-                    "requires_manual_confirmation",
-                ),
+                "requires_manual_confirmation": ("requires_manual_confirmation",),
                 "mode": ("mode", "screen_type"),
                 "prompt_id": ("prompt_id",),
                 "source_zone": ("source_zone", "source_pile"),
@@ -167,11 +175,13 @@ def _translate_legal_actions(
             if enemy is not None:
                 action["target"] = _translate_enemy(enemy)
         elif sim_kind in {"use_potion", "discard_potion"}:
-            potion = _find_index(
-                sim_player.get("potions"), raw_action.get("slot"), index_field="slot"
-            )
+            potion = _find_index(sim_player.get("potions"), raw_action.get("slot"), index_field="slot")
             if potion is not None:
-                action["potion"] = _translate_potion(potion)
+                slot = raw_action.get("slot")
+                action["potion"] = _translate_potion(
+                    potion,
+                    slot_index=slot if isinstance(slot, int) else None,
+                )
             enemy = _find_enemy(battle.get("enemies"), raw_action.get("target_id"))
             if enemy is not None:
                 action["target"] = _translate_enemy(enemy)
@@ -190,7 +200,23 @@ def _translate_legal_actions(
         elif sim_kind == "shop_purchase":
             item = _find_index(shop.get("items"), raw_action.get("index"))
             if item is not None:
-                action["item"] = deepcopy(dict(item))
+                item_index = raw_action.get("index")
+                action["item"] = _translate_shop_item(
+                    item,
+                    index=item_index if isinstance(item_index, int) else 0,
+                )
+        elif sim_kind == "claim_reward":
+            reward_index = raw_action.get("index")
+            item = _find_index(rewards.get("items"), reward_index)
+            if item is not None:
+                index = reward_index if isinstance(reward_index, int) else 0
+                translated_item = _translate_reward_item(item, index=index)
+                nested_reward = translated_item.get("reward")
+                action["reward"] = (
+                    nested_reward
+                    if isinstance(nested_reward, Mapping)
+                    else _translate_reward_payload(translated_item, index=index)
+                )
         elif sim_kind in {"choose_card_reward", "select_card_reward"}:
             card = _find_index(card_reward.get("cards"), raw_action.get("index"))
             if card is not None:

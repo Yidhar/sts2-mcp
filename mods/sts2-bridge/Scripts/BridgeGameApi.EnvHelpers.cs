@@ -62,7 +62,9 @@ internal static partial class BridgeGameApi
                 break;
 
             case "reward":
-                entry["reward"] = CompactRewardPayload(TryGetNestedElement(payload, "reward"));
+                entry["reward"] = CompactRewardPayload(
+                    TryGetNestedElement(payload, "reward"),
+                    TryGetNestedInt(payload, "index"));
                 break;
 
             case "card_reward":

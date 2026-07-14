@@ -67,7 +67,9 @@ of rebuilding the former monolith.
 - v2 action revision validation, current-handle re-resolution, and action start
   happen in one main-thread work item.
 - `/v2/state` uses an explicit root allowlist and recursively removes hidden
-  draw-pile order, legacy hashes, and policy/training annotations.
+  draw-pile order, legacy hashes, and policy/training annotations. Public
+  draw-pile composition is emitted in canonical order with
+  `order_visible=false`.
 - `/v2/events` carries only bounded revision notifications; clients fetch the
   latest `/v2/state` snapshot after observing a newer revision.
 - v2 training results contain canonical `transition_facts`; scalar `reward` is
@@ -126,6 +128,15 @@ A v2 reset must include `expected_state_version` from the latest
 the global mutation gate before reset work begins. Reset and step results expose
 real `state_version_before`/`state_version_after`; `committed_state_version`
 uses the actual final frontier revision and never the episode `step_index`.
+
+Training environment observations expose complete factual state for the active
+decision surface: unordered draw/discard/exhaust/play pile contents, stable card
+and combat instance identities, potion slots, map connectivity, shop inventory,
+rest options and heal amount, rewards, card-selection membership, and deck
+upgrade previews. Inactive macro UI trees are not serialized into combat
+decisions. These additions are interface facts only; the Bridge does not attach
+card tiers, route scores, target priorities, predicted damage, event outcomes,
+or reward shaping.
 
 Player commands require `deadline_utc` no more than 120 seconds in the future,
 a non-empty `action_handle`, and `wait_after_ms` from 0 through 5000. Unknown or

@@ -104,9 +104,7 @@ def translate_to_bridge_shape(
         ),
     )
     in_combat = bool(
-        state_type in {"combat", "battle"}
-        or battle.get("player") is not None
-        or battle.get("enemies") is not None
+        state_type in {"combat", "battle"} or battle.get("player") is not None or battle.get("enemies") is not None
     )
     phase = _phase_from_state(state_type, in_combat=in_combat)
 
@@ -115,11 +113,7 @@ def translate_to_bridge_shape(
         raw_actions = []
     if not isinstance(raw_actions, list | tuple):
         raise TypeError("simulator legal_actions must be a sequence")
-    combat_card_selection = (
-        battle.get("card_selection")
-        if isinstance(battle.get("card_selection"), Mapping)
-        else None
-    )
+    combat_card_selection = battle.get("card_selection") if isinstance(battle.get("card_selection"), Mapping) else None
     action_card_selection = card_select or hand_select or combat_card_selection or {}
     actions = _translate_legal_actions(
         raw_actions,
@@ -129,17 +123,14 @@ def translate_to_bridge_shape(
         event=event,
         rest_site=rest_site,
         shop=shop,
+        rewards=rewards_state,
         card_reward=card_reward,
         card_select=action_card_selection,
         treasure=treasure,
         relic_select=relic_select,
     )
 
-    event_payload = {
-        key: deepcopy(value)
-        for key, value in event.items()
-        if key not in {"player", "options"}
-    }
+    event_payload = {key: deepcopy(value) for key, value in event.items() if key not in {"player", "options"}}
     event_payload["options"] = _translate_event_options(event)
 
     observation: dict[str, Any] = {
@@ -162,9 +153,7 @@ def translate_to_bridge_shape(
         "run": _translate_run_block(sim_run),
         "map": _translate_map_block(map_state),
         "event": event_payload,
-        "rewards": _translate_rewards_block(
-            rewards_state, card_reward, treasure, relic_select
-        ),
+        "rewards": _translate_rewards_block(rewards_state, card_reward, treasure, relic_select),
         "rest_site": _translate_rest_site_block(rest_site),
         "shop": _translate_shop_block(shop),
         "card_selection": _translate_card_sel_block(
@@ -180,9 +169,7 @@ def translate_to_bridge_shape(
         "_training": {
             "revival_budget": sim_state.get("training_revival_budget"),
             "revivals_used": int(sim_state.get("training_revivals_used", 0) or 0),
-            "player_hp_lost": float(
-                sim_state.get("training_player_hp_lost", 0) or 0
-            ),
+            "player_hp_lost": float(sim_state.get("training_player_hp_lost", 0) or 0),
         },
         # Dispatch/debug provenance stays outside model features: the grounded
         # encoder rejects all underscore-prefixed fields.

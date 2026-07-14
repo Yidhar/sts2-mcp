@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sts2-rl"
-version = "0.3.0"
+version = "0.4.0"
 description = "Grounded legal-candidate actor-critic baseline for Slay the Spire 2"
 requires-python = ">=3.11"
 dependencies = [

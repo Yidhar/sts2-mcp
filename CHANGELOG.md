@@ -21,9 +21,10 @@ historical RL artifacts.
 - Replaced the failed MuZero/token-memory/MCTS line with
   `python -m sts2_rl.train`. Old checkpoints and replay are not compatible with the
   new randomly initialized grounded baseline.
-- Advanced the grounded observation ABI to runtime-mechanics v6 with a 224-feature
-  minimum. Earlier card/selection checkpoints are rejected rather than padded or
-  migrated.
+- Advanced the grounded observation ABI from runtime-mechanics v6 to relational
+  runtime encoding v7 with a 224-feature minimum. Definition/instance/zone
+  channels and the run/combat memory split intentionally reject earlier
+  card/selection checkpoints rather than padding or migrating them.
 - Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
 
 ### Added
@@ -66,9 +67,20 @@ historical RL artifacts.
   enchantments/afflictions, events, observable enemy moves and boss encounter identity;
   formal headless training now fails closed on a catalog and event-to-combat mechanics
   preflight before launching collectors.
+- Added Bridge 0.9 and RL 0.4 relational training facts: collision-free process-local
+  card references, player-visible unordered draw composition, full active map/shop/rest/
+  reward/selection payloads, fixed pile zones, exact action source/target binding,
+  owner relations for card modifiers and enemy mechanics, guaranteed mutation facts,
+  learned exact-instance vs same-definition grounding, and separate run/combat recurrent
+  memory. No card tier, target priority, route score, predicted outcome, or new reward
+  heuristic was introduced.
 
 ### Fixed
 
+- Changed the maintained standard `full-run` profile from the Act-1 diagnostic
+  objective to the complete-run objective. Entering Act 2 is now ordinary
+  progress rather than an implicit episode boundary; `act1` remains available
+  only when explicitly selected for diagnostics.
 - Raised the fail-closed candidate-local fact capacity from 24 to 64 after the
   first uninterrupted full-run collection crossed an Act transition and then
   encountered a legal action requiring at least 26 tokens. Overflow diagnostics

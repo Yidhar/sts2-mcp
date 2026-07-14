@@ -9,7 +9,7 @@ internal static class BridgeRuntime
     public const string ModId = "sts2-bridge";
     public const string HarmonyId = "dev.yidhar.sts2.bridge";
     public const string BridgeName = "STS2 MCP Bridge";
-    public const string BridgeVersion = "0.8.0";
+    public const string BridgeVersion = "0.9.0";
     public const string StateSchemaVersion = "2026-03-20.1";
     public const int BasePreferredPort = 27100;
     public const int PortsPerInstance = 10;

@@ -23,7 +23,7 @@ import json
 import math
 import re
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -186,6 +186,20 @@ _IDENTITY_KEYS: Final[tuple[str, ...]] = (
     "room_model_id",
     "room_model",
 )
+_INSTANCE_KEYS: Final[tuple[str, ...]] = (
+    # These identifiers never define what an entity *is*.  They bind a legal
+    # action to the same concrete runtime object in the world observation.
+    # The model receives them through the separate entity_aux channel.
+    "instance_uuid",
+    "card_instance_id",
+    "combat_uuid",
+    "instance_id",
+    "card_ref",
+    "ref",
+    "uuid",
+    "uid",
+    "combat_id",
+)
 _ROLE_KEYS: Final[tuple[str, ...]] = (
     "kind",
     "type",
@@ -205,6 +219,7 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "act",
         "amount",
         "amount_on_turn_start",
+        "act_floor",
         "ascension",
         "block",
         "charges",
@@ -230,6 +245,7 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "focus",
         "gold",
         "height",
+        "heal_amount",
         "hits",
         "hp",
         "level",
@@ -243,6 +259,7 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "min_count",
         "min_select",
         "open_potion_slots",
+        "option_count",
         "orb_empty_slots",
         "orb_slots",
         "passive_val",
@@ -254,6 +271,9 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "repeats",
         "round",
         "row",
+        "rows",
+        "columns",
+        "slot_index",
         "stars",
         "selected_count",
         "stack_count",
@@ -282,6 +302,7 @@ _CARD_PATH_PARTS: Final[frozenset[str]] = frozenset(
         "selectable_cards",
         "selected_cards",
         "upgrade_preview",
+        "upgrade_previews",
     }
 )
 _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
@@ -335,6 +356,7 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         *_OWNER_KEYS,
         *_ROLE_KEYS,
         "action",
+        "act_id",
         "character",
         "character_id",
         "class_name",
@@ -347,11 +369,13 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "event_id",
         "intent_type",
         "destination_zone",
+        "item_kind",
         "layout_type",
         "mode",
         "next_move_id",
         "next_move_state_id",
         "operation_type",
+        "option_type",
         "owner_model_id",
         "owner_side",
         "applier_model_id",
@@ -360,6 +384,7 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "prompt_id",
         "power_type",
         "rarity",
+        "resource",
         "room_model",
         "room_model_id",
         "room_type",
@@ -367,6 +392,7 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "screen",
         "selection_membership",
         "slot_name",
+        "slot_type",
         "source_zone",
         "stack_type",
         "state_type",
@@ -398,9 +424,11 @@ _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
         "can_be_generated_in_combat",
         "can_receive_powers",
         "can_skip",
+        "can_reroll",
         "can_throw_at_ally",
         "can_transition_away",
         "can_use_in_combat",
+        "enough_gold",
         "cancelable",
         "confirm_ready",
         "exhaust",
@@ -414,9 +442,11 @@ _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
         "in_dialogue",
         "in_progress",
         "is_allowed_in_shops",
+        "is_affordable",
         "is_alive",
         "is_deterministic",
         "is_finished",
+        "is_enabled",
         "is_hittable",
         "is_instanced",
         "is_chosen",
@@ -436,7 +466,12 @@ _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
         "is_upgraded",
         "is_used_up",
         "is_proceed",
+        "is_on_sale",
+        "is_open",
+        "is_stocked",
         "is_visible",
+        "is_travel_enabled",
+        "is_traveling",
         "is_wax",
         "must_perform_once_before_transitioning",
         "owner_is_secondary_enemy",
@@ -456,6 +491,9 @@ _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
         "spawned_this_turn",
         "spawns_pets",
         "upgraded",
+        "used",
+        "visible",
+        "proceed_visible",
     }
 )
 _ENGINEERED_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
@@ -498,6 +536,7 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "enchantment",
         "enchantments",
         "enemies",
+        "edges",
         "event",
         "exhaust_pile",
         "game_over",
@@ -543,6 +582,9 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "tags",
         "traits",
         "decision",
+        "dimensions",
+        "current_coord",
+        "transaction",
     }
 )
 _SOURCE_KEYS: Final[tuple[str, ...]] = (
@@ -551,13 +593,52 @@ _SOURCE_KEYS: Final[tuple[str, ...]] = (
     "selected_character",
     "potion",
     "relic",
+    "reward",
     "item",
     "option",
     "map_node",
 )
 _CANDIDATE_LOCAL_ROOTS: Final[frozenset[str]] = frozenset(
-    {*_SOURCE_KEYS, "target", "coord", "selection"}
+    {
+        *_SOURCE_KEYS,
+        "target",
+        "coord",
+        "selection",
+        "transaction",
+        "upgrade_preview",
+    }
 )
+
+# Stable physical/decision regions.  Known zones are never sent through a
+# collision-prone hash in production.  Unknown future zones still have a
+# deterministic fallback so a game update remains representable until the
+# vocabulary is reviewed.
+_ZONE_IDS: Final[dict[str, int]] = {
+    "deck": 2,
+    "hand": 3,
+    "draw": 4,
+    "discard": 5,
+    "exhaust": 6,
+    "play": 7,
+    "reward": 8,
+    "shop": 9,
+    "map": 10,
+    "rest_site": 11,
+    "event": 12,
+    "player": 13,
+    "enemy": 14,
+    "relic": 15,
+    "potion": 16,
+    "selection": 17,
+    "power": 18,
+    "intent": 19,
+    "modifier": 20,
+    "transaction": 21,
+    "run": 22,
+    "combat": 23,
+    "candidate": 24,
+    "world": 25,
+}
 
 # Feature ABI v1.  Numeric state keys must never share a slot: doing so makes
 # observations such as ``block=3,max_hp=80`` alias a value-swapped state.  The
@@ -565,16 +646,10 @@ _CANDIDATE_LOCAL_ROOTS: Final[frozenset[str]] = frozenset(
 # disjoint from categorical and arbitrary ``dynamic_vars`` hashing.
 _SUMMARY_SLOT_COUNT: Final = 6
 _FIXED_NUMERIC_KEYS: Final[tuple[str, ...]] = tuple(
-    sorted(
-        _FACT_NUMERIC_KEYS
-        | _FACT_BOOLEAN_KEYS
-        | _CARD_FACT_NUMERIC_KEYS
-        | _CARD_FACT_BOOLEAN_KEYS
-    )
+    sorted(_FACT_NUMERIC_KEYS | _FACT_BOOLEAN_KEYS | _CARD_FACT_NUMERIC_KEYS | _CARD_FACT_BOOLEAN_KEYS)
 )
 _NUMERIC_SLOT_BY_KEY: Final[dict[str, int]] = {
-    key: _SUMMARY_SLOT_COUNT + index
-    for index, key in enumerate(_FIXED_NUMERIC_KEYS)
+    key: _SUMMARY_SLOT_COUNT + index for index, key in enumerate(_FIXED_NUMERIC_KEYS)
 }
 _CATEGORY_SLOT_COUNT: Final = 32
 _CATEGORY_SLOT_START: Final = _SUMMARY_SLOT_COUNT + len(_FIXED_NUMERIC_KEYS)
@@ -588,18 +663,16 @@ _DYNAMIC_VALUE_KEYS: Final[tuple[str, ...]] = (
     "was_just_upgraded",
 )
 _DYNAMIC_VALUE_SLOT_BY_KEY: Final[dict[str, int]] = {
-    key: _DYNAMIC_SLOT_START + index
-    for index, key in enumerate(_DYNAMIC_VALUE_KEYS)
+    key: _DYNAMIC_SLOT_START + index for index, key in enumerate(_DYNAMIC_VALUE_KEYS)
 }
 _DYNAMIC_HASH_SLOT_START: Final = _DYNAMIC_SLOT_START + len(_DYNAMIC_VALUE_KEYS)
 _DYNAMIC_HASH_SLOT_COUNT: Final = _DYNAMIC_SLOT_COUNT - len(_DYNAMIC_VALUE_KEYS)
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-runtime-mechanics-encoding-v6"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v7"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
-        "grounded feature ABI exceeds MIN_TOKEN_FEATURE_DIM: "
-        f"{_FEATURE_ABI_END} > {MIN_TOKEN_FEATURE_DIM}"
+        "grounded feature ABI exceeds MIN_TOKEN_FEATURE_DIM: " f"{_FEATURE_ABI_END} > {MIN_TOKEN_FEATURE_DIM}"
     )
 
 
@@ -633,6 +706,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "world_excluded_keys": sorted(_WORLD_EXCLUDED_KEYS),
         "candidate_excluded_keys": sorted(_CANDIDATE_EXCLUDED_KEYS),
         "identity_keys": list(_IDENTITY_KEYS),
+        "instance_keys": list(_INSTANCE_KEYS),
         "role_keys": list(_ROLE_KEYS),
         "owner_keys": list(_OWNER_KEYS),
         "categorical_keys": sorted(_FACT_CATEGORICAL_KEYS),
@@ -643,6 +717,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "container_keys": sorted(_FACT_CONTAINER_KEYS),
         "source_keys": list(_SOURCE_KEYS),
         "candidate_local_roots": sorted(_CANDIDATE_LOCAL_ROOTS),
+        "zone_ids": _ZONE_IDS,
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
@@ -713,6 +788,7 @@ class _WalkItem:
     value: Any
     path: tuple[str, ...]
     inherited_owner: str
+    inherited_relation: str
     order: int
     depth: int
 
@@ -725,6 +801,149 @@ def _hash_id(namespace: str, value: Any, size: int) -> int:
         return 1
     digest = hashlib.sha256(f"{namespace}\0{text}".encode()).digest()
     return 2 + int.from_bytes(digest[:8], "big") % (size - 2)
+
+
+def _stable_zone_id(value: Any, size: int) -> int:
+    """Encode reviewed zones collision-free and future zones deterministically."""
+
+    normalized = _normalize_key(value)
+    aliases = {
+        "draw_pile": "draw",
+        "discard_pile": "discard",
+        "exhaust_pile": "exhaust",
+        "play_pile": "play",
+        "deck_cards": "deck",
+        "card_reward": "reward",
+        "card_reward_selection": "reward",
+        "rewards": "reward",
+        "rest": "rest_site",
+        "restsite": "rest_site",
+        "enchantments": "modifier",
+        "afflictions": "modifier",
+        "dynamic_vars": "modifier",
+        "powers": "power",
+        "intents": "intent",
+        "enemies": "enemy",
+        "relics": "relic",
+        "potions": "potion",
+        "decision": "selection",
+    }
+    canonical = aliases.get(normalized, normalized)
+    stable = _ZONE_IDS.get(canonical)
+    if stable is not None and stable < size:
+        return stable
+    return _hash_id("zone", canonical, size)
+
+
+def _instance_field(value: Mapping[str, Any]) -> str:
+    return _string_field(value, _INSTANCE_KEYS)
+
+
+def _coord_relation(value: Mapping[str, Any]) -> str:
+    raw_coord = value.get("coord")
+    coord = raw_coord if isinstance(raw_coord, Mapping) else value
+    x = _first_present(coord, "x", "col", "column")
+    y = _first_present(coord, "y", "row")
+    if (
+        isinstance(x, int | float)
+        and not isinstance(x, bool)
+        and isinstance(y, int | float)
+        and not isinstance(y, bool)
+    ):
+        return f"map_coord:{int(x)}:{int(y)}"
+    return ""
+
+
+def _relation_identity(
+    value: Mapping[str, Any],
+    *,
+    path: tuple[str, ...],
+    inherited: str,
+) -> str:
+    """Return a runtime relation key, distinct from definition identity.
+
+    Per-instance IDs bind cards and enemies across piles/actions.  Coordinates
+    bind map choices to the corresponding graph node.  Children without their
+    own identity inherit the enclosing entity relation, which explicitly ties
+    dynamic vars, modifiers, powers and intents to their owner.
+    """
+
+    instance = _instance_field(value)
+    if instance:
+        return f"instance:{instance}"
+    coord = _coord_relation(value)
+    if coord:
+        return coord
+    normalized_path = {_normalize_key(part) for part in path}
+    leaf = _normalize_key(path[-1]) if path else "world"
+    if leaf in {
+        "player",
+        "run",
+        "combat",
+        "event",
+        "map",
+        "shop",
+        "rest_site",
+        "rewards",
+        "card_selection",
+        "deck_upgrade_selection",
+    }:
+        return f"group:{leaf}"
+    identity = _string_field(value, _IDENTITY_KEYS)
+    if inherited and normalized_path & {
+        "powers",
+        "intents",
+        "dynamic_vars",
+        "enchantments",
+        "afflictions",
+    }:
+        # Definition identity still distinguishes the child token. Sharing the
+        # concrete relation ID binds it to the exact owning card/enemy/player.
+        return inherited
+    if identity and normalized_path & {
+        "card",
+        "cards",
+        "deck_cards",
+        "hand",
+        "discard_pile",
+        "exhaust_pile",
+        "play_pile",
+        "enemies",
+        "relics",
+        "potions",
+        "powers",
+        "intents",
+        "items",
+    }:
+        return f"entity:{identity}"
+    return inherited
+
+
+def _zone_label(value: Mapping[str, Any], path: tuple[str, ...]) -> str:
+    physical = _first_present(value, "source_pile", "pile", "zone")
+    if physical is not None and str(physical).strip():
+        return str(physical)
+    for part in reversed(path):
+        normalized = _normalize_key(part)
+        if normalized in _ZONE_IDS or normalized in {
+            "draw_pile",
+            "discard_pile",
+            "exhaust_pile",
+            "play_pile",
+            "deck_cards",
+            "card_reward_selection",
+            "enchantments",
+            "afflictions",
+            "dynamic_vars",
+            "powers",
+            "intents",
+            "enemies",
+            "relics",
+            "potions",
+            "decision",
+        }:
+            return normalized
+    return path[-1] if path else "unknown"
 
 
 def _bounded_number(value: Any) -> float | None:
@@ -869,7 +1088,9 @@ def _canonical_dynamic_vars(value: Any) -> list[dict[str, Any]]:
             raw_values: Sequence[Any] = [value]
         else:
             raw_values = [
-                {"name": key, **dict(item)} if isinstance(item, Mapping) else {
+                {"name": key, **dict(item)}
+                if isinstance(item, Mapping)
+                else {
                     "name": key,
                     "base_value": item,
                     "current_value": item,
@@ -986,6 +1207,9 @@ def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
         item = _first_present(value, *source_keys)
         if item is not None:
             result[canonical] = item
+    instance = _first_present(value, *_INSTANCE_KEYS)
+    if instance is not None and str(instance).strip():
+        result["instance_id"] = str(instance).strip()
     for field, fact_type in (
         ("keywords", "card_keyword"),
         ("tags", "card_tag"),
@@ -1110,6 +1334,12 @@ def _canonical_inventory_entity(
     identity = _first_present(value, *id_keys)
     if identity is not None and str(identity).strip():
         result["id"] = identity
+    instance = _first_present(value, *_INSTANCE_KEYS)
+    if instance is not None and str(instance).strip():
+        result["instance_id"] = str(instance).strip()
+    slot_index = _first_present(value, "slot_index", "slot")
+    if isinstance(slot_index, int) and not isinstance(slot_index, bool):
+        result["slot_index"] = slot_index
     for key in ("rarity", "charges", "target_type", "type", "status"):
         item = _first_present(value, key)
         if item is not None:
@@ -1189,6 +1419,9 @@ def _canonical_enemy(value: Mapping[str, Any]) -> dict[str, Any]:
         stable_identity = raw_id
     if stable_identity is not None:
         result["model_id"] = stable_identity
+    instance = _first_present(value, *_INSTANCE_KEYS)
+    if instance is not None and str(instance).strip():
+        result["instance_id"] = str(instance).strip()
     for key in (
         "side",
         "hp",
@@ -1221,9 +1454,7 @@ def _canonical_enemy(value: Mapping[str, Any]) -> dict[str, Any]:
         label="enemy powers",
     )
     result["powers"] = [_canonical_power(item) for item in powers]
-    result["powers"].sort(
-        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
-    )
+    result["powers"].sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     intents = _as_mapping_list(
         _first_present(value, "intents"),
         label="enemy intents",
@@ -1357,13 +1588,185 @@ def _canonical_event(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _canonical_map(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, aliases in {
+        "is_open": ("is_open",),
+        "is_travel_enabled": ("is_travel_enabled",),
+        "is_traveling": ("is_traveling",),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    raw_current = _first_present(value, "current_coord", "coord")
+    if raw_current is not None:
+        coord = _canonical_coord(_as_mapping(raw_current, label="map.current_coord"))
+        if coord:
+            result["current_coord"] = coord
+    raw_dimensions = _first_present(value, "dimensions")
+    if isinstance(raw_dimensions, Mapping):
+        dimensions: dict[str, Any] = {}
+        for key in ("rows", "columns"):
+            item = _first_present(raw_dimensions, key)
+            if item is not None:
+                dimensions[key] = item
+        if dimensions:
+            result["dimensions"] = dimensions
+    raw_points = _first_present(value, "points", "nodes")
+    if raw_points is not None:
+        points = [_canonical_map_node(point) for point in _as_mapping_list(raw_points, label="map.points")]
+        canonical_points = [point for point in points if point]
+        edges: list[dict[str, Any]] = []
+        for point in canonical_points:
+            source = str(point.get("instance_id") or "")
+            for child in point.get("children", []):
+                if not isinstance(child, Mapping):
+                    continue
+                target = str(child.get("instance_id") or "")
+                if source and target:
+                    edges.append(
+                        {
+                            "id": source,
+                            "instance_id": target,
+                            "type": "map_edge",
+                        }
+                    )
+        if edges:
+            result["edges"] = edges
+        # Edges now carry the exact source/target relation pair, so retaining
+        # nested child-coordinate copies would only multiply attention cost.
+        result["points"] = [
+            {key: item for key, item in point.items() if key != "children"} for point in canonical_points
+        ]
+    raw_next = _first_present(value, "next_options")
+    if raw_next is not None:
+        options = [_canonical_map_node(point) for point in _as_mapping_list(raw_next, label="map.next_options")]
+        result["next_options"] = [point for point in options if point]
+    return result
+
+
+def _canonical_shop(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in (
+        "visible",
+        "is_open",
+        "gold",
+        "merchant_button_visible",
+        "back_button_visible",
+        "proceed_visible",
+    ):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    raw_items = _first_present(value, "items")
+    if raw_items is not None:
+        result["items"] = [
+            item for raw in _as_mapping_list(raw_items, label="shop.items") if (item := _canonical_item(raw))
+        ]
+    return result
+
+
+def _canonical_rest_site(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in ("visible", "proceed_visible"):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    raw_options = _first_present(value, "options")
+    if raw_options is not None:
+        options: list[dict[str, Any]] = []
+        for raw in _as_mapping_list(raw_options, label="rest_site.options"):
+            option = _canonical_option(raw)
+            heal_amount = _first_present(raw, "heal_amount")
+            if heal_amount is not None:
+                option["heal_amount"] = heal_amount
+            if option:
+                options.append(option)
+        result["options"] = options
+    return result
+
+
+def _canonical_reward(
+    value: Mapping[str, Any],
+    *,
+    slot_index: int | None = None,
+) -> dict[str, Any]:
+    """Project one claimable reward without inventing hidden contents."""
+
+    result: dict[str, Any] = {}
+    reward_type = _first_present(value, "reward_type", "type", "kind")
+    if reward_type is not None and str(reward_type).strip():
+        normalized_type = str(reward_type).strip()
+        result["id"] = f"reward:{normalized_type}"
+        result["type"] = normalized_type
+    resolved_slot = _first_present(value, "slot_index", "index")
+    if resolved_slot is None:
+        resolved_slot = slot_index
+    if isinstance(resolved_slot, int) and not isinstance(resolved_slot, bool):
+        result["slot_index"] = resolved_slot
+        result["instance_id"] = f"reward_slot:{resolved_slot}"
+    for key in ("amount", "rarity", "option_count", "card_count"):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    for key in ("can_skip", "can_reroll"):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    for key, projector in (
+        ("card", _canonical_card),
+        ("relic", _canonical_relic),
+        ("potion", _canonical_potion),
+    ):
+        raw = _first_present(value, key)
+        if raw is not None:
+            result[key] = projector(_as_mapping(raw, label=f"reward.{key}"))
+    return result
+
+
+def _canonical_rewards(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain only explicit reward entities; no reward-quality annotation."""
+
+    result: dict[str, Any] = {}
+    for field, projector in (
+        ("cards", _canonical_card),
+        ("relics", _canonical_relic),
+        ("potions", _canonical_potion),
+    ):
+        raw_values = _first_present(value, field)
+        if raw_values is None:
+            continue
+        result[field] = [
+            projected for raw in _as_mapping_list(raw_values, label=f"rewards.{field}") if (projected := projector(raw))
+        ]
+    for key in ("can_skip", "proceed_visible"):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    raw_entries = _first_present(value, "rewards", "items")
+    if raw_entries is not None:
+        items: list[dict[str, Any]] = []
+        for entry in _as_mapping_list(raw_entries, label="rewards.items"):
+            raw_reward = _first_present(entry, "reward")
+            reward = _as_mapping(raw_reward, label="rewards.items.reward") if raw_reward is not None else entry
+            raw_slot = _first_present(entry, "slot_index", "index")
+            slot = raw_slot if isinstance(raw_slot, int) and not isinstance(raw_slot, bool) else None
+            normalized = _canonical_reward(reward, slot_index=slot)
+            if normalized:
+                items.append(normalized)
+        if items:
+            result["items"] = items
+    return result
+
+
 def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
     """Project live/headless state to one deliberately shared model DTO.
 
     Inactive UI sections are not part of the model contract.  Public discard
     and exhaust composition, physical source piles, and exact multi-selection
-    membership are retained because they change legal decisions.  Hidden draw
-    order/composition remains represented by count only.
+    membership are retained because they change legal decisions.  Public draw
+    composition is represented as an orderless multiset; hidden draw order is
+    never retained.
     """
 
     phase = str(observation.get("phase") or "unknown")
@@ -1389,11 +1792,14 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         deck_cards = _as_mapping_list(deck_value, label="player deck")
         deck_count = len(deck_cards)
 
-    canonical_deck_cards = _canonical_card_sequence(
-        deck_cards,
-        label="player.deck_cards",
-        pile="Deck",
-    ) or []
+    canonical_deck_cards = (
+        _canonical_card_sequence(
+            deck_cards,
+            label="player.deck_cards",
+            pile="Deck",
+        )
+        or []
+    )
     player: dict[str, Any] = {
         "deck": deck_count,
         "deck_cards": canonical_deck_cards,
@@ -1407,9 +1813,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         "relics": [],
         "potions": [],
     }
-    player["powers"].sort(
-        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
-    )
+    player["powers"].sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     for relic in _as_mapping_list(
         _first_present(raw_player, "relics"),
         label="player relics",
@@ -1425,9 +1829,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         if normalized.get("id"):
             player["potions"].append(normalized)
     for field in ("relics", "potions"):
-        player[field].sort(
-            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
-        )
+        player[field].sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     for key, aliases in {
         "character_id": ("character_id", "character"),
         "hp": ("hp", "current_hp"),
@@ -1495,11 +1897,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         canonical["terminated"] = True
 
     raw_enemies = _first_present(raw_combat, "enemies")
-    combat_active = (
-        phase == "combat"
-        or _first_present(raw_combat, "in_progress") is True
-        or bool(raw_enemies)
-    )
+    combat_active = phase == "combat" or _first_present(raw_combat, "in_progress") is True or bool(raw_enemies)
     if combat_active:
         raw_hand = _first_present(raw_combat, "hand")
         if raw_hand is None:
@@ -1510,7 +1908,8 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 raw_hand,
                 label="combat hand",
                 pile="Hand",
-            ) or [],
+            )
+            or [],
             "enemies": [
                 _canonical_enemy(enemy)
                 for enemy in _as_mapping_list(
@@ -1543,6 +1942,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             if count is not None:
                 combat[key] = count
         for key, aliases, pile in (
+            ("draw_pile", ("draw_pile",), "Draw"),
             ("discard_pile", ("discard_pile",), "Discard"),
             ("exhaust_pile", ("exhaust_pile",), "Exhaust"),
             ("play_pile", ("play_pile",), "Play"),
@@ -1566,6 +1966,58 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         if event:
             canonical["event"] = event
 
+    raw_map = _as_mapping(observation.get("map"), label="observation.map")
+    if raw_map and domain != "combat":
+        map_state = _canonical_map(raw_map)
+        if map_state:
+            canonical["map"] = map_state
+
+    raw_shop = _as_mapping(observation.get("shop"), label="observation.shop")
+    if raw_shop and (
+        _first_present(raw_shop, "visible", "is_open") is True
+        or bool(_first_present(raw_shop, "items"))
+        or phase == "shop"
+    ):
+        shop = _canonical_shop(raw_shop)
+        if shop:
+            canonical["shop"] = shop
+
+    raw_rest_site = _as_mapping(
+        observation.get("rest_site"),
+        label="observation.rest_site",
+    )
+    if raw_rest_site and (
+        _first_present(raw_rest_site, "visible") is True
+        or bool(_first_present(raw_rest_site, "options"))
+        or phase == "rest_site"
+    ):
+        rest_site = _canonical_rest_site(raw_rest_site)
+        if rest_site:
+            canonical["rest_site"] = rest_site
+
+    raw_rewards = _as_mapping(
+        observation.get("rewards"),
+        label="observation.rewards",
+    )
+    rewards = _canonical_rewards(raw_rewards) if raw_rewards else {}
+    raw_card_reward = _as_mapping(
+        observation.get("card_reward_selection"),
+        label="observation.card_reward_selection",
+    )
+    if raw_card_reward:
+        cards = _canonical_card_sequence(
+            _first_present(raw_card_reward, "cards"),
+            label="card_reward_selection.cards",
+            pile="Reward",
+        )
+        if cards is not None:
+            rewards["cards"] = cards
+        can_skip = _first_present(raw_card_reward, "can_skip")
+        if can_skip is not None:
+            rewards["can_skip"] = can_skip
+    if rewards:
+        canonical["rewards"] = rewards
+
     raw_decision = _as_mapping(
         observation.get("decision"),
         label="observation.decision",
@@ -1574,11 +2026,20 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         observation.get("card_selection"),
         label="observation.card_selection",
     )
+    explicit_upgrade = _as_mapping(
+        observation.get("deck_upgrade_selection"),
+        label="observation.deck_upgrade_selection",
+    )
     # Live places the card option membership on top-level card_selection while
     # its compact decision block carries counts.  Headless places both in the
     # explicit selection DTO.  Merge the two instead of allowing the summary
     # block to hide card identity.
     raw_selection: dict[str, Any] = dict(explicit_selection)
+    if explicit_upgrade and (explicit_upgrade.get("visible") is True or phase == "deck_upgrade"):
+        raw_selection.update(explicit_upgrade)
+        raw_selection.setdefault("operation_type", "upgrade")
+        raw_selection.setdefault("source_zone", "Deck")
+        raw_selection.setdefault("destination_zone", "Deck")
     raw_selection.update(raw_decision)
     # Card/hand prompts can occur inside combat while the top-level phase stays
     # ``combat``.  Presence of the explicit selection DTO, rather than the
@@ -1658,24 +2119,36 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         if raw_options is not None:
             option_selectable: list[dict[str, Any]] = []
             option_selected: list[dict[str, Any]] = []
+            upgrade_previews: list[dict[str, Any]] = []
             for option in _as_mapping_list(raw_options, label="selection.options"):
                 raw_card = _first_present(option, "card")
                 if raw_card is None:
                     continue
                 card = _as_mapping(raw_card, label="selection.options.card")
                 membership = "selected" if option.get("is_selected") is True else "selectable"
-                canonical_cards = _canonical_card_sequence(
-                    [card],
-                    label="selection.options.card",
-                    membership=membership,
-                ) or []
-                (option_selected if membership == "selected" else option_selectable).extend(
-                    canonical_cards
+                canonical_cards = (
+                    _canonical_card_sequence(
+                        [card],
+                        label="selection.options.card",
+                        membership=membership,
+                    )
+                    or []
                 )
+                (option_selected if membership == "selected" else option_selectable).extend(canonical_cards)
+                raw_preview = _first_present(option, "upgrade_preview")
+                if isinstance(raw_preview, Mapping):
+                    preview = _canonical_card(raw_preview)
+                    source_instance = canonical_cards[0].get("instance_id") if canonical_cards else None
+                    if source_instance:
+                        preview["instance_id"] = source_instance
+                    if preview:
+                        upgrade_previews.append(preview)
             if selectable is None:
                 selectable = option_selectable
             if selected is None:
                 selected = option_selected
+            if upgrade_previews:
+                selection["upgrade_previews"] = upgrade_previews
         if selectable is not None:
             selection["selectable_cards"] = selectable
         if selected is not None:
@@ -1705,8 +2178,10 @@ def _canonical_option(value: Mapping[str, Any]) -> dict[str, Any]:
         "description": ("description",),
         "text": ("text", "label"),
         "is_locked": ("is_locked",),
+        "is_enabled": ("is_enabled",),
         "is_proceed": ("is_proceed", "proceed"),
         "is_selected": ("is_selected",),
+        "heal_amount": ("heal_amount",),
     }.items():
         item = _first_present(value, *aliases)
         if item is not None:
@@ -1722,14 +2197,11 @@ def _canonical_option(value: Mapping[str, Any]) -> dict[str, Any]:
 def _canonical_map_node(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     raw_coord = _first_present(value, "coord")
-    coord_source = (
-        _as_mapping(raw_coord, label="map_node.coord")
-        if raw_coord is not None
-        else value
-    )
+    coord_source = _as_mapping(raw_coord, label="map_node.coord") if raw_coord is not None else value
     coord = _canonical_coord(coord_source)
     if coord:
         result["coord"] = coord
+        result["instance_id"] = f"map_coord:{int(coord['x'])}:{int(coord['y'])}"
     for key, aliases in {
         "point_type": ("point_type", "room_type", "type"),
         "room_model_id": ("room_model_id", "room_model", "model_id"),
@@ -1737,6 +2209,20 @@ def _canonical_map_node(value: Mapping[str, Any]) -> dict[str, Any]:
         item = _first_present(value, *aliases)
         if item is not None:
             result[key] = item
+    raw_children = _first_present(value, "children")
+    if isinstance(raw_children, Sequence) and not isinstance(raw_children, str | bytes):
+        children: list[dict[str, Any]] = []
+        for index, raw_child in enumerate(raw_children):
+            if isinstance(raw_child, Mapping):
+                child = _canonical_coord(raw_child)
+            elif isinstance(raw_child, Sequence) and not isinstance(raw_child, str | bytes) and len(raw_child) >= 2:
+                child = {"x": raw_child[0], "y": raw_child[1]}
+            else:
+                raise TypeError(f"map_node.children[{index}] must be a coordinate")
+            if child:
+                child["instance_id"] = f"map_coord:{int(child['x'])}:{int(child['y'])}"
+                children.append(child)
+        result["children"] = children
     return result
 
 
@@ -1779,9 +2265,16 @@ def _canonical_item(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, aliases in {
         "id": ("id", "model_id"),
-        "type": ("type", "item_type", "kind"),
+        "type": ("type", "item_type", "item_kind", "kind"),
         "price": ("price", "cost"),
         "rarity": ("rarity",),
+        "slot_type": ("slot_type",),
+        "is_affordable": ("is_affordable",),
+        "enough_gold": ("enough_gold",),
+        "is_stocked": ("is_stocked",),
+        "is_on_sale": ("is_on_sale",),
+        "used": ("used",),
+        "slot_index": ("slot_index", "index"),
     }.items():
         item = _first_present(value, *aliases)
         if item is not None:
@@ -1800,6 +2293,19 @@ def _canonical_item(value: Mapping[str, Any]) -> dict[str, Any]:
         raw = _first_present(value, key)
         if raw is not None:
             result[key] = projector(_as_mapping(raw, label=f"item.{key}"))
+    # Shop slots often have no game-model ID of their own.  Their coordinate
+    # within the current inventory is a factual relation key shared by the
+    # world item and its legal purchase candidate; it is not candidate order.
+    if "id" not in result and isinstance(result.get("slot_index"), int):
+        result["instance_id"] = f"shop_slot:{result['slot_index']}"
+    for nested_key in ("card", "relic", "potion"):
+        nested = result.get(nested_key)
+        if not isinstance(nested, Mapping):
+            continue
+        if "id" not in result and nested.get("id"):
+            result["id"] = nested["id"]
+        if "instance_id" not in result and nested.get("instance_id"):
+            result["instance_id"] = nested["instance_id"]
     return result
 
 
@@ -1821,6 +2327,200 @@ def _target_fact_lookup(
     return result
 
 
+def _candidate_transaction(
+    action: Mapping[str, Any],
+    *,
+    model_kind: str,
+    roots: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Describe the exact immediate mutation family of a legal action.
+
+    This is protocol semantics, not a predicted outcome.  It intentionally
+    stops at effects the environment guarantees immediately: a shop purchase
+    spends gold and adds/opens the advertised item, a card reward adds a card,
+    a selection moves or mutates the selected instance, and leaving preserves
+    inventory.  Combat damage, future draws and event outcomes are never
+    fabricated here.
+    """
+
+    variant = _string_field(
+        action,
+        (
+            "model_action_variant",
+            "shop_action",
+            "selection_operation",
+            "operation_type",
+            "kind",
+            "action",
+        ),
+    )
+    normalized_variant = _normalize_key(variant)
+    transaction: dict[str, Any] = {"type": "transaction"}
+
+    if model_kind == "shop":
+        if normalized_variant in {"back", "leave", "skip", "shop_skip"}:
+            transaction.update(
+                operation_type="leave_shop",
+                resource="gold",
+                amount=0,
+                source_zone="Shop",
+                destination_zone="Run",
+            )
+            return transaction
+        item = roots.get("item", {})
+        item_type = _normalize_key(item.get("type", "item"))
+        operation = "purchase_card_removal" if item_type == "card_removal" else f"purchase_{item_type or 'item'}"
+        price = item.get("price")
+        transaction.update(
+            operation_type=operation,
+            resource="gold",
+            source_zone="Shop",
+            destination_zone={
+                "card": "Deck",
+                "relic": "Relic",
+                "potion": "Potion",
+                "card_removal": "Selection",
+            }.get(item_type, "Run"),
+        )
+        if isinstance(price, int | float) and not isinstance(price, bool):
+            transaction["price"] = price
+            transaction["amount"] = -float(price)
+        return transaction
+
+    if model_kind == "rest_site":
+        option = roots.get("option", {})
+        option_type = _normalize_key(option.get("option_type", option.get("option_id", normalized_variant)))
+        if "heal" in option_type or option_type in {"rest", "sleep"}:
+            operation = "heal"
+            resource = "hp"
+        elif "upgrade" in option_type or "smith" in option_type:
+            operation = "open_upgrade_selection"
+            resource = "upgrade_level"
+        else:
+            operation = f"rest_option:{option_type or 'unknown'}"
+            resource = "run_state"
+        transaction.update(
+            operation_type=operation,
+            resource=resource,
+            source_zone="RestSite",
+            destination_zone="Run" if operation == "heal" else "Selection",
+        )
+        heal_amount = option.get("heal_amount")
+        if isinstance(heal_amount, int | float) and not isinstance(heal_amount, bool):
+            transaction["amount"] = heal_amount
+        return transaction
+
+    if model_kind == "card_reward":
+        has_card = isinstance(roots.get("card"), Mapping)
+        transaction.update(
+            operation_type="add_card" if has_card else "skip_card_reward",
+            resource="deck",
+            amount=1 if has_card else 0,
+            source_zone="Reward",
+            destination_zone="Deck" if has_card else "Run",
+        )
+        return transaction
+
+    if model_kind == "reward":
+        reward = roots.get("reward", {})
+        reward_type = _normalize_key(reward.get("type", "unknown"))
+        operation, resource, destination = {
+            "gold": ("claim_gold", "gold", "Run"),
+            "card": ("open_card_reward", "card_options", "Reward"),
+            "relic": ("claim_relic_reward", "relic", "Relic"),
+            "potion": ("claim_potion_reward", "potion_slot", "Potion"),
+        }.get(
+            reward_type,
+            ("claim_reward", "run_state", "Run"),
+        )
+        transaction.update(
+            operation_type=operation,
+            resource=resource,
+            source_zone="Reward",
+            destination_zone=destination,
+        )
+        amount = reward.get("amount")
+        if isinstance(amount, int | float) and not isinstance(amount, bool):
+            transaction["amount"] = amount
+        elif reward_type in {"relic", "potion"}:
+            transaction["amount"] = 1
+        return transaction
+
+    if model_kind == "card_selection":
+        selection = roots.get("selection", {})
+        operation = str(selection.get("operation_type") or normalized_variant or "select")
+        transaction.update(
+            operation_type=operation,
+            resource="selection_membership",
+            source_zone=selection.get("source_zone", "Selection"),
+            destination_zone="Selection",
+        )
+        normalized_operation = _normalize_key(operation)
+        if normalized_operation in {"select", "toggle_on"}:
+            transaction["amount"] = 1
+        elif normalized_operation in {"deselect", "toggle_off"}:
+            transaction["amount"] = -1
+        elif normalized_operation in {"confirm", "cancel"}:
+            transaction["amount"] = 0
+        return transaction
+
+    if model_kind == "deck_upgrade":
+        transaction.update(
+            operation_type="upgrade_card",
+            resource="upgrade_level",
+            amount=1,
+            source_zone="Deck",
+            destination_zone="Deck",
+        )
+        return transaction
+
+    if model_kind == "map":
+        transaction.update(
+            operation_type="move_to_map_node",
+            resource="map_position",
+            amount=1,
+            source_zone="Map",
+            destination_zone="Map",
+        )
+        return transaction
+
+    operation_by_kind = {
+        "play_card": ("play_card", "energy", "Hand", "Play", None),
+        "use_potion": ("use_potion", "potion_slot", "Potion", "Combat", -1),
+        "discard_potion": ("discard_potion", "potion_slot", "Potion", "Run", -1),
+        "end_turn": ("end_turn", "turn", "Combat", "Combat", 1),
+        "treasure": ("claim_treasure", "inventory", "Reward", "Run", None),
+        "treasure_relic": ("add_relic", "relic", "Reward", "Relic", 1),
+        "event_option": (
+            "choose_event_option",
+            "event_state",
+            "Event",
+            "Event",
+            None,
+        ),
+        "proceed": ("proceed", "run_state", "Run", "Run", None),
+    }
+    resolved = operation_by_kind.get(model_kind)
+    if resolved is None:
+        return {}
+    operation, resource, source_zone, destination_zone, amount = resolved
+    transaction.update(
+        operation_type=operation,
+        resource=resource,
+        source_zone=source_zone,
+        destination_zone=destination_zone,
+    )
+    if model_kind == "play_card":
+        card = roots.get("card", {})
+        cost = card.get("cost")
+        costs_x = any(isinstance(trait, Mapping) and trait.get("id") == "costs_x" for trait in card.get("traits", []))
+        if isinstance(cost, int | float) and not isinstance(cost, bool) and not costs_x:
+            transaction["amount"] = -float(cost)
+    elif amount is not None:
+        transaction["amount"] = amount
+    return transaction
+
+
 def _candidate_local_roots(
     action: Mapping[str, Any],
     *,
@@ -1828,22 +2528,23 @@ def _candidate_local_roots(
     target_lookup: Mapping[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     roots: dict[str, dict[str, Any]] = {}
-    projectors = {
+    projectors: dict[
+        str,
+        Callable[[Mapping[str, Any]], dict[str, Any]],
+    ] = {
         "card": _canonical_card,
-        "character": lambda value: {
-            "id": _first_present(value, "id", "character_id", "model_id")
-        },
-        "selected_character": lambda value: {
-            "id": _first_present(value, "id", "character_id", "model_id")
-        },
+        "character": lambda value: {"id": _first_present(value, "id", "character_id", "model_id")},
+        "selected_character": lambda value: {"id": _first_present(value, "id", "character_id", "model_id")},
         "potion": _canonical_potion,
         "relic": _canonical_relic,
+        "reward": _canonical_reward,
         "item": _canonical_item,
         "option": _canonical_option,
         "map_node": _canonical_map_node,
         "coord": _canonical_coord,
         "selection": _canonical_selection,
         "typed_selection": _canonical_selection,
+        "upgrade_preview": _canonical_card,
     }
     for key, projector in projectors.items():
         raw = action.get(key)
@@ -1851,6 +2552,12 @@ def _candidate_local_roots(
             projected = projector(raw)
             if projected:
                 roots[key] = projected
+    source_card = roots.get("card")
+    upgrade_preview = roots.get("upgrade_preview")
+    if source_card is not None and upgrade_preview is not None:
+        source_instance = source_card.get("instance_id")
+        if source_instance:
+            upgrade_preview["instance_id"] = source_instance
 
     # The live map DTO exposes coord/point_type at the root, whereas the
     # simulator joins them under map_node. Normalize both to one local token.
@@ -1889,6 +2596,13 @@ def _candidate_local_roots(
             **roots.get("selection", {}),
             **selection,
         }
+    transaction = _candidate_transaction(
+        action,
+        model_kind=model_kind,
+        roots=roots,
+    )
+    if transaction:
+        roots["transaction"] = transaction
     return roots
 
 
@@ -1930,9 +2644,7 @@ class GroundedObservationEncoder:
             candidates.append(candidate)
             handle_value = action.get("action_handle", action.get("action_id"))
             handle = str(handle_value) if handle_value is not None and str(handle_value) else None
-            references.append(
-                ActionReference(position=position, handle=handle, enabled=candidate.enabled)
-            )
+            references.append(ActionReference(position=position, handle=handle, enabled=candidate.enabled))
         domain_id = self._domain_id(model_observation)
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         snapshot = self._snapshot(
@@ -1955,10 +2667,7 @@ class GroundedObservationEncoder:
         if not decisions:
             raise ValueError("at least one decision is required")
         expected_fingerprint = decisions[0].encoding_fingerprint
-        if any(
-            item.encoding_fingerprint != expected_fingerprint
-            for item in decisions[1:]
-        ):
+        if any(item.encoding_fingerprint != expected_fingerprint for item in decisions[1:]):
             raise ValueError("cannot stack decisions from different encoding contracts")
         if expected_fingerprint != grounding_encoding_identity()["fingerprint_sha256"]:
             raise ValueError("decision encoding contract differs from the active encoder")
@@ -2025,9 +2734,7 @@ class GroundedObservationEncoder:
             feature_dim=self.config.feature_dim,
             id_width=9,
         )
-        flattened_locals = tuple(
-            local for candidate in candidates for local in candidate.locals
-        )
+        flattened_locals = tuple(local for candidate in candidates for local in candidate.locals)
         local_table = sparse_token_table(
             features=tuple(token.features for token in flattened_locals),
             ids=tuple(
@@ -2065,12 +2772,13 @@ class GroundedObservationEncoder:
     def _domain_id(self, observation: Mapping[str, Any]) -> int:
         if bool(observation.get("terminated", False)):
             return _DOMAIN_IDS["terminal"]
-        raw = str(
-            observation.get("decision_domain")
-            or observation.get("domain")
-            or observation.get("phase")
-            or "unknown"
-        ).strip().lower()
+        raw = (
+            str(
+                observation.get("decision_domain") or observation.get("domain") or observation.get("phase") or "unknown"
+            )
+            .strip()
+            .lower()
+        )
         if raw in _DOMAIN_IDS:
             return _DOMAIN_IDS[raw]
         if raw in {"map", "navigation"}:
@@ -2078,7 +2786,7 @@ class GroundedObservationEncoder:
         return _DOMAIN_IDS["unknown"]
 
     def _world_tokens(self, observation: Mapping[str, Any]) -> tuple[_Token, ...]:
-        queue: deque[_WalkItem] = deque([_WalkItem(observation, ("world",), "neutral", 0, 0)])
+        queue: deque[_WalkItem] = deque([_WalkItem(observation, ("world",), "neutral", "", 0, 0)])
         result: list[_Token] = []
         while queue and len(result) < self.config.max_world_tokens:
             item = queue.popleft()
@@ -2136,6 +2844,14 @@ class GroundedObservationEncoder:
                 source_zone = key
                 break
         entity = _string_field(source or action, _IDENTITY_KEYS)
+        source_relation = _relation_identity(
+            source or action,
+            path=("candidate", source_zone),
+            inherited="",
+        )
+        source_zone_label = _zone_label(source, ("candidate", source_zone)) if source is not None else source_zone
+        if source_zone == "item" and kind == "shop":
+            source_zone_label = "Shop"
         if not entity and source is not None and source_zone == "option":
             # Event choices do not expose a canonical game ID today.  Hash the
             # raw player-visible option text as opaque identity; do not parse it
@@ -2165,25 +2881,30 @@ class GroundedObservationEncoder:
             entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
             entity_aux_id=_hash_id(
                 "entity_aux",
-                entity,
+                source_relation or entity,
                 self.config.entity_vocab_size,
             ),
-            zone_id=_hash_id("zone", source_zone, self.config.zone_vocab_size),
+            zone_id=_stable_zone_id(
+                source_zone_label,
+                self.config.zone_vocab_size,
+            ),
             order_id=0,
         )
         target_value = roots.get("target")
         target = target_value if isinstance(target_value, Mapping) else {}
         target_owner = _owner_label(target, ("candidate", "target"), "neutral")
         target_entity = _string_field(target, _IDENTITY_KEYS)
+        target_relation = _relation_identity(
+            target,
+            path=("candidate", "target"),
+            inherited="",
+        )
 
         locals_: list[_Token] = []
         queue: deque[_WalkItem] = deque()
         for key in sorted(roots):
             normalized_key = _normalize_key(key)
-            if (
-                normalized_key not in _CANDIDATE_LOCAL_ROOTS
-                or self._excluded(key, _CANDIDATE_EXCLUDED_KEYS)
-            ):
+            if normalized_key not in _CANDIDATE_LOCAL_ROOTS or self._excluded(key, _CANDIDATE_EXCLUDED_KEYS):
                 continue
             child = roots[key]
             if isinstance(child, Mapping | list | tuple) and self._node_admitted(
@@ -2191,7 +2912,16 @@ class GroundedObservationEncoder:
                 path=("candidate", str(key)),
                 excluded=_CANDIDATE_EXCLUDED_KEYS,
             ):
-                queue.append(_WalkItem(child, ("candidate", str(key)), owner, 0, 1))
+                queue.append(
+                    _WalkItem(
+                        child,
+                        ("candidate", str(key)),
+                        owner,
+                        source_relation,
+                        0,
+                        1,
+                    )
+                )
         while queue and len(locals_) < self.config.max_candidate_local_tokens:
             item = queue.popleft()
             local, children = self._tokenize_node(item, excluded=_CANDIDATE_EXCLUDED_KEYS)
@@ -2224,7 +2954,7 @@ class GroundedObservationEncoder:
             target_entity_id=_hash_id("entity", target_entity, self.config.entity_vocab_size),
             target_entity_aux_id=_hash_id(
                 "entity_aux",
-                target_entity,
+                target_relation or target_entity,
                 self.config.entity_vocab_size,
             ),
             locals=tuple(locals_),
@@ -2312,21 +3042,16 @@ class GroundedObservationEncoder:
             return False
         if "dynamic_vars" in normalized_path:
             return lowered in _DYNAMIC_VALUE_SLOT_BY_KEY
-        identity = str(
-            container.get("card_id")
-            or container.get("id")
-            or container.get("model_id")
-            or ""
-        ).strip().upper()
+        identity = (
+            str(container.get("card_id") or container.get("id") or container.get("model_id") or "").strip().upper()
+        )
         if identity.startswith("CARD.") or normalized_path & _CARD_PATH_PARTS:
             if isinstance(value, bool):
                 return lowered in _CARD_FACT_BOOLEAN_KEYS
             return lowered in _CARD_FACT_NUMERIC_KEYS
         if isinstance(value, bool):
             return lowered in _FACT_BOOLEAN_KEYS
-        return lowered in _FACT_NUMERIC_KEYS or lowered.endswith(
-            _FACT_NUMERIC_SUFFIXES
-        )
+        return lowered in _FACT_NUMERIC_KEYS or lowered.endswith(_FACT_NUMERIC_SUFFIXES)
 
     def _tokenize_node(
         self,
@@ -2340,6 +3065,11 @@ class GroundedObservationEncoder:
             owner = _owner_label(value, item.path, item.inherited_owner)
             role = _string_field(value, _ROLE_KEYS) or zone
             entity = _string_field(value, _IDENTITY_KEYS)
+            relation = _relation_identity(
+                value,
+                path=item.path,
+                inherited=item.inherited_relation,
+            )
             mapping_children: list[_WalkItem] = []
             for key in sorted(value):
                 if self._excluded(str(key), excluded):
@@ -2359,6 +3089,7 @@ class GroundedObservationEncoder:
                             child,
                             (*item.path, str(key)),
                             owner,
+                            relation,
                             0,
                             item.depth + 1,
                         )
@@ -2378,16 +3109,26 @@ class GroundedObservationEncoder:
                 entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
                 entity_aux_id=_hash_id(
                     "entity_aux",
-                    entity,
+                    relation or entity,
                     self.config.entity_vocab_size,
                 ),
-                zone_id=_hash_id("zone", "/".join(item.path[-2:]), self.config.zone_vocab_size),
+                zone_id=_stable_zone_id(
+                    _zone_label(value, item.path),
+                    self.config.zone_vocab_size,
+                ),
                 order_id=min(max(item.order + 1, 0), self.config.max_order_id - 1),
             )
             return token, tuple(mapping_children)
         if isinstance(value, list | tuple):
             sequence_children = tuple(
-                _WalkItem(child, (*item.path, "item"), item.inherited_owner, index, item.depth + 1)
+                _WalkItem(
+                    child,
+                    (*item.path, "item"),
+                    item.inherited_owner,
+                    item.inherited_relation,
+                    index,
+                    item.depth + 1,
+                )
                 for index, child in enumerate(value)
                 if not isinstance(child, Mapping | list | tuple)
                 or self._node_admitted(
@@ -2406,8 +3147,12 @@ class GroundedObservationEncoder:
                 role_id=_hash_id("role", zone, self.config.role_vocab_size),
                 owner_id=_hash_id("owner", item.inherited_owner, self.config.owner_vocab_size),
                 entity_id=1,
-                entity_aux_id=1,
-                zone_id=_hash_id("zone", "/".join(item.path[-2:]), self.config.zone_vocab_size),
+                entity_aux_id=_hash_id(
+                    "entity_aux",
+                    item.inherited_relation,
+                    self.config.entity_vocab_size,
+                ),
+                zone_id=_stable_zone_id(zone, self.config.zone_vocab_size),
                 order_id=min(max(item.order + 1, 0), self.config.max_order_id - 1),
             )
             return token, sequence_children
@@ -2426,10 +3171,10 @@ class GroundedObservationEncoder:
             entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
             entity_aux_id=_hash_id(
                 "entity_aux",
-                entity,
+                item.inherited_relation or entity,
                 self.config.entity_vocab_size,
             ),
-            zone_id=_hash_id("zone", "/".join(item.path[-2:]), self.config.zone_vocab_size),
+            zone_id=_stable_zone_id(zone, self.config.zone_vocab_size),
             order_id=min(max(item.order + 1, 0), self.config.max_order_id - 1),
         )
         return token, ()
@@ -2456,12 +3201,8 @@ class GroundedObservationEncoder:
             raw = value[key]
             if self._is_factual_categorical(str(key), raw):
                 categorical_count += 1
-                digest = hashlib.sha256(
-                    f"category\0{_normalize_key(key)}\0{str(raw).lower()}".encode()
-                ).digest()
-                slot = _CATEGORY_SLOT_START + int.from_bytes(
-                    digest[:4], "big"
-                ) % _CATEGORY_SLOT_COUNT
+                digest = hashlib.sha256(f"category\0{_normalize_key(key)}\0{str(raw).lower()}".encode()).digest()
+                slot = _CATEGORY_SLOT_START + int.from_bytes(digest[:4], "big") % _CATEGORY_SLOT_COUNT
                 sign = 1.0 if digest[4] & 1 else -1.0
                 features[slot] = max(
                     -1.0,
@@ -2486,12 +3227,8 @@ class GroundedObservationEncoder:
                 if normalized_key in _DYNAMIC_VALUE_SLOT_BY_KEY:
                     slot = _DYNAMIC_VALUE_SLOT_BY_KEY[normalized_key]
                 else:  # pragma: no cover - guarded by _is_factual_numeric
-                    digest = hashlib.sha256(
-                        f"dynamic\0{normalized_key}".encode()
-                    ).digest()
-                    slot = _DYNAMIC_HASH_SLOT_START + int.from_bytes(
-                        digest[:4], "big"
-                    ) % _DYNAMIC_HASH_SLOT_COUNT
+                    digest = hashlib.sha256(f"dynamic\0{normalized_key}".encode()).digest()
+                    slot = _DYNAMIC_HASH_SLOT_START + int.from_bytes(digest[:4], "big") % _DYNAMIC_HASH_SLOT_COUNT
             else:
                 # `_is_factual_numeric` admits only reviewed fixed keys outside
                 # dynamic_vars.  Index directly so two mechanics never alias.

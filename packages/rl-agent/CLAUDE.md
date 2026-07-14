@@ -1,6 +1,6 @@
 # RL agent contributor guide
 
-This package contains the recurrent grounded legal-candidate V-trace v2
+This package contains the relational recurrent legal-candidate V-trace v3
 baseline. The only maintained training entry point is:
 
 ```text
@@ -36,8 +36,8 @@ Torch/ROCm build or fall back to CPU.
 ```text
 sts2_rl.train
   -> typed LiveBackend or HeadlessBackend
-  -> structural GroundedObservationEncoder
-  -> RecurrentCandidateModel (GRU + masked policy + scalar value)
+  -> factual relational GroundedObservationEncoder
+  -> RecurrentCandidateModel (exact relation grounding + run/combat GRU + masked policy + scalar value)
   -> fixed, profile-selected sts2_baseline reward contract
   -> bounded FIFO SequenceUnroll queue
   -> VTraceLearner
@@ -46,8 +46,9 @@ sts2_rl.train
 
 - `sts2_rl/contracts/` owns reset/step/result/capability boundaries.
 - `sts2_rl/backends/` owns live/headless protocol adapters.
-- `sts2_rl/encoding/` structurally hashes raw state and candidates; it must not
-  interpret boss/card/route strategy.
+- `sts2_rl/encoding/` projects factual runtime state and candidates into
+  definition, instance/relation, zone and numeric channels; it must not
+  interpret boss/card/route strategy or fabricate future outcomes.
 - `sts2_rl/models/` owns the candidate-independent world encoder and grounded
   candidate scorer.
 - `sts2_baseline/` owns immutable, versioned task rewards plus sequence-unroll
@@ -61,6 +62,13 @@ sts2_rl.train
 
 - World encoding cannot read legal candidates.
 - Candidate order and opaque action handles are not model features.
+- Definition identity and concrete runtime identity are separate channels.
+  Candidate source/target relations must bind to the corresponding world
+  entity; modifiers, powers and intents must retain their factual owner.
+- Known physical/decision zones use reviewed fixed IDs. Draw composition is an
+  unordered player-visible set; hidden pile order is never a model input.
+- Run-scale memory updates outside combat. Combat-scale memory updates inside
+  combat and clears on exit; keep the combined recurrent tensor ABI stable.
 - Only the authoritative environment legality mask can suppress an action.
 - No MCTS, planner, root bias, action rewrite or policy distillation is allowed
   in the baseline.

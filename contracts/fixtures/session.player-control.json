@@ -39,7 +39,7 @@
   },
   "created_at_utc": "2026-07-11T11:59:00Z",
   "bridge_name": "sts2-mcp-bridge",
-  "bridge_version": "0.8.0",
+  "bridge_version": "0.9.0",
   "port": 27100,
   "preferred_port": 27100,
   "max_port": 27109,

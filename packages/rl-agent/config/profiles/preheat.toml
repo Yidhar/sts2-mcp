@@ -1,8 +1,8 @@
-version = "sts2-recurrent-curriculum-config-v2"
+version = "sts2-relational-curriculum-config-v3"
 profile = "preheat"
 
 [model]
-architecture = "recurrent_candidate_v2"
+architecture = "relational_candidate_v3"
 token_feature_dim = 224
 d_model = 128
 n_heads = 4

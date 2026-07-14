@@ -16,6 +16,8 @@ from sts2_rl.encoding import (
 )
 from sts2_rl.encoding.grounded import (
     _DYNAMIC_VALUE_SLOT_BY_KEY,
+    _NUMERIC_SLOT_BY_KEY,
+    _ZONE_IDS,
     _bounded_number,
     _canonical_card,
     _canonical_enemy,
@@ -76,11 +78,7 @@ def _observation() -> dict[str, object]:
                 {"id": "defend", "cost": 1},
             ],
         },
-        "combat": {
-            "enemies": [
-                {"id": "cultist", "side": "enemy", "hp": 31, "max_hp": 48}
-            ]
-        },
+        "combat": {"enemies": [{"id": "cultist", "side": "enemy", "hp": 31, "max_hp": 48}]},
         "available_actions": [{"kind": "retired-leak", "quality": 999999}],
         "boss_mechanics": {"forced_line": 1.0},
         "_sim_raw": {"secret": 42},
@@ -228,16 +226,8 @@ def test_stable_enemy_model_identity_is_encoded_before_runtime_combat_id() -> No
     encoder = _encoder()
     first = _observation()
     second = _observation()
-    first["combat"] = {
-        "enemies": [
-            {"combat_id": 7, "model_id": "MONSTER.CULTIST", "hp": 30, "max_hp": 40}
-        ]
-    }
-    second["combat"] = {
-        "enemies": [
-            {"combat_id": 7, "model_id": "MONSTER.LOUSE", "hp": 30, "max_hp": 40}
-        ]
-    }
+    first["combat"] = {"enemies": [{"combat_id": 7, "model_id": "MONSTER.CULTIST", "hp": 30, "max_hp": 40}]}
+    second["combat"] = {"enemies": [{"combat_id": 7, "model_id": "MONSTER.LOUSE", "hp": 30, "max_hp": 40}]}
 
     first_world = encoder.encode(first, _actions()).batch.world
     second_world = encoder.encode(second, _actions()).batch.world
@@ -381,24 +371,16 @@ def test_multiselect_membership_identity_is_part_of_world_state() -> None:
             "max_select": 2,
             "remaining_select": 1,
             "can_confirm": True,
-            "selectable_cards": [
-                {"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}
-            ],
-            "selected_cards": [
-                {"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}
-            ],
+            "selectable_cards": [{"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}],
+            "selected_cards": [{"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}],
         },
     }
     changed = {
         **base,
         "card_selection": {
             **base["card_selection"],
-            "selectable_cards": [
-                {"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}
-            ],
-            "selected_cards": [
-                {"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}
-            ],
+            "selectable_cards": [{"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}],
+            "selected_cards": [{"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}],
         },
     }
     actions = [
@@ -531,9 +513,7 @@ def test_selection_candidate_keeps_physical_source_zone_separate_from_membership
     ]
 
     candidates = encoder.encode(observation, actions).batch.candidates
-    assert not torch.equal(
-        candidates.local_features[:, 0], candidates.local_features[:, 1]
-    )
+    assert not torch.equal(candidates.local_features[:, 0], candidates.local_features[:, 1])
     assert not torch.equal(candidates.role_ids[:, 0], candidates.role_ids[:, 2])
 
 
@@ -867,7 +847,15 @@ def test_live_target_is_joined_to_world_facts_like_headless_target() -> None:
 
 
 def test_live_and_headless_world_projection_use_same_observable_intersection() -> None:
-    encoder = _encoder()
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=32,
+            max_candidates=6,
+            max_candidate_local_tokens=5,
+        )
+    )
     live = {
         "phase": "combat",
         "decision_domain": "combat",
@@ -904,6 +892,17 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
             "draw": 2,
             "discard": 1,
             "exhaust": 0,
+            # Composition is player-inspectable; only its hidden order is
+            # removed by the projector and canonical encoder.
+            "draw_pile": {
+                "count": 2,
+                "cards": [
+                    {"id": "CARD.SECRET_B", "pile": "Draw"},
+                    {"id": "CARD.SECRET_A", "pile": "Draw"},
+                ],
+                "cards_visible": True,
+                "order_visible": False,
+            },
             "discard_pile": {
                 "count": 1,
                 "cards": [{"id": "CARD.SECRET_C", "pile": "Discard"}],
@@ -945,8 +944,8 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
                 {"id": "CARD.DEFEND", "type": "Skill", "cost": 1, "pile": "Deck"},
             ],
             "hand": [{"id": "CARD.STRIKE", "type": "Attack", "cost": 1}],
-            # Draw composition is redacted by live and therefore collapses to
-            # a count. Discard/exhaust are public and must retain identity.
+            # The order differs from the live fixture. Canonicalization treats
+            # the visible contents as a set and must therefore stay identical.
             "draw_pile": [{"id": "CARD.SECRET_A"}, {"id": "CARD.SECRET_B"}],
             "discard_pile": [{"id": "CARD.SECRET_C"}],
             "exhaust_pile": [],
@@ -968,9 +967,7 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
                     "max_hp": 48,
                     "block": 0,
                     "status": [],
-                    "intents": [
-                        {"intent_type": "Attack", "total_damage": 6, "hits": 1}
-                    ],
+                    "intents": [{"intent_type": "Attack", "total_damage": 6, "hits": 1}],
                 }
             ],
         },
@@ -1257,8 +1254,7 @@ def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
 def test_encoder_never_silently_truncates_legal_candidates() -> None:
     encoder = _encoder()
     actions = [
-        {"action_handle": f"candidate:{index}", "kind": "choose"}
-        for index in range(encoder.config.max_candidates + 1)
+        {"action_handle": f"candidate:{index}", "kind": "choose"} for index in range(encoder.config.max_candidates + 1)
     ]
 
     with pytest.raises(ValueError, match="silently hide dispatchable candidates"):
@@ -1297,10 +1293,7 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
     }
     with pytest.raises(
         ValueError,
-        match=(
-            "candidate-local observation exceeds.*"
-            "capacity=1 required_tokens=2 action_kind='event_option'"
-        ),
+        match=("candidate-local observation exceeds.*" "capacity=1 required_tokens=3 action_kind='event_option'"),
     ):
         local_limited.encode(_observation(), [action])
 
@@ -1446,9 +1439,7 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
             {
                 "id": "CARD.BURNING_PACT",
                 "type": "Skill",
-                "hover_tip_ids": [
-                    "LocString with Title=static_hover_tips.exhaust.title"
-                ],
+                "hover_tip_ids": ["LocString with Title=static_hover_tips.exhaust.title"],
                 "dynamic_vars": [
                     {
                         "name": "Cards",
@@ -1530,9 +1521,7 @@ def test_dynamic_var_values_use_named_non_colliding_feature_slots() -> None:
     }
     assert len(set(_DYNAMIC_VALUE_SLOT_BY_KEY.values())) == len(expected)
     for key, raw_value in expected.items():
-        assert features[_DYNAMIC_VALUE_SLOT_BY_KEY[key]].item() == pytest.approx(
-            _bounded_number(raw_value)
-        )
+        assert features[_DYNAMIC_VALUE_SLOT_BY_KEY[key]].item() == pytest.approx(_bounded_number(raw_value))
 
 
 def test_card_cost_rarity_and_x_cost_transport_aliases_are_preserved() -> None:
@@ -1558,10 +1547,7 @@ def test_card_cost_rarity_and_x_cost_transport_aliases_are_preserved() -> None:
     )
     assert catalog["cost"] == -1
     assert catalog["rarity"] == "Uncommon"
-    assert {
-        (str(trait["id"]), str(trait["type"]))
-        for trait in catalog["traits"]
-    } == {("costs_x", "card_trait")}
+    assert {(str(trait["id"]), str(trait["type"])) for trait in catalog["traits"]} == {("costs_x", "card_trait")}
 
 
 def test_runtime_mechanics_v6_projects_power_relic_and_potion_state() -> None:
@@ -1774,3 +1760,302 @@ def test_runtime_mechanics_v6_set_like_status_and_inventory_are_permutation_inva
         "order_ids",
     ):
         assert torch.equal(getattr(first, field), getattr(second, field)), field
+
+
+def test_runtime_instance_relations_bind_actions_cards_targets_and_modifiers() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=96,
+            max_candidates=4,
+            max_candidate_local_tokens=16,
+        )
+    )
+    first_card = {
+        "id": "CARD.TWIN",
+        "instance_uuid": "card-instance-a",
+        "type": "Attack",
+        "cost": 0,
+        "pile": "Hand",
+        "dynamic_vars": {"Damage": 7},
+        "enchantment": {"id": "ENCHANTMENT.SHARP", "amount": 2},
+    }
+    second_card = {
+        "id": "CARD.TWIN",
+        "instance_uuid": "card-instance-b",
+        "type": "Attack",
+        "cost": 2,
+        "pile": "Hand",
+        "dynamic_vars": {"Damage": 11},
+    }
+    enemy = {
+        "combat_id": 17,
+        "model_id": "MONSTER.TEST",
+        "hp": 40,
+        "max_hp": 40,
+        "powers": [{"id": "POWER.VULNERABLE", "amount": 2}],
+        "intents": [{"type": "Attack", "damage": 9, "repeats": 1}],
+    }
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"character_id": "CHARACTER.TEST", "hp": 50, "max_hp": 80},
+        "combat": {"hand": [first_card, second_card], "enemies": [enemy]},
+    }
+    actions = [
+        {
+            "action_handle": "play:a",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "card": first_card,
+            "target": {"combat_id": 17},
+        },
+        {
+            "action_handle": "play:b",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "card": second_card,
+            "target": {"combat_id": 17},
+        },
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    candidate_relations = batch.candidates.entity_aux_ids[0, :2]
+    assert candidate_relations[0] != candidate_relations[1]
+
+    twin_definition = _hash_id("entity", "CARD.TWIN", model.entity_vocab_size)
+    twin_rows = torch.nonzero(
+        batch.world.entity_ids[0] == twin_definition,
+        as_tuple=False,
+    ).flatten()
+    assert twin_rows.numel() == 2
+    twin_relations = set(batch.world.entity_aux_ids[0, twin_rows].tolist())
+    assert twin_relations == set(candidate_relations.tolist())
+
+    damage_definition = _hash_id("entity", "Damage", model.entity_vocab_size)
+    enchantment_definition = _hash_id("entity", "ENCHANTMENT.SHARP", model.entity_vocab_size)
+    first_relation = int(candidate_relations[0].item())
+    for definition in (damage_definition, enchantment_definition):
+        rows = torch.nonzero(
+            batch.world.entity_ids[0] == definition,
+            as_tuple=False,
+        ).flatten()
+        assert rows.numel() >= 1
+        assert first_relation in batch.world.entity_aux_ids[0, rows].tolist()
+
+    enemy_relation = batch.candidates.target_entity_aux_ids[0, 0]
+    assert enemy_relation == batch.candidates.target_entity_aux_ids[0, 1]
+    enemy_definition = _hash_id("entity", "MONSTER.TEST", model.entity_vocab_size)
+    enemy_rows = torch.nonzero(
+        batch.world.entity_ids[0] == enemy_definition,
+        as_tuple=False,
+    ).flatten()
+    assert enemy_rows.numel() == 1
+    assert batch.world.entity_aux_ids[0, enemy_rows[0]] == enemy_relation
+
+    power_rows = torch.nonzero(
+        batch.world.entity_ids[0] == _hash_id("entity", "POWER.VULNERABLE", model.entity_vocab_size),
+        as_tuple=False,
+    ).flatten()
+    assert power_rows.numel() >= 1
+    assert int(enemy_relation.item()) in batch.world.entity_aux_ids[0, power_rows].tolist()
+    intent_rows = torch.nonzero(
+        batch.world.role_ids[0] == _hash_id("role", "Attack", model.role_vocab_size),
+        as_tuple=False,
+    ).flatten()
+    assert intent_rows.numel() >= 1
+    assert int(enemy_relation.item()) in batch.world.entity_aux_ids[0, intent_rows].tolist()
+
+
+def test_physical_piles_have_fixed_zones_while_instances_survive_movement() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=64,
+            max_candidates=2,
+            max_candidate_local_tokens=8,
+        )
+    )
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"character_id": "CHARACTER.TEST", "hp": 50, "max_hp": 80},
+        "combat": {
+            "draw_pile": [{"id": "CARD.CYCLE", "instance_uuid": "cycle-a"}],
+            "discard_pile": [{"id": "CARD.CYCLE", "instance_uuid": "cycle-b"}],
+            "exhaust_pile": [{"id": "CARD.CYCLE", "instance_uuid": "cycle-c"}],
+            "enemies": [],
+        },
+    }
+    batch = encoder.encode(
+        observation,
+        [
+            {
+                "action_handle": "end",
+                "kind": "end_turn",
+                "model_action_kind": "end_turn",
+            }
+        ],
+    ).batch.world
+    card_definition = _hash_id("entity", "CARD.CYCLE", model.entity_vocab_size)
+    rows = torch.nonzero(batch.entity_ids[0] == card_definition, as_tuple=False).flatten()
+    assert rows.numel() == 3
+    assert len(set(batch.entity_aux_ids[0, rows].tolist())) == 3
+    assert set(batch.zone_ids[0, rows].tolist()) == {
+        _ZONE_IDS["draw"],
+        _ZONE_IDS["discard"],
+        _ZONE_IDS["exhaust"],
+    }
+
+
+def test_macro_surfaces_and_exact_shop_slot_relation_reach_the_model() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=160,
+            max_candidates=4,
+            max_candidate_local_tokens=16,
+        )
+    )
+    shop_item = {
+        "index": 3,
+        "item_kind": "card",
+        "price": 75,
+        "is_affordable": True,
+        "is_stocked": True,
+        "card": {"id": "CARD.SHOP", "type": "Skill", "cost": 1},
+    }
+    observation = {
+        "phase": "shop",
+        "decision_domain": "build",
+        "run": {"active": True, "floor": 8, "act": 1},
+        "player": {
+            "character_id": "CHARACTER.TEST",
+            "hp": 42,
+            "max_hp": 80,
+            "gold": 100,
+            "deck": [{"id": "CARD.STARTER", "type": "Attack", "cost": 1}],
+        },
+        "map": {
+            "is_open": True,
+            "current_coord": {"x": 0, "y": 0},
+            "points": [
+                {
+                    "coord": {"x": 0, "y": 0},
+                    "point_type": "Monster",
+                    "children": [{"x": 1, "y": 1}],
+                },
+                {"coord": {"x": 1, "y": 1}, "point_type": "Shop"},
+            ],
+        },
+        "shop": {"visible": True, "gold": 100, "items": [shop_item]},
+        "rest_site": {
+            "visible": True,
+            "options": [
+                {
+                    "option_id": "REST",
+                    "option_type": "Rest",
+                    "heal_amount": 24,
+                    "is_enabled": True,
+                }
+            ],
+        },
+        "rewards": {
+            "cards": [{"id": "CARD.REWARD", "type": "Power", "cost": 2}],
+            "relics": [{"id": "RELIC.REWARD", "rarity": "Rare"}],
+            "potions": [{"id": "POTION.REWARD", "slot_index": 1}],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "shop:3",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "model_action_variant": "buy",
+            "item": shop_item,
+        }
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    relation = batch.candidates.entity_aux_ids[0, 0]
+    matching_world = torch.nonzero(
+        batch.world.entity_aux_ids[0] == relation,
+        as_tuple=False,
+    ).flatten()
+    assert matching_world.numel() >= 1
+    assert batch.candidates.zone_ids[0, 0] == _ZONE_IDS["shop"]
+    assert _ZONE_IDS["map"] in batch.world.zone_ids[0].tolist()
+    assert _ZONE_IDS["rest_site"] in batch.world.zone_ids[0].tolist()
+    assert _ZONE_IDS["reward"] in batch.world.zone_ids[0].tolist()
+
+    local_mask = batch.candidates.local_mask[0, 0]
+    local_rows = batch.candidates.local_features[0, 0, local_mask]
+    price_slot = _NUMERIC_SLOT_BY_KEY["price"]
+    amount_slot = _NUMERIC_SLOT_BY_KEY["amount"]
+    assert any(row[price_slot].item() == pytest.approx(_bounded_number(75)) for row in local_rows)
+    assert any(row[amount_slot].item() == pytest.approx(_bounded_number(-75)) for row in local_rows)
+
+
+def test_claimable_rewards_bind_candidate_slots_and_exact_resource_facts() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=64,
+            max_candidates=4,
+            max_candidate_local_tokens=12,
+        )
+    )
+    observation = {
+        "phase": "reward",
+        "decision_domain": "build",
+        "run": {"active": True, "floor": 9},
+        "player": {
+            "character_id": "CHARACTER.TEST",
+            "hp": 40,
+            "max_hp": 80,
+            "gold": 20,
+        },
+        "rewards": {
+            "visible": True,
+            "rewards": [
+                {"index": 0, "reward": {"reward_type": "gold", "amount": 30}},
+                {"index": 1, "reward": {"reward_type": "relic", "rarity": "Rare"}},
+            ],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "reward:0",
+            "kind": "reward",
+            "model_action_kind": "reward",
+            "reward": {"slot_index": 0, "type": "gold", "amount": 30},
+        },
+        {
+            "action_handle": "reward:1",
+            "kind": "reward",
+            "model_action_kind": "reward",
+            "reward": {"slot_index": 1, "type": "relic", "rarity": "Rare"},
+        },
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    candidate_relations = batch.candidates.entity_aux_ids[0, :2]
+    assert candidate_relations[0] != candidate_relations[1]
+    world_relations = set(batch.world.entity_aux_ids[0].tolist())
+    assert set(candidate_relations.tolist()).issubset(world_relations)
+    assert batch.candidates.zone_ids[0, :2].tolist() == [
+        _ZONE_IDS["reward"],
+        _ZONE_IDS["reward"],
+    ]
+
+    gold_local = batch.candidates.local_features[
+        0,
+        0,
+        batch.candidates.local_mask[0, 0],
+    ]
+    amount_slot = _NUMERIC_SLOT_BY_KEY["amount"]
+    assert any(row[amount_slot].item() == pytest.approx(_bounded_number(30)) for row in gold_local)

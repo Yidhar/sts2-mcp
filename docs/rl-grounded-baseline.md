@@ -1,9 +1,10 @@
-# Recurrent grounded-candidate V-trace baseline (v2)
+# Relational grounded-candidate V-trace baseline (v3)
 
 This document is the normative architecture for the restarted RL line. The v1
-grounded single-step replay learner did not clear Act 1 and is not a migration
-source. Its checkpoints and metrics may be retained as failure evidence, but v2
-starts from fresh random parameters and rejects the v1 checkpoint ABI.
+grounded single-step replay learner and the relation-poor v2 recurrent learner
+did not establish a useful Act 1 baseline and are not migration sources. Their
+checkpoints and metrics may be retained as failure evidence, but v3 starts from
+fresh random parameters and rejects both older model/encoding ABIs.
 
 ## Scope
 
@@ -15,7 +16,7 @@ head or terminal-prediction head.
 ```mermaid
 flowchart LR
     Env["Typed live/headless backend"] --> Encoder["Structural grounded encoder"]
-    Encoder --> Actor["Recurrent actor replica"]
+    Encoder --> Actor["Relational recurrent actor replica"]
     Actor --> Unroll["64-decision SequenceUnroll"]
     Unroll --> Queue["Bounded FIFO queue"]
     Queue --> Learner["V-trace actor/value learner"]
@@ -31,25 +32,31 @@ flowchart LR
 `RecurrentCandidateModel` preserves the reviewed world/candidate separation:
 
 1. `encode_world` reads structural world tokens and the decision domain only.
-2. `encode_candidates` grounds each currently legal candidate against the world
-   latents without candidate-position embeddings.
-3. A GRU consumes the candidate-independent state embedding and the previous
-   recurrent state.
-4. The recurrent context conditions a masked legal-candidate policy.
-5. One scalar value predicts the configured task horizon.
+2. Every world entity carries both a stable definition identity and, where the
+   runtime supplies one, a concrete instance/relation identity.
+3. `encode_candidates` attends the exact world tokens and separately pools
+   exact-instance and same-definition evidence for its source and target. A
+   learned projection decides how to combine those four channels; no fixed
+   tactical ratio is encoded.
+4. Two GRU halves consume candidate-independent state: run memory updates on
+   macro decisions, while combat memory updates in combat and is cleared on
+   exit. Hundreds of card plays cannot overwrite route/build memory.
+5. The recurrent context conditions a masked legal-candidate policy.
+6. One scalar value predicts the configured task horizon.
 
 The default contract is:
 
-- structural feature width: 160;
+- structural feature width: 224;
 - world/candidate width: 128;
 - world layers: 3;
 - latent slots: 12;
 - recurrent hidden width: 256;
-- parameters: 3,971,778;
+- parameters: 4,014,146;
 - output heads: masked policy and scalar value only.
 
 The model-facing observation uses the versioned
-[`grounded-card-facts-encoding-v3`](./card-facts-abi.md) contract. Card effects
+`grounded-relational-runtime-encoding-v7` contract together with the factual
+[`grounded-card-facts-encoding-v3`](./card-facts-abi.md) mechanics ABI. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
 description parsing or curated card rules. The default capacity is 512 world
 tokens and 64 local tokens per candidate; overflow is an error, never silent
@@ -58,6 +65,32 @@ truncation. This encoder change invalidates every earlier checkpoint.
 Candidate permutation must permute policy outputs in the same way while leaving
 the world encoding, recurrent state and value unchanged. Opaque dispatch handles
 are not model inputs. Only the environment legality mask can suppress an action.
+
+### Factual relation coverage
+
+The encoder exposes relationships which a policy would otherwise have to infer
+from unstable list positions:
+
+| Relation | Representation |
+|---|---|
+| same card definition vs. concrete copy | separate `entity_id` and runtime `entity_aux_id` |
+| card to dynamic vars, enchantment and affliction | shared concrete relation identity |
+| card to Deck/Hand/Draw/Discard/Exhaust/Play | fixed collision-free zone ID plus instance identity |
+| play/potion action to source and enemy target | independent source/target definition and relation channels |
+| enemy to powers and visible intents | shared enemy relation identity, child definition/role identity |
+| potion to inventory slot | factual `slot_index` and potion zone |
+| card selection/multi-select | source/destination zone, membership, operation, counts and confirmation facts |
+| deck upgrade | original instance bound to its factual upgrade preview |
+| shop choice | exact shelf slot, nested item, price, stock and affordability facts |
+| rest choice | native option type/enabled state and exact heal amount when supplied by the game |
+| reward choice | reward card/relic/potion identity and explicit add/skip mutation family |
+| map route | coordinate identities, point/room types and explicit directed edge tokens |
+| action consequence | only guaranteed immediate protocol mutation/resource facts; never predicted damage, draws, event results or future RNG |
+
+Draw-pile composition is player-inspectable and is encoded as a canonical
+unordered multiset; hidden draw order is never exposed. Active map/shop/rest,
+reward and selection surfaces are included only where decision-relevant so the
+interface does not serialize inactive UI trees on every combat action.
 
 ## Training data contract
 
@@ -138,14 +171,14 @@ Combat reward does **not** pay for damage dealt, enemy-HP change, number of
 cards played, or any preferred action. Those quantities may remain factual
 observations/diagnostics, but they are not reward terms.
 
-The default standard full-run objective is `act1`: entering Act 2 is success and
-dying or deadlocking before Act 2 is failure. The native-revival preheat uses the
-longer `run` objective so it traverses route, reward, event, shop, rest, combat,
-and build decisions instead of terminating at the first Act boundary. The
-`combat` profile remains only an optional software diagnostic. Backend reward
-scalars are not targets.
+The default standard full-run objective and the native-revival preheat objective
+are both `run`: entering Act 2 is ordinary forward progress rather than an
+artificial episode boundary. Both profiles traverse route, reward, event, shop,
+rest, combat, and build decisions until the complete run terminates. The retained
+`act1` objective and the `combat` profile are explicit software diagnostics, not
+gates or the main training route. Backend reward scalars are not targets.
 
-No human-data cold start is required for the first v2 baseline. Human trajectories
+No human-data cold start is required for the first v3 baseline. Human trajectories
 may be evaluated later as a separately versioned experiment; they must not be
 silently mixed into this baseline.
 
@@ -217,7 +250,7 @@ diagnostic artifacts and never enter the rollout queue.
 
 ## Evaluation schedule
 
-Training seeds are even; held-out evaluation seeds are odd. The default v2 gates
+Training seeds are even; held-out evaluation seeds are odd. The default v3 gates
 are steps 0, 10,000, 25,000 and 50,000, with fixed seeds and deterministic policy.
 Reports include:
 

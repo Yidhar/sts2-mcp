@@ -475,6 +475,76 @@ internal static partial class BridgeGameApi
             observation["event"] = eventState;
         }
 
+        // Macro decisions require the same factual state visible on the game
+        // surfaces, not only a count in the decision summary.  These builders
+        // expose exact inventory/options/map connectivity and contain no
+        // policy score or inferred outcome.
+        // Do not serialize inactive UI trees into every combat decision.  The
+        // run-scale recurrent half carries the last macro state across combat;
+        // active selection surfaces still enter even when opened by a card.
+        if (!string.Equals(decisionDomain, "combat", StringComparison.Ordinal))
+        {
+            observation["map"] = BuildMapPayload(
+                context.RunState,
+                context.MapScreen,
+                context.MapPoints,
+                context.CombatManager,
+                context.Screen);
+        }
+        if (string.Equals(phase, "rest_site", StringComparison.Ordinal))
+        {
+            observation["rest_site"] = BuildRestSitePayload(
+                context.MapScreen,
+                context.RestSiteRoom,
+                context.RestSiteButtons,
+                context.RestSiteProceedButton);
+        }
+        if (string.Equals(phase, "shop", StringComparison.Ordinal))
+        {
+            observation["shop"] = BuildShopPayload(
+                context.MerchantRoom,
+                context.MerchantInventory,
+                context.MerchantSlots,
+                context.MerchantButton,
+                context.MerchantProceedButton,
+                context.MerchantBackButton);
+        }
+        if (string.Equals(phase, "reward", StringComparison.Ordinal))
+        {
+            observation["rewards"] = BuildRewardsPayload(
+                context.RewardsScreen,
+                context.ProceedButton,
+                context.RewardProceedButton,
+                context.MapScreen,
+                context.RewardButtons);
+        }
+        if (string.Equals(phase, "card_reward", StringComparison.Ordinal))
+        {
+            observation["card_reward_selection"] = BuildCardRewardSelectionPayload(
+                context.CardRewardScreen,
+                context.CardRewardOptions,
+                context.CardRewardSkipButton);
+        }
+        if (string.Equals(phase, "card_selection", StringComparison.Ordinal))
+        {
+            observation["card_selection"] = BuildCardSelectionPayload(
+                context.CardSelectionScreen,
+                context.CardSelectionOptions,
+                context.CardSelectionConfirmButton,
+                context.CardSelectionCancelButton,
+                context.CardSelectionCloseButton,
+                context.CardSelectionSkipButton);
+        }
+        if (string.Equals(phase, "deck_upgrade", StringComparison.Ordinal))
+        {
+            observation["deck_upgrade_selection"] = BuildDeckUpgradeSelectionPayload(
+                context.DeckUpgradeScreen,
+                context.DeckUpgradeOptions,
+                context.DeckUpgradeConfirmButton,
+                context.DeckUpgradeCancelButton,
+                context.DeckUpgradeCloseButton);
+        }
+
         var decision = BuildEnvDecisionPayload(context, phase);
         if (decision is not null)
         {
@@ -522,8 +592,9 @@ internal static partial class BridgeGameApi
             .ToArray();
 
         var potions = (player?.PotionSlots ?? Enumerable.Empty<PotionModel?>())
-            .Where(static potion => potion is not null)
-            .Select(static potion => BuildPotionPayload(potion))
+            .Select(static (potion, slotIndex) => (potion, slotIndex))
+            .Where(static entry => entry.potion is not null)
+            .Select(static entry => BuildPotionPayload(entry.potion, entry.slotIndex))
             .ToArray();
 
         return new
@@ -626,6 +697,10 @@ internal static partial class BridgeGameApi
             draw = playerCombat?.DrawPile?.Cards.Count ?? 0,
             discard = playerCombat?.DiscardPile?.Cards.Count ?? 0,
             exhaust = playerCombat?.ExhaustPile?.Cards.Count ?? 0,
+            draw_pile = BuildPilePayload(playerCombat?.DrawPile),
+            discard_pile = BuildPilePayload(playerCombat?.DiscardPile),
+            exhaust_pile = BuildPilePayload(playerCombat?.ExhaustPile),
+            play_pile = BuildPilePayload(playerCombat?.PlayPile),
             players = context.CombatState.PlayerCreatures
                 .Select(BuildEnvCreaturePayload)
                 .ToArray(),
@@ -670,7 +745,10 @@ internal static partial class BridgeGameApi
             is_secondary_enemy = creature.IsSecondaryEnemy,
             is_stunned = creature.IsStunned,
             is_pet = creature.IsPet,
-            shows_infinite_hp = creature.ShowsInfiniteHp,
+            shows_infinite_hp = TryGetBoolFromPropertyOrField(
+                creature,
+                "ShowsInfiniteHp",
+                "_showsInfiniteHp") ?? false,
             can_receive_powers = creature.CanReceivePowers,
             slot_name = creature.SlotName,
             next_move_state_id = nextMove?.StateId,

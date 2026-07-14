@@ -186,7 +186,9 @@ internal static partial class BridgeGameApi
                     : CreateNotInCombatPayload(),
                 deck = BuildPilePayload(player.Deck),
                 relics = player.Relics.Select(BuildRelicPayload).ToArray(),
-                potions = player.PotionSlots.Select(BuildPotionPayload).ToArray()
+                potions = player.PotionSlots
+                    .Select((potion, slotIndex) => BuildPotionPayload(potion, slotIndex))
+                    .ToArray()
             })
             .Cast<object>()
             .ToArray();
@@ -277,12 +279,9 @@ internal static partial class BridgeGameApi
             model_id = card.Id.ToString(),
             class_name = card.GetType().Name,
             kind = card.GetType().Name,
-            // P0-6: stable per-instance handle.  CardModel instances persist
-            // for the lifetime of a card object across draw/discard/exhaust
-            // pile movement and replay/copy triggers, so the CLR's identity
-            // hash is a process-stable per-instance UUID for our purposes.
-            // Hex-formatted to make collisions visually obvious in logs.
-            instance_uuid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(card).ToString("X"),
+            // Stable collision-free process-local reference shared by state,
+            // pile, selection and legal-action payloads.
+            instance_uuid = GetCardReference(card),
             current_upgrade_level = card.CurrentUpgradeLevel,
             max_upgrade_level = card.MaxUpgradeLevel,
             base_replay_count = card.BaseReplayCount,

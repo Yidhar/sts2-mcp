@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -90,9 +91,23 @@ internal static class BridgePlayerStateProjector
 
             if (string.Equals(parentPropertyName, "draw_pile", StringComparison.OrdinalIgnoreCase))
             {
-                // Count/type are visible, but composition and ordering are not.
-                obj["cards"] = null;
-                obj["cards_visible"] = false;
+                // Players may inspect draw-pile composition, but not its
+                // hidden order.  Canonically sort cloned payloads before they
+                // cross the v2 boundary so transport order can never leak the
+                // next draw while the model still receives the public
+                // multiset needed for cycle planning.
+                if (obj["cards"] is JsonArray cards)
+                {
+                    var sortedCards = cards
+                        .Where(static card => card is not null)
+                        .OrderBy(
+                            static card => card!.ToJsonString(),
+                            StringComparer.Ordinal)
+                        .Select(static card => card!.DeepClone())
+                        .ToArray();
+                    obj["cards"] = new JsonArray(sortedCards);
+                }
+                obj["cards_visible"] = true;
                 obj["order_visible"] = false;
             }
             return;

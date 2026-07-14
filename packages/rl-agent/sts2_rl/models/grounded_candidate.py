@@ -13,10 +13,13 @@ from candidate-conditioned action scoring:
     permuting the candidate axis permutes every candidate output in the same
     way without changing state values.
 
-The recurrent state is the only cross-decision memory.  There are no Q,
-next-reward, terminal-class, search, or heuristic heads.  The module has no
-dependency on boss mechanics, card rules, reward shaping, replay, or MuZero.  A
-future raw-state encoder only needs to construct the typed tensor batches below.
+Concrete runtime identities occupy a separate relation channel from definition
+IDs.  Candidate sources and targets are matched back to the exact encoded world
+tokens before scoring, while definition matches remain available for unseen
+reward/shop entities.  The recurrent state is split into a run-scale memory and
+a combat-scale memory: combat decisions cannot overwrite long-horizon build
+context, and leaving combat clears only the tactical half.  There are no
+hand-written card/boss scores or predicted effect deltas in this module.
 """
 
 from __future__ import annotations
@@ -33,9 +36,8 @@ from torch import Tensor, nn
 # hash regions.  Keep the minimum here so model and encoder cannot silently
 # disagree about that tensor ABI.
 MIN_TOKEN_FEATURE_DIM: Final = 224
-_INTEGER_DTYPES = frozenset(
-    {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}
-)
+COMBAT_DOMAIN_ID: Final = 1
+_INTEGER_DTYPES = frozenset({torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8})
 
 
 def _require_rank(name: str, value: Tensor, rank: int) -> None:
@@ -63,17 +65,13 @@ def _require_finite_floating(name: str, value: Tensor) -> None:
 def _require_ids(name: str, value: Tensor, size: int) -> None:
     if value.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"{name} must use an integer dtype, got {value.dtype}")
-    if value.numel() and (
-        int(value.min().item()) < 0 or int(value.max().item()) >= size
-    ):
+    if value.numel() and (int(value.min().item()) < 0 or int(value.max().item()) >= size):
         raise ValueError(f"{name} contains an ID outside [0, {size})")
 
 
 def _require_same_device(name: str, reference: Tensor, value: Tensor) -> None:
     if value.device != reference.device:
-        raise ValueError(
-            f"{name} must be on {reference.device}, got {value.device}"
-        )
+        raise ValueError(f"{name} must be on {reference.device}, got {value.device}")
 
 
 def _candidate_axis(value: Tensor, permutation: Tensor) -> Tensor:
@@ -132,20 +130,17 @@ class GroundedCandidateConfig:
             "order_vocab_size": self.order_vocab_size,
         }
         wrong_types = [
-            name
-            for name, value in positive.items()
-            if isinstance(value, bool) or not isinstance(value, int)
+            name for name, value in positive.items() if isinstance(value, bool) or not isinstance(value, int)
         ]
         if wrong_types:
-            raise TypeError(
-                "grounded-candidate dimensions must be exact integers: "
-                + ", ".join(wrong_types)
-            )
+            raise TypeError("grounded-candidate dimensions must be exact integers: " + ", ".join(wrong_types))
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"grounded-candidate dimensions must be positive: {', '.join(invalid)}")
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if self.recurrent_hidden_dim % 2 != 0:
+            raise ValueError("recurrent_hidden_dim must be even for run/combat memory partitioning")
         if (
             isinstance(self.dropout, bool)
             or not isinstance(self.dropout, int | float)
@@ -155,8 +150,7 @@ class GroundedCandidateConfig:
             raise ValueError("dropout must be in [0, 1)")
         if self.token_feature_dim < MIN_TOKEN_FEATURE_DIM:
             raise ValueError(
-                "token_feature_dim must be at least "
-                f"{MIN_TOKEN_FEATURE_DIM} for the grounded feature ABI"
+                "token_feature_dim must be at least " f"{MIN_TOKEN_FEATURE_DIM} for the grounded feature ABI"
             )
         for name in (
             "type_vocab_size",
@@ -307,12 +301,8 @@ class CandidateTokenBatch:
             _require_ids(f"candidates.{name}", value, size)
 
         _require_rank("candidates.local_features", self.local_features, 4)
-        _require_finite_floating(
-            "candidates.local_features", self.local_features
-        )
-        _require_same_device(
-            "candidates.local_features", self.features, self.local_features
-        )
+        _require_finite_floating("candidates.local_features", self.local_features)
+        _require_same_device("candidates.local_features", self.features, self.local_features)
         local_batch, local_actions, local_count, local_feature_dim = self.local_features.shape
         if (local_batch, local_actions) != candidate_shape:
             raise ValueError(
@@ -408,12 +398,8 @@ class GroundedCandidateBatch:
         world_batch, world_count = self.world.validate(config)
         candidate_batch, action_count, local_count = self.candidates.validate(config)
         if world_batch != candidate_batch:
-            raise ValueError(
-                f"world/candidate batch sizes differ: {world_batch} != {candidate_batch}"
-            )
-        _require_same_device(
-            "candidates.features", self.world.features, self.candidates.features
-        )
+            raise ValueError(f"world/candidate batch sizes differ: {world_batch} != {candidate_batch}")
+        _require_same_device("candidates.features", self.world.features, self.candidates.features)
         _require_shape("domain_ids", self.domain_ids, (world_batch,))
         _require_same_device("domain_ids", self.world.features, self.domain_ids)
         _require_ids("domain_ids", self.domain_ids, config.domain_count)
@@ -433,7 +419,10 @@ class WorldEncoding:
 
     latents: Tensor  # [B, S, D]
     state_embedding: Tensor  # [B, D]
+    tokens: Tensor  # [B, W, D]
     world_mask: Tensor  # [B, W]
+    entity_ids: Tensor  # [B, W]
+    entity_aux_ids: Tensor  # [B, W], concrete/group relation identity
 
     def validate(
         self,
@@ -451,20 +440,31 @@ class WorldEncoding:
             self.state_embedding,
             (batch_size, config.d_model),
         )
+        _require_rank("world_encoding.tokens", self.tokens, 3)
+        if self.tokens.shape[0] != batch_size or self.tokens.shape[2] != config.d_model:
+            raise ValueError("world_encoding.tokens has an invalid batch/model shape")
         _require_rank("world_encoding.world_mask", self.world_mask, 2)
-        if self.world_mask.shape[0] != batch_size:
-            raise ValueError("world_encoding.world_mask batch size differs")
+        token_shape = (batch_size, int(self.tokens.shape[1]))
+        if tuple(self.world_mask.shape) != token_shape:
+            raise ValueError("world_encoding.world_mask shape differs from tokens")
+        for name, value in (
+            ("entity_ids", self.entity_ids),
+            ("entity_aux_ids", self.entity_aux_ids),
+        ):
+            _require_shape(f"world_encoding.{name}", value, token_shape)
+            _require_ids(f"world_encoding.{name}", value, config.entity_vocab_size)
         _require_finite_floating("world_encoding.latents", self.latents)
-        _require_finite_floating(
-            "world_encoding.state_embedding", self.state_embedding
-        )
+        _require_finite_floating("world_encoding.state_embedding", self.state_embedding)
+        _require_finite_floating("world_encoding.tokens", self.tokens)
         _require_bool("world_encoding.world_mask", self.world_mask)
-        _require_same_device(
-            "world_encoding.state_embedding", self.latents, self.state_embedding
-        )
-        _require_same_device(
-            "world_encoding.world_mask", self.latents, self.world_mask
-        )
+        _require_same_device("world_encoding.state_embedding", self.latents, self.state_embedding)
+        _require_same_device("world_encoding.world_mask", self.latents, self.world_mask)
+        for name, value in (
+            ("tokens", self.tokens),
+            ("entity_ids", self.entity_ids),
+            ("entity_aux_ids", self.entity_aux_ids),
+        ):
+            _require_same_device(f"world_encoding.{name}", self.latents, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +575,21 @@ class _StructuredTokenEmbedder(nn.Module):
             config.entity_vocab_size,
             config.d_model,
         )
+        self.target_owner_projection = nn.Linear(
+            config.d_model,
+            config.d_model,
+            bias=False,
+        )
+        self.target_entity_projection = nn.Linear(
+            config.d_model,
+            config.d_model,
+            bias=False,
+        )
+        self.target_relation_projection = nn.Linear(
+            config.d_model,
+            config.d_model,
+            bias=False,
+        )
         self.zone_embedding = nn.Embedding(config.zone_vocab_size, config.d_model)
         self.order_embedding = nn.Embedding(config.order_vocab_size, config.d_model)
         self.segment_embedding = nn.Embedding(3, config.d_model)
@@ -600,34 +615,29 @@ class _StructuredTokenEmbedder(nn.Module):
         target_entity_ids: Tensor | None = None,
         target_entity_aux_ids: Tensor | None = None,
     ) -> Tensor:
-        x = self.feature_projection(
-            features.to(dtype=self.type_embedding.weight.dtype)
-        )
+        x = self.feature_projection(features.to(dtype=self.type_embedding.weight.dtype))
         x = x + self.type_embedding(self._bounded(type_ids, self.config.type_vocab_size))
         x = x + self.role_embedding(self._bounded(role_ids, self.config.role_vocab_size))
         x = x + self.owner_embedding(self._bounded(owner_ids, self.config.owner_vocab_size))
         x = x + self.entity_embedding(self._bounded(entity_ids, self.config.entity_vocab_size))
-        x = x + self.entity_aux_embedding(
-            self._bounded(entity_aux_ids, self.config.entity_vocab_size)
-        )
+        x = x + self.entity_aux_embedding(self._bounded(entity_aux_ids, self.config.entity_vocab_size))
         x = x + self.zone_embedding(self._bounded(zone_ids, self.config.zone_vocab_size))
         if order_ids is not None:
             x = x + self.order_embedding(self._bounded(order_ids, self.config.order_vocab_size))
         if target_owner_ids is not None:
-            x = x + 0.5 * self.owner_embedding(
-                self._bounded(target_owner_ids, self.config.owner_vocab_size)
-            )
+            target_owner = self.owner_embedding(self._bounded(target_owner_ids, self.config.owner_vocab_size))
+            x = x + self.target_owner_projection(target_owner)
         if target_entity_ids is not None:
-            x = x + 0.5 * self.entity_embedding(
-                self._bounded(target_entity_ids, self.config.entity_vocab_size)
-            )
+            target_entity = self.entity_embedding(self._bounded(target_entity_ids, self.config.entity_vocab_size))
+            x = x + self.target_entity_projection(target_entity)
         if target_entity_aux_ids is not None:
-            x = x + 0.5 * self.entity_aux_embedding(
+            target_relation = self.entity_aux_embedding(
                 self._bounded(
                     target_entity_aux_ids,
                     self.config.entity_vocab_size,
                 )
             )
+            x = x + self.target_relation_projection(target_relation)
         segment = torch.full(type_ids.shape, segment_id, dtype=torch.long, device=features.device)
         x = x + self.segment_embedding(segment)
         return cast(Tensor, self.output_norm(x))
@@ -688,6 +698,15 @@ class RecurrentCandidateModel(nn.Module):
             batch_first=True,
         )
         self.candidate_to_world_norm = nn.LayerNorm(cfg.d_model)
+        # Keep exact-runtime and same-definition evidence in separate channels.
+        # Their relative usefulness is learned; there is deliberately no fixed
+        # "instance match is worth N times a definition match" policy rule.
+        self.relation_projection = nn.Sequential(
+            nn.LayerNorm(4 * cfg.d_model),
+            nn.Linear(4 * cfg.d_model, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.d_model),
+        )
         self.candidate_encoder = _make_transformer_stack(
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -703,8 +722,13 @@ class RecurrentCandidateModel(nn.Module):
         )
         self.candidate_norm = nn.LayerNorm(cfg.d_model)
 
-        self.recurrent_cell = nn.GRUCell(cfg.d_model, cfg.recurrent_hidden_dim)
-        self.recurrent_norm = nn.LayerNorm(cfg.recurrent_hidden_dim)
+        if cfg.recurrent_hidden_dim % 2:
+            raise ValueError("recurrent_hidden_dim must be even for run/combat memory partitioning")
+        memory_half = cfg.recurrent_hidden_dim // 2
+        self.run_recurrent_cell = nn.GRUCell(cfg.d_model, memory_half)
+        self.combat_recurrent_cell = nn.GRUCell(cfg.d_model, memory_half)
+        self.run_recurrent_norm = nn.LayerNorm(memory_half)
+        self.combat_recurrent_norm = nn.LayerNorm(memory_half)
         self.memory_to_candidate = nn.Sequential(
             nn.LayerNorm(cfg.recurrent_hidden_dim),
             nn.Linear(cfg.recurrent_hidden_dim, cfg.d_model),
@@ -805,6 +829,7 @@ class RecurrentCandidateModel(nn.Module):
             encoded_tokens,
             src_key_padding_mask=~encoded_mask,
         )
+        relation_tokens = encoded_tokens[:, 1:] * world_mask.unsqueeze(-1).to(dtype=encoded_tokens.dtype)
 
         domain_context = self.domain_embedding(domain_ids).unsqueeze(1)
         latent_queries = self.latent_queries.expand(batch_size, -1, -1) + domain_context
@@ -821,7 +846,10 @@ class RecurrentCandidateModel(nn.Module):
         return WorldEncoding(
             latents=latents,
             state_embedding=state_embedding,
+            tokens=relation_tokens,
             world_mask=world_mask,
+            entity_ids=world.entity_ids,
+            entity_aux_ids=world.entity_aux_ids,
         )
 
     def encode_candidates(
@@ -896,11 +924,33 @@ class RecurrentCandidateModel(nn.Module):
 
         world_delta, _ = self.candidate_to_world(
             candidate_tokens,
-            world_encoding.latents,
-            world_encoding.latents,
+            world_encoding.tokens,
+            world_encoding.tokens,
+            key_padding_mask=~_safe_valid_mask(world_encoding.world_mask),
             need_weights=False,
         )
-        candidate_tokens = self.candidate_to_world_norm(candidate_tokens + world_delta)
+        source_exact, source_definition = self._matched_world_contexts(
+            definition_ids=candidates.entity_ids,
+            relation_ids=candidates.entity_aux_ids,
+            world_encoding=world_encoding,
+        )
+        target_exact, target_definition = self._matched_world_contexts(
+            definition_ids=candidates.target_entity_ids,
+            relation_ids=candidates.target_entity_aux_ids,
+            world_encoding=world_encoding,
+        )
+        relation_context = self.relation_projection(
+            torch.cat(
+                [
+                    source_exact,
+                    source_definition,
+                    target_exact,
+                    target_definition,
+                ],
+                dim=-1,
+            )
+        )
+        candidate_tokens = self.candidate_to_world_norm(candidate_tokens + world_delta + relation_context)
         candidate_tokens = self.candidate_encoder(
             candidate_tokens,
             src_key_padding_mask=~_safe_valid_mask(action_mask),
@@ -909,6 +959,35 @@ class RecurrentCandidateModel(nn.Module):
         candidate_tokens = self.candidate_norm(candidate_tokens + state_context)
         candidate_tokens = candidate_tokens * action_mask.unsqueeze(-1).to(candidate_tokens.dtype)
         return CandidateEncoding(embeddings=candidate_tokens, action_mask=action_mask)
+
+    @staticmethod
+    def _matched_world_contexts(
+        *,
+        definition_ids: Tensor,
+        relation_ids: Tensor,
+        world_encoding: WorldEncoding,
+    ) -> tuple[Tensor, Tensor]:
+        """Pool exact-instance and same-definition evidence independently.
+
+        A missing/unknown ID (0/1) never matches, so padded candidates and
+        unseen entities receive zero context rather than an accidental global
+        pool.  The projection consuming these two channels learns how much to
+        use each kind of relation instead of relying on a hand-written ratio.
+        """
+
+        world_mask = world_encoding.world_mask.unsqueeze(1)
+        relation_valid = relation_ids.unsqueeze(-1) > 1
+        definition_valid = definition_ids.unsqueeze(-1) > 1
+        relation_match = relation_valid & (relation_ids.unsqueeze(-1) == world_encoding.entity_aux_ids.unsqueeze(1))
+        definition_match = definition_valid & (definition_ids.unsqueeze(-1) == world_encoding.entity_ids.unsqueeze(1))
+
+        def _pool(matches: Tensor) -> Tensor:
+            weights = matches.to(dtype=world_encoding.tokens.dtype) * world_mask.to(dtype=world_encoding.tokens.dtype)
+            numerator = torch.einsum("baw,bwd->bad", weights, world_encoding.tokens)
+            denominator = weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            return numerator / denominator
+
+        return _pool(relation_match), _pool(definition_match)
 
     def forward(
         self,
@@ -946,16 +1025,27 @@ class RecurrentCandidateModel(nn.Module):
             _validated=True,
         )
         mask = candidates.action_mask
-        next_recurrent_state = self.recurrent_norm(
-            self.recurrent_cell(world.state_embedding, recurrent_state)
+        memory_half = self.config.recurrent_hidden_dim // 2
+        previous_run = recurrent_state[:, :memory_half]
+        previous_combat = recurrent_state[:, memory_half:]
+        combat_domain = batch.domain_ids.eq(COMBAT_DOMAIN_ID).unsqueeze(-1)
+
+        # Long-horizon run memory updates only on macro/post-combat states;
+        # hundreds of individual card plays therefore cannot overwrite deck,
+        # route, shop and resource context.  Tactical memory updates inside a
+        # combat and is cleared as soon as the environment leaves that domain.
+        run_update = self.run_recurrent_norm(self.run_recurrent_cell(world.state_embedding, previous_run))
+        next_run = torch.where(combat_domain, previous_run, run_update)
+        combat_update = self.combat_recurrent_norm(self.combat_recurrent_cell(world.state_embedding, previous_combat))
+        next_combat = torch.where(
+            combat_domain,
+            combat_update,
+            torch.zeros_like(combat_update),
         )
+        next_recurrent_state = torch.cat([next_run, next_combat], dim=-1)
         memory_context = self.memory_to_candidate(next_recurrent_state).unsqueeze(1)
-        policy_features = self.policy_feature_norm(
-            candidates.embeddings + memory_context
-        )
-        policy_features = policy_features * mask.unsqueeze(-1).to(
-            dtype=policy_features.dtype
-        )
+        policy_features = self.policy_feature_norm(candidates.embeddings + memory_context)
+        policy_features = policy_features * mask.unsqueeze(-1).to(dtype=policy_features.dtype)
         raw_policy_logits = self.policy_head(policy_features).squeeze(-1)
         invalid_logit = torch.finfo(raw_policy_logits.dtype).min
         policy_logits = raw_policy_logits.masked_fill(~mask, invalid_logit)

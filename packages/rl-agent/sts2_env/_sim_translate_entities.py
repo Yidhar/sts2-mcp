@@ -55,6 +55,24 @@ def _translate_card(
     if raw_id is not None:
         card["id"] = _qualified_id("CARD", raw_id)
     card.pop("card_id", None)
+    runtime_identity = next(
+        (
+            sim_card.get(key)
+            for key in (
+                "instance_uuid",
+                "card_instance_id",
+                "instance_id",
+                "card_ref",
+                "ref",
+                "uuid",
+                "uid",
+            )
+            if sim_card.get(key) is not None and str(sim_card.get(key)).strip()
+        ),
+        None,
+    )
+    if runtime_identity is not None:
+        card["instance_id"] = str(runtime_identity)
     if sim_card.get("name") is not None and sim_card.get("title") is None:
         card["title"] = str(sim_card["name"])
     # A selection is not a physical card pile.  Native selection DTOs retain
@@ -96,7 +114,7 @@ def _translate_relic(sim_relic: Any) -> dict[str, Any]:
     return relic
 
 
-def _translate_potion(sim_potion: Any) -> dict[str, Any]:
+def _translate_potion(sim_potion: Any, *, slot_index: int | None = None) -> dict[str, Any]:
     if not isinstance(sim_potion, Mapping):
         raise TypeError("simulator potion must be a mapping")
     potion = deepcopy(dict(sim_potion))
@@ -106,6 +124,8 @@ def _translate_potion(sim_potion: Any) -> dict[str, Any]:
     potion.pop("potion_id", None)
     if sim_potion.get("name") is not None and sim_potion.get("title") is None:
         potion["title"] = str(sim_potion["name"])
+    if slot_index is not None:
+        potion["slot_index"] = slot_index
     return potion
 
 
@@ -138,7 +158,14 @@ def _translate_player(sim_player: Mapping[str, Any]) -> dict[str, Any]:
         raw_potions = sim_player.get("potions") or []
         if not isinstance(raw_potions, list | tuple):
             raise TypeError("simulator potions must be a sequence")
-        player["potions"] = [_translate_potion(item) for item in raw_potions]
+        translated_potions: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_potions):
+            if not isinstance(item, Mapping):
+                raise TypeError("simulator potion must be a mapping")
+            raw_slot = item.get("slot_index", item.get("slot"))
+            slot = raw_slot if isinstance(raw_slot, int) and not isinstance(raw_slot, bool) else index
+            translated_potions.append(_translate_potion(item, slot_index=slot))
+        player["potions"] = translated_potions
     if "status" in sim_player:
         player["powers"] = _translate_powers(sim_player.get("status"))
         player.pop("status", None)
@@ -152,6 +179,9 @@ def _translate_enemy(raw: Any) -> dict[str, Any]:
     entity_id = raw.get("entity_id", raw.get("model_id"))
     if entity_id is not None:
         enemy["model_id"] = _qualified_id("MONSTER", entity_id)
+    combat_identity = raw.get("combat_id", raw.get("instance_id", raw.get("id")))
+    if combat_identity is not None and str(combat_identity).strip():
+        enemy["instance_id"] = str(combat_identity)
     hp = raw.get("hp", raw.get("current_hp"))
     if hp is not None:
         enemy["hp"] = int(hp)
@@ -163,11 +193,7 @@ def _translate_enemy(raw: Any) -> dict[str, Any]:
         intents = raw.get("intents") or []
         if not isinstance(intents, list | tuple):
             raise TypeError("simulator enemy intents must be a sequence")
-        enemy["intents"] = [
-            deepcopy(dict(intent))
-            for intent in intents
-            if isinstance(intent, Mapping)
-        ]
+        enemy["intents"] = [deepcopy(dict(intent)) for intent in intents if isinstance(intent, Mapping)]
         if len(enemy["intents"]) != len(intents):
             raise TypeError("simulator enemy intent must be a mapping")
     return enemy

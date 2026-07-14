@@ -36,8 +36,12 @@ class RepositorySbomTests(unittest.TestCase):
         components = {component["purl"]: component for component in bom["components"]}
         self.assertEqual(list(components), sorted(components))
 
+        release_manifest = json.loads(
+            (ROOT / "release-manifest.json").read_text(encoding="utf-8")
+        )
+        bridge_version = release_manifest["components"]["bridge"]
         expected = {
-            "pkg:generic/sts2/bridge@0.8.0",
+            f"pkg:generic/sts2/bridge@{bridge_version}",
             "pkg:npm/%40modelcontextprotocol/sdk@1.29.0",
             "pkg:pypi/numpy@2.4.3?download_profile=windows-cp313",
             "pkg:pypi/torch@2.9.1%2Brocm7.2.1.lw.gitff65f5bc?download_profile=wsl-cp312-rocm-7.2.1",
@@ -65,22 +69,34 @@ class RepositorySbomTests(unittest.TestCase):
             "pkg:github/frankqwang/sts2-ai@459f30873eac374c160f0b409d2d8167e7eead7c"
         ]
         third_party_properties = _properties(third_party)
-        self.assertEqual(third_party_properties["sts2:license-status"], "review-required")
+        self.assertEqual(
+            third_party_properties["sts2:license-status"], "review-required"
+        )
         self.assertEqual(third_party_properties["sts2:distribution-allowed"], "false")
-        self.assertEqual(third_party["hashes"], [{"alg": "SHA-1", "content": "459f30873eac374c160f0b409d2d8167e7eead7c"}])
+        self.assertEqual(
+            third_party["hashes"],
+            [{"alg": "SHA-1", "content": "459f30873eac374c160f0b409d2d8167e7eead7c"}],
+        )
 
         def all_keys(value: object) -> set[str]:
             if isinstance(value, dict):
-                return set(value) | set().union(*(all_keys(item) for item in value.values()))
+                return set(value) | set().union(
+                    *(all_keys(item) for item in value.values())
+                )
             if isinstance(value, list):
-                return set().union(*(all_keys(item) for item in value)) if value else set()
+                return (
+                    set().union(*(all_keys(item) for item in value)) if value else set()
+                )
             return set()
 
         self.assertNotIn("timestamp", all_keys(bom))
         self.assertNotIn(str(ROOT), first.decode("utf-8"))
 
     def test_output_option_writes_identical_bytes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory, redirect_stdout(StringIO()):
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            redirect_stdout(StringIO()),
+        ):
             first_path = Path(temporary_directory) / "first.json"
             second_path = Path(temporary_directory) / "second.json"
             self.assertEqual(build_sbom.main(["--output", str(first_path)]), 0)
@@ -161,7 +177,9 @@ class FailClosedTests(unittest.TestCase):
                 f"example-python==3.0.0 --hash=sha256:{'4' * 64}\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(build_sbom.SbomError, "duplicate Python requirement"):
+            with self.assertRaisesRegex(
+                build_sbom.SbomError, "duplicate Python requirement"
+            ):
                 build_sbom.build_sbom(root)
 
     def test_missing_python_or_rocm_artifact_hash_is_rejected(self) -> None:
@@ -174,7 +192,9 @@ class FailClosedTests(unittest.TestCase):
                 "example-python==3.0.0\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(build_sbom.SbomError, "exact name==version pin"):
+            with self.assertRaisesRegex(
+                build_sbom.SbomError, "exact name==version pin"
+            ):
                 build_sbom.build_sbom(root)
 
             (root / "packages" / "rl-agent" / "requirements.lock").write_text(
@@ -207,7 +227,9 @@ class FailClosedTests(unittest.TestCase):
                 "resolved": "https://registry.example/example-2.0.0.tgz",
             }
             path.write_text(json.dumps(lock), encoding="utf-8")
-            with self.assertRaisesRegex(build_sbom.SbomError, "conflicting SHA-512 hashes"):
+            with self.assertRaisesRegex(
+                build_sbom.SbomError, "conflicting SHA-512 hashes"
+            ):
                 build_sbom.build_sbom(root)
 
     def test_missing_third_party_tree_is_rejected(self) -> None:
@@ -218,7 +240,9 @@ class FailClosedTests(unittest.TestCase):
             lock = json.loads(path.read_text(encoding="utf-8"))
             del lock["tree"]
             path.write_text(json.dumps(lock), encoding="utf-8")
-            with self.assertRaisesRegex(build_sbom.SbomError, "tree must be a non-empty"):
+            with self.assertRaisesRegex(
+                build_sbom.SbomError, "tree must be a non-empty"
+            ):
                 build_sbom.build_sbom(root)
 
 

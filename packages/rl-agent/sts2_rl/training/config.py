@@ -1,4 +1,4 @@
-"""Strict configuration ABI for the recurrent V-trace v2 baseline."""
+"""Strict configuration ABI for the relational recurrent V-trace v3 baseline."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-recurrent-curriculum-config-v2"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v3"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -60,7 +60,7 @@ def _require_optional_text(value: object, *, label: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    architecture: str = "recurrent_candidate_v2"
+    architecture: str = "relational_candidate_v3"
     token_feature_dim: int = 224
     d_model: int = 128
     n_heads: int = 4
@@ -112,15 +112,18 @@ class ModelConfig:
             label="model.dropout",
             minimum=0.0,
         )
-        if self.architecture != "recurrent_candidate_v2":
-            raise ValueError("only architecture='recurrent_candidate_v2' is supported")
+        if self.architecture != "relational_candidate_v3":
+            raise ValueError("only architecture='relational_candidate_v3' is supported")
         # Reuse the model's own shape validation as the single source of truth.
         self.to_model_config()
-        if min(
-            self.max_world_tokens,
-            self.max_candidates,
-            self.max_candidate_local_tokens,
-        ) <= 0:
+        if (
+            min(
+                self.max_world_tokens,
+                self.max_candidates,
+                self.max_candidate_local_tokens,
+            )
+            <= 0
+        ):
             raise ValueError("model token capacities must be positive")
 
     def to_model_config(self) -> GroundedCandidateConfig:
@@ -244,9 +247,7 @@ class RolloutConfig:
         if self.minimum_unrolls > self.queue_capacity:
             raise ValueError("rollout minimum_unrolls cannot exceed queue_capacity")
         if self.collector_workers != 1:
-            raise ValueError(
-                "v2 currently requires one collector worker per typed backend session"
-            )
+            raise ValueError("v2 currently requires one collector worker per typed backend session")
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +288,7 @@ class CurriculumConfig:
     """Task horizon and exploration schedule without mechanics rules."""
 
     mode: Literal["standard", "native-revival-preheat"] = "standard"
-    reward_objective: Literal["combat", "act1", "run"] = "act1"
+    reward_objective: Literal["combat", "act1", "run"] = "run"
     revival_relic_id: str | None = None
     revival_budget: int | None = None
     epsilon_start: float = 0.30
@@ -376,10 +377,7 @@ class RuntimeConfig:
             previous = step
         if not isinstance(self.device, str) or not self.device.strip():
             raise TypeError("runtime.device must be a non-empty string")
-        if (
-            not isinstance(self.collector_device, str)
-            or not self.collector_device.strip()
-        ):
+        if not isinstance(self.collector_device, str) or not self.collector_device.strip():
             raise TypeError("runtime.collector_device must be a non-empty string")
         if (
             not isinstance(self.log_dir, str)
@@ -417,9 +415,7 @@ class DiagnosticsConfig:
         if self.deadlock_repeat_threshold < 2:
             raise ValueError("diagnostics.deadlock_repeat_threshold must be at least 2")
         if self.deadlock_repeat_threshold > self.deadlock_window:
-            raise ValueError(
-                "diagnostics.deadlock_repeat_threshold cannot exceed deadlock_window"
-            )
+            raise ValueError("diagnostics.deadlock_repeat_threshold cannot exceed deadlock_window")
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,9 +434,7 @@ class TrainingConfig:
         if not isinstance(self.version, str):
             raise TypeError("training config version must be a string")
         if self.version != CONFIG_VERSION:
-            raise ValueError(
-                f"unsupported training config version {self.version!r}; expected {CONFIG_VERSION!r}"
-            )
+            raise ValueError(f"unsupported training config version {self.version!r}; expected {CONFIG_VERSION!r}")
         if not isinstance(self.profile, str) or not self.profile.strip():
             raise ValueError("training profile must be non-empty")
         for name, expected_type in (
@@ -453,26 +447,17 @@ class TrainingConfig:
             ("diagnostics", DiagnosticsConfig),
         ):
             if not isinstance(getattr(self, name), expected_type):
-                raise TypeError(
-                    f"training config {name} must be {expected_type.__name__}"
-                )
+                raise TypeError(f"training config {name} must be {expected_type.__name__}")
         if self.environment.scenario == "combat" and self.curriculum.reward_objective != "combat":
             raise ValueError(
-                "reward objective must match the environment horizon: "
-                "combat scenarios require objective='combat'"
+                "reward objective must match the environment horizon: " "combat scenarios require objective='combat'"
             )
         if self.environment.scenario == "full-run" and self.curriculum.reward_objective == "combat":
-            raise ValueError(
-                "full-run scenarios require objective='act1' or objective='run'"
-            )
+            raise ValueError("full-run scenarios require objective='act1' or objective='run'")
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("native revival preheat requires the headless backend")
-        expected_discount = (
-            1.0
-            if self.curriculum.mode == "native-revival-preheat"
-            else TASK_REWARD_SPEC.discount
-        )
+        expected_discount = 1.0 if self.curriculum.mode == "native-revival-preheat" else TASK_REWARD_SPEC.discount
         if self.optimization.discount != expected_discount:
             raise ValueError(
                 "optimization.discount must equal the reward contract discount "
@@ -575,20 +560,12 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
         version=version,
         profile=profile,
         model=_construct(ModelConfig, _table(payload, "model"), label="model"),
-        optimization=_construct(
-            OptimizationConfig, _table(payload, "optimization"), label="optimization"
-        ),
+        optimization=_construct(OptimizationConfig, _table(payload, "optimization"), label="optimization"),
         rollout=_construct(RolloutConfig, _table(payload, "rollout"), label="rollout"),
-        environment=_construct(
-            EnvironmentConfig, _table(payload, "environment"), label="environment"
-        ),
-        curriculum=_construct(
-            CurriculumConfig, _table(payload, "curriculum"), label="curriculum"
-        ),
+        environment=_construct(EnvironmentConfig, _table(payload, "environment"), label="environment"),
+        curriculum=_construct(CurriculumConfig, _table(payload, "curriculum"), label="curriculum"),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
-        diagnostics=_construct(
-            DiagnosticsConfig, _table(payload, "diagnostics"), label="diagnostics"
-        ),
+        diagnostics=_construct(DiagnosticsConfig, _table(payload, "diagnostics"), label="diagnostics"),
     )
 
 

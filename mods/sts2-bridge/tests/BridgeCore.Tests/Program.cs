@@ -1036,10 +1036,12 @@ var projectedDrawPile = projectedPlayerState.GetProperty("players")[0]
     .GetProperty("combat")
     .GetProperty("draw_pile");
 Assert(projectedDrawPile.GetProperty("count").GetInt32() == 2 &&
-       projectedDrawPile.GetProperty("cards").ValueKind == JsonValueKind.Null &&
-       !projectedDrawPile.GetProperty("cards_visible").GetBoolean() &&
+       projectedDrawPile.GetProperty("cards").GetArrayLength() == 2 &&
+       projectedDrawPile.GetProperty("cards")[0].GetProperty("id").GetString() == "secret-a" &&
+       projectedDrawPile.GetProperty("cards")[1].GetProperty("id").GetString() == "secret-b" &&
+       projectedDrawPile.GetProperty("cards_visible").GetBoolean() &&
        !projectedDrawPile.GetProperty("order_visible").GetBoolean(),
-    "player state projection must recursively redact hidden draw-pile composition and order");
+    "player state projection must expose player-inspectable draw composition in canonical order without leaking hidden order");
 var projectedPotion = projectedPlayerState.GetProperty("players")[0].GetProperty("potion");
 Assert(!projectedPotion.TryGetProperty("training_tags", out _) &&
        !projectedPotion.TryGetProperty("enabled_for_training", out _),

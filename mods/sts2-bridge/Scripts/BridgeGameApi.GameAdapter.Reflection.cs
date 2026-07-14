@@ -1279,8 +1279,21 @@ internal static partial class BridgeGameApi
 
     private static string GetCardReference(CardModel card)
     {
-        return $"card-{RuntimeHelpers.GetHashCode(card):x8}";
+        return CardReferences.GetValue(
+            card,
+            static _ => new CardReferenceIdentity(
+                $"card-{Interlocked.Increment(ref _nextCardReference):x16}"))
+            .Value;
     }
+
+    private sealed record CardReferenceIdentity(string Value);
+
+    // Reference equality is the authoritative runtime card-instance identity.
+    // ConditionalWeakTable keeps it stable across pile movement without
+    // retaining removed card objects. A monotonic 64-bit counter avoids the
+    // collisions possible with RuntimeHelpers.GetHashCode.
+    private static readonly ConditionalWeakTable<CardModel, CardReferenceIdentity> CardReferences = new();
+    private static long _nextCardReference;
 
     private static int? TryGetIntFromPropertyOrField(object? target, params string[] memberNames)
     {

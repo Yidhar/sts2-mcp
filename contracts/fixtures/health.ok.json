@@ -15,7 +15,7 @@
     "training"
   ],
   "bridge_name": "sts2-mcp-bridge",
-  "bridge_version": "0.8.0",
+  "bridge_version": "0.9.0",
   "process_id": 4242,
   "process_started_at_utc": "2026-07-11T11:59:00Z",
   "heartbeat_timeout_ms": 5000,

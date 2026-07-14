@@ -46,6 +46,61 @@ def test_unregistered_simulator_action_enum_fails_closed() -> None:
         sim_kind_to_model_kind("future_unregistered_action")
 
 
+def test_claim_reward_action_binds_exact_reward_slot_and_nested_entities() -> None:
+    sim_state = {
+        "state_type": "rewards",
+        "rewards": {
+            "player": _player(),
+            "items": [
+                {
+                    "index": 0,
+                    "reward": {"reward_type": "gold", "amount": 31},
+                },
+                {
+                    "index": 1,
+                    "reward": {
+                        "reward_type": "relic",
+                        "relic": {"id": "RELIC.TEST", "rarity": "Rare"},
+                    },
+                },
+                {
+                    "index": 2,
+                    "reward": {
+                        "reward_type": "potion",
+                        "potion": {"id": "POTION.TEST", "usage": "Combat"},
+                    },
+                },
+            ],
+        },
+        "legal_actions": [
+            {"action": "claim_reward", "index": 0},
+            {"action": "claim_reward", "index": 1},
+            {"action": "claim_reward", "index": 2},
+            {"action": "skip_rewards"},
+        ],
+    }
+
+    translated = translate_to_bridge_shape(sim_state, episode_id="ep-rewards")
+
+    assert [item["slot_index"] for item in translated["rewards"]["items"]] == [
+        0,
+        1,
+        2,
+    ]
+    assert [item["reward"]["slot_index"] for item in translated["rewards"]["items"]] == [0, 1, 2]
+    actions = translated["available_actions"]
+    assert actions[0]["reward"] == {
+        "reward_type": "gold",
+        "amount": 31,
+        "slot_index": 0,
+    }
+    assert actions[1]["reward"]["slot_index"] == 1
+    assert actions[1]["reward"]["relic"]["id"] == "RELIC.TEST"
+    assert actions[2]["reward"]["slot_index"] == 2
+    assert actions[2]["reward"]["potion"]["id"] == "POTION.TEST"
+    assert "reward" not in actions[3]
+
+
 def _player() -> dict[str, object]:
     return {
         "current_hp": 61,
@@ -70,9 +125,7 @@ def test_selection_actions_keep_simulator_order_membership_and_enabled_state() -
                 {"index": 0, "id": "STRIKE", "source_pile": "Discard"},
                 {"index": 1, "id": "DEFEND", "source_pile": "Discard"},
             ],
-            "selected_cards": [
-                {"index": 0, "id": "STRIKE", "source_pile": "Discard"}
-            ],
+            "selected_cards": [{"index": 0, "id": "STRIKE", "source_pile": "Discard"}],
             "selected_count": 1,
             "remaining_picks": 1,
             "mode": "SimpleGrid",
@@ -160,10 +213,10 @@ def test_hand_selection_defaults_to_hand_without_synthetic_selection_piles() -> 
         "Hand",
         "Hand",
     ]
-    assert [
-        action["card"]["selection_membership"]
-        for action in translated["available_actions"]
-    ] == ["selectable", "selected"]
+    assert [action["card"]["selection_membership"] for action in translated["available_actions"]] == [
+        "selectable",
+        "selected",
+    ]
 
 
 def test_selection_operation_metadata_mismatch_fails_closed() -> None:
@@ -315,6 +368,59 @@ def test_combat_entities_have_no_mechanic_or_self_damage_derivations() -> None:
     assert "canonical_text" not in card
 
 
+def test_runtime_instances_and_sparse_potion_slots_bind_state_to_actions() -> None:
+    sim_state = {
+        "state_type": "combat",
+        "battle": {
+            "player": {
+                "current_hp": 70,
+                "max_hp": 80,
+                "hand": [
+                    {
+                        "index": 0,
+                        "id": "STRIKE",
+                        "instance_uuid": "card-runtime-17",
+                        "cost": 1,
+                    }
+                ],
+                "deck": [],
+                "draw_pile": [{"id": "DEFEND", "instance_uuid": "card-runtime-18"}],
+                "discard_pile": [{"id": "BASH", "instance_uuid": "card-runtime-19"}],
+                "exhaust_pile": [{"id": "BURN", "instance_uuid": "card-runtime-20"}],
+                "potions": [
+                    {"slot": 2, "id": "FIRE_POTION"},
+                ],
+            },
+            "enemies": [
+                {
+                    "entity_id": "CULTIST",
+                    "combat_id": 41,
+                    "hp": 50,
+                    "max_hp": 50,
+                }
+            ],
+        },
+        "legal_actions": [
+            {"action": "play_card", "card_index": 0, "target_id": 41},
+            {"action": "use_potion", "slot": 2, "target_id": 41},
+        ],
+    }
+
+    translated = translate_to_bridge_shape(sim_state, episode_id="ep-relations")
+    player = translated["player"]
+    actions = translated["available_actions"]
+
+    assert player["hand"][0]["instance_id"] == "card-runtime-17"
+    assert actions[0]["card"]["instance_id"] == "card-runtime-17"
+    assert actions[0]["target"]["instance_id"] == "41"
+    assert translated["combat"]["enemies"][0]["instance_id"] == "41"
+    assert player["draw_pile"][0]["pile"] == "Draw"
+    assert player["discard_pile"][0]["pile"] == "Discard"
+    assert player["exhaust_pile"][0]["pile"] == "Exhaust"
+    assert player["potions"][0]["slot_index"] == 2
+    assert actions[1]["potion"]["slot_index"] == 2
+
+
 def test_runtime_mechanics_fields_survive_transport_without_inference() -> None:
     dynamic_var = {
         "name": "Amount",
@@ -339,9 +445,7 @@ def test_runtime_mechanics_fields_survive_transport_without_inference() -> None:
                 "dynamic_vars": [dynamic_var],
             }
         ],
-        "afflictions": [
-            {"id": "CURSED", "modifier_type": "affliction", "amount": 2}
-        ],
+        "afflictions": [{"id": "CURSED", "modifier_type": "affliction", "amount": 2}],
         "base_replay_count": 1,
         "current_replay_count": 2,
         "is_retained": True,

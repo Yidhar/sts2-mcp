@@ -28,7 +28,7 @@ from sts2_rl.models.grounded_candidate import (
     WorldTokenBatch,
 )
 
-ENCODED_DECISION_SNAPSHOT_VERSION: Final = "grounded-encoded-decision-v1"
+ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v2"
 _WORLD_ID_WIDTH: Final = 7
 _CANDIDATE_ID_WIDTH: Final = 9
 _LOCAL_ID_WIDTH: Final = 7
@@ -90,19 +90,12 @@ class GroundedEncodingConfig:
         wrong_types = [
             name
             for name in integer_fields
-            if isinstance(getattr(self, name), bool)
-            or not isinstance(getattr(self, name), int)
+            if isinstance(getattr(self, name), bool) or not isinstance(getattr(self, name), int)
         ]
         if wrong_types:
-            raise TypeError(
-                "grounded encoding dimensions must be exact integers: "
-                + ", ".join(wrong_types)
-            )
+            raise TypeError("grounded encoding dimensions must be exact integers: " + ", ".join(wrong_types))
         if self.feature_dim < MIN_TOKEN_FEATURE_DIM:
-            raise ValueError(
-                "feature_dim must be at least "
-                f"{MIN_TOKEN_FEATURE_DIM} for the grounded feature ABI"
-            )
+            raise ValueError("feature_dim must be at least " f"{MIN_TOKEN_FEATURE_DIM} for the grounded feature ABI")
         if self.feature_dim > int(np.iinfo(np.uint16).max) + 1:
             raise ValueError("feature_dim exceeds the sparse snapshot index ABI")
         for name in (
@@ -129,9 +122,7 @@ class GroundedEncodingConfig:
             raise ValueError("max_order_id exceeds the sparse snapshot ID ABI")
         if self.domain_count <= 5:
             raise ValueError("domain_count is too small for the fixed domain vocabulary")
-        if self.max_candidates * self.max_candidate_local_tokens > int(
-            np.iinfo(np.uint32).max
-        ):
+        if self.max_candidates * self.max_candidate_local_tokens > int(np.iinfo(np.uint32).max):
             raise ValueError("candidate-local capacity exceeds the snapshot offset ABI")
 
 
@@ -257,9 +248,7 @@ class SparseTokenTable:
     ) -> None:
         self.validate_structure()
         if self.ids.shape[1:] != (len(id_bounds),):
-            raise ValueError(
-                f"{label}.ids width must be {len(id_bounds)}, got {self.ids.shape[1:]}"
-            )
+            raise ValueError(f"{label}.ids width must be {len(id_bounds)}, got {self.ids.shape[1:]}")
         if len(self.feature_indices) and int(self.feature_indices.max()) >= feature_dim:
             raise ValueError(f"{label} sparse feature index exceeds feature_dim")
         for column, bound in enumerate(id_bounds):
@@ -281,9 +270,7 @@ def sparse_token_table(
     if id_width <= 0 or any(len(row) != id_width for row in ids):
         raise ValueError("token ID rows differ from the declared width")
     if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value <= int(np.iinfo(np.int32).max)
+        isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= int(np.iinfo(np.int32).max)
         for row in ids
         for value in row
     ):
@@ -362,9 +349,11 @@ class EncodedDecisionSnapshot:
     ) -> None:
         if not isinstance(self.config, GroundedEncodingConfig):
             raise TypeError("encoded decision snapshot config has the wrong type")
-        if not isinstance(self.world, SparseTokenTable) or not isinstance(
-            self.candidates, SparseTokenTable
-        ) or not isinstance(self.locals, SparseTokenTable):
+        if (
+            not isinstance(self.world, SparseTokenTable)
+            or not isinstance(self.candidates, SparseTokenTable)
+            or not isinstance(self.locals, SparseTokenTable)
+        ):
             raise TypeError("encoded decision snapshot token tables have the wrong type")
         for name, value, dtype in (
             ("local_offsets", self.local_offsets, np.dtype(np.uint32)),
@@ -373,9 +362,7 @@ class EncodedDecisionSnapshot:
             if not isinstance(value, np.ndarray):
                 raise TypeError(f"encoded decision {name} must be a NumPy array")
             if value.dtype != dtype or value.ndim != 1 or not value.flags.c_contiguous:
-                raise ValueError(
-                    f"encoded decision {name} must be canonical contiguous {dtype} rank-1"
-                )
+                raise ValueError(f"encoded decision {name} must be canonical contiguous {dtype} rank-1")
         if self.version != ENCODED_DECISION_SNAPSHOT_VERSION:
             raise ValueError(f"unsupported encoded decision snapshot: {self.version!r}")
         if self.config != expected_config:
@@ -502,25 +489,15 @@ def collate_encoded_snapshots(
     local_capacity = max(
         1,
         max(
-            (
-                int(count)
-                for snapshot in snapshots
-                for count in np.diff(snapshot.local_offsets)
-            ),
+            (int(count) for snapshot in snapshots for count in np.diff(snapshot.local_offsets)),
             default=0,
         ),
     )
-    world_features = np.zeros(
-        (batch_size, world_capacity, cfg.feature_dim), dtype=np.float32
-    )
+    world_features = np.zeros((batch_size, world_capacity, cfg.feature_dim), dtype=np.float32)
     world_mask = np.zeros((batch_size, world_capacity), dtype=np.bool_)
     world_ids = np.zeros((batch_size, world_capacity, _WORLD_ID_WIDTH), dtype=np.int64)
-    candidate_features = np.zeros(
-        (batch_size, candidate_capacity, cfg.feature_dim), dtype=np.float32
-    )
-    candidate_ids = np.zeros(
-        (batch_size, candidate_capacity, _CANDIDATE_ID_WIDTH), dtype=np.int64
-    )
+    candidate_features = np.zeros((batch_size, candidate_capacity, cfg.feature_dim), dtype=np.float32)
+    candidate_ids = np.zeros((batch_size, candidate_capacity, _CANDIDATE_ID_WIDTH), dtype=np.int64)
     action_mask = np.zeros((batch_size, candidate_capacity), dtype=np.bool_)
     local_features = np.zeros(
         (
@@ -575,9 +552,11 @@ def collate_encoded_snapshots(
 
         local_counts = np.diff(snapshot.local_offsets).astype(np.int64)
         local_candidate_rows = np.repeat(np.arange(candidate_count), local_counts)
-        local_positions = np.concatenate(
-            [np.arange(count, dtype=np.int64) for count in local_counts]
-        ) if snapshot.locals.token_count else np.empty((0,), dtype=np.int64)
+        local_positions = (
+            np.concatenate([np.arange(count, dtype=np.int64) for count in local_counts])
+            if snapshot.locals.token_count
+            else np.empty((0,), dtype=np.int64)
+        )
         if snapshot.locals.token_count:
             local_mask[
                 batch_index,

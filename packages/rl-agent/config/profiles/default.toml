@@ -1,8 +1,8 @@
-version = "sts2-recurrent-curriculum-config-v2"
+version = "sts2-relational-curriculum-config-v3"
 profile = "default"
 
 [model]
-architecture = "recurrent_candidate_v2"
+architecture = "relational_candidate_v3"
 token_feature_dim = 224
 d_model = 128
 n_heads = 4
@@ -53,7 +53,7 @@ max_episode_steps = 10000
 
 [curriculum]
 mode = "standard"
-reward_objective = "act1"
+reward_objective = "run"
 epsilon_start = 0.30
 epsilon_end = 0.05
 epsilon_decay_steps = 250000

@@ -18,13 +18,13 @@ from sts2_rl.training import (
 )
 
 
-def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
+def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-recurrent-curriculum-config-v2"
-    assert default.model.architecture == "recurrent_candidate_v2"
-    assert default.curriculum.reward_objective == "act1"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v3"
+    assert default.model.architecture == "relational_candidate_v3"
+    assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
     assert preheat.curriculum.mode == "native-revival-preheat"
     assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
@@ -54,7 +54,7 @@ def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
 
 
 def test_model_and_rollout_configs_fail_closed() -> None:
-    with pytest.raises(ValueError, match="recurrent_candidate_v2"):
+    with pytest.raises(ValueError, match="relational_candidate_v3"):
         ModelConfig(architecture="grounded_candidate_v1")
     with pytest.raises(ValueError, match="minimum_unrolls"):
         RolloutConfig(queue_capacity=4, minimum_unrolls=5)

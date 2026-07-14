@@ -177,7 +177,7 @@ internal static partial class BridgeGameApi
                             player_index = playerIndex,
                             player_net_id = player.NetId,
                             slot_index = slotIndex,
-                            potion = BuildPotionPayload(potion),
+                            potion = BuildPotionPayload(potion, slotIndex),
                             target = resolvedTarget.Target is null ? null : BuildCreaturePayload(resolvedTarget.Target),
                             target_action_suffix = resolvedTarget.ActionSuffix,
                             target_combat_id = resolvedTarget.Target?.CombatId,
@@ -250,7 +250,7 @@ internal static partial class BridgeGameApi
                         player_index = playerIndex,
                         player_net_id = player.NetId,
                         slot_index = slotIndex,
-                        potion = BuildPotionPayload(potion),
+                        potion = BuildPotionPayload(potion, slotIndex),
                         can_remove_potions = player.CanRemovePotions,
                         screen = context.Screen
                     },
