@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,13 @@ class HeadlessSimBridgeClient:
         self._proc: subprocess.Popen | None = None
         self._episode_counter = 0
         self._current_episode_id: str = ""
+        # ``combat_reset`` creates a combat-scoped episode on top of the
+        # full-run simulator.  The full-run RPC reports a won combat as the
+        # non-interactive ``combat_post_end_pending`` boundary rather than as
+        # a terminal episode, so the adapter must remember which reset mode
+        # owns the current episode.
+        self._combat_episode_active = False
+        self._last_observation: dict[str, Any] | None = None
         # Cache the bridge-shaped legal_actions from the most recent step/reset
         # response so step() can resolve an action_index back to the sim's
         # raw action dict when the env dispatches.
@@ -522,6 +530,7 @@ class HeadlessSimBridgeClient:
         seed: str | int | None = None,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
+        self._combat_episode_active = False
         timeout_s = max(float(timeout_ms) / 1000.0, 0.001)
         if rebind_active_run and self._current_episode_id:
             sim_state = self._rpc("state", timeout_s=timeout_s)
@@ -611,6 +620,7 @@ class HeadlessSimBridgeClient:
         deck_entries: list[dict[str, Any]] | None = None,
         relics: list[str] | None = None,
         additional_relics: list[str] | None = None,
+        training_revival_budget: int | None = None,
         potions: list[str] | None = None,
         gold: int | None = None,
         timeout_ms: int = 15_000,
@@ -684,6 +694,13 @@ class HeadlessSimBridgeClient:
                 for rid in additional_relics
                 if rid
             ]
+        if training_revival_budget is not None:
+            budget = int(training_revival_budget)
+            if budget < -1:
+                raise ValueError(
+                    "training_revival_budget must be -1 or a non-negative integer"
+                )
+            build["training_revival_budget"] = budget
         if potions is not None:
             # SimulationBuildSpec may or may not have potions; include under
             # build to be future-proof; sim ignores unknown fields.
@@ -704,6 +721,7 @@ class HeadlessSimBridgeClient:
                 f"combat_reset failed: {combat_result.get('error_code')}: "
                 f"{str(combat_result.get('error'))[:500]}"
             )
+        self._combat_episode_active = True
         sim_state = self._rpc("state", timeout_s=timeout_s)
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
@@ -736,22 +754,74 @@ def _build_bridge_step_response(
         client._episode_counter += 1
         client._current_episode_id = f"sim-ep-{client._episode_counter}"
 
+    sim_state = dict(sim_state)
+    # CombatTrainingEnvService is hosted inside the full-run runtime.  After
+    # its encounter is won, the full-run state advances to this internal
+    # transition boundary with no legal actions, but the combat-scoped RL
+    # episode is complete.  Treating it as non-terminal made every real win
+    # look like a deadlocked episode and was the reason preheat reported zero
+    # victories even under unlimited native revival.
+    combat_victory_boundary = (
+        client._combat_episode_active
+        and str(sim_state.get("state_type") or "").lower()
+        == "combat_post_end_pending"
+    )
+    if combat_victory_boundary:
+        sim_state["terminal"] = True
+        sim_state["run_outcome"] = "victory"
+        sim_state["legal_actions"] = []
+
     terminal = bool(sim_state.get("terminal", False))
     truncated = bool(sim_state.get("truncated", False))
 
     from sts2_env._sim_translate import translate_to_bridge_shape
-    bridge_obs = translate_to_bridge_shape(
+    translated_obs = translate_to_bridge_shape(
         sim_state,
         episode_id=client._current_episode_id,
     )
+    if combat_victory_boundary and client._last_observation is not None:
+        # The post-end DTO has already discarded the battle/player blocks.
+        # Preserve the last factual combat snapshot for terminal HP/fact
+        # derivation while taking counters and state identity from the actual
+        # post-end state. No model action is ever chosen from this snapshot.
+        bridge_obs = deepcopy(client._last_observation)
+        for key in (
+            "state_version",
+            "state_hash",
+            "semantic_state_hash",
+            "_training",
+            "_sim_raw",
+        ):
+            bridge_obs[key] = translated_obs.get(key)
+        bridge_obs.update(
+            {
+                "state_type": "combat_victory",
+                "terminated": True,
+                "truncated": False,
+                "available_actions": [],
+            }
+        )
+        combat = bridge_obs.get("combat")
+        if isinstance(combat, dict):
+            combat["in_progress"] = False
+    else:
+        bridge_obs = translated_obs
     legal_actions = bridge_obs.get("available_actions") or []
     # Cache so the next step() call can map an action_index back to the raw
     # sim action dict stored under ``_sim_raw``.
     client._last_legal_actions = legal_actions
+    client._last_observation = deepcopy(bridge_obs)
 
     info = dict(sim_state.get("info") or {})
     if info_extra:
         info.update(info_extra)
+    terminal_reason = (
+        "combat_victory"
+        if combat_victory_boundary
+        else sim_state.get("terminal_reason", info.get("terminal_reason"))
+    )
+    if terminal_reason is not None:
+        info["terminal_reason"] = str(terminal_reason)
 
     # This adapter preserves the simulator scalar as transport data only.
     # HeadlessBackend projects transition facts and replaces it before any
@@ -767,6 +837,9 @@ def _build_bridge_step_response(
         "reward_authority": "backend-diagnostic",
         "done": terminal,
         "truncated": truncated,
+        "terminal_reason": (
+            str(terminal_reason) if terminal_reason is not None else None
+        ),
         "obs": bridge_obs,
         "legal_actions": legal_actions,
         "info": info,

@@ -1,8 +1,18 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..fab8e72 100644
+index 76abc62..6ff72c5 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-@@ -695,7 +695,9 @@ public static class FullRunApiStateBuilder
+@@ -46,6 +46,9 @@ public static class FullRunApiStateBuilder
+ 			backend_kind = snapshot.BackendKind,
+ 			coverage_tier = snapshot.CoverageTier,
+ 			run_outcome = snapshot.RunOutcome,
++			training_revival_budget = TrainingRevivalController.RevivalBudget,
++			training_revivals_used = TrainingRevivalController.RevivalsUsed,
++			training_player_hp_lost = TrainingRevivalController.PlayerHpLost,
+ 			run = new FullRunApiRun
+ 			{
+ 				character_id = snapshot.CharacterId,
+@@ -695,7 +698,9 @@ public static class FullRunApiStateBuilder
  			name = SafeGetText(() => relic.Title),
  			rarity = relic.Rarity.ToString(),
  			description = SafeGetText(() => relic.DynamicDescription),
@@ -14,7 +24,7 @@ index 76abc62..fab8e72 100644
  	}
  
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..26bb610 100644
+index 15bb206..ce74c23 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 @@ -166,6 +166,10 @@ public sealed class FullRunApiRelicOption
@@ -28,33 +38,58 @@ index 15bb206..26bb610 100644
  }
  
  public sealed class FullRunApiPlayerState
+@@ -532,6 +536,12 @@ public sealed class FullRunApiState
+ 
+ 	public string? run_outcome { get; set; }
+ 
++	public int? training_revival_budget { get; set; }
++
++	public int training_revivals_used { get; set; }
++
++	public int training_player_hp_lost { get; set; }
++
+ 	public FullRunApiRun run { get; set; } = new FullRunApiRun();
+ 
+ 	public List<FullRunApiAction> legal_actions { get; set; } = new List<FullRunApiAction>();
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
-index 6f1ecf4..fba2e6f 100644
+index 6f1ecf4..f0b3d4b 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
-@@ -30,6 +30,9 @@ public sealed class SimulationBuildSpec
+@@ -30,6 +30,12 @@ public sealed class SimulationBuildSpec
  	[JsonPropertyName("relics")]
  	public List<SimulationBuildRelicSpec>? Relics { get; set; }
  
 +	[JsonPropertyName("additional_relics")]
 +	public List<SimulationBuildRelicSpec>? AdditionalRelics { get; set; }
 +
++	[JsonPropertyName("training_revival_budget")]
++	public int? TrainingRevivalBudget { get; set; }
++
  	[JsonPropertyName("current_hp")]
  	public int? CurrentHp { get; set; }
  
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
-index 658be06..cfa38e9 100644
+index 658be06..3ed8f30 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
-@@ -29,6 +29,7 @@ internal static class SimulationBuildSupport
+@@ -29,6 +29,8 @@ internal static class SimulationBuildSupport
  
  		return build.Deck != null
  			|| build.Relics != null
 +			|| build.AdditionalRelics != null
++			|| build.TrainingRevivalBudget.HasValue
  			|| build.CurrentHp.HasValue
  			|| build.MaxHp.HasValue
  			|| build.MaxEnergy.HasValue
-@@ -89,6 +90,23 @@ internal static class SimulationBuildSupport
+@@ -71,6 +73,7 @@ internal static class SimulationBuildSupport
+ 
+ 	public static void ApplyToPlayerIfRequested(Player player, SimulationBuildSpec? build)
+ 	{
++		TrainingRevivalController.Configure(build?.TrainingRevivalBudget);
+ 		if (!HasOverrides(build))
+ 		{
+ 			return;
+@@ -89,6 +92,23 @@ internal static class SimulationBuildSupport
  			AddDiscoveredRelics(save, save.Relics);
  		}
  
@@ -78,3 +113,134 @@ index 658be06..cfa38e9 100644
  		if (build.MaxHp.HasValue)
  		{
  			save.MaxHp = Math.Max(1, build.MaxHp.Value);
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
+new file mode 100644
+index 0000000..82ebe6f
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
+@@ -0,0 +1,62 @@
++using System;
++using MegaCrit.Sts2.Core.Entities.Creatures;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Simulator-only accounting and budget control for combat knowledge preheat.
++/// A null budget disables the training override, -1 is unlimited, and any
++/// non-negative value is the total number of native Lizard Tail revivals that
++/// may fire in the current combat.
++/// </summary>
++public static class TrainingRevivalController
++{
++	private static int? _revivalBudget;
++
++	public static bool IsEnabled => _revivalBudget.HasValue;
++
++	public static int? RevivalBudget => _revivalBudget;
++
++	public static int RevivalsUsed { get; private set; }
++
++	public static int PlayerHpLost { get; private set; }
++
++	public static bool CanRevive => IsEnabled
++		&& (_revivalBudget == -1 || RevivalsUsed < _revivalBudget);
++
++	public static void Configure(int? revivalBudget)
++	{
++		if (revivalBudget.HasValue && revivalBudget.Value < -1)
++		{
++			throw new InvalidOperationException(
++				"training_revival_budget must be null, -1, or a non-negative integer."
++			);
++		}
++
++		_revivalBudget = revivalBudget;
++		RevivalsUsed = 0;
++		PlayerHpLost = 0;
++	}
++
++	public static void RecordRevival()
++	{
++		if (!CanRevive)
++		{
++			throw new InvalidOperationException(
++				"A training revival fired after its configured budget was exhausted."
++			);
++		}
++
++		RevivalsUsed = checked(RevivalsUsed + 1);
++	}
++
++	public static void RecordHpLoss(Creature creature, int amount)
++	{
++		if (!IsEnabled || !creature.IsPlayer || amount <= 0)
++		{
++			return;
++		}
++
++		PlayerHpLost = checked(PlayerHpLost + amount);
++	}
++}
+diff --git a/src/Core/Entities/Creatures/Creature.cs b/src/Core/Entities/Creatures/Creature.cs
+index 644a57f..c8c963e 100644
+--- a/src/Core/Entities/Creatures/Creature.cs
++++ b/src/Core/Entities/Creatures/Creature.cs
+@@ -16,6 +16,7 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
+ using MegaCrit.Sts2.Core.Platform;
+ using MegaCrit.Sts2.Core.Random;
+ using MegaCrit.Sts2.Core.Runs;
++using MegaCrit.Sts2.Core.Simulation;
+ using MegaCrit.Sts2.Core.TestSupport;
+ using MegaCrit.Sts2.Core.ValueProps;
+ 
+@@ -377,6 +378,7 @@ public class Creature
+ 		int currentHp = CurrentHp;
+ 		int num = (int)Math.Min(amount, 999999999m);
+ 		CurrentHp = Math.Max(CurrentHp - num, 0);
++		TrainingRevivalController.RecordHpLoss(this, currentHp - CurrentHp);
+ 		return new DamageResult(this, props)
+ 		{
+ 			UnblockedDamage = currentHp - CurrentHp,
+diff --git a/src/Core/Models/Relics/LizardTail.cs b/src/Core/Models/Relics/LizardTail.cs
+index dffe5c6..e4bdc17 100644
+--- a/src/Core/Models/Relics/LizardTail.cs
++++ b/src/Core/Models/Relics/LizardTail.cs
+@@ -6,6 +6,7 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Entities.Relics;
+ using MegaCrit.Sts2.Core.Localization.DynamicVars;
+ using MegaCrit.Sts2.Core.Saves.Runs;
++using MegaCrit.Sts2.Core.Simulation;
+ 
+ namespace MegaCrit.Sts2.Core.Models.Relics;
+ 
+@@ -43,6 +44,10 @@ public sealed class LizardTail : RelicModel
+ 		{
+ 			return true;
+ 		}
++		if (TrainingRevivalController.IsEnabled)
++		{
++			return !TrainingRevivalController.CanRevive;
++		}
+ 		if (WasUsed)
+ 		{
+ 			return true;
+@@ -53,8 +58,19 @@ public sealed class LizardTail : RelicModel
+ 	public override async Task AfterPreventingDeath(Creature creature)
+ 	{
+ 		Flash();
++		if (TrainingRevivalController.IsEnabled)
++		{
++			TrainingRevivalController.RecordRevival();
++		}
+ 		WasUsed = true;
+ 		decimal amount = Math.Max(1m, (decimal)creature.MaxHp * (base.DynamicVars.Heal.BaseValue / 100m));
+ 		await CreatureCmd.Heal(creature, amount);
++		if (TrainingRevivalController.CanRevive)
++		{
++			// Rearm only the simulator training copy. The death prevention,
++			// relic flash and 50% native heal above remain the game's own path.
++			WasUsed = false;
++			base.Status = RelicStatus.Normal;
++		}
+ 	}
+ }

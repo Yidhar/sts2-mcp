@@ -53,6 +53,7 @@ class RewardCalculator(Protocol):
         after: EnvironmentResult,
         *,
         deadlock: bool = False,
+        horizon_exhausted: bool = False,
     ) -> TaskReward: ...
 
 
@@ -74,6 +75,7 @@ class EpisodeMetrics:
     deadlocked: bool
     revivals_used: int
     revival_free_combat_win: bool
+    player_hp_lost: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +207,8 @@ class GroundedCollector:
         reward_calculator: RewardCalculator | None = None,
         additional_relics: tuple[str, ...] = (),
         revival_relic_id: str | None = None,
+        training_revival_budget: int | None = None,
+        horizon_as_failure: bool = False,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -256,12 +260,21 @@ class GroundedCollector:
             if isinstance(revival_relic_id, str) and revival_relic_id.strip()
             else None
         )
+        self.training_revival_budget = training_revival_budget
+        self.horizon_as_failure = bool(horizon_as_failure)
         if self.additional_relics and scenario != "combat":
             raise ValueError("additional reset relics are only supported for combat collection")
         if self.revival_relic_id is not None and self.revival_relic_id not in {
             item.upper() for item in self.additional_relics
         }:
             raise ValueError("revival_relic_id must be one of the injected additional relics")
+        if self.training_revival_budget is not None:
+            if scenario != "combat" or self.revival_relic_id is None:
+                raise ValueError(
+                    "training_revival_budget requires combat and an injected revival relic"
+                )
+            if self.training_revival_budget < -1:
+                raise ValueError("training_revival_budget must be -1 or non-negative")
         self._rng = np.random.default_rng(int(seed))
         self._episode_seed = training_seed_start(int(seed))
         self._active_state_version: int | None = None
@@ -481,6 +494,7 @@ class GroundedCollector:
                     encounter_id=self.encounter_id,
                     seed=seed,
                     additional_relics=self.additional_relics or None,
+                    training_revival_budget=self.training_revival_budget,
                 )
             )
         else:
@@ -663,7 +677,9 @@ class GroundedCollector:
         final_outcome = "ongoing"
         deadlocked = False
         forced_horizon = False
+        curriculum_horizon = False
         revivals_used = 0
+        player_hp_lost = 0.0
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -702,14 +718,26 @@ class GroundedCollector:
                 and not next_state.terminated
                 and not next_state.truncated
             )
+            # ``maximum_steps`` may be a runtime's remaining global budget,
+            # which can cut an otherwise healthy episode after only one or a
+            # few decisions. Only the configured task horizon is a semantic
+            # failure. A shorter collection-budget cut keeps a positive
+            # discount and a bootstrap snapshot instead of fabricating a loss.
+            curriculum_horizon = bool(
+                forced_horizon and episode_limit >= self.max_episode_steps
+            )
             reward_started_ns = time.perf_counter_ns()
             breakdown = self.reward_calculator.evaluate(
                 state,
                 next_state,
                 deadlock=deadlock_evidence is not None,
+                horizon_exhausted=bool(
+                    curriculum_horizon and self.horizon_as_failure
+                ),
             )
             reward_total += breakdown.reward
-            revivals_used += int(breakdown.revival_penalty < 0.0)
+            revivals_used += breakdown.revivals_used_delta
+            player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
             deadlocked = breakdown.outcome == "deadlock"
             if record:
@@ -753,6 +781,8 @@ class GroundedCollector:
                         "potential_reward": breakdown.potential_reward,
                         "revival_penalty": breakdown.revival_penalty,
                         "pace_penalty": breakdown.pace_penalty,
+                        "hp_loss_penalty": breakdown.hp_loss_penalty,
+                        "player_hp_lost": player_hp_lost,
                         "revivals_used": revivals_used,
                         "outcome": breakdown.outcome,
                         "deadlock": (
@@ -821,7 +851,13 @@ class GroundedCollector:
                 steps=steps_taken,
                 reward_total=reward_total,
                 terminal_reason=(
-                    "semantic_deadlock" if deadlocked else state.terminal_reason
+                    "semantic_deadlock"
+                    if deadlocked
+                    else "curriculum_horizon"
+                    if curriculum_horizon and self.horizon_as_failure
+                    else "collection_budget"
+                    if forced_horizon
+                    else state.terminal_reason
                 ),
                 truncated=forced_horizon,
                 run_won=run_won,
@@ -834,6 +870,7 @@ class GroundedCollector:
                 deadlocked=deadlocked,
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
+                player_hp_lost=player_hp_lost,
             ),
             timings=timings.snapshot(),
         )

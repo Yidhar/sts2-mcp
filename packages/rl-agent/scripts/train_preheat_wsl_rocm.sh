@@ -65,6 +65,15 @@ echo "[preheat-rocm] STS2_ARTIFACT_ROOT=$STS2_ARTIFACT_ROOT"
 echo "[preheat-rocm] STS2_HEADLESS_SIM_EXE=$SIM_EXE"
 
 cd "$REPO_ROOT"
+GATE_EPISODES=500
+echo "[preheat-rocm] running fail-closed native-revival/solvability gate ($GATE_EPISODES episodes)"
+python -m sts2_rl.preheat_gate \
+  --sim-exe "$SIM_EXE" \
+  --episodes "$GATE_EPISODES" \
+  --encounter-id FUZZY_WURM_CRAWLER_WEAK \
+  --stress-encounter-id TUNNELER_WEAK \
+  --required-stress-revivals 2
+
 exec python -m sts2_rl.train \
   --profile preheat \
   --device cuda \

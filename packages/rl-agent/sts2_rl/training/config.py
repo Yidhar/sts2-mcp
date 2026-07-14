@@ -289,6 +289,7 @@ class CurriculumConfig:
     mode: Literal["standard", "native-revival-preheat"] = "standard"
     reward_objective: Literal["combat", "act1", "run"] = "act1"
     revival_relic_id: str | None = None
+    revival_budget: int | None = None
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 250_000
@@ -304,8 +305,18 @@ class CurriculumConfig:
         )
         if self.mode == "standard" and self.revival_relic_id is not None:
             raise ValueError("standard curriculum cannot inject a revival relic")
+        if self.mode == "standard" and self.revival_budget is not None:
+            raise ValueError("standard curriculum cannot set a revival budget")
         if self.mode == "native-revival-preheat" and self.revival_relic_id is None:
             raise ValueError("native revival preheat requires revival_relic_id")
+        if self.mode == "native-revival-preheat" and self.revival_budget is None:
+            raise ValueError("native revival preheat requires revival_budget")
+        if self.revival_budget is not None:
+            _require_int(
+                self.revival_budget,
+                label="curriculum.revival_budget",
+                minimum=-1,
+            )
         epsilon_start = _require_finite_number(
             self.epsilon_start,
             label="curriculum.epsilon_start",
@@ -463,10 +474,15 @@ class TrainingConfig:
                 raise ValueError(
                     "native revival preheat max_episode_steps cannot exceed 512"
                 )
-        if self.optimization.discount != TASK_REWARD_SPEC.discount:
+        expected_discount = (
+            1.0
+            if self.curriculum.mode == "native-revival-preheat"
+            else TASK_REWARD_SPEC.discount
+        )
+        if self.optimization.discount != expected_discount:
             raise ValueError(
-                "optimization.discount must equal the immutable v2 reward discount "
-                f"{TASK_REWARD_SPEC.discount}"
+                "optimization.discount must equal the reward contract discount "
+                f"{expected_discount} for curriculum mode {self.curriculum.mode!r}"
             )
 
     def to_mapping(self) -> dict[str, Any]:

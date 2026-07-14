@@ -253,6 +253,40 @@ def test_collector_emits_contiguous_recurrent_unroll() -> None:
         resources.close()
 
 
+def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> None:
+    base = _config(total_steps=1)
+    config = replace(
+        base,
+        optimization=replace(base.optimization, discount=1.0),
+        curriculum=CurriculumConfig(
+            mode="native-revival-preheat",
+            reward_objective="combat",
+            revival_relic_id="RELIC.LIZARD_TAIL",
+            revival_budget=-1,
+            epsilon_start=0.2,
+            epsilon_end=0.1,
+            epsilon_decay_steps=10,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=FakeCombatBackend(terminal_step=10),
+    )
+    try:
+        episode = resources.collector.collect_episode(
+            record=True,
+            maximum_steps=1,
+        )
+        assert episode.metrics.terminal_reason == "collection_budget"
+        assert not episode.metrics.combat_won
+        assert episode.metrics.reward_total > -0.1
+        assert len(episode.unrolls) == 1
+        assert episode.unrolls[0].steps[-1].discount == 1.0
+        assert episode.unrolls[0].bootstrap_snapshot is not None
+    finally:
+        resources.close()
+
+
 def test_collector_fails_closed_on_stale_transition_revision() -> None:
     resources = build_training_resources(_config(), backend=StaleRevisionBackend())
     try:

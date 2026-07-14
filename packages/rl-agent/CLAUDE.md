@@ -68,8 +68,18 @@ sts2_rl.train
   are never accepted as targets (the headless adapter strips them and may
   retain a diagnostic); objective vectors and settlement bonuses are rejected.
 - Native-revival preheat may inject only the configured native revival relic.
-  Revival is counted from the exact `is_used_up: false -> true` transition,
-  never from HP changes or a hand-written combat policy.
+  The simulator re-arms only that training copy after the game's native death
+  hook/flash/50%-heal path. Revival and actual HP removed come from exact
+  monotonic simulator counters under `observation._training`, never from HP
+  increase inference or a hand-written combat policy. Those underscore facts
+  are not model inputs.
+- Reward never pays for damage dealt, enemy-HP change or cards played. Preheat
+  ranks typed combat outcome first, then bounded exact HP-loss/revival costs and
+  a small decision cost; Act/run tasks use terminal outcome plus forward run
+  distance.
+- `scripts/train_preheat_wsl_rocm.sh` must pass the 500-episode random
+  solvability gate and repeated-native-revival stress probe before it may
+  launch the learner.
 - Forced singleton actions generate no policy target or policy-gradient term.
 - Training data is consumed once in FIFO order; replay sampling, PER and
   long-lived sample retention are forbidden.

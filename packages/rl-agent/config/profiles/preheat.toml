@@ -29,7 +29,7 @@ max_candidate_local_tokens = 16
 learning_rate = 0.0003
 weight_decay = 0.0001
 batch_unrolls = 8
-discount = 0.997
+discount = 1.0
 gradient_clip_norm = 1.0
 vtrace_rho_clip = 1.0
 vtrace_c_clip = 1.0
@@ -49,12 +49,14 @@ max_policy_lag = 1024
 [environment]
 backend = "headless"
 scenario = "combat"
+encounter_id = "FUZZY_WURM_CRAWLER_WEAK"
 max_episode_steps = 512
 
 [curriculum]
 mode = "native-revival-preheat"
 reward_objective = "combat"
 revival_relic_id = "RELIC.LIZARD_TAIL"
+revival_budget = -1
 epsilon_start = 0.70
 epsilon_end = 0.10
 epsilon_decay_steps = 100000
@@ -64,8 +66,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/native-revival-preheat"
-checkpoint_dir = "checkpoints/native-revival-preheat"
+log_dir = "runs/survival-preheat-v2"
+checkpoint_dir = "checkpoints/survival-preheat-v2"
 checkpoint_interval_steps = 25000
 evaluation_steps = [0, 10000, 25000, 50000]
 evaluation_episodes = 50

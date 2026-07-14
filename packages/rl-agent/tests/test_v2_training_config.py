@@ -28,6 +28,9 @@ def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
     assert combat.curriculum.reward_objective == "combat"
     assert preheat.curriculum.mode == "native-revival-preheat"
     assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
+    assert preheat.curriculum.revival_budget == -1
+    assert preheat.optimization.discount == 1.0
+    assert preheat.environment.encounter_id == "FUZZY_WURM_CRAWLER_WEAK"
     assert preheat.environment.max_episode_steps == 512
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
     mapping = default.to_mapping()
@@ -71,9 +74,25 @@ def test_native_revival_preheat_is_a_bounded_headless_combat_curriculum() -> Non
         mode="native-revival-preheat",
         reward_objective="combat",
         revival_relic_id="RELIC.LIZARD_TAIL",
+        revival_budget=-1,
     )
     with pytest.raises(ValueError, match="full-run|combat scenario"):
         replace(TrainingConfig(), curriculum=curriculum)
+
+
+def test_preheat_and_standard_discount_contracts_fail_closed() -> None:
+    preheat = load_training_config(profile="preheat")
+    with pytest.raises(ValueError, match="reward contract discount 1.0"):
+        replace(
+            preheat,
+            optimization=replace(preheat.optimization, discount=0.997),
+        )
+    standard = load_training_config(profile="default")
+    with pytest.raises(ValueError, match="reward contract discount 0.997"):
+        replace(
+            standard,
+            optimization=replace(standard.optimization, discount=1.0),
+        )
 
 
 def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> None:

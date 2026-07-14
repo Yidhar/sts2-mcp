@@ -19,3 +19,7 @@
 *.pkl binary
 *.onnx binary
 *.safetensors binary
+
+# Unified diffs necessarily contain context-prefix spaces before source tabs
+# and blank context lines. Do not diagnose patch syntax as source whitespace.
+*.patch -whitespace

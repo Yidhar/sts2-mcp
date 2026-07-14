@@ -37,6 +37,8 @@ class TransitionFacts:
     potions_added: tuple[str, ...] = ()
     potions_removed: tuple[str, ...] = ()
     relics_used: tuple[str, ...] = ()
+    revivals_used_delta: int = 0
+    player_hp_lost_delta: float = 0.0
     room_entered: str | None = None
     combat_result: CombatResult = "none"
     terminal_reason: str | None = None
@@ -60,6 +62,8 @@ class TransitionFacts:
             potions_added=_ids(data.get("potions_added")),
             potions_removed=_ids(data.get("potions_removed")),
             relics_used=_ids(data.get("relics_used")),
+            revivals_used_delta=int(_number(data.get("revivals_used_delta"))),
+            player_hp_lost_delta=_number(data.get("player_hp_lost_delta")),
             room_entered=(
                 str(data["room_entered"]) if data.get("room_entered") is not None else None
             ),
@@ -75,6 +79,18 @@ class TransitionFacts:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _nonnegative_counter_delta(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    key: str,
+) -> float:
+    before_training = _mapping(before.get("_training"))
+    after_training = _mapping(after.get("_training"))
+    before_value = max(0.0, _number(before_training.get(key)))
+    after_value = max(0.0, _number(after_training.get(key)))
+    return max(0.0, after_value - before_value)
 
 
 def _player_from_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -191,7 +207,15 @@ def derive_transition_facts(
     reason = str(terminal_reason or "").lower()
     combat_result: CombatResult = "none"
     if terminated:
-        if after_hp <= 0.0 or any(token in reason for token in ("death", "defeat", "died")):
+        # An explicit transport outcome is authoritative. Combat-scoped
+        # simulator victories cross a post-combat DTO that no longer carries
+        # a player object, so checking its default HP=0 first would invert a
+        # real victory into a defeat.
+        if any(token in reason for token in ("victory", "won", "win")):
+            combat_result = "victory"
+        elif after_hp <= 0.0 or any(
+            token in reason for token in ("death", "defeat", "died")
+        ):
             combat_result = "defeat"
         elif "escape" in reason:
             combat_result = "escaped"
@@ -208,6 +232,12 @@ def derive_transition_facts(
         relics_used=_newly_used_relics(
             before_player.get("relics"),
             after_player.get("relics"),
+        ),
+        revivals_used_delta=int(
+            _nonnegative_counter_delta(before, after, "revivals_used")
+        ),
+        player_hp_lost_delta=_nonnegative_counter_delta(
+            before, after, "player_hp_lost"
         ),
         room_entered=(
             str(after_run.get("room_type") or after.get("room_type"))

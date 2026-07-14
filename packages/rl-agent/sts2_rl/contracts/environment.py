@@ -181,6 +181,7 @@ class CombatResetRequest:
     deck_entries: tuple[Mapping[str, Any], ...] | None = None
     relics: tuple[str, ...] | None = None
     additional_relics: tuple[str, ...] | None = None
+    training_revival_budget: int | None = None
     potions: tuple[str, ...] | None = None
     gold: int | None = None
     timeout_ms: int = 15_000
@@ -196,6 +197,13 @@ class CombatResetRequest:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if (
+            self.training_revival_budget is not None
+            and self.training_revival_budget < -1
+        ):
+            raise ValueError(
+                "training_revival_budget must be null, -1, or non-negative"
+            )
 
     @classmethod
     def from_legacy(
@@ -222,6 +230,7 @@ class CombatResetRequest:
                 if self.additional_relics is not None
                 else None
             ),
+            "training_revival_budget": self.training_revival_budget,
             "potions": list(self.potions) if self.potions is not None else None,
             "gold": self.gold,
             "timeout_ms": self.timeout_ms,
@@ -243,6 +252,7 @@ class CombatResetRequest:
                 if self.additional_relics is not None
                 else None
             ),
+            "training_revival_budget": self.training_revival_budget,
             "potions": list(self.potions) if self.potions is not None else None,
             "gold": self.gold,
             "timeout_ms": self.timeout_ms,

@@ -162,6 +162,8 @@ def build_training_resources(
             else ()
         ),
         revival_relic_id=revival_relic_id,
+        training_revival_budget=config.curriculum.revival_budget,
+        horizon_as_failure=config.curriculum.mode == "native-revival-preheat",
     )
     learner = VTraceLearner(
         model=model,

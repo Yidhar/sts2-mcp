@@ -82,6 +82,7 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "mean_undiscounted_reward_total": 0.0,
             "mean_environment_steps": 0.0,
             "mean_revivals_used": 0.0,
+            "mean_player_hp_lost": 0.0,
             "revival_free_combat_win_rate": 0.0,
         }
     count = len(episodes)
@@ -100,6 +101,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "mean_environment_steps": statistics.fmean(item.steps for item in episodes),
         "mean_revivals_used": statistics.fmean(
             item.revivals_used for item in episodes
+        ),
+        "mean_player_hp_lost": statistics.fmean(
+            item.player_hp_lost for item in episodes
         ),
         "revival_free_combat_win_rate": (
             sum(item.revival_free_combat_win for item in episodes) / count
@@ -194,6 +198,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "reward_objective": config.curriculum.reward_objective,
         "curriculum_mode": config.curriculum.mode,
         "revival_relic_id": config.curriculum.revival_relic_id,
+        "revival_budget": config.curriculum.revival_budget,
     }
 
 

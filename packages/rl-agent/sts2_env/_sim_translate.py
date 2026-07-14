@@ -174,6 +174,16 @@ def translate_to_bridge_shape(
         ),
         "card_reward_selection": _translate_card_reward_sel_block(card_reward),
         "available_actions": actions,
+        # Exact simulator curriculum counters are reward/evaluation facts, not
+        # policy features. The leading underscore keeps them outside the
+        # grounded encoder while preserving an auditable transition source.
+        "_training": {
+            "revival_budget": sim_state.get("training_revival_budget"),
+            "revivals_used": int(sim_state.get("training_revivals_used", 0) or 0),
+            "player_hp_lost": float(
+                sim_state.get("training_player_hp_lost", 0) or 0
+            ),
+        },
         # Dispatch/debug provenance stays outside model features: the grounded
         # encoder rejects all underscore-prefixed fields.
         "_sim_raw": deepcopy(dict(sim_state)),

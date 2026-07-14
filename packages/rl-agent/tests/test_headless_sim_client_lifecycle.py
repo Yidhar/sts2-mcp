@@ -17,7 +17,11 @@ from sts2_env.headless_sim_bridge_client import (
 
 def _bare_client() -> HeadlessSimBridgeClient:
     client = HeadlessSimBridgeClient.__new__(HeadlessSimBridgeClient)
+    client._episode_counter = 0
     client._current_episode_id = ""
+    client._combat_episode_active = False
+    client._last_observation = None
+    client._last_legal_actions = []
     return client
 
 
@@ -62,6 +66,47 @@ def test_step_rejects_stale_episode_before_dispatch() -> None:
     with pytest.raises(HeadlessSimError, match="episode mismatch"):
         client.step("sim-ep-old", action_index=0)
     client._rpc.assert_not_called()
+
+
+def test_combat_post_end_boundary_is_a_typed_victory_not_a_deadlock() -> None:
+    client = _bare_client()
+    client._combat_episode_active = True
+    active = module._build_bridge_step_response(
+        client,
+        {
+            "state_type": "combat",
+            "battle": {
+                "player": {"hp": 17, "max_hp": 50},
+                "enemies": [{"id": "MONSTER.TEST", "hp": 1, "max_hp": 10}],
+            },
+            "training_revival_budget": -1,
+            "training_revivals_used": 3,
+            "training_player_hp_lost": 120,
+            "legal_actions": [],
+        },
+        episode_started=True,
+        reward=0.0,
+    )
+    assert not active["done"]
+
+    victory = module._build_bridge_step_response(
+        client,
+        {
+            "state_type": "combat_post_end_pending",
+            "training_revival_budget": -1,
+            "training_revivals_used": 3,
+            "training_player_hp_lost": 120,
+            "legal_actions": [],
+        },
+        episode_started=False,
+        reward=0.0,
+    )
+    assert victory["done"]
+    assert victory["terminal_reason"] == "combat_victory"
+    assert victory["obs"]["state_type"] == "combat_victory"
+    assert victory["obs"]["player"]["hp"] == 17
+    assert victory["obs"]["_training"]["revivals_used"] == 3
+    assert victory["legal_actions"] == []
 
 
 class _Stream:

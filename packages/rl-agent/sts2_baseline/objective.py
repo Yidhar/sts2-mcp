@@ -1,9 +1,10 @@
-"""Auditable, versioned task rewards for the recurrent v2 training line.
+"""Auditable outcome, survival-efficiency, and run-distance rewards.
 
-The normal reward contains no card, boss, encounter, deck, route, or
-action-specific rules.  The optional native-revival preheat reward adds only an
-exact relic-consumption event and a bounded per-step pace cost.  Neither reward
-uses backend-provided reward scalars or inferred healing/HP-jump heuristics.
+The v3 objective deliberately contains no reward for damage dealt, enemy HP
+change, cards played, or any hand-written action preference.  Combat preheat
+learns from victory plus exact player-HP loss and native-revival counters.
+Longer horizons learn from monotonic run progress.  Simulator-only counters
+remain underscore-prefixed observation facts and are never model features.
 """
 
 from __future__ import annotations
@@ -18,20 +19,20 @@ from typing import Any, Final, Literal
 from sts2_rl.contracts import EnvironmentResult
 
 TaskObjective = Literal["combat", "act1", "run"]
-TaskOutcome = Literal["ongoing", "success", "failure", "deadlock"]
+TaskOutcome = Literal["ongoing", "success", "failure", "deadlock", "horizon"]
 
 
 @dataclass(frozen=True, slots=True)
 class TaskRewardSpec:
-    version: str = field(default="sts2-task-reward-v2", init=False)
+    """Normal-task reward: terminal outcome plus bounded forward distance."""
+
+    version: str = field(default="sts2-task-reward-v3", init=False)
     discount: float = field(default=0.997, init=False)
     success_reward: float = field(default=1.0, init=False)
     failure_reward: float = field(default=-1.0, init=False)
     deadlock_reward: float = field(default=-1.0, init=False)
-    player_hp_potential_weight: float = field(default=0.05, init=False)
-    enemy_progress_potential_weight: float = field(default=0.05, init=False)
-    run_progress_potential_weight: float = field(default=0.10, init=False)
-    potential_delta_abs_cap: float = field(default=0.20, init=False)
+    horizon_reward: float = field(default=-1.0, init=False)
+    run_progress_reward_weight: float = field(default=0.50, init=False)
     act1_success_act: int = field(default=2, init=False)
     fallback_run_floor_cap: float = field(default=60.0, init=False)
 
@@ -41,19 +42,25 @@ TASK_REWARD_SPEC: Final = TaskRewardSpec()
 
 @dataclass(frozen=True, slots=True)
 class RevivalEfficiencyRewardSpec:
-    """Bounded lexicographic curriculum layered over the normal combat task.
+    """Bounded, undiscounted combat-preheat preference.
 
-    For the preheat profile the episode horizon is at most 512 steps.  The
-    terminal margin dominates every possible revival/pace cost, and one native
-    revival costs more than the entire pace budget.  The resulting preference
-    is therefore: win first, then avoid revival, then finish in fewer steps.
+    Each efficiency term is a delta of a monotonic bounded score.  Across a
+    512-decision episode their combined magnitude is strictly below 1.0, so
+    every victory remains better than every failure.  Within the same outcome,
+    the weighted survival objective jointly prefers less cumulative HP loss,
+    fewer native revivals, and fewer decisions; it does not reward damage.
     """
 
-    version: str = field(default="sts2-native-revival-efficiency-v1", init=False)
-    terminal_margin: float = field(default=3.0, init=False)
-    native_revival_penalty: float = field(default=-1.0, init=False)
-    pace_penalty_per_step: float = field(default=-1.0 / 2048.0, init=False)
+    version: str = field(default="sts2-survival-efficiency-v2", init=False)
+    required_discount: float = field(default=1.0, init=False)
+    hp_loss_weight: float = field(default=0.55, init=False)
+    revival_weight: float = field(default=0.20, init=False)
+    pace_budget: float = field(default=0.05, init=False)
     maximum_episode_steps: int = field(default=512, init=False)
+
+    @property
+    def pace_penalty_per_step(self) -> float:
+        return -self.pace_budget / self.maximum_episode_steps
 
 
 REVIVAL_EFFICIENCY_REWARD_SPEC: Final = RevivalEfficiencyRewardSpec()
@@ -67,9 +74,11 @@ def task_reward_identity() -> dict[str, Any]:
             "environment_result.terminated+typed_transition.facts.combat_result+"
             "typed_transition.facts.terminal_reason+observation.run.act"
         ),
+        "progress_source": "positive_delta(observation.run.progress_or_floor)",
+        "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
         "terminal_reason_policy": "transition/result exact equality",
         "transport_truncation": "reject",
-        "collector_horizon": "bootstrap",
+        "collector_horizon": "explicit_horizon_outcome_when_configured",
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
@@ -84,8 +93,10 @@ def revival_efficiency_reward_identity() -> dict[str, Any]:
         "version": REVIVAL_EFFICIENCY_REWARD_SPEC.version,
         "base": task_reward_identity(),
         "spec": asdict(REVIVAL_EFFICIENCY_REWARD_SPEC),
-        "revival_event_source": "typed_transition.facts.relics_used",
-        "ordering": "task_outcome>native_revival_count>environment_steps",
+        "revival_event_source": "observation._training.revivals_used exact counter",
+        "hp_loss_source": "observation._training.player_hp_lost exact counter",
+        "ordering": "combat_outcome>bounded_survival_efficiency>decisions",
+        "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
@@ -109,14 +120,6 @@ def _number(value: Any, *, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
-def _ratio(current: Any, maximum: Any) -> float:
-    maximum_value = _number(maximum)
-    current_value = _number(current)
-    if maximum_value <= 0.0:
-        return 0.0
-    return min(max(current_value / maximum_value, 0.0), 1.0)
-
-
 def _run_position(observation: Mapping[str, Any]) -> tuple[int, int, float]:
     run = _mapping(observation.get("run"))
     act = int(max(0.0, _number(run.get("act", observation.get("act")))))
@@ -129,36 +132,23 @@ def _run_position(observation: Mapping[str, Any]) -> tuple[int, int, float]:
     return act, floor, progress
 
 
-def _potential(observation: Mapping[str, Any], objective: TaskObjective) -> float:
-    player = _mapping(observation.get("player"))
-    player_hp = player.get("hp", player.get("current_hp"))
-    player_max_hp = player.get("max_hp", player.get("maximum_hp"))
-    player_ratio = _ratio(player_hp, player_max_hp)
+def _training_counter(observation: Mapping[str, Any], key: str) -> float:
+    training = _mapping(observation.get("_training"))
+    return max(0.0, _number(training.get(key)))
 
-    combat = _mapping(observation.get("combat"))
-    enemies = combat.get("enemies", ())
-    current_enemy_hp = 0.0
-    maximum_enemy_hp = 0.0
-    if isinstance(enemies, list | tuple):
-        for raw_enemy in enemies:
-            enemy = _mapping(raw_enemy)
-            current_enemy_hp += max(0.0, _number(enemy.get("hp")))
-            maximum_enemy_hp += max(
-                0.0,
-                _number(enemy.get("max_hp", enemy.get("maximum_hp"))),
-            )
-    enemy_progress = (
-        1.0 - min(current_enemy_hp / maximum_enemy_hp, 1.0)
-        if maximum_enemy_hp > 0.0
-        else 0.0
+
+def _player_max_hp(observation: Mapping[str, Any]) -> float:
+    player = _mapping(observation.get("player"))
+    return max(
+        1.0,
+        _number(player.get("max_hp", player.get("maximum_hp")), default=1.0),
     )
-    _, _, run_progress = _run_position(observation)
-    result = TASK_REWARD_SPEC.player_hp_potential_weight * player_ratio
-    if objective in {"combat", "act1", "run"}:
-        result += TASK_REWARD_SPEC.enemy_progress_potential_weight * enemy_progress
-    if objective in {"act1", "run"}:
-        result += TASK_REWARD_SPEC.run_progress_potential_weight * run_progress
-    return result
+
+
+def _bounded_resource_score(amount: float, scale: float) -> float:
+    normalized_amount = max(0.0, float(amount))
+    normalized_scale = max(1.0, float(scale))
+    return normalized_amount / (normalized_amount + normalized_scale)
 
 
 def _typed_combat_result(result: EnvironmentResult) -> str:
@@ -195,6 +185,10 @@ class TaskReward:
     outcome: TaskOutcome
     revival_penalty: float = 0.0
     pace_penalty: float = 0.0
+    hp_loss_penalty: float = 0.0
+    progress_reward: float = 0.0
+    revivals_used_delta: int = 0
+    player_hp_lost_delta: float = 0.0
 
 
 class TaskRewardCalculator:
@@ -212,9 +206,12 @@ class TaskRewardCalculator:
         after: EnvironmentResult,
         *,
         deadlock: bool,
+        horizon_exhausted: bool,
     ) -> TaskOutcome:
         if deadlock:
             return "deadlock"
+        if horizon_exhausted:
+            return "horizon"
         act, _, _ = _run_position(after.observation)
         if self.objective == "act1" and act >= TASK_REWARD_SPEC.act1_success_act:
             return "success"
@@ -233,53 +230,61 @@ class TaskRewardCalculator:
         after: EnvironmentResult,
         *,
         deadlock: bool = False,
+        horizon_exhausted: bool = False,
     ) -> TaskReward:
         if after.truncated:
             raise ValueError(
                 "transport/outcome-unknown truncation cannot become training data"
             )
-        outcome = self._outcome(after, deadlock=deadlock)
+        outcome = self._outcome(
+            after,
+            deadlock=deadlock,
+            horizon_exhausted=horizon_exhausted,
+        )
         task_terminal = outcome != "ongoing"
         terminal_reward = {
             "ongoing": 0.0,
             "success": TASK_REWARD_SPEC.success_reward,
             "failure": TASK_REWARD_SPEC.failure_reward,
             "deadlock": TASK_REWARD_SPEC.deadlock_reward,
+            "horizon": TASK_REWARD_SPEC.horizon_reward,
         }[outcome]
-        before_potential = _potential(before.observation, self.objective)
-        after_potential = (
-            0.0 if task_terminal else _potential(after.observation, self.objective)
-        )
-        potential_reward = self.discount * after_potential - before_potential
-        cap = TASK_REWARD_SPEC.potential_delta_abs_cap
-        potential_reward = min(max(potential_reward, -cap), cap)
+        progress_reward = 0.0
+        if self.objective in {"act1", "run"}:
+            before_progress = _run_position(before.observation)[2]
+            after_progress = _run_position(after.observation)[2]
+            progress_reward = TASK_REWARD_SPEC.run_progress_reward_weight * max(
+                0.0, after_progress - before_progress
+            )
         return TaskReward(
-            reward=float(terminal_reward + potential_reward),
+            reward=float(terminal_reward + progress_reward),
             discount=0.0 if task_terminal else self.discount,
             terminal_reward=float(terminal_reward),
-            potential_reward=float(potential_reward),
+            potential_reward=float(progress_reward),
             task_terminal=task_terminal,
             outcome=outcome,
+            progress_reward=float(progress_reward),
         )
 
 
 class RevivalEfficiencyRewardCalculator:
-    """Combat preheat reward using exact native relic-consumption events."""
+    """Combat preheat reward from exact cumulative simulator counters."""
 
     def __init__(
         self,
         *,
         revival_relic_id: str,
-        discount: float = 0.997,
+        discount: float = 1.0,
         maximum_episode_steps: int = 512,
     ) -> None:
         if not isinstance(revival_relic_id, str) or not revival_relic_id.strip():
             raise TypeError("revival_relic_id must be non-empty text")
         if maximum_episode_steps > REVIVAL_EFFICIENCY_REWARD_SPEC.maximum_episode_steps:
-            raise ValueError(
-                "native revival preheat horizon exceeds the reward ordering proof"
-            )
+            raise ValueError("survival preheat horizon exceeds the bounded pace budget")
+        if float(discount) != REVIVAL_EFFICIENCY_REWARD_SPEC.required_discount:
+            raise ValueError("survival preheat requires an undiscounted return (discount=1)")
         self.revival_relic_id = revival_relic_id.strip().upper()
+        self.maximum_episode_steps = int(maximum_episode_steps)
         self.base = TaskRewardCalculator("combat", discount=discount)
 
     def evaluate(
@@ -288,35 +293,53 @@ class RevivalEfficiencyRewardCalculator:
         after: EnvironmentResult,
         *,
         deadlock: bool = False,
+        horizon_exhausted: bool = False,
     ) -> TaskReward:
-        base = self.base.evaluate(before, after, deadlock=deadlock)
-        facts = after.transition.facts if after.transition is not None else {}
-        raw_used = facts.get("relics_used", ()) if isinstance(facts, Mapping) else ()
-        used = {
-            str(item).upper()
-            for item in raw_used
-        } if isinstance(raw_used, list | tuple) else set()
-        revival_penalty = (
-            REVIVAL_EFFICIENCY_REWARD_SPEC.native_revival_penalty
-            if self.revival_relic_id in used
-            else 0.0
+        base = self.base.evaluate(
+            before,
+            after,
+            deadlock=deadlock,
+            horizon_exhausted=horizon_exhausted,
         )
-        pace_penalty = REVIVAL_EFFICIENCY_REWARD_SPEC.pace_penalty_per_step
-        terminal_margin = {
-            "ongoing": 0.0,
-            "success": REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
-            "failure": -REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
-            "deadlock": -REVIVAL_EFFICIENCY_REWARD_SPEC.terminal_margin,
-        }[base.outcome]
+        before_revivals = _training_counter(before.observation, "revivals_used")
+        after_revivals = _training_counter(after.observation, "revivals_used")
+        before_hp_lost = _training_counter(before.observation, "player_hp_lost")
+        after_hp_lost = _training_counter(after.observation, "player_hp_lost")
+        if after_revivals < before_revivals or after_hp_lost < before_hp_lost:
+            raise ValueError("training efficiency counters must be monotonic")
+
+        revivals_used_delta = int(after_revivals - before_revivals)
+        player_hp_lost_delta = after_hp_lost - before_hp_lost
+        max_hp = max(
+            _player_max_hp(before.observation),
+            _player_max_hp(after.observation),
+        )
+        hp_loss_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.hp_loss_weight * (
+            _bounded_resource_score(after_hp_lost, max_hp)
+            - _bounded_resource_score(before_hp_lost, max_hp)
+        )
+        revival_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.revival_weight * (
+            _bounded_resource_score(after_revivals, 1.0)
+            - _bounded_resource_score(before_revivals, 1.0)
+        )
+        pace_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.pace_budget / float(
+            self.maximum_episode_steps
+        )
         return TaskReward(
-            reward=float(base.reward + terminal_margin + revival_penalty + pace_penalty),
+            reward=float(
+                base.reward + hp_loss_penalty + revival_penalty + pace_penalty
+            ),
             discount=base.discount,
-            terminal_reward=float(base.terminal_reward + terminal_margin),
-            potential_reward=base.potential_reward,
+            terminal_reward=base.terminal_reward,
+            potential_reward=0.0,
             task_terminal=base.task_terminal,
             outcome=base.outcome,
             revival_penalty=float(revival_penalty),
             pace_penalty=float(pace_penalty),
+            hp_loss_penalty=float(hp_loss_penalty),
+            progress_reward=0.0,
+            revivals_used_delta=revivals_used_delta,
+            player_hp_lost_delta=float(player_hp_lost_delta),
         )
 
 

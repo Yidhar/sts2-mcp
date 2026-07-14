@@ -86,7 +86,8 @@ occupancy, produced count and consumed count are runtime metrics.
 ## Learner
 
 The learner replays each unroll recurrently under current parameters and computes
-IMPALA V-trace targets from current and behavior action probabilities. Defaults:
+IMPALA V-trace targets from current and behavior action probabilities.
+Standard-task defaults:
 
 - discount: 0.997;
 - V-trace rho clip: 1.0;
@@ -96,6 +97,9 @@ IMPALA V-trace targets from current and behavior action probabilities. Defaults:
 - value loss weight: 0.5;
 - entropy weight: 0.01;
 - global gradient norm clip: 1.0.
+
+The native-revival preheat profile uses discount `1.0`, not `0.997`, so its
+bounded cumulative survival scores telescope exactly over an episode.
 
 Forced singleton actions contribute value/recurrent training but no policy loss
 or policy entropy. All tensors, gradients and post-step parameters are checked
@@ -116,12 +120,16 @@ actor/learner overlap.
 
 ## Reward and initial curriculum
 
-`sts2-task-reward-v2` has no mechanic-specific rules. It combines:
+`sts2-task-reward-v3` has no action-quality or damage heuristic. It combines:
 
 - task success: +1;
-- task failure or semantic deadlock: -1;
-- a capped potential delta using generic player HP, enemy HP progress and run
-  progress facts.
+- task failure, semantic deadlock or an explicit curriculum horizon: -1;
+- for Act/run horizons only, a bounded positive delta in monotonic run
+  progress, so a failed run that travelled farther ranks above an early loss.
+
+Combat reward does **not** pay for damage dealt, enemy-HP change, number of
+cards played, or any preferred action. Those quantities may remain factual
+observations/diagnostics, but they are not reward terms.
 
 The default full-run objective is `act1`: entering Act 2 is success and dying or
 deadlocking before Act 2 is failure. The `combat` profile is an optional software
@@ -134,32 +142,50 @@ silently mixed into this baseline.
 
 The optional `preheat` profile is a separate, versioned combat curriculum. It
 adds the game's native `RELIC.LIZARD_TAIL` to the normal starter relic set at
-combat reset and reads the simulator's authoritative `is_used_up` state. A
-revival event exists only when that field changes from `false` to `true`; HP
-increases, healing and transport omissions do not imply revival.
+combat reset. The simulator-only training controller can budget that same
+native death-prevention path; `-1` means unlimited and normal profiles leave it
+disabled. The relic still performs the game's own death hook, flash and 50%
+maximum-HP heal. Only the training copy is re-armed after it fires.
 
-`sts2-native-revival-efficiency-v1` layers three bounded terms over the normal
-combat task reward:
+The simulator exports exact monotonic `training_revivals_used` and
+`training_player_hp_lost` counters. HP loss is recorded at `Creature.LoseHp`
+from actual HP removed, so overkill is not counted and later healing cannot
+erase prior loss. These counters are translated under `observation._training`:
+they are reward/evaluation facts and the grounded encoder never sees them.
+
+`sts2-survival-efficiency-v2` combines the normal combat outcome with three
+bounded costs:
 
 - a terminal margin that makes every victory rank above every failure;
-- a cost for each exact native revival consumption;
+- a cumulative cost for exact player HP lost;
+- a cumulative cost for exact native revivals used;
 - a small cost per environment decision.
 
-The profile caps episodes at 512 decisions. At that horizon, the complete pace
-budget is smaller than one revival cost, and the terminal margin dominates all
-revival/pace costs. The intended preference is therefore lexicographic:
+The profile caps episodes at 512 decisions and uses undiscounted return. All
+survival/pace costs together are bounded below one point, so the terminal
+margin guarantees every victory ranks above every failure. Within the same
+outcome the weighted objective prefers:
 
 1. win the combat;
-2. among wins, consume fewer revivals;
-3. at equal revival count, finish in fewer decisions.
+2. lose less player HP and consume fewer revivals;
+3. finish in fewer decisions.
 
 This is not an invincibility/no-consequence dataset and it does not supervise
 random actions as correct. Epsilon exploration supplies broad state/action
-coverage, while V-trace trains policy and value from outcome, revival and pace
-consequences. Evaluation reports mean decision count, mean revivals used and
-revival-free combat win rate. A revival-free win leaves the injected relic
-unused and is the primary gate before switching to the normal combat/full-run
-curriculum.
+coverage, while V-trace trains policy and value from outcome, survival and pace
+consequences. The warm-up encounter is the single-enemy
+`FUZZY_WURM_CRAWLER_WEAK`, rather than `AXEBOTS_NORMAL` whose own enemy-revival
+mechanic makes it unsuitable as an initialization task. Evaluation reports mean
+decision count, mean exact HP lost, mean revivals used and revival-free combat
+win rate.
+
+Before WSL/ROCm training starts, a fail-closed random-policy gate runs 500
+warm-up combats and a separate `TUNNELER_WEAK` stress probe. It requires at
+least two native revivals within one uninterrupted combat, verifies exact
+counter deltas and enemy continuity across revival, rejects any non-terminal
+zero-action state, and requires at least a 99% typed victory rate. This gate
+also protects the `combat_post_end_pending -> combat_victory` adapter boundary;
+without that projection real combat wins would be misreported as deadlocks.
 
 ## Deadlock diagnostics
 
@@ -186,6 +212,8 @@ Reports include:
 - mean and maximum floor;
 - mean maximum act;
 - mean undiscounted reward.
+- for revival preheat, mean exact player HP lost, mean revivals used and
+  revival-free combat win rate.
 
 No Act 1 performance claim is valid without these held-out evaluations and their
 trajectory journals.
@@ -223,6 +251,7 @@ python -m sts2_rl.train --dry-run
 python -m sts2_rl.train --profile combat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival knowledge preheat (Windows CPU)
+python -m sts2_rl.preheat_gate --sim-exe <PINNED_RELEASE_EXE> --episodes 500
 python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival knowledge preheat (WSL/ROCm; refuses CPU fallback)
