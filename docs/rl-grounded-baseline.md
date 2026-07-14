@@ -266,11 +266,13 @@ python -m sts2_rl.train --dry-run
 python -m sts2_rl.train --profile combat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival full-run knowledge preheat (Windows CPU)
+python scripts/audit_card_fact_coverage.py --sim-exe <PINNED_RELEASE_EXE>
+python scripts/audit_runtime_mechanics_coverage.py --sim-exe <PINNED_RELEASE_EXE>
 python -m sts2_rl.preheat_gate --sim-exe <PINNED_RELEASE_EXE> --episodes 500
 python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival knowledge preheat (WSL/ROCm; refuses CPU fallback)
-wsl.exe -- bash -lc 'export STS2_ARTIFACT_ROOT=/mnt/e/game/project/sts2_mcp_artifacts/runtime; cd /mnt/e/game/project/sts2_mcp/packages/rl-agent; bash scripts/train_preheat_wsl_rocm.sh'
+wsl.exe -- bash -lc 'export STS2_ARTIFACT_ROOT=<WSL_ARTIFACT_ROOT>; cd <WSL_REPOSITORY_ROOT>/packages/rl-agent; bash scripts/train_preheat_wsl_rocm.sh'
 
 # Main Act 1 baseline
 python -m sts2_rl.train --profile default --sim-exe <PINNED_RELEASE_EXE>
@@ -278,3 +280,5 @@ python -m sts2_rl.train --profile default --sim-exe <PINNED_RELEASE_EXE>
 
 Mutable output must remain below `STS2_ARTIFACT_ROOT`, outside the source tree.
 Formal headless runs require the pinned Release simulator and identity sidecar.
+They also run the native catalog and event-to-combat runtime-mechanics preflight
+before backend launch. See [`runtime-mechanics-abi.md`](./runtime-mechanics-abi.md).

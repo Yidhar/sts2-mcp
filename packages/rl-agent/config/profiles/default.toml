@@ -3,7 +3,7 @@ profile = "default"
 
 [model]
 architecture = "recurrent_candidate_v2"
-token_feature_dim = 160
+token_feature_dim = 224
 d_model = 128
 n_heads = 4
 ffn_dim = 384
@@ -63,8 +63,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 1000000
 seed = 0
-log_dir = "runs/recurrent-vtrace"
-checkpoint_dir = "checkpoints/recurrent-vtrace"
+log_dir = "runs/recurrent-vtrace-v6-runtime-mechanics"
+checkpoint_dir = "checkpoints/recurrent-vtrace-v6-runtime-mechanics"
 checkpoint_interval_steps = 25000
 evaluation_steps = [0, 10000, 25000, 50000]
 evaluation_episodes = 20

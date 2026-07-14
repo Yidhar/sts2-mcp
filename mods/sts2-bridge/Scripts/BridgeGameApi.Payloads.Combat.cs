@@ -285,6 +285,10 @@ internal static partial class BridgeGameApi
             instance_uuid = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(card).ToString("X"),
             current_upgrade_level = card.CurrentUpgradeLevel,
             max_upgrade_level = card.MaxUpgradeLevel,
+            base_replay_count = card.BaseReplayCount,
+            current_replay_count = card.GetEnchantedReplayCount(),
+            last_stars_spent = card.LastStarsSpent,
+            floor_added_to_deck = card.FloorAddedToDeck,
             title = string.IsNullOrWhiteSpace(card.Title)
                 ? DescribeText(card.TitleLocString, card)
                 : DescribeText(card.Title, card),
@@ -307,6 +311,15 @@ internal static partial class BridgeGameApi
             has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
             has_on_draw_effect = HasCardOnDrawEffect(card),
             exhaust_on_next_play = card.ExhaustOnNextPlay,
+            is_removable = card.IsRemovable,
+            is_transformable = card.IsTransformable,
+            is_in_combat = card.IsInCombat,
+            is_upgradable = card.IsUpgradable,
+            is_sly_this_turn = card.IsSlyThisTurn,
+            is_retained = card.ShouldRetainThisTurn,
+            is_clone = card.IsClone,
+            is_dupe = card.IsDupe,
+            has_been_removed_from_state = card.HasBeenRemovedFromState,
             dynamic_vars = BuildDynamicVarPayloads(previewVars),
             afflictions,
             enchantments
@@ -315,32 +328,14 @@ internal static partial class BridgeGameApi
 
     private static object[] BuildCardModifierPayloads(CardModel card, string modifierKind)
     {
-        // Bosses/events can attach runtime per-card restrictions or buffs (Queen
-        // binding/chains, forced retain/exhaust/cost mutations, etc.).  Their
-        // concrete STS2 classes have moved across builds, so expose them through
-        // reflection rather than coupling the bridge to one exact API surface.
-        var candidates = modifierKind.Equals("afflictions", StringComparison.OrdinalIgnoreCase)
-            ? new[] { "Afflictions", "AfflictionModels", "CardAfflictions", "Statuses", "StatusEffects" }
-            : new[] { "Enchantments", "EnchantmentModels", "CardEnchantments", "Modifiers", "CardModifiers" };
-
-        var emitted = new List<object>();
-        foreach (var memberName in candidates)
-        {
-            foreach (var item in EnumerateHiddenCollectionMember(card, memberName))
-            {
-                var payload = BuildCardModifierPayload(item);
-                if (payload is not null)
-                {
-                    emitted.Add(payload);
-                    if (emitted.Count >= 16)
-                    {
-                        return emitted.ToArray();
-                    }
-                }
-            }
-        }
-
-        return emitted.ToArray();
+        // The retail CardModel contract is singular: a card has at most one
+        // Enchantment and one Affliction.  The old plural-reflection probe
+        // silently returned an empty list for real cards.
+        object? modifier = modifierKind.Equals("afflictions", StringComparison.OrdinalIgnoreCase)
+            ? card.Affliction
+            : card.Enchantment;
+        var payload = BuildCardModifierPayload(modifier);
+        return payload is null ? Array.Empty<object>() : new[] { payload };
     }
 
     private static IEnumerable<object?> EnumerateHiddenCollectionMember(object? target, string memberName)
@@ -445,18 +440,31 @@ internal static partial class BridgeGameApi
             GetHiddenFieldValue(modifier, "Status"),
             GetHiddenFieldValue(modifier, "_status"));
         var enabled = !string.Equals(status, "Disabled", StringComparison.OrdinalIgnoreCase);
+        var enchantment = modifier as EnchantmentModel;
+        var affliction = modifier as AfflictionModel;
 
         return new
         {
             id,
-            type = typeName,
+            class_name = typeName,
+            type = enchantment is not null ? "enchantment" : affliction is not null ? "affliction" : typeName,
             title,
             description,
             amount,
+            display_amount = enchantment?.DisplayAmount,
             status,
             enabled,
-            is_debuff = GetHiddenPropertyValue<bool>(modifier, "IsDebuff"),
-            is_buff = GetHiddenPropertyValue<bool>(modifier, "IsBuff")
+            show_amount = enchantment?.ShowAmount,
+            is_stackable = enchantment?.IsStackable ?? affliction?.IsStackable,
+            should_start_at_bottom_of_draw_pile = enchantment?.ShouldStartAtBottomOfDrawPile,
+            should_glow_gold = enchantment?.ShouldGlowGold,
+            should_glow_red = enchantment?.ShouldGlowRed,
+            has_extra_card_text = enchantment?.HasExtraCardText ?? affliction?.HasExtraCardText,
+            can_afflict_unplayable_cards = affliction?.CanAfflictUnplayableCards,
+            has_overlay = affliction?.HasOverlay,
+            dynamic_vars = enchantment is null
+                ? Array.Empty<object>()
+                : BuildDynamicVarPayloads(enchantment.DynamicVars)
         };
     }
 

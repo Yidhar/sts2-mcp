@@ -38,7 +38,7 @@ _LOCAL_ID_WIDTH: Final = 7
 class GroundedEncodingConfig:
     """Maximum tensor capacities and categorical vocabulary contract."""
 
-    feature_dim: int = 160
+    feature_dim: int = 224
     max_world_tokens: int = 512
     max_candidates: int = 96
     max_candidate_local_tokens: int = 24

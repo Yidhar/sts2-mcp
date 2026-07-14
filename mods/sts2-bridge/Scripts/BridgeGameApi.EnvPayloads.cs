@@ -469,6 +469,12 @@ internal static partial class BridgeGameApi
             observation["combat"] = combat;
         }
 
+        var eventState = BuildEnvEventPayload(context);
+        if (eventState is not null)
+        {
+            observation["event"] = eventState;
+        }
+
         var decision = BuildEnvDecisionPayload(context, phase);
         if (decision is not null)
         {
@@ -511,43 +517,13 @@ internal static partial class BridgeGameApi
         var player = GetPrimaryPlayer(context);
         var creature = player?.Creature;
 
-        // Relics as objects with canonical_text
         var relics = (player?.Relics ?? Enumerable.Empty<RelicModel>())
-            .Select(relic =>
-            {
-                var relicId = relic.Id.ToString();
-                var title = TryGetTitle(relic);
-                var desc = SafeGetRelicDescription(relic);
-                var rarity = relic.Rarity.ToString();
-                return new
-                {
-                    id = relicId,
-                    title,
-                    rarity,
-                    canonical_text = BuildCanonicalRelicText(title, rarity, desc)
-                };
-            })
+            .Select(BuildRelicPayload)
             .ToArray();
 
-        // Potions as objects with canonical_text
         var potions = (player?.PotionSlots ?? Enumerable.Empty<PotionModel?>())
-            .Select(slot =>
-            {
-                if (slot is null) return new { id = (string?)null, title = "[empty]", rarity = (string?)null, target = (string?)null, canonical_text = "" };
-                var potionId = slot.Id.ToString();
-                var title = TryGetTitle(slot);
-                var desc = SafeGetPotionDescription(slot);
-                var target = slot.TargetType.ToString();
-                var rarity = slot.Rarity.ToString();
-                return new
-                {
-                    id = (string?)potionId,
-                    title,
-                    rarity = (string?)rarity,
-                    target = (string?)target,
-                    canonical_text = BuildCanonicalPotionText(title, rarity, target, desc)
-                };
-            })
+            .Where(static potion => potion is not null)
+            .Select(static potion => BuildPotionPayload(potion))
             .ToArray();
 
         return new
@@ -558,12 +534,44 @@ internal static partial class BridgeGameApi
             max_hp = creature?.MaxHp,
             block = creature?.Block,
             gold = player?.Gold,
+            open_potion_slots = player?.PotionSlots.Count(static potion => potion is null) ?? 0,
             deck = player?.Deck?.Cards.Count ?? 0,
             deck_cards = player?.Deck?.Cards.Select(card => BuildEnvCardPayload(card, GetCardReference(card))).ToArray()
                 ?? Array.Empty<object>(),
             powers = creature?.Powers.Select(BuildEnvPowerPayload).ToArray() ?? Array.Empty<object>(),
             relics,
             potions
+        };
+    }
+
+    private static object? BuildEnvEventPayload(BridgeWorldContext context)
+    {
+        var eventModel = GetHiddenFieldValue(context.EventRoom, "_event") as EventModel;
+        if (eventModel is null)
+        {
+            return null;
+        }
+
+        return new
+        {
+            event_id = eventModel.Id.ToString(),
+            layout_type = eventModel.LayoutType.ToString(),
+            is_deterministic = eventModel.IsDeterministic,
+            is_shared = eventModel.IsShared,
+            is_finished = eventModel.IsFinished,
+            in_dialogue = !eventModel.IsFinished && eventModel.CurrentOptions.Count == 0,
+            description_key = eventModel.Description?.LocEntryKey,
+            encounter_id = eventModel.CanonicalEncounter?.Id.ToString(),
+            dynamic_vars = BuildDynamicVarPayloads(eventModel.DynamicVars),
+            options = eventModel.CurrentOptions.Select(static option => new
+            {
+                text_key = option.TextKey,
+                title = DescribeText(option.Title, option),
+                description = DescribeText(option.Description, option),
+                is_locked = option.IsLocked,
+                is_chosen = option.WasChosen,
+                is_proceed = option.IsProceed
+            }).ToArray()
         };
     }
 
@@ -644,6 +652,8 @@ internal static partial class BridgeGameApi
     private static object BuildEnvEnemyPayload(Creature creature)
     {
         var intentEnvelope = JsonSerializer.SerializeToElement(BuildEnemyIntentPayload(creature));
+        var monster = creature.Monster;
+        var nextMove = monster?.NextMove;
         return new
         {
             id = creature.CombatId,
@@ -654,6 +664,26 @@ internal static partial class BridgeGameApi
             hp = creature.CurrentHp,
             max_hp = creature.MaxHp,
             block = creature.Block,
+            is_alive = creature.IsAlive,
+            is_hittable = SafeGetCreatureIsHittable(creature),
+            is_primary_enemy = creature.IsPrimaryEnemy,
+            is_secondary_enemy = creature.IsSecondaryEnemy,
+            is_stunned = creature.IsStunned,
+            is_pet = creature.IsPet,
+            shows_infinite_hp = creature.ShowsInfiniteHp,
+            can_receive_powers = creature.CanReceivePowers,
+            slot_name = creature.SlotName,
+            next_move_state_id = nextMove?.StateId,
+            is_move = nextMove?.IsMove ?? false,
+            must_perform_once_before_transitioning = nextMove?.MustPerformOnceBeforeTransitioning ?? false,
+            can_transition_away = nextMove?.CanTransitionAway ?? false,
+            is_performing_move = monster?.IsPerformingMove ?? false,
+            spawned_this_turn = monster?.SpawnedThisTurn ?? false,
+            intends_to_attack = monster?.IntendsToAttack ?? false,
+            move_history = monster?.MoveStateMachine?.StateLog
+                .Where(static state => state.ShouldAppearInLogs)
+                .Select(static state => state.Id)
+                .ToArray() ?? Array.Empty<string>(),
             intents = BuildEnvEnemyIntentPayloads(intentEnvelope),
             powers = creature.Powers.Select(BuildEnvPowerPayload).ToArray()
         };
@@ -679,15 +709,7 @@ internal static partial class BridgeGameApi
 
     private static object BuildEnvPowerPayload(PowerModel power)
     {
-        return new
-        {
-            id = power.Id.ToString(),
-            title = TextOf(power.Title),
-            amount = power.Amount,
-            display_amount = power.DisplayAmount,
-            type = power.Type.ToString(),
-            stack_type = power.StackType.ToString()
-        };
+        return BuildPowerPayload(power);
     }
 
     private static object BuildEnvCardPayload(CardModel card, string? cardRef = null)

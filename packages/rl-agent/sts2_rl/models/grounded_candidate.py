@@ -32,7 +32,7 @@ from torch import Tensor, nn
 # reviewed numeric facts, followed by disjoint categorical and dynamic-value
 # hash regions.  Keep the minimum here so model and encoder cannot silently
 # disagree about that tensor ABI.
-MIN_TOKEN_FEATURE_DIM: Final = 128
+MIN_TOKEN_FEATURE_DIM: Final = 224
 _INTEGER_DTYPES = frozenset(
     {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}
 )
@@ -89,7 +89,7 @@ class GroundedCandidateConfig:
     as long as their emitted IDs remain within these declared bounds.
     """
 
-    token_feature_dim: int = 160
+    token_feature_dim: int = 224
     d_model: int = 128
     n_heads: int = 4
     ffn_dim: int = 384

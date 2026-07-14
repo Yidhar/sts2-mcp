@@ -10,6 +10,11 @@ from pathlib import Path
 
 from sts2_env.headless_sim_bridge_client import HeadlessSimError, resolve_headless_sim_exe
 from sts2_rl.artifacts import resolve_external_input_path
+from sts2_rl.runtime_mechanics import (
+    RuntimeMechanicsAuditError,
+    run_runtime_mechanics_preflight,
+    write_runtime_mechanics_audit,
+)
 from sts2_rl.simulator_identity import (
     SimulatorIdentityError,
     verify_headless_simulator,
@@ -108,8 +113,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 identity_path=args.sim_identity,
             )
             audit_path = write_preflight_audit(simulator)
-        except (HeadlessSimError, OSError, SimulatorIdentityError, ValueError) as exc:
-            raise SystemExit(f"HeadlessSim identity preflight failed: {exc}") from exc
+            mechanics_summary = run_runtime_mechanics_preflight(simulator.executable)
+            mechanics_audit_path = write_runtime_mechanics_audit(mechanics_summary)
+        except (
+            HeadlessSimError,
+            OSError,
+            RuntimeMechanicsAuditError,
+            SimulatorIdentityError,
+            ValueError,
+        ) as exc:
+            raise SystemExit(f"HeadlessSim preflight failed: {exc}") from exc
         config = replace(
             config,
             environment=replace(
@@ -123,6 +136,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "event": "simulator_identity_verified",
                     "audit_path": str(audit_path),
                     **simulator.to_mapping(),
+                },
+                sort_keys=True,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "runtime_mechanics_verified",
+                    "audit_path": str(mechanics_audit_path),
+                    **mechanics_summary,
                 },
                 sort_keys=True,
             )

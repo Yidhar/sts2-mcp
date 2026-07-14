@@ -78,6 +78,13 @@ internal static partial class BridgeGameApi
             block = creature.Block,
             is_alive = creature.IsAlive,
             is_hittable = SafeGetCreatureIsHittable(creature),
+            is_primary_enemy = creature.IsPrimaryEnemy,
+            is_secondary_enemy = creature.IsSecondaryEnemy,
+            is_stunned = creature.IsStunned,
+            is_pet = creature.IsPet,
+            shows_infinite_hp = creature.ShowsInfiniteHp,
+            can_receive_powers = creature.CanReceivePowers,
+            slot_name = creature.SlotName,
             powers = creature.Powers.Select(BuildPowerPayload).ToArray(),
             intent = creature.IsEnemy ? BuildEnemyIntentPayload(creature) : null
         };
@@ -98,8 +105,16 @@ internal static partial class BridgeGameApi
         return new
         {
             state_id = nextMove?.StateId,
-            follow_up_state_id = nextMove?.FollowUpStateId,
             is_move = nextMove?.IsMove ?? false,
+            must_perform_once_before_transitioning = nextMove?.MustPerformOnceBeforeTransitioning ?? false,
+            can_transition_away = nextMove?.CanTransitionAway ?? false,
+            is_performing_move = monster.IsPerformingMove,
+            spawned_this_turn = monster.SpawnedThisTurn,
+            intends_to_attack = monster.IntendsToAttack,
+            move_history = monster.MoveStateMachine?.StateLog
+                .Where(static state => state.ShouldAppearInLogs)
+                .Select(static state => state.Id)
+                .ToArray() ?? Array.Empty<string>(),
             title = intents.Select(GetMonsterIntentTitle)
                 .FirstOrDefault(title => !string.IsNullOrWhiteSpace(title)),
             intents = intents.Select(intent => BuildMonsterIntentPayload(intent, creature, targets)).ToArray()
@@ -316,9 +331,24 @@ internal static partial class BridgeGameApi
             title = TextOf(power.Title),
             description = TryGetDescription(power),
             amount = power.Amount,
+            amount_on_turn_start = power.AmountOnTurnStart,
             display_amount = power.DisplayAmount,
             type = power.Type.ToString(),
-            stack_type = power.StackType.ToString()
+            stack_type = power.StackType.ToString(),
+            type_for_current_amount = power.TypeForCurrentAmount.ToString(),
+            is_instanced = power.IsInstanced,
+            is_visible = power.IsVisible,
+            allow_negative = power.AllowNegative,
+            skip_next_duration_tick = power.SkipNextDurationTick,
+            should_scale_in_multiplayer = power.ShouldScaleInMultiplayer,
+            owner_is_secondary_enemy = power.OwnerIsSecondaryEnemy,
+            owner_side = power.Owner.Side.ToString(),
+            owner_model_id = power.Owner.ModelId.ToString(),
+            applier_side = power.Applier?.Side.ToString(),
+            applier_model_id = power.Applier?.ModelId.ToString(),
+            target_side = power.Target?.Side.ToString(),
+            target_model_id = power.Target?.ModelId.ToString(),
+            dynamic_vars = BuildDynamicVarPayloads(power.DynamicVars)
         };
     }
 

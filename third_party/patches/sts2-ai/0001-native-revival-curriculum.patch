@@ -1,5 +1,5 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
-index 87bbbf1..399d33c 100644
+index 87bbbf1..ccaae29 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
 @@ -183,8 +183,8 @@ internal sealed class BinarySearchCombatMctsRequest
@@ -8,8 +8,8 @@ index 87bbbf1..399d33c 100644
  {
 -	private const ushort ProtocolVersion = 12;
 -	internal const string BinarySchemaHash = "sts2-binary-schema-2026-04-14-build-reset";
-+	private const ushort ProtocolVersion = 13;
-+	internal const string BinarySchemaHash = "sts2-binary-schema-2026-07-14-selection-semantics";
++	private const ushort ProtocolVersion = 14;
++	internal const string BinarySchemaHash = "sts2-binary-schema-2026-07-14-runtime-mechanics";
  	private static readonly string BuildGitSha = ResolveBuildGitSha();
  
  	private static readonly Dictionary<string, byte> ActionTypeToCode = new(StringComparer.OrdinalIgnoreCase)
@@ -29,7 +29,7 @@ index 87bbbf1..399d33c 100644
  
  	private sealed class PlayerStaticCard
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
-index ae63755..4bf3d9d 100644
+index ae63755..df3b192 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 @@ -806,7 +806,9 @@ internal static class Program
@@ -61,7 +61,16 @@ index ae63755..4bf3d9d 100644
  			"confirm_selection" => CombatTrainingActionType.ConfirmSelection,
  			"cancel_selection" => CombatTrainingActionType.CancelSelection,
  			"use_potion" => CombatTrainingActionType.UsePotion,
-@@ -2035,7 +2039,7 @@ internal static class Program
+@@ -2031,11 +2035,15 @@ internal static class Program
+ 			{
+ 				["monster_id"] = m.Id.Entry,
+ 				["class_name"] = m.GetType().Name,
+-				["powers"] = BuildMonsterPowerClassNames(m),
++				["min_initial_hp"] = m.MinInitialHp,
++				["max_initial_hp"] = m.MaxInitialHp,
++				// Initial powers are created only on a mutable combat instance and
++				// therefore belong to the runtime state contract, not this catalog.
++				["powers"] = new List<string>(),
  			})
  			.ToList();
  
@@ -70,7 +79,7 @@ index ae63755..4bf3d9d 100644
  		List<Dictionary<string, object?>> cards = ModelDb.AllCards
  			.OrderBy(static c => c.Id.Entry, StringComparer.Ordinal)
  			.Select(static c => new Dictionary<string, object?>
-@@ -2049,8 +2053,27 @@ internal static class Program
+@@ -2049,8 +2057,27 @@ internal static class Program
  				["base_cost"] = SafeBaseCost(c),
  				["is_x_cost"] = c.EnergyCost?.GetType().Name.Contains("XCost") ?? false,
  				["gains_block"] = c.GainsBlock,
@@ -98,6 +107,225 @@ index ae63755..4bf3d9d 100644
  			})
  			.ToList();
  
+@@ -2063,6 +2090,20 @@ internal static class Program
+ 				["class_name"] = r.GetType().Name,
+ 				["rarity"] = SafeRelicRarity(r),
+ 				["tags"] = SafeRelicTags(r),
++				["is_tradable"] = r.IsTradable,
++				["is_allowed_in_shops"] = r.IsAllowedInShops,
++				["is_used_up"] = SafeCatalogValue(() => r.IsUsedUp, false),
++				["has_upon_pickup_effect"] = r.HasUponPickupEffect,
++				["spawns_pets"] = r.SpawnsPets,
++				["is_stackable"] = r.IsStackable,
++				["adds_pet"] = r.AddsPet,
++				["merchant_cost"] = SafeCatalogValue(() => r.MerchantCost, 0),
++				["show_counter"] = SafeCatalogValue(() => r.ShowCounter, false),
++				// Some relic counters depend on a runtime Owner. Canonical catalog models
++				// intentionally have no owner, so an unavailable instance value is null.
++				["display_amount"] = SafeCatalogNullableInt(() => r.DisplayAmount),
++				["dynamic_vars"] = BuildCatalogDynamicVarsSafely(
++					() => CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(r.DynamicVars)),
+ 			})
+ 			.ToList();
+ 
+@@ -2074,19 +2115,80 @@ internal static class Program
+ 				["potion_id"] = p.Id.Entry,
+ 				["class_name"] = p.GetType().Name,
+ 				["rarity"] = SafePotionRarity(p),
++				["usage"] = p.Usage.ToString(),
++				["target_type"] = p.TargetType.ToString(),
++				["can_be_generated_in_combat"] = p.CanBeGeneratedInCombat,
++				// Custom usability may depend on the owning player and current combat.
++				["passes_custom_usability_check"] = SafeCatalogValue(
++					() => p.PassesCustomUsabilityCheck,
++					false),
++				["dynamic_vars"] = BuildCatalogDynamicVarsSafely(
++					() => CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(p.DynamicVars)),
+ 			})
+ 			.ToList();
+ 
+-		// powers：class_name + base class chain + 类别（buff/debuff/等，基于 class 名 heuristic）
+-		// 加 base_classes 让 Python 侧能识别 power 继承类型（如 "xxx → TimedPower → PowerModel" 表示临时 power）
++		// powers：只导出游戏模型直接声明的事实。类别语义来自 PowerModel.Type，
++		// 不再根据类名手写猜测 buff/debuff，避免把启发式污染到训练 ABI。
+ 		List<Dictionary<string, object?>> powers = ModelDb.AllPowers
+ 			.OrderBy(static p => p.GetType().Name, StringComparer.Ordinal)
+ 			.Select(static p => new Dictionary<string, object?>
+ 			{
++				["power_id"] = p.Id.Entry,
+ 				["class_name"] = p.GetType().Name,
++				["type"] = p.Type.ToString(),
++				["stack_type"] = p.StackType.ToString(),
++				["is_instanced"] = p.IsInstanced,
++				["allow_negative"] = p.AllowNegative,
++				["should_scale_in_multiplayer"] = p.ShouldScaleInMultiplayer,
++				["owner_is_secondary_enemy"] = p.OwnerIsSecondaryEnemy,
++				["dynamic_vars"] = BuildCatalogDynamicVarsSafely(
++					() => CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(p.DynamicVars)),
+ 				["base_classes"] = GetBaseClassChain(p.GetType(), "PowerModel"),
+-				// Heuristic：类名含 "Debuff" / "Buff" 或者根据已知 debuff list
+-				["is_debuff_hint"] = IsDebuffByName(p.GetType().Name),
++			})
++			.ToList();
++
++		List<Dictionary<string, object?>> enchantments = ModelDb.DebugEnchantments
++			.OrderBy(static value => value.Id.Entry, StringComparer.Ordinal)
++			.Select(static value => new Dictionary<string, object?>
++			{
++				["enchantment_id"] = value.Id.Entry,
++				["class_name"] = value.GetType().Name,
++				["show_amount"] = value.ShowAmount,
++				["is_stackable"] = value.IsStackable,
++				["should_start_at_bottom_of_draw_pile"] = value.ShouldStartAtBottomOfDrawPile,
++				["should_glow_gold"] = value.ShouldGlowGold,
++				["should_glow_red"] = value.ShouldGlowRed,
++				["has_extra_card_text"] = value.HasExtraCardText,
++				["dynamic_vars"] = BuildCatalogDynamicVarsSafely(
++					() => CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(value.DynamicVars)),
++			})
++			.ToList();
++
++		List<Dictionary<string, object?>> afflictions = ModelDb.DebugAfflictions
++			.OrderBy(static value => value.Id.Entry, StringComparer.Ordinal)
++			.Select(static value => new Dictionary<string, object?>
++			{
++				["affliction_id"] = value.Id.Entry,
++				["class_name"] = value.GetType().Name,
++				["is_stackable"] = value.IsStackable,
++				["has_extra_card_text"] = value.HasExtraCardText,
++				["can_afflict_unplayable_cards"] = value.CanAfflictUnplayableCards,
++				["has_overlay"] = value.HasOverlay,
++			})
++			.ToList();
++
++		List<Dictionary<string, object?>> events = ModelDb.AllEvents
++			.OrderBy(static value => value.Id.Entry, StringComparer.Ordinal)
++			.Select(static value => new Dictionary<string, object?>
++			{
++				["event_id"] = value.Id.Entry,
++				["class_name"] = value.GetType().Name,
++				["layout_type"] = value.LayoutType.ToString(),
++				["is_deterministic"] = value.IsDeterministic,
++				["is_shared"] = value.IsShared,
++				["encounter_id"] = value.CanonicalEncounter?.Id.Entry,
++				["dynamic_vars"] = BuildCatalogDynamicVarsSafely(
++					() => CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(value.DynamicVars)),
+ 			})
+ 			.ToList();
+ 
+@@ -2098,9 +2200,66 @@ internal static class Program
+ 			["relics"] = relics,
+ 			["potions"] = potions,
+ 			["powers"] = powers,
++			["enchantments"] = enchantments,
++			["afflictions"] = afflictions,
++			["events"] = events,
+ 		};
+ 	}
+ 
++	private static List<Dictionary<string, object?>> BuildCatalogDynamicVars(IEnumerable<CombatTrainingDynamicVarSnapshot> values)
++	{
++		return values.Select(static value => new Dictionary<string, object?>
++		{
++			["name"] = value.Name,
++			["var_type"] = value.VarType,
++			["family"] = value.Family,
++			["power_type"] = value.PowerType,
++			["value_props"] = value.ValueProps,
++			["base_value"] = value.BaseValue,
++			["enchanted_value"] = value.EnchantedValue,
++			["preview_value"] = value.PreviewValue,
++			["int_value"] = value.IntValue,
++			["was_just_upgraded"] = value.WasJustUpgraded
++		}).ToList();
++	}
++
++	private static List<Dictionary<string, object?>> BuildCatalogDynamicVarsSafely(
++		Func<IEnumerable<CombatTrainingDynamicVarSnapshot>> valuesFactory)
++	{
++		try
++		{
++			return BuildCatalogDynamicVars(valuesFactory());
++		}
++		catch
++		{
++			return new List<Dictionary<string, object?>>();
++		}
++	}
++
++	private static T SafeCatalogValue<T>(Func<T> valueFactory, T fallback)
++	{
++		try
++		{
++			return valueFactory();
++		}
++		catch
++		{
++			return fallback;
++		}
++	}
++
++	private static int? SafeCatalogNullableInt(Func<int> valueFactory)
++	{
++		try
++		{
++			return valueFactory();
++		}
++		catch
++		{
++			return null;
++		}
++	}
++
+ 	private static List<string> BuildEncounterMonsterIds(EncounterModel encounter)
+ 	{
+ 		// EncounterModel.AllPossibleMonsters -> IEnumerable<MonsterModel>
+@@ -2111,7 +2270,7 @@ internal static class Program
+ 			{
+ 				if (m != null)
+ 				{
+-					ids.Add(m.GetType().Name);
++					ids.Add(m.Id.Entry);
+ 				}
+ 			}
+ 		}
+@@ -2119,14 +2278,6 @@ internal static class Program
+ 		return ids;
+ 	}
+ 
+-	private static List<string> BuildMonsterPowerClassNames(MonsterModel monster)
+-	{
+-		// Monster 初始 power 是 runtime 阶段 AddPower 才创建的，ModelDb 没有静态列表。
+-		// 暂时返回空；initial powers 仍由 source_knowledge.sqlite 提供（build 脚本扫源码）。
+-		// TODO：扫源码注释 / MoveModel 的 PowerFactory 类型注解可提取，需另一 AI 实现。
+-		return new List<string>();
+-	}
+-
+ 	// ---- game_catalog 辅助 ----
+ 	private static int SafeBaseCost(CardModel c)
+ 	{
+@@ -2188,21 +2339,6 @@ internal static class Program
+ 		return chain;
+ 	}
+ 
+-	private static bool IsDebuffByName(string className)
+-	{
+-		// Known STS2 debuff powers by class name suffix/stem
+-		string[] debuffHints = {
+-			"WeakPower", "VulnerablePower", "FrailPower", "PoisonPower",
+-			"ShacklesPower", "StranglePower", "ConfusedPower", "NoDrawPower",
+-			"EntangledPower", "HexPower", "LockOnPower",
+-		};
+-		foreach (var h in debuffHints)
+-		{
+-			if (className == h) return true;
+-		}
+-		return className.EndsWith("DebuffPower", StringComparison.Ordinal);
+-	}
+-
+ 	private static object BuildCombatApiState()
+ 	{
+ 		return BuildCombatApiState(CombatTrainingEnvService.Instance.GetState());
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
 index fab2a82..008a847 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
@@ -139,7 +367,7 @@ index fab2a82..008a847 100644
  			{
  				gs.LegalActions.Add(new LegalAction { Action = "confirm_selection", Label = "Confirm" });
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..68b274f 100644
+index 76abc62..7c94561 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -46,6 +46,9 @@ public static class FullRunApiStateBuilder
@@ -161,7 +389,27 @@ index 76abc62..68b274f 100644
  			{
  				try
  				{
-@@ -432,15 +435,19 @@ public static class FullRunApiStateBuilder
+@@ -274,11 +277,19 @@ public static class FullRunApiStateBuilder
+ 		}
+ 		EventModel localEvent = eventRoom.LocalMutableEvent;
+ 		state.event_id = localEvent.Id.Entry;
++		state.layout_type = localEvent.LayoutType.ToString();
++		state.description_key = localEvent.Description?.LocEntryKey;
++		state.encounter_id = localEvent.CanonicalEncounter?.Id.Entry;
++		state.is_deterministic = localEvent.IsDeterministic;
++		state.is_shared = localEvent.IsShared;
+ 		state.is_finished = localEvent.IsFinished;
++		state.dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(localEvent.DynamicVars));
+ 		state.options = localEvent.CurrentOptions.Select(static (option, index) => new FullRunApiEventOption
+ 		{
+ 			index = index,
+ 			text = option.Title.GetRawText(),
++			text_key = option.TextKey,
++			description = option.Description.GetRawText(),
+ 			is_locked = option.IsLocked,
+ 			is_chosen = option.WasChosen,
+ 			is_proceed = option.IsProceed
+@@ -432,15 +443,19 @@ public static class FullRunApiStateBuilder
  		{
  			player = playerState,
  			screen_type = selection?.Mode,
@@ -182,7 +430,7 @@ index 76abc62..68b274f 100644
  			cards = selection?.SelectableCards.Select(ToApiSelectableCardOption).ToList() ?? new List<FullRunApiCardOption>(),
  			selected_cards = selection?.SelectedCards.Select(ToApiSelectableCardOption).ToList() ?? new List<FullRunApiCardOption>()
  		};
-@@ -460,10 +467,19 @@ public static class FullRunApiStateBuilder
+@@ -460,10 +475,19 @@ public static class FullRunApiStateBuilder
  	{
  		return new FullRunApiHandSelectState
  		{
@@ -202,7 +450,7 @@ index 76abc62..68b274f 100644
  			cards = selection.SelectableCards.Select(ToApiHandCardOption).ToList(),
  			selected_cards = selection.SelectedCards.Select(ToApiHandCardOption).ToList()
  		};
-@@ -475,10 +491,17 @@ public static class FullRunApiStateBuilder
+@@ -475,10 +499,17 @@ public static class FullRunApiStateBuilder
  		{
  			prompt = selection.PromptText,
  			mode = selection.Mode,
@@ -220,7 +468,33 @@ index 76abc62..68b274f 100644
  			selectable_cards = selection.SelectableCards.Select(ToApiSelectableCardOption).ToList(),
  			selected_cards = selection.SelectedCards.Select(ToApiSelectableCardOption).ToList()
  		};
-@@ -626,6 +649,8 @@ public static class FullRunApiStateBuilder
+@@ -596,11 +627,20 @@ public static class FullRunApiStateBuilder
+ 			// can distinguish Vantom InkBlot vs Dismember etc.
+ 			next_move_id = enemy.NextMoveId,
+ 			intends_to_attack = enemy.IntendsToAttack,
+-			status = enemy.Powers?.Where(static power => power != null).Select(static power => new FullRunApiPower
+-			{
+-				id = power.Id,
+-				amount = power.Amount
+-			}).ToList() ?? new List<FullRunApiPower>(),
++			is_primary_enemy = enemy.IsPrimaryEnemy,
++			is_secondary_enemy = enemy.IsSecondaryEnemy,
++			is_stunned = enemy.IsStunned,
++			is_pet = enemy.IsPet,
++			shows_infinite_hp = enemy.ShowsInfiniteHp,
++			can_receive_powers = enemy.CanReceivePowers,
++			slot_name = enemy.SlotName,
++			spawned_this_turn = enemy.SpawnedThisTurn,
++			is_performing_move = enemy.IsPerformingMove,
++			is_move = enemy.IsMove,
++			must_perform_once_before_transitioning = enemy.MustPerformOnceBeforeTransitioning,
++			can_transition_away = enemy.CanTransitionAway,
++			move_history = enemy.MoveHistory?.ToList() ?? new List<string>(),
++			status = enemy.Powers?.Where(static power => power != null).Select(ToApiPower).ToList() ?? new List<FullRunApiPower>(),
+ 			intents = enemy.Intents?.Where(static intent => intent != null).Select(static intent => new FullRunApiIntent
+ 			{
+ 				type = intent.IntentType.ToLowerInvariant(),
+@@ -626,6 +666,8 @@ public static class FullRunApiStateBuilder
  			col = action.Col,
  			row = action.Row,
  			card_index = action.CardIndex,
@@ -229,7 +503,7 @@ index 76abc62..68b274f 100644
  			card_id = action.CardId,
  			card_type = action.CardType,
  			card_rarity = action.CardRarity,
-@@ -654,6 +679,8 @@ public static class FullRunApiStateBuilder
+@@ -654,6 +696,8 @@ public static class FullRunApiStateBuilder
  			col = action.col,
  			row = action.row,
  			card_index = action.card_index,
@@ -238,18 +512,51 @@ index 76abc62..68b274f 100644
  			card_id = action.card_id,
  			card_type = action.card_type,
  			card_rarity = action.card_rarity,
-@@ -695,7 +722,9 @@ public static class FullRunApiStateBuilder
+@@ -676,8 +720,16 @@ public static class FullRunApiStateBuilder
+ 			id = potion.Id.Entry,
+ 			name = SafeGetText(() => potion.Title),
+ 			description = SafeGetText(() => potion.DynamicDescription),
++			rarity = potion.Rarity.ToString(),
++			usage = potion.Usage.ToString(),
+ 			target_type = potion.TargetType.ToString(),
+-			can_use_in_combat = canUseInCombat && (potion.Usage == PotionUsage.CombatOnly || potion.Usage == PotionUsage.AnyTime) && !potion.IsQueued
++			can_use_in_combat = canUseInCombat && (potion.Usage == PotionUsage.CombatOnly || potion.Usage == PotionUsage.AnyTime) && !potion.IsQueued && potion.PassesCustomUsabilityCheck,
++			can_throw_at_ally = potion.CanThrowAtAlly(),
++			is_queued = potion.IsQueued,
++			can_be_generated_in_combat = potion.CanBeGeneratedInCombat,
++			passes_custom_usability_check = potion.PassesCustomUsabilityCheck,
++			has_been_removed_from_state = potion.HasBeenRemovedFromState,
++			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(potion.DynamicVars))
+ 		};
+ 	}
+ 
+@@ -695,7 +747,24 @@ public static class FullRunApiStateBuilder
  			name = SafeGetText(() => relic.Title),
  			rarity = relic.Rarity.ToString(),
  			description = SafeGetText(() => relic.DynamicDescription),
 -			counter = relic.ShowCounter ? relic.DisplayAmount : null
 +			counter = relic.ShowCounter ? relic.DisplayAmount : null,
 +			is_used_up = relic.IsUsedUp,
-+			status = relic.Status.ToString()
++			status = relic.Status.ToString(),
++			is_tradable = relic.IsTradable,
++			is_allowed_in_shops = relic.IsAllowedInShops,
++			has_upon_pickup_effect = relic.HasUponPickupEffect,
++			spawns_pets = relic.SpawnsPets,
++			is_stackable = relic.IsStackable,
++			is_wax = relic.IsWax,
++			is_melted = relic.IsMelted,
++			adds_pet = relic.AddsPet,
++			stack_count = relic.StackCount,
++			merchant_cost = relic.MerchantCost,
++			floor_added_to_deck = relic.FloorAddedToDeck,
++			show_counter = relic.ShowCounter,
++			display_amount = relic.DisplayAmount,
++			has_been_removed_from_state = relic.HasBeenRemovedFromState,
++			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(relic.DynamicVars))
  		};
  	}
  
-@@ -708,11 +737,22 @@ public static class FullRunApiStateBuilder
+@@ -708,11 +777,37 @@ public static class FullRunApiStateBuilder
  			name = SafeGetText(() => card.Title, card.Id.Entry),
  			type = card.Type.ToString(),
  			rarity = card.Rarity.ToString(),
@@ -269,11 +576,26 @@ index 76abc62..68b274f 100644
 +			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
 +			has_on_draw_effect = CombatTrainingChoiceSnapshotBuilder.HasOnDrawEffect(card),
 +			exhaust_on_next_play = card.ExhaustOnNextPlay,
-+			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card))
++			base_replay_count = card.BaseReplayCount,
++			current_replay_count = card.GetEnchantedReplayCount(),
++			last_stars_spent = card.LastStarsSpent,
++			floor_added_to_deck = card.FloorAddedToDeck,
++			is_removable = card.IsRemovable,
++			is_transformable = card.IsTransformable,
++			is_in_combat = card.IsInCombat,
++			is_upgradable = card.IsUpgradable,
++			is_sly_this_turn = card.IsSlyThisTurn,
++			is_retained = card.ShouldRetainThisTurn,
++			is_clone = card.IsClone,
++			is_dupe = card.IsDupe,
++			has_been_removed_from_state = card.HasBeenRemovedFromState,
++			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card)),
++			enchantments = ToApiCardModifiers(CombatTrainingChoiceSnapshotBuilder.BuildEnchantmentSnapshots(card)),
++			afflictions = ToApiCardModifiers(CombatTrainingChoiceSnapshotBuilder.BuildAfflictionSnapshots(card))
  		};
  	}
  
-@@ -769,13 +809,24 @@ public static class FullRunApiStateBuilder
+@@ -769,13 +864,39 @@ public static class FullRunApiStateBuilder
  			id = card.Id,
  			name = card.Title,
  			type = card.CardType,
@@ -295,11 +617,26 @@ index 76abc62..68b274f 100644
 +			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
 +			has_on_draw_effect = card.HasOnDrawEffect,
 +			exhaust_on_next_play = card.ExhaustOnNextPlay,
-+			dynamic_vars = ToApiDynamicVars(card.DynamicVars)
++			base_replay_count = card.BaseReplayCount,
++			current_replay_count = card.CurrentReplayCount,
++			last_stars_spent = card.LastStarsSpent,
++			floor_added_to_deck = card.FloorAddedToDeck,
++			is_removable = card.IsRemovable,
++			is_transformable = card.IsTransformable,
++			is_in_combat = card.IsInCombat,
++			is_upgradable = card.IsUpgradable,
++			is_sly_this_turn = card.IsSlyThisTurn,
++			is_retained = card.IsRetained,
++			is_clone = card.IsClone,
++			is_dupe = card.IsDupe,
++			has_been_removed_from_state = card.HasBeenRemovedFromState,
++			dynamic_vars = ToApiDynamicVars(card.DynamicVars),
++			enchantments = ToApiCardModifiers(card.Enchantments),
++			afflictions = ToApiCardModifiers(card.Afflictions)
  		};
  	}
  
-@@ -787,12 +838,41 @@ public static class FullRunApiStateBuilder
+@@ -787,9 +908,131 @@ public static class FullRunApiStateBuilder
  			id = card.Id,
  			name = card.Title,
  			type = SafeValue(() => card.Type.ToString(), string.Empty),
@@ -318,10 +655,25 @@ index 76abc62..68b274f 100644
 +			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
 +			has_on_draw_effect = card.HasOnDrawEffect,
 +			exhaust_on_next_play = card.ExhaustOnNextPlay,
-+			dynamic_vars = ToApiDynamicVars(card.DynamicVars)
- 		};
- 	}
- 
++			base_replay_count = card.BaseReplayCount,
++			current_replay_count = card.CurrentReplayCount,
++			last_stars_spent = card.LastStarsSpent,
++			floor_added_to_deck = card.FloorAddedToDeck,
++			is_removable = card.IsRemovable,
++			is_transformable = card.IsTransformable,
++			is_in_combat = card.IsInCombat,
++			is_upgradable = card.IsUpgradable,
++			is_sly_this_turn = card.IsSlyThisTurn,
++			is_retained = card.IsRetained,
++			is_clone = card.IsClone,
++			is_dupe = card.IsDupe,
++			has_been_removed_from_state = card.HasBeenRemovedFromState,
++			dynamic_vars = ToApiDynamicVars(card.DynamicVars),
++			enchantments = ToApiCardModifiers(card.Enchantments),
++			afflictions = ToApiCardModifiers(card.Afflictions)
++		};
++	}
++
 +	private static List<FullRunApiDynamicVar> ToApiDynamicVars(IEnumerable<CombatTrainingDynamicVarSnapshot>? dynamicVars)
 +	{
 +		return dynamicVars?.Select(static dynamicVar => new FullRunApiDynamicVar
@@ -339,11 +691,112 @@ index 76abc62..68b274f 100644
 +		}).ToList() ?? new List<FullRunApiDynamicVar>();
 +	}
 +
- 	private static string RewardTypeForUi(Reward reward)
- 	{
- 		return reward switch
++	private static List<FullRunApiCardModifier> ToApiCardModifiers(IEnumerable<CombatTrainingCardModifierSnapshot>? modifiers)
++	{
++		return modifiers?.Select(static modifier => new FullRunApiCardModifier
++		{
++			id = modifier.Id,
++			type = modifier.Type,
++			class_name = modifier.ClassName,
++			amount = modifier.Amount,
++			display_amount = modifier.DisplayAmount,
++			status = modifier.Status,
++			show_amount = modifier.ShowAmount,
++			is_stackable = modifier.IsStackable,
++			should_start_at_bottom_of_draw_pile = modifier.ShouldStartAtBottomOfDrawPile,
++			should_glow_gold = modifier.ShouldGlowGold,
++			should_glow_red = modifier.ShouldGlowRed,
++			has_extra_card_text = modifier.HasExtraCardText,
++			can_afflict_unplayable_cards = modifier.CanAfflictUnplayableCards,
++			has_overlay = modifier.HasOverlay,
++			dynamic_vars = ToApiDynamicVars(modifier.DynamicVars)
++		}).ToList() ?? new List<FullRunApiCardModifier>();
++	}
++
++	private static FullRunApiPower ToApiPower(CombatTrainingPowerSnapshot power)
++	{
++		return new FullRunApiPower
++		{
++			id = power.Id,
++			amount = power.Amount,
++			amount_on_turn_start = power.AmountOnTurnStart,
++			display_amount = power.DisplayAmount,
++			type = power.Type,
++			stack_type = power.StackType,
++			type_for_current_amount = power.TypeForCurrentAmount,
++			class_name = power.ClassName,
++			is_instanced = power.IsInstanced,
++			is_visible = power.IsVisible,
++			allow_negative = power.AllowNegative,
++			skip_next_duration_tick = power.SkipNextDurationTick,
++			should_scale_in_multiplayer = power.ShouldScaleInMultiplayer,
++			owner_is_secondary_enemy = power.OwnerIsSecondaryEnemy,
++			owner_side = power.OwnerSide,
++			owner_model_id = power.OwnerModelId,
++			applier_side = power.ApplierSide,
++			applier_model_id = power.ApplierModelId,
++			target_side = power.TargetSide,
++			target_model_id = power.TargetModelId,
++			dynamic_vars = ToApiDynamicVars(power.DynamicVars)
++		};
++	}
++
++	private static FullRunApiPower ToApiPower(PowerModel power)
++	{
++		return new FullRunApiPower
++		{
++			id = power.Id.Entry,
++			amount = power.Amount,
++			amount_on_turn_start = power.AmountOnTurnStart,
++			display_amount = power.DisplayAmount,
++			type = power.Type.ToString(),
++			stack_type = power.StackType.ToString(),
++			type_for_current_amount = power.TypeForCurrentAmount.ToString(),
++			class_name = power.GetType().Name,
++			is_instanced = power.IsInstanced,
++			is_visible = power.IsVisible,
++			allow_negative = power.AllowNegative,
++			skip_next_duration_tick = power.SkipNextDurationTick,
++			should_scale_in_multiplayer = power.ShouldScaleInMultiplayer,
++			owner_is_secondary_enemy = power.OwnerIsSecondaryEnemy,
++			owner_side = power.Owner.Side.ToString(),
++			owner_model_id = power.Owner.ModelId.ToString(),
++			applier_side = power.Applier?.Side.ToString(),
++			applier_model_id = power.Applier?.ModelId.ToString(),
++			target_side = power.Target?.Side.ToString(),
++			target_model_id = power.Target?.ModelId.ToString(),
++			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(power.DynamicVars))
+ 		};
+ 	}
+ 
+@@ -961,11 +1204,7 @@ public static class FullRunApiStateBuilder
+ 		{
+ 			return player.Creature?.Powers?
+ 				.Where(static power => power != null && power.IsVisible)
+-				.Select(static power => new FullRunApiPower
+-				{
+-					id = power.Id?.Entry,
+-					amount = power.Amount
+-				})
++				.Select(ToApiPower)
+ 				.ToList()
+ 				?? new List<FullRunApiPower>();
+ 		}
+@@ -1052,11 +1291,7 @@ public static class FullRunApiStateBuilder
+ 		{
+ 			return combat.Player?.Powers?
+ 				.Where(static power => power != null)
+-				.Select(static power => new FullRunApiPower
+-				{
+-					id = power.Id,
+-					amount = power.Amount
+-				})
++				.Select(ToApiPower)
+ 				.ToList()
+ 				?? fallback;
+ 		}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..f754e71 100644
+index 15bb206..8e56f53 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 @@ -14,6 +14,10 @@ public sealed class FullRunApiAction
@@ -357,7 +810,52 @@ index 15bb206..f754e71 100644
  	public int? slot { get; set; }
  
  	public uint? target_id { get; set; }
-@@ -105,6 +109,29 @@ public sealed class FullRunApiIntent
+@@ -71,6 +75,44 @@ public sealed class FullRunApiPower
+ 	public string? id { get; set; }
+ 
+ 	public int amount { get; set; }
++
++	public int amount_on_turn_start { get; set; }
++
++	public int display_amount { get; set; }
++
++	public string? type { get; set; }
++
++	public string? stack_type { get; set; }
++
++	public string? type_for_current_amount { get; set; }
++
++	public string? class_name { get; set; }
++
++	public bool is_instanced { get; set; }
++
++	public bool is_visible { get; set; }
++
++	public bool allow_negative { get; set; }
++
++	public bool skip_next_duration_tick { get; set; }
++
++	public bool should_scale_in_multiplayer { get; set; }
++
++	public bool owner_is_secondary_enemy { get; set; }
++
++	public string? owner_side { get; set; }
++
++	public string? owner_model_id { get; set; }
++
++	public string? applier_side { get; set; }
++
++	public string? applier_model_id { get; set; }
++
++	public string? target_side { get; set; }
++
++	public string? target_model_id { get; set; }
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
+ }
+ 
+ public sealed class FullRunApiOrbState
+@@ -105,6 +147,62 @@ public sealed class FullRunApiIntent
  	public int? repeats { get; set; }
  }
  
@@ -384,10 +882,43 @@ index 15bb206..f754e71 100644
 +	public bool was_just_upgraded { get; set; }
 +}
 +
++public sealed class FullRunApiCardModifier
++{
++	public string? id { get; set; }
++
++	public string? type { get; set; }
++
++	public string? class_name { get; set; }
++
++	public int amount { get; set; }
++
++	public int? display_amount { get; set; }
++
++	public string? status { get; set; }
++
++	public bool? show_amount { get; set; }
++
++	public bool is_stackable { get; set; }
++
++	public bool? should_start_at_bottom_of_draw_pile { get; set; }
++
++	public bool? should_glow_gold { get; set; }
++
++	public bool? should_glow_red { get; set; }
++
++	public bool has_extra_card_text { get; set; }
++
++	public bool? can_afflict_unplayable_cards { get; set; }
++
++	public bool? has_overlay { get; set; }
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
++}
++
  public sealed class FullRunApiCardOption
  {
  	public int index { get; set; }
-@@ -117,8 +144,16 @@ public sealed class FullRunApiCardOption
+@@ -117,8 +215,16 @@ public sealed class FullRunApiCardOption
  
  	public string? rarity { get; set; }
  
@@ -404,7 +935,7 @@ index 15bb206..f754e71 100644
  	public bool is_upgraded { get; set; }
  
  	public bool? can_play { get; set; }
-@@ -129,9 +164,23 @@ public sealed class FullRunApiCardOption
+@@ -129,9 +235,53 @@ public sealed class FullRunApiCardOption
  
  	public string? description { get; set; }
  
@@ -416,6 +947,32 @@ index 15bb206..f754e71 100644
 +
 +	public bool exhaust_on_next_play { get; set; }
 +
++	public int base_replay_count { get; set; }
++
++	public int current_replay_count { get; set; }
++
++	public int last_stars_spent { get; set; }
++
++	public int? floor_added_to_deck { get; set; }
++
++	public bool is_removable { get; set; }
++
++	public bool is_transformable { get; set; }
++
++	public bool is_in_combat { get; set; }
++
++	public bool is_upgradable { get; set; }
++
++	public bool is_sly_this_turn { get; set; }
++
++	public bool is_retained { get; set; }
++
++	public bool is_clone { get; set; }
++
++	public bool is_dupe { get; set; }
++
++	public bool has_been_removed_from_state { get; set; }
++
  	public List<uint> valid_target_ids { get; set; } = new List<uint>();
  
  	public List<string> keywords { get; set; } = new List<string>();
@@ -425,10 +982,42 @@ index 15bb206..f754e71 100644
 +	public List<string> hover_tip_ids { get; set; } = new List<string>();
 +
 +	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
++
++	public List<FullRunApiCardModifier> enchantments { get; set; } = new List<FullRunApiCardModifier>();
++
++	public List<FullRunApiCardModifier> afflictions { get; set; } = new List<FullRunApiCardModifier>();
  }
  
  public sealed class FullRunApiPotionState
-@@ -166,6 +215,10 @@ public sealed class FullRunApiRelicOption
+@@ -146,11 +296,27 @@ public sealed class FullRunApiPotionState
+ 
+ 	public string? target_type { get; set; }
+ 
++	public string? rarity { get; set; }
++
++	public string? usage { get; set; }
++
+ 	public bool can_use_in_combat { get; set; }
+ 
++	public bool can_throw_at_ally { get; set; }
++
++	public bool is_queued { get; set; }
++
++	public bool can_be_generated_in_combat { get; set; }
++
++	public bool passes_custom_usability_check { get; set; }
++
++	public bool has_been_removed_from_state { get; set; }
++
+ 	public List<uint>? valid_target_ids { get; set; }
+ 
+ 	public List<string> keywords { get; set; } = new List<string>();
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
+ }
+ 
+ public sealed class FullRunApiRelicOption
+@@ -166,6 +332,40 @@ public sealed class FullRunApiRelicOption
  	public string? description { get; set; }
  
  	public int? counter { get; set; }
@@ -436,10 +1025,73 @@ index 15bb206..f754e71 100644
 +	public bool is_used_up { get; set; }
 +
 +	public string? status { get; set; }
++
++	public bool is_tradable { get; set; }
++
++	public bool is_allowed_in_shops { get; set; }
++
++	public bool has_upon_pickup_effect { get; set; }
++
++	public bool spawns_pets { get; set; }
++
++	public bool is_stackable { get; set; }
++
++	public bool is_wax { get; set; }
++
++	public bool is_melted { get; set; }
++
++	public bool adds_pet { get; set; }
++
++	public int stack_count { get; set; }
++
++	public int merchant_cost { get; set; }
++
++	public int floor_added_to_deck { get; set; }
++
++	public bool show_counter { get; set; }
++
++	public int display_amount { get; set; }
++
++	public bool has_been_removed_from_state { get; set; }
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
  }
  
  public sealed class FullRunApiPlayerState
-@@ -272,6 +325,15 @@ public sealed class FullRunApiBattleState
+@@ -250,6 +450,32 @@ public sealed class FullRunApiBattleEnemy
+ 
+ 	public bool intends_to_attack { get; set; }
+ 
++	public bool is_primary_enemy { get; set; }
++
++	public bool is_secondary_enemy { get; set; }
++
++	public bool is_stunned { get; set; }
++
++	public bool is_pet { get; set; }
++
++	public bool shows_infinite_hp { get; set; }
++
++	public bool can_receive_powers { get; set; }
++
++	public string? slot_name { get; set; }
++
++	public bool spawned_this_turn { get; set; }
++
++	public bool is_performing_move { get; set; }
++
++	public bool is_move { get; set; }
++
++	public bool must_perform_once_before_transitioning { get; set; }
++
++	public bool can_transition_away { get; set; }
++
++	public List<string> move_history { get; set; } = new List<string>();
++
+ 	public List<FullRunApiPower> status { get; set; } = new List<FullRunApiPower>();
+ 
+ 	public List<FullRunApiIntent> intents { get; set; } = new List<FullRunApiIntent>();
+@@ -272,6 +498,15 @@ public sealed class FullRunApiBattleState
  
  public sealed class FullRunApiHandSelectState
  {
@@ -455,7 +1107,7 @@ index 15bb206..f754e71 100644
  	public string? prompt { get; set; }
  
  	public int min_select { get; set; }
-@@ -280,6 +342,14 @@ public sealed class FullRunApiHandSelectState
+@@ -280,6 +515,14 @@ public sealed class FullRunApiHandSelectState
  
  	public bool can_confirm { get; set; }
  
@@ -470,7 +1122,7 @@ index 15bb206..f754e71 100644
  	public List<FullRunApiCardOption> cards { get; set; } = new List<FullRunApiCardOption>();
  
  	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
-@@ -287,6 +357,13 @@ public sealed class FullRunApiHandSelectState
+@@ -287,6 +530,13 @@ public sealed class FullRunApiHandSelectState
  
  public sealed class FullRunApiCombatCardSelectionState
  {
@@ -484,7 +1136,7 @@ index 15bb206..f754e71 100644
  	public string? prompt { get; set; }
  
  	public string? mode { get; set; }
-@@ -297,8 +374,14 @@ public sealed class FullRunApiCombatCardSelectionState
+@@ -297,8 +547,14 @@ public sealed class FullRunApiCombatCardSelectionState
  
  	public bool can_confirm { get; set; }
  
@@ -499,7 +1151,37 @@ index 15bb206..f754e71 100644
  	public List<FullRunApiCardOption> selectable_cards { get; set; } = new List<FullRunApiCardOption>();
  
  	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
-@@ -479,6 +562,13 @@ public sealed class FullRunApiTreasureState
+@@ -328,6 +584,10 @@ public sealed class FullRunApiEventOption
+ 
+ 	public string? text { get; set; }
+ 
++	public string? text_key { get; set; }
++
++	public string? description { get; set; }
++
+ 	public bool is_locked { get; set; }
+ 
+ 	public bool is_chosen { get; set; }
+@@ -339,6 +599,18 @@ public sealed class FullRunApiEventState
+ {
+ 	public string? event_id { get; set; }
+ 
++	public string? layout_type { get; set; }
++
++	public string? description_key { get; set; }
++
++	public string? encounter_id { get; set; }
++
++	public bool is_deterministic { get; set; }
++
++	public bool is_shared { get; set; }
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
++
+ 	public FullRunApiPlayerState player { get; set; } = new FullRunApiPlayerState();
+ 
+ 	public bool in_dialogue { get; set; }
+@@ -479,6 +751,13 @@ public sealed class FullRunApiTreasureState
  
  public sealed class FullRunApiCardSelectState
  {
@@ -513,7 +1195,7 @@ index 15bb206..f754e71 100644
  	public FullRunApiPlayerState player { get; set; } = new FullRunApiPlayerState();
  
  	public string? screen_type { get; set; }
-@@ -495,12 +585,12 @@ public sealed class FullRunApiCardSelectState
+@@ -495,12 +774,12 @@ public sealed class FullRunApiCardSelectState
  
  	public bool can_confirm { get; set; }
  
@@ -528,7 +1210,7 @@ index 15bb206..f754e71 100644
  	public List<FullRunApiCardOption> cards { get; set; } = new List<FullRunApiCardOption>();
  
  	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
-@@ -532,6 +622,12 @@ public sealed class FullRunApiState
+@@ -532,6 +811,12 @@ public sealed class FullRunApiState
  
  	public string? run_outcome { get; set; }
  
@@ -1286,7 +1968,7 @@ index 981b065..182d1f0 100644
 +	DeselectCardChoice = 8
  }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
-index be21d69..ea195e4 100644
+index be21d69..bcbc45b 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 @@ -1,6 +1,7 @@
@@ -1378,7 +2060,7 @@ index be21d69..ea195e4 100644
  			TargetType = card.TargetType,
  			CanPlay = card.CanPlay(),
  			RequiresTarget = CardRequiresTarget(card),
-@@ -80,10 +132,140 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+@@ -80,10 +132,212 @@ internal static class CombatTrainingChoiceSnapshotBuilder
  			Description = SafeCardDescription(card),
  			Keywords = SafeCardKeywords(card),
  			IsUpgraded = card.IsUpgraded,
@@ -1387,22 +2069,94 @@ index be21d69..ea195e4 100644
 +			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
 +			HasOnDrawEffect = HasOnDrawEffect(card),
 +			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			BaseReplayCount = card.BaseReplayCount,
++			CurrentReplayCount = card.GetEnchantedReplayCount(),
++			LastStarsSpent = card.LastStarsSpent,
++			FloorAddedToDeck = card.FloorAddedToDeck,
++			IsRemovable = card.IsRemovable,
++			IsTransformable = card.IsTransformable,
++			IsInCombat = card.IsInCombat,
++			IsUpgradable = card.IsUpgradable,
++			IsSlyThisTurn = card.IsSlyThisTurn,
++			IsRetained = card.ShouldRetainThisTurn,
++			IsClone = card.IsClone,
++			IsDupe = card.IsDupe,
++			HasBeenRemovedFromState = card.HasBeenRemovedFromState,
 +			Tags = SafeCardTags(card),
 +			HoverTipIds = SafeCardHoverTipIds(card),
-+			DynamicVars = BuildDynamicVarSnapshots(card)
++			DynamicVars = BuildDynamicVarSnapshots(card),
++			Enchantments = BuildEnchantmentSnapshots(card),
++			Afflictions = BuildAfflictionSnapshots(card)
 +		};
 +	}
 +
 +	internal static List<CombatTrainingDynamicVarSnapshot> BuildDynamicVarSnapshots(CardModel card)
 +	{
++		return BuildDynamicVarSnapshots(card.DynamicVars);
++	}
++
++	internal static List<CombatTrainingDynamicVarSnapshot> BuildDynamicVarSnapshots(DynamicVarSet? dynamicVars)
++	{
 +		try
 +		{
-+			return card.DynamicVars.Values.Select(BuildDynamicVarSnapshot).ToList();
++			return dynamicVars?.Values.Select(BuildDynamicVarSnapshot).ToList()
++				?? new List<CombatTrainingDynamicVarSnapshot>();
 +		}
 +		catch
 +		{
 +			return new List<CombatTrainingDynamicVarSnapshot>();
 +		}
++	}
++
++	internal static List<CombatTrainingCardModifierSnapshot> BuildEnchantmentSnapshots(CardModel card)
++	{
++		EnchantmentModel? enchantment = card.Enchantment;
++		if (enchantment == null)
++		{
++			return new List<CombatTrainingCardModifierSnapshot>();
++		}
++		return new List<CombatTrainingCardModifierSnapshot>
++		{
++			new CombatTrainingCardModifierSnapshot
++			{
++				Id = enchantment.Id.Entry,
++				Type = "enchantment",
++				ClassName = enchantment.GetType().Name,
++				Amount = enchantment.Amount,
++				DisplayAmount = enchantment.DisplayAmount,
++				Status = enchantment.Status.ToString(),
++				ShowAmount = enchantment.ShowAmount,
++				IsStackable = enchantment.IsStackable,
++				ShouldStartAtBottomOfDrawPile = enchantment.ShouldStartAtBottomOfDrawPile,
++				ShouldGlowGold = enchantment.ShouldGlowGold,
++				ShouldGlowRed = enchantment.ShouldGlowRed,
++				HasExtraCardText = enchantment.HasExtraCardText,
++				DynamicVars = BuildDynamicVarSnapshots(enchantment.DynamicVars)
++			}
++		};
++	}
++
++	internal static List<CombatTrainingCardModifierSnapshot> BuildAfflictionSnapshots(CardModel card)
++	{
++		AfflictionModel? affliction = card.Affliction;
++		if (affliction == null)
++		{
++			return new List<CombatTrainingCardModifierSnapshot>();
++		}
++		return new List<CombatTrainingCardModifierSnapshot>
++		{
++			new CombatTrainingCardModifierSnapshot
++			{
++				Id = affliction.Id.Entry,
++				Type = "affliction",
++				ClassName = affliction.GetType().Name,
++				Amount = affliction.Amount,
++				IsStackable = affliction.IsStackable,
++				HasExtraCardText = affliction.HasExtraCardText,
++				CanAfflictUnplayableCards = affliction.CanAfflictUnplayableCards,
++				HasOverlay = affliction.HasOverlay
++			}
++		};
 +	}
 +
 +	private static CombatTrainingDynamicVarSnapshot BuildDynamicVarSnapshot(DynamicVar dynamicVar)
@@ -1520,7 +2274,7 @@ index be21d69..ea195e4 100644
  	private static string SafeCardDescription(CardModel card)
  	{
  		try
-@@ -162,10 +344,19 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+@@ -162,10 +416,33 @@ internal static class CombatTrainingChoiceSnapshotBuilder
  			EnergyCost = card.EnergyCost.GetWithModifiers(CostModifiers.All),
  			CostsX = card.EnergyCost.CostsX,
  			StarCost = card.GetStarCostWithModifiers(),
@@ -1534,14 +2288,28 @@ index be21d69..ea195e4 100644
 +			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
 +			HasOnDrawEffect = HasOnDrawEffect(card),
 +			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			BaseReplayCount = card.BaseReplayCount,
++			CurrentReplayCount = card.GetEnchantedReplayCount(),
++			LastStarsSpent = card.LastStarsSpent,
++			FloorAddedToDeck = card.FloorAddedToDeck,
++			IsRemovable = card.IsRemovable,
++			IsTransformable = card.IsTransformable,
++			IsInCombat = card.IsInCombat,
++			IsSlyThisTurn = card.IsSlyThisTurn,
++			IsRetained = card.ShouldRetainThisTurn,
++			IsClone = card.IsClone,
++			IsDupe = card.IsDupe,
++			HasBeenRemovedFromState = card.HasBeenRemovedFromState,
 +			Tags = SafeCardTags(card),
 +			Keywords = SafeCardKeywords(card),
 +			HoverTipIds = SafeCardHoverTipIds(card),
-+			DynamicVars = BuildDynamicVarSnapshots(card)
++			DynamicVars = BuildDynamicVarSnapshots(card),
++			Enchantments = BuildEnchantmentSnapshots(card),
++			Afflictions = BuildAfflictionSnapshots(card)
  		};
  	}
  
-@@ -249,12 +440,39 @@ internal sealed class UiCombatChoiceAdapter : ICombatChoiceAdapter
+@@ -249,12 +526,39 @@ internal sealed class UiCombatChoiceAdapter : ICombatChoiceAdapter
  		return true;
  	}
  
@@ -1582,13 +2350,86 @@ index be21d69..ea195e4 100644
  	{
  		error = "";
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
-index 245c978..4ed5cad 100644
+index 245c978..9eacd11 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
-@@ -133,6 +133,34 @@ public sealed class CombatTrainingPowerSnapshot
- 	public int Amount { get; set; }
- }
+@@ -110,6 +110,32 @@ public sealed class CombatTrainingCreatureSnapshot
  
+ 	public bool IntendsToAttack { get; set; }
+ 
++	public bool IsPrimaryEnemy { get; set; }
++
++	public bool IsSecondaryEnemy { get; set; }
++
++	public bool IsStunned { get; set; }
++
++	public bool IsPet { get; set; }
++
++	public bool ShowsInfiniteHp { get; set; }
++
++	public bool CanReceivePowers { get; set; }
++
++	public string? SlotName { get; set; }
++
++	public bool SpawnedThisTurn { get; set; }
++
++	public bool IsPerformingMove { get; set; }
++
++	public bool IsMove { get; set; }
++
++	public bool MustPerformOnceBeforeTransitioning { get; set; }
++
++	public bool CanTransitionAway { get; set; }
++
++	public List<string> MoveHistory { get; set; } = new List<string>();
++
+ 	public List<CombatTrainingIntentSnapshot> Intents { get; set; } = new List<CombatTrainingIntentSnapshot>();
+ 
+ 	public List<CombatTrainingPowerSnapshot> Powers { get; set; } = new List<CombatTrainingPowerSnapshot>();
+@@ -131,6 +157,105 @@ public sealed class CombatTrainingPowerSnapshot
+ 	public string Id { get; set; } = "";
+ 
+ 	public int Amount { get; set; }
++
++	public int AmountOnTurnStart { get; set; }
++
++	public int DisplayAmount { get; set; }
++
++	public string Type { get; set; } = "";
++
++	public string StackType { get; set; } = "";
++
++	public string TypeForCurrentAmount { get; set; } = "";
++
++	public string ClassName { get; set; } = "";
++
++	public bool IsInstanced { get; set; }
++
++	public bool IsVisible { get; set; }
++
++	public bool AllowNegative { get; set; }
++
++	public bool SkipNextDurationTick { get; set; }
++
++	public bool ShouldScaleInMultiplayer { get; set; }
++
++	public bool OwnerIsSecondaryEnemy { get; set; }
++
++	public string? OwnerSide { get; set; }
++
++	public string? OwnerModelId { get; set; }
++
++	public string? ApplierSide { get; set; }
++
++	public string? ApplierModelId { get; set; }
++
++	public string? TargetSide { get; set; }
++
++	public string? TargetModelId { get; set; }
++
++	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
++}
++
 +/// <summary>
 +/// A value emitted by the card model itself.  This is deliberately a generic
 +/// runtime fact rather than a hand-maintained card-effect table: new cards and
@@ -1617,10 +2458,41 @@ index 245c978..4ed5cad 100644
 +	public bool WasJustUpgraded { get; set; }
 +}
 +
++public sealed class CombatTrainingCardModifierSnapshot
++{
++	public string Id { get; set; } = "";
++
++	public string Type { get; set; } = "";
++
++	public string ClassName { get; set; } = "";
++
++	public int Amount { get; set; }
++
++	public int? DisplayAmount { get; set; }
++
++	public string? Status { get; set; }
++
++	public bool? ShowAmount { get; set; }
++
++	public bool IsStackable { get; set; }
++
++	public bool? ShouldStartAtBottomOfDrawPile { get; set; }
++
++	public bool? ShouldGlowGold { get; set; }
++
++	public bool? ShouldGlowRed { get; set; }
++
++	public bool HasExtraCardText { get; set; }
++
++	public bool? CanAfflictUnplayableCards { get; set; }
++
++	public bool? HasOverlay { get; set; }
++
++	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
+ }
+ 
  public sealed class CombatTrainingHandCardSnapshot
- {
- 	public int HandIndex { get; set; }
-@@ -149,6 +177,8 @@ public sealed class CombatTrainingHandCardSnapshot
+@@ -149,6 +274,8 @@ public sealed class CombatTrainingHandCardSnapshot
  
  	public int StarCost { get; set; }
  
@@ -1629,7 +2501,7 @@ index 245c978..4ed5cad 100644
  	public TargetType TargetType { get; set; }
  
  	public bool CanPlay { get; set; }
-@@ -165,7 +195,19 @@ public sealed class CombatTrainingHandCardSnapshot
+@@ -165,7 +292,49 @@ public sealed class CombatTrainingHandCardSnapshot
  
  	public bool GainsBlock { get; set; }
  
@@ -1639,6 +2511,32 @@ index 245c978..4ed5cad 100644
 +
 +	public bool ExhaustOnNextPlay { get; set; }
 +
++	public int BaseReplayCount { get; set; }
++
++	public int CurrentReplayCount { get; set; }
++
++	public int LastStarsSpent { get; set; }
++
++	public int? FloorAddedToDeck { get; set; }
++
++	public bool IsRemovable { get; set; }
++
++	public bool IsTransformable { get; set; }
++
++	public bool IsInCombat { get; set; }
++
++	public bool IsUpgradable { get; set; }
++
++	public bool IsSlyThisTurn { get; set; }
++
++	public bool IsRetained { get; set; }
++
++	public bool IsClone { get; set; }
++
++	public bool IsDupe { get; set; }
++
++	public bool HasBeenRemovedFromState { get; set; }
++
 +	public List<string> Tags { get; set; } = new List<string>();
 +
  	public List<string> Keywords { get; set; } = new List<string>();
@@ -1646,10 +2544,14 @@ index 245c978..4ed5cad 100644
 +	public List<string> HoverTipIds { get; set; } = new List<string>();
 +
 +	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
++
++	public List<CombatTrainingCardModifierSnapshot> Enchantments { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
++
++	public List<CombatTrainingCardModifierSnapshot> Afflictions { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
  }
  
  public sealed class CombatTrainingPileSnapshot
-@@ -196,6 +238,14 @@ public sealed class CombatTrainingHandSelectionSnapshot
+@@ -196,6 +365,14 @@ public sealed class CombatTrainingHandSelectionSnapshot
  
  	public string Mode { get; set; } = "";
  
@@ -1664,7 +2566,7 @@ index 245c978..4ed5cad 100644
  	public string PromptText { get; set; } = "";
  
  	public int MinSelect { get; set; }
-@@ -204,6 +254,8 @@ public sealed class CombatTrainingHandSelectionSnapshot
+@@ -204,6 +381,8 @@ public sealed class CombatTrainingHandSelectionSnapshot
  
  	public bool CanConfirm { get; set; }
  
@@ -1673,7 +2575,7 @@ index 245c978..4ed5cad 100644
  	public bool Cancelable { get; set; }
  
  	public List<CombatTrainingHandCardSnapshot> SelectableCards { get; set; } = new List<CombatTrainingHandCardSnapshot>();
-@@ -219,6 +271,14 @@ public sealed class CombatTrainingCardSelectionSnapshot
+@@ -219,6 +398,14 @@ public sealed class CombatTrainingCardSelectionSnapshot
  
  	public string Mode { get; set; } = "";
  
@@ -1688,7 +2590,7 @@ index 245c978..4ed5cad 100644
  	public string PromptText { get; set; } = "";
  
  	public int MinSelect { get; set; }
-@@ -227,6 +287,8 @@ public sealed class CombatTrainingCardSelectionSnapshot
+@@ -227,6 +414,8 @@ public sealed class CombatTrainingCardSelectionSnapshot
  
  	public bool CanConfirm { get; set; }
  
@@ -1697,7 +2599,7 @@ index 245c978..4ed5cad 100644
  	public bool Cancelable { get; set; }
  
  	public List<CombatTrainingSelectableCardSnapshot> SelectableCards { get; set; } = new List<CombatTrainingSelectableCardSnapshot>();
-@@ -250,6 +312,8 @@ public sealed class CombatTrainingSelectableCardSnapshot
+@@ -250,6 +439,8 @@ public sealed class CombatTrainingSelectableCardSnapshot
  
  	public int StarCost { get; set; }
  
@@ -1706,7 +2608,7 @@ index 245c978..4ed5cad 100644
  	public TargetType TargetType { get; set; }
  
  	public string SourcePile { get; set; } = "";
-@@ -257,4 +321,20 @@ public sealed class CombatTrainingSelectableCardSnapshot
+@@ -257,4 +448,48 @@ public sealed class CombatTrainingSelectableCardSnapshot
  	public bool IsUpgraded { get; set; }
  
  	public bool IsUpgradable { get; set; }
@@ -1719,6 +2621,30 @@ index 245c978..4ed5cad 100644
 +
 +	public bool ExhaustOnNextPlay { get; set; }
 +
++	public int BaseReplayCount { get; set; }
++
++	public int CurrentReplayCount { get; set; }
++
++	public int LastStarsSpent { get; set; }
++
++	public int? FloorAddedToDeck { get; set; }
++
++	public bool IsRemovable { get; set; }
++
++	public bool IsTransformable { get; set; }
++
++	public bool IsInCombat { get; set; }
++
++	public bool IsSlyThisTurn { get; set; }
++
++	public bool IsRetained { get; set; }
++
++	public bool IsClone { get; set; }
++
++	public bool IsDupe { get; set; }
++
++	public bool HasBeenRemovedFromState { get; set; }
++
 +	public List<string> Tags { get; set; } = new List<string>();
 +
 +	public List<string> Keywords { get; set; } = new List<string>();
@@ -1726,9 +2652,13 @@ index 245c978..4ed5cad 100644
 +	public List<string> HoverTipIds { get; set; } = new List<string>();
 +
 +	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
++
++	public List<CombatTrainingCardModifierSnapshot> Enchantments { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
++
++	public List<CombatTrainingCardModifierSnapshot> Afflictions { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
  }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
-index f0f6080..2c977b9 100644
+index f0f6080..656947f 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 @@ -149,6 +149,23 @@ public sealed class CombatTrainingEnvService
@@ -1779,7 +2709,65 @@ index f0f6080..2c977b9 100644
  		case CombatTrainingActionType.ConfirmSelection:
  			{
  				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: null);
-@@ -561,6 +595,7 @@ public sealed class CombatTrainingEnvService
+@@ -446,6 +480,22 @@ public sealed class CombatTrainingEnvService
+ 			IsHittable = creature.IsHittable,
+ 			NextMoveId = nextMove?.Id,
+ 			IntendsToAttack = creature.Monster?.IntendsToAttack ?? false,
++			IsPrimaryEnemy = creature.IsPrimaryEnemy,
++			IsSecondaryEnemy = creature.IsSecondaryEnemy,
++			IsStunned = creature.IsStunned,
++			IsPet = creature.IsPet,
++			ShowsInfiniteHp = creature.ShowsInfiniteHp,
++			CanReceivePowers = creature.CanReceivePowers,
++			SlotName = creature.SlotName,
++			SpawnedThisTurn = creature.Monster?.SpawnedThisTurn ?? false,
++			IsPerformingMove = creature.Monster?.IsPerformingMove ?? false,
++			IsMove = nextMove?.IsMove ?? false,
++			MustPerformOnceBeforeTransitioning = nextMove?.MustPerformOnceBeforeTransitioning ?? false,
++			CanTransitionAway = nextMove?.CanTransitionAway ?? false,
++			MoveHistory = creature.Monster?.MoveStateMachine?.StateLog
++				.Where(static state => state.ShouldAppearInLogs)
++				.Select(static state => state.Id)
++				.ToList() ?? new List<string>(),
+ 			Intents = BuildIntentSnapshot(nextMove, creature, intentTargets),
+ 			Powers = BuildPowerSnapshot(creature)
+ 		};
+@@ -521,10 +571,33 @@ public sealed class CombatTrainingEnvService
+ 		List<CombatTrainingPowerSnapshot> result = new List<CombatTrainingPowerSnapshot>(powers.Count);
+ 		foreach (var power in powers)
+ 		{
++			if (!power.IsVisible)
++			{
++				continue;
++			}
+ 			result.Add(new CombatTrainingPowerSnapshot
+ 			{
+ 				Id = power.Id.Entry,
+-				Amount = power.Amount
++				Amount = power.Amount,
++				AmountOnTurnStart = power.AmountOnTurnStart,
++				DisplayAmount = power.DisplayAmount,
++				Type = power.Type.ToString(),
++				StackType = power.StackType.ToString(),
++				TypeForCurrentAmount = power.TypeForCurrentAmount.ToString(),
++				ClassName = power.GetType().Name,
++				IsInstanced = power.IsInstanced,
++				IsVisible = power.IsVisible,
++				AllowNegative = power.AllowNegative,
++				SkipNextDurationTick = power.SkipNextDurationTick,
++				ShouldScaleInMultiplayer = power.ShouldScaleInMultiplayer,
++				OwnerIsSecondaryEnemy = power.OwnerIsSecondaryEnemy,
++				OwnerSide = power.Owner.Side.ToString(),
++				OwnerModelId = power.Owner.ModelId.ToString(),
++				ApplierSide = power.Applier?.Side.ToString(),
++				ApplierModelId = power.Applier?.ModelId.ToString(),
++				TargetSide = power.Target?.Side.ToString(),
++				TargetModelId = power.Target?.ModelId.ToString(),
++				DynamicVars = CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(power.DynamicVars)
+ 			});
+ 		}
+ 		return result;
+@@ -561,6 +634,7 @@ public sealed class CombatTrainingEnvService
  			IsUpgraded = card.IsUpgraded,
  			CostsX = card.EnergyCost.CostsX,
  			StarCost = card.GetStarCostWithModifiers(),
@@ -1787,7 +2775,7 @@ index f0f6080..2c977b9 100644
  			TargetType = card.TargetType,
  			CanPlay = card.CanPlay(),
  			RequiresTarget = CardRequiresTarget(card),
-@@ -568,7 +603,13 @@ public sealed class CombatTrainingEnvService
+@@ -568,7 +642,28 @@ public sealed class CombatTrainingEnvService
  			CardType = card.Type.ToString(),
  			Description = SafeCardDescription(card),
  			Keywords = SafeCardKeywords(card),
@@ -1796,13 +2784,28 @@ index f0f6080..2c977b9 100644
 +			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
 +			HasOnDrawEffect = CombatTrainingChoiceSnapshotBuilder.HasOnDrawEffect(card),
 +			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			BaseReplayCount = card.BaseReplayCount,
++			CurrentReplayCount = card.GetEnchantedReplayCount(),
++			LastStarsSpent = card.LastStarsSpent,
++			FloorAddedToDeck = card.FloorAddedToDeck,
++			IsRemovable = card.IsRemovable,
++			IsTransformable = card.IsTransformable,
++			IsInCombat = card.IsInCombat,
++			IsUpgradable = card.IsUpgradable,
++			IsSlyThisTurn = card.IsSlyThisTurn,
++			IsRetained = card.ShouldRetainThisTurn,
++			IsClone = card.IsClone,
++			IsDupe = card.IsDupe,
++			HasBeenRemovedFromState = card.HasBeenRemovedFromState,
 +			Tags = CombatTrainingChoiceSnapshotBuilder.SafeCardTags(card),
 +			HoverTipIds = CombatTrainingChoiceSnapshotBuilder.SafeCardHoverTipIds(card),
-+			DynamicVars = CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card)
++			DynamicVars = CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card),
++			Enchantments = CombatTrainingChoiceSnapshotBuilder.BuildEnchantmentSnapshots(card),
++			Afflictions = CombatTrainingChoiceSnapshotBuilder.BuildAfflictionSnapshots(card)
  		};
  	}
  
-@@ -712,6 +753,14 @@ public sealed class CombatTrainingEnvService
+@@ -712,6 +807,14 @@ public sealed class CombatTrainingEnvService
  		{
  			return BuildRejectedResult("SelectCardChoice requires choice_index.");
  		}

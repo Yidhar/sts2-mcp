@@ -315,6 +315,113 @@ def test_combat_entities_have_no_mechanic_or_self_damage_derivations() -> None:
     assert "canonical_text" not in card
 
 
+def test_runtime_mechanics_fields_survive_transport_without_inference() -> None:
+    dynamic_var = {
+        "name": "Amount",
+        "var_type": "IntVar",
+        "family": "amount",
+        "base_value": 2,
+        "enchanted_value": 3,
+        "preview_value": 3,
+        "int_value": 3,
+        "was_just_upgraded": False,
+    }
+    card = {
+        "index": 0,
+        "id": "TEST_CARD",
+        "source_pile": "Hand",
+        "dynamic_vars": [dynamic_var],
+        "enchantments": [
+            {
+                "id": "SHINY",
+                "modifier_type": "enchantment",
+                "amount": 1,
+                "dynamic_vars": [dynamic_var],
+            }
+        ],
+        "afflictions": [
+            {"id": "CURSED", "modifier_type": "affliction", "amount": 2}
+        ],
+        "base_replay_count": 1,
+        "current_replay_count": 2,
+        "is_retained": True,
+    }
+    power = {
+        "id": "RITUAL_POWER",
+        "amount": 4,
+        "type": "Buff",
+        "stack_type": "Counter",
+        "is_visible": True,
+        "allow_negative": False,
+        "dynamic_vars": [dynamic_var],
+    }
+    relic = {
+        "id": "COUNTING_RELIC",
+        "rarity": "Rare",
+        "status": "Normal",
+        "stack_count": 2,
+        "display_amount": 7,
+        "dynamic_vars": [dynamic_var],
+    }
+    potion = {
+        "id": "TARGET_POTION",
+        "rarity": "Common",
+        "usage": "Combat",
+        "target_type": "AnyEnemy",
+        "passes_custom_usability_check": True,
+        "dynamic_vars": [dynamic_var],
+    }
+    translated = translate_to_bridge_shape(
+        {
+            "state_type": "monster",
+            "battle": {
+                "player": {
+                    "current_hp": 40,
+                    "max_hp": 80,
+                    "hand": [card],
+                    "deck": [card],
+                    "status": [power],
+                    "relics": [relic],
+                    "potions": [potion],
+                },
+                "enemies": [
+                    {
+                        "entity_id": "BOSS",
+                        "combat_id": 9,
+                        "hp": 300,
+                        "max_hp": 300,
+                        "next_move_id": "VISIBLE_MOVE",
+                        "move_history": ["INTRO", "VISIBLE_MOVE"],
+                        "is_primary_enemy": True,
+                        "is_secondary_enemy": False,
+                        "must_perform_once_before_transitioning": True,
+                        "can_transition_away": False,
+                        "status": [power],
+                        "intents": [{"type": "Attack", "damage": 12}],
+                    }
+                ],
+            },
+            "legal_actions": [{"action": "play_card", "card_index": 0}],
+        },
+        episode_id="ep-runtime-mechanics",
+    )
+
+    player = translated["player"]
+    translated_card = player["hand"][0]
+    enemy = translated["combat"]["enemies"][0]
+    assert translated_card["enchantments"][0]["id"] == "SHINY"
+    assert translated_card["afflictions"][0]["id"] == "CURSED"
+    assert translated_card["current_replay_count"] == 2
+    assert translated_card["is_retained"] is True
+    assert player["powers"][0]["type"] == "Buff"
+    assert player["relics"][0]["display_amount"] == 7
+    assert player["potions"][0]["target_type"] == "AnyEnemy"
+    assert enemy["move_history"] == ["INTRO", "VISIBLE_MOVE"]
+    assert enemy["must_perform_once_before_transitioning"] is True
+    assert enemy["powers"][0]["dynamic_vars"][0]["int_value"] == 3
+    assert "follow_up_state_id" not in enemy
+
+
 def test_malformed_legal_action_fails_instead_of_being_silently_filtered() -> None:
     with pytest.raises(TypeError, match="legal action 1"):
         translate_to_bridge_shape(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -17,6 +18,11 @@ from sts2_rl.encoding.grounded import (
     _DYNAMIC_VALUE_SLOT_BY_KEY,
     _bounded_number,
     _canonical_card,
+    _canonical_enemy,
+    _canonical_event,
+    _canonical_potion,
+    _canonical_power,
+    _canonical_relic,
     _hash_id,
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
@@ -24,7 +30,7 @@ from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 
 def _small_model_config() -> GroundedCandidateConfig:
     return GroundedCandidateConfig(
-        token_feature_dim=128,
+        token_feature_dim=224,
         d_model=32,
         n_heads=4,
         ffn_dim=64,
@@ -1103,16 +1109,16 @@ def test_reviewed_numeric_facts_have_collision_free_feature_slots() -> None:
 
 
 def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
-    with pytest.raises(ValueError, match="at least 128"):
-        GroundedEncodingConfig(feature_dim=127)
+    with pytest.raises(ValueError, match="at least 224"):
+        GroundedEncodingConfig(feature_dim=223)
 
 
 def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
     assert identity["version"] == GROUNDING_ENCODING_VERSION
-    assert identity["min_token_feature_dim"] == 128
-    assert identity["feature_abi_end"] <= 128
+    assert identity["min_token_feature_dim"] == 224
+    assert identity["feature_abi_end"] <= 224
     assert len(identity["fingerprint_sha256"]) == 64
     assert set(identity["fingerprint_sha256"]) <= set("0123456789abcdef")
     assert grounding_encoding_identity() == identity
@@ -1540,3 +1546,215 @@ def test_card_cost_rarity_and_x_cost_transport_aliases_are_preserved() -> None:
         (str(trait["id"]), str(trait["type"]))
         for trait in catalog["traits"]
     } == {("costs_x", "card_trait")}
+
+
+def test_runtime_mechanics_v6_projects_power_relic_and_potion_state() -> None:
+    power = _canonical_power(
+        {
+            "id": "POWER.POISON",
+            "class_name": "PoisonPower",
+            "amount": 7,
+            "amount_on_turn_start": 5,
+            "display_amount": 7,
+            "type": "Debuff",
+            "stack_type": "Counter",
+            "type_for_current_amount": "Debuff",
+            "is_instanced": False,
+            "is_visible": True,
+            "allow_negative": False,
+            "skip_next_duration_tick": True,
+            "owner_side": "Enemy",
+            "owner_model_id": "MONSTER.TEST",
+            "dynamic_vars": {"Decay": 1},
+        }
+    )
+    assert power["amount_on_turn_start"] == 5
+    assert power["display_amount"] == 7
+    assert power["stack_type"] == "Counter"
+    assert power["skip_next_duration_tick"] is True
+    assert power["dynamic_vars"][0]["id"] == "Decay"
+
+    relic = _canonical_relic(
+        {
+            "id": "RELIC.LIZARD_TAIL",
+            "rarity": "Rare",
+            "status": "Active",
+            "counter": 1,
+            "stack_count": 2,
+            "is_used_up": False,
+            "show_counter": True,
+            "is_wax": True,
+            "dynamic_vars": {"Heal": 50},
+        }
+    )
+    assert relic["display_amount"] == 1
+    assert relic["stack_count"] == 2
+    assert relic["status"] == "Active"
+    assert relic["is_used_up"] is False
+    assert relic["dynamic_vars"][0]["current_value"] == 50
+
+    potion = _canonical_potion(
+        {
+            "id": "POTION.FIRE",
+            "rarity": "Common",
+            "usage": "CombatOnly",
+            "target_type": "AnyEnemy",
+            "can_use_in_combat": True,
+            "can_throw_at_ally": False,
+            "is_queued": False,
+            "passes_custom_usability_check": True,
+            "dynamic_vars": {"Damage": 20},
+        }
+    )
+    assert potion["usage"] == "CombatOnly"
+    assert potion["can_use_in_combat"] is True
+    assert potion["dynamic_vars"][0]["current_value"] == 20
+
+
+def test_runtime_mechanics_v6_projects_singular_card_modifiers() -> None:
+    card = _canonical_card(
+        {
+            "id": "CARD.TEST",
+            "type": "Attack",
+            "enchantment": {
+                "id": "ENCHANTMENT.SHARP",
+                "class_name": "SharpEnchantment",
+                "amount": 2,
+                "display_amount": 2,
+                "status": "Normal",
+                "show_amount": True,
+                "should_glow_gold": True,
+                "dynamic_vars": {"Damage": 3},
+            },
+            "affliction": {
+                "id": "AFFLICTION.BOUND",
+                "class_name": "BoundAffliction",
+                "amount": 1,
+                "is_stackable": False,
+                "can_afflict_unplayable_cards": True,
+                "has_overlay": True,
+            },
+        }
+    )
+    enchantment = card["enchantments"][0]
+    affliction = card["afflictions"][0]
+    assert enchantment["id"] == "ENCHANTMENT.SHARP"
+    assert enchantment["type"] == "enchantment"
+    assert enchantment["dynamic_vars"][0]["current_value"] == 3
+    assert affliction["id"] == "AFFLICTION.BOUND"
+    assert affliction["type"] == "affliction"
+    assert affliction["has_overlay"] is True
+
+
+def test_runtime_mechanics_v6_keeps_observable_boss_state_but_not_hidden_follow_up() -> None:
+    raw = {
+        "model_id": "MONSTER.BOSS",
+        "hp": 300,
+        "max_hp": 400,
+        "is_alive": True,
+        "is_hittable": True,
+        "is_primary_enemy": True,
+        "is_stunned": False,
+        "next_move_id": "PHASE_TWO_ATTACK",
+        "follow_up_state_id": "HIDDEN_RANDOM_BRANCH",
+        "is_move": True,
+        "must_perform_once_before_transitioning": True,
+        "can_transition_away": False,
+        "spawned_this_turn": False,
+        "is_performing_move": False,
+        "move_history": ["OPENING", "PHASE_ONE"],
+        "powers": [],
+        "intents": [{"type": "Attack", "damage": 18, "repeats": 2}],
+    }
+    first = _canonical_enemy(raw)
+    raw["follow_up_state_id"] = "A_DIFFERENT_HIDDEN_BRANCH"
+    second = _canonical_enemy(raw)
+    assert first == second
+    assert first["next_move_state_id"] == "PHASE_TWO_ATTACK"
+    assert first["must_perform_once_before_transitioning"] is True
+    assert [item["id"] for item in first["move_history"]] == [
+        "OPENING",
+        "PHASE_ONE",
+    ]
+
+
+def test_runtime_mechanics_v6_event_state_changes_world_encoding() -> None:
+    event = _canonical_event(
+        {
+            "event_id": "EVENT.TEST",
+            "layout_type": "Ancient",
+            "description_key": "TEST.pages.SECOND.description",
+            "is_deterministic": True,
+            "is_shared": False,
+            "is_finished": False,
+            "dynamic_vars": {"Gold": 75},
+            "options": [
+                {
+                    "text_key": "BUY",
+                    "title": "Buy",
+                    "is_locked": False,
+                    "is_chosen": False,
+                    "is_proceed": False,
+                }
+            ],
+        }
+    )
+    assert event["event_id"] == "EVENT.TEST"
+    assert event["options"][0]["text_key"] == "BUY"
+
+    encoder = _encoder()
+    before = _observation()
+    before["event"] = event
+    after = deepcopy(before)
+    after["event"]["description_key"] = "TEST.pages.THIRD.description"
+    first = encoder.encode(before, _actions()).batch.world
+    second = encoder.encode(after, _actions()).batch.world
+    assert not torch.equal(first.features, second.features)
+
+
+def test_runtime_mechanics_v6_keeps_act_and_ascension_context() -> None:
+    encoder = _encoder()
+    first_observation = _observation()
+    first_observation["run"] = {"act": 1, "ascension_level": 0}
+    second_observation = deepcopy(first_observation)
+    second_observation["run"].update({"act": 2, "ascension_level": 10})
+
+    first = encoder.encode(first_observation, _actions()).batch.world
+    second = encoder.encode(second_observation, _actions()).batch.world
+
+    assert not torch.equal(first.features, second.features)
+
+
+def test_runtime_mechanics_v6_set_like_status_and_inventory_are_permutation_invariant() -> None:
+    encoder = _encoder()
+    first_observation = _observation()
+    first_observation["player"]["powers"] = [
+        {"id": "POWER.STRENGTH", "amount": 2},
+        {"id": "POWER.WEAK", "amount": 1},
+    ]
+    first_observation["player"]["relics"] = [
+        {"id": "RELIC.A", "stack_count": 1},
+        {"id": "RELIC.B", "stack_count": 2},
+    ]
+    first_observation["player"]["potions"] = [
+        {"id": "POTION.A", "is_queued": False},
+        {"id": "POTION.B", "is_queued": True},
+    ]
+    second_observation = deepcopy(first_observation)
+    for field in ("powers", "relics", "potions"):
+        second_observation["player"][field].reverse()
+
+    first = encoder.encode(first_observation, _actions()).batch.world
+    second = encoder.encode(second_observation, _actions()).batch.world
+    for field in (
+        "features",
+        "mask",
+        "type_ids",
+        "role_ids",
+        "owner_ids",
+        "entity_ids",
+        "entity_aux_ids",
+        "zone_ids",
+        "order_ids",
+    ):
+        assert torch.equal(getattr(first, field), getattr(second, field)), field

@@ -79,24 +79,82 @@ internal static partial class BridgeGameApi
         if (starCost.HasValue && starCost.Value >= 0)
         {
             payload["star"] = starCost.Value;
+            payload["star_cost"] = starCost.Value;
         }
 
         if (TryGetNestedBool(element.Value, "costs_x") == true)
         {
             payload["x_cost"] = true;
+            payload["costs_x"] = true;
         }
 
         if (TryGetNestedBool(element.Value, "has_star_cost_x") == true)
         {
             payload["star_x"] = true;
+            payload["has_star_cost_x"] = true;
         }
 
         AppendCompactCardKeywords(payload, element.Value);
+        AppendCompactStringArray(payload, element.Value, "tags");
+        AppendCompactStringArray(payload, element.Value, "hover_tip_ids");
+
+        foreach (var key in new[]
+                 {
+                     "base_replay_count",
+                     "current_replay_count",
+                     "last_stars_spent",
+                     "floor_added_to_deck",
+                     "max_upgrade_level"
+                 })
+        {
+            var value = TryGetNestedInt(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        foreach (var key in new[]
+                 {
+                     "gains_block",
+                     "has_turn_end_in_hand_effect",
+                     "has_on_draw_effect",
+                     "exhaust_on_next_play",
+                     "is_playable",
+                     "is_removable",
+                     "is_transformable",
+                     "is_in_combat",
+                     "is_upgradable",
+                     "is_sly_this_turn",
+                     "is_retained",
+                     "is_clone",
+                     "is_dupe",
+                     "has_been_removed_from_state"
+                 })
+        {
+            var value = TryGetNestedBool(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        var dynamicVars = TryGetNestedElement(element.Value, "dynamic_vars");
+        if (dynamicVars is not null && dynamicVars.Value.ValueKind == JsonValueKind.Array)
+        {
+            payload["dynamic_vars"] = dynamicVars.Value.Clone();
+        }
 
         var type = TryGetNestedString(element.Value, "type");
         if (!string.IsNullOrWhiteSpace(type))
         {
             payload["type"] = type;
+        }
+
+        var rarity = TryGetNestedString(element.Value, "rarity");
+        if (!string.IsNullOrWhiteSpace(rarity))
+        {
+            payload["rarity"] = rarity;
         }
 
         var target = TryGetNestedString(element.Value, "target_type");
@@ -217,6 +275,29 @@ internal static partial class BridgeGameApi
 
     }
 
+    private static void AppendCompactStringArray(
+        Dictionary<string, object?> payload,
+        JsonElement element,
+        string fieldName)
+    {
+        var values = TryGetNestedElement(element, fieldName);
+        if (values is null || values.Value.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var compact = values.Value.EnumerateArray()
+            .Select(static item => item.ValueKind == JsonValueKind.String ? item.GetString() : item.ToString())
+            .Where(static item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(static item => item, StringComparer.Ordinal)
+            .ToArray();
+        if (compact.Length > 0)
+        {
+            payload[fieldName] = compact;
+        }
+    }
+
     private static void AppendCompactCardModifiers(Dictionary<string, object?> payload, JsonElement element, string fieldName)
     {
         var modifiers = TryGetNestedElement(element, fieldName);
@@ -242,12 +323,21 @@ internal static partial class BridgeGameApi
                 id,
                 title,
                 type,
+                class_name = TryGetNestedString(modifier, "class_name"),
                 description,
                 amount,
+                display_amount = TryGetNestedDecimal(modifier, "display_amount"),
                 status = TryGetNestedString(modifier, "status"),
                 enabled = TryGetNestedBool(modifier, "enabled"),
-                is_debuff = TryGetNestedBool(modifier, "is_debuff"),
-                is_buff = TryGetNestedBool(modifier, "is_buff")
+                show_amount = TryGetNestedBool(modifier, "show_amount"),
+                is_stackable = TryGetNestedBool(modifier, "is_stackable"),
+                should_start_at_bottom_of_draw_pile = TryGetNestedBool(modifier, "should_start_at_bottom_of_draw_pile"),
+                should_glow_gold = TryGetNestedBool(modifier, "should_glow_gold"),
+                should_glow_red = TryGetNestedBool(modifier, "should_glow_red"),
+                has_extra_card_text = TryGetNestedBool(modifier, "has_extra_card_text"),
+                can_afflict_unplayable_cards = TryGetNestedBool(modifier, "can_afflict_unplayable_cards"),
+                has_overlay = TryGetNestedBool(modifier, "has_overlay"),
+                dynamic_vars = TryGetNestedElement(modifier, "dynamic_vars")?.Clone()
             });
             if (compact.Count >= 8)
             {
@@ -290,6 +380,8 @@ internal static partial class BridgeGameApi
         var title = TryGetNestedString(element.Value, "title");
         var rarity = TryGetNestedString(element.Value, "rarity");
         var target = TryGetNestedString(element.Value, "target_type");
+        var usage = TryGetNestedString(element.Value, "usage");
+        var status = TryGetNestedString(element.Value, "status");
         var desc = TryGetNestedString(element.Value, "description");
         if (!string.IsNullOrWhiteSpace(potionId))
         {
@@ -312,6 +404,39 @@ internal static partial class BridgeGameApi
             payload["target_type"] = target;
         }
 
+        if (!string.IsNullOrWhiteSpace(usage))
+        {
+            payload["usage"] = usage;
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            payload["status"] = status;
+        }
+
+        foreach (var key in new[]
+                 {
+                     "is_queued",
+                     "can_be_generated_in_combat",
+                     "passes_custom_usability_check",
+                     "has_been_removed_from_state",
+                     "can_use_in_combat",
+                     "can_throw_at_ally"
+                 })
+        {
+            var value = TryGetNestedBool(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        var dynamicVars = TryGetNestedElement(element.Value, "dynamic_vars");
+        if (dynamicVars is not null && dynamicVars.Value.ValueKind == JsonValueKind.Array)
+        {
+            payload["dynamic_vars"] = dynamicVars.Value.Clone();
+        }
+
         payload["canonical_text"] = BuildCanonicalPotionText(title, rarity, target, desc);
         return payload;
     }
@@ -326,6 +451,7 @@ internal static partial class BridgeGameApi
         var relicId = TryGetNestedString(element.Value, "id");
         var title = TryGetNestedString(element.Value, "title");
         var rarity = TryGetNestedString(element.Value, "rarity");
+        var status = TryGetNestedString(element.Value, "status");
         var desc = TryGetNestedString(element.Value, "description");
         var payload = new Dictionary<string, object?>(StringComparer.Ordinal);
         if (!string.IsNullOrWhiteSpace(relicId))
@@ -341,6 +467,54 @@ internal static partial class BridgeGameApi
         if (!string.IsNullOrWhiteSpace(rarity))
         {
             payload["rarity"] = rarity;
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            payload["status"] = status;
+        }
+
+        foreach (var key in new[]
+                 {
+                     "display_amount",
+                     "stack_count",
+                     "merchant_cost",
+                     "floor_added_to_deck"
+                 })
+        {
+            var value = TryGetNestedInt(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        foreach (var key in new[]
+                 {
+                     "is_tradable",
+                     "is_allowed_in_shops",
+                     "is_used_up",
+                     "has_upon_pickup_effect",
+                     "spawns_pets",
+                     "is_stackable",
+                     "is_wax",
+                     "is_melted",
+                     "adds_pet",
+                     "show_counter",
+                     "has_been_removed_from_state"
+                 })
+        {
+            var value = TryGetNestedBool(element.Value, key);
+            if (value.HasValue)
+            {
+                payload[key] = value.Value;
+            }
+        }
+
+        var dynamicVars = TryGetNestedElement(element.Value, "dynamic_vars");
+        if (dynamicVars is not null && dynamicVars.Value.ValueKind == JsonValueKind.Array)
+        {
+            payload["dynamic_vars"] = dynamicVars.Value.Clone();
         }
 
         payload["canonical_text"] = BuildCanonicalRelicText(title, rarity, desc);
@@ -413,9 +587,11 @@ internal static partial class BridgeGameApi
             index = TryGetNestedInt(element.Value, "index"),
             option_type = TryGetNestedString(element.Value, "option_type"),
             option_id = TryGetNestedString(element.Value, "option_id"),
+            text_key = TryGetNestedString(element.Value, "text_key"),
             title = TryGetNestedString(element.Value, "title"),
             description = TryGetNestedString(element.Value, "description"),
             is_locked = TryGetNestedBool(element.Value, "is_locked"),
+            is_chosen = TryGetNestedBool(element.Value, "is_chosen"),
             is_proceed = TryGetNestedBool(element.Value, "is_proceed"),
             is_selected = TryGetNestedBool(element.Value, "is_selected"),
             is_enabled = TryGetNestedBool(element.Value, "is_enabled"),

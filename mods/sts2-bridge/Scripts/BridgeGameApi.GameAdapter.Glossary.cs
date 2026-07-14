@@ -81,9 +81,11 @@ internal static partial class BridgeGameApi
         return new
         {
             index,
+            text_key = option?.TextKey,
             title = resolvedTitle,
             description = resolvedDescription,
             is_locked = option?.IsLocked ?? true,
+            is_chosen = option?.WasChosen ?? false,
             is_proceed = option?.IsProceed ?? false,
             relic = (object?)null,
             glossary

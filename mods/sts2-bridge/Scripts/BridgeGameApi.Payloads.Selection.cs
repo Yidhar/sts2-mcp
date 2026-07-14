@@ -448,6 +448,16 @@ internal static partial class BridgeGameApi
         return new
         {
             visible = eventOptionButtons.Count > 0 || options.Count > 0 || isCrystalSphereVisible || glossaryTexts.Count > 0,
+            event_id = currentEventModel?.Id.ToString(),
+            layout_type = currentEventModel?.LayoutType.ToString(),
+            is_deterministic = currentEventModel?.IsDeterministic,
+            is_shared = currentEventModel?.IsShared,
+            is_finished = currentEventModel?.IsFinished,
+            description_key = currentEventModel?.Description?.LocEntryKey,
+            encounter_id = currentEventModel?.CanonicalEncounter?.Id.ToString(),
+            dynamic_vars = currentEventModel is null
+                ? Array.Empty<object>()
+                : BuildDynamicVarPayloads(currentEventModel.DynamicVars),
             visible_glossary_source = glossarySource,
             visible_glossary_texts = glossaryTexts.ToArray(),
             visible_glossary = BuildVisibleGlossaryPayload(glossaryEntries),

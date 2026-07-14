@@ -1252,8 +1252,12 @@ Assert(!combatPayloadSource.Contains("BuildPlayCardSemantic", StringComparison.O
        !combatPayloadSource.Contains("will_exhaust", StringComparison.Ordinal) &&
        !compactPayloadSource.Contains("semantic_tags", StringComparison.Ordinal) &&
        !compactPayloadSource.Contains("semantic_values", StringComparison.Ordinal) &&
-       combatPayloadSource.Contains("is_debuff = GetHiddenPropertyValue<bool>", StringComparison.Ordinal) &&
-       combatPayloadSource.Contains("is_buff = GetHiddenPropertyValue<bool>", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("is_debuff =", StringComparison.Ordinal) &&
+       !combatPayloadSource.Contains("is_buff =", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("var enchantment = modifier as EnchantmentModel", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("var affliction = modifier as AfflictionModel", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("show_amount = enchantment?.ShowAmount", StringComparison.Ordinal) &&
+       combatPayloadSource.Contains("can_afflict_unplayable_cards = affliction?.CanAfflictUnplayableCards", StringComparison.Ordinal) &&
        compactPayloadSource.Contains("var amount = TryGetNestedDecimal(modifier, \"amount\")", StringComparison.Ordinal) &&
        !cardFactsSource.Contains("BodySlam", StringComparison.Ordinal) &&
        !cardFactsSource.Contains("strategic", StringComparison.Ordinal) &&

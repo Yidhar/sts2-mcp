@@ -17,7 +17,7 @@
   "patches": [
     {
       "path": "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
-      "sha256": "207f1d510897a55770de3ca86e9757d21bfc96e3dbdeca17397589a1fc0c44d2"
+      "sha256": "7b234d288d18d982e105fc590c38309e9b3bf4f51c001c3fa6a76536f61cc33d"
     }
   ]
 }

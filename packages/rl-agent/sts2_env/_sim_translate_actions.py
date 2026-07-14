@@ -131,7 +131,7 @@ def _translate_legal_actions(
             # Select, deselect, confirm, and cancel-prompt must never alias.
             action["model_action_variant"] = selection_operation
             action["selection_operation"] = selection_operation
-            selection = {
+            selection: dict[str, Any] = {
                 "operation_type": selection_operation,
             }
             for canonical, aliases in {

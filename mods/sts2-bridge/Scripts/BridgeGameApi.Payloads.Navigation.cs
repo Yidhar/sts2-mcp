@@ -356,9 +356,28 @@ internal static partial class BridgeGameApi
         return new
         {
             id = relic.Id.ToString(),
+            model_id = relic.Id.ToString(),
+            class_name = relic.GetType().Name,
             title = TryGetTitle(relic),
             description = TryGetDescription(relic),
-            rarity = relic.Rarity.ToString()
+            rarity = relic.Rarity.ToString(),
+            status = relic.Status.ToString(),
+            is_tradable = relic.IsTradable,
+            is_allowed_in_shops = relic.IsAllowedInShops,
+            is_used_up = relic.IsUsedUp,
+            has_upon_pickup_effect = relic.HasUponPickupEffect,
+            spawns_pets = relic.SpawnsPets,
+            is_stackable = relic.IsStackable,
+            is_wax = relic.IsWax,
+            is_melted = relic.IsMelted,
+            adds_pet = relic.AddsPet,
+            stack_count = relic.StackCount,
+            merchant_cost = relic.MerchantCost,
+            floor_added_to_deck = relic.FloorAddedToDeck,
+            show_counter = relic.ShowCounter,
+            display_amount = relic.DisplayAmount,
+            has_been_removed_from_state = relic.HasBeenRemovedFromState,
+            dynamic_vars = BuildDynamicVarPayloads(relic.DynamicVars)
         };
     }
 
@@ -375,15 +394,21 @@ internal static partial class BridgeGameApi
         return new
         {
             id = potion.Id.ToString(),
+            model_id = potion.Id.ToString(),
+            class_name = potion.GetType().Name,
             title = TryGetTitle(potion),
             description = TryGetDescription(potion),
             rarity = potion.Rarity.ToString(),
+            usage = potion.Usage.ToString(),
             target_type = potion.TargetType.ToString(),
             selection_screen_prompt = DescribeText(potion.SelectionScreenPrompt, potion),
             can_throw_at_ally = SafeCanThrowPotionAtAlly(potion),
             is_usable = SafeGetPotionIsUsable(potion),
             is_queued = SafeGetPotionIsQueued(potion),
-            has_been_removed_from_state = SafeGetPotionHasBeenRemovedFromState(potion)
+            can_be_generated_in_combat = potion.CanBeGeneratedInCombat,
+            passes_custom_usability_check = potion.PassesCustomUsabilityCheck,
+            has_been_removed_from_state = SafeGetPotionHasBeenRemovedFromState(potion),
+            dynamic_vars = BuildDynamicVarPayloads(potion.DynamicVars)
         };
     }
 

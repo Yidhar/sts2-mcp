@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 
+from sts2_rl.checkpoints import ValidatedResumeCheckpoint
 from sts2_rl.contracts import (
     BackendCapabilities,
     CombatResetRequest,
@@ -15,6 +16,7 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
+from sts2_rl.encoding import grounding_encoding_identity
 from sts2_rl.training import (
     CurriculumConfig,
     EnvironmentConfig,
@@ -28,6 +30,7 @@ from sts2_rl.training import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
+from sts2_rl.training import checkpointing as checkpointing_module
 from sts2_rl.training.checkpointing import TrainingState
 from sts2_rl.training.collector import CollectionProtocolError
 from sts2_rl.training.pipeline import ActorLearnerPipeline
@@ -176,7 +179,7 @@ def _config(*, total_steps: int = 4) -> TrainingConfig:
     return TrainingConfig(
         profile="v2-test",
         model=ModelConfig(
-            token_feature_dim=128,
+            token_feature_dim=224,
             d_model=32,
             n_heads=4,
             ffn_dim=64,
@@ -407,3 +410,36 @@ def test_v2_checkpoint_roundtrip_restores_models_optimizer_queue_and_rng(
         assert not (checkpoint / "replay_buffer.pkl").exists()
     finally:
         restored.close()
+
+
+def test_previous_selection_abi_checkpoint_is_rejected_before_tensor_load(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    old_encoding = dict(grounding_encoding_identity())
+    old_encoding.update(
+        {
+            "version": "grounded-selection-semantics-encoding-v5",
+            "min_token_feature_dim": 128,
+            "fingerprint_sha256": "0" * 64,
+        }
+    )
+    validated = ValidatedResumeCheckpoint(
+        root=tmp_path,
+        manifest={},
+        metadata={
+            "format": "sts2-recurrent-vtrace-checkpoint-v3",
+            "model_config": asdict(config.model.to_model_config()),
+            "encoding_contract": old_encoding,
+            "model_state_spec": {},
+        },
+    )
+
+    with pytest.raises(ValueError, match="encoding contract does not match"):
+        checkpointing_module._validate_metadata(
+            validated,
+            config=config,
+            resolved_device=None,
+            resolved_collector_device=None,
+            model_only=True,
+        )

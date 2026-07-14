@@ -21,6 +21,9 @@ historical RL artifacts.
 - Replaced the failed MuZero/token-memory/MCTS line with
   `python -m sts2_rl.train`. Old checkpoints and replay are not compatible with the
   new randomly initialized grounded baseline.
+- Advanced the grounded observation ABI to runtime-mechanics v6 with a 224-feature
+  minimum. Earlier card/selection checkpoints are rejected rather than padded or
+  migrated.
 - Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
 
 ### Added
@@ -59,6 +62,10 @@ historical RL artifacts.
   GitHub Actions CI, artifact migration tooling, and v2 architecture/runbooks.
 - Added exact Node/npm/Python/.NET pins, exact dependency closures, SHA-pinned GitHub
   Actions, deterministic CycloneDX SBOM generation, and source/artifact provenance.
+- Added native catalogs and runtime transport for powers, relics, potions, card
+  enchantments/afflictions, events, observable enemy moves and boss encounter identity;
+  formal headless training now fails closed on a catalog and event-to-combat mechanics
+  preflight before launching collectors.
 
 ### Fixed
 

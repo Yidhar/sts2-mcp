@@ -61,7 +61,7 @@ def _require_optional_text(value: object, *, label: str) -> None:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     architecture: str = "recurrent_candidate_v2"
-    token_feature_dim: int = 160
+    token_feature_dim: int = 224
     d_model: int = 128
     n_heads: int = 4
     ffn_dim: int = 384

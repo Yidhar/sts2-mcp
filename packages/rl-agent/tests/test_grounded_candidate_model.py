@@ -18,7 +18,7 @@ from sts2_rl.models import (
 @pytest.fixture
 def config() -> GroundedCandidateConfig:
     return GroundedCandidateConfig(
-        token_feature_dim=128,
+        token_feature_dim=224,
         d_model=32,
         n_heads=4,
         ffn_dim=64,
@@ -205,7 +205,7 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
 
 def test_default_model_stays_small() -> None:
     model = RecurrentCandidateModel()
-    assert model.parameter_count == 3_971_778
+    assert model.parameter_count == 3_980_098
 
 
 def test_batch_shape_contract_rejects_misaligned_candidate_local_axis(
@@ -284,7 +284,7 @@ def test_model_respects_requested_floating_dtype(
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"token_feature_dim": 127}, "at least 128"),
+        ({"token_feature_dim": 223}, "at least 224"),
         ({"domain_count": 3}, "six fixed"),
         ({"entity_vocab_size": 1}, "at least 4"),
         ({"order_vocab_size": 1}, "at least 2"),

@@ -1,6 +1,6 @@
 # Runtime card-facts ABI
 
-`grounded-card-facts-encoding-v3` is the maintained card representation for the
+`grounded-runtime-mechanics-encoding-v6` is the maintained representation for the
 restarted RL line. It replaces the incomplete structural projection that kept
 card ID, type, cost, target and upgrade state but discarded most card-model
 facts.
@@ -102,7 +102,7 @@ Standard game-owned prompt IDs such as `card_selection.TO_DISCARD` and
 `card_selection.TO_TRANSFORM` may be mapped exactly; unknown/custom prompts
 remain generic `select` operations and are learned from their stable prompt ID
 and real transition rather than from card-name tables or localized-text
-heuristics. This contract is fingerprinted as grounded selection encoding v5,
+heuristics. This contract is fingerprinted as runtime mechanics encoding v6,
 so checkpoints from the earlier selection ABI fail closed.
 
 Likewise, a numeric family is a typed magnitude, not an invented verb. An
@@ -120,7 +120,7 @@ separation.
 
 ## Checkpoint compatibility
 
-The new encoder version and fingerprint intentionally reject previous
+The new encoder version, 224-feature minimum and fingerprint intentionally reject previous
 checkpoints. World capacity is 512 tokens and candidate-local capacity is 24 so
 larger decks and multi-effect cards fail less often; the encoder still raises on
 overflow rather than silently truncating facts. Training must start with a new

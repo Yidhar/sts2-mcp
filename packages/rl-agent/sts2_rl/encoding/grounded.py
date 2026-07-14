@@ -180,7 +180,9 @@ _IDENTITY_KEYS: Final[tuple[str, ...]] = (
     "enemy_id",
     "character_id",
     "encounter_id",
+    "event_id",
     "option_id",
+    "text_key",
     "room_model_id",
     "room_model",
 )
@@ -202,6 +204,8 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
     {
         "act",
         "amount",
+        "amount_on_turn_start",
+        "ascension",
         "block",
         "charges",
         "col",
@@ -216,10 +220,13 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "damage_per_hit",
         "dexterity",
         "discard",
+        "display_amount",
         "draw",
         "energy",
+        "evoke_val",
         "exhaust",
         "floor",
+        "floor_added_to_deck",
         "focus",
         "gold",
         "height",
@@ -232,8 +239,13 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "max_hp",
         "max_stars",
         "max_select",
+        "merchant_cost",
         "min_count",
         "min_select",
+        "open_potion_slots",
+        "orb_empty_slots",
+        "orb_slots",
+        "passive_val",
         "poison",
         "price",
         "progress",
@@ -244,6 +256,7 @@ _FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "row",
         "stars",
         "selected_count",
+        "stack_count",
         "strength",
         "turn",
         "total_damage",
@@ -273,11 +286,18 @@ _CARD_PATH_PARTS: Final[frozenset[str]] = frozenset(
 )
 _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
     {
+        "amount",
+        "base_replay_count",
         "cost",
+        "current_replay_count",
         "current_upgrade_level",
+        "display_amount",
         "energy_cost",
+        "floor_added_to_deck",
+        "last_stars_spent",
         "max_upgrade_level",
         "price",
+        "stack_count",
         "star_cost",
         "upgrade_level",
         "upgrades",
@@ -285,10 +305,27 @@ _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
 )
 _CARD_FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
     {
+        "can_afflict_unplayable_cards",
+        "has_been_removed_from_state",
+        "has_extra_card_text",
+        "has_overlay",
+        "is_clone",
+        "is_dupe",
+        "is_in_combat",
         "is_selected",
         "is_playable",
+        "is_removable",
+        "is_retained",
+        "is_sly_this_turn",
+        "is_stackable",
+        "is_transformable",
         "is_upgraded",
+        "is_upgradable",
         "playable",
+        "should_glow_gold",
+        "should_glow_red",
+        "should_start_at_bottom_of_draw_pile",
+        "show_amount",
         "upgraded",
     }
 )
@@ -303,13 +340,22 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "class_name",
         "confirmation_mode",
         "decision_domain",
+        "description_key",
         "facing",
         "family",
+        "encounter_id",
+        "event_id",
         "intent_type",
         "destination_zone",
+        "layout_type",
         "mode",
         "next_move_id",
+        "next_move_state_id",
         "operation_type",
+        "owner_model_id",
+        "owner_side",
+        "applier_model_id",
+        "applier_side",
         "pile",
         "prompt_id",
         "power_type",
@@ -320,10 +366,18 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "run_mode_action",
         "screen",
         "selection_membership",
+        "slot_name",
         "source_zone",
+        "stack_type",
         "state_type",
+        "status",
         "target_type",
+        "target_model_id",
+        "target_side",
+        "text_key",
         "transport_kind",
+        "type_for_current_amount",
+        "usage",
         "value_props",
         "var_type",
         "visibility",
@@ -338,23 +392,69 @@ _FACT_NUMERIC_SUFFIXES: Final[tuple[str, ...]] = (
 _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
     {
         "active",
+        "adds_pet",
+        "allow_negative",
+        "can_afflict_unplayable_cards",
+        "can_be_generated_in_combat",
+        "can_receive_powers",
         "can_skip",
+        "can_throw_at_ally",
+        "can_transition_away",
+        "can_use_in_combat",
         "cancelable",
         "confirm_ready",
         "exhaust",
         "exhausts",
         "ethereal",
+        "has_been_removed_from_state",
+        "has_extra_card_text",
+        "has_overlay",
+        "has_upon_pickup_effect",
         "in_combat",
+        "in_dialogue",
         "in_progress",
+        "is_allowed_in_shops",
         "is_alive",
+        "is_deterministic",
+        "is_finished",
         "is_hittable",
+        "is_instanced",
+        "is_chosen",
+        "is_melted",
+        "is_move",
+        "is_performing_move",
+        "is_pet",
         "is_playable",
+        "is_primary_enemy",
+        "is_queued",
+        "is_secondary_enemy",
         "is_selected",
+        "is_shared",
+        "is_stackable",
+        "is_stunned",
+        "is_tradable",
         "is_upgraded",
+        "is_used_up",
+        "is_proceed",
+        "is_visible",
+        "is_wax",
+        "must_perform_once_before_transitioning",
+        "owner_is_secondary_enemy",
+        "passes_custom_usability_check",
         "playable",
         "retain",
         "retained",
         "run_active",
+        "should_glow_gold",
+        "should_glow_red",
+        "should_scale_in_multiplayer",
+        "should_start_at_bottom_of_draw_pile",
+        "show_amount",
+        "show_counter",
+        "shows_infinite_hp",
+        "skip_next_duration_tick",
+        "spawned_this_turn",
+        "spawns_pets",
         "upgraded",
     }
 )
@@ -377,6 +477,7 @@ _ENGINEERED_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
 )
 _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
     {
+        "affliction",
         "afflictions",
         "allies",
         "card",
@@ -394,6 +495,7 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "discard_pile",
         "draw_pile",
         "dynamic_vars",
+        "enchantment",
         "enchantments",
         "enemies",
         "event",
@@ -409,10 +511,12 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "map",
         "map_node",
         "modifiers",
+        "move_history",
         "next_options",
         "nodes",
         "option",
         "options",
+        "orbs",
         "player",
         "player_powers",
         "players",
@@ -490,7 +594,7 @@ _DYNAMIC_VALUE_SLOT_BY_KEY: Final[dict[str, int]] = {
 _DYNAMIC_HASH_SLOT_START: Final = _DYNAMIC_SLOT_START + len(_DYNAMIC_VALUE_KEYS)
 _DYNAMIC_HASH_SLOT_COUNT: Final = _DYNAMIC_SLOT_COUNT - len(_DYNAMIC_VALUE_KEYS)
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-selection-zones-encoding-v5"
+GROUNDING_ENCODING_VERSION: Final = "grounded-runtime-mechanics-encoding-v6"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -786,6 +890,67 @@ def _canonical_dynamic_vars(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _canonical_card_modifier(
+    value: Mapping[str, Any],
+    *,
+    modifier_type: str,
+) -> dict[str, Any]:
+    """Project an exact native enchantment/affliction without text inference."""
+
+    result: dict[str, Any] = {"type": modifier_type}
+    for key, aliases in {
+        "id": ("id", "model_id", f"{modifier_type}_id"),
+        "class_name": ("class_name", "runtime_type"),
+        "status": ("status",),
+        "amount": ("amount",),
+        "display_amount": ("display_amount",),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    for key in (
+        "show_amount",
+        "is_stackable",
+        "should_start_at_bottom_of_draw_pile",
+        "should_glow_gold",
+        "should_glow_red",
+        "has_extra_card_text",
+        "can_afflict_unplayable_cards",
+        "has_overlay",
+    ):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
+    return result
+
+
+def _canonical_card_modifiers(
+    value: Any,
+    *,
+    modifier_type: str,
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        raw: Sequence[Any] = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        raw = value
+    else:
+        raise TypeError(f"card.{modifier_type} must be a mapping or sequence")
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"card.{modifier_type}[{index}] must be a mapping")
+        normalized = _canonical_card_modifier(item, modifier_type=modifier_type)
+        if normalized.get("id"):
+            result.append(normalized)
+    result.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return result
+
+
 def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
     """Project a card to exact runtime facts shared by maintained backends."""
 
@@ -801,6 +966,10 @@ def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
         "star_cost": ("star_cost", "current_star_cost"),
         "upgrade_level": ("upgrade_level", "current_upgrade_level"),
         "max_upgrade_level": ("max_upgrade_level",),
+        "base_replay_count": ("base_replay_count",),
+        "current_replay_count": ("current_replay_count", "replay_count"),
+        "last_stars_spent": ("last_stars_spent",),
+        "floor_added_to_deck": ("floor_added_to_deck",),
         "is_playable": ("is_playable", "playable"),
         "is_upgraded": ("is_upgraded", "upgraded"),
         "exhaust": ("exhaust",),
@@ -861,6 +1030,30 @@ def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
     dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
     if dynamic_vars:
         result["dynamic_vars"] = dynamic_vars
+    for field, singular, modifier_type in (
+        ("enchantments", "enchantment", "enchantment"),
+        ("afflictions", "affliction", "affliction"),
+    ):
+        modifiers = _canonical_card_modifiers(
+            _first_present(value, field, singular),
+            modifier_type=modifier_type,
+        )
+        if modifiers:
+            result[field] = modifiers
+    for field in (
+        "is_removable",
+        "is_transformable",
+        "is_in_combat",
+        "is_upgradable",
+        "is_sly_this_turn",
+        "is_retained",
+        "is_clone",
+        "is_dupe",
+        "has_been_removed_from_state",
+    ):
+        item = _first_present(value, field)
+        if item is not None:
+            result[field] = item
     return result
 
 
@@ -869,12 +1062,42 @@ def _canonical_power(value: Mapping[str, Any]) -> dict[str, Any]:
     aliases = {
         "id": ("id", "power_id", "model_id"),
         "amount": ("amount", "stacks", "value"),
-        "type": ("type", "stack_type"),
+        "amount_on_turn_start": ("amount_on_turn_start",),
+        "display_amount": ("display_amount",),
+        "type": ("type", "power_type"),
+        "stack_type": ("stack_type",),
+        "type_for_current_amount": ("type_for_current_amount",),
+        "class_name": ("class_name", "runtime_type"),
     }
     for canonical, source_keys in aliases.items():
         item = _first_present(value, *source_keys)
         if item is not None:
             result[canonical] = item
+    for field in (
+        "is_instanced",
+        "is_visible",
+        "allow_negative",
+        "skip_next_duration_tick",
+        "should_scale_in_multiplayer",
+        "owner_is_secondary_enemy",
+    ):
+        item = _first_present(value, field)
+        if item is not None:
+            result[field] = item
+    for field in (
+        "owner_side",
+        "owner_model_id",
+        "applier_side",
+        "applier_model_id",
+        "target_side",
+        "target_model_id",
+    ):
+        item = _first_present(value, field)
+        if item is not None:
+            result[field] = item
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
     return result
 
 
@@ -887,10 +1110,72 @@ def _canonical_inventory_entity(
     identity = _first_present(value, *id_keys)
     if identity is not None and str(identity).strip():
         result["id"] = identity
-    for key in ("rarity", "charges", "target_type", "type"):
+    for key in ("rarity", "charges", "target_type", "type", "status"):
         item = _first_present(value, key)
         if item is not None:
             result[key] = item
+    return result
+
+
+def _canonical_relic(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = _canonical_inventory_entity(
+        value,
+        id_keys=("id", "relic_id", "model_id"),
+    )
+    for key, aliases in {
+        "display_amount": ("display_amount", "counter"),
+        "stack_count": ("stack_count",),
+        "merchant_cost": ("merchant_cost",),
+        "floor_added_to_deck": ("floor_added_to_deck",),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    for key in (
+        "is_tradable",
+        "is_allowed_in_shops",
+        "is_used_up",
+        "has_upon_pickup_effect",
+        "spawns_pets",
+        "is_stackable",
+        "is_wax",
+        "is_melted",
+        "adds_pet",
+        "show_counter",
+        "has_been_removed_from_state",
+    ):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
+    return result
+
+
+def _canonical_potion(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = _canonical_inventory_entity(
+        value,
+        id_keys=("id", "potion_id", "model_id"),
+    )
+    for key in ("usage",):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    for key in (
+        "is_queued",
+        "can_be_generated_in_combat",
+        "passes_custom_usability_check",
+        "has_been_removed_from_state",
+        "can_use_in_combat",
+        "can_throw_at_ally",
+    ):
+        item = _first_present(value, key)
+        if item is not None:
+            result[key] = item
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
     return result
 
 
@@ -904,15 +1189,41 @@ def _canonical_enemy(value: Mapping[str, Any]) -> dict[str, Any]:
         stable_identity = raw_id
     if stable_identity is not None:
         result["model_id"] = stable_identity
-    for key in ("side", "hp", "max_hp", "block", "is_alive", "is_hittable"):
+    for key in (
+        "side",
+        "hp",
+        "max_hp",
+        "block",
+        "is_alive",
+        "is_hittable",
+        "is_primary_enemy",
+        "is_secondary_enemy",
+        "is_stunned",
+        "is_pet",
+        "shows_infinite_hp",
+        "can_receive_powers",
+        "spawned_this_turn",
+        "is_performing_move",
+        "intends_to_attack",
+        "slot_name",
+        "is_move",
+        "must_perform_once_before_transitioning",
+        "can_transition_away",
+    ):
         item = _first_present(value, key, f"current_{key}")
         if item is not None:
             result[key] = item
+    next_move = _first_present(value, "next_move_state_id", "next_move_id")
+    if next_move is not None:
+        result["next_move_state_id"] = next_move
     powers = _as_mapping_list(
         _first_present(value, "powers", "status"),
         label="enemy powers",
     )
     result["powers"] = [_canonical_power(item) for item in powers]
+    result["powers"].sort(
+        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+    )
     intents = _as_mapping_list(
         _first_present(value, "intents"),
         label="enemy intents",
@@ -929,6 +1240,13 @@ def _canonical_enemy(value: Mapping[str, Any]) -> dict[str, Any]:
                 normalized[key] = item
         normalized_intents.append(normalized)
     result["intents"] = normalized_intents
+    raw_history = _first_present(value, "move_history", "state_log")
+    if raw_history is not None:
+        result["move_history"] = _canonical_card_labels(
+            raw_history,
+            label="enemy.move_history",
+            fact_type="move_state",
+        )
     return result
 
 
@@ -990,6 +1308,55 @@ def _canonical_card_sequence(
     return result
 
 
+def _canonical_event_option(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, aliases in {
+        "text_key": ("text_key", "option_id", "id"),
+        "title": ("title",),
+        "description": ("description",),
+        "text": ("text", "label"),
+        "is_locked": ("is_locked",),
+        "is_chosen": ("is_chosen", "was_chosen"),
+        "is_proceed": ("is_proceed", "proceed"),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    raw_relic = _first_present(value, "relic")
+    if raw_relic is not None:
+        relic = _canonical_relic(_as_mapping(raw_relic, label="event.option.relic"))
+        if relic.get("id"):
+            result["relic"] = relic
+    return result
+
+
+def _canonical_event(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, aliases in {
+        "event_id": ("event_id", "id", "model_id"),
+        "layout_type": ("layout_type",),
+        "description_key": ("description_key", "page_key"),
+        "encounter_id": ("encounter_id", "canonical_encounter_id"),
+        "is_deterministic": ("is_deterministic",),
+        "is_shared": ("is_shared",),
+        "is_finished": ("is_finished",),
+        "in_dialogue": ("in_dialogue",),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
+    raw_options = _as_mapping_list(
+        _first_present(value, "options", "current_options"),
+        label="event options",
+    )
+    if raw_options:
+        result["options"] = [_canonical_event_option(option) for option in raw_options]
+    return result
+
+
 def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
     """Project live/headless state to one deliberately shared model DTO.
 
@@ -1040,42 +1407,64 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         "relics": [],
         "potions": [],
     }
+    player["powers"].sort(
+        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+    )
     for relic in _as_mapping_list(
         _first_present(raw_player, "relics"),
         label="player relics",
     ):
-        normalized = _canonical_inventory_entity(
-            relic,
-            id_keys=("id", "relic_id", "model_id"),
-        )
+        normalized = _canonical_relic(relic)
         if normalized.get("id"):
             player["relics"].append(normalized)
     for potion in _as_mapping_list(
         _first_present(raw_player, "potions"),
         label="player potions",
     ):
-        normalized = _canonical_inventory_entity(
-            potion,
-            id_keys=("id", "potion_id", "model_id"),
-        )
+        normalized = _canonical_potion(potion)
         if normalized.get("id"):
             player["potions"].append(normalized)
+    for field in ("relics", "potions"):
+        player[field].sort(
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+        )
     for key, aliases in {
         "character_id": ("character_id", "character"),
         "hp": ("hp", "current_hp"),
         "max_hp": ("max_hp",),
         "block": ("block",),
         "gold": ("gold",),
+        "open_potion_slots": ("open_potion_slots",),
+        "orb_slots": ("orb_slots",),
+        "orb_empty_slots": ("orb_empty_slots",),
     }.items():
         item = _first_present(raw_player, *aliases)
         if item is not None and not isinstance(item, Mapping):
             player[key] = item
+    raw_orbs = _as_mapping_list(_first_present(raw_player, "orbs"), label="player orbs")
+    if raw_orbs:
+        orbs: list[dict[str, Any]] = []
+        for orb in raw_orbs:
+            normalized_orb: dict[str, Any] = {}
+            for key, aliases in {
+                "id": ("id", "orb_id", "model_id"),
+                "passive_val": ("passive_val",),
+                "evoke_val": ("evoke_val",),
+            }.items():
+                item = _first_present(orb, *aliases)
+                if item is not None:
+                    normalized_orb[key] = item
+            if normalized_orb.get("id"):
+                orbs.append(normalized_orb)
+        player["orbs"] = orbs
 
     run: dict[str, Any] = {}
     for key, aliases in {
         "active": ("active", "run_active"),
         "game_over": ("game_over",),
         "floor": ("floor", "total_floor"),
+        "act": ("act", "act_index"),
+        "ascension": ("ascension", "ascension_level"),
         "progress": ("progress",),
         "room_type": ("room_type",),
         "room_model_id": ("room_model_id", "room_model"),
@@ -1170,6 +1559,12 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             if cards is not None:
                 combat[key] = cards
         canonical["combat"] = combat
+
+    raw_event = _as_mapping(observation.get("event"), label="observation.event")
+    if raw_event:
+        event = _canonical_event(raw_event)
+        if event:
+            canonical["event"] = event
 
     raw_decision = _as_mapping(
         observation.get("decision"),
@@ -1304,7 +1699,7 @@ def _canonical_coord(value: Mapping[str, Any]) -> dict[str, Any]:
 def _canonical_option(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, aliases in {
-        "option_id": ("option_id", "id", "model_id"),
+        "option_id": ("option_id", "text_key", "id", "model_id"),
         "option_type": ("option_type", "type"),
         "title": ("title",),
         "description": ("description",),
@@ -1395,17 +1790,11 @@ def _canonical_item(value: Mapping[str, Any]) -> dict[str, Any]:
         ("card", _canonical_card),
         (
             "potion",
-            lambda item: _canonical_inventory_entity(
-                item,
-                id_keys=("id", "potion_id", "model_id"),
-            ),
+            _canonical_potion,
         ),
         (
             "relic",
-            lambda item: _canonical_inventory_entity(
-                item,
-                id_keys=("id", "relic_id", "model_id"),
-            ),
+            _canonical_relic,
         ),
     ):
         raw = _first_present(value, key)
@@ -1447,14 +1836,8 @@ def _candidate_local_roots(
         "selected_character": lambda value: {
             "id": _first_present(value, "id", "character_id", "model_id")
         },
-        "potion": lambda value: _canonical_inventory_entity(
-            value,
-            id_keys=("id", "potion_id", "model_id"),
-        ),
-        "relic": lambda value: _canonical_inventory_entity(
-            value,
-            id_keys=("id", "relic_id", "model_id"),
-        ),
+        "potion": _canonical_potion,
+        "relic": _canonical_relic,
         "item": _canonical_item,
         "option": _canonical_option,
         "map_node": _canonical_map_node,

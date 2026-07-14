@@ -209,6 +209,15 @@ def test_training_cli_gates_and_pins_headless_executable_before_run(
         return TrainingState()
 
     monkeypatch.setattr(train_module, "run_training", _run)
+    monkeypatch.setattr(
+        train_module,
+        "run_runtime_mechanics_preflight",
+        lambda _executable: {
+            "schema": "sts2-runtime-mechanics-audit-v1",
+            "runtime_event_checked": True,
+            "runtime_combat_checked": True,
+        },
+    )
 
     assert train_module.main(["--backend", "headless", "--sim-exe", str(executable), "--steps", "1"]) == 0
 
@@ -218,4 +227,6 @@ def test_training_cli_gates_and_pins_headless_executable_before_run(
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert events[0]["event"] == "simulator_identity_verified"
     assert Path(events[0]["audit_path"]).is_file()
+    assert events[1]["event"] == "runtime_mechanics_verified"
+    assert Path(events[1]["audit_path"]).is_file()
     assert events[-1]["status"] == "complete"
