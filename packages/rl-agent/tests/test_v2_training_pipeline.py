@@ -303,15 +303,24 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
     resources = build_training_resources(_config(), backend=FakeCombatBackend())
     try:
         unroll = resources.collector.collect_episode(record=True).unrolls[0]
+        progress: list[tuple[str, dict[str, int | float]]] = []
         before = {
             name: value.detach().clone()
             for name, value in resources.model.state_dict().items()
         }
-        metrics = resources.learner.update((unroll,), current_policy_version=0)
+        metrics = resources.learner.update(
+            (unroll,),
+            current_policy_version=0,
+            progress=lambda stage, payload: progress.append((stage, payload)),
+        )
         assert metrics.environment_steps == 2
         assert metrics.unrolls == 1
         assert torch.isfinite(torch.tensor(metrics.loss))
         assert metrics.importance_ratio_mean > 0.0
+        assert progress[0][0] == "validation_complete"
+        assert progress[-1][0] == "optimizer_complete"
+        assert any(stage == "backward_complete" for stage, _ in progress)
+        assert all(payload["elapsed_ms"] >= 0.0 for _, payload in progress)
         assert any(
             not torch.equal(before[name], value)
             for name, value in resources.model.state_dict().items()

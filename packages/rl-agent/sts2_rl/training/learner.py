@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 import torch
@@ -100,8 +101,17 @@ class VTraceLearner:
         unrolls: tuple[SequenceUnroll, ...],
         *,
         current_policy_version: int,
+        progress: Callable[[str, dict[str, int | float]], None] | None = None,
     ) -> LearnerMetrics:
         total_started_ns = time.perf_counter_ns()
+
+        def report(stage: str, **fields: int | float) -> None:
+            if progress is not None:
+                progress(
+                    stage,
+                    {"elapsed_ms": _elapsed_ms(total_started_ns), **fields},
+                )
+
         if not unrolls:
             raise ValueError("learner unroll batch cannot be empty")
         if isinstance(current_policy_version, bool) or not isinstance(
@@ -130,6 +140,7 @@ class VTraceLearner:
                 )
             lags.append(lag)
         validation_ms = _elapsed_ms(validation_started_ns)
+        report("validation_complete", validation_ms=validation_ms)
 
         recurrent_started_ns = time.perf_counter_ns()
         batch_size = len(unrolls)
@@ -247,6 +258,13 @@ class VTraceLearner:
                     ),
                 )
             )
+            completed_steps = time_index + 1
+            if completed_steps == 1 or completed_steps == maximum_time or completed_steps % 4 == 0:
+                report(
+                    "recurrent_forward_progress",
+                    completed_time_steps=completed_steps,
+                    maximum_time_steps=maximum_time,
+                )
 
         bootstrap_values = hidden.new_zeros(batch_size)
         bootstrapped = [
@@ -281,6 +299,7 @@ class VTraceLearner:
                 bootstrap_output.value,
             )
         recurrent_forward_ms = _elapsed_ms(recurrent_started_ns)
+        report("recurrent_forward_complete", recurrent_forward_ms=recurrent_forward_ms)
 
         target_started_ns = time.perf_counter_ns()
         log_probs = torch.stack(log_prob_rows)
@@ -359,6 +378,7 @@ class VTraceLearner:
             ),
         )
         target_and_loss_ms = _elapsed_ms(target_started_ns)
+        report("targets_complete", target_and_loss_ms=target_and_loss_ms)
 
         backward_started_ns = time.perf_counter_ns()
         self.optimizer.zero_grad(set_to_none=True)
@@ -376,6 +396,7 @@ class VTraceLearner:
         )
         gradient_norm = float(gradient_norm_tensor.item())
         backward_ms = _elapsed_ms(backward_started_ns)
+        report("backward_complete", backward_ms=backward_ms)
 
         optimizer_started_ns = time.perf_counter_ns()
         self.optimizer.step()
@@ -385,6 +406,11 @@ class VTraceLearner:
         )
         optimizer_step_ms = _elapsed_ms(optimizer_started_ns)
         total_ms = _elapsed_ms(total_started_ns)
+        report(
+            "optimizer_complete",
+            optimizer_step_ms=optimizer_step_ms,
+            total_ms=total_ms,
+        )
 
         active_ratios = ratios[valid]
         active_advantages = advantages[policy_decisions]

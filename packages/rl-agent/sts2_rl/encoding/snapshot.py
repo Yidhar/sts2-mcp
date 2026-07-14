@@ -478,7 +478,15 @@ def collate_encoded_snapshots(
     expected_fingerprint: str,
     device: torch.device | str | None,
 ) -> GroundedCandidateBatch:
-    """Materialize fixed-capacity tensors for a whole decision batch at once."""
+    """Materialize tensors trimmed to the active capacity of this batch.
+
+    ``GroundedEncodingConfig`` defines hard acceptance limits, not a requirement
+    to run every transformer invocation at those limits.  Padding every small
+    decision to 512 world tokens, 96 candidates and 24 local tokens made one
+    recurrent 8x64 learner batch retain hundreds of unnecessarily large
+    attention graphs.  Use the largest active shape in the current batch while
+    preserving the same feature/vocabulary ABI and masks.
+    """
 
     if not snapshots:
         raise ValueError("at least one encoded decision snapshot is required")
@@ -489,36 +497,49 @@ def collate_encoded_snapshots(
         )
     cfg = expected_config
     batch_size = len(snapshots)
-    world_features = np.zeros(
-        (batch_size, cfg.max_world_tokens, cfg.feature_dim), dtype=np.float32
+    world_capacity = max(snapshot.world.token_count for snapshot in snapshots)
+    candidate_capacity = max(snapshot.candidate_count for snapshot in snapshots)
+    local_capacity = max(
+        1,
+        max(
+            (
+                int(count)
+                for snapshot in snapshots
+                for count in np.diff(snapshot.local_offsets)
+            ),
+            default=0,
+        ),
     )
-    world_mask = np.zeros((batch_size, cfg.max_world_tokens), dtype=np.bool_)
-    world_ids = np.zeros((batch_size, cfg.max_world_tokens, _WORLD_ID_WIDTH), dtype=np.int64)
+    world_features = np.zeros(
+        (batch_size, world_capacity, cfg.feature_dim), dtype=np.float32
+    )
+    world_mask = np.zeros((batch_size, world_capacity), dtype=np.bool_)
+    world_ids = np.zeros((batch_size, world_capacity, _WORLD_ID_WIDTH), dtype=np.int64)
     candidate_features = np.zeros(
-        (batch_size, cfg.max_candidates, cfg.feature_dim), dtype=np.float32
+        (batch_size, candidate_capacity, cfg.feature_dim), dtype=np.float32
     )
     candidate_ids = np.zeros(
-        (batch_size, cfg.max_candidates, _CANDIDATE_ID_WIDTH), dtype=np.int64
+        (batch_size, candidate_capacity, _CANDIDATE_ID_WIDTH), dtype=np.int64
     )
-    action_mask = np.zeros((batch_size, cfg.max_candidates), dtype=np.bool_)
+    action_mask = np.zeros((batch_size, candidate_capacity), dtype=np.bool_)
     local_features = np.zeros(
         (
             batch_size,
-            cfg.max_candidates,
-            cfg.max_candidate_local_tokens,
+            candidate_capacity,
+            local_capacity,
             cfg.feature_dim,
         ),
         dtype=np.float32,
     )
     local_mask = np.zeros(
-        (batch_size, cfg.max_candidates, cfg.max_candidate_local_tokens),
+        (batch_size, candidate_capacity, local_capacity),
         dtype=np.bool_,
     )
     local_ids = np.zeros(
         (
             batch_size,
-            cfg.max_candidates,
-            cfg.max_candidate_local_tokens,
+            candidate_capacity,
+            local_capacity,
             _LOCAL_ID_WIDTH,
         ),
         dtype=np.int64,

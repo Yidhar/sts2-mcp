@@ -117,8 +117,8 @@ def test_encoder_contract_runs_through_grounded_model() -> None:
     with torch.no_grad():
         output = model(encoded.batch)
 
-    assert output.policy_logits.shape == (1, 6)
-    assert output.action_mask[0].tolist() == [True, False, False, False, False, False]
+    assert output.policy_logits.shape == (1, len(_actions()))
+    assert output.action_mask[0].tolist() == [True, False]
     assert encoded.action(0).handle == "opaque:one"
 
 
@@ -1164,7 +1164,7 @@ def test_secondary_entity_hash_disambiguates_primary_bucket_collisions() -> None
     )
 
 
-def test_encoder_stack_preserves_fixed_shape_batches() -> None:
+def test_encoder_stack_pads_only_to_active_batch_capacity() -> None:
     encoder = _encoder()
     first = encoder.encode(_observation(), _actions())
     second_obs = _observation()
@@ -1175,6 +1175,16 @@ def test_encoder_stack_preserves_fixed_shape_batches() -> None:
 
     assert batch.world.features.shape[0] == 2
     assert batch.candidates.features.shape[0] == 2
+    assert batch.world.features.shape[1] == max(
+        first.snapshot.world.token_count,
+        second.snapshot.world.token_count,
+    )
+    assert batch.candidates.features.shape[1] == max(
+        first.snapshot.candidate_count,
+        second.snapshot.candidate_count,
+    )
+    assert batch.world.features.shape[1] < encoder.config.max_world_tokens
+    assert batch.candidates.features.shape[1] < encoder.config.max_candidates
     assert batch.domain_ids.tolist() == [1, 3]
 
     with pytest.raises(ValueError, match="different encoding contracts"):

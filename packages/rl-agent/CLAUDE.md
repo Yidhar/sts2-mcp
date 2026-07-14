@@ -77,9 +77,10 @@ sts2_rl.train
   maintained preheat runs the complete headless game flow and ranks final run
   outcome plus forward run distance first, then bounded exact run-scoped
   HP-loss/revival costs and a small decision cost.
-- `scripts/train_preheat_wsl_rocm.sh` must pass the 500-episode random
-  combat-solvability gate, repeated-native-revival stress probe, and full-run
-  Act-2 traversal gate before it may launch the learner.
+- `scripts/train_preheat_wsl_rocm.sh` launches the native-revival full game
+  directly. Act boundaries are episode metrics, never behavior gates or
+  curriculum truncations. The short binary/schema/runtime-mechanics preflight
+  validates transport facts only; it does not score a policy.
 - Forced singleton actions generate no policy target or policy-gradient term.
 - Training data is consumed once in FIFO order; replay sampling, PER and
   long-lived sample retention are forbidden.

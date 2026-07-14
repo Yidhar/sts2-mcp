@@ -1,4 +1,4 @@
-"""Asynchronous actor/V-trace runtime with fixed held-out evaluation gates."""
+"""Asynchronous actor/V-trace runtime with fixed held-out evaluation schedules."""
 
 from __future__ import annotations
 
@@ -357,9 +357,41 @@ def run_training(
             except TimeoutError:
                 batch = ()
             if batch:
+                update_number = state.learner_updates + 1
+                batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
+                metrics.write(
+                    "learner_update_start",
+                    {
+                        "update_number": update_number,
+                        "environment_steps": pipeline.environment_steps,
+                        "policy_version": state.policy_version,
+                        "unrolls": len(batch),
+                        "batch_environment_steps": batch_environment_steps,
+                    },
+                )
+
+                def learner_progress(
+                    stage: str,
+                    payload: dict[str, int | float],
+                    *,
+                    _update_number: int = update_number,
+                    _policy_version: int = state.policy_version,
+                ) -> None:
+                    metrics.write(
+                        "learner_progress",
+                        {
+                            "update_number": _update_number,
+                            "stage": stage,
+                            "environment_steps": pipeline.environment_steps,
+                            "policy_version": _policy_version,
+                            **payload,
+                        },
+                    )
+
                 learner_metrics = resources.learner.update(
                     batch,
                     current_policy_version=state.policy_version,
+                    progress=learner_progress,
                 )
                 state = replace(
                     state,

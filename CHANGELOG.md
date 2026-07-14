@@ -69,6 +69,11 @@ historical RL artifacts.
 
 ### Fixed
 
+- Removed the random-combat/Act-1 preheat launch gate: native-revival preheat
+  now enters the uninterrupted full game immediately. Learner batches pad to
+  active token/candidate sizes and the preheat recurrent batch is reduced to
+  4x16, preventing the first 8x64 padded Transformer update from blocking the
+  collector for hours without producing one optimizer step.
 - Increased the headless backend's bounded ten-minute request-id replay store from
   2,048 to 65,536 entries and exposed its capacity/TTL in the backend spec. The old
   default exhausted before any identity could expire during normal online collection

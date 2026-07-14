@@ -188,19 +188,19 @@ V-trace trains policy and value from run outcome, forward distance, survival,
 and pace consequences. Evaluation reports run/Act-1 success, floor, decision
 count, exact HP lost, revivals used, and revival-free success rates.
 
-Before WSL/ROCm training starts, a fail-closed random-policy gate runs 500
-combat smoke episodes, a separate `TUNNELER_WEAK` stress probe, and three
-complete-flow traversal episodes. It requires at least two native revivals
-within one uninterrupted combat, verifies exact counter deltas and enemy
-continuity across revival, rejects any non-terminal zero-action state, and
-requires at least a 99% typed combat victory rate. Every unlimited-revival
-full-run traversal probe must inject the native relic/budget, retain monotonic
-run-scoped counters, exercise build/combat/route domains, and enter Act 2. A
-second set of bounded-revival full-run probes must consume its exact native
-budget and reach a typed terminal boundary. Separating traversal from
-termination avoids the contradictory requirement that an infinitely reviving
-random policy must die within a short fixed horizon. The combat portion also
-protects the `combat_post_end_pending -> combat_victory` adapter boundary.
+WSL/ROCm preheat starts the native-revival full game directly. There is no
+random-combat, Act-1, Act-2 or Act-3 behavior gate in the launch path. Act
+crossings and the real terminal outcome are metrics from the same uninterrupted
+episode, not prerequisites that repeatedly rerun parts of the game. The short
+formal preflight verifies the pinned simulator identity, runtime-mechanics
+schema and one real event-to-combat transport path; it does not score actions or
+truncate the training curriculum.
+
+Learner collation pads only to the largest active world/candidate/local shape
+in each batch. The configured 512/96/24 capacities remain fail-closed input
+limits, but are not paid on every small decision. The preheat profile uses
+16-step recurrent unrolls in batches of four so an initial ROCm update completes
+before the asynchronous collector can accumulate hours of unusable rollout.
 
 ## Deadlock diagnostics
 
@@ -215,7 +215,7 @@ versioned JSONL with compact observations, legal actions, selected action, polic
 top-k, value, reward breakdown and deadlock evidence. These journals are
 diagnostic artifacts and never enter the rollout queue.
 
-## Evaluation gates
+## Evaluation schedule
 
 Training seeds are even; held-out evaluation seeds are odd. The default v2 gates
 are steps 0, 10,000, 25,000 and 50,000, with fixed seeds and deterministic policy.
@@ -268,7 +268,6 @@ python -m sts2_rl.train --profile combat --sim-exe <PINNED_RELEASE_EXE>
 # Native-revival full-run knowledge preheat (Windows CPU)
 python scripts/audit_card_fact_coverage.py --sim-exe <PINNED_RELEASE_EXE>
 python scripts/audit_runtime_mechanics_coverage.py --sim-exe <PINNED_RELEASE_EXE>
-python -m sts2_rl.preheat_gate --sim-exe <PINNED_RELEASE_EXE> --episodes 500
 python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival knowledge preheat (WSL/ROCm; refuses CPU fallback)

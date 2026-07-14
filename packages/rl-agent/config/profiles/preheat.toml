@@ -28,7 +28,7 @@ max_candidate_local_tokens = 24
 [optimization]
 learning_rate = 0.0003
 weight_decay = 0.0001
-batch_unrolls = 8
+batch_unrolls = 4
 discount = 1.0
 gradient_clip_norm = 1.0
 vtrace_rho_clip = 1.0
@@ -39,11 +39,11 @@ value_weight = 0.5
 entropy_weight = 0.02
 
 [rollout]
-unroll_length = 64
+unroll_length = 16
 queue_capacity = 256
-minimum_unrolls = 8
+minimum_unrolls = 4
 collector_workers = 1
-policy_sync_interval_unrolls = 8
+policy_sync_interval_unrolls = 4
 max_policy_lag = 1024
 
 [environment]
@@ -68,12 +68,12 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-preheat-v6-runtime-mechanics"
-checkpoint_dir = "checkpoints/full-run-revival-preheat-v6-runtime-mechanics"
+log_dir = "runs/full-run-revival-direct-v6-runtime-mechanics"
+checkpoint_dir = "checkpoints/full-run-revival-direct-v6-runtime-mechanics"
 checkpoint_interval_steps = 25000
 # Do not block actor/learner startup on a deterministic evaluation of the
-# randomly initialized policy.  The fail-closed simulator gate and GPU smoke
-# test cover step zero; fixed held-out evaluation begins after learning starts.
+# randomly initialized policy. The short simulator/mechanics preflight and a
+# real GPU update smoke test cover plumbing; held-out evaluation begins later.
 evaluation_steps = [10000, 25000, 50000]
 evaluation_episodes = 5
 
