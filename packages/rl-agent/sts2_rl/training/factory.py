@@ -132,6 +132,7 @@ def build_training_resources(
     reward_calculator = (
         RevivalEfficiencyRewardCalculator(
             revival_relic_id=revival_relic_id,
+            objective=config.curriculum.reward_objective,
             discount=config.optimization.discount,
             maximum_episode_steps=config.environment.max_episode_steps,
         )

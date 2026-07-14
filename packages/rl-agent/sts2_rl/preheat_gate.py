@@ -1,12 +1,15 @@
-"""Fail-closed random-policy gate for native-revival combat preheat.
+"""Fail-closed random-policy gate for native-revival full-run preheat.
 
 The gate proves two independent properties before the learner is allowed to
 start:
 
 * one combat can consume the game's native Lizard Tail path more than once
   without resetting the enemy state; and
-* a random legal policy can actually reach typed combat victories in the
-  configured warm-up encounter under unlimited revival.
+* a random legal policy can actually reach typed combat victories in a
+  configured smoke encounter under unlimited revival; and
+* full-run reset injects the same native relic/budget and a random legal policy
+  can traverse combat, route, and build decisions into Act 2 while the exact
+  counters remain monotonic across the entire run.
 
 This is an environment/protocol acceptance gate, not a learning benchmark.
 """
@@ -28,9 +31,14 @@ from uuid import uuid4
 
 from sts2_rl.artifacts import resolve_artifact_path
 from sts2_rl.backends import HeadlessBackend
-from sts2_rl.contracts import CombatResetRequest, EnvironmentResult, StepRequest
+from sts2_rl.contracts import (
+    CombatResetRequest,
+    EnvironmentResult,
+    ResetRequest,
+    StepRequest,
+)
 
-GATE_VERSION = "sts2-native-revival-solvability-gate-v1"
+GATE_VERSION = "sts2-native-revival-full-run-gate-v2"
 DEFAULT_ENCOUNTER = "FUZZY_WURM_CRAWLER_WEAK"
 DEFAULT_STRESS_ENCOUNTER = "TUNNELER_WEAK"
 
@@ -44,6 +52,9 @@ class GateConfig:
     encounter_id: str = DEFAULT_ENCOUNTER
     stress_encounter_id: str = DEFAULT_STRESS_ENCOUNTER
     required_stress_revivals: int = 2
+    full_run_episodes: int = 3
+    full_run_maximum_steps: int = 3_000
+    minimum_act1_clear_rate: float = 1.0
 
     def __post_init__(self) -> None:
         if self.episodes <= 0:
@@ -56,6 +67,12 @@ class GateConfig:
             raise ValueError("seed must be non-negative")
         if self.required_stress_revivals < 2:
             raise ValueError("required_stress_revivals must be at least two")
+        if self.full_run_episodes <= 0:
+            raise ValueError("full_run_episodes must be positive")
+        if self.full_run_maximum_steps <= 0:
+            raise ValueError("full_run_maximum_steps must be positive")
+        if not 0.0 < self.minimum_act1_clear_rate <= 1.0:
+            raise ValueError("minimum_act1_clear_rate must be in (0, 1]")
         if not self.encounter_id.strip() or not self.stress_encounter_id.strip():
             raise ValueError("encounter IDs must be non-empty")
 
@@ -67,6 +84,18 @@ class EpisodeGateStats:
     victory: bool
     revivals_used: int
     player_hp_lost: float
+
+
+@dataclass(frozen=True, slots=True)
+class FullRunGateStats:
+    seed: int
+    steps: int
+    act1_cleared: bool
+    max_act: int
+    max_floor: int
+    revivals_used: int
+    player_hp_lost: float
+    decision_domains: tuple[str, ...]
 
 
 def _training_counter(result: EnvironmentResult, key: str) -> float:
@@ -184,6 +213,96 @@ def _random_step(
     )
 
 
+def _run_position(result: EnvironmentResult) -> tuple[int, int]:
+    run = result.observation.get("run")
+    if not isinstance(run, dict):
+        return 0, 0
+    return int(run.get("act") or 0), int(run.get("floor") or 0)
+
+
+def _reset_full_run(backend: HeadlessBackend, *, seed: int) -> EnvironmentResult:
+    result = backend.reset(
+        ResetRequest(
+            request_id=str(uuid4()),
+            session_id=backend.session_id,
+            expected_state_version=int(backend.get_state()["state_version"]),
+            scenario="full-run",
+            character="IRONCLAD",
+            seed=seed,
+            force_fresh=True,
+            additional_relics=("RELIC.LIZARD_TAIL",),
+            training_revival_budget=-1,
+        )
+    )
+    training = result.observation.get("_training")
+    if not isinstance(training, dict) or training.get("revival_budget") != -1:
+        raise RuntimeError("full-run reset did not activate unlimited native revival")
+    if _training_counter(result, "revivals_used") != 0.0:
+        raise RuntimeError("full-run revival counter did not reset at episode start")
+    if _training_counter(result, "player_hp_lost") != 0.0:
+        raise RuntimeError("full-run HP-loss counter did not reset at episode start")
+    player = result.observation.get("player")
+    relics = player.get("relics") if isinstance(player, dict) else None
+    relic_ids = {
+        str(relic.get("id") or "").upper()
+        for relic in relics or []
+        if isinstance(relic, dict)
+    }
+    if "RELIC.LIZARD_TAIL" not in relic_ids:
+        raise RuntimeError("full-run reset did not inject the native Lizard Tail")
+    return result
+
+
+def _run_full_run_episode(
+    backend: HeadlessBackend,
+    config: GateConfig,
+    *,
+    episode_index: int,
+) -> FullRunGateStats:
+    episode_seed = config.seed + 10_000 + episode_index
+    rng = random.Random(episode_seed ^ 0xF011A17)
+    result = _reset_full_run(backend, seed=episode_seed)
+    max_act, max_floor = _run_position(result)
+    domains: set[str] = set()
+    for step in range(1, config.full_run_maximum_steps + 1):
+        domain = result.observation.get("decision_domain")
+        if isinstance(domain, str) and domain:
+            domains.add(domain)
+        act, floor = _run_position(result)
+        max_act = max(max_act, act)
+        max_floor = max(max_floor, floor)
+        if act >= 2:
+            return FullRunGateStats(
+                seed=episode_seed,
+                steps=step - 1,
+                act1_cleared=True,
+                max_act=max_act,
+                max_floor=max_floor,
+                revivals_used=int(_training_counter(result, "revivals_used")),
+                player_hp_lost=_training_counter(result, "player_hp_lost"),
+                decision_domains=tuple(sorted(domains)),
+            )
+        if result.terminated:
+            break
+        before = result
+        result = _random_step(backend, result, rng)
+        validate_counter_transition(before, result)
+        if result.truncated:
+            raise RuntimeError("full-run simulator returned an outcome-unknown truncation")
+
+    act, floor = _run_position(result)
+    return FullRunGateStats(
+        seed=episode_seed,
+        steps=min(result.step_index, config.full_run_maximum_steps),
+        act1_cleared=act >= 2,
+        max_act=max(max_act, act),
+        max_floor=max(max_floor, floor),
+        revivals_used=int(_training_counter(result, "revivals_used")),
+        player_hp_lost=_training_counter(result, "player_hp_lost"),
+        decision_domains=tuple(sorted(domains)),
+    )
+
+
 def _prove_repeated_native_revival(
     backend: HeadlessBackend,
     config: GateConfig,
@@ -273,6 +392,10 @@ def run_gate(
             _run_solvability_episode(backend, config, episode_index=index)
             for index in range(config.episodes)
         ]
+        full_runs = [
+            _run_full_run_episode(backend, config, episode_index=index)
+            for index in range(config.full_run_episodes)
+        ]
         resolved_exe = Path(backend.client._exe_path).resolve()
 
     wins = sum(episode.victory for episode in episodes)
@@ -283,6 +406,28 @@ def run_gate(
             f"random-policy solvability failed: {wins}/{config.episodes} wins "
             f"is below required {minimum_wins}/{config.episodes}"
         )
+    act1_clears = sum(episode.act1_cleared for episode in full_runs)
+    minimum_act1_clears = math.ceil(
+        config.minimum_act1_clear_rate * config.full_run_episodes
+    )
+    if act1_clears < minimum_act1_clears:
+        raise RuntimeError(
+            "full-run random-policy solvability failed: "
+            f"{act1_clears}/{config.full_run_episodes} Act 1 clears is below "
+            f"required {minimum_act1_clears}/{config.full_run_episodes}"
+        )
+    required_domains = {"build", "combat", "route"}
+    for episode in full_runs:
+        missing_domains = required_domains.difference(episode.decision_domains)
+        if missing_domains:
+            raise RuntimeError(
+                f"full-run seed={episode.seed} missed decision domains "
+                f"{sorted(missing_domains)}"
+            )
+        if episode.revivals_used <= 0:
+            raise RuntimeError(
+                f"full-run seed={episode.seed} reached Act 2 without exercising revival"
+            )
     return {
         "version": GATE_VERSION,
         "passed": True,
@@ -306,6 +451,22 @@ def run_gate(
             ),
             "max_player_hp_lost": max(e.player_hp_lost for e in episodes),
         },
+        "full_run": {
+            "episodes": config.full_run_episodes,
+            "act1_clears": act1_clears,
+            "act1_clear_rate": act1_clears / config.full_run_episodes,
+            "mean_steps": statistics.fmean(e.steps for e in full_runs),
+            "max_steps": max(e.steps for e in full_runs),
+            "mean_max_floor": statistics.fmean(e.max_floor for e in full_runs),
+            "maximum_floor": max(e.max_floor for e in full_runs),
+            "mean_revivals": statistics.fmean(e.revivals_used for e in full_runs),
+            "max_revivals": max(e.revivals_used for e in full_runs),
+            "mean_player_hp_lost": statistics.fmean(
+                e.player_hp_lost for e in full_runs
+            ),
+            "max_player_hp_lost": max(e.player_hp_lost for e in full_runs),
+            "episodes_detail": [asdict(e) for e in full_runs],
+        },
     }
 
 
@@ -319,6 +480,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--encounter-id", default=DEFAULT_ENCOUNTER)
     parser.add_argument("--stress-encounter-id", default=DEFAULT_STRESS_ENCOUNTER)
     parser.add_argument("--required-stress-revivals", type=int, default=2)
+    parser.add_argument("--full-run-episodes", type=int, default=3)
+    parser.add_argument("--full-run-maximum-steps", type=int, default=3_000)
+    parser.add_argument("--minimum-act1-clear-rate", type=float, default=1.0)
     parser.add_argument("--output")
     return parser
 
@@ -333,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
         encounter_id=args.encounter_id,
         stress_encounter_id=args.stress_encounter_id,
         required_stress_revivals=args.required_stress_revivals,
+        full_run_episodes=args.full_run_episodes,
+        full_run_maximum_steps=args.full_run_maximum_steps,
+        minimum_act1_clear_rate=args.minimum_act1_clear_rate,
     )
     output = resolve_artifact_path(
         args.output,
@@ -362,6 +529,7 @@ __all__ = [
     "DEFAULT_STRESS_ENCOUNTER",
     "GATE_VERSION",
     "EpisodeGateStats",
+    "FullRunGateStats",
     "GateConfig",
     "run_gate",
     "validate_counter_transition",

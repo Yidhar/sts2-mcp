@@ -61,6 +61,8 @@ class ResetRequest:
     rebind_active_run: bool = False
     force_fresh: bool = False
     defensive_buffs: bool = False
+    additional_relics: tuple[str, ...] | None = None
+    training_revival_budget: int | None = None
     timeout_ms: int = 45_000
 
     def __post_init__(self) -> None:
@@ -72,6 +74,13 @@ class ResetRequest:
             raise ValueError("expected_state_version must be non-negative")
         if self.timeout_ms <= 0:
             raise ValueError("timeout_ms must be positive")
+        if (
+            self.training_revival_budget is not None
+            and self.training_revival_budget < -1
+        ):
+            raise ValueError(
+                "training_revival_budget must be null, -1, or non-negative"
+            )
 
     @classmethod
     def from_legacy(
@@ -90,13 +99,20 @@ class ResetRequest:
         )
 
     def to_v2_options(self) -> JsonObject:
-        return {
+        options: JsonObject = {
             "character": self.character,
             "rebind_active_run": self.rebind_active_run,
             "force_fresh": self.force_fresh,
             "defensive_buffs": self.defensive_buffs,
             "timeout_ms": self.timeout_ms,
         }
+        # These privileged simulator-only options are omitted entirely for a
+        # normal reset so an older live v2 bridge never sees unknown keys.
+        if self.additional_relics is not None:
+            options["additional_relics"] = list(self.additional_relics)
+        if self.training_revival_budget is not None:
+            options["training_revival_budget"] = self.training_revival_budget
+        return options
 
     def to_legacy_kwargs(self) -> JsonObject:
         if self.scenario != "full-run":
@@ -107,6 +123,12 @@ class ResetRequest:
             "rebind_active_run": self.rebind_active_run,
             "force_fresh": self.force_fresh,
             "defensive_buffs": self.defensive_buffs,
+            "additional_relics": (
+                list(self.additional_relics)
+                if self.additional_relics is not None
+                else None
+            ),
+            "training_revival_budget": self.training_revival_budget,
             "timeout_ms": self.timeout_ms,
         }
 

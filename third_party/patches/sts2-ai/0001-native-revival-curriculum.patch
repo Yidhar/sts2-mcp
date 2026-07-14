@@ -125,10 +125,10 @@ index 0000000..82ebe6f
 +namespace MegaCrit.Sts2.Core.Simulation;
 +
 +/// <summary>
-+/// Simulator-only accounting and budget control for combat knowledge preheat.
++/// Simulator-only accounting and budget control for native-revival preheat.
 +/// A null budget disables the training override, -1 is unlimited, and any
 +/// non-negative value is the total number of native Lizard Tail revivals that
-+/// may fire in the current combat.
++/// may fire in the current reset episode, including an entire full run.
 +/// </summary>
 +public static class TrainingRevivalController
 +{

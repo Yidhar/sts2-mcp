@@ -1,10 +1,11 @@
 """Auditable outcome, survival-efficiency, and run-distance rewards.
 
 The v3 objective deliberately contains no reward for damage dealt, enemy HP
-change, cards played, or any hand-written action preference.  Combat preheat
-learns from victory plus exact player-HP loss and native-revival counters.
-Longer horizons learn from monotonic run progress.  Simulator-only counters
-remain underscore-prefixed observation facts and are never model features.
+change, cards played, or any hand-written action preference.  Native-revival
+preheat runs on either a combat or full-run horizon and learns from the task
+outcome, monotonic run progress, exact player-HP loss, and exact native-revival
+counters. Simulator-only counters remain underscore-prefixed observation facts
+and are never model features.
 """
 
 from __future__ import annotations
@@ -42,25 +43,21 @@ TASK_REWARD_SPEC: Final = TaskRewardSpec()
 
 @dataclass(frozen=True, slots=True)
 class RevivalEfficiencyRewardSpec:
-    """Bounded, undiscounted combat-preheat preference.
+    """Bounded, undiscounted native-revival preference.
 
     Each efficiency term is a delta of a monotonic bounded score.  Across a
-    512-decision episode their combined magnitude is strictly below 1.0, so
+    complete episode their combined magnitude is strictly below 1.0, so
     every victory remains better than every failure.  Within the same outcome,
     the weighted survival objective jointly prefers less cumulative HP loss,
     fewer native revivals, and fewer decisions; it does not reward damage.
     """
 
-    version: str = field(default="sts2-survival-efficiency-v2", init=False)
+    version: str = field(default="sts2-run-survival-efficiency-v3", init=False)
     required_discount: float = field(default=1.0, init=False)
     hp_loss_weight: float = field(default=0.55, init=False)
     revival_weight: float = field(default=0.20, init=False)
     pace_budget: float = field(default=0.05, init=False)
-    maximum_episode_steps: int = field(default=512, init=False)
-
-    @property
-    def pace_penalty_per_step(self) -> float:
-        return -self.pace_budget / self.maximum_episode_steps
+    hp_loss_scale: float = field(default=80.0, init=False)
 
 
 REVIVAL_EFFICIENCY_REWARD_SPEC: Final = RevivalEfficiencyRewardSpec()
@@ -95,7 +92,7 @@ def revival_efficiency_reward_identity() -> dict[str, Any]:
         "spec": asdict(REVIVAL_EFFICIENCY_REWARD_SPEC),
         "revival_event_source": "observation._training.revivals_used exact counter",
         "hp_loss_source": "observation._training.player_hp_lost exact counter",
-        "ordering": "combat_outcome>bounded_survival_efficiency>decisions",
+        "ordering": "task_outcome+run_progress>bounded_survival_efficiency>decisions",
         "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -135,14 +132,6 @@ def _run_position(observation: Mapping[str, Any]) -> tuple[int, int, float]:
 def _training_counter(observation: Mapping[str, Any], key: str) -> float:
     training = _mapping(observation.get("_training"))
     return max(0.0, _number(training.get(key)))
-
-
-def _player_max_hp(observation: Mapping[str, Any]) -> float:
-    player = _mapping(observation.get("player"))
-    return max(
-        1.0,
-        _number(player.get("max_hp", player.get("maximum_hp")), default=1.0),
-    )
 
 
 def _bounded_resource_score(amount: float, scale: float) -> float:
@@ -268,24 +257,27 @@ class TaskRewardCalculator:
 
 
 class RevivalEfficiencyRewardCalculator:
-    """Combat preheat reward from exact cumulative simulator counters."""
+    """Revival preheat reward from task progress and exact run counters."""
 
     def __init__(
         self,
         *,
         revival_relic_id: str,
+        maximum_episode_steps: int,
+        objective: TaskObjective = "combat",
         discount: float = 1.0,
-        maximum_episode_steps: int = 512,
     ) -> None:
         if not isinstance(revival_relic_id, str) or not revival_relic_id.strip():
             raise TypeError("revival_relic_id must be non-empty text")
-        if maximum_episode_steps > REVIVAL_EFFICIENCY_REWARD_SPEC.maximum_episode_steps:
-            raise ValueError("survival preheat horizon exceeds the bounded pace budget")
+        if objective not in {"combat", "act1", "run"}:
+            raise ValueError("objective must be combat, act1, or run")
+        if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
+            raise ValueError("maximum_episode_steps must be a positive integer")
         if float(discount) != REVIVAL_EFFICIENCY_REWARD_SPEC.required_discount:
             raise ValueError("survival preheat requires an undiscounted return (discount=1)")
         self.revival_relic_id = revival_relic_id.strip().upper()
         self.maximum_episode_steps = int(maximum_episode_steps)
-        self.base = TaskRewardCalculator("combat", discount=discount)
+        self.base = TaskRewardCalculator(objective, discount=discount)
 
     def evaluate(
         self,
@@ -310,13 +302,15 @@ class RevivalEfficiencyRewardCalculator:
 
         revivals_used_delta = int(after_revivals - before_revivals)
         player_hp_lost_delta = after_hp_lost - before_hp_lost
-        max_hp = max(
-            _player_max_hp(before.observation),
-            _player_max_hp(after.observation),
-        )
         hp_loss_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.hp_loss_weight * (
-            _bounded_resource_score(after_hp_lost, max_hp)
-            - _bounded_resource_score(before_hp_lost, max_hp)
+            _bounded_resource_score(
+                after_hp_lost,
+                REVIVAL_EFFICIENCY_REWARD_SPEC.hp_loss_scale,
+            )
+            - _bounded_resource_score(
+                before_hp_lost,
+                REVIVAL_EFFICIENCY_REWARD_SPEC.hp_loss_scale,
+            )
         )
         revival_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.revival_weight * (
             _bounded_resource_score(after_revivals, 1.0)
@@ -331,13 +325,13 @@ class RevivalEfficiencyRewardCalculator:
             ),
             discount=base.discount,
             terminal_reward=base.terminal_reward,
-            potential_reward=0.0,
+            potential_reward=base.potential_reward,
             task_terminal=base.task_terminal,
             outcome=base.outcome,
             revival_penalty=float(revival_penalty),
             pace_penalty=float(pace_penalty),
             hp_loss_penalty=float(hp_loss_penalty),
-            progress_reward=0.0,
+            progress_reward=base.progress_reward,
             revivals_used_delta=revivals_used_delta,
             player_hp_lost_delta=float(player_hp_lost_delta),
         )

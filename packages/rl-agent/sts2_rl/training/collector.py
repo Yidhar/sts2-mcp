@@ -75,6 +75,8 @@ class EpisodeMetrics:
     deadlocked: bool
     revivals_used: int
     revival_free_combat_win: bool
+    revival_free_act1_clear: bool
+    revival_free_run_win: bool
     player_hp_lost: float
 
 
@@ -262,16 +264,14 @@ class GroundedCollector:
         )
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
-        if self.additional_relics and scenario != "combat":
-            raise ValueError("additional reset relics are only supported for combat collection")
         if self.revival_relic_id is not None and self.revival_relic_id not in {
             item.upper() for item in self.additional_relics
         }:
             raise ValueError("revival_relic_id must be one of the injected additional relics")
         if self.training_revival_budget is not None:
-            if scenario != "combat" or self.revival_relic_id is None:
+            if self.revival_relic_id is None:
                 raise ValueError(
-                    "training_revival_budget requires combat and an injected revival relic"
+                    "training_revival_budget requires an injected revival relic"
                 )
             if self.training_revival_budget < -1:
                 raise ValueError("training_revival_budget must be -1 or non-negative")
@@ -507,6 +507,8 @@ class GroundedCollector:
                     character=self.character,
                     seed=seed,
                     force_fresh=True,
+                    additional_relics=self.additional_relics or None,
+                    training_revival_budget=self.training_revival_budget,
                 )
             )
         committed_state_version = self._state_version()
@@ -870,6 +872,8 @@ class GroundedCollector:
                 deadlocked=deadlocked,
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
+                revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),
+                revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
             ),
             timings=timings.snapshot(),

@@ -131,21 +131,24 @@ Combat reward does **not** pay for damage dealt, enemy-HP change, number of
 cards played, or any preferred action. Those quantities may remain factual
 observations/diagnostics, but they are not reward terms.
 
-The default full-run objective is `act1`: entering Act 2 is success and dying or
-deadlocking before Act 2 is failure. The `combat` profile is an optional software
-and representation bootstrap. A `run` objective remains available only for later
-full-run experiments. Backend reward scalars are not targets.
+The default standard full-run objective is `act1`: entering Act 2 is success and
+dying or deadlocking before Act 2 is failure. The native-revival preheat uses the
+longer `run` objective so it traverses route, reward, event, shop, rest, combat,
+and build decisions instead of terminating at the first Act boundary. The
+`combat` profile remains only an optional software diagnostic. Backend reward
+scalars are not targets.
 
 No human-data cold start is required for the first v2 baseline. Human trajectories
 may be evaluated later as a separately versioned experiment; they must not be
 silently mixed into this baseline.
 
-The optional `preheat` profile is a separate, versioned combat curriculum. It
-adds the game's native `RELIC.LIZARD_TAIL` to the normal starter relic set at
-combat reset. The simulator-only training controller can budget that same
-native death-prevention path; `-1` means unlimited and normal profiles leave it
-disabled. The relic still performs the game's own death hook, flash and 50%
-maximum-HP heal. Only the training copy is re-armed after it fires.
+The optional `preheat` profile is a separate, versioned full-run curriculum. It
+adds the game's native `RELIC.LIZARD_TAIL` to the normal starter relic set at a
+fresh full-run reset. The simulator-only training controller budgets that same
+native death-prevention path across the entire run; `-1` means unlimited and
+normal profiles leave it disabled. The relic still performs the game's own
+death hook, flash and 50% maximum-HP heal. Only the training copy is re-armed
+after it fires.
 
 The simulator exports exact monotonic `training_revivals_used` and
 `training_player_hp_lost` counters. HP loss is recorded at `Creature.LoseHp`
@@ -153,39 +156,40 @@ from actual HP removed, so overkill is not counted and later healing cannot
 erase prior loss. These counters are translated under `observation._training`:
 they are reward/evaluation facts and the grounded encoder never sees them.
 
-`sts2-survival-efficiency-v2` combines the normal combat outcome with three
-bounded costs:
+`sts2-run-survival-efficiency-v3` combines the final run outcome and monotonic
+forward run distance with three bounded costs:
 
-- a terminal margin that makes every victory rank above every failure;
+- a terminal margin that makes every run victory rank above every failure;
 - a cumulative cost for exact player HP lost;
 - a cumulative cost for exact native revivals used;
 - a small cost per environment decision.
 
-The profile caps episodes at 512 decisions and uses undiscounted return. All
-survival/pace costs together are bounded below one point, so the terminal
-margin guarantees every victory ranks above every failure. Within the same
-outcome the weighted objective prefers:
+The profile caps a complete run at 10,000 decisions and uses undiscounted
+return. All survival/pace costs together are bounded below one point, so the
+terminal margin guarantees every victory ranks above every failure. Forward
+floor progress gives failed runs useful ordering without paying for damage or
+specific choices. Within the same outcome the weighted objective prefers:
 
-1. win the combat;
+1. finish the run and travel farther;
 2. lose less player HP and consume fewer revivals;
 3. finish in fewer decisions.
 
 This is not an invincibility/no-consequence dataset and it does not supervise
-random actions as correct. Epsilon exploration supplies broad state/action
-coverage, while V-trace trains policy and value from outcome, survival and pace
-consequences. The warm-up encounter is the single-enemy
-`FUZZY_WURM_CRAWLER_WEAK`, rather than `AXEBOTS_NORMAL` whose own enemy-revival
-mechanic makes it unsuitable as an initialization task. Evaluation reports mean
-decision count, mean exact HP lost, mean revivals used and revival-free combat
-win rate.
+random actions as correct. Epsilon exploration uses revival as a safety net to
+reach later map, build, reward, event, shop, rest, elite, and boss decisions;
+V-trace trains policy and value from run outcome, forward distance, survival,
+and pace consequences. Evaluation reports run/Act-1 success, floor, decision
+count, exact HP lost, revivals used, and revival-free success rates.
 
 Before WSL/ROCm training starts, a fail-closed random-policy gate runs 500
-warm-up combats and a separate `TUNNELER_WEAK` stress probe. It requires at
-least two native revivals within one uninterrupted combat, verifies exact
-counter deltas and enemy continuity across revival, rejects any non-terminal
-zero-action state, and requires at least a 99% typed victory rate. This gate
-also protects the `combat_post_end_pending -> combat_victory` adapter boundary;
-without that projection real combat wins would be misreported as deadlocks.
+combat smoke episodes, a separate `TUNNELER_WEAK` stress probe, and three
+complete-flow traversal episodes. It requires at least two native revivals
+within one uninterrupted combat, verifies exact counter deltas and enemy
+continuity across revival, rejects any non-terminal zero-action state, and
+requires at least a 99% typed combat victory rate. Every full-run probe must
+inject the native relic/budget, retain monotonic run-scoped counters, exercise
+build/combat/route domains, and enter Act 2. The combat portion also protects
+the `combat_post_end_pending -> combat_victory` adapter boundary.
 
 ## Deadlock diagnostics
 
@@ -212,8 +216,8 @@ Reports include:
 - mean and maximum floor;
 - mean maximum act;
 - mean undiscounted reward.
-- for revival preheat, mean exact player HP lost, mean revivals used and
-  revival-free combat win rate.
+- for revival preheat, mean exact player HP lost, mean revivals used,
+  revival-free Act-1/run success rates, and full-run progress.
 
 No Act 1 performance claim is valid without these held-out evaluations and their
 trajectory journals.
@@ -247,10 +251,10 @@ python -m mypy sts2_rl sts2_baseline
 python -m pytest tests -q -p no:cacheprovider
 python -m sts2_rl.train --dry-run
 
-# Optional combat bootstrap
+# Optional combat transport diagnostic
 python -m sts2_rl.train --profile combat --sim-exe <PINNED_RELEASE_EXE>
 
-# Native-revival knowledge preheat (Windows CPU)
+# Native-revival full-run knowledge preheat (Windows CPU)
 python -m sts2_rl.preheat_gate --sim-exe <PINNED_RELEASE_EXE> --episodes 500
 python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
 

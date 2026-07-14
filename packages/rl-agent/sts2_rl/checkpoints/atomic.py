@@ -59,7 +59,7 @@ def reward_spec_metadata() -> dict[str, Any]:
     """Return the complete, stable identity of the active reward specification."""
 
     payload: dict[str, Any] = {
-        "version": "sts2-reward-catalog-v3",
+        "version": "sts2-reward-catalog-v4",
         "standard": task_reward_identity(),
         "native_revival_preheat": revival_efficiency_reward_identity(),
     }

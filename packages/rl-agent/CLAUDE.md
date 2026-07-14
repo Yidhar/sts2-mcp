@@ -73,13 +73,13 @@ sts2_rl.train
   monotonic simulator counters under `observation._training`, never from HP
   increase inference or a hand-written combat policy. Those underscore facts
   are not model inputs.
-- Reward never pays for damage dealt, enemy-HP change or cards played. Preheat
-  ranks typed combat outcome first, then bounded exact HP-loss/revival costs and
-  a small decision cost; Act/run tasks use terminal outcome plus forward run
-  distance.
+- Reward never pays for damage dealt, enemy-HP change or cards played. The
+  maintained preheat runs the complete headless game flow and ranks final run
+  outcome plus forward run distance first, then bounded exact run-scoped
+  HP-loss/revival costs and a small decision cost.
 - `scripts/train_preheat_wsl_rocm.sh` must pass the 500-episode random
-  solvability gate and repeated-native-revival stress probe before it may
-  launch the learner.
+  combat-solvability gate, repeated-native-revival stress probe, and full-run
+  Act-2 traversal gate before it may launch the learner.
 - Forced singleton actions generate no policy target or policy-gradient term.
 - Training data is consumed once in FIFO order; replay sampling, PER and
   long-lived sample retention are forbidden.

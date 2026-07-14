@@ -157,7 +157,7 @@ def test_combat_objective_uses_typed_terminal_outcome() -> None:
 
 def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
-    assert identity["version"] == "sts2-survival-efficiency-v2"
+    assert identity["version"] == "sts2-run-survival-efficiency-v3"
     calculator = RevivalEfficiencyRewardCalculator(
         revival_relic_id="RELIC.LIZARD_TAIL",
         maximum_episode_steps=512,
@@ -202,6 +202,51 @@ def test_healing_does_not_erase_exact_hp_loss_cost() -> None:
     assert reward.hp_loss_penalty < 0.0
 
 
+def test_full_run_preheat_combines_forward_progress_with_run_scoped_costs() -> None:
+    calculator = RevivalEfficiencyRewardCalculator(
+        revival_relic_id="RELIC.LIZARD_TAIL",
+        objective="run",
+        maximum_episode_steps=10_000,
+    )
+    reward = calculator.evaluate(
+        _result(step=0, floor=1),
+        _result(
+            step=1,
+            floor=2,
+            revivals_used=1,
+            player_hp_lost=40,
+            revivals_used_delta=1,
+            player_hp_lost_delta=40,
+        ),
+    )
+    assert reward.outcome == "ongoing"
+    assert reward.progress_reward > 0.0
+    assert reward.hp_loss_penalty < 0.0
+    assert reward.revival_penalty < 0.0
+    assert reward.pace_penalty < 0.0
+    assert reward.reward == pytest.approx(
+        reward.progress_reward
+        + reward.hp_loss_penalty
+        + reward.revival_penalty
+        + reward.pace_penalty
+    )
+
+
+def test_full_run_preheat_progresses_past_act1_instead_of_terminating() -> None:
+    calculator = RevivalEfficiencyRewardCalculator(
+        revival_relic_id="RELIC.LIZARD_TAIL",
+        objective="run",
+        maximum_episode_steps=10_000,
+    )
+    act2 = calculator.evaluate(
+        _result(step=0, act=1, floor=17),
+        _result(step=1, act=2, floor=18),
+    )
+    assert act2.outcome == "ongoing"
+    assert not act2.task_terminal
+    assert act2.discount == 1.0
+
+
 def test_survival_preheat_still_makes_every_win_better_than_every_loss() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
         revival_relic_id="RELIC.LIZARD_TAIL",
@@ -231,6 +276,7 @@ def test_preheat_requires_undiscounted_efficiency_telescoping() -> None:
     with pytest.raises(ValueError, match="undiscounted"):
         RevivalEfficiencyRewardCalculator(
             revival_relic_id="RELIC.LIZARD_TAIL",
+            maximum_episode_steps=512,
             discount=0.997,
         )
 

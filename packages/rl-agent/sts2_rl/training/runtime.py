@@ -84,6 +84,8 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "mean_revivals_used": 0.0,
             "mean_player_hp_lost": 0.0,
             "revival_free_combat_win_rate": 0.0,
+            "revival_free_act1_clear_rate": 0.0,
+            "revival_free_run_win_rate": 0.0,
         }
     count = len(episodes)
     return {
@@ -107,6 +109,12 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         ),
         "revival_free_combat_win_rate": (
             sum(item.revival_free_combat_win for item in episodes) / count
+        ),
+        "revival_free_act1_clear_rate": (
+            sum(item.revival_free_act1_clear for item in episodes) / count
+        ),
+        "revival_free_run_win_rate": (
+            sum(item.revival_free_run_win for item in episodes) / count
         ),
     }
 

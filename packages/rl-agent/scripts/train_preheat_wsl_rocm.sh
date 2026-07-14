@@ -66,13 +66,16 @@ echo "[preheat-rocm] STS2_HEADLESS_SIM_EXE=$SIM_EXE"
 
 cd "$REPO_ROOT"
 GATE_EPISODES=500
-echo "[preheat-rocm] running fail-closed native-revival/solvability gate ($GATE_EPISODES episodes)"
+echo "[preheat-rocm] running fail-closed native-revival combat + full-run gate ($GATE_EPISODES combat episodes)"
 python -m sts2_rl.preheat_gate \
   --sim-exe "$SIM_EXE" \
   --episodes "$GATE_EPISODES" \
   --encounter-id FUZZY_WURM_CRAWLER_WEAK \
   --stress-encounter-id TUNNELER_WEAK \
-  --required-stress-revivals 2
+  --required-stress-revivals 2 \
+  --full-run-episodes 3 \
+  --minimum-act1-clear-rate 1.0 \
+  --output reports/full-run-revival-preheat-gate.json
 
 exec python -m sts2_rl.train \
   --profile preheat \

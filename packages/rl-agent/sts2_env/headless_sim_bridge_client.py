@@ -527,6 +527,8 @@ class HeadlessSimBridgeClient:
         rebind_active_run: bool = False,
         force_fresh: bool = False,
         defensive_buffs: bool = False,
+        additional_relics: list[str] | None = None,
+        training_revival_budget: int | None = None,
         seed: str | int | None = None,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
@@ -545,6 +547,22 @@ class HeadlessSimBridgeClient:
             params["seed"] = str(seed)
         if defensive_buffs:
             params["defensive_buffs"] = True
+        build: dict[str, Any] = {}
+        if additional_relics is not None:
+            build["additional_relics"] = [
+                {"id": _strip_model_prefix(relic_id, "RELIC.")}
+                for relic_id in additional_relics
+                if relic_id
+            ]
+        if training_revival_budget is not None:
+            budget = int(training_revival_budget)
+            if budget < -1:
+                raise ValueError(
+                    "training_revival_budget must be -1 or a non-negative integer"
+                )
+            build["training_revival_budget"] = budget
+        if build:
+            params["build"] = build
         sim_state = self._rpc("reset", params, timeout_s=timeout_s)
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
@@ -663,17 +681,11 @@ class HeadlessSimBridgeClient:
         # Sim's SimulationBuildSupport.ResolveCard re-prepends "CARD." (and
         # analogous for RELIC./POTION.), same bug pattern as encounter_id.
         # Strip the category prefix so we don't end up with CARD.CARD.ANGER.
-        def _strip_prefix(raw: str, prefix: str) -> str:
-            s = str(raw)
-            if s.upper().startswith(prefix):
-                s = s[len(prefix):]
-            return s
-
         if deck_entries is not None and len(deck_entries) > 0:
             # Prefer upgrade-aware entries when we have them.
             build["deck"] = [
                 {
-                    "id": _strip_prefix(entry.get("id"), "CARD."),
+                    "id": _strip_model_prefix(entry.get("id"), "CARD."),
                     "upgrade_level": int(entry.get("upgrade_level") or 0),
                 }
                 for entry in deck_entries
@@ -681,16 +693,16 @@ class HeadlessSimBridgeClient:
             ]
         elif deck is not None:
             build["deck"] = [
-                {"id": _strip_prefix(cid, "CARD."), "upgrade_level": 0}
+                {"id": _strip_model_prefix(cid, "CARD."), "upgrade_level": 0}
                 for cid in deck if cid
             ]
         if relics is not None:
             build["relics"] = [
-                {"id": _strip_prefix(rid, "RELIC.")} for rid in relics if rid
+                {"id": _strip_model_prefix(rid, "RELIC.")} for rid in relics if rid
             ]
         if additional_relics is not None:
             build["additional_relics"] = [
-                {"id": _strip_prefix(rid, "RELIC.")}
+                {"id": _strip_model_prefix(rid, "RELIC.")}
                 for rid in additional_relics
                 if rid
             ]
@@ -704,7 +716,9 @@ class HeadlessSimBridgeClient:
         if potions is not None:
             # SimulationBuildSpec may or may not have potions; include under
             # build to be future-proof; sim ignores unknown fields.
-            build["potions"] = [_strip_prefix(pid, "POTION.") for pid in potions if pid]
+            build["potions"] = [
+                _strip_model_prefix(pid, "POTION.") for pid in potions if pid
+            ]
         if build:
             params["build"] = build
         timeout_s = max(float(timeout_ms) / 1000.0, 0.001)
@@ -737,6 +751,15 @@ def _normalize_character(character: str | None) -> str:
     if s.startswith("CHARACTER."):
         s = s.split(".", 1)[1]
     return s
+
+
+def _strip_model_prefix(raw: Any, prefix: str) -> str:
+    """Strip a category prefix before sending a model id to HeadlessSim."""
+
+    value = str(raw)
+    if value.upper().startswith(prefix):
+        value = value[len(prefix):]
+    return value
 
 
 def _build_bridge_step_response(

@@ -468,12 +468,6 @@ class TrainingConfig:
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("native revival preheat requires the headless backend")
-            if self.environment.scenario != "combat":
-                raise ValueError("native revival preheat requires the combat scenario")
-            if self.environment.max_episode_steps > 512:
-                raise ValueError(
-                    "native revival preheat max_episode_steps cannot exceed 512"
-                )
         expected_discount = (
             1.0
             if self.curriculum.mode == "native-revival-preheat"

@@ -30,8 +30,10 @@ def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
     assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
     assert preheat.curriculum.revival_budget == -1
     assert preheat.optimization.discount == 1.0
-    assert preheat.environment.encounter_id == "FUZZY_WURM_CRAWLER_WEAK"
-    assert preheat.environment.max_episode_steps == 512
+    assert preheat.environment.scenario == "full-run"
+    assert preheat.curriculum.reward_objective == "run"
+    assert preheat.environment.encounter_id is None
+    assert preheat.environment.max_episode_steps == 10_000
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
     mapping = default.to_mapping()
     assert "rollout" in mapping
@@ -67,7 +69,7 @@ def test_environment_and_task_horizons_must_match() -> None:
         replace(base, curriculum=CurriculumConfig(reward_objective="combat"))
 
 
-def test_native_revival_preheat_is_a_bounded_headless_combat_curriculum() -> None:
+def test_native_revival_preheat_supports_a_headless_full_run_curriculum() -> None:
     with pytest.raises(ValueError, match="requires revival_relic_id"):
         CurriculumConfig(mode="native-revival-preheat", reward_objective="combat")
     curriculum = CurriculumConfig(
@@ -76,8 +78,14 @@ def test_native_revival_preheat_is_a_bounded_headless_combat_curriculum() -> Non
         revival_relic_id="RELIC.LIZARD_TAIL",
         revival_budget=-1,
     )
-    with pytest.raises(ValueError, match="full-run|combat scenario"):
-        replace(TrainingConfig(), curriculum=curriculum)
+    combat = TrainingConfig(
+        environment=replace(TrainingConfig().environment, scenario="combat"),
+        curriculum=curriculum,
+        optimization=OptimizationConfig(discount=1.0),
+    )
+    assert combat.environment.scenario == "combat"
+    full_run = load_training_config(profile="preheat")
+    assert full_run.environment.scenario == "full-run"
 
 
 def test_preheat_and_standard_discount_contracts_fail_closed() -> None:
