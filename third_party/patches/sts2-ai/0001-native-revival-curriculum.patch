@@ -68,6 +68,60 @@ index 6f1ecf4..f0b3d4b 100644
  	[JsonPropertyName("current_hp")]
  	public int? CurrentHp { get; set; }
  
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+index 4093373..4ebbac4 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+@@ -295,6 +295,22 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 				IsSupported = true
+ 			});
+ 		}
++		// Some multi-stage events either clear every option or leave only disabled
++		// previously chosen options after the final choice resolves. The rendered
++		// game closes the room at that point, but pure simulation has no event-layout
++		// button to drive the closeout. Expose that closeout as an explicit model
++		// decision instead of returning a non-terminal state with no legal actions.
++		if (actions.Count == 0)
++		{
++			FullRunSimulationTrace.Write(
++				$"headless_event_legal_actions.exhausted_options id={localEvent.Id.Entry} options={localEvent.CurrentOptions.Count}");
++			actions.Add(new FullRunSimulationLegalAction
++			{
++				Action = "proceed",
++				Label = "Proceed",
++				IsSupported = true
++			});
++		}
+ 		return actions;
+ 	}
+ 
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index 217a7c3..94c52f6 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -2697,10 +2697,21 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			return false;
+ 		}
+ 		EventModel localEvent = eventRoom.LocalMutableEvent;
+-		if (!localEvent.IsFinished && !localEvent.CurrentOptions.Any(static option => option.IsProceed && !option.IsLocked))
++		bool hasProceedOption = localEvent.CurrentOptions.Any(
++			static option => option.IsProceed && !option.IsLocked);
++		bool hasSelectableOption = localEvent.CurrentOptions.Any(
++			static option => !option.IsLocked
++				&& (!option.WasChosen || !FullRunUpstreamCompat.IsDisableOnChosen(option)));
++		bool exhaustedOptions = !hasSelectableOption;
++		if (!localEvent.IsFinished && !hasProceedOption && !exhaustedOptions)
+ 		{
+ 			return false;
+ 		}
++		if (exhaustedOptions && !localEvent.IsFinished && !hasProceedOption)
++		{
++			FullRunSimulationTrace.Write(
++				$"full_run.event.proceed_exhausted_options id={localEvent.Id.Entry} options={localEvent.CurrentOptions.Count}");
++		}
+ 		_forceMapView = true;
+ 		return true;
+ 	}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
 index 658be06..3ed8f30 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
@@ -115,7 +169,7 @@ index 658be06..3ed8f30 100644
  			save.MaxHp = Math.Max(1, build.MaxHp.Value);
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
 new file mode 100644
-index 0000000..82ebe6f
+index 0000000..6dacd8a
 --- /dev/null
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
 @@ -0,0 +1,62 @@

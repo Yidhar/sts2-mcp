@@ -7,9 +7,10 @@ start:
   without resetting the enemy state; and
 * a random legal policy can actually reach typed combat victories in a
   configured smoke encounter under unlimited revival; and
-* full-run reset injects the same native relic/budget and a random legal policy
-  can traverse combat, route, and build decisions into Act 2 while the exact
-  counters remain monotonic across the entire run.
+* an unlimited-revival full-run probe can traverse combat, route, and build
+  decisions past Act 1 while the exact counters remain monotonic; and
+* a separate bounded-revival full-run probe exhausts the native budget and
+  reaches a typed game-over boundary.
 
 This is an environment/protocol acceptance gate, not a learning benchmark.
 """
@@ -38,7 +39,7 @@ from sts2_rl.contracts import (
     StepRequest,
 )
 
-GATE_VERSION = "sts2-native-revival-full-run-gate-v2"
+GATE_VERSION = "sts2-native-revival-full-run-gate-v4"
 DEFAULT_ENCOUNTER = "FUZZY_WURM_CRAWLER_WEAK"
 DEFAULT_STRESS_ENCOUNTER = "TUNNELER_WEAK"
 
@@ -55,6 +56,9 @@ class GateConfig:
     full_run_episodes: int = 3
     full_run_maximum_steps: int = 3_000
     minimum_act1_clear_rate: float = 1.0
+    terminal_run_episodes: int = 3
+    terminal_run_maximum_steps: int = 3_000
+    terminal_run_revival_budget: int = 2
 
     def __post_init__(self) -> None:
         if self.episodes <= 0:
@@ -73,6 +77,12 @@ class GateConfig:
             raise ValueError("full_run_maximum_steps must be positive")
         if not 0.0 < self.minimum_act1_clear_rate <= 1.0:
             raise ValueError("minimum_act1_clear_rate must be in (0, 1]")
+        if self.terminal_run_episodes <= 0:
+            raise ValueError("terminal_run_episodes must be positive")
+        if self.terminal_run_maximum_steps <= 0:
+            raise ValueError("terminal_run_maximum_steps must be positive")
+        if self.terminal_run_revival_budget < 0:
+            raise ValueError("terminal_run_revival_budget must be non-negative")
         if not self.encounter_id.strip() or not self.stress_encounter_id.strip():
             raise ValueError("encounter IDs must be non-empty")
 
@@ -96,6 +106,9 @@ class FullRunGateStats:
     revivals_used: int
     player_hp_lost: float
     decision_domains: tuple[str, ...]
+    terminated: bool
+    run_won: bool
+    terminal_reason: str | None
 
 
 def _training_counter(result: EnvironmentResult, key: str) -> float:
@@ -220,7 +233,12 @@ def _run_position(result: EnvironmentResult) -> tuple[int, int]:
     return int(run.get("act") or 0), int(run.get("floor") or 0)
 
 
-def _reset_full_run(backend: HeadlessBackend, *, seed: int) -> EnvironmentResult:
+def _reset_full_run(
+    backend: HeadlessBackend,
+    *,
+    seed: int,
+    revival_budget: int,
+) -> EnvironmentResult:
     result = backend.reset(
         ResetRequest(
             request_id=str(uuid4()),
@@ -231,12 +249,14 @@ def _reset_full_run(backend: HeadlessBackend, *, seed: int) -> EnvironmentResult
             seed=seed,
             force_fresh=True,
             additional_relics=("RELIC.LIZARD_TAIL",),
-            training_revival_budget=-1,
+            training_revival_budget=revival_budget,
         )
     )
     training = result.observation.get("_training")
-    if not isinstance(training, dict) or training.get("revival_budget") != -1:
-        raise RuntimeError("full-run reset did not activate unlimited native revival")
+    if not isinstance(training, dict) or training.get("revival_budget") != revival_budget:
+        raise RuntimeError(
+            "full-run reset did not activate the requested native revival budget"
+        )
     if _training_counter(result, "revivals_used") != 0.0:
         raise RuntimeError("full-run revival counter did not reset at episode start")
     if _training_counter(result, "player_hp_lost") != 0.0:
@@ -258,30 +278,30 @@ def _run_full_run_episode(
     config: GateConfig,
     *,
     episode_index: int,
+    seed_offset: int = 10_000,
+    revival_budget: int = -1,
+    stop_after_act1: bool = True,
+    maximum_steps: int | None = None,
 ) -> FullRunGateStats:
-    episode_seed = config.seed + 10_000 + episode_index
+    episode_seed = config.seed + seed_offset + episode_index
     rng = random.Random(episode_seed ^ 0xF011A17)
-    result = _reset_full_run(backend, seed=episode_seed)
+    result = _reset_full_run(
+        backend,
+        seed=episode_seed,
+        revival_budget=revival_budget,
+    )
+    episode_limit = maximum_steps or config.full_run_maximum_steps
     max_act, max_floor = _run_position(result)
     domains: set[str] = set()
-    for step in range(1, config.full_run_maximum_steps + 1):
+    for _step in range(1, episode_limit + 1):
         domain = result.observation.get("decision_domain")
         if isinstance(domain, str) and domain:
             domains.add(domain)
         act, floor = _run_position(result)
         max_act = max(max_act, act)
         max_floor = max(max_floor, floor)
-        if act >= 2:
-            return FullRunGateStats(
-                seed=episode_seed,
-                steps=step - 1,
-                act1_cleared=True,
-                max_act=max_act,
-                max_floor=max_floor,
-                revivals_used=int(_training_counter(result, "revivals_used")),
-                player_hp_lost=_training_counter(result, "player_hp_lost"),
-                decision_domains=tuple(sorted(domains)),
-            )
+        if stop_after_act1 and max_act >= 2:
+            break
         if result.terminated:
             break
         before = result
@@ -291,15 +311,19 @@ def _run_full_run_episode(
             raise RuntimeError("full-run simulator returned an outcome-unknown truncation")
 
     act, floor = _run_position(result)
+    facts = result.transition.facts if result.transition is not None else {}
     return FullRunGateStats(
         seed=episode_seed,
-        steps=min(result.step_index, config.full_run_maximum_steps),
-        act1_cleared=act >= 2,
+        steps=min(result.step_index, episode_limit),
+        act1_cleared=max(max_act, act) >= 2,
         max_act=max(max_act, act),
         max_floor=max(max_floor, floor),
         revivals_used=int(_training_counter(result, "revivals_used")),
         player_hp_lost=_training_counter(result, "player_hp_lost"),
         decision_domains=tuple(sorted(domains)),
+        terminated=result.terminated,
+        run_won=bool(result.terminated and facts.get("combat_result") == "victory"),
+        terminal_reason=result.terminal_reason,
     )
 
 
@@ -393,8 +417,26 @@ def run_gate(
             for index in range(config.episodes)
         ]
         full_runs = [
-            _run_full_run_episode(backend, config, episode_index=index)
+            _run_full_run_episode(
+                backend,
+                config,
+                episode_index=index,
+                revival_budget=-1,
+                stop_after_act1=True,
+            )
             for index in range(config.full_run_episodes)
+        ]
+        terminal_runs = [
+            _run_full_run_episode(
+                backend,
+                config,
+                episode_index=index,
+                seed_offset=20_000,
+                revival_budget=config.terminal_run_revival_budget,
+                stop_after_act1=False,
+                maximum_steps=config.terminal_run_maximum_steps,
+            )
+            for index in range(config.terminal_run_episodes)
         ]
         resolved_exe = Path(backend.client._exe_path).resolve()
 
@@ -426,8 +468,22 @@ def run_gate(
             )
         if episode.revivals_used <= 0:
             raise RuntimeError(
-                f"full-run seed={episode.seed} reached Act 2 without exercising revival"
+                f"full-run seed={episode.seed} did not exercise native revival"
             )
+    for episode in terminal_runs:
+        if not episode.terminated:
+            raise RuntimeError(
+                f"bounded full-run seed={episode.seed} did not reach a typed "
+                f"game-over within {config.terminal_run_maximum_steps} model decisions"
+            )
+        if episode.revivals_used != config.terminal_run_revival_budget:
+            raise RuntimeError(
+                f"bounded full-run seed={episode.seed} terminated after "
+                f"{episode.revivals_used} revivals instead of exhausting "
+                f"budget={config.terminal_run_revival_budget}"
+            )
+    terminated_count = sum(episode.terminated for episode in terminal_runs)
+    run_wins = sum(episode.run_won for episode in terminal_runs)
     return {
         "version": GATE_VERSION,
         "passed": True,
@@ -467,6 +523,23 @@ def run_gate(
             "max_player_hp_lost": max(e.player_hp_lost for e in full_runs),
             "episodes_detail": [asdict(e) for e in full_runs],
         },
+        "terminal_probe": {
+            "episodes": config.terminal_run_episodes,
+            "revival_budget": config.terminal_run_revival_budget,
+            "terminal_runs": terminated_count,
+            "terminal_rate": terminated_count / config.terminal_run_episodes,
+            "run_wins": run_wins,
+            "run_win_rate": run_wins / config.terminal_run_episodes,
+            "mean_steps": statistics.fmean(e.steps for e in terminal_runs),
+            "max_steps": max(e.steps for e in terminal_runs),
+            "mean_revivals": statistics.fmean(
+                e.revivals_used for e in terminal_runs
+            ),
+            "mean_player_hp_lost": statistics.fmean(
+                e.player_hp_lost for e in terminal_runs
+            ),
+            "episodes_detail": [asdict(e) for e in terminal_runs],
+        },
     }
 
 
@@ -483,6 +556,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--full-run-episodes", type=int, default=3)
     parser.add_argument("--full-run-maximum-steps", type=int, default=3_000)
     parser.add_argument("--minimum-act1-clear-rate", type=float, default=1.0)
+    parser.add_argument("--terminal-run-episodes", type=int, default=3)
+    parser.add_argument("--terminal-run-maximum-steps", type=int, default=3_000)
+    parser.add_argument("--terminal-run-revival-budget", type=int, default=2)
     parser.add_argument("--output")
     return parser
 
@@ -500,6 +576,9 @@ def main(argv: list[str] | None = None) -> int:
         full_run_episodes=args.full_run_episodes,
         full_run_maximum_steps=args.full_run_maximum_steps,
         minimum_act1_clear_rate=args.minimum_act1_clear_rate,
+        terminal_run_episodes=args.terminal_run_episodes,
+        terminal_run_maximum_steps=args.terminal_run_maximum_steps,
+        terminal_run_revival_budget=args.terminal_run_revival_budget,
     )
     output = resolve_artifact_path(
         args.output,

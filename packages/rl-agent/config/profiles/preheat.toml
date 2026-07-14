@@ -52,7 +52,7 @@ scenario = "full-run"
 # A complete successful run is expected to fit comfortably inside this
 # budget.  The bound also prevents an untrained recurrent policy from spending
 # tens of thousands of decisions oscillating in a reversible selection UI.
-max_episode_steps = 3000
+max_episode_steps = 10000
 
 [curriculum]
 mode = "native-revival-preheat"

@@ -33,7 +33,7 @@ def test_profiles_use_recurrent_vtrace_v2_without_replay() -> None:
     assert preheat.environment.scenario == "full-run"
     assert preheat.curriculum.reward_objective == "run"
     assert preheat.environment.encounter_id is None
-    assert preheat.environment.max_episode_steps == 3_000
+    assert preheat.environment.max_episode_steps == 10_000
     assert preheat.runtime.evaluation_steps == (10_000, 25_000, 50_000)
     assert preheat.runtime.evaluation_episodes == 5
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)

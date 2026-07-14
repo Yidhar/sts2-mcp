@@ -186,10 +186,14 @@ combat smoke episodes, a separate `TUNNELER_WEAK` stress probe, and three
 complete-flow traversal episodes. It requires at least two native revivals
 within one uninterrupted combat, verifies exact counter deltas and enemy
 continuity across revival, rejects any non-terminal zero-action state, and
-requires at least a 99% typed combat victory rate. Every full-run probe must
-inject the native relic/budget, retain monotonic run-scoped counters, exercise
-build/combat/route domains, and enter Act 2. The combat portion also protects
-the `combat_post_end_pending -> combat_victory` adapter boundary.
+requires at least a 99% typed combat victory rate. Every unlimited-revival
+full-run traversal probe must inject the native relic/budget, retain monotonic
+run-scoped counters, exercise build/combat/route domains, and enter Act 2. A
+second set of bounded-revival full-run probes must consume its exact native
+budget and reach a typed terminal boundary. Separating traversal from
+termination avoids the contradictory requirement that an infinitely reviving
+random policy must die within a short fixed horizon. The combat portion also
+protects the `combat_post_end_pending -> combat_victory` adapter boundary.
 
 ## Deadlock diagnostics
 
