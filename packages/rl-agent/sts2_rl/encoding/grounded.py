@@ -278,6 +278,7 @@ _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "energy_cost",
         "max_upgrade_level",
         "price",
+        "star_cost",
         "upgrade_level",
         "upgrades",
     }
@@ -301,9 +302,11 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "class_name",
         "decision_domain",
         "facing",
+        "family",
         "intent_type",
         "next_move_id",
         "pile",
+        "power_type",
         "rarity",
         "room_model",
         "room_model_id",
@@ -313,6 +316,8 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "state_type",
         "target_type",
         "transport_kind",
+        "value_props",
+        "var_type",
         "visibility",
         "zone",
     }
@@ -387,6 +392,7 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "game_over",
         "hand",
         "hand_select",
+        "hover_tips",
         "intents",
         "intent",
         "item",
@@ -421,6 +427,8 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "treasure",
         "upgrade_preview",
         "keywords",
+        "tags",
+        "traits",
         "decision",
     }
 )
@@ -459,8 +467,21 @@ _CATEGORY_SLOT_COUNT: Final = 32
 _CATEGORY_SLOT_START: Final = _SUMMARY_SLOT_COUNT + len(_FIXED_NUMERIC_KEYS)
 _DYNAMIC_SLOT_COUNT: Final = 16
 _DYNAMIC_SLOT_START: Final = _CATEGORY_SLOT_START + _CATEGORY_SLOT_COUNT
+_DYNAMIC_VALUE_KEYS: Final[tuple[str, ...]] = (
+    "base_value",
+    "enchanted_value",
+    "current_value",
+    "int_value",
+    "was_just_upgraded",
+)
+_DYNAMIC_VALUE_SLOT_BY_KEY: Final[dict[str, int]] = {
+    key: _DYNAMIC_SLOT_START + index
+    for index, key in enumerate(_DYNAMIC_VALUE_KEYS)
+}
+_DYNAMIC_HASH_SLOT_START: Final = _DYNAMIC_SLOT_START + len(_DYNAMIC_VALUE_KEYS)
+_DYNAMIC_HASH_SLOT_COUNT: Final = _DYNAMIC_SLOT_COUNT - len(_DYNAMIC_VALUE_KEYS)
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-structural-encoding-v2"
+GROUNDING_ENCODING_VERSION: Final = "grounded-card-facts-encoding-v3"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -493,6 +514,9 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "category_slot_count": _CATEGORY_SLOT_COUNT,
         "dynamic_slot_start": _DYNAMIC_SLOT_START,
         "dynamic_slot_count": _DYNAMIC_SLOT_COUNT,
+        "dynamic_value_slots": _DYNAMIC_VALUE_SLOT_BY_KEY,
+        "dynamic_hash_slot_start": _DYNAMIC_HASH_SLOT_START,
+        "dynamic_hash_slot_count": _DYNAMIC_HASH_SLOT_COUNT,
         "world_excluded_keys": sorted(_WORLD_EXCLUDED_KEYS),
         "candidate_excluded_keys": sorted(_CANDIDATE_EXCLUDED_KEYS),
         "identity_keys": list(_IDENTITY_KEYS),
@@ -652,15 +676,120 @@ def _first_present(value: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
+def _canonical_card_labels(
+    value: Any,
+    *,
+    label: str,
+    fact_type: str,
+) -> list[dict[str, Any]]:
+    """Represent exact runtime enums as typed entity tokens.
+
+    These are not inferred semantic tags: every label must be emitted by the
+    game model (keyword, card tag, or factual lifecycle flag).
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values: Sequence[Any] = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, bytes):
+        values = value
+    else:
+        raise TypeError(f"{label} must be a string or sequence")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, Mapping):
+            identity = _first_present(item, "id", "name", "value", "type")
+        else:
+            identity = item
+        text = str(identity or "").strip()
+        if not text or text.lower() == "none" or text.lower() in seen:
+            continue
+        seen.add(text.lower())
+        result.append({"id": text, "type": fact_type})
+    return result
+
+
+def _canonical_dynamic_var(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one game-owned DynamicVar to a typed, collision-free value token."""
+
+    result: dict[str, Any] = {}
+    name = _first_present(value, "name", "id")
+    if name is not None and str(name).strip():
+        result["id"] = str(name).strip()
+    var_type = _first_present(value, "var_type", "dynamic_var_type", "class_name")
+    family = _first_present(value, "family", "effect_family")
+    if family is None:
+        family = var_type or "value"
+    result["type"] = str(family)
+    if var_type is not None and str(var_type).strip():
+        result["var_type"] = str(var_type).strip()
+    for key, aliases in {
+        "power_type": ("power_type", "power_id"),
+        "value_props": ("value_props", "props"),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None and str(item).strip():
+            result[key] = str(item).strip()
+    for key, aliases in {
+        "base_value": ("base_value",),
+        "enchanted_value": ("enchanted_value",),
+        # ``preview_value`` is a factual value calculated by CardModel hooks,
+        # not the retired action-effect preview.  Rename it so the engineered
+        # preview firewall remains closed outside this exact DynamicVar path.
+        "current_value": ("current_value", "preview_value"),
+        "int_value": ("int_value",),
+        "was_just_upgraded": ("was_just_upgraded",),
+    }.items():
+        item = _first_present(value, *aliases)
+        if item is not None:
+            result[key] = item
+    return result
+
+
+def _canonical_dynamic_vars(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        if _first_present(value, "name", "id", "base_value") is not None:
+            raw_values: Sequence[Any] = [value]
+        else:
+            raw_values = [
+                {"name": key, **dict(item)} if isinstance(item, Mapping) else {
+                    "name": key,
+                    "base_value": item,
+                    "current_value": item,
+                }
+                for key, item in value.items()
+            ]
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        raw_values = value
+    else:
+        raise TypeError("card.dynamic_vars must be a mapping or sequence")
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_values):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"card.dynamic_vars[{index}] must be a mapping")
+        normalized = _canonical_dynamic_var(item)
+        if normalized.get("id"):
+            result.append(normalized)
+    return result
+
+
 def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a card to facts observable on both maintained backends."""
+    """Project a card to exact runtime facts shared by maintained backends."""
 
     result: dict[str, Any] = {}
     aliases = {
         "id": ("id", "card_id", "model_id"),
         "type": ("type", "card_type"),
         "target_type": ("target_type",),
-        "cost": ("cost", "energy_cost", "resolved_energy_cost"),
+        # Prefer the live resolved cost. ``base_cost``/``is_x_cost`` are used
+        # by the pinned native catalog and remain useful for fail-closed
+        # catalog/fixture audits where no combat owner exists yet.
+        "cost": ("resolved_energy_cost", "cost", "energy_cost", "base_cost"),
+        "star_cost": ("star_cost", "current_star_cost"),
         "upgrade_level": ("upgrade_level", "current_upgrade_level"),
         "max_upgrade_level": ("max_upgrade_level",),
         "is_playable": ("is_playable", "playable"),
@@ -668,11 +797,56 @@ def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
         "exhaust": ("exhaust",),
         "ethereal": ("ethereal",),
         "retain": ("retain", "retained"),
+        "rarity": ("rarity",),
     }
     for canonical, source_keys in aliases.items():
         item = _first_present(value, *source_keys)
         if item is not None:
             result[canonical] = item
+    for field, fact_type in (
+        ("keywords", "card_keyword"),
+        ("tags", "card_tag"),
+        ("hover_tips", "card_hover_tip"),
+    ):
+        source = (
+            _first_present(value, "hover_tip_ids", "hover_tips")
+            if field == "hover_tips"
+            else _first_present(value, field)
+        )
+        labels = _canonical_card_labels(
+            source,
+            label=f"card.{field}",
+            fact_type=fact_type,
+        )
+        if labels:
+            result[field] = labels
+    traits = _canonical_card_labels(
+        _first_present(value, "traits"),
+        label="card.traits",
+        fact_type="card_trait",
+    )
+    for field, source_keys in (
+        ("costs_x", ("costs_x", "is_x_cost")),
+        ("has_star_cost_x", ("has_star_cost_x",)),
+        ("gains_block", ("gains_block",)),
+        ("has_turn_end_in_hand_effect", ("has_turn_end_in_hand_effect",)),
+        ("has_on_draw_effect", ("has_on_draw_effect",)),
+        ("exhaust_on_next_play", ("exhaust_on_next_play",)),
+    ):
+        if _first_present(value, *source_keys) is True:
+            traits.extend(
+                _canonical_card_labels(
+                    [field],
+                    label=f"card.{field}",
+                    fact_type="card_trait",
+                )
+            )
+    if traits:
+        deduplicated = {str(item["id"]).lower(): item for item in traits}
+        result["traits"] = list(deduplicated.values())
+    dynamic_vars = _canonical_dynamic_vars(_first_present(value, "dynamic_vars"))
+    if dynamic_vars:
+        result["dynamic_vars"] = dynamic_vars
     return result
 
 
@@ -1567,7 +1741,7 @@ class GroundedObservationEncoder:
         if not isinstance(value, bool | int | float):
             return False
         if "dynamic_vars" in normalized_path:
-            return isinstance(value, int | float) and not isinstance(value, bool)
+            return lowered in _DYNAMIC_VALUE_SLOT_BY_KEY
         identity = str(
             container.get("card_id")
             or container.get("id")
@@ -1739,12 +1913,15 @@ class GroundedObservationEncoder:
             normalized_key = _normalize_key(key)
             normalized_path = {_normalize_key(part) for part in path}
             if "dynamic_vars" in normalized_path:
-                digest = hashlib.sha256(
-                    f"dynamic\0{normalized_key}".encode()
-                ).digest()
-                slot = _DYNAMIC_SLOT_START + int.from_bytes(
-                    digest[:4], "big"
-                ) % _DYNAMIC_SLOT_COUNT
+                if normalized_key in _DYNAMIC_VALUE_SLOT_BY_KEY:
+                    slot = _DYNAMIC_VALUE_SLOT_BY_KEY[normalized_key]
+                else:  # pragma: no cover - guarded by _is_factual_numeric
+                    digest = hashlib.sha256(
+                        f"dynamic\0{normalized_key}".encode()
+                    ).digest()
+                    slot = _DYNAMIC_HASH_SLOT_START + int.from_bytes(
+                        digest[:4], "big"
+                    ) % _DYNAMIC_HASH_SLOT_COUNT
             else:
                 # `_is_factual_numeric` admits only reviewed fixed keys outside
                 # dynamic_vars.  Index directly so two mechanics never alias.

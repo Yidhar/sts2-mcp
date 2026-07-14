@@ -1,5 +1,5 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
-index ae63755..ac1ae52 100644
+index ae63755..4bf3d9d 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 @@ -806,7 +806,9 @@ internal static class Program
@@ -31,8 +31,45 @@ index ae63755..ac1ae52 100644
  			"confirm_selection" => CombatTrainingActionType.ConfirmSelection,
  			"cancel_selection" => CombatTrainingActionType.CancelSelection,
  			"use_potion" => CombatTrainingActionType.UsePotion,
+@@ -2035,7 +2039,7 @@ internal static class Program
+ 			})
+ 			.ToList();
+ 
+-		// cards：id / type / cost / rarity / target_type / tags / keywords / gains_block
++		// cards: exact runtime facts used by the model-facing card-facts ABI.
+ 		List<Dictionary<string, object?>> cards = ModelDb.AllCards
+ 			.OrderBy(static c => c.Id.Entry, StringComparer.Ordinal)
+ 			.Select(static c => new Dictionary<string, object?>
+@@ -2049,8 +2053,27 @@ internal static class Program
+ 				["base_cost"] = SafeBaseCost(c),
+ 				["is_x_cost"] = c.EnergyCost?.GetType().Name.Contains("XCost") ?? false,
+ 				["gains_block"] = c.GainsBlock,
++				["has_turn_end_in_hand_effect"] = c.HasTurnEndInHandEffect,
++				["has_on_draw_effect"] = CombatTrainingChoiceSnapshotBuilder.HasOnDrawEffect(c),
++				["exhaust_on_next_play"] = c.ExhaustOnNextPlay,
+ 				["tags"] = c.Tags.Select(t => t.ToString()).OrderBy(s => s, StringComparer.Ordinal).ToList(),
+ 				["keywords"] = c.CanonicalKeywords.Select(k => k.ToString()).OrderBy(s => s, StringComparer.Ordinal).ToList(),
++				["hover_tip_ids"] = CombatTrainingChoiceSnapshotBuilder.SafeCardHoverTipIds(c),
++				["dynamic_vars"] = CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(c)
++					.Select(static value => new Dictionary<string, object?>
++					{
++						["name"] = value.Name,
++						["var_type"] = value.VarType,
++						["family"] = value.Family,
++						["power_type"] = value.PowerType,
++						["value_props"] = value.ValueProps,
++						["base_value"] = value.BaseValue,
++						["enchanted_value"] = value.EnchantedValue,
++						["preview_value"] = value.PreviewValue,
++						["int_value"] = value.IntValue,
++						["was_just_upgraded"] = value.WasJustUpgraded
++					})
++					.ToList(),
+ 			})
+ 			.ToList();
+ 
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..6a74ce2 100644
+index 76abc62..39d8e45 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -46,6 +46,9 @@ public static class FullRunApiStateBuilder
@@ -93,8 +130,95 @@ index 76abc62..6a74ce2 100644
  		};
  	}
  
+@@ -709,10 +723,20 @@ public static class FullRunApiStateBuilder
+ 			type = card.Type.ToString(),
+ 			rarity = card.Rarity.ToString(),
+ 			cost = card.EnergyCost.GetWithModifiers(CostModifiers.All),
++			costs_x = card.EnergyCost.CostsX,
++			star_cost = SafeValue(() => card.GetStarCostWithModifiers(), card.CurrentStarCost),
++			has_star_cost_x = card.HasStarCostX,
+ 			is_upgraded = card.IsUpgraded,
+ 			target_type = card.TargetType.ToString(),
+ 			description = GetCardDescription(card),
+-			keywords = card.Keywords.Select(static keyword => keyword.ToString()).ToList()
++			keywords = card.Keywords.Select(static keyword => keyword.ToString()).ToList(),
++			tags = CombatTrainingChoiceSnapshotBuilder.SafeCardTags(card),
++			hover_tip_ids = CombatTrainingChoiceSnapshotBuilder.SafeCardHoverTipIds(card),
++			gains_block = card.GainsBlock,
++			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
++			has_on_draw_effect = CombatTrainingChoiceSnapshotBuilder.HasOnDrawEffect(card),
++			exhaust_on_next_play = card.ExhaustOnNextPlay,
++			dynamic_vars = ToApiDynamicVars(CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card))
+ 		};
+ 	}
+ 
+@@ -770,12 +794,22 @@ public static class FullRunApiStateBuilder
+ 			name = card.Title,
+ 			type = card.CardType,
+ 			cost = card.EnergyCost,
++			costs_x = card.CostsX,
++			star_cost = card.StarCost,
++			has_star_cost_x = card.HasStarCostX,
+ 			is_upgraded = card.IsUpgraded,
+ 			can_play = card.CanPlay,
+ 			target_type = SafeValue(() => card.TargetType.ToString(), string.Empty),
+ 			description = card.Description,
+ 			valid_target_ids = card.ValidTargetIds?.ToList() ?? new List<uint>(),
+-			keywords = card.Keywords?.ToList() ?? new List<string>()
++			keywords = card.Keywords?.ToList() ?? new List<string>(),
++			tags = card.Tags?.ToList() ?? new List<string>(),
++			hover_tip_ids = card.HoverTipIds?.ToList() ?? new List<string>(),
++			gains_block = card.GainsBlock,
++			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
++			has_on_draw_effect = card.HasOnDrawEffect,
++			exhaust_on_next_play = card.ExhaustOnNextPlay,
++			dynamic_vars = ToApiDynamicVars(card.DynamicVars)
+ 		};
+ 	}
+ 
+@@ -788,11 +822,39 @@ public static class FullRunApiStateBuilder
+ 			name = card.Title,
+ 			type = SafeValue(() => card.Type.ToString(), string.Empty),
+ 			cost = card.EnergyCost,
++			costs_x = card.CostsX,
++			star_cost = card.StarCost,
++			has_star_cost_x = card.HasStarCostX,
+ 			is_upgraded = card.IsUpgraded,
+-			target_type = SafeValue(() => card.TargetType.ToString(), string.Empty)
++			target_type = SafeValue(() => card.TargetType.ToString(), string.Empty),
++			keywords = card.Keywords?.ToList() ?? new List<string>(),
++			tags = card.Tags?.ToList() ?? new List<string>(),
++			hover_tip_ids = card.HoverTipIds?.ToList() ?? new List<string>(),
++			gains_block = card.GainsBlock,
++			has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
++			has_on_draw_effect = card.HasOnDrawEffect,
++			exhaust_on_next_play = card.ExhaustOnNextPlay,
++			dynamic_vars = ToApiDynamicVars(card.DynamicVars)
+ 		};
+ 	}
+ 
++	private static List<FullRunApiDynamicVar> ToApiDynamicVars(IEnumerable<CombatTrainingDynamicVarSnapshot>? dynamicVars)
++	{
++		return dynamicVars?.Select(static dynamicVar => new FullRunApiDynamicVar
++		{
++			name = dynamicVar.Name,
++			var_type = dynamicVar.VarType,
++			family = dynamicVar.Family,
++			power_type = dynamicVar.PowerType,
++			value_props = dynamicVar.ValueProps,
++			base_value = dynamicVar.BaseValue,
++			enchanted_value = dynamicVar.EnchantedValue,
++			preview_value = dynamicVar.PreviewValue,
++			int_value = dynamicVar.IntValue,
++			was_just_upgraded = dynamicVar.WasJustUpgraded
++		}).ToList() ?? new List<FullRunApiDynamicVar>();
++	}
++
+ 	private static string RewardTypeForUi(Reward reward)
+ 	{
+ 		return reward switch
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..9b9b774 100644
+index 15bb206..7c0bcf5 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 @@ -14,6 +14,10 @@ public sealed class FullRunApiAction
@@ -108,7 +232,74 @@ index 15bb206..9b9b774 100644
  	public int? slot { get; set; }
  
  	public uint? target_id { get; set; }
-@@ -166,6 +170,10 @@ public sealed class FullRunApiRelicOption
+@@ -105,6 +109,29 @@ public sealed class FullRunApiIntent
+ 	public int? repeats { get; set; }
+ }
+ 
++public sealed class FullRunApiDynamicVar
++{
++	public string? name { get; set; }
++
++	public string? var_type { get; set; }
++
++	public string? family { get; set; }
++
++	public string? power_type { get; set; }
++
++	public string? value_props { get; set; }
++
++	public decimal base_value { get; set; }
++
++	public decimal enchanted_value { get; set; }
++
++	public decimal preview_value { get; set; }
++
++	public int int_value { get; set; }
++
++	public bool was_just_upgraded { get; set; }
++}
++
+ public sealed class FullRunApiCardOption
+ {
+ 	public int index { get; set; }
+@@ -119,6 +146,12 @@ public sealed class FullRunApiCardOption
+ 
+ 	public int? cost { get; set; }
+ 
++	public bool costs_x { get; set; }
++
++	public int? star_cost { get; set; }
++
++	public bool has_star_cost_x { get; set; }
++
+ 	public bool is_upgraded { get; set; }
+ 
+ 	public bool? can_play { get; set; }
+@@ -129,9 +162,23 @@ public sealed class FullRunApiCardOption
+ 
+ 	public string? description { get; set; }
+ 
++	public bool gains_block { get; set; }
++
++	public bool has_turn_end_in_hand_effect { get; set; }
++
++	public bool has_on_draw_effect { get; set; }
++
++	public bool exhaust_on_next_play { get; set; }
++
+ 	public List<uint> valid_target_ids { get; set; } = new List<uint>();
+ 
+ 	public List<string> keywords { get; set; } = new List<string>();
++
++	public List<string> tags { get; set; } = new List<string>();
++
++	public List<string> hover_tip_ids { get; set; } = new List<string>();
++
++	public List<FullRunApiDynamicVar> dynamic_vars { get; set; } = new List<FullRunApiDynamicVar>();
+ }
+ 
+ public sealed class FullRunApiPotionState
+@@ -166,6 +213,10 @@ public sealed class FullRunApiRelicOption
  	public string? description { get; set; }
  
  	public int? counter { get; set; }
@@ -119,7 +310,7 @@ index 15bb206..9b9b774 100644
  }
  
  public sealed class FullRunApiPlayerState
-@@ -280,6 +288,12 @@ public sealed class FullRunApiHandSelectState
+@@ -280,6 +331,12 @@ public sealed class FullRunApiHandSelectState
  
  	public bool can_confirm { get; set; }
  
@@ -132,7 +323,7 @@ index 15bb206..9b9b774 100644
  	public List<FullRunApiCardOption> cards { get; set; } = new List<FullRunApiCardOption>();
  
  	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
-@@ -299,6 +313,10 @@ public sealed class FullRunApiCombatCardSelectionState
+@@ -299,6 +356,10 @@ public sealed class FullRunApiCombatCardSelectionState
  
  	public bool can_cancel { get; set; }
  
@@ -143,7 +334,7 @@ index 15bb206..9b9b774 100644
  	public List<FullRunApiCardOption> selectable_cards { get; set; } = new List<FullRunApiCardOption>();
  
  	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
-@@ -532,6 +550,12 @@ public sealed class FullRunApiState
+@@ -532,6 +593,12 @@ public sealed class FullRunApiState
  
  	public string? run_outcome { get; set; }
  
@@ -666,10 +857,18 @@ index 981b065..182d1f0 100644
 +	DeselectCardChoice = 8
  }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
-index be21d69..a92d68c 100644
+index be21d69..2fab22c 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
-@@ -31,8 +31,12 @@ public interface ICombatChoiceAdapter
+@@ -9,6 +9,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Entities.Multiplayer;
+ using MegaCrit.Sts2.Core.Localization;
++using MegaCrit.Sts2.Core.Localization.DynamicVars;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
+ using MegaCrit.Sts2.Core.Nodes.CommonUi;
+@@ -31,8 +32,12 @@ public interface ICombatChoiceAdapter
  
  	bool TrySelectHandCard(int handIndex, out string error);
  
@@ -682,7 +881,178 @@ index be21d69..a92d68c 100644
  	bool TryConfirmSelection(out string error);
  
  	bool TryCancelSelection(out string error);
-@@ -249,12 +253,39 @@ internal sealed class UiCombatChoiceAdapter : ICombatChoiceAdapter
+@@ -72,6 +77,7 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+ 			EnergyCost = NormalizeApiCardCost(card.EnergyCost.GetWithModifiers(CostModifiers.All), card.EnergyCost.CostsX),
+ 			CostsX = card.EnergyCost.CostsX,
+ 			StarCost = card.GetStarCostWithModifiers(),
++			HasStarCostX = card.HasStarCostX,
+ 			TargetType = card.TargetType,
+ 			CanPlay = card.CanPlay(),
+ 			RequiresTarget = CardRequiresTarget(card),
+@@ -80,10 +86,140 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+ 			Description = SafeCardDescription(card),
+ 			Keywords = SafeCardKeywords(card),
+ 			IsUpgraded = card.IsUpgraded,
+-			GainsBlock = card.GainsBlock
++			GainsBlock = card.GainsBlock,
++			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
++			HasOnDrawEffect = HasOnDrawEffect(card),
++			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			Tags = SafeCardTags(card),
++			HoverTipIds = SafeCardHoverTipIds(card),
++			DynamicVars = BuildDynamicVarSnapshots(card)
++		};
++	}
++
++	internal static List<CombatTrainingDynamicVarSnapshot> BuildDynamicVarSnapshots(CardModel card)
++	{
++		try
++		{
++			return card.DynamicVars.Values.Select(BuildDynamicVarSnapshot).ToList();
++		}
++		catch
++		{
++			return new List<CombatTrainingDynamicVarSnapshot>();
++		}
++	}
++
++	private static CombatTrainingDynamicVarSnapshot BuildDynamicVarSnapshot(DynamicVar dynamicVar)
++	{
++		Type runtimeType = dynamicVar.GetType();
++		Type? powerVarType = FindGenericBase(runtimeType, typeof(PowerVar<>));
++		return new CombatTrainingDynamicVarSnapshot
++		{
++			Name = dynamicVar.Name,
++			VarType = runtimeType.Name,
++			Family = DynamicVarFamily(dynamicVar, powerVarType),
++			PowerType = powerVarType?.GetGenericArguments()[0].Name,
++			ValueProps = DynamicVarValueProps(dynamicVar),
++			BaseValue = dynamicVar.BaseValue,
++			EnchantedValue = dynamicVar.EnchantedValue,
++			PreviewValue = dynamicVar.PreviewValue,
++			IntValue = dynamicVar.IntValue,
++			WasJustUpgraded = dynamicVar.WasJustUpgraded
++		};
++	}
++
++	private static Type? FindGenericBase(Type runtimeType, Type genericDefinition)
++	{
++		for (Type? type = runtimeType; type != null; type = type.BaseType)
++		{
++			if (type.IsGenericType && type.GetGenericTypeDefinition() == genericDefinition)
++			{
++				return type;
++			}
++		}
++		return null;
++	}
++
++	private static string DynamicVarFamily(DynamicVar dynamicVar, Type? powerVarType)
++	{
++		if (powerVarType != null)
++		{
++			return "power";
++		}
++		return dynamicVar switch
++		{
++			DamageVar or CalculatedDamageVar or ExtraDamageVar or OstyDamageVar => "damage",
++			BlockVar or CalculatedBlockVar => "block",
++			CardsVar => "cards",
++			EnergyVar => "energy",
++			RepeatVar => "repeat",
++			HpLossVar => "hp_loss",
++			HealVar => "heal",
++			MaxHpVar => "max_hp",
++			GoldVar => "gold",
++			StarsVar => "stars",
++			ForgeVar => "forge",
++			SummonVar => "summon",
++			BoolVar => "boolean",
++			StringVar => "string",
++			_ => "value"
++		};
++	}
++
++	private static string? DynamicVarValueProps(DynamicVar dynamicVar)
++	{
++		return dynamicVar switch
++		{
++			DamageVar damage => damage.Props.ToString(),
++			BlockVar block => block.Props.ToString(),
++			CalculatedDamageVar damage => damage.Props.ToString(),
++			CalculatedBlockVar block => block.Props.ToString(),
++			OstyDamageVar damage => damage.Props.ToString(),
++			_ => null
+ 		};
+ 	}
+ 
++	internal static bool HasOnDrawEffect(CardModel card)
++	{
++		try
++		{
++			Type? declaringType = card.GetType().GetMethod(nameof(AbstractModel.AfterCardDrawn))?.DeclaringType;
++			return declaringType != null && declaringType != typeof(AbstractModel);
++		}
++		catch
++		{
++			return false;
++		}
++	}
++
++	internal static List<string> SafeCardTags(CardModel card)
++	{
++		try
++		{
++			return card.Tags.Select(static tag => tag.ToString()).ToList();
++		}
++		catch
++		{
++			return new List<string>();
++		}
++	}
++
++	internal static List<string> SafeCardHoverTipIds(CardModel card)
++	{
++		try
++		{
++			return card.HoverTips
++				.Select(static hoverTip => hoverTip.Id)
++				.Where(static id => !string.IsNullOrWhiteSpace(id))
++				.Distinct(StringComparer.Ordinal)
++				.OrderBy(static id => id, StringComparer.Ordinal)
++				.ToList();
++		}
++		catch
++		{
++			return new List<string>();
++		}
++	}
++
+ 	private static string SafeCardDescription(CardModel card)
+ 	{
+ 		try
+@@ -162,10 +298,19 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+ 			EnergyCost = card.EnergyCost.GetWithModifiers(CostModifiers.All),
+ 			CostsX = card.EnergyCost.CostsX,
+ 			StarCost = card.GetStarCostWithModifiers(),
++			HasStarCostX = card.HasStarCostX,
+ 			TargetType = card.TargetType,
+ 			SourcePile = card.Pile?.Type.ToString() ?? PileType.None.ToString(),
+ 			IsUpgraded = card.IsUpgraded,
+-			IsUpgradable = card.IsUpgradable
++			IsUpgradable = card.IsUpgradable,
++			GainsBlock = card.GainsBlock,
++			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
++			HasOnDrawEffect = HasOnDrawEffect(card),
++			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			Tags = SafeCardTags(card),
++			Keywords = SafeCardKeywords(card),
++			HoverTipIds = SafeCardHoverTipIds(card),
++			DynamicVars = BuildDynamicVarSnapshots(card)
+ 		};
+ 	}
+ 
+@@ -249,12 +394,39 @@ internal sealed class UiCombatChoiceAdapter : ICombatChoiceAdapter
  		return true;
  	}
  
@@ -722,8 +1092,106 @@ index be21d69..a92d68c 100644
  	public bool TryConfirmSelection(out string error)
  	{
  		error = "";
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
+index 245c978..b5a40fa 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
+@@ -133,6 +133,34 @@ public sealed class CombatTrainingPowerSnapshot
+ 	public int Amount { get; set; }
+ }
+ 
++/// <summary>
++/// A value emitted by the card model itself.  This is deliberately a generic
++/// runtime fact rather than a hand-maintained card-effect table: new cards and
++/// upgraded values flow through the same contract automatically.
++/// </summary>
++public sealed class CombatTrainingDynamicVarSnapshot
++{
++	public string Name { get; set; } = "";
++
++	public string VarType { get; set; } = "";
++
++	public string Family { get; set; } = "";
++
++	public string? PowerType { get; set; }
++
++	public string? ValueProps { get; set; }
++
++	public decimal BaseValue { get; set; }
++
++	public decimal EnchantedValue { get; set; }
++
++	public decimal PreviewValue { get; set; }
++
++	public int IntValue { get; set; }
++
++	public bool WasJustUpgraded { get; set; }
++}
++
+ public sealed class CombatTrainingHandCardSnapshot
+ {
+ 	public int HandIndex { get; set; }
+@@ -149,6 +177,8 @@ public sealed class CombatTrainingHandCardSnapshot
+ 
+ 	public int StarCost { get; set; }
+ 
++	public bool HasStarCostX { get; set; }
++
+ 	public TargetType TargetType { get; set; }
+ 
+ 	public bool CanPlay { get; set; }
+@@ -165,7 +195,19 @@ public sealed class CombatTrainingHandCardSnapshot
+ 
+ 	public bool GainsBlock { get; set; }
+ 
++	public bool HasTurnEndInHandEffect { get; set; }
++
++	public bool HasOnDrawEffect { get; set; }
++
++	public bool ExhaustOnNextPlay { get; set; }
++
++	public List<string> Tags { get; set; } = new List<string>();
++
+ 	public List<string> Keywords { get; set; } = new List<string>();
++
++	public List<string> HoverTipIds { get; set; } = new List<string>();
++
++	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
+ }
+ 
+ public sealed class CombatTrainingPileSnapshot
+@@ -250,6 +292,8 @@ public sealed class CombatTrainingSelectableCardSnapshot
+ 
+ 	public int StarCost { get; set; }
+ 
++	public bool HasStarCostX { get; set; }
++
+ 	public TargetType TargetType { get; set; }
+ 
+ 	public string SourcePile { get; set; } = "";
+@@ -257,4 +301,20 @@ public sealed class CombatTrainingSelectableCardSnapshot
+ 	public bool IsUpgraded { get; set; }
+ 
+ 	public bool IsUpgradable { get; set; }
++
++	public bool GainsBlock { get; set; }
++
++	public bool HasTurnEndInHandEffect { get; set; }
++
++	public bool HasOnDrawEffect { get; set; }
++
++	public bool ExhaustOnNextPlay { get; set; }
++
++	public List<string> Tags { get; set; } = new List<string>();
++
++	public List<string> Keywords { get; set; } = new List<string>();
++
++	public List<string> HoverTipIds { get; set; } = new List<string>();
++
++	public List<CombatTrainingDynamicVarSnapshot> DynamicVars { get; set; } = new List<CombatTrainingDynamicVarSnapshot>();
+ }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
-index f0f6080..a984018 100644
+index f0f6080..2c977b9 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 @@ -149,6 +149,23 @@ public sealed class CombatTrainingEnvService
@@ -774,7 +1242,30 @@ index f0f6080..a984018 100644
  		case CombatTrainingActionType.ConfirmSelection:
  			{
  				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: null);
-@@ -712,6 +746,14 @@ public sealed class CombatTrainingEnvService
+@@ -561,6 +595,7 @@ public sealed class CombatTrainingEnvService
+ 			IsUpgraded = card.IsUpgraded,
+ 			CostsX = card.EnergyCost.CostsX,
+ 			StarCost = card.GetStarCostWithModifiers(),
++			HasStarCostX = card.HasStarCostX,
+ 			TargetType = card.TargetType,
+ 			CanPlay = card.CanPlay(),
+ 			RequiresTarget = CardRequiresTarget(card),
+@@ -568,7 +603,13 @@ public sealed class CombatTrainingEnvService
+ 			CardType = card.Type.ToString(),
+ 			Description = SafeCardDescription(card),
+ 			Keywords = SafeCardKeywords(card),
+-			GainsBlock = card.GainsBlock
++			GainsBlock = card.GainsBlock,
++			HasTurnEndInHandEffect = card.HasTurnEndInHandEffect,
++			HasOnDrawEffect = CombatTrainingChoiceSnapshotBuilder.HasOnDrawEffect(card),
++			ExhaustOnNextPlay = card.ExhaustOnNextPlay,
++			Tags = CombatTrainingChoiceSnapshotBuilder.SafeCardTags(card),
++			HoverTipIds = CombatTrainingChoiceSnapshotBuilder.SafeCardHoverTipIds(card),
++			DynamicVars = CombatTrainingChoiceSnapshotBuilder.BuildDynamicVarSnapshots(card)
+ 		};
+ 	}
+ 
+@@ -712,6 +753,14 @@ public sealed class CombatTrainingEnvService
  		{
  			return BuildRejectedResult("SelectCardChoice requires choice_index.");
  		}

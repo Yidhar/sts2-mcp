@@ -254,15 +254,91 @@ internal static partial class BridgeGameApi
             return null;
         }
 
+        var runtimeType = dynamicVar.GetType();
+        var powerVarType = FindGenericBase(runtimeType, "PowerVar`1");
         return new
         {
             name = dynamicVar.Name,
+            var_type = runtimeType.Name,
+            family = ResolveDynamicVarFamily(runtimeType, powerVarType is not null),
+            power_type = powerVarType?.GetGenericArguments()[0].Name,
+            value_props = GetHiddenPropertyObjectValue(dynamicVar, "Props")?.ToString(),
             int_value = dynamicVar.IntValue,
             preview_value = dynamicVar.PreviewValue,
             base_value = dynamicVar.BaseValue,
             enchanted_value = dynamicVar.EnchantedValue,
             was_just_upgraded = dynamicVar.WasJustUpgraded
         };
+    }
+
+    private static Type? FindGenericBase(Type runtimeType, string genericTypeName)
+    {
+        for (var type = runtimeType; type is not null; type = type.BaseType)
+        {
+            if (type.IsGenericType && type.GetGenericTypeDefinition().Name == genericTypeName)
+            {
+                return type;
+            }
+        }
+
+        return null;
+    }
+
+    private static string ResolveDynamicVarFamily(Type runtimeType, bool isPowerVar)
+    {
+        if (isPowerVar)
+        {
+            return "power";
+        }
+
+        return runtimeType.Name switch
+        {
+            "DamageVar" or "CalculatedDamageVar" or "ExtraDamageVar" or "OstyDamageVar" => "damage",
+            "BlockVar" or "CalculatedBlockVar" => "block",
+            "CardsVar" => "cards",
+            "EnergyVar" => "energy",
+            "RepeatVar" => "repeat",
+            "HpLossVar" => "hp_loss",
+            "HealVar" => "heal",
+            "MaxHpVar" => "max_hp",
+            "GoldVar" => "gold",
+            "StarsVar" => "stars",
+            "ForgeVar" => "forge",
+            "SummonVar" => "summon",
+            "BoolVar" => "boolean",
+            "StringVar" => "string",
+            _ => "value"
+        };
+    }
+
+    private static bool HasCardOnDrawEffect(CardModel card)
+    {
+        try
+        {
+            var declaringType = card.GetType().GetMethod(nameof(AbstractModel.AfterCardDrawn))?.DeclaringType;
+            return declaringType is not null && declaringType != typeof(AbstractModel);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string[] BuildCardHoverTipIds(CardModel card)
+    {
+        try
+        {
+            return card.HoverTips
+                .Select(static hoverTip => hoverTip.Id)
+                .Where(static id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(static id => id, StringComparer.Ordinal)
+                .ToArray();
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
     }
 
 

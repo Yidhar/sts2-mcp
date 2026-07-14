@@ -79,9 +79,9 @@ class ModelConfig:
     zone_vocab_size: int = 32
     order_vocab_size: int = 128
     domain_count: int = 8
-    max_world_tokens: int = 256
+    max_world_tokens: int = 512
     max_candidates: int = 96
-    max_candidate_local_tokens: int = 16
+    max_candidate_local_tokens: int = 24
 
     def __post_init__(self) -> None:
         for name in (

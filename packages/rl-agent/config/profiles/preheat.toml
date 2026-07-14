@@ -21,9 +21,9 @@ entity_vocab_size = 8192
 zone_vocab_size = 32
 order_vocab_size = 128
 domain_count = 8
-max_world_tokens = 256
+max_world_tokens = 512
 max_candidates = 96
-max_candidate_local_tokens = 16
+max_candidate_local_tokens = 24
 
 [optimization]
 learning_rate = 0.0003

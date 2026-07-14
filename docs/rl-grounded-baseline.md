@@ -48,6 +48,13 @@ The default contract is:
 - parameters: 3,971,778;
 - output heads: masked policy and scalar value only.
 
+The model-facing observation uses the versioned
+[`grounded-card-facts-encoding-v3`](./card-facts-abi.md) contract. Card effects
+come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
+description parsing or curated card rules. The default capacity is 512 world
+tokens and 24 local tokens per candidate; overflow is an error, never silent
+truncation. This encoder change invalidates every earlier checkpoint.
+
 Candidate permutation must permute policy outputs in the same way while leaving
 the world encoding, recurrent state and value unchanged. Opaque dispatch handles
 are not model inputs. Only the environment legality mask can suppress an action.

@@ -262,6 +262,12 @@ internal static partial class BridgeGameApi
             .Distinct(StringComparer.Ordinal)
             .OrderBy(static keyword => keyword, StringComparer.Ordinal)
             .ToArray();
+        var tagNames = card.Tags
+            .Where(static tag => tag != CardTag.None)
+            .Select(static tag => tag.ToString())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(static tag => tag, StringComparer.Ordinal)
+            .ToArray();
         var afflictions = BuildCardModifierPayloads(card, "afflictions");
         var enchantments = BuildCardModifierPayloads(card, "enchantments");
 
@@ -295,6 +301,12 @@ internal static partial class BridgeGameApi
             current_star_cost = currentStarCost,
             has_star_cost_x = card.HasStarCostX,
             keywords = keywordNames,
+            tags = tagNames,
+            hover_tip_ids = BuildCardHoverTipIds(card),
+            gains_block = card.GainsBlock,
+            has_turn_end_in_hand_effect = card.HasTurnEndInHandEffect,
+            has_on_draw_effect = HasCardOnDrawEffect(card),
+            exhaust_on_next_play = card.ExhaustOnNextPlay,
             dynamic_vars = BuildDynamicVarPayloads(previewVars),
             afflictions,
             enchantments

@@ -13,7 +13,8 @@ Use these sources in this order:
 2. [`../release-manifest.json`](../release-manifest.json) for component versions.
 3. [`architecture.md`](./architecture.md) and
    [`architecture/target-architecture.md`](./architecture/target-architecture.md),
-   plus [`rl-grounded-baseline.md`](./rl-grounded-baseline.md)
+   plus [`rl-grounded-baseline.md`](./rl-grounded-baseline.md) and
+   [`card-facts-abi.md`](./card-facts-abi.md)
    for boundaries and ownership.
 4. Accepted decisions under [`adr/`](./adr).
 5. [`migration/README.md`](./migration/README.md) and
@@ -46,6 +47,7 @@ decisions from a launcher, compatibility wrapper, or build script.
 - [Artifact inventory and externalization](./runbooks/artifacts.md)
 - [WSL ROCm training](./runbooks/wsl-rocm-training.md)
 - [HeadlessSim build identity](./headless-simulator-identity.md)
+- [Runtime card-facts ABI](./card-facts-abi.md)
 - [Release validation and evidence](./runbooks/release.md)
 - [V2 migration guide](./migration/README.md)
 

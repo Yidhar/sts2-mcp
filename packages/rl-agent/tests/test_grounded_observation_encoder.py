@@ -13,6 +13,12 @@ from sts2_rl.encoding import (
     GroundedObservationEncoder,
     grounding_encoding_identity,
 )
+from sts2_rl.encoding.grounded import (
+    _DYNAMIC_VALUE_SLOT_BY_KEY,
+    _bounded_number,
+    _canonical_card,
+    _hash_id,
+)
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 
 
@@ -1046,3 +1052,262 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
     }
     with pytest.raises(ValueError, match="candidate-local observation exceeds"):
         local_limited.encode(_observation(), [action])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_type", "expected_effects", "expected_labels"),
+    [
+        (
+            {
+                "id": "CARD.STRIKE_IRONCLAD",
+                "type": "Attack",
+                "tags": ["Strike"],
+                "dynamic_vars": [
+                    {
+                        "name": "Damage",
+                        "var_type": "DamageVar",
+                        "family": "damage",
+                        "base_value": 6,
+                        "preview_value": 6,
+                        "int_value": 6,
+                    }
+                ],
+            },
+            "Attack",
+            {("Damage", "damage", 6)},
+            {("Strike", "card_tag")},
+        ),
+        (
+            {
+                "id": "CARD.DEFEND_IRONCLAD",
+                "type": "Skill",
+                "gains_block": True,
+                "tags": ["Defend"],
+                "dynamic_vars": [
+                    {
+                        "name": "Block",
+                        "var_type": "BlockVar",
+                        "family": "block",
+                        "base_value": 5,
+                        "preview_value": 5,
+                        "int_value": 5,
+                    }
+                ],
+            },
+            "Skill",
+            {("Block", "block", 5)},
+            {("Defend", "card_tag"), ("gains_block", "card_trait")},
+        ),
+        (
+            {
+                "id": "CARD.BURN",
+                "type": "Status",
+                "keywords": ["Unplayable"],
+                "has_turn_end_in_hand_effect": True,
+                "dynamic_vars": [
+                    {
+                        "name": "Damage",
+                        "var_type": "DamageVar",
+                        "family": "damage",
+                        "base_value": 2,
+                        "preview_value": 2,
+                        "int_value": 2,
+                    }
+                ],
+            },
+            "Status",
+            {("Damage", "damage", 2)},
+            {
+                ("Unplayable", "card_keyword"),
+                ("has_turn_end_in_hand_effect", "card_trait"),
+            },
+        ),
+        (
+            {
+                "id": "CARD.VOID",
+                "type": "Status",
+                "keywords": ["Unplayable", "Ethereal"],
+                "has_on_draw_effect": True,
+                "dynamic_vars": [
+                    {
+                        "name": "Energy",
+                        "var_type": "EnergyVar",
+                        "family": "energy",
+                        "base_value": 1,
+                        "preview_value": 1,
+                        "int_value": 1,
+                    }
+                ],
+            },
+            "Status",
+            {("Energy", "energy", 1)},
+            {
+                ("Unplayable", "card_keyword"),
+                ("Ethereal", "card_keyword"),
+                ("has_on_draw_effect", "card_trait"),
+            },
+        ),
+        (
+            {
+                "id": "CARD.SHAME",
+                "type": "Curse",
+                "keywords": ["Unplayable"],
+                "has_turn_end_in_hand_effect": True,
+                "dynamic_vars": [
+                    {
+                        "name": "Frail",
+                        "var_type": "DynamicVar",
+                        "family": "value",
+                        "base_value": 1,
+                        "preview_value": 1,
+                        "int_value": 1,
+                    }
+                ],
+            },
+            "Curse",
+            {("Frail", "value", 1)},
+            {
+                ("Unplayable", "card_keyword"),
+                ("has_turn_end_in_hand_effect", "card_trait"),
+            },
+        ),
+        (
+            {
+                "id": "CARD.DEADLY_POISON",
+                "type": "Skill",
+                "dynamic_vars": [
+                    {
+                        "name": "PoisonPower",
+                        "var_type": "PowerVar`1",
+                        "family": "power",
+                        "power_type": "PoisonPower",
+                        "base_value": 5,
+                        "preview_value": 5,
+                        "int_value": 5,
+                    }
+                ],
+            },
+            "Skill",
+            {("PoisonPower", "power", 5)},
+            set(),
+        ),
+        (
+            {
+                "id": "CARD.BURNING_PACT",
+                "type": "Skill",
+                "hover_tip_ids": [
+                    "LocString with Title=static_hover_tips.exhaust.title"
+                ],
+                "dynamic_vars": [
+                    {
+                        "name": "Cards",
+                        "var_type": "CardsVar",
+                        "family": "cards",
+                        "base_value": 2,
+                        "preview_value": 2,
+                        "int_value": 2,
+                    }
+                ],
+            },
+            "Skill",
+            {("Cards", "cards", 2)},
+            {
+                (
+                    "LocString with Title=static_hover_tips.exhaust.title",
+                    "card_hover_tip",
+                )
+            },
+        ),
+    ],
+)
+def test_runtime_card_facts_preserve_representative_mechanics(
+    raw: dict[str, object],
+    expected_type: str,
+    expected_effects: set[tuple[str, str, int]],
+    expected_labels: set[tuple[str, str]],
+) -> None:
+    card = _canonical_card(raw)
+    assert card["type"] == expected_type
+    effects = {
+        (str(effect["id"]), str(effect["type"]), int(effect["current_value"]))
+        for effect in card.get("dynamic_vars", [])
+    }
+    labels = {
+        (str(label["id"]), str(label["type"]))
+        for field in ("keywords", "tags", "hover_tips", "traits")
+        for label in card.get(field, [])
+    }
+    assert effects == expected_effects
+    assert labels == expected_labels
+
+
+def test_dynamic_var_values_use_named_non_colliding_feature_slots() -> None:
+    encoder = _encoder()
+    observation = _observation()
+    observation["player"]["hand"] = [
+        {
+            "id": "CARD.TEST",
+            "type": "Attack",
+            "dynamic_vars": [
+                {
+                    "name": "Damage",
+                    "var_type": "DamageVar",
+                    "family": "damage",
+                    "base_value": 7,
+                    "enchanted_value": 8,
+                    "preview_value": 9,
+                    "int_value": 7,
+                    "was_just_upgraded": True,
+                }
+            ],
+        }
+    ]
+    encoded = encoder.encode(observation, _actions())
+    entity_id = _hash_id("entity", "Damage", encoder.config.entity_vocab_size)
+    rows = torch.nonzero(
+        encoded.batch.world.entity_ids[0] == entity_id,
+        as_tuple=False,
+    ).flatten()
+    assert rows.numel() == 1
+    features = encoded.batch.world.features[0, int(rows.item())]
+    expected = {
+        "base_value": 7,
+        "enchanted_value": 8,
+        "current_value": 9,
+        "int_value": 7,
+        "was_just_upgraded": True,
+    }
+    assert len(set(_DYNAMIC_VALUE_SLOT_BY_KEY.values())) == len(expected)
+    for key, raw_value in expected.items():
+        assert features[_DYNAMIC_VALUE_SLOT_BY_KEY[key]].item() == pytest.approx(
+            _bounded_number(raw_value)
+        )
+
+
+def test_card_cost_rarity_and_x_cost_transport_aliases_are_preserved() -> None:
+    live = _canonical_card(
+        {
+            "id": "CARD.TEST_LIVE",
+            "rarity": "Rare",
+            "canonical_energy_cost": 3,
+            "resolved_energy_cost": 1,
+            "costs_x": False,
+        }
+    )
+    assert live["cost"] == 1
+    assert live["rarity"] == "Rare"
+
+    catalog = _canonical_card(
+        {
+            "card_id": "TEST_X",
+            "rarity": "Uncommon",
+            "base_cost": -1,
+            "is_x_cost": True,
+        }
+    )
+    assert catalog["cost"] == -1
+    assert catalog["rarity"] == "Uncommon"
+    assert {
+        (str(trait["id"]), str(trait["type"]))
+        for trait in catalog["traits"]
+    } == {("costs_x", "card_trait")}
