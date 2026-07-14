@@ -33,6 +33,8 @@ def _simulator(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
     lock_path, lock = _lock(tmp_path)
     executable = tmp_path / "HeadlessSim.exe"
     executable.write_bytes(b"pinned-headless-sim")
+    managed_assembly = tmp_path / "HeadlessSim.dll"
+    managed_assembly.write_bytes(b"pinned-headless-sim-managed-code")
     payload: dict[str, object] = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
         "component": "HeadlessSim",
@@ -53,6 +55,11 @@ def _simulator(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
             "size_bytes": executable.stat().st_size,
             "sha256": sha256_file(executable),
         },
+        "managed_binary": {
+            "file_name": managed_assembly.name,
+            "size_bytes": managed_assembly.stat().st_size,
+            "sha256": sha256_file(managed_assembly),
+        },
     }
     identity_path = simulator_identity_path(executable)
     identity_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -65,6 +72,8 @@ def _simulator_for_repository_lock(tmp_path: Path) -> Path:
     lock = load_sts2_ai_lock()
     executable = tmp_path / "HeadlessSim.exe"
     executable.write_bytes(b"repository-pinned-test-simulator")
+    managed_assembly = tmp_path / "HeadlessSim.dll"
+    managed_assembly.write_bytes(b"repository-pinned-test-managed-code")
     payload = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
         "component": "HeadlessSim",
@@ -85,6 +94,11 @@ def _simulator_for_repository_lock(tmp_path: Path) -> Path:
             "size_bytes": executable.stat().st_size,
             "sha256": sha256_file(executable),
         },
+        "managed_binary": {
+            "file_name": managed_assembly.name,
+            "size_bytes": managed_assembly.stat().st_size,
+            "sha256": sha256_file(managed_assembly),
+        },
     }
     simulator_identity_path(executable).write_text(json.dumps(payload), encoding="utf-8")
     return executable
@@ -102,18 +116,25 @@ def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     assert identity.executable == executable.resolve()
     assert identity.source_commit == "1" * 40
     assert identity.binary_sha256 == sha256_file(executable)
+    assert identity.managed_assembly_sha256 == sha256_file(
+        executable.with_suffix(".dll")
+    )
     assert identity.build_configuration == "Release"
 
 
 def test_missing_sidecar_is_refused_without_path_or_version_fallback(tmp_path: Path) -> None:
     executable = tmp_path / "HeadlessSim.exe"
     executable.write_bytes(b"fake")
+    executable.with_suffix(".dll").write_bytes(b"fake-managed-code")
 
     with pytest.raises(SimulatorIdentityError, match="sidecar is missing.*unverified binaries are refused"):
         verify_headless_simulator(executable, lock_path=_lock(tmp_path)[0])
 
 
-@pytest.mark.parametrize("mutation", ["source", "binary", "configuration"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["source", "binary", "managed_binary", "configuration"],
+)
 def test_wrong_source_binary_or_build_configuration_is_refused(
     tmp_path: Path,
     mutation: str,
@@ -128,6 +149,9 @@ def test_wrong_source_binary_or_build_configuration_is_refused(
     elif mutation == "binary":
         executable.write_bytes(b"different-binary")
         expected = "size mismatch|SHA-256 mismatch"
+    elif mutation == "managed_binary":
+        executable.with_suffix(".dll").write_bytes(b"different-managed-binary")
+        expected = "managed assembly size mismatch|managed assembly SHA-256 mismatch"
     else:
         build = payload["build"]
         assert isinstance(build, dict)
@@ -162,6 +186,10 @@ def test_verified_identity_can_be_persisted_as_external_audit(
     assert audit.parent == artifact_root / "logs" / "simulator-preflight"
     assert payload["event"] == "simulator_identity_verified"
     assert payload["binary"]["sha256"] == identity.binary_sha256
+    assert (
+        payload["managed_binary"]["sha256"]
+        == identity.managed_assembly_sha256
+    )
 
 
 def test_training_cli_gates_and_pins_headless_executable_before_run(

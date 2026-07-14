@@ -192,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
     ).resolve(strict=False)
     if not executable.is_file():
         raise SystemExit(f"Release HeadlessSim output is missing after build: {executable}")
+    managed_assembly = executable.with_suffix(".dll")
+    if not managed_assembly.is_file():
+        raise SystemExit(
+            "Release HeadlessSim managed assembly is missing after build: "
+            f"{managed_assembly}"
+        )
     identity_path = simulator_identity_path(executable)
     payload = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
@@ -214,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:
             "file_name": executable.name,
             "size_bytes": executable.stat().st_size,
             "sha256": sha256_file(executable),
+        },
+        "managed_binary": {
+            "file_name": managed_assembly.name,
+            "size_bytes": managed_assembly.stat().st_size,
+            "sha256": sha256_file(managed_assembly),
         },
     }
     _atomic_write_json(identity_path, payload)

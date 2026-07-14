@@ -3,8 +3,9 @@
 The simulator is built from a separately restored repository, so its path or
 assembly version alone cannot prove which source produced it.  A verified
 build writes a sidecar identity next to the executable.  Formal headless
-training accepts the executable only when the sidecar agrees with both the
-repository lock and the executable bytes on disk.
+training accepts the executable only when the sidecar agrees with the
+repository lock, the native apphost, and the managed assembly that contains
+the simulator implementation.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import Any
 
 from sts2_rl.artifacts import resolve_artifact_path
 
-IDENTITY_SCHEMA_VERSION = "1.1.0"
+IDENTITY_SCHEMA_VERSION = "1.2.0"
 IDENTITY_SUFFIX = ".identity.json"
 REQUIRED_BUILD_CONFIGURATION = "Release"
 REQUIRED_TARGET_FRAMEWORK = "net9.0"
@@ -33,9 +34,12 @@ class SimulatorIdentityError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class VerifiedSimulatorIdentity:
     executable: Path
+    managed_assembly: Path
     identity_path: Path
     binary_sha256: str
     binary_size_bytes: int
+    managed_assembly_sha256: str
+    managed_assembly_size_bytes: int
     source_commit: str
     source_tree: str
     source_url: str
@@ -48,12 +52,17 @@ class VerifiedSimulatorIdentity:
         return {
             "schema_version": IDENTITY_SCHEMA_VERSION,
             "component": "HeadlessSim",
-            "verification": "lock-and-binary-sha256",
+            "verification": "lock-apphost-and-managed-assembly-sha256",
             "executable": str(self.executable),
+            "managed_assembly": str(self.managed_assembly),
             "identity_path": str(self.identity_path),
             "binary": {
                 "sha256": self.binary_sha256,
                 "size_bytes": self.binary_size_bytes,
+            },
+            "managed_binary": {
+                "sha256": self.managed_assembly_sha256,
+                "size_bytes": self.managed_assembly_size_bytes,
             },
             "source": {
                 "url": self.source_url,
@@ -127,6 +136,13 @@ def simulator_identity_path(executable: str | os.PathLike[str]) -> Path:
     return path.with_name(path.name + IDENTITY_SUFFIX)
 
 
+def simulator_managed_assembly_path(executable: str | os.PathLike[str]) -> Path:
+    """Return the managed DLL that carries the HeadlessSim implementation."""
+
+    path = Path(executable).expanduser().resolve(strict=False)
+    return path.with_suffix(".dll")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -157,7 +173,7 @@ def verify_headless_simulator(
     identity_path: str | os.PathLike[str] | None = None,
     lock_path: str | os.PathLike[str] | None = None,
 ) -> VerifiedSimulatorIdentity:
-    """Verify pinned source provenance and the exact executable bytes.
+    """Verify pinned source provenance and exact apphost/assembly bytes.
 
     No path-based or product-version fallback is accepted.  Tests that use a
     fake in-memory backend remain unaffected because they do not launch a real
@@ -167,6 +183,11 @@ def verify_headless_simulator(
     exe = Path(executable).expanduser().resolve(strict=False)
     if not exe.is_file():
         raise SimulatorIdentityError(f"HeadlessSim executable does not exist: {exe}")
+    managed_assembly = simulator_managed_assembly_path(exe)
+    if not managed_assembly.is_file():
+        raise SimulatorIdentityError(
+            f"HeadlessSim managed assembly does not exist: {managed_assembly}"
+        )
     sidecar = (
         Path(identity_path).expanduser().resolve(strict=False)
         if identity_path is not None
@@ -191,6 +212,7 @@ def verify_headless_simulator(
 
     source = _mapping(root.get("source"), label="source")
     binary = _mapping(root.get("binary"), label="binary")
+    managed_binary = _mapping(root.get("managed_binary"), label="managed_binary")
     build = _mapping(root.get("build"), label="build")
     lock = load_sts2_ai_lock(lock_path)
     expected_source = {
@@ -235,6 +257,45 @@ def verify_headless_simulator(
             f"HeadlessSim SHA-256 mismatch: identity={recorded_hash}, executable={actual_hash}"
         )
 
+    recorded_managed_name = _text(managed_binary, "file_name", label="managed_binary")
+    if recorded_managed_name != managed_assembly.name:
+        raise SimulatorIdentityError(
+            "HeadlessSim managed assembly file-name mismatch: "
+            f"identity={recorded_managed_name!r}, assembly={managed_assembly.name!r}"
+        )
+    recorded_managed_hash = _text(
+        managed_binary,
+        "sha256",
+        label="managed_binary",
+    ).lower()
+    if len(recorded_managed_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in recorded_managed_hash
+    ):
+        raise SimulatorIdentityError(
+            "simulator identity managed_binary.sha256 must be a lowercase SHA-256 digest"
+        )
+    recorded_managed_size = managed_binary.get("size_bytes")
+    if (
+        isinstance(recorded_managed_size, bool)
+        or not isinstance(recorded_managed_size, int)
+        or recorded_managed_size < 1
+    ):
+        raise SimulatorIdentityError(
+            "simulator identity managed_binary.size_bytes must be a positive integer"
+        )
+    actual_managed_size = managed_assembly.stat().st_size
+    if actual_managed_size != recorded_managed_size:
+        raise SimulatorIdentityError(
+            "HeadlessSim managed assembly size mismatch: "
+            f"identity={recorded_managed_size}, assembly={actual_managed_size}"
+        )
+    actual_managed_hash = sha256_file(managed_assembly)
+    if actual_managed_hash != recorded_managed_hash:
+        raise SimulatorIdentityError(
+            "HeadlessSim managed assembly SHA-256 mismatch: "
+            f"identity={recorded_managed_hash}, assembly={actual_managed_hash}"
+        )
+
     configuration = _text(build, "configuration", label="build")
     target_framework = _text(build, "target_framework", label="build")
     dotnet_sdk = _text(build, "dotnet_sdk", label="build")
@@ -248,9 +309,12 @@ def verify_headless_simulator(
         )
     return VerifiedSimulatorIdentity(
         executable=exe,
+        managed_assembly=managed_assembly,
         identity_path=sidecar,
         binary_sha256=actual_hash,
         binary_size_bytes=actual_size,
+        managed_assembly_sha256=actual_managed_hash,
+        managed_assembly_size_bytes=actual_managed_size,
         source_commit=expected_source["commit"],
         source_tree=expected_source["tree"],
         source_url=expected_source["url"],
@@ -298,6 +362,7 @@ __all__ = [
     "repository_root",
     "sha256_file",
     "simulator_identity_path",
+    "simulator_managed_assembly_path",
     "verify_headless_simulator",
     "write_preflight_audit",
 ]
