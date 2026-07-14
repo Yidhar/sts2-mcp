@@ -1,5 +1,38 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+index ae63755..ac1ae52 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+@@ -806,7 +806,9 @@ internal static class Program
+ 			"play_card" => CombatTrainingActionType.PlayCard,
+ 			"end_turn" => CombatTrainingActionType.EndTurn,
+ 			"select_hand_card" => CombatTrainingActionType.SelectHandCard,
++			"deselect_hand_card" => CombatTrainingActionType.DeselectHandCard,
+ 			"select_card_option" => CombatTrainingActionType.SelectCardChoice,
++			"deselect_card_option" => CombatTrainingActionType.DeselectCardChoice,
+ 			"confirm_selection" => CombatTrainingActionType.ConfirmSelection,
+ 			"cancel_selection" => CombatTrainingActionType.CancelSelection,
+ 			"use_potion" => CombatTrainingActionType.UsePotion,
+@@ -817,7 +819,7 @@ internal static class Program
+ 		if (chosenIdx >= 0)
+ 		{
+ 			// select_card_option 走 ChoiceIndex;其他 (play_card/select_hand_card)走 HandIndex
+-			if (type == CombatTrainingActionType.SelectCardChoice)
++			if (type is CombatTrainingActionType.SelectCardChoice or CombatTrainingActionType.DeselectCardChoice)
+ 			{
+ 				req.ChoiceIndex = chosenIdx;
+ 			}
+@@ -1930,7 +1932,9 @@ internal static class Program
+ 			"play_card" => CombatTrainingActionType.PlayCard,
+ 			"end_turn" => CombatTrainingActionType.EndTurn,
+ 			"select_hand_card" => CombatTrainingActionType.SelectHandCard,
++			"deselect_hand_card" => CombatTrainingActionType.DeselectHandCard,
+ 			"select_card_option" => CombatTrainingActionType.SelectCardChoice,
++			"deselect_card_option" => CombatTrainingActionType.DeselectCardChoice,
+ 			"confirm_selection" => CombatTrainingActionType.ConfirmSelection,
+ 			"cancel_selection" => CombatTrainingActionType.CancelSelection,
+ 			"use_potion" => CombatTrainingActionType.UsePotion,
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..6ff72c5 100644
+index 76abc62..6a74ce2 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -46,6 +46,9 @@ public static class FullRunApiStateBuilder
@@ -12,7 +45,44 @@ index 76abc62..6ff72c5 100644
  			run = new FullRunApiRun
  			{
  				character_id = snapshot.CharacterId,
-@@ -695,7 +698,9 @@ public static class FullRunApiStateBuilder
+@@ -464,6 +467,9 @@ public static class FullRunApiStateBuilder
+ 			min_select = selection.MinSelect,
+ 			max_select = selection.MaxSelect,
+ 			can_confirm = selection.CanConfirm,
++			can_cancel = selection.Cancelable,
++			selected_count = selection.SelectedCards.Count,
++			remaining_select = Math.Max(0, selection.MaxSelect - selection.SelectedCards.Count),
+ 			cards = selection.SelectableCards.Select(ToApiHandCardOption).ToList(),
+ 			selected_cards = selection.SelectedCards.Select(ToApiHandCardOption).ToList()
+ 		};
+@@ -479,6 +485,8 @@ public static class FullRunApiStateBuilder
+ 			max_select = selection.MaxSelect,
+ 			can_confirm = selection.CanConfirm,
+ 			can_cancel = selection.Cancelable,
++			selected_count = selection.SelectedCards.Count,
++			remaining_select = Math.Max(0, selection.MaxSelect - selection.SelectedCards.Count),
+ 			selectable_cards = selection.SelectableCards.Select(ToApiSelectableCardOption).ToList(),
+ 			selected_cards = selection.SelectedCards.Select(ToApiSelectableCardOption).ToList()
+ 		};
+@@ -626,6 +634,8 @@ public static class FullRunApiStateBuilder
+ 			col = action.Col,
+ 			row = action.Row,
+ 			card_index = action.CardIndex,
++			selection_operation = action.SelectionOperation,
++			is_selected = action.IsSelected,
+ 			card_id = action.CardId,
+ 			card_type = action.CardType,
+ 			card_rarity = action.CardRarity,
+@@ -654,6 +664,8 @@ public static class FullRunApiStateBuilder
+ 			col = action.col,
+ 			row = action.row,
+ 			card_index = action.card_index,
++			selection_operation = action.selection_operation,
++			is_selected = action.is_selected,
+ 			card_id = action.card_id,
+ 			card_type = action.card_type,
+ 			card_rarity = action.card_rarity,
+@@ -695,7 +707,9 @@ public static class FullRunApiStateBuilder
  			name = SafeGetText(() => relic.Title),
  			rarity = relic.Rarity.ToString(),
  			description = SafeGetText(() => relic.DynamicDescription),
@@ -24,10 +94,21 @@ index 76abc62..6ff72c5 100644
  	}
  
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..ce74c23 100644
+index 15bb206..9b9b774 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-@@ -166,6 +166,10 @@ public sealed class FullRunApiRelicOption
+@@ -14,6 +14,10 @@ public sealed class FullRunApiAction
+ 
+ 	public int? card_index { get; set; }
+ 
++	public string? selection_operation { get; set; }
++
++	public bool? is_selected { get; set; }
++
+ 	public int? slot { get; set; }
+ 
+ 	public uint? target_id { get; set; }
+@@ -166,6 +170,10 @@ public sealed class FullRunApiRelicOption
  	public string? description { get; set; }
  
  	public int? counter { get; set; }
@@ -38,7 +119,31 @@ index 15bb206..ce74c23 100644
  }
  
  public sealed class FullRunApiPlayerState
-@@ -532,6 +536,12 @@ public sealed class FullRunApiState
+@@ -280,6 +288,12 @@ public sealed class FullRunApiHandSelectState
+ 
+ 	public bool can_confirm { get; set; }
+ 
++	public bool can_cancel { get; set; }
++
++	public int selected_count { get; set; }
++
++	public int remaining_select { get; set; }
++
+ 	public List<FullRunApiCardOption> cards { get; set; } = new List<FullRunApiCardOption>();
+ 
+ 	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
+@@ -299,6 +313,10 @@ public sealed class FullRunApiCombatCardSelectionState
+ 
+ 	public bool can_cancel { get; set; }
+ 
++	public int selected_count { get; set; }
++
++	public int remaining_select { get; set; }
++
+ 	public List<FullRunApiCardOption> selectable_cards { get; set; } = new List<FullRunApiCardOption>();
+ 
+ 	public List<FullRunApiCardOption> selected_cards { get; set; } = new List<FullRunApiCardOption>();
+@@ -532,6 +550,12 @@ public sealed class FullRunApiState
  
  	public string? run_outcome { get; set; }
  
@@ -51,8 +156,111 @@ index 15bb206..ce74c23 100644
  	public FullRunApiRun run { get; set; } = new FullRunApiRun();
  
  	public List<FullRunApiAction> legal_actions { get; set; } = new List<FullRunApiAction>();
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
+index 29357a3..8843304 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
+@@ -135,27 +135,35 @@ internal sealed class FullRunSimulationChoiceBridge : ICombatChoiceAdapter, IHan
+ 
+ 		public IReadOnlyList<CardModel> SelectedCards => _selectedCards;
+ 
+-		public IEnumerable<CardModel> SelectableCards => Options.Where((CardModel card) => !_selectedCards.Contains(card));
++		public bool CanSelectMore => _selectedCards.Count < Prefs.MaxSelect;
+ 
+-		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectableChoices => Options.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card)).Where((valueTuple) => !_selectedCards.Contains(valueTuple.Card));
++		public IEnumerable<CardModel> SelectableCards => CanSelectMore
++			? Options.Where((CardModel card) => !_selectedCards.Contains(card))
++			: Enumerable.Empty<CardModel>();
++
++		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectableChoices => CanSelectMore
++			? Options.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card)).Where((valueTuple) => !_selectedCards.Contains(valueTuple.Card))
++			: Enumerable.Empty<(int ChoiceIndex, CardModel Card)>();
++
++		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectedChoices => Options
++			.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card))
++			.Where((valueTuple) => _selectedCards.Contains(valueTuple.Card));
+ 
+ 		public bool CanConfirm => _selectedCards.Count >= Prefs.MinSelect && _selectedCards.Count <= Prefs.MaxSelect;
+ 
+-		public void Select(CardModel card)
++		public bool Select(CardModel card)
+ 		{
+-			if (_selectedCards.Contains(card))
+-			{
+-				return;
+-			}
+-			if (Mode == "UpgradeSelect" && _selectedCards.Count > 0)
+-			{
+-				_selectedCards.Clear();
+-			}
+-			else if (_selectedCards.Count >= Prefs.MaxSelect && _selectedCards.Count > 0)
++			if (_selectedCards.Contains(card) || !CanSelectMore)
+ 			{
+-				_selectedCards.RemoveAt(_selectedCards.Count - 1);
++				return false;
+ 			}
+ 			_selectedCards.Add(card);
++			return true;
++		}
++
++		public bool Deselect(CardModel card)
++		{
++			return _selectedCards.Remove(card);
+ 		}
+ 	}
+ 
+@@ -477,6 +485,24 @@ internal sealed class FullRunSimulationChoiceBridge : ICombatChoiceAdapter, IHan
+ 		return true;
+ 	}
+ 
++	public bool TryDeselectHandCard(int handIndex, out string error)
++	{
++		error = "";
++		PendingCardSelection? selection = _pendingCardSelection;
++		if (selection == null || !selection.IsHandSelection)
++		{
++			error = "Hand card selection is not active.";
++			return false;
++		}
++		CardModel? card = selection.SelectedCards.FirstOrDefault((CardModel candidate) => CombatTrainingChoiceSnapshotBuilder.GetHandIndex(candidate) == handIndex);
++		if (card == null || !selection.Deselect(card))
++		{
++			error = $"Hand index {handIndex} is not selected in the current hand selection prompt.";
++			return false;
++		}
++		return true;
++	}
++
+ 	public bool TrySelectCardChoice(int choiceIndex, out string error)
+ 	{
+ 		error = "";
+@@ -496,6 +522,24 @@ internal sealed class FullRunSimulationChoiceBridge : ICombatChoiceAdapter, IHan
+ 		return true;
+ 	}
+ 
++	public bool TryDeselectCardChoice(int choiceIndex, out string error)
++	{
++		error = "";
++		PendingCardSelection? selection = _pendingCardSelection;
++		if (selection == null || selection.IsHandSelection)
++		{
++			error = "Card selection is not active.";
++			return false;
++		}
++		(int ChoiceIndex, CardModel Card) choice = selection.SelectedChoices.FirstOrDefault((valueTuple) => valueTuple.ChoiceIndex == choiceIndex);
++		if (choice.Card == null || !selection.Deselect(choice.Card))
++		{
++			error = $"Choice index {choiceIndex} is not selected in the current card selection prompt.";
++			return false;
++		}
++		return true;
++	}
++
+ 	public bool TryConfirmSelection(out string error)
+ 	{
+ 		error = "";
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
-index 6f1ecf4..f0b3d4b 100644
+index 6f1ecf4..10841df 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
 @@ -30,6 +30,12 @@ public sealed class SimulationBuildSpec
@@ -68,8 +276,19 @@ index 6f1ecf4..f0b3d4b 100644
  	[JsonPropertyName("current_hp")]
  	public int? CurrentHp { get; set; }
  
+@@ -106,6 +112,10 @@ public sealed class FullRunSimulationLegalAction
+ 
+ 	public int? CardIndex { get; set; }
+ 
++	public string? SelectionOperation { get; set; }
++
++	public bool? IsSelected { get; set; }
++
+ 	public int? Slot { get; set; }
+ 
+ 	public uint? TargetId { get; set; }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
-index 4093373..4ebbac4 100644
+index 4093373..7347075 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
 @@ -295,6 +295,22 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
@@ -95,11 +314,209 @@ index 4093373..4ebbac4 100644
  		return actions;
  	}
  
+@@ -450,6 +466,21 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 			actions.Add(new FullRunSimulationLegalAction
+ 			{
+ 				Action = "select_card",
++				SelectionOperation = "select",
++				IsSelected = false,
++				Index = card.ChoiceIndex,
++				CardIndex = card.ChoiceIndex,
++				Label = card.Title,
++				IsSupported = true
++			});
++		}
++		foreach (CombatTrainingSelectableCardSnapshot card in selection.SelectedCards)
++		{
++			actions.Add(new FullRunSimulationLegalAction
++			{
++				Action = "deselect_card",
++				SelectionOperation = "deselect",
++				IsSelected = true,
+ 				Index = card.ChoiceIndex,
+ 				CardIndex = card.ChoiceIndex,
+ 				Label = card.Title,
+@@ -461,6 +492,7 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 			actions.Add(new FullRunSimulationLegalAction
+ 			{
+ 				Action = "confirm_selection",
++				SelectionOperation = "confirm",
+ 				Label = "Confirm",
+ 				IsSupported = true
+ 			});
+@@ -470,6 +502,7 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 			actions.Add(new FullRunSimulationLegalAction
+ 			{
+ 				Action = "cancel_selection",
++				SelectionOperation = "cancel_prompt",
+ 				Label = "Cancel",
+ 				IsSupported = true
+ 			});
+@@ -607,6 +640,30 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 		return actions;
+ 	}
+ 
++	private static void AppendCombatSelectionTerminalActions(List<FullRunSimulationLegalAction> actions, bool canConfirm, bool canCancel)
++	{
++		if (canConfirm)
++		{
++			actions.Add(new FullRunSimulationLegalAction
++			{
++				Action = "combat_confirm_selection",
++				SelectionOperation = "confirm",
++				Label = "Confirm",
++				IsSupported = true
++			});
++		}
++		if (canCancel)
++		{
++			actions.Add(new FullRunSimulationLegalAction
++			{
++				Action = "combat_cancel_selection",
++				SelectionOperation = "cancel_prompt",
++				Label = "Cancel",
++				IsSupported = true
++			});
++		}
++	}
++
+ 	private static List<FullRunSimulationLegalAction> BuildCombatLegalActions(Player localPlayer, FullRunSimulationStateSnapshot snapshot)
+ 	{
+ 		List<FullRunSimulationLegalAction> actions = new List<FullRunSimulationLegalAction>();
+@@ -654,45 +711,58 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 					actions.Add(new FullRunSimulationLegalAction
+ 					{
+ 						Action = "combat_select_card",
++						SelectionOperation = "select",
++						IsSelected = false,
+ 						CardIndex = card.HandIndex,
+ 						Label = card.Title,
+ 						IsSupported = true
+ 					});
+ 				}
+-				if (combatState.HandSelection.CanConfirm)
++				foreach (CombatTrainingHandCardSnapshot card in combatState.HandSelection.SelectedCards)
+ 				{
+ 					actions.Add(new FullRunSimulationLegalAction
+ 					{
+-						Action = "combat_confirm_selection",
+-						Label = "Confirm",
++						Action = "combat_deselect_card",
++						SelectionOperation = "deselect",
++						IsSelected = true,
++						CardIndex = card.HandIndex,
++						Label = card.Title,
+ 						IsSupported = true
+ 					});
+ 				}
++				AppendCombatSelectionTerminalActions(actions, combatState.HandSelection.CanConfirm, combatState.HandSelection.Cancelable);
+ 				return actions;
+ 			}
+ 			if (combatState.IsCardSelectionActive && combatState.CardSelection != null)
+ 			{
+-				foreach (CombatTrainingSelectableCardSnapshot card2 in combatState.CardSelection.SelectableCards)
++				foreach (CombatTrainingSelectableCardSnapshot card in combatState.CardSelection.SelectableCards)
+ 				{
+ 					actions.Add(new FullRunSimulationLegalAction
+ 					{
+ 						Action = "combat_select_card",
+-						CardIndex = card2.ChoiceIndex,
+-						Label = card2.Title,
++						SelectionOperation = "select",
++						IsSelected = false,
++						CardIndex = card.ChoiceIndex,
++						Label = card.Title,
+ 						IsSupported = true
+ 					});
+ 				}
+-				if (combatState.CardSelection.CanConfirm)
++				foreach (CombatTrainingSelectableCardSnapshot card in combatState.CardSelection.SelectedCards)
+ 				{
+ 					actions.Add(new FullRunSimulationLegalAction
+ 					{
+-						Action = "combat_confirm_selection",
+-						Label = "Confirm",
++						Action = "combat_deselect_card",
++						SelectionOperation = "deselect",
++						IsSelected = true,
++						CardIndex = card.ChoiceIndex,
++						Label = card.Title,
+ 						IsSupported = true
+ 					});
+ 				}
++				AppendCombatSelectionTerminalActions(actions, combatState.CardSelection.CanConfirm, combatState.CardSelection.Cancelable);
+ 				return actions;
+ 			}
++
+ 			if (!combatState.IsPlayPhase || combatState.PlayerActionsDisabled || combatState.IsActionQueueRunning)
+ 			{
+ 				Godot.GD.PrintErr($"[BuildCombatLegalActions] Returning empty: IsPlayPhase={combatState.IsPlayPhase} PlayerActionsDisabled={combatState.PlayerActionsDisabled} IsActionQueueRunning={combatState.IsActionQueueRunning} PlayerHP={combatState.Player?.CurrentHp}");
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
-index 217a7c3..94c52f6 100644
+index 217a7c3..a7d1ae3 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
-@@ -2697,10 +2697,21 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+@@ -763,6 +763,24 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 					Accepted = true,
+ 					State = await WaitForStateChangeAsync(state)
+ 				};
++			case "deselect_card":
++				if (state.StateType != "card_select")
++				{
++					return BuildRejected("deselect_card is only valid from card_select.", "full_run_invalid_state");
++				}
++				if (!action.Index.HasValue)
++				{
++					return BuildRejected("deselect_card requires an index.", "full_run_action_required");
++				}
++				if (!FullRunSimulationChoiceBridge.Instance.TryDeselectCardChoice(action.Index.Value, out string cardDeselectError))
++				{
++					return BuildRejected(cardDeselectError, "full_run_card_deselect_not_found");
++				}
++				return new FullRunSimulationStepResult
++				{
++					Accepted = true,
++					State = await WaitForStateChangeAsync(state)
++				};
+ 			case "confirm_selection":
+ 				if (state.StateType != "card_select")
+ 				{
+@@ -826,7 +844,9 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			case "play_card":
+ 			case "end_turn":
+ 			case "combat_select_card":
++			case "combat_deselect_card":
+ 			case "combat_confirm_selection":
++			case "combat_cancel_selection":
+ 			case "select_card_option":
+ 			case "use_potion":
+ 				return await StepCombatAsync(state, actionType, action);
+@@ -1155,6 +1175,13 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 					HandIndex = action.CardIndex ?? action.HandIndex ?? action.Index,
+ 					ChoiceIndex = action.CardIndex ?? action.HandIndex ?? action.Index
+ 				};
++			case "combat_deselect_card":
++				return new CombatTrainingActionRequest
++				{
++					Type = state.StateType == "hand_select" ? CombatTrainingActionType.DeselectHandCard : CombatTrainingActionType.DeselectCardChoice,
++					HandIndex = action.CardIndex ?? action.HandIndex ?? action.Index,
++					ChoiceIndex = action.CardIndex ?? action.HandIndex ?? action.Index
++				};
+ 			case "select_card_option":
+ 				return new CombatTrainingActionRequest
+ 				{
+@@ -1166,6 +1193,11 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				{
+ 					Type = CombatTrainingActionType.ConfirmSelection
+ 				};
++			case "combat_cancel_selection":
++				return new CombatTrainingActionRequest
++				{
++					Type = CombatTrainingActionType.CancelSelection
++				};
+ 			case "use_potion":
+ 				return new CombatTrainingActionRequest
+ 				{
+@@ -2697,10 +2729,21 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
  			return false;
  		}
  		EventModel localEvent = eventRoom.LocalMutableEvent;
@@ -235,6 +652,246 @@ index 0000000..6dacd8a
 +		PlayerHpLost = checked(PlayerHpLost + amount);
 +	}
 +}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
+index 981b065..182d1f0 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
+@@ -8,5 +8,7 @@ public enum CombatTrainingActionType
+ 	ConfirmSelection = 3,
+ 	CancelSelection = 4,
+ 	SelectCardChoice = 5,
+-	UsePotion = 6
++	UsePotion = 6,
++	DeselectHandCard = 7,
++	DeselectCardChoice = 8
+ }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
+index be21d69..a92d68c 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
+@@ -31,8 +31,12 @@ public interface ICombatChoiceAdapter
+ 
+ 	bool TrySelectHandCard(int handIndex, out string error);
+ 
++	bool TryDeselectHandCard(int handIndex, out string error);
++
+ 	bool TrySelectCardChoice(int choiceIndex, out string error);
+ 
++	bool TryDeselectCardChoice(int choiceIndex, out string error);
++
+ 	bool TryConfirmSelection(out string error);
+ 
+ 	bool TryCancelSelection(out string error);
+@@ -249,12 +253,39 @@ internal sealed class UiCombatChoiceAdapter : ICombatChoiceAdapter
+ 		return true;
+ 	}
+ 
++	public bool TryDeselectHandCard(int handIndex, out string error)
++	{
++		error = "";
++		if (!_hand.IsInCardSelection)
++		{
++			error = "Hand card selection is not active.";
++			return false;
++		}
++		NSelectedHandCardContainer? selectedContainer = _hand.GetNodeOrNull<NSelectedHandCardContainer>("%SelectedHandCardContainer");
++		NCardHolder? holder = selectedContainer?.Holders.FirstOrDefault(candidate =>
++			candidate.CardNode != null &&
++			CombatTrainingChoiceSnapshotBuilder.GetHandIndex(candidate.CardNode.Model) == handIndex);
++		if (holder == null)
++		{
++			error = $"Hand index {handIndex} is not selected in the current hand selection prompt.";
++			return false;
++		}
++		holder.EmitSignal(NCardHolder.SignalName.Pressed, holder);
++		return true;
++	}
++
+ 	public bool TrySelectCardChoice(int choiceIndex, out string error)
+ 	{
+ 		error = "CardSelection is not supported by the UI-backed combat choice adapter yet.";
+ 		return false;
+ 	}
+ 
++	public bool TryDeselectCardChoice(int choiceIndex, out string error)
++	{
++		error = "CardSelection is not supported by the UI-backed combat choice adapter yet.";
++		return false;
++	}
++
+ 	public bool TryConfirmSelection(out string error)
+ 	{
+ 		error = "";
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
+index f0f6080..a984018 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
+@@ -149,6 +149,23 @@ public sealed class CombatTrainingEnvService
+ 				}
+ 				break;
+ 			}
++		case CombatTrainingActionType.DeselectHandCard:
++			{
++				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: true);
++				if (validationFailure != null)
++				{
++					return validationFailure;
++				}
++				if (!action.HandIndex.HasValue)
++				{
++					return BuildRejectedResult("DeselectHandCard requires hand_index.");
++				}
++				if (!choiceAdapter.TryDeselectHandCard(action.HandIndex.Value, out string error))
++				{
++					return BuildRejectedResult(error);
++				}
++				break;
++			}
+ 		case CombatTrainingActionType.SelectCardChoice:
+ 			{
+ 				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: false);
+@@ -166,6 +183,23 @@ public sealed class CombatTrainingEnvService
+ 				}
+ 				break;
+ 			}
++		case CombatTrainingActionType.DeselectCardChoice:
++			{
++				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: false);
++				if (validationFailure != null)
++				{
++					return validationFailure;
++				}
++				if (!action.ChoiceIndex.HasValue)
++				{
++					return BuildRejectedResult("DeselectCardChoice requires choice_index.");
++				}
++				if (!choiceAdapter.TryDeselectCardChoice(action.ChoiceIndex.Value, out string error))
++				{
++					return BuildRejectedResult(error);
++				}
++				break;
++			}
+ 		case CombatTrainingActionType.ConfirmSelection:
+ 			{
+ 				CombatTrainingStepResult? validationFailure = TryValidateSelectionRequest(action, choiceAdapter, requireHandSelection: null);
+@@ -712,6 +746,14 @@ public sealed class CombatTrainingEnvService
+ 		{
+ 			return BuildRejectedResult("SelectCardChoice requires choice_index.");
+ 		}
++		if (action.Type == CombatTrainingActionType.DeselectHandCard && !action.HandIndex.HasValue)
++		{
++			return BuildRejectedResult("DeselectHandCard requires hand_index.");
++		}
++		if (action.Type == CombatTrainingActionType.DeselectCardChoice && !action.ChoiceIndex.HasValue)
++		{
++			return BuildRejectedResult("DeselectCardChoice requires choice_index.");
++		}
+ 		return null;
+ 	}
+ 
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
+index 46e3b00..56fc5a1 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
+@@ -37,27 +37,35 @@ internal sealed class CombatTrainingSimulatorChoiceBridge : ICombatChoiceAdapter
+ 
+ 		public IReadOnlyList<CardModel> SelectedCards => _selectedCards;
+ 
+-		public IEnumerable<CardModel> SelectableCards => Options.Where((CardModel card) => !_selectedCards.Contains(card));
++		public bool CanSelectMore => _selectedCards.Count < Prefs.MaxSelect;
+ 
+-		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectableChoices => Options.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card)).Where((valueTuple) => !_selectedCards.Contains(valueTuple.Card));
++		public IEnumerable<CardModel> SelectableCards => CanSelectMore
++			? Options.Where((CardModel card) => !_selectedCards.Contains(card))
++			: Enumerable.Empty<CardModel>();
++
++		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectableChoices => CanSelectMore
++			? Options.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card)).Where((valueTuple) => !_selectedCards.Contains(valueTuple.Card))
++			: Enumerable.Empty<(int ChoiceIndex, CardModel Card)>();
++
++		public IEnumerable<(int ChoiceIndex, CardModel Card)> SelectedChoices => Options
++			.Select((CardModel card, int index) => (ChoiceIndex: index, Card: card))
++			.Where((valueTuple) => _selectedCards.Contains(valueTuple.Card));
+ 
+ 		public bool CanConfirm => _selectedCards.Count >= Prefs.MinSelect && _selectedCards.Count <= Prefs.MaxSelect;
+ 
+-		public void Select(CardModel card)
++		public bool Select(CardModel card)
+ 		{
+-			if (_selectedCards.Contains(card))
+-			{
+-				return;
+-			}
+-			if (Mode == "UpgradeSelect" && _selectedCards.Count > 0)
+-			{
+-				_selectedCards.Clear();
+-			}
+-			else if (_selectedCards.Count >= Prefs.MaxSelect && _selectedCards.Count > 0)
++			if (_selectedCards.Contains(card) || !CanSelectMore)
+ 			{
+-				_selectedCards.RemoveAt(_selectedCards.Count - 1);
++				return false;
+ 			}
+ 			_selectedCards.Add(card);
++			return true;
++		}
++
++		public bool Deselect(CardModel card)
++		{
++			return _selectedCards.Remove(card);
+ 		}
+ 	}
+ 
+@@ -155,6 +163,24 @@ internal sealed class CombatTrainingSimulatorChoiceBridge : ICombatChoiceAdapter
+ 		return true;
+ 	}
+ 
++	public bool TryDeselectHandCard(int handIndex, out string error)
++	{
++		error = "";
++		PendingCardSelection? selection = _pendingSelection;
++		if (selection == null || !selection.IsHandSelection)
++		{
++			error = "Hand card selection is not active.";
++			return false;
++		}
++		CardModel? card = selection.SelectedCards.FirstOrDefault((CardModel candidate) => CombatTrainingChoiceSnapshotBuilder.GetHandIndex(candidate) == handIndex);
++		if (card == null || !selection.Deselect(card))
++		{
++			error = $"Hand index {handIndex} is not selected in the current hand selection prompt.";
++			return false;
++		}
++		return true;
++	}
++
+ 	public bool TrySelectCardChoice(int choiceIndex, out string error)
+ 	{
+ 		error = "";
+@@ -174,6 +200,24 @@ internal sealed class CombatTrainingSimulatorChoiceBridge : ICombatChoiceAdapter
+ 		return true;
+ 	}
+ 
++	public bool TryDeselectCardChoice(int choiceIndex, out string error)
++	{
++		error = "";
++		PendingCardSelection? selection = _pendingSelection;
++		if (selection == null || selection.IsHandSelection)
++		{
++			error = "Card selection is not active.";
++			return false;
++		}
++		(int ChoiceIndex, CardModel Card) choice = selection.SelectedChoices.FirstOrDefault((valueTuple) => valueTuple.ChoiceIndex == choiceIndex);
++		if (choice.Card == null || !selection.Deselect(choice.Card))
++		{
++			error = $"Choice index {choiceIndex} is not selected in the current card selection prompt.";
++			return false;
++		}
++		return true;
++	}
++
+ 	public bool TryConfirmSelection(out string error)
+ 	{
+ 		error = "";
 diff --git a/src/Core/Entities/Creatures/Creature.cs b/src/Core/Entities/Creatures/Creature.cs
 index 644a57f..c8c963e 100644
 --- a/src/Core/Entities/Creatures/Creature.cs

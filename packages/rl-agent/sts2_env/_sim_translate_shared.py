@@ -22,13 +22,18 @@ _SIM_KIND_TO_TRANSPORT_KIND: dict[str, str] = {
     "choose_character": "startup",
     "embark": "startup",
     "select_card": "card_selection",
+    "deselect_card": "card_selection",
     "select_hand_card": "card_selection",
+    "deselect_hand_card": "card_selection",
     "confirm_selection": "card_selection",
     "cancel_selection": "card_selection",
     "choose_card_select_option": "card_selection",
     "select_card_option": "card_selection",
+    "deselect_card_option": "card_selection",
     "combat_select_card": "card_selection",
+    "combat_deselect_card": "card_selection",
     "combat_confirm_selection": "card_selection",
+    "combat_cancel_selection": "card_selection",
     "skip_rewards": "proceed",
     "claim_reward": "reward",
     "claim_relic": "treasure_relic",
@@ -59,13 +64,18 @@ _SIM_KIND_TO_MODEL_KIND: dict[str, str] = {
     "choose_character": "character_select",
     "embark": "character_select",
     "select_card": "card_selection",
+    "deselect_card": "card_selection",
     "select_hand_card": "card_selection",
+    "deselect_hand_card": "card_selection",
     "confirm_selection": "card_selection",
     "cancel_selection": "card_selection",
     "choose_card_select_option": "card_selection",
     "select_card_option": "card_selection",
+    "deselect_card_option": "card_selection",
     "combat_select_card": "card_selection",
+    "combat_deselect_card": "card_selection",
     "combat_confirm_selection": "card_selection",
+    "combat_cancel_selection": "card_selection",
     "skip_rewards": "proceed",
     "claim_reward": "reward",
     "skip_relic_select": "treasure_relic",
@@ -75,6 +85,21 @@ _SIM_KIND_TO_MODEL_KIND: dict[str, str] = {
     "choose_run_mode": "run_mode_selection",
     "game_over_continue": "game_over",
     "return_to_main_menu": "game_over",
+}
+
+_SIM_SELECTION_OPERATION: dict[str, str] = {
+    "select_card": "select",
+    "select_hand_card": "select",
+    "select_card_option": "select",
+    "combat_select_card": "select",
+    "deselect_card": "deselect",
+    "deselect_hand_card": "deselect",
+    "deselect_card_option": "deselect",
+    "combat_deselect_card": "deselect",
+    "confirm_selection": "confirm",
+    "combat_confirm_selection": "confirm",
+    "cancel_selection": "cancel_prompt",
+    "combat_cancel_selection": "cancel_prompt",
 }
 
 
@@ -95,6 +120,12 @@ def sim_kind_to_model_kind(sim_kind: str) -> str:
         raise ValueError(
             f"simulator action enum has no canonical model mapping: {normalized!r}"
         ) from exc
+
+
+def sim_kind_to_selection_operation(sim_kind: str) -> str | None:
+    """Return the exact mutation performed by a selection action enum."""
+
+    return _SIM_SELECTION_OPERATION.get(str(sim_kind or "").strip())
 
 
 _STATE_TYPE_TO_SCREEN: dict[str, str] = {
@@ -155,4 +186,8 @@ def _decision_domain_from_phase(phase: str, *, in_combat: bool = False) -> str:
     return "build"
 
 
-__all__ = ["sim_kind_to_bridge_kind", "sim_kind_to_model_kind"]
+__all__ = [
+    "sim_kind_to_bridge_kind",
+    "sim_kind_to_model_kind",
+    "sim_kind_to_selection_operation",
+]

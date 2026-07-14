@@ -39,7 +39,7 @@ from sts2_rl.contracts import (
     StepRequest,
 )
 
-GATE_VERSION = "sts2-native-revival-full-run-gate-v4"
+GATE_VERSION = "sts2-native-revival-full-run-gate-v5-selection-semantics"
 DEFAULT_ENCOUNTER = "FUZZY_WURM_CRAWLER_WEAK"
 DEFAULT_STRESS_ENCOUNTER = "TUNNELER_WEAK"
 

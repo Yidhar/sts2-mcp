@@ -918,12 +918,15 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         label="observation.decision",
     )
     raw_selection = raw_decision
-    if not raw_selection and phase in {"card_selection", "deck_upgrade"}:
+    # Card/hand prompts can occur inside combat while the top-level phase stays
+    # ``combat``.  Presence of the explicit selection DTO, rather than the
+    # screen phase, determines whether selection state is model-visible.
+    if not raw_selection:
         raw_selection = _as_mapping(
             observation.get("card_selection"),
             label="observation.card_selection",
         )
-    if raw_selection and phase in {"card_selection", "deck_upgrade"}:
+    if raw_selection:
         selected_cards = _first_present(raw_selection, "selected_cards")
         selected_count = _first_present(raw_selection, "selected_count")
         if selected_count is None and selected_cards is not None:
@@ -938,14 +941,22 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             "selected_count": selected_count,
             "min_select": _first_present(raw_selection, "min_select"),
             "max_select": _first_present(raw_selection, "max_select"),
-            "remaining_select": _first_present(raw_selection, "remaining_select"),
+            "remaining_select": _first_present(
+                raw_selection,
+                "remaining_select",
+                "remaining_picks",
+            ),
             "confirm_ready": _first_present(
                 raw_selection,
                 "confirm_ready",
                 "can_confirm",
             ),
             "can_skip": _first_present(raw_selection, "can_skip"),
-            "cancelable": _first_present(raw_selection, "cancelable"),
+            "cancelable": _first_present(
+                raw_selection,
+                "cancelable",
+                "can_cancel",
+            ),
         }.items():
             if item is not None:
                 selection[key] = item

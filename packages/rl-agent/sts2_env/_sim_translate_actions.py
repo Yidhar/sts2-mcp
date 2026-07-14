@@ -13,7 +13,11 @@ from ._sim_translate_entities import (
     _translate_relic,
 )
 from ._sim_translate_route import _translate_route_point
-from ._sim_translate_shared import sim_kind_to_bridge_kind, sim_kind_to_model_kind
+from ._sim_translate_shared import (
+    sim_kind_to_bridge_kind,
+    sim_kind_to_model_kind,
+    sim_kind_to_selection_operation,
+)
 
 
 def _find_index(records: Any, index: Any, *, index_field: str = "index") -> Mapping[str, Any] | None:
@@ -82,6 +86,30 @@ def _translate_legal_actions(
         action = deepcopy(dict(raw_action))
         sim_kind = str(raw_action.get("action") or "unknown")
         handle = _action_handle(position, raw_action)
+        selection_operation = sim_kind_to_selection_operation(sim_kind)
+        native_selection_operation = raw_action.get("selection_operation")
+        if native_selection_operation is not None:
+            native_selection_operation = str(native_selection_operation).strip()
+            if selection_operation != native_selection_operation:
+                raise ValueError(
+                    "simulator selection action has inconsistent operation metadata: "
+                    f"action={sim_kind!r} expected={selection_operation!r} "
+                    f"actual={native_selection_operation!r}"
+                )
+        native_is_selected = raw_action.get("is_selected")
+        if native_is_selected is not None and selection_operation in {"select", "deselect"}:
+            if not isinstance(native_is_selected, bool):
+                raise ValueError(
+                    "simulator selection action has non-boolean membership metadata: "
+                    f"action={sim_kind!r} is_selected={native_is_selected!r}"
+                )
+            expected_is_selected = selection_operation == "deselect"
+            if native_is_selected is not expected_is_selected:
+                raise ValueError(
+                    "simulator selection action has inconsistent membership metadata: "
+                    f"action={sim_kind!r} expected_is_selected={expected_is_selected!r} "
+                    f"actual={native_is_selected!r}"
+                )
         action.update(
             {
                 "idx": position,
@@ -97,6 +125,12 @@ def _translate_legal_actions(
                 "_sim_raw": deepcopy(dict(raw_action)),
             }
         )
+        if selection_operation is not None:
+            # The policy vocabulary intentionally shares one card-selection
+            # family, while this variant preserves the exact state mutation.
+            # Select, deselect, confirm, and cancel-prompt must never alias.
+            action["model_action_variant"] = selection_operation
+            action["selection_operation"] = selection_operation
 
         if sim_kind == "play_card":
             card = _find_index(sim_player.get("hand"), raw_action.get("card_index"))
@@ -136,16 +170,25 @@ def _translate_legal_actions(
                 action["card"] = _translate_card(card, pile="Reward")
         elif sim_kind in {
             "select_card",
+            "deselect_card",
             "select_hand_card",
+            "deselect_hand_card",
             "combat_select_card",
+            "combat_deselect_card",
             "select_card_option",
+            "deselect_card_option",
         }:
             index = raw_action.get("index", raw_action.get("card_index"))
             card = _find_index(card_select.get("cards"), index)
             if card is None:
+                card = _find_index(card_select.get("selectable_cards"), index)
+            if card is None:
+                card = _find_index(card_select.get("selected_cards"), index)
+            if card is None:
                 card = _find_index(sim_player.get("hand"), index)
             if card is not None:
-                action["card"] = _translate_card(card, pile="Select")
+                pile = "Selected" if selection_operation == "deselect" else "Select"
+                action["card"] = _translate_card(card, pile=pile)
         elif sim_kind in {"claim_treasure", "claim_treasure_relic", "claim_relic"}:
             relic = _find_index(treasure.get("relics"), raw_action.get("index"))
             if relic is not None:

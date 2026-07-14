@@ -298,6 +298,61 @@ def test_candidate_character_and_selection_identity_use_typed_fields_not_ui_labe
         assert torch.equal(getattr(encoded, field), getattr(second, field))
 
 
+def test_selection_mutations_have_distinct_candidate_roles() -> None:
+    encoder = _encoder()
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "card_selection": {
+            "selected_count": 1,
+            "min_select": 1,
+            "max_select": 1,
+            "remaining_picks": 0,
+            "can_confirm": True,
+            "selected_cards": [{"id": "CARD.STRIKE", "index": 0}],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "selection:deselect",
+            "kind": "deselect_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "deselect",
+            "card": {"id": "CARD.STRIKE", "pile": "Selected", "cost": 1},
+        },
+        {
+            "action_handle": "selection:confirm",
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+        },
+        {
+            "action_handle": "selection:cancel",
+            "kind": "cancel_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "cancel_prompt",
+        },
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    unselected = {
+        **observation,
+        "card_selection": {
+            **observation["card_selection"],
+            "selected_count": 0,
+            "remaining_picks": 1,
+            "can_confirm": False,
+            "selected_cards": [],
+        },
+    }
+    unselected_world = encoder.encode(unselected, actions).batch.world
+
+    assert batch.world.mask.any()
+    assert not torch.equal(batch.world.features, unselected_world.features)
+    roles = batch.candidates.role_ids[0, :3].tolist()
+    assert len(set(roles)) == 3
+
+
 def test_raw_event_options_and_run_modes_remain_distinguishable_without_effect_rules() -> None:
     encoder = _encoder()
     event_actions = [

@@ -68,8 +68,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-preheat-v4"
-checkpoint_dir = "checkpoints/full-run-revival-preheat-v4"
+log_dir = "runs/full-run-revival-preheat-v5-selection-semantics"
+checkpoint_dir = "checkpoints/full-run-revival-preheat-v5-selection-semantics"
 checkpoint_interval_steps = 25000
 # Do not block actor/learner startup on a deterministic evaluation of the
 # randomly initialized policy.  The fail-closed simulator gate and GPU smoke

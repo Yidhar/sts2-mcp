@@ -24,6 +24,9 @@ def test_package_exports_transport_clients_only() -> None:
         ("claim_reward", "reward"),
         ("select_card_reward", "card_reward"),
         ("select_card_option", "card_selection"),
+        ("deselect_card", "card_selection"),
+        ("combat_deselect_card", "card_selection"),
+        ("combat_cancel_selection", "card_selection"),
         ("select_relic", "treasure_relic"),
         ("skip_relic_selection", "treasure_relic"),
         ("claim_treasure_relic", "treasure_relic"),
@@ -68,12 +71,25 @@ def test_selection_actions_keep_simulator_order_membership_and_enabled_state() -
                 {"index": 1, "id": "DEFEND"},
             ],
             "selected_cards": [{"index": 0, "id": "STRIKE"}],
-            "max_select": 1,
+            "selected_count": 1,
+            "remaining_picks": 1,
+            "max_select": 2,
             "can_confirm": True,
         },
         "legal_actions": [
-            {"action": "select_card", "index": 0},
-            {"action": "confirm_selection"},
+            {
+                "action": "select_card",
+                "selection_operation": "select",
+                "is_selected": False,
+                "index": 1,
+            },
+            {
+                "action": "deselect_card",
+                "selection_operation": "deselect",
+                "is_selected": True,
+                "index": 0,
+            },
+            {"action": "confirm_selection", "selection_operation": "confirm"},
             {"action": "select_card", "index": 1, "is_enabled": False},
         ],
     }
@@ -83,15 +99,71 @@ def test_selection_actions_keep_simulator_order_membership_and_enabled_state() -
 
     assert [action["action"] for action in actions] == [
         "select_card",
+        "deselect_card",
         "confirm_selection",
         "select_card",
     ]
-    assert [action["idx"] for action in actions] == [0, 1, 2]
-    assert [action["is_enabled"] for action in actions] == [True, True, False]
+    assert [action["idx"] for action in actions] == [0, 1, 2, 3]
+    assert [action["is_enabled"] for action in actions] == [True, True, True, False]
     assert [action["_sim_raw"] for action in actions] == sim_state["legal_actions"]
     assert actions[0]["kind"] == "select_card"
-    assert actions[1]["kind"] == "confirm_selection"
+    assert actions[0]["model_action_variant"] == "select"
+    assert actions[0]["card"]["pile"] == "Select"
+    assert actions[1]["kind"] == "deselect_card"
+    assert actions[1]["model_action_variant"] == "deselect"
+    assert actions[1]["card"]["pile"] == "Selected"
+    assert actions[2]["kind"] == "confirm_selection"
+    assert actions[2]["model_action_variant"] == "confirm"
     assert all(action["action_handle"].startswith("sim:") for action in actions)
+
+
+def test_selection_operation_metadata_mismatch_fails_closed() -> None:
+    with pytest.raises(ValueError, match="inconsistent operation metadata"):
+        translate_to_bridge_shape(
+            {
+                "state_type": "card_select",
+                "card_select": {"player": _player(), "cards": []},
+                "legal_actions": [
+                    {
+                        "action": "deselect_card",
+                        "selection_operation": "select",
+                        "index": 0,
+                    }
+                ],
+            },
+            episode_id="ep-invalid-selection-semantics",
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "selection_operation", "is_selected"),
+    [
+        ("select_card", "select", True),
+        ("deselect_card", "deselect", False),
+        ("deselect_card", "deselect", "true"),
+    ],
+)
+def test_selection_membership_metadata_mismatch_fails_closed(
+    action: str,
+    selection_operation: str,
+    is_selected: object,
+) -> None:
+    with pytest.raises(ValueError, match="membership metadata"):
+        translate_to_bridge_shape(
+            {
+                "state_type": "card_select",
+                "card_select": {"player": _player(), "cards": []},
+                "legal_actions": [
+                    {
+                        "action": action,
+                        "selection_operation": selection_operation,
+                        "is_selected": is_selected,
+                        "index": 0,
+                    }
+                ],
+            },
+            episode_id="ep-invalid-selection-membership",
+        )
 
 
 def test_event_text_and_route_graph_are_copied_without_inferred_features() -> None:

@@ -75,7 +75,7 @@ python -m sts2_rl.preheat_gate \
   --required-stress-revivals 2 \
   --full-run-episodes 3 \
   --minimum-act1-clear-rate 1.0 \
-  --output reports/full-run-revival-preheat-gate.json
+  --output reports/full-run-revival-preheat-gate-v5-selection-semantics.json
 
 exec python -m sts2_rl.train \
   --profile preheat \
