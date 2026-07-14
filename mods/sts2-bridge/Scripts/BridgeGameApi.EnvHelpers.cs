@@ -99,13 +99,28 @@ internal static partial class BridgeGameApi
                 break;
 
             case "card_selection":
-                entry["selection"] = TryGetNestedString(payload, "selection_action");
+                var selectionAction = TryGetNestedString(payload, "selection_action");
+                var isSelected = TryGetNestedBool(payload, "is_selected");
+                var selectionOperation = selectionAction switch
+                {
+                    "cancel" => "cancel_prompt",
+                    "close" => "close",
+                    "skip" => "skip",
+                    _ => selectionAction
+                };
+                entry["selection"] = selectionAction;
+                entry["selection_operation"] = selectionOperation;
+                entry["model_action_variant"] = selectionOperation;
                 entry["typed_selection"] = CompactSelectionPayload(TryGetNestedElement(payload, "typed_selection"));
                 entry["index"] = TryGetNestedInt(payload, "index");
                 entry["selection_id"] = TryGetNestedString(payload, "selection_id");
                 entry["selection_prompt"] = TryGetNestedString(payload, "selection_prompt");
                 entry["screen_type"] = TryGetNestedString(payload, "screen_type");
-                entry["is_selected"] = TryGetNestedBool(payload, "is_selected");
+                entry["prompt_id"] = TryGetNestedString(payload, "prompt_id");
+                entry["operation_type"] = TryGetNestedString(payload, "operation_type");
+                entry["source_zone"] = TryGetNestedString(payload, "source_zone");
+                entry["destination_zone"] = TryGetNestedString(payload, "destination_zone");
+                entry["is_selected"] = isSelected;
                 entry["selected_count"] = TryGetNestedInt(payload, "selected_count");
                 entry["min_select"] = TryGetNestedInt(payload, "min_select");
                 entry["max_select"] = TryGetNestedInt(payload, "max_select");

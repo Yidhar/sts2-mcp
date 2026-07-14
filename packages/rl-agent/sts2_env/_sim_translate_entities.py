@@ -42,7 +42,12 @@ def _translate_powers(raw: Any) -> list[dict[str, Any]]:
     return [_translate_power(item) for item in raw]
 
 
-def _translate_card(sim_card: Any, *, pile: str | None = None) -> dict[str, Any]:
+def _translate_card(
+    sim_card: Any,
+    *,
+    pile: str | None = None,
+    selection_membership: str | None = None,
+) -> dict[str, Any]:
     if not isinstance(sim_card, Mapping):
         raise TypeError("simulator card must be a mapping")
     card = deepcopy(dict(sim_card))
@@ -52,8 +57,21 @@ def _translate_card(sim_card: Any, *, pile: str | None = None) -> dict[str, Any]
     card.pop("card_id", None)
     if sim_card.get("name") is not None and sim_card.get("title") is None:
         card["title"] = str(sim_card["name"])
-    if pile is not None:
-        card["pile"] = str(pile)
+    # A selection is not a physical card pile.  Native selection DTOs retain
+    # the real source pile (Hand/Discard/Draw/Deck/Exhaust) separately from
+    # whether the card is currently selected.  Prefer that native source over
+    # a caller-provided fallback and never overwrite it with Select/Selected.
+    source_pile = sim_card.get("source_pile", sim_card.get("pile"))
+    resolved_pile = source_pile if source_pile is not None else pile
+    if resolved_pile is not None and str(resolved_pile).strip():
+        card["pile"] = str(resolved_pile)
+        card["source_pile"] = str(resolved_pile)
+    if selection_membership is not None:
+        membership = str(selection_membership).strip().lower()
+        if membership not in {"selectable", "selected"}:
+            raise ValueError(f"invalid card selection membership: {selection_membership!r}")
+        card["selection_membership"] = membership
+        card["is_selected"] = membership == "selected"
     return card
 
 

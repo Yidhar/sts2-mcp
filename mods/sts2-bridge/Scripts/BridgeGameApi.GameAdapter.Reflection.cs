@@ -866,9 +866,11 @@ internal static partial class BridgeGameApi
         if (cardSelectionScreen is NPlayerHand playerHand)
         {
             return FindVisibleDescendants<NCardHolder>(playerHand)
-                    .Where(static holder =>
-                        holder.CardModel is not null &&
-                        holder is not NSelectedHandCardHolder)
+                    // Selected hand holders remain legal click targets: clicking
+                    // one removes it from a multi-select checkbox set.  Keep
+                    // them beside the unselected holders so action export can
+                    // emit an explicit deselect mutation.
+                    .Where(static holder => holder.CardModel is not null)
                     .OrderBy(holder => TryGetCombatHandCardSelectionIndex(holder.CardModel) ?? int.MaxValue)
                     .ThenBy(static holder => holder is Control control ? control.GlobalPosition.Y : 0f)
                     .ThenBy(static holder => holder is Control control ? control.GlobalPosition.X : 0f)

@@ -90,6 +90,21 @@ select/deselect/confirm action protocol. Conditional branches and unusual
 command sequences can likewise retain card-ID residual semantics until a
 game-owned command trace or mechanic graph is available.
 
+Selection state is part of the factual ABI, not an action-label shortcut. A
+card keeps its physical pile (`Hand`, `Discard`, `Exhaust`, or `Deck`) while a
+separate membership field records whether it is currently selectable or
+selected. Multi-select observations retain the identity of every checkbox,
+the selected set, min/max/count, prompt ID, source/destination zones, and
+whether the game requires explicit confirmation. Legal candidates distinguish
+select, deselect, confirm, and cancel-prompt mutations. Fixed-count prompts
+that the game auto-completes therefore expose no invented confirm action.
+Standard game-owned prompt IDs such as `card_selection.TO_DISCARD` and
+`card_selection.TO_TRANSFORM` may be mapped exactly; unknown/custom prompts
+remain generic `select` operations and are learned from their stable prompt ID
+and real transition rather than from card-name tables or localized-text
+heuristics. This contract is fingerprinted as grounded selection encoding v5,
+so checkpoints from the earlier selection ABI fail closed.
+
 Likewise, a numeric family is a typed magnitude, not an invented verb. An
 `EnergyVar(1)` is stored in the energy family, but the encoder does not label it
 "gain" or "lose" unless the native model exposes that direction through another

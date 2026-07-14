@@ -99,17 +99,25 @@ def _translate_card_sel_block(
     source = card_select or hand_select or combat_card_sel or {}
     translated = deepcopy(dict(source))
     translated.pop("player", None)
-    for field, pile in (
-        ("cards", "Select"),
-        ("selectable_cards", "Select"),
-        ("selected_cards", "Selected"),
+    default_pile = "Hand" if hand_select else None
+    for field, membership in (
+        ("cards", "selectable"),
+        ("selectable_cards", "selectable"),
+        ("selected_cards", "selected"),
     ):
         if field not in source:
             continue
         raw_cards = source.get(field) or []
         if not isinstance(raw_cards, list | tuple):
             raise TypeError(f"simulator card selection {field} must be a sequence")
-        translated[field] = [_translate_card(card, pile=pile) for card in raw_cards]
+        translated[field] = [
+            _translate_card(
+                card,
+                pile=default_pile,
+                selection_membership=membership,
+            )
+            for card in raw_cards
+        ]
     return translated
 
 

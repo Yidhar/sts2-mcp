@@ -285,6 +285,7 @@ _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
 )
 _CARD_FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
     {
+        "is_selected",
         "is_playable",
         "is_upgraded",
         "playable",
@@ -300,12 +301,17 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "character",
         "character_id",
         "class_name",
+        "confirmation_mode",
         "decision_domain",
         "facing",
         "family",
         "intent_type",
+        "destination_zone",
+        "mode",
         "next_move_id",
+        "operation_type",
         "pile",
+        "prompt_id",
         "power_type",
         "rarity",
         "room_model",
@@ -313,6 +319,8 @@ _FACT_CATEGORICAL_KEYS: Final[frozenset[str]] = frozenset(
         "room_type",
         "run_mode_action",
         "screen",
+        "selection_membership",
+        "source_zone",
         "state_type",
         "target_type",
         "transport_kind",
@@ -341,6 +349,7 @@ _FACT_BOOLEAN_KEYS: Final[frozenset[str]] = frozenset(
         "is_alive",
         "is_hittable",
         "is_playable",
+        "is_selected",
         "is_upgraded",
         "playable",
         "retain",
@@ -481,7 +490,7 @@ _DYNAMIC_VALUE_SLOT_BY_KEY: Final[dict[str, int]] = {
 _DYNAMIC_HASH_SLOT_START: Final = _DYNAMIC_SLOT_START + len(_DYNAMIC_VALUE_KEYS)
 _DYNAMIC_HASH_SLOT_COUNT: Final = _DYNAMIC_SLOT_COUNT - len(_DYNAMIC_VALUE_KEYS)
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-card-facts-encoding-v3"
+GROUNDING_ENCODING_VERSION: Final = "grounded-selection-zones-encoding-v5"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -725,14 +734,14 @@ def _canonical_dynamic_var(value: Mapping[str, Any]) -> dict[str, Any]:
     result["type"] = str(family)
     if var_type is not None and str(var_type).strip():
         result["var_type"] = str(var_type).strip()
-    for key, aliases in {
+    for key, semantic_aliases in {
         "power_type": ("power_type", "power_id"),
         "value_props": ("value_props", "props"),
     }.items():
-        item = _first_present(value, *aliases)
+        item = _first_present(value, *semantic_aliases)
         if item is not None and str(item).strip():
             result[key] = str(item).strip()
-    for key, aliases in {
+    for key, numeric_aliases in {
         "base_value": ("base_value",),
         "enchanted_value": ("enchanted_value",),
         # ``preview_value`` is a factual value calculated by CardModel hooks,
@@ -742,7 +751,7 @@ def _canonical_dynamic_var(value: Mapping[str, Any]) -> dict[str, Any]:
         "int_value": ("int_value",),
         "was_just_upgraded": ("was_just_upgraded",),
     }.items():
-        item = _first_present(value, *aliases)
+        item = _first_present(value, *numeric_aliases)
         if item is not None:
             result[key] = item
     return result
@@ -798,6 +807,11 @@ def _canonical_card(value: Mapping[str, Any]) -> dict[str, Any]:
         "ethereal": ("ethereal",),
         "retain": ("retain", "retained"),
         "rarity": ("rarity",),
+        # Selection membership and the physical pile are orthogonal.  A card
+        # remains in Discard/Hand/Deck while the prompt marks it selected.
+        "pile": ("source_pile", "pile", "zone"),
+        "selection_membership": ("selection_membership",),
+        "is_selected": ("is_selected",),
     }
     for canonical, source_keys in aliases.items():
         item = _first_present(value, *source_keys)
@@ -925,16 +939,64 @@ def _pile_count(value: Any, *, label: str) -> int | float | None:
         raise TypeError(f"{label} must be a number or card sequence")
     if isinstance(value, int | float):
         return value
+    if isinstance(value, Mapping):
+        explicit = _first_present(value, "count")
+        if explicit is not None:
+            if isinstance(explicit, bool) or not isinstance(explicit, int | float):
+                raise TypeError(f"{label}.count must be numeric")
+            return float(explicit) if isinstance(explicit, float) else int(explicit)
+        cards = _first_present(value, "cards")
+        if cards is None:
+            return None
+        return len(_as_mapping_list(cards, label=f"{label}.cards"))
     return len(_as_mapping_list(value, label=label))
+
+
+def _pile_cards(value: Any, *, label: str) -> list[Mapping[str, Any]] | None:
+    """Return visible pile cards, or ``None`` when composition is redacted."""
+
+    if value is None or isinstance(value, bool | int | float):
+        return None
+    if isinstance(value, Mapping):
+        cards = _first_present(value, "cards")
+        if cards is None:
+            return None
+        return _as_mapping_list(cards, label=f"{label}.cards")
+    return _as_mapping_list(value, label=label)
+
+
+def _canonical_card_sequence(
+    value: Any,
+    *,
+    label: str,
+    pile: str | None = None,
+    membership: str | None = None,
+    sort_as_set: bool = False,
+) -> list[dict[str, Any]] | None:
+    cards = _pile_cards(value, label=label)
+    if cards is None:
+        return None
+    result: list[dict[str, Any]] = []
+    for card in cards:
+        enriched = dict(card)
+        if pile is not None and _first_present(enriched, "source_pile", "pile", "zone") is None:
+            enriched["pile"] = pile
+        if membership is not None:
+            enriched["selection_membership"] = membership
+            enriched["is_selected"] = membership == "selected"
+        result.append(_canonical_card(enriched))
+    if sort_as_set:
+        result.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return result
 
 
 def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
     """Project live/headless state to one deliberately shared model DTO.
 
-    Inactive UI sections and simulator-only pile identities are not part of the
-    model contract. Legal candidates carry active choices; world state contains
-    only run, player, combat, and typed selection progress available in both
-    maintained deployments.
+    Inactive UI sections are not part of the model contract.  Public discard
+    and exhaust composition, physical source piles, and exact multi-selection
+    membership are retained because they change legal decisions.  Hidden draw
+    order/composition remains represented by count only.
     """
 
     phase = str(observation.get("phase") or "unknown")
@@ -960,9 +1022,14 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         deck_cards = _as_mapping_list(deck_value, label="player deck")
         deck_count = len(deck_cards)
 
+    canonical_deck_cards = _canonical_card_sequence(
+        deck_cards,
+        label="player.deck_cards",
+        pile="Deck",
+    ) or []
     player: dict[str, Any] = {
         "deck": deck_count,
-        "deck_cards": [_canonical_card(card) for card in deck_cards],
+        "deck_cards": canonical_deck_cards,
         "powers": [
             _canonical_power(power)
             for power in _as_mapping_list(
@@ -1050,10 +1117,11 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             raw_hand = _first_present(raw_player, "hand")
         combat: dict[str, Any] = {
             "in_progress": True,
-            "hand": [
-                _canonical_card(card)
-                for card in _as_mapping_list(raw_hand, label="combat hand")
-            ],
+            "hand": _canonical_card_sequence(
+                raw_hand,
+                label="combat hand",
+                pile="Hand",
+            ) or [],
             "enemies": [
                 _canonical_enemy(enemy)
                 for enemy in _as_mapping_list(
@@ -1085,21 +1153,41 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             count = _pile_count(item, label=f"combat {key}")
             if count is not None:
                 combat[key] = count
+        for key, aliases, pile in (
+            ("discard_pile", ("discard_pile",), "Discard"),
+            ("exhaust_pile", ("exhaust_pile",), "Exhaust"),
+            ("play_pile", ("play_pile",), "Play"),
+        ):
+            item = _first_present(raw_combat, *aliases)
+            if item is None:
+                item = _first_present(raw_player, *aliases)
+            cards = _canonical_card_sequence(
+                item,
+                label=f"combat {key}",
+                pile=pile,
+                sort_as_set=True,
+            )
+            if cards is not None:
+                combat[key] = cards
         canonical["combat"] = combat
 
     raw_decision = _as_mapping(
         observation.get("decision"),
         label="observation.decision",
     )
-    raw_selection = raw_decision
+    explicit_selection = _as_mapping(
+        observation.get("card_selection"),
+        label="observation.card_selection",
+    )
+    # Live places the card option membership on top-level card_selection while
+    # its compact decision block carries counts.  Headless places both in the
+    # explicit selection DTO.  Merge the two instead of allowing the summary
+    # block to hide card identity.
+    raw_selection: dict[str, Any] = dict(explicit_selection)
+    raw_selection.update(raw_decision)
     # Card/hand prompts can occur inside combat while the top-level phase stays
     # ``combat``.  Presence of the explicit selection DTO, rather than the
     # screen phase, determines whether selection state is model-visible.
-    if not raw_selection:
-        raw_selection = _as_mapping(
-            observation.get("card_selection"),
-            label="observation.card_selection",
-        )
     if raw_selection:
         selected_cards = _first_present(raw_selection, "selected_cards")
         selected_count = _first_present(raw_selection, "selected_count")
@@ -1110,6 +1198,17 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                     label="selection.selected_cards",
                 )
             )
+        requires_manual_confirmation = _first_present(
+            raw_selection,
+            "requires_manual_confirmation",
+        )
+        confirmation_mode = (
+            "manual"
+            if requires_manual_confirmation is True
+            else "automatic"
+            if requires_manual_confirmation is False
+            else None
+        )
         selection: dict[str, Any] = {}
         for key, item in {
             "selected_count": selected_count,
@@ -1131,9 +1230,61 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 "cancelable",
                 "can_cancel",
             ),
+            "confirmation_mode": confirmation_mode,
+            "mode": _first_present(raw_selection, "mode", "screen_type"),
+            "prompt_id": _first_present(raw_selection, "prompt_id"),
+            "operation_type": _first_present(raw_selection, "operation_type"),
+            "source_zone": _first_present(
+                raw_selection,
+                "source_zone",
+                "source_pile",
+            ),
+            "destination_zone": _first_present(
+                raw_selection,
+                "destination_zone",
+                "destination_pile",
+            ),
         }.items():
             if item is not None:
                 selection[key] = item
+        selectable = _canonical_card_sequence(
+            _first_present(raw_selection, "selectable_cards", "cards"),
+            label="selection.selectable_cards",
+            membership="selectable",
+            sort_as_set=True,
+        )
+        selected = _canonical_card_sequence(
+            selected_cards,
+            label="selection.selected_cards",
+            membership="selected",
+            sort_as_set=True,
+        )
+        raw_options = _first_present(raw_selection, "options")
+        if raw_options is not None:
+            option_selectable: list[dict[str, Any]] = []
+            option_selected: list[dict[str, Any]] = []
+            for option in _as_mapping_list(raw_options, label="selection.options"):
+                raw_card = _first_present(option, "card")
+                if raw_card is None:
+                    continue
+                card = _as_mapping(raw_card, label="selection.options.card")
+                membership = "selected" if option.get("is_selected") is True else "selectable"
+                canonical_cards = _canonical_card_sequence(
+                    [card],
+                    label="selection.options.card",
+                    membership=membership,
+                ) or []
+                (option_selected if membership == "selected" else option_selectable).extend(
+                    canonical_cards
+                )
+            if selectable is None:
+                selectable = option_selectable
+            if selected is None:
+                selected = option_selected
+        if selectable is not None:
+            selection["selectable_cards"] = selectable
+        if selected is not None:
+            selection["selected_cards"] = selected
         if selection:
             canonical["decision"] = {"selection": selection}
     return canonical
@@ -1196,16 +1347,32 @@ def _canonical_map_node(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _canonical_selection(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    requires_manual_confirmation = _first_present(
+        value,
+        "requires_manual_confirmation",
+    )
+    if requires_manual_confirmation is True:
+        result["confirmation_mode"] = "manual"
+    elif requires_manual_confirmation is False:
+        result["confirmation_mode"] = "automatic"
     for key, aliases in {
         "selected_count": ("selected_count",),
         "min_select": ("min_select", "min_count"),
         "max_select": ("max_select", "max_count"),
-        "remaining_select": ("remaining_select",),
+        "remaining_select": ("remaining_select", "remaining_picks"),
         "confirm_ready": ("confirm_ready", "can_confirm"),
         "can_skip": ("can_skip",),
-        "cancelable": ("cancelable",),
+        "cancelable": ("cancelable", "can_cancel"),
         "is_selected": ("is_selected",),
-        "operation_type": ("operation_type",),
+        "operation_type": (
+            "operation_type",
+            "selection_operation",
+            "model_action_variant",
+        ),
+        "mode": ("mode", "screen_type"),
+        "prompt_id": ("prompt_id",),
+        "source_zone": ("source_zone", "source_pile"),
+        "destination_zone": ("destination_zone", "destination_pile"),
     }.items():
         item = _first_present(value, *aliases)
         if item is not None:
@@ -1293,6 +1460,7 @@ def _candidate_local_roots(
         "map_node": _canonical_map_node,
         "coord": _canonical_coord,
         "selection": _canonical_selection,
+        "typed_selection": _canonical_selection,
     }
     for key, projector in projectors.items():
         raw = action.get(key)
@@ -1327,6 +1495,12 @@ def _candidate_local_roots(
             roots["target"] = target
 
     selection = _canonical_selection(action)
+    typed_selection = action.get("typed_selection")
+    if isinstance(typed_selection, Mapping):
+        selection = {
+            **_canonical_selection(typed_selection),
+            **selection,
+        }
     if selection:
         roots["selection"] = {
             **roots.get("selection", {}),

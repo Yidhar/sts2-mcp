@@ -107,6 +107,16 @@ internal static partial class BridgeGameApi
             payload["target_type"] = target;
         }
 
+        var pile = TryGetNestedString(element.Value, "pile");
+        if (!string.IsNullOrWhiteSpace(pile))
+        {
+            // Physical card zone is independent from selection membership.
+            // In particular, clicking a selected discard card does not move it
+            // to a synthetic "Selected" pile; it remains a Discard card.
+            payload["pile"] = pile;
+            payload["source_pile"] = pile;
+        }
+
         var description = TryGetNestedString(element.Value, "description");
         if (!string.IsNullOrWhiteSpace(description))
         {
@@ -155,6 +165,7 @@ internal static partial class BridgeGameApi
                  {
                      "screen_type",
                      "operation_type",
+                     "prompt_id",
                      "source",
                      "source_zone",
                      "destination_zone",

@@ -81,16 +81,21 @@ internal static partial class BridgeGameApi
                       IsButtonEnabled(context.CardSelectionSkipButton);
         var selectionReady = selectionState.SelectionReady;
         var openedAgeMs = selectionState.OpenedAgeMs;
+        var promptId = GetSelectionPromptId(prefs);
+        var sourceZone = ResolveCardSelectionSourceZone(context);
+        var operationType = InferSelectionOperationType(promptId);
+        var destinationZone = InferSelectionDestinationZone(operationType, sourceZone);
         var typedSelection = BuildRuntimeSelectionPayload(
             context.CardSelectionScreen?.GetType().Name,
-            "select",
+            operationType,
+            promptId,
             selectedCount,
             minSelect,
             maxSelect,
             requiresManualConfirmation,
             source: "card_selection",
-            sourceZone: string.Empty,
-            destinationZone: string.Empty);
+            sourceZone,
+            destinationZone);
 
         if (context.CardSelectionScreen is NChooseABundleSelectionScreen)
         {
@@ -113,6 +118,10 @@ internal static partial class BridgeGameApi
                         kind = "card_selection",
                         selection_action = "select",
                         selection_prompt = selectionPrompt,
+                        prompt_id = promptId,
+                        operation_type = operationType,
+                        source_zone = sourceZone,
+                        destination_zone = destinationZone,
                         typed_selection = typedSelection,
                         selected_count = selectedCount,
                         min_select = minSelect,
@@ -146,10 +155,11 @@ internal static partial class BridgeGameApi
 
                 var optionIndex = GetCardSelectionOptionIndex(context.CardSelectionScreen, cardHolder, index);
                 var selectionId = GetCardSelectionOptionSelectionId(context.CardSelectionScreen, cardHolder, optionIndex);
-                var actionId = selectionId is not null
-                    ? $"card_selection:select:{selectionId}"
-                    : $"card_selection:select:{optionIndex}";
                 var isSelected = IsCardSelectionCardSelected(context.CardSelectionScreen, cardHolder.CardModel);
+                var selectionAction = isSelected ? "deselect" : "select";
+                var actionId = selectionId is not null
+                    ? $"card_selection:{selectionAction}:{selectionId}"
+                    : $"card_selection:{selectionAction}:{optionIndex}";
                 actions.Add(new BridgeResolvedAction
                 {
                     ActionId = actionId,
@@ -157,8 +167,15 @@ internal static partial class BridgeGameApi
                     {
                         action_id = actionId,
                         kind = "card_selection",
-                        selection_action = "select",
+                        // The same UI click toggles membership.  Export the
+                        // actual mutation instead of forcing the learner to
+                        // infer a deselect from an auxiliary boolean.
+                        selection_action = selectionAction,
                         selection_prompt = selectionPrompt,
+                        prompt_id = promptId,
+                        operation_type = operationType,
+                        source_zone = sourceZone,
+                        destination_zone = destinationZone,
                         typed_selection = typedSelection,
                         selected_count = selectedCount,
                         min_select = minSelect,
@@ -200,6 +217,10 @@ internal static partial class BridgeGameApi
                     kind = "card_selection",
                     selection_action = "confirm",
                     selection_prompt = selectionPrompt,
+                    prompt_id = promptId,
+                    operation_type = operationType,
+                    source_zone = sourceZone,
+                    destination_zone = destinationZone,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
                     min_select = minSelect,
@@ -234,6 +255,10 @@ internal static partial class BridgeGameApi
                     kind = "card_selection",
                     selection_action = "cancel",
                     selection_prompt = selectionPrompt,
+                    prompt_id = promptId,
+                    operation_type = operationType,
+                    source_zone = sourceZone,
+                    destination_zone = destinationZone,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
                     min_select = minSelect,
@@ -268,6 +293,10 @@ internal static partial class BridgeGameApi
                     kind = "card_selection",
                     selection_action = "close",
                     selection_prompt = selectionPrompt,
+                    prompt_id = promptId,
+                    operation_type = operationType,
+                    source_zone = sourceZone,
+                    destination_zone = destinationZone,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
                     min_select = minSelect,
@@ -302,6 +331,10 @@ internal static partial class BridgeGameApi
                     kind = "card_selection",
                     selection_action = "skip",
                     selection_prompt = selectionPrompt,
+                    prompt_id = promptId,
+                    operation_type = operationType,
+                    source_zone = sourceZone,
+                    destination_zone = destinationZone,
                     typed_selection = typedSelection,
                     selected_count = selectedCount,
                     min_select = minSelect,

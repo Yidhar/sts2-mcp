@@ -131,6 +131,33 @@ def _translate_legal_actions(
             # Select, deselect, confirm, and cancel-prompt must never alias.
             action["model_action_variant"] = selection_operation
             action["selection_operation"] = selection_operation
+            selection = {
+                "operation_type": selection_operation,
+            }
+            for canonical, aliases in {
+                "selected_count": ("selected_count",),
+                "min_select": ("min_select", "min_count"),
+                "max_select": ("max_select", "max_count"),
+                "remaining_select": ("remaining_select", "remaining_picks"),
+                "confirm_ready": ("confirm_ready", "can_confirm"),
+                "cancelable": ("cancelable", "can_cancel"),
+                "requires_manual_confirmation": (
+                    "requires_manual_confirmation",
+                ),
+                "mode": ("mode", "screen_type"),
+                "prompt_id": ("prompt_id",),
+                "source_zone": ("source_zone", "source_pile"),
+                "destination_zone": ("destination_zone", "destination_pile"),
+            }.items():
+                value = next(
+                    (card_select.get(alias) for alias in aliases if card_select.get(alias) is not None),
+                    None,
+                )
+                if value is not None:
+                    selection[canonical] = deepcopy(value)
+            if raw_action.get("is_selected") is not None:
+                selection["is_selected"] = bool(raw_action["is_selected"])
+            action["selection"] = selection
 
         if sim_kind == "play_card":
             card = _find_index(sim_player.get("hand"), raw_action.get("card_index"))
@@ -187,8 +214,13 @@ def _translate_legal_actions(
             if card is None:
                 card = _find_index(sim_player.get("hand"), index)
             if card is not None:
-                pile = "Selected" if selection_operation == "deselect" else "Select"
-                action["card"] = _translate_card(card, pile=pile)
+                membership = "selected" if selection_operation == "deselect" else "selectable"
+                default_pile = "Hand" if "hand_card" in sim_kind else None
+                action["card"] = _translate_card(
+                    card,
+                    pile=default_pile,
+                    selection_membership=membership,
+                )
         elif sim_kind in {"claim_treasure", "claim_treasure_relic", "claim_relic"}:
             relic = _find_index(treasure.get("relics"), raw_action.get("index"))
             if relic is not None:

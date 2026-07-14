@@ -1145,6 +1145,7 @@ var compactPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", 
 var envPayloadsSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvPayloads.cs"));
 var envTextSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.EnvText.cs"));
 var cardFactsSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.GameAdapter.CardFacts.cs"));
+var adapterReflectionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.GameAdapter.Reflection.cs"));
 var selectionActionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Actions.SelectionShop.cs"));
 var navigationSelectionActionSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Actions.NavigationSelection.cs"));
 var selectionPayloadSource = File.ReadAllText(Path.Combine(bridgeRoot, "Scripts", "BridgeGameApi.Payloads.Selection.cs"));
@@ -1291,9 +1292,21 @@ Assert(!envPayloadsSource.Contains("ResolveCardSelectionSemantics", StringCompar
        !selectionPayloadSource.Contains("selection_semantics", StringComparison.Ordinal) &&
        !envHelpersSource.Contains("selection_semantics", StringComparison.Ordinal) &&
        !envTextSource.Contains("DescribeSelectionSemanticsLabel", StringComparison.Ordinal) &&
+       !navigationSelectionActionSource.Contains("semantic.Contains(", StringComparison.Ordinal) &&
+       navigationSelectionActionSource.Contains("\"CARD_SELECTION.TO_DISCARD\" => \"discard\"", StringComparison.Ordinal) &&
        navigationSelectionActionSource.Contains("operation_type = operationType", StringComparison.Ordinal) &&
        selectionActionSource.Contains("\"select\"", StringComparison.Ordinal),
     "card-selection transport must retain typed UI facts without classifying natural-language prompts");
+Assert(selectionActionSource.Contains("var selectionAction = isSelected ? \"deselect\" : \"select\";", StringComparison.Ordinal) &&
+       selectionActionSource.Contains("$\"card_selection:{selectionAction}:{selectionId}\"", StringComparison.Ordinal) &&
+       selectionActionSource.Contains("selection_action = selectionAction", StringComparison.Ordinal) &&
+       !envHelpersSource.Contains("when isSelected => \"deselect\"", StringComparison.Ordinal),
+    "live multi-select actions must export select and deselect as distinct source mutations");
+Assert(envPayloadsSource.Contains("option_count = options.Length", StringComparison.Ordinal) &&
+       envPayloadsSource.Contains("is_selected = IsCardSelectionCardSelected(screen, holder.CardModel)", StringComparison.Ordinal) &&
+       envPayloadsSource.Contains("requires_manual_confirmation = requiresManualConfirmation", StringComparison.Ordinal) &&
+       !adapterReflectionSource.Contains("holder is not NSelectedHandCardHolder", StringComparison.Ordinal),
+    "live selection observations must retain each checkbox identity, membership, and confirmation mode");
 Assert(!mainApiSource.Contains("MaxShopOpenActionsPerRoom", StringComparison.Ordinal) &&
        !mainApiSource.Contains("ShopOpenLimiter", StringComparison.Ordinal) &&
        !cardFactsSource.Contains("CanExposeShopOpenAction", StringComparison.Ordinal) &&

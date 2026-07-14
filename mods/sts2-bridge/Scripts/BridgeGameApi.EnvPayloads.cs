@@ -838,11 +838,33 @@ internal static partial class BridgeGameApi
                       IsNodeVisible(context.CardSelectionSkipButton) &&
                       IsButtonEnabled(context.CardSelectionSkipButton);
         var remainingSelect = ResolveRemainingSelectCount(selectedCount, minSelect, maxSelect);
+        var promptId = GetSelectionPromptId(prefs);
+        var sourceZone = ResolveCardSelectionSourceZone(context);
+        var operationType = InferSelectionOperationType(promptId);
+        var destinationZone = InferSelectionDestinationZone(operationType, sourceZone);
+        var options = context.CardSelectionOptions
+            .Where(IsNodeVisible)
+            .Select((holder, index) => new
+            {
+                index = GetCardSelectionOptionIndex(screen, holder, index),
+                selection_id = GetCardSelectionOptionSelectionId(
+                    screen,
+                    holder,
+                    GetCardSelectionOptionIndex(screen, holder, index)),
+                card = CompactCardPayload(
+                    JsonSerializer.SerializeToElement(BuildCardPayload(holder.CardModel))),
+                is_selected = IsCardSelectionCardSelected(screen, holder.CardModel)
+            })
+            .ToArray();
 
         return new
         {
             screen_type = screen?.GetType().Name,
             prompt,
+            prompt_id = promptId,
+            operation_type = operationType,
+            source_zone = sourceZone,
+            destination_zone = destinationZone,
             texts,
             remaining_select = remainingSelect,
             selected_count = selectedCount,
@@ -851,7 +873,9 @@ internal static partial class BridgeGameApi
             requires_manual_confirmation = requiresManualConfirmation,
             cancelable = cancelable,
             confirm_ready = confirmReady,
-            can_skip = canSkip
+            can_skip = canSkip,
+            option_count = options.Length,
+            options
         };
     }
 

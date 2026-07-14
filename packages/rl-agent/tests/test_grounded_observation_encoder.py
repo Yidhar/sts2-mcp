@@ -359,6 +359,230 @@ def test_selection_mutations_have_distinct_candidate_roles() -> None:
     assert len(set(roles)) == 3
 
 
+def test_multiselect_membership_identity_is_part_of_world_state() -> None:
+    encoder = _encoder()
+    base = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"hp": 50, "max_hp": 80},
+        "card_selection": {
+            "mode": "SimpleGrid",
+            "prompt_id": "card.DREDGE.selection",
+            "operation_type": "select",
+            "source_zone": "Discard",
+            "selected_count": 1,
+            "min_select": 1,
+            "max_select": 2,
+            "remaining_select": 1,
+            "can_confirm": True,
+            "selectable_cards": [
+                {"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}
+            ],
+            "selected_cards": [
+                {"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}
+            ],
+        },
+    }
+    changed = {
+        **base,
+        "card_selection": {
+            **base["card_selection"],
+            "selectable_cards": [
+                {"id": "CARD.STRIKE", "source_pile": "Discard", "cost": 1}
+            ],
+            "selected_cards": [
+                {"id": "CARD.BASH", "source_pile": "Discard", "cost": 2}
+            ],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "confirm",
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+        }
+    ]
+
+    first = encoder.encode(base, actions).batch.world
+    second = encoder.encode(changed, actions).batch.world
+    assert not torch.equal(first.entity_ids, second.entity_ids)
+
+
+def test_live_checkbox_options_and_confirmation_mode_are_world_facts() -> None:
+    encoder = _encoder()
+    base = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"hp": 50, "max_hp": 80},
+        "card_selection": {
+            "mode": "SimpleGrid",
+            "prompt_id": "card.TEST.checkbox_selection",
+            "operation_type": "discard",
+            "source_zone": "Hand",
+            "destination_zone": "Discard",
+            "selected_count": 1,
+            "min_select": 1,
+            "max_select": 2,
+            "requires_manual_confirmation": True,
+            "options": [
+                {
+                    "option_index": 0,
+                    "is_selected": True,
+                    "card": {"id": "CARD.STRIKE", "pile": "Hand", "cost": 1},
+                },
+                {
+                    "option_index": 1,
+                    "is_selected": False,
+                    "card": {"id": "CARD.DEFEND", "pile": "Hand", "cost": 1},
+                },
+            ],
+        },
+    }
+    swapped = {
+        **base,
+        "card_selection": {
+            **base["card_selection"],
+            "options": [
+                {
+                    "option_index": 0,
+                    "is_selected": False,
+                    "card": {"id": "CARD.STRIKE", "pile": "Hand", "cost": 1},
+                },
+                {
+                    "option_index": 1,
+                    "is_selected": True,
+                    "card": {"id": "CARD.DEFEND", "pile": "Hand", "cost": 1},
+                },
+            ],
+        },
+    }
+    automatic = {
+        **base,
+        "card_selection": {
+            **base["card_selection"],
+            "requires_manual_confirmation": False,
+        },
+    }
+    actions = [
+        {
+            "action_handle": "confirm",
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+        }
+    ]
+
+    first = encoder.encode(base, actions).batch.world
+    second = encoder.encode(swapped, actions).batch.world
+    third = encoder.encode(automatic, actions).batch.world
+    assert not torch.equal(first.entity_ids, second.entity_ids)
+    assert not torch.equal(first.features, third.features)
+
+
+def test_selection_candidate_keeps_physical_source_zone_separate_from_membership() -> None:
+    encoder = _encoder()
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"hp": 50, "max_hp": 80},
+    }
+    actions = [
+        {
+            "action_handle": "discard-card",
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "card": {
+                "id": "CARD.STRIKE",
+                "pile": "Discard",
+                "selection_membership": "selectable",
+            },
+        },
+        {
+            "action_handle": "hand-card",
+            "kind": "select_hand_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "card": {
+                "id": "CARD.STRIKE",
+                "pile": "Hand",
+                "selection_membership": "selectable",
+            },
+        },
+        {
+            "action_handle": "selected-discard-card",
+            "kind": "deselect_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "deselect",
+            "card": {
+                "id": "CARD.STRIKE",
+                "pile": "Discard",
+                "selection_membership": "selected",
+                "is_selected": True,
+            },
+        },
+    ]
+
+    candidates = encoder.encode(observation, actions).batch.candidates
+    assert not torch.equal(
+        candidates.local_features[:, 0], candidates.local_features[:, 1]
+    )
+    assert not torch.equal(candidates.role_ids[:, 0], candidates.role_ids[:, 2])
+
+
+def test_public_discard_and_exhaust_composition_is_set_like_but_not_count_only() -> None:
+    encoder = _encoder()
+    base = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"hp": 50, "max_hp": 80},
+        "combat": {
+            "in_progress": True,
+            "discard_pile": [
+                {"id": "CARD.STRIKE", "pile": "Discard"},
+                {"id": "CARD.DEFEND", "pile": "Discard"},
+            ],
+            "exhaust_pile": [{"id": "CARD.BURN", "pile": "Exhaust"}],
+            "enemies": [],
+        },
+    }
+    permuted = {
+        **base,
+        "combat": {
+            **base["combat"],
+            "discard_pile": list(reversed(base["combat"]["discard_pile"])),
+        },
+    }
+    transformed = {
+        **base,
+        "combat": {
+            **base["combat"],
+            "discard_pile": [
+                {"id": "CARD.STRIKE", "pile": "Discard"},
+                {"id": "CARD.BASH", "pile": "Discard"},
+            ],
+        },
+    }
+
+    first = encoder.encode(base, _actions()).batch.world
+    second = encoder.encode(permuted, _actions()).batch.world
+    third = encoder.encode(transformed, _actions()).batch.world
+    for field in (
+        "features",
+        "mask",
+        "type_ids",
+        "role_ids",
+        "owner_ids",
+        "entity_ids",
+        "entity_aux_ids",
+        "zone_ids",
+        "order_ids",
+    ):
+        assert torch.equal(getattr(first, field), getattr(second, field)), field
+    assert not torch.equal(first.entity_ids, third.entity_ids)
+
+
 def test_raw_event_options_and_run_modes_remain_distinguishable_without_effect_rules() -> None:
     encoder = _encoder()
     event_actions = [
@@ -674,6 +898,11 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
             "draw": 2,
             "discard": 1,
             "exhaust": 0,
+            "discard_pile": {
+                "count": 1,
+                "cards": [{"id": "CARD.SECRET_C", "pile": "Discard"}],
+            },
+            "exhaust_pile": {"count": 0, "cards": []},
             "enemies": [
                 {
                     "id": 7,
@@ -710,8 +939,8 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
                 {"id": "CARD.DEFEND", "type": "Skill", "cost": 1, "pile": "Deck"},
             ],
             "hand": [{"id": "CARD.STRIKE", "type": "Attack", "cost": 1}],
-            # Identities in these piles are simulator-only and must collapse to
-            # the same counts exposed by live.
+            # Draw composition is redacted by live and therefore collapses to
+            # a count. Discard/exhaust are public and must retain identity.
             "draw_pile": [{"id": "CARD.SECRET_A"}, {"id": "CARD.SECRET_B"}],
             "discard_pile": [{"id": "CARD.SECRET_C"}],
             "exhaust_pile": [],

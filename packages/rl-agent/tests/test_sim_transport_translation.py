@@ -67,14 +67,21 @@ def test_selection_actions_keep_simulator_order_membership_and_enabled_state() -
         "card_select": {
             "player": _player(),
             "cards": [
-                {"index": 0, "id": "STRIKE"},
-                {"index": 1, "id": "DEFEND"},
+                {"index": 0, "id": "STRIKE", "source_pile": "Discard"},
+                {"index": 1, "id": "DEFEND", "source_pile": "Discard"},
             ],
-            "selected_cards": [{"index": 0, "id": "STRIKE"}],
+            "selected_cards": [
+                {"index": 0, "id": "STRIKE", "source_pile": "Discard"}
+            ],
             "selected_count": 1,
             "remaining_picks": 1,
+            "mode": "SimpleGrid",
+            "prompt_id": "card.HEADBUTT.selection",
+            "operation_type": "select",
+            "source_zone": "Discard",
             "max_select": 2,
             "can_confirm": True,
+            "requires_manual_confirmation": True,
         },
         "legal_actions": [
             {
@@ -108,13 +115,55 @@ def test_selection_actions_keep_simulator_order_membership_and_enabled_state() -
     assert [action["_sim_raw"] for action in actions] == sim_state["legal_actions"]
     assert actions[0]["kind"] == "select_card"
     assert actions[0]["model_action_variant"] == "select"
-    assert actions[0]["card"]["pile"] == "Select"
+    assert actions[0]["card"]["pile"] == "Discard"
+    assert actions[0]["card"]["selection_membership"] == "selectable"
+    assert actions[0]["selection"]["source_zone"] == "Discard"
+    assert actions[0]["selection"]["prompt_id"] == "card.HEADBUTT.selection"
+    assert actions[0]["selection"]["requires_manual_confirmation"] is True
     assert actions[1]["kind"] == "deselect_card"
     assert actions[1]["model_action_variant"] == "deselect"
-    assert actions[1]["card"]["pile"] == "Selected"
+    assert actions[1]["card"]["pile"] == "Discard"
+    assert actions[1]["card"]["selection_membership"] == "selected"
     assert actions[2]["kind"] == "confirm_selection"
     assert actions[2]["model_action_variant"] == "confirm"
     assert all(action["action_handle"].startswith("sim:") for action in actions)
+
+    selection = translated["card_selection"]
+    assert selection["cards"][0]["pile"] == "Discard"
+    assert selection["cards"][0]["selection_membership"] == "selectable"
+    assert selection["selected_cards"][0]["pile"] == "Discard"
+    assert selection["selected_cards"][0]["selection_membership"] == "selected"
+    assert selection["requires_manual_confirmation"] is True
+
+
+def test_hand_selection_defaults_to_hand_without_synthetic_selection_piles() -> None:
+    translated = translate_to_bridge_shape(
+        {
+            "state_type": "hand_select",
+            "hand_select": {
+                "player": _player(),
+                "cards": [{"index": 1, "id": "DEFEND"}],
+                "selected_cards": [{"index": 0, "id": "STRIKE"}],
+                "selected_count": 1,
+                "min_select": 1,
+                "max_select": 2,
+            },
+            "legal_actions": [
+                {"action": "select_hand_card", "card_index": 1},
+                {"action": "deselect_hand_card", "card_index": 0},
+            ],
+        },
+        episode_id="ep-hand-multiselect",
+    )
+
+    assert [action["card"]["pile"] for action in translated["available_actions"]] == [
+        "Hand",
+        "Hand",
+    ]
+    assert [
+        action["card"]["selection_membership"]
+        for action in translated["available_actions"]
+    ] == ["selectable", "selected"]
 
 
 def test_selection_operation_metadata_mismatch_fails_closed() -> None:

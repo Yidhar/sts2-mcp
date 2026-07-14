@@ -225,6 +225,7 @@ internal static partial class BridgeGameApi
     private static object BuildRuntimeSelectionPayload(
         string? screenType,
         string operationType,
+        string promptId,
         int selectedCount,
         int? minSelect,
         int? maxSelect,
@@ -238,6 +239,7 @@ internal static partial class BridgeGameApi
         {
             screen_type = string.IsNullOrWhiteSpace(screenType) ? "card_selection" : screenType,
             operation_type = operationType,
+            prompt_id = promptId ?? string.Empty,
             source = string.IsNullOrWhiteSpace(source) ? "card_selection" : source,
             source_zone = sourceZone ?? string.Empty,
             destination_zone = destinationZone ?? string.Empty,
@@ -250,6 +252,66 @@ internal static partial class BridgeGameApi
         };
     }
 
+    private static string GetSelectionPromptId(object? prefs)
+    {
+        if (prefs is null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            var prompt = prefs.GetType()
+                .GetProperty("Prompt", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.GetValue(prefs) as LocString;
+            if (prompt is null || prompt.IsEmpty)
+            {
+                return string.Empty;
+            }
+            return $"{prompt.LocTable}.{prompt.LocEntryKey}";
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string InferSelectionOperationType(string? promptId)
+    {
+        return promptId?.ToUpperInvariant() switch
+        {
+            "CARD_SELECTION.TO_TRANSFORM" => "transform",
+            "CARD_SELECTION.TO_EXHAUST" => "exhaust",
+            "CARD_SELECTION.TO_REMOVE" => "remove",
+            "CARD_SELECTION.TO_ENCHANT" => "enchant",
+            "CARD_SELECTION.TO_DISCARD" => "discard",
+            "CARD_SELECTION.TO_UPGRADE" => "upgrade",
+            _ => "select"
+        };
+    }
+
+    private static string ResolveCardSelectionSourceZone(BridgeWorldContext context)
+    {
+        var zones = context.CardSelectionOptions
+            .Select(static holder => holder.CardModel?.Pile?.Type.ToString())
+            .Where(static zone => !string.IsNullOrWhiteSpace(zone))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return zones.Length == 1 ? zones[0]! : string.Empty;
+    }
+
+    private static string InferSelectionDestinationZone(string operationType, string sourceZone)
+    {
+        return operationType switch
+        {
+            "discard" => "Discard",
+            "exhaust" => "Exhaust",
+            "remove" => "Removed",
+            "upgrade" or "enchant" or "transform" => sourceZone,
+            _ => string.Empty
+        };
+    }
+
     private static void AddDeckUpgradeActions(List<BridgeResolvedAction> actions, BridgeWorldContext context)
     {
         if (!IsDeckUpgradeSelectionVisible(context) || context.DeckUpgradeScreen is null)
@@ -258,9 +320,11 @@ internal static partial class BridgeGameApi
         }
 
         var selectionPrompt = TryGetDeckUpgradePrompt(context.DeckUpgradeScreen);
+        const string promptId = "card_selection.TO_UPGRADE";
         var typedSelection = BuildRuntimeSelectionPayload(
             context.DeckUpgradeScreen.GetType().Name,
             "upgrade",
+            promptId,
             selectedCount: 0,
             minSelect: 1,
             maxSelect: 1,
@@ -287,6 +351,7 @@ internal static partial class BridgeGameApi
                     kind = "deck_upgrade",
                     upgrade_action = "select_card",
                     selection_prompt = selectionPrompt,
+                    prompt_id = promptId,
                     typed_selection = typedSelection,
                     index,
                     label = $"Select upgrade card {index}: {cardHolder.CardModel.Title}",
