@@ -1295,7 +1295,13 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
             "coord": {"x": 1, "y": 2},
         },
     }
-    with pytest.raises(ValueError, match="candidate-local observation exceeds"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "candidate-local observation exceeds.*"
+            "capacity=1 required_tokens=2 action_kind='event_option'"
+        ),
+    ):
         local_limited.encode(_observation(), [action])
 
 

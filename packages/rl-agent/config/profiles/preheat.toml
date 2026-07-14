@@ -23,7 +23,7 @@ order_vocab_size = 128
 domain_count = 8
 max_world_tokens = 512
 max_candidates = 96
-max_candidate_local_tokens = 24
+max_candidate_local_tokens = 64
 
 [optimization]
 learning_rate = 0.0003
@@ -68,8 +68,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-direct-v6-runtime-mechanics"
-checkpoint_dir = "checkpoints/full-run-revival-direct-v6-runtime-mechanics"
+log_dir = "runs/full-run-revival-direct-v6-cap64-runtime-mechanics"
+checkpoint_dir = "checkpoints/full-run-revival-direct-v6-cap64-runtime-mechanics"
 checkpoint_interval_steps = 25000
 # Do not block actor/learner startup on a deterministic evaluation of the
 # randomly initialized policy. The short simulator/mechanics preflight and a

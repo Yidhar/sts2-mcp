@@ -52,7 +52,7 @@ The model-facing observation uses the versioned
 [`grounded-card-facts-encoding-v3`](./card-facts-abi.md) contract. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
 description parsing or curated card rules. The default capacity is 512 world
-tokens and 24 local tokens per candidate; overflow is an error, never silent
+tokens and 64 local tokens per candidate; overflow is an error, never silent
 truncation. This encoder change invalidates every earlier checkpoint.
 
 Candidate permutation must permute policy outputs in the same way while leaving
@@ -197,7 +197,7 @@ schema and one real event-to-combat transport path; it does not score actions or
 truncate the training curriculum.
 
 Learner collation pads only to the largest active world/candidate/local shape
-in each batch. The configured 512/96/24 capacities remain fail-closed input
+in each batch. The configured 512/96/64 capacities remain fail-closed input
 limits, but are not paid on every small decision. The preheat profile uses
 16-step recurrent unrolls in batches of four so an initial ROCm update completes
 before the asynchronous collector can accumulate hours of unusable rollout.

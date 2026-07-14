@@ -70,7 +70,7 @@ python scripts/audit_card_fact_coverage.py --sim-exe <PATH_TO_HEADLESS_SIM_EXE>
 
 For the currently pinned source, the gate enumerates 577 cards, 774 runtime
 dynamic variables and 410 cards with game-owned hover-tip identities. It also
-runs every catalog card through the production 24-token candidate-local ABI;
+runs every catalog card through the production 64-token candidate-local ABI;
 the largest current card uses 14 tokens. Finally, it starts a deterministic
 full run and verifies that Strike, Defend and Bash retain the same facts in a
 real combat hand after native DTO and Python transport. These counts are
@@ -121,7 +121,7 @@ separation.
 ## Checkpoint compatibility
 
 The new encoder version, 224-feature minimum and fingerprint intentionally reject previous
-checkpoints. World capacity is 512 tokens and candidate-local capacity is 24 so
+checkpoints. World capacity is 512 tokens and candidate-local capacity is 64 so
 larger decks and multi-effect cards fail less often; the encoder still raises on
 overflow rather than silently truncating facts. Training must start with a new
 model and run directory after this ABI change.

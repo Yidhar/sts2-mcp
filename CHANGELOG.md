@@ -69,6 +69,11 @@ historical RL artifacts.
 
 ### Fixed
 
+- Raised the fail-closed candidate-local fact capacity from 24 to 64 after the
+  first uninterrupted full-run collection crossed an Act transition and then
+  encountered a legal action requiring at least 26 tokens. Overflow diagnostics
+  now report the exact required capacity and action kind; legal-action facts are
+  still never truncated.
 - Removed the random-combat/Act-1 preheat launch gate: native-revival preheat
   now enters the uninterrupted full game immediately. Learner batches pad to
   active token/candidate sizes and the preheat recurrent batch is reduced to

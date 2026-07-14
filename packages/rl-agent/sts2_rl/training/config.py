@@ -81,7 +81,7 @@ class ModelConfig:
     domain_count: int = 8
     max_world_tokens: int = 512
     max_candidates: int = 96
-    max_candidate_local_tokens: int = 24
+    max_candidate_local_tokens: int = 64
 
     def __post_init__(self) -> None:
         for name in (

@@ -2198,11 +2198,24 @@ class GroundedObservationEncoder:
             locals_.append(local)
             queue.extend(children)
         if queue:
+            # Finish walking only to report the exact required capacity.  The
+            # encoder still fails closed: no legal-action fact is silently
+            # truncated and no partial snapshot can reach the learner.
+            required_tokens = len(locals_)
+            while queue:
+                item = queue.popleft()
+                _local, children = self._tokenize_node(
+                    item,
+                    excluded=_CANDIDATE_EXCLUDED_KEYS,
+                )
+                required_tokens += 1
+                queue.extend(children)
             raise ValueError(
                 "candidate-local observation exceeds grounded token capacity; "
                 "refusing lossy training input: "
                 f"capacity={self.config.max_candidate_local_tokens} "
-                f"pending_nodes={len(queue)}"
+                f"required_tokens={required_tokens} "
+                f"action_kind={kind!r}"
             )
         enabled = bool(action.get("is_enabled", action.get("enabled", True)))
         return _Candidate(

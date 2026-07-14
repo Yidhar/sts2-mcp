@@ -23,7 +23,7 @@ order_vocab_size = 128
 domain_count = 8
 max_world_tokens = 512
 max_candidates = 96
-max_candidate_local_tokens = 24
+max_candidate_local_tokens = 64
 
 [optimization]
 learning_rate = 0.0003

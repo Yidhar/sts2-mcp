@@ -51,7 +51,7 @@ _REQUIRED_DYNAMIC_VAR_FIELDS = frozenset(
     }
 )
 _PRODUCTION_MAX_WORLD_TOKENS = 512
-_PRODUCTION_MAX_CANDIDATE_LOCAL_TOKENS = 24
+_PRODUCTION_MAX_CANDIDATE_LOCAL_TOKENS = 64
 
 
 def _dynamic_var(card: Mapping[str, Any], name: str) -> Mapping[str, Any]:
