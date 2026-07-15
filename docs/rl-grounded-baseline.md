@@ -121,10 +121,12 @@ periodic checkpointing and held-out evaluation intent to commit before the next
 simulator reset.
 
 Each completed unroll also updates one compact actor-progress snapshot with the
-current maximum Act/floor, cumulative reward, revivals, HP loss and exact
-behavior-policy version. Learner metrics attach that snapshot without writing a
-verbose per-decision training journal, so an in-flight Act 1--3 run remains
-observable without sacrificing simulator throughput.
+current maximum Act/floor, cumulative reward, revivals, HP loss, enemy HP,
+hand/draw/discard/exhaust counts, decision surface, legal/selected action-kind
+counts, the last selected action, no-damage age, and the exact behavior-policy
+version. Learner metrics attach that snapshot without
+writing a verbose per-decision training journal, so an in-flight Act 1--3 run
+remains observable without sacrificing simulator throughput.
 
 Default data-plane settings are:
 
@@ -220,9 +222,14 @@ forward run distance with three bounded costs:
 - a small cost per environment decision.
 
 The profile keeps a 30,000-decision outer transport-safety ceiling and uses
-undiscounted return. Exact semantic deadlock detection can terminate a genuine
-reversible UI loop earlier; the outer ceiling is not an Act boundary or
-curriculum gate. All survival/pace costs together are bounded below one point, so the
+undiscounted return. Exact semantic deadlock detection terminates a genuine
+reversible UI loop earlier. Separately, 256 consecutive combat decisions with
+no observed enemy HP loss terminate as a diagnosed progress deadlock. This
+generic fact boundary prevents an irreversibly exhausted unlimited-revival
+combat from consuming the rest of the run; it does not inspect card IDs,
+preferred actions, damage estimates, or revival counts. The outer ceiling is
+not an Act boundary or curriculum gate. All survival/pace costs together are
+bounded below one point, so the
 terminal margin guarantees every victory ranks above every failure. Forward
 floor progress gives failed runs useful ordering without paying for damage or
 specific choices. Within the same outcome the weighted objective prefers:

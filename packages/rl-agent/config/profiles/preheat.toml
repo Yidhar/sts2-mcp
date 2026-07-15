@@ -80,4 +80,5 @@ evaluation_episodes = 1
 [diagnostics]
 deadlock_window = 128
 deadlock_repeat_threshold = 8
+combat_no_damage_window = 256
 journal_policy_topk = 5

@@ -29,6 +29,7 @@ from sts2_rl.contracts import (
 )
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.models import RecurrentCandidateModel
+from sts2_rl.transitions import TransitionFacts
 
 from .seeding import (
     EVALUATION_SEED_PARITY,
@@ -73,6 +74,8 @@ class EpisodeMetrics:
     policy_decisions: int
     forced_decisions: int
     deadlocked: bool
+    combat_progress_stalled: bool
+    maximum_combat_no_damage_steps: int
     revivals_used: int
     revival_free_combat_win: bool
     revival_free_act1_clear: bool
@@ -103,6 +106,19 @@ class EpisodeProgress:
     forced_decisions: int
     revivals_used: int
     player_hp_lost: float
+    combat_in_progress: bool
+    phase: str
+    decision_domain: str
+    combat_no_damage_steps: int
+    enemy_hp_total: float
+    enemy_max_hp_total: float
+    hand_cards: int
+    draw_cards: int
+    discard_cards: int
+    exhaust_cards: int
+    legal_action_kinds: dict[str, int]
+    selected_action_kinds: dict[str, int]
+    last_selected_action_kind: str
     behavior_policy_version: int
 
 
@@ -205,6 +221,50 @@ def _run_position(observation: Mapping[str, object]) -> tuple[int, int]:
     return act, floor
 
 
+def _combat_in_progress(observation: Mapping[str, object]) -> bool:
+    combat = observation.get("combat")
+    return bool(isinstance(combat, Mapping) and combat.get("in_progress") is True)
+
+
+def _enemy_hp_totals(observation: Mapping[str, object]) -> tuple[float, float]:
+    combat = observation.get("combat")
+    enemies = combat.get("enemies") if isinstance(combat, Mapping) else None
+    if not isinstance(enemies, list | tuple):
+        return 0.0, 0.0
+    current = 0.0
+    maximum = 0.0
+    for enemy in enemies:
+        if not isinstance(enemy, Mapping):
+            continue
+        current += max(0.0, _number(enemy.get("hp", enemy.get("current_hp"))))
+        maximum += max(
+            0.0,
+            _number(enemy.get("max_hp", enemy.get("maximum_hp"))),
+        )
+    return current, maximum
+
+
+def _zone_count(observation: Mapping[str, object], key: str) -> int:
+    player = observation.get("player")
+    value = player.get(key) if isinstance(player, Mapping) else None
+    if isinstance(value, Mapping):
+        value = value.get("cards")
+    return len(value) if isinstance(value, list | tuple) else 0
+
+
+def _legal_action_kind_counts(
+    legal_actions: tuple[dict[str, object], ...],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for action in legal_actions:
+        kind = str(
+            action.get("model_action_kind", action.get("kind", "unknown"))
+            or "unknown"
+        )
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 class GroundedCollector:
     """Collect policy trajectories with no MCTS, guard, or action rewrite."""
 
@@ -224,6 +284,7 @@ class GroundedCollector:
         unroll_length: int = 64,
         deadlock_window: int = 128,
         deadlock_repeat_threshold: int = 8,
+        combat_no_damage_window: int = 256,
         journal_policy_topk: int = 5,
         reward_calculator: RewardCalculator | None = None,
         additional_relics: tuple[str, ...] = (),
@@ -264,6 +325,12 @@ class GroundedCollector:
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
             raise ValueError("journal_policy_topk must be positive")
+        if isinstance(combat_no_damage_window, bool) or not isinstance(
+            combat_no_damage_window, int
+        ):
+            raise TypeError("combat_no_damage_window must be an integer")
+        if combat_no_damage_window <= 0:
+            raise ValueError("combat_no_damage_window must be positive")
         self.model = model
         self.encoder = encoder
         self.backend = backend
@@ -275,6 +342,7 @@ class GroundedCollector:
         self.encounter_id = encounter_id
         self.unroll_length = unroll_length
         self.journal_policy_topk = journal_policy_topk
+        self.combat_no_damage_window = combat_no_damage_window
         self.additional_relics = tuple(str(item) for item in additional_relics)
         self.revival_relic_id = (
             revival_relic_id.strip().upper()
@@ -699,11 +767,18 @@ class GroundedCollector:
         steps_taken = 0
         final_outcome = "ongoing"
         deadlocked = False
+        combat_progress_stalled = False
+        combat_in_progress = _combat_in_progress(state.observation)
+        last_enemy_damage_step = 0
+        combat_no_damage_steps = 0
+        maximum_combat_no_damage_steps = 0
         forced_horizon = False
         curriculum_horizon = False
         revivals_used = 0
         player_hp_lost = 0.0
         final_behavior_policy_version = policy_version
+        selected_action_kind_counts: dict[str, int] = {}
+        last_selected_action_kind = ""
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -723,6 +798,16 @@ class GroundedCollector:
             policy_decisions += int(choice.valid_count > 1)
             forced_decisions += int(choice.valid_count == 1)
             selected_action = state.legal_actions[choice.action_index]
+            last_selected_action_kind = str(
+                selected_action.get(
+                    "model_action_kind",
+                    selected_action.get("kind", "unknown"),
+                )
+                or "unknown"
+            )
+            selected_action_kind_counts[last_selected_action_kind] = (
+                selected_action_kind_counts.get(last_selected_action_kind, 0) + 1
+            )
             deadlock_evidence = self.deadlock_detector.observe(
                 step_index=state.step_index,
                 observation=state.observation,
@@ -742,6 +827,40 @@ class GroundedCollector:
                 and not next_state.terminated
                 and not next_state.truncated
             )
+            if next_state.transition is None:  # pragma: no cover - validated above
+                raise CollectionProtocolError("step result lost its typed transition")
+            transition_facts = TransitionFacts.from_mapping(
+                next_state.transition.facts
+            )
+            observed_enemy_hp_delta = (
+                _enemy_hp_totals(state.observation)[0]
+                - _enemy_hp_totals(next_state.observation)[0]
+            )
+            enemy_hp_loss = max(
+                transition_facts.enemy_hp_delta,
+                observed_enemy_hp_delta,
+            )
+            next_combat_in_progress = _combat_in_progress(next_state.observation)
+            if next_combat_in_progress and not combat_in_progress:
+                last_enemy_damage_step = steps_taken
+            elif next_combat_in_progress and enemy_hp_loss > 0.0:
+                last_enemy_damage_step = steps_taken
+            elif not next_combat_in_progress:
+                last_enemy_damage_step = steps_taken
+            combat_no_damage_steps = (
+                steps_taken - last_enemy_damage_step
+                if next_combat_in_progress
+                else 0
+            )
+            maximum_combat_no_damage_steps = max(
+                maximum_combat_no_damage_steps,
+                combat_no_damage_steps,
+            )
+            combat_progress_stalled = bool(
+                next_combat_in_progress
+                and combat_no_damage_steps >= self.combat_no_damage_window
+            )
+            combat_in_progress = next_combat_in_progress
             # ``maximum_steps`` may be a runtime's remaining global budget,
             # which can cut an otherwise healthy episode after only one or a
             # few decisions. Only the configured task horizon is a semantic
@@ -754,7 +873,9 @@ class GroundedCollector:
             breakdown = self.reward_calculator.evaluate(
                 state,
                 next_state,
-                deadlock=deadlock_evidence is not None,
+                deadlock=(
+                    deadlock_evidence is not None or combat_progress_stalled
+                ),
                 horizon_exhausted=bool(
                     curriculum_horizon and self.horizon_as_failure
                 ),
@@ -812,6 +933,13 @@ class GroundedCollector:
                         "deadlock": (
                             deadlock_evidence.to_mapping()
                             if deadlock_evidence is not None
+                            else {
+                                "kind": "combat_no_enemy_hp_loss",
+                                "window": self.combat_no_damage_window,
+                                "steps_without_enemy_hp_loss": combat_no_damage_steps,
+                                "detected_step": state.step_index,
+                            }
+                            if combat_progress_stalled
                             else None
                         ),
                     }
@@ -878,6 +1006,31 @@ class GroundedCollector:
                             forced_decisions=forced_decisions,
                             revivals_used=revivals_used,
                             player_hp_lost=player_hp_lost,
+                            combat_in_progress=combat_in_progress,
+                            phase=str(state.observation.get("phase") or ""),
+                            decision_domain=str(
+                                state.observation.get("decision_domain") or ""
+                            ),
+                            combat_no_damage_steps=combat_no_damage_steps,
+                            enemy_hp_total=_enemy_hp_totals(state.observation)[0],
+                            enemy_max_hp_total=_enemy_hp_totals(state.observation)[1],
+                            hand_cards=_zone_count(state.observation, "hand"),
+                            draw_cards=_zone_count(state.observation, "draw_pile"),
+                            discard_cards=_zone_count(
+                                state.observation,
+                                "discard_pile",
+                            ),
+                            exhaust_cards=_zone_count(
+                                state.observation,
+                                "exhaust_pile",
+                            ),
+                            legal_action_kinds=_legal_action_kind_counts(
+                                state.legal_actions
+                            ),
+                            selected_action_kinds=dict(
+                                sorted(selected_action_kind_counts.items())
+                            ),
+                            last_selected_action_kind=last_selected_action_kind,
                             behavior_policy_version=completed_unroll.policy_version,
                         )
                     )
@@ -902,7 +1055,9 @@ class GroundedCollector:
                 steps=steps_taken,
                 reward_total=reward_total,
                 terminal_reason=(
-                    "semantic_deadlock"
+                    "combat_progress_stall"
+                    if combat_progress_stalled
+                    else "semantic_deadlock"
                     if deadlocked
                     else "curriculum_horizon"
                     if curriculum_horizon and self.horizon_as_failure
@@ -919,6 +1074,8 @@ class GroundedCollector:
                 policy_decisions=policy_decisions,
                 forced_decisions=forced_decisions,
                 deadlocked=deadlocked,
+                combat_progress_stalled=combat_progress_stalled,
+                maximum_combat_no_damage_steps=maximum_combat_no_damage_steps,
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
                 revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),

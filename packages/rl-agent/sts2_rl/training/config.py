@@ -397,12 +397,14 @@ class RuntimeConfig:
 class DiagnosticsConfig:
     deadlock_window: int = 128
     deadlock_repeat_threshold: int = 8
+    combat_no_damage_window: int = 256
     journal_policy_topk: int = 5
 
     def __post_init__(self) -> None:
         for name in (
             "deadlock_window",
             "deadlock_repeat_threshold",
+            "combat_no_damage_window",
             "journal_policy_topk",
         ):
             _require_int(

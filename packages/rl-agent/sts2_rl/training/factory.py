@@ -154,6 +154,7 @@ def build_training_resources(
         unroll_length=config.rollout.unroll_length,
         deadlock_window=config.diagnostics.deadlock_window,
         deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
+        combat_no_damage_window=config.diagnostics.combat_no_damage_window,
         journal_policy_topk=config.diagnostics.journal_policy_topk,
         reward_calculator=reward_calculator,
         additional_relics=(

@@ -20,6 +20,7 @@ from sts2_rl.contracts import (
 from sts2_rl.encoding import grounding_encoding_identity
 from sts2_rl.training import (
     CurriculumConfig,
+    DiagnosticsConfig,
     EnvironmentConfig,
     ModelConfig,
     OptimizationConfig,
@@ -317,6 +318,49 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         assert len(episode.unrolls) == 1
         assert episode.unrolls[0].steps[-1].discount == 1.0
         assert episode.unrolls[0].bootstrap_snapshot is not None
+    finally:
+        resources.close()
+
+
+def test_combat_without_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
+    base = _config(total_steps=12)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=12),
+        diagnostics=DiagnosticsConfig(
+            deadlock_window=128,
+            deadlock_repeat_threshold=8,
+            combat_no_damage_window=3,
+            journal_policy_topk=5,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=FakeCombatBackend(terminal_step=100),
+    )
+    progress = []
+    try:
+        episode = resources.collector.collect_episode(
+            record=True,
+            progress_sink=progress.append,
+        )
+        assert episode.metrics.steps == 9
+        assert episode.metrics.deadlocked
+        assert episode.metrics.combat_progress_stalled
+        assert episode.metrics.terminal_reason == "combat_progress_stall"
+        assert episode.metrics.maximum_combat_no_damage_steps == 3
+        assert progress[-1].combat_in_progress
+        assert progress[-1].combat_no_damage_steps == 3
+        assert progress[-1].enemy_hp_total == 1.0
+        assert progress[-1].legal_action_kinds == {
+            "end_turn": 1,
+            "play_card": 1,
+        }
+        assert sum(progress[-1].selected_action_kinds.values()) == 9
+        assert progress[-1].last_selected_action_kind in {
+            "end_turn",
+            "play_card",
+        }
     finally:
         resources.close()
 

@@ -76,6 +76,7 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "run_win_rate": 0.0,
             "combat_win_rate": 0.0,
             "deadlock_rate": 0.0,
+            "combat_progress_stall_rate": 0.0,
             "mean_max_floor": 0.0,
             "maximum_floor": 0,
             "mean_max_act": 0.0,
@@ -94,6 +95,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "run_win_rate": sum(item.run_won for item in episodes) / count,
         "combat_win_rate": sum(item.combat_won for item in episodes) / count,
         "deadlock_rate": sum(item.deadlocked for item in episodes) / count,
+        "combat_progress_stall_rate": (
+            sum(item.combat_progress_stalled for item in episodes) / count
+        ),
         "mean_max_floor": statistics.fmean(item.max_floor for item in episodes),
         "maximum_floor": max(item.max_floor for item in episodes),
         "mean_max_act": statistics.fmean(item.max_act for item in episodes),

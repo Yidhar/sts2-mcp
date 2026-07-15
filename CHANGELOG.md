@@ -98,6 +98,13 @@ historical RL artifacts.
 - Replaced the five-run evaluation block at the first 10,000-step boundary with
   one held-out run at 30k/100k/250k. This keeps validation without preventing
   the updated actor from immediately continuing its training trajectory.
+- Added an observation-grounded combat-progress stall boundary: a combat that
+  produces no enemy HP loss for 256 consecutive decisions ends as a diagnosed
+  deadlock and starts a fresh native run. This addresses irreversible exhaust
+  states under unlimited revival without card-name rules, revival-count gates,
+  or verbose per-decision journals. Compact actor progress now also reports
+  enemy HP, pile sizes, decision surface, legal/selected action-kind counts,
+  last selected action kind, and no-damage age.
 - Raised the relational world-token ceiling from 512 to 1,024 after the first
   complete 10,000-decision run reached Act 1 floor 17 and the following run
   exposed 61 additional pending factual nodes beyond the old limit. Overflow
