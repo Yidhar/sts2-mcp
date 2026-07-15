@@ -84,7 +84,26 @@ class EpisodeMetrics:
 class CollectedEpisode:
     unrolls: tuple[SequenceUnroll, ...]
     metrics: EpisodeMetrics
+    actor_policy_version: int
+    behavior_policy_version: int
     timings: CollectorTimings | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeProgress:
+    """Compact actor progress published once per completed recurrent unroll."""
+
+    episode_id: str
+    reset_seed: int
+    steps: int
+    reward_total: float
+    max_act: int
+    max_floor: int
+    policy_decisions: int
+    forced_decisions: int
+    revivals_used: int
+    player_hp_lost: float
+    behavior_policy_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,7 +664,8 @@ class GroundedCollector:
         policy_version: int = 0,
         trajectory_journal: TrajectoryJournal | None = None,
         maximum_steps: int | None = None,
-        unroll_sink: Callable[[SequenceUnroll], None] | None = None,
+        unroll_sink: Callable[[SequenceUnroll], int | None] | None = None,
+        progress_sink: Callable[[EpisodeProgress], None] | None = None,
     ) -> CollectedEpisode:
         if isinstance(policy_version, bool) or not isinstance(policy_version, int):
             raise TypeError("policy_version must be an integer")
@@ -669,6 +689,7 @@ class GroundedCollector:
             recurrent_state[0].detach().float().cpu().numpy().copy()
         )
         segment_start_step = state.step_index
+        segment_policy_version = policy_version
         segment_steps: list[RolloutStep] = []
         unrolls: list[SequenceUnroll] = []
         reward_total = 0.0
@@ -682,6 +703,7 @@ class GroundedCollector:
         curriculum_horizon = False
         revivals_used = 0
         player_hp_lost = 0.0
+        final_behavior_policy_version = policy_version
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -823,15 +845,42 @@ class GroundedCollector:
                 completed_unroll = SequenceUnroll(
                     episode_id=state.episode_id,
                     start_step=segment_start_step,
-                    policy_version=policy_version,
+                    policy_version=segment_policy_version,
                     initial_recurrent_state=segment_initial_state,
                     steps=tuple(segment_steps),
                     bootstrap_snapshot=bootstrap_snapshot,
                 )
+                final_behavior_policy_version = completed_unroll.policy_version
                 if unroll_sink is None:
                     unrolls.append(completed_unroll)
                 else:
-                    unroll_sink(completed_unroll)
+                    adopted_policy_version = unroll_sink(completed_unroll)
+                    if adopted_policy_version is not None:
+                        if (
+                            isinstance(adopted_policy_version, bool)
+                            or not isinstance(adopted_policy_version, int)
+                            or adopted_policy_version < segment_policy_version
+                        ):
+                            raise ValueError(
+                                "unroll sink returned an invalid actor policy version"
+                            )
+                        segment_policy_version = adopted_policy_version
+                if progress_sink is not None:
+                    progress_sink(
+                        EpisodeProgress(
+                            episode_id=state.episode_id,
+                            reset_seed=reset_seed,
+                            steps=steps_taken,
+                            reward_total=reward_total,
+                            max_act=max_act,
+                            max_floor=max_floor,
+                            policy_decisions=policy_decisions,
+                            forced_decisions=forced_decisions,
+                            revivals_used=revivals_used,
+                            player_hp_lost=player_hp_lost,
+                            behavior_policy_version=completed_unroll.policy_version,
+                        )
+                    )
                 segment_steps = []
                 segment_initial_state = (
                     recurrent_state[0].detach().float().cpu().numpy().copy()
@@ -876,6 +925,8 @@ class GroundedCollector:
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
             ),
+            actor_policy_version=segment_policy_version,
+            behavior_policy_version=final_behavior_policy_version,
             timings=timings.snapshot(),
         )
 
@@ -884,5 +935,6 @@ __all__ = [
     "CollectedEpisode",
     "CollectionProtocolError",
     "EpisodeMetrics",
+    "EpisodeProgress",
     "GroundedCollector",
 ]

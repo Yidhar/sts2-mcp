@@ -22,9 +22,10 @@ historical RL artifacts.
   `python -m sts2_rl.train`. Old checkpoints and replay are not compatible with the
   new randomly initialized grounded baseline.
 - Advanced the grounded observation ABI from runtime-mechanics v6 to relational
-  runtime encoding v7 with a 224-feature minimum. Definition/instance/zone
-  channels and the run/combat memory split intentionally reject earlier
-  card/selection checkpoints rather than padding or migrating them.
+  runtime encoding v8 with a 224-feature minimum. Definition/instance/zone
+  channels, exact counted orderless card multisets, and the run/combat memory
+  split intentionally reject earlier card/selection checkpoints rather than
+  padding or migrating them.
 - Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
 
 ### Added
@@ -77,6 +78,26 @@ historical RL artifacts.
 
 ### Fixed
 
+- Replaced copy-proportional Deck/Draw/Discard/Exhaust/Play expansion with an
+  exact counted multiset of fact-identical card variants. Concrete hand,
+  selection and legal-action entities remain unaggregated, while upgrade,
+  cost, modifier and lifecycle differences remain separate. The fail-closed
+  world ceiling is now 2,048 and overflow reports exact total demand plus
+  top-level branch counts instead of an ambiguous pending-queue size.
+- Added an acknowledged actor/main-thread episode boundary. A completed episode
+  cannot reset into the next run before metrics, evaluation intent and periodic
+  checkpoint state are committed, closing the race that lost the first
+  10,000-step checkpoint when episode two failed. Policy snapshots are now
+  adopted by the actor after complete recurrent unrolls, not only between
+  10,000-step episodes, so learner progress affects an ongoing full run without
+  mutating a model mid-forward or mislabelling behavior-policy data. Learner
+  metrics now distinguish global from batch environment steps and include a
+  compact per-unroll Act/floor/revival/reward snapshot. The preheat outer
+  transport ceiling is 30,000 decisions so one native run can traverse Acts
+  1--3, while exact semantic deadlock detection remains the early loop exit.
+- Replaced the five-run evaluation block at the first 10,000-step boundary with
+  one held-out run at 30k/100k/250k. This keeps validation without preventing
+  the updated actor from immediately continuing its training trajectory.
 - Raised the relational world-token ceiling from 512 to 1,024 after the first
   complete 10,000-decision run reached Act 1 floor 17 and the following run
   exposed 61 additional pending factual nodes beyond the old limit. Overflow

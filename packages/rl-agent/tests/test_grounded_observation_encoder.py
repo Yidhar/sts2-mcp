@@ -1271,7 +1271,10 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
             max_candidate_local_tokens=2,
         )
     )
-    with pytest.raises(ValueError, match="world observation exceeds"):
+    with pytest.raises(
+        ValueError,
+        match=r"world observation exceeds.*required_tokens=\d+.*branch_tokens=",
+    ):
         world_limited.encode(_observation(), _actions())
 
     local_limited = GroundedObservationEncoder(
@@ -1298,10 +1301,10 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
         local_limited.encode(_observation(), [action])
 
 
-def test_production_capacity_accepts_world_above_legacy_limit() -> None:
+def test_orderless_card_multiset_bounds_copy_growth_without_merging_variants() -> None:
     model = _small_model_config()
     config = GroundedEncodingConfig.from_model_config(model)
-    assert config.max_world_tokens == 1024
+    assert config.max_world_tokens == 2048
 
     encoder = GroundedObservationEncoder(config)
     observation = {
@@ -1318,6 +1321,7 @@ def test_production_capacity_accepts_world_above_legacy_limit() -> None:
                     "instance_uuid": f"card-{index}",
                     "type": "Attack",
                     "cost": 1,
+                    "is_upgraded": index >= 400,
                 }
                 for index in range(600)
             ],
@@ -1334,7 +1338,17 @@ def test_production_capacity_accepts_world_above_legacy_limit() -> None:
 
     encoded = encoder.encode(observation, actions)
     token_count = int(encoded.batch.world.mask.sum().item())
-    assert 512 < token_count <= config.max_world_tokens
+    assert token_count < 32
+
+    quantity_slot = _NUMERIC_SLOT_BY_KEY["quantity"]
+    world = encoded.batch.world
+    quantity_rows = world.features[0, world.mask[0], quantity_slot]
+    quantities = sorted(
+        value.item() for value in quantity_rows if value.item() > 0.0
+    )
+    assert quantities == pytest.approx(
+        sorted((_bounded_number(200), _bounded_number(400)))
+    )
 
 
 @pytest.mark.parametrize(

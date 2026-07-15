@@ -52,6 +52,7 @@ class LearnerMetrics:
 
     def to_mapping(self) -> dict[str, float | int | dict[str, float]]:
         payload: dict[str, float | int | dict[str, float]] = asdict(self)
+        payload["batch_environment_steps"] = payload.pop("environment_steps")
         payload["timings"] = self.timings.to_mapping()
         return payload
 

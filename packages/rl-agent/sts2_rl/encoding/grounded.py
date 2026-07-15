@@ -22,7 +22,7 @@ import hashlib
 import json
 import math
 import re
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
@@ -318,6 +318,7 @@ _CARD_FACT_NUMERIC_KEYS: Final[frozenset[str]] = frozenset(
         "last_stars_spent",
         "max_upgrade_level",
         "price",
+        "quantity",
         "stack_count",
         "star_cost",
         "upgrade_level",
@@ -668,7 +669,7 @@ _DYNAMIC_VALUE_SLOT_BY_KEY: Final[dict[str, int]] = {
 _DYNAMIC_HASH_SLOT_START: Final = _DYNAMIC_SLOT_START + len(_DYNAMIC_VALUE_KEYS)
 _DYNAMIC_HASH_SLOT_COUNT: Final = _DYNAMIC_SLOT_COUNT - len(_DYNAMIC_VALUE_KEYS)
 _FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v7"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v8"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -1539,6 +1540,51 @@ def _canonical_card_sequence(
     return result
 
 
+def _aggregate_orderless_card_multiset(
+    cards: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse fact-identical cards into an exact counted multiset.
+
+    Permanent decks and public combat piles are orderless model surfaces.  A
+    full card subtree for every physical copy duplicated immutable keywords,
+    DynamicVars and modifier facts across both the deck and the current combat
+    pile.  Long runs therefore grew the transformer input with copy count
+    rather than semantic variety and eventually exceeded the hard world-token
+    limit.
+
+    Instance identity is deliberately removed only from these orderless
+    multisets.  Every distinct factual variant (upgrade, cost, modifier,
+    lifecycle flag, etc.) remains a separate entry, and ``quantity`` preserves
+    exact multiplicity.  Hand/selection entities and legal-action locals remain
+    unaggregated so the dispatcher can still bind a concrete selectable card.
+    """
+
+    grouped: dict[str, tuple[dict[str, Any], dict[str, Any], int]] = {}
+    for raw_card in cards:
+        original = dict(raw_card)
+        card = dict(original)
+        card.pop("instance_id", None)
+        card.pop("instance_uuid", None)
+        card.pop("quantity", None)
+        identity = json.dumps(card, sort_keys=True, separators=(",", ":"))
+        existing = grouped.get(identity)
+        if existing is None:
+            grouped[identity] = (card, original, 1)
+        else:
+            grouped[identity] = (existing[0], existing[1], existing[2] + 1)
+
+    result: list[dict[str, Any]] = []
+    for identity in sorted(grouped):
+        card, original, quantity = grouped[identity]
+        # A singleton can retain its concrete relation identity.  Once several
+        # fact-identical copies collapse, the counted multiset intentionally
+        # uses the shared factual variant instead of choosing one arbitrary
+        # instance as representative.
+        representative = original if quantity == 1 else card
+        result.append({**representative, "quantity": quantity})
+    return result
+
+
 def _canonical_event_option(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, aliases in {
@@ -1792,13 +1838,14 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         deck_cards = _as_mapping_list(deck_value, label="player deck")
         deck_count = len(deck_cards)
 
-    canonical_deck_cards = (
-        _canonical_card_sequence(
-            deck_cards,
-            label="player.deck_cards",
-            pile="Deck",
-        )
-        or []
+    canonical_deck_sequence = _canonical_card_sequence(
+        deck_cards,
+        label="player.deck_cards",
+        pile="Deck",
+        sort_as_set=True,
+    ) or []
+    canonical_deck_cards = _aggregate_orderless_card_multiset(
+        canonical_deck_sequence
     )
     player: dict[str, Any] = {
         "deck": deck_count,
@@ -1957,7 +2004,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 sort_as_set=True,
             )
             if cards is not None:
-                combat[key] = cards
+                combat[key] = _aggregate_orderless_card_multiset(cards)
         canonical["combat"] = combat
 
     raw_event = _as_mapping(observation.get("event"), label="observation.event")
@@ -2788,16 +2835,35 @@ class GroundedObservationEncoder:
     def _world_tokens(self, observation: Mapping[str, Any]) -> tuple[_Token, ...]:
         queue: deque[_WalkItem] = deque([_WalkItem(observation, ("world",), "neutral", "", 0, 0)])
         result: list[_Token] = []
+        branch_tokens: Counter[str] = Counter()
         while queue and len(result) < self.config.max_world_tokens:
             item = queue.popleft()
             token, children = self._tokenize_node(item, excluded=_WORLD_EXCLUDED_KEYS)
             result.append(token)
+            branch_tokens[item.path[1] if len(item.path) > 1 else "world"] += 1
             queue.extend(children)
         if queue:
+            # Overflow is exceptional, so finish the structural walk only on
+            # this path.  Exact demand and top-level branch counts make the
+            # next failure actionable without adding per-decision logging or
+            # silently truncating any game fact.
+            required_tokens = len(result)
+            while queue:
+                item = queue.popleft()
+                _token, children = self._tokenize_node(
+                    item,
+                    excluded=_WORLD_EXCLUDED_KEYS,
+                )
+                required_tokens += 1
+                branch_tokens[item.path[1] if len(item.path) > 1 else "world"] += 1
+                queue.extend(children)
             raise ValueError(
                 "world observation exceeds grounded token capacity; refusing "
                 "lossy training input: "
-                f"capacity={self.config.max_world_tokens} pending_nodes={len(queue)}"
+                f"capacity={self.config.max_world_tokens} "
+                f"required_tokens={required_tokens} "
+                "branch_tokens="
+                f"{json.dumps(dict(sorted(branch_tokens.items())), separators=(',', ':'))}"
             )
         return tuple(result)
 

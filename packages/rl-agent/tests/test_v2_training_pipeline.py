@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from sts2_rl.training import (
     build_training_resources,
     evaluate_policy,
     load_training_checkpoint,
+    run_training,
     save_training_checkpoint,
 )
 from sts2_rl.training import checkpointing as checkpointing_module
@@ -256,6 +258,35 @@ def test_collector_emits_contiguous_recurrent_unroll() -> None:
         resources.close()
 
 
+def test_collector_can_adopt_new_policy_only_between_complete_unrolls() -> None:
+    resources = build_training_resources(
+        _config(total_steps=4),
+        backend=FakeCombatBackend(terminal_step=4),
+    )
+    emitted = []
+    progress = []
+
+    def sink(unroll: Any) -> int:
+        emitted.append(unroll)
+        return 7 if len(emitted) == 1 else 9
+
+    try:
+        episode = resources.collector.collect_episode(
+            record=True,
+            policy_version=0,
+            unroll_sink=sink,
+            progress_sink=progress.append,
+        )
+        assert [unroll.policy_version for unroll in emitted] == [0, 7]
+        assert [item.steps for item in progress] == [2, 4]
+        assert [item.behavior_policy_version for item in progress] == [0, 7]
+        assert all(item.max_act == 1 and item.max_floor == 1 for item in progress)
+        assert episode.behavior_policy_version == 7
+        assert episode.actor_policy_version == 9
+    finally:
+        resources.close()
+
+
 def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> None:
     base = _config(total_steps=1)
     config = replace(
@@ -314,6 +345,8 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
             progress=lambda stage, payload: progress.append((stage, payload)),
         )
         assert metrics.environment_steps == 2
+        assert metrics.to_mapping()["batch_environment_steps"] == 2
+        assert "environment_steps" not in metrics.to_mapping()
         assert metrics.unrolls == 1
         assert torch.isfinite(torch.tensor(metrics.loss))
         assert metrics.importance_ratio_mean > 0.0
@@ -345,17 +378,100 @@ def test_async_pipeline_streams_fifo_data_and_finishes_exact_horizon() -> None:
         metrics = resources.learner.update(first, current_policy_version=0)
         assert metrics.environment_steps == 2
         pipeline.request_policy_publication(1)
+        episodes = []
+        while sum(item.metrics.steps for item in episodes) < 4:
+            episode = pipeline.next_episode(timeout=5.0)
+            assert episode is not None
+            episodes.append(episode)
+            pipeline.release_episode_boundary()
         pipeline.join(timeout=10.0)
         assert pipeline.environment_steps == 4
-        episodes = []
-        while True:
-            episode = pipeline.next_episode(timeout=0.0)
-            if episode is None:
-                break
-            episodes.append(episode)
         assert sum(item.metrics.steps for item in episodes) == 4
+        assert [item.behavior_policy_version for item in episodes] == [0, 1]
+        assert [item.actor_policy_version for item in episodes] == [0, 1]
     finally:
         resources.close()
+
+
+def test_actor_waits_for_main_thread_at_episode_boundary() -> None:
+    backend = FakeCombatBackend()
+    resources = build_training_resources(_config(total_steps=4), backend=backend)
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=4,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        epsilon=lambda _: 0.1,
+    )
+    try:
+        pipeline.start()
+        episode = pipeline.next_episode(timeout=5.0)
+        assert episode is not None
+        deadline = time.monotonic() + 5.0
+        while not pipeline.at_episode_boundary and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pipeline.at_episode_boundary
+        assert pipeline.environment_steps == 2
+        assert len(backend.reset_seeds) == 1
+        first_seed = backend.reset_seeds[0]
+
+        pipeline.request_pause()
+        pipeline.release_episode_boundary()
+        deadline = time.monotonic() + 5.0
+        while not pipeline.paused and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pipeline.paused
+        assert backend.reset_seeds == [first_seed]
+
+        pipeline.resume()
+        second = pipeline.next_episode(timeout=5.0)
+        assert second is not None
+        pipeline.release_episode_boundary()
+        pipeline.join(timeout=10.0)
+        assert len(backend.reset_seeds) == 2
+        assert backend.reset_seeds[0] == first_seed
+        assert backend.reset_seeds[1] != first_seed
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
+def test_runtime_checkpoints_each_crossed_episode_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/boundary-checkpoint",
+            checkpoint_dir="checkpoints/boundary-checkpoint",
+            checkpoint_interval_steps=2,
+        ),
+    )
+
+    state = run_training(config, backend=FakeCombatBackend())
+
+    assert state.environment_steps == 4
+    assert state.episodes == 2
+    checkpoint_root = tmp_path / "checkpoints" / "boundary-checkpoint"
+    periodic = sorted(checkpoint_root.glob("run-*/periodic-*"))
+    assert len(periodic) == 2
+    assert all((path / "checkpoint.manifest.json").is_file() for path in periodic)
+    assert all((path / "metadata.json").is_file() for path in periodic)
+
+    metrics_path = next(
+        (tmp_path / "runs" / "boundary-checkpoint").glob("run-*/metrics.jsonl")
+    )
+    metrics_text = metrics_path.read_text(encoding="utf-8")
+    assert metrics_text.count('"event": "train_episode"') == 2
+    assert metrics_text.count('"event": "checkpoint"') == 2
+    assert '"behavior_policy_version": 0' in metrics_text
+    assert '"actor_progress": {' in metrics_text
 
 
 def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(

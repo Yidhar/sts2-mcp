@@ -79,7 +79,7 @@ class ModelConfig:
     zone_vocab_size: int = 32
     order_vocab_size: int = 128
     domain_count: int = 8
-    max_world_tokens: int = 1024
+    max_world_tokens: int = 2048
     max_candidates: int = 96
     max_candidate_local_tokens: int = 64
 

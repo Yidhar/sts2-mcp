@@ -11,7 +11,7 @@ import torch
 
 from sts2_baseline import RolloutQueueClosed, SequenceUnroll
 
-from .collector import CollectedEpisode
+from .collector import CollectedEpisode, EpisodeProgress
 from .factory import TrainingResources
 
 
@@ -19,9 +19,12 @@ class ActorLearnerPipeline:
     """Run one environment actor concurrently with the main-thread learner.
 
     The actor streams each completed unroll into the bounded FIFO immediately;
-    it does not wait for the episode to end.  Model publication is applied only
-    at episode boundaries, so one unroll is always labelled with the exact
-    behavior-policy version that produced it.
+    it does not wait for the episode to end.  At each episode boundary it does
+    wait for the main thread to commit metrics and request any checkpoint or
+    evaluation pause before resetting the simulator.  Model publication is
+    applied only after complete recurrent unrolls or at acknowledged episode
+    boundaries, so every unroll is labelled with the exact behavior-policy
+    version that produced it.
     """
 
     def __init__(
@@ -50,7 +53,11 @@ class ActorLearnerPipeline:
         self._paused = Event()
         self._resume = Event()
         self._resume.set()
+        self._episode_boundary_waiting = Event()
+        self._episode_boundary_release = Event()
         self._publication_lock = Lock()
+        self._progress_lock = Lock()
+        self._actor_progress: EpisodeProgress | None = None
         self._pending_publication: tuple[int, Mapping[str, Any]] | None = None
         self._thread = Thread(
             target=self._run,
@@ -74,13 +81,22 @@ class ActorLearnerPipeline:
     def paused(self) -> bool:
         return self._paused.is_set()
 
+    @property
+    def at_episode_boundary(self) -> bool:
+        return self._episode_boundary_waiting.is_set()
+
+    @property
+    def actor_progress(self) -> EpisodeProgress | None:
+        with self._progress_lock:
+            return self._actor_progress
+
     def start(self) -> None:
         if self._thread.ident is not None:
             raise RuntimeError("actor pipeline can only be started once")
         self._thread.start()
 
     def request_policy_publication(self, policy_version: int) -> None:
-        """Copy a learner snapshot now; the actor adopts it between episodes."""
+        """Copy a learner snapshot now; the actor adopts it between unrolls."""
 
         if policy_version < self._actor_policy_version:
             raise ValueError("cannot publish an older policy version")
@@ -128,6 +144,7 @@ class ActorLearnerPipeline:
     def stop(self) -> None:
         self._stop.set()
         self._resume.set()
+        self._episode_boundary_release.set()
         self.resources.rollout_queue.close()
 
     def join(self, timeout: float | None = None) -> None:
@@ -144,10 +161,29 @@ class ActorLearnerPipeline:
             raise result
         return result
 
-    def _put_unroll(self, unroll: SequenceUnroll) -> None:
+    def release_episode_boundary(self) -> None:
+        """Acknowledge that the main thread committed one episode result."""
+
+        self._episode_boundary_release.set()
+
+    def _put_unroll(self, unroll: SequenceUnroll) -> int:
         if self._stop.is_set():
             raise RolloutQueueClosed("actor pipeline was stopped")
         self.resources.rollout_queue.put(unroll)
+        # Count accepted rollout steps immediately instead of waiting for a
+        # potentially very long full-run episode to end. Runtime progress and
+        # total-step accounting therefore remain truthful during Act 1--3.
+        self._environment_steps += unroll.environment_steps
+        # Publication is adopted by the actor thread only after an entire
+        # recurrent unroll has been emitted.  This permits real actor/learner
+        # overlap during a long full-run episode without mutating a model in
+        # the middle of a forward pass or mislabelling behavior-policy data.
+        self._adopt_publication()
+        return self._actor_policy_version
+
+    def _record_progress(self, progress: EpisodeProgress) -> None:
+        with self._progress_lock:
+            self._actor_progress = progress
 
     def _wait_if_paused(self) -> None:
         if not self._pause_requested.is_set():
@@ -158,6 +194,14 @@ class ActorLearnerPipeline:
         while self._pause_requested.is_set() and not self._stop.is_set():
             self._resume.wait(0.1)
         self._paused.clear()
+
+    def _wait_for_episode_boundary_ack(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if self._episode_boundary_release.wait(0.1):
+                    return
+        finally:
+            self._episode_boundary_waiting.clear()
 
     def _run(self) -> None:
         try:
@@ -174,9 +218,12 @@ class ActorLearnerPipeline:
                     policy_version=self._actor_policy_version,
                     maximum_steps=remaining,
                     unroll_sink=self._put_unroll,
+                    progress_sink=self._record_progress,
                 )
-                self._environment_steps += episode.metrics.steps
+                self._episode_boundary_release.clear()
+                self._episode_boundary_waiting.set()
                 self._episodes.put(episode)
+                self._wait_for_episode_boundary_ack()
                 self._wait_if_paused()
         except RolloutQueueClosed:
             if not self._stop.is_set():

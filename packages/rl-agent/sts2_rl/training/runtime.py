@@ -185,7 +185,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     return {
         "config_version": config.version,
         "profile": config.profile,
-        "pipeline": "bounded-fifo-async-vtrace-v2",
+        "pipeline": "bounded-fifo-async-vtrace-v3",
         "collector_device": config.runtime.collector_device,
         "architecture": config.model.architecture,
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
@@ -301,7 +301,7 @@ def run_training(
                 "run_id": run_id,
                 "state": asdict(state),
                 "config": config.to_mapping(),
-                "pipeline": "bounded-fifo-async-vtrace-v2",
+                "pipeline": "bounded-fifo-async-vtrace-v3",
             },
         )
 
@@ -405,6 +405,11 @@ def run_training(
                     {
                         "environment_steps": pipeline.environment_steps,
                         "policy_version": state.policy_version,
+                        "actor_progress": (
+                            asdict(pipeline.actor_progress)
+                            if pipeline.actor_progress is not None
+                            else None
+                        ),
                         "rollout_queue": resources.rollout_queue.metrics(),
                         **learner_metrics.to_mapping(),
                     },
@@ -425,7 +430,7 @@ def run_training(
                     state,
                     environment_steps=state.environment_steps + episode.metrics.steps,
                     episodes=state.episodes + 1,
-                    actor_policy_version=pipeline.actor_policy_version,
+                    actor_policy_version=episode.actor_policy_version,
                 )
                 metrics.write(
                     "train_episode",
@@ -435,6 +440,7 @@ def run_training(
                         "learner_updates": state.learner_updates,
                         "policy_version": state.policy_version,
                         "actor_policy_version": state.actor_policy_version,
+                        "behavior_policy_version": episode.behavior_policy_version,
                         "epsilon": exploration_epsilon(
                             config, state.environment_steps
                         ),
@@ -456,6 +462,9 @@ def run_training(
                     maintenance_requested = True
                     if pipeline.alive:
                         pipeline.request_pause()
+                # The actor cannot reset into the next run until metrics and
+                # maintenance intent for this completed episode are committed.
+                pipeline.release_episode_boundary()
 
             actor_idle = not pipeline.alive or pipeline.paused
             if maintenance_requested and actor_idle:
@@ -524,6 +533,7 @@ def run_training(
                 environment_steps=state.environment_steps + episode.metrics.steps,
                 episodes=state.episodes + 1,
             )
+            pipeline.release_episode_boundary()
         resources.publish_collector_policy()
         for evaluation_step in config.runtime.evaluation_steps:
             if (

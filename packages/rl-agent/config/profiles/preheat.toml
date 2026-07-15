@@ -21,7 +21,7 @@ entity_vocab_size = 8192
 zone_vocab_size = 32
 order_vocab_size = 128
 domain_count = 8
-max_world_tokens = 1024
+max_world_tokens = 2048
 max_candidates = 96
 max_candidate_local_tokens = 64
 
@@ -49,10 +49,10 @@ max_policy_lag = 1024
 [environment]
 backend = "headless"
 scenario = "full-run"
-# A complete successful run is expected to fit comfortably inside this
-# budget.  The bound also prevents an untrained recurrent policy from spending
-# tens of thousands of decisions oscillating in a reversible selection UI.
-max_episode_steps = 10000
+# Preserve one continuous native run long enough to traverse Acts 1--3. Exact
+# semantic deadlock detection remains the fast escape hatch for reversible UI
+# cycles; this outer bound is only a final transport-safety ceiling.
+max_episode_steps = 30000
 
 [curriculum]
 mode = "native-revival-preheat"
@@ -68,14 +68,14 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-direct-v7-cap1024-relational"
-checkpoint_dir = "checkpoints/full-run-revival-direct-v7-cap1024-relational"
+log_dir = "runs/full-run-revival-direct-v8-counted-card-multiset"
+checkpoint_dir = "checkpoints/full-run-revival-direct-v8-counted-card-multiset"
 checkpoint_interval_steps = 10000
 # Do not block actor/learner startup on a deterministic evaluation of the
 # randomly initialized policy. The short simulator/mechanics preflight and a
 # real GPU update smoke test cover plumbing; held-out evaluation begins later.
-evaluation_steps = [10000, 25000, 50000]
-evaluation_episodes = 5
+evaluation_steps = [30000, 100000, 250000]
+evaluation_episodes = 1
 
 [diagnostics]
 deadlock_window = 128

@@ -39,7 +39,7 @@ class GroundedEncodingConfig:
     """Maximum tensor capacities and categorical vocabulary contract."""
 
     feature_dim: int = 224
-    max_world_tokens: int = 1024
+    max_world_tokens: int = 2048
     max_candidates: int = 96
     max_candidate_local_tokens: int = 64
     type_vocab_size: int = 128
@@ -55,7 +55,7 @@ class GroundedEncodingConfig:
         cls,
         model: GroundedCandidateConfig,
         *,
-        max_world_tokens: int = 1024,
+        max_world_tokens: int = 2048,
         max_candidates: int = 96,
         max_candidate_local_tokens: int = 64,
     ) -> GroundedEncodingConfig:

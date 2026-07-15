@@ -55,11 +55,14 @@ The default contract is:
 - output heads: masked policy and scalar value only.
 
 The model-facing observation uses the versioned
-`grounded-relational-runtime-encoding-v7` contract together with the factual
+`grounded-relational-runtime-encoding-v8` contract together with the factual
 [`grounded-card-facts-encoding-v3`](./card-facts-abi.md) mechanics ABI. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
-description parsing or curated card rules. The default capacity is 1,024 world
-tokens and 64 local tokens per candidate; overflow is an error, never silent
+description parsing or curated card rules. The default capacity is 2,048 world
+tokens and 64 local tokens per candidate. Fact-identical copies in the permanent
+deck and public orderless combat piles share one exact counted variant, while
+hands, selections, candidates and distinct modified variants stay separate.
+Overflow is an error with exact structural diagnostics, never silent
 truncation. This encoder change invalidates every earlier checkpoint.
 
 Candidate permutation must permute policy outputs in the same way while leaving
@@ -73,7 +76,7 @@ from unstable list positions:
 
 | Relation | Representation |
 |---|---|
-| same card definition vs. concrete copy | separate `entity_id` and runtime `entity_aux_id` |
+| same card definition vs. concrete copy | separate `entity_id` and runtime `entity_aux_id` for concrete hand/selection/action entities; exact `quantity` for fact-identical copies in orderless multisets |
 | card to dynamic vars, enchantment and affliction | shared concrete relation identity |
 | card to Deck/Hand/Draw/Discard/Exhaust/Play | fixed collision-free zone ID plus instance identity |
 | play/potion action to source and enemy target | independent source/target definition and relation channels |
@@ -88,7 +91,7 @@ from unstable list positions:
 | action consequence | only guaranteed immediate protocol mutation/resource facts; never predicted damage, draws, event results or future RNG |
 
 Draw-pile composition is player-inspectable and is encoded as a canonical
-unordered multiset; hidden draw order is never exposed. Active map/shop/rest,
+unordered counted multiset; hidden draw order is never exposed. Active map/shop/rest,
 reward and selection surfaces are included only where decision-relevant so the
 interface does not serialize inactive UI trees on every combat action.
 
@@ -110,6 +113,18 @@ discount requires a bootstrap snapshot. Unrolls are placed in a bounded FIFO and
 consumed once. There is no replay capacity measured in transitions, recent mix,
 coverage mix, priority, TD-error refresh, resampling, demonstration partition or
 backfill.
+
+The learner may publish a new policy while a long episode is running, but the
+actor adopts it only after emitting a complete recurrent unroll. At episode end
+the actor waits for an explicit main-thread acknowledgement, allowing metrics,
+periodic checkpointing and held-out evaluation intent to commit before the next
+simulator reset.
+
+Each completed unroll also updates one compact actor-progress snapshot with the
+current maximum Act/floor, cumulative reward, revivals, HP loss and exact
+behavior-policy version. Learner metrics attach that snapshot without writing a
+verbose per-decision training journal, so an in-flight Act 1--3 run remains
+observable without sacrificing simulator throughput.
 
 Default data-plane settings are:
 
@@ -204,8 +219,10 @@ forward run distance with three bounded costs:
 - a cumulative cost for exact native revivals used;
 - a small cost per environment decision.
 
-The profile caps a complete run at 10,000 decisions and uses undiscounted
-return. All survival/pace costs together are bounded below one point, so the
+The profile keeps a 30,000-decision outer transport-safety ceiling and uses
+undiscounted return. Exact semantic deadlock detection can terminate a genuine
+reversible UI loop earlier; the outer ceiling is not an Act boundary or
+curriculum gate. All survival/pace costs together are bounded below one point, so the
 terminal margin guarantees every victory ranks above every failure. Forward
 floor progress gives failed runs useful ordering without paying for damage or
 specific choices. Within the same outcome the weighted objective prefers:

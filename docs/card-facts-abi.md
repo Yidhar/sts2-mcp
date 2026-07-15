@@ -102,8 +102,8 @@ Standard game-owned prompt IDs such as `card_selection.TO_DISCARD` and
 `card_selection.TO_TRANSFORM` may be mapped exactly; unknown/custom prompts
 remain generic `select` operations and are learned from their stable prompt ID
 and real transition rather than from card-name tables or localized-text
-heuristics. This contract is fingerprinted as runtime mechanics encoding v6,
-so checkpoints from the earlier selection ABI fail closed.
+heuristics. This selection sub-contract is included in relational runtime
+encoding v8, so checkpoints from the earlier selection ABI fail closed.
 
 Likewise, a numeric family is a typed magnitude, not an invented verb. An
 `EnergyVar(1)` is stored in the energy family, but the encoder does not label it
@@ -120,8 +120,12 @@ separation.
 
 ## Checkpoint compatibility
 
-The new encoder version, 224-feature minimum and fingerprint intentionally reject previous
-checkpoints. World capacity is 1,024 tokens and candidate-local capacity is 64 so
-larger decks and multi-effect cards fail less often; the encoder still raises on
-overflow rather than silently truncating facts. Training must start with a new
-model and run directory after this ABI change.
+The new encoder version, 224-feature minimum and fingerprint intentionally reject
+previous checkpoints. World capacity is 2,048 tokens and candidate-local
+capacity is 64. Permanent decks and public orderless combat piles collapse only
+fact-identical copies into an exact `quantity`; distinct upgrades, costs,
+enchantments, afflictions and lifecycle state remain separate. Hands, selection
+surfaces and legal candidates retain concrete entries. The encoder still raises
+on overflow rather than silently truncating facts, and the exception reports
+exact total demand plus branch counts. Training must start with a new model and
+run directory after this ABI change.
