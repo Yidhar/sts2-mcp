@@ -77,6 +77,12 @@ historical RL artifacts.
 
 ### Fixed
 
+- Raised the relational world-token ceiling from 512 to 1,024 after the first
+  complete 10,000-decision run reached Act 1 floor 17 and the following run
+  exposed 61 additional pending factual nodes beyond the old limit. Overflow
+  remains fail-closed; active-shape collation avoids padding every update to the
+  ceiling. Native-revival preheat now checkpoints every completed 10,000-step
+  horizon so a later interface failure cannot discard multiple episodes.
 - Changed the maintained standard `full-run` profile from the Act-1 diagnostic
   objective to the complete-run objective. Entering Act 2 is now ordinary
   progress rather than an implicit episode boundary; `act1` remains available

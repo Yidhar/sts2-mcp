@@ -21,7 +21,7 @@ entity_vocab_size = 8192
 zone_vocab_size = 32
 order_vocab_size = 128
 domain_count = 8
-max_world_tokens = 512
+max_world_tokens = 1024
 max_candidates = 96
 max_candidate_local_tokens = 64
 

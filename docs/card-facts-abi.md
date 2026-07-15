@@ -121,7 +121,7 @@ separation.
 ## Checkpoint compatibility
 
 The new encoder version, 224-feature minimum and fingerprint intentionally reject previous
-checkpoints. World capacity is 512 tokens and candidate-local capacity is 64 so
+checkpoints. World capacity is 1,024 tokens and candidate-local capacity is 64 so
 larger decks and multi-effect cards fail less often; the encoder still raises on
 overflow rather than silently truncating facts. Training must start with a new
 model and run directory after this ABI change.

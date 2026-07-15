@@ -58,7 +58,7 @@ The model-facing observation uses the versioned
 `grounded-relational-runtime-encoding-v7` contract together with the factual
 [`grounded-card-facts-encoding-v3`](./card-facts-abi.md) mechanics ABI. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
-description parsing or curated card rules. The default capacity is 512 world
+description parsing or curated card rules. The default capacity is 1,024 world
 tokens and 64 local tokens per candidate; overflow is an error, never silent
 truncation. This encoder change invalidates every earlier checkpoint.
 

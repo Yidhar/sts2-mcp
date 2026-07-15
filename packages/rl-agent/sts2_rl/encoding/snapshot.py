@@ -39,7 +39,7 @@ class GroundedEncodingConfig:
     """Maximum tensor capacities and categorical vocabulary contract."""
 
     feature_dim: int = 224
-    max_world_tokens: int = 512
+    max_world_tokens: int = 1024
     max_candidates: int = 96
     max_candidate_local_tokens: int = 64
     type_vocab_size: int = 128
@@ -55,7 +55,7 @@ class GroundedEncodingConfig:
         cls,
         model: GroundedCandidateConfig,
         *,
-        max_world_tokens: int = 512,
+        max_world_tokens: int = 1024,
         max_candidates: int = 96,
         max_candidate_local_tokens: int = 64,
     ) -> GroundedEncodingConfig:
@@ -469,7 +469,7 @@ def collate_encoded_snapshots(
 
     ``GroundedEncodingConfig`` defines hard acceptance limits, not a requirement
     to run every transformer invocation at those limits.  Padding every small
-    decision to 512 world tokens, 96 candidates and 24 local tokens made one
+    decision to the configured world/candidate/local limits made one
     recurrent 8x64 learner batch retain hundreds of unnecessarily large
     attention graphs.  Use the largest active shape in the current batch while
     preserving the same feature/vocabulary ABI and masks.

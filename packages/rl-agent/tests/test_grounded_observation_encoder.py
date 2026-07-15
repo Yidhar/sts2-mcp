@@ -1298,6 +1298,45 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
         local_limited.encode(_observation(), [action])
 
 
+def test_production_capacity_accepts_world_above_legacy_limit() -> None:
+    model = _small_model_config()
+    config = GroundedEncodingConfig.from_model_config(model)
+    assert config.max_world_tokens == 1024
+
+    encoder = GroundedObservationEncoder(config)
+    observation = {
+        "phase": "actions",
+        "decision_domain": "build",
+        "run": {"active": True, "floor": 17},
+        "player": {
+            "id": "ironclad",
+            "hp": 80,
+            "max_hp": 80,
+            "deck": [
+                {
+                    "id": "CARD.TEST",
+                    "instance_uuid": f"card-{index}",
+                    "type": "Attack",
+                    "cost": 1,
+                }
+                for index in range(600)
+            ],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "proceed",
+            "kind": "proceed",
+            "model_action_kind": "proceed",
+            "is_enabled": True,
+        }
+    ]
+
+    encoded = encoder.encode(observation, actions)
+    token_count = int(encoded.batch.world.mask.sum().item())
+    assert 512 < token_count <= config.max_world_tokens
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_type", "expected_effects", "expected_labels"),
     [

@@ -36,12 +36,16 @@ def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
     assert preheat.environment.max_episode_steps == 10_000
     assert preheat.rollout.unroll_length == 16
     assert preheat.optimization.batch_unrolls == 4
+    assert default.model.max_world_tokens == 1024
+    assert combat.model.max_world_tokens == 1024
+    assert preheat.model.max_world_tokens == 1024
     assert preheat.model.max_candidate_local_tokens == 64
     assert preheat.rollout.minimum_unrolls == 4
     assert preheat.runtime.evaluation_steps == (10_000, 25_000, 50_000)
     assert preheat.runtime.evaluation_episodes == 5
-    assert preheat.runtime.log_dir.endswith("v6-cap64-runtime-mechanics")
-    assert preheat.runtime.checkpoint_dir.endswith("v6-cap64-runtime-mechanics")
+    assert preheat.runtime.log_dir.endswith("v7-cap1024-relational")
+    assert preheat.runtime.checkpoint_dir.endswith("v7-cap1024-relational")
+    assert preheat.runtime.checkpoint_interval_steps == 10_000
     assert "direct" in preheat.runtime.log_dir
     assert "direct" in preheat.runtime.checkpoint_dir
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
