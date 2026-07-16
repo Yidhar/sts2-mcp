@@ -11,6 +11,9 @@ from sts2_env import headless_sim_bridge_client as module
 from sts2_env.headless_sim_bridge_client import (
     HeadlessSimBridgeClient,
     HeadlessSimError,
+    HeadlessSimProtocolError,
+    HeadlessSimStepRejected,
+    HeadlessSimUnsettledError,
     resolve_headless_sim_exe,
 )
 
@@ -22,6 +25,9 @@ def _bare_client() -> HeadlessSimBridgeClient:
     client._combat_episode_active = False
     client._last_observation = None
     client._last_legal_actions = []
+    client._rpc_timeout_s = 1.0
+    client._transition_poll_budget_s = 1.0
+    client._transition_poll_max_attempts = 8
     return client
 
 
@@ -102,7 +108,7 @@ def test_combat_post_end_boundary_is_a_typed_victory_not_a_deadlock() -> None:
             "training_revival_budget": -1,
             "training_revivals_used": 3,
             "training_player_hp_lost": 120,
-            "legal_actions": [],
+            "legal_actions": [{"action": "end_turn"}],
         },
         episode_started=True,
         reward=0.0,
@@ -127,6 +133,221 @@ def test_combat_post_end_boundary_is_a_typed_victory_not_a_deadlock() -> None:
     assert victory["obs"]["player"]["hp"] == 17
     assert victory["obs"]["_training"]["revivals_used"] == 3
     assert victory["legal_actions"] == []
+
+
+def test_step_rejection_is_typed_and_mutation_is_sent_once() -> None:
+    client = _bare_client()
+    client._current_episode_id = "sim-ep-1"
+    client._last_legal_actions = [
+        {"action_id": "sim:0:proceed", "_sim_raw": {"action": "proceed"}}
+    ]
+    client._rpc = mock.Mock(
+        return_value={
+            "accepted": False,
+            "error": "invalid action",
+            "state": {},
+        }
+    )
+
+    with pytest.raises(HeadlessSimStepRejected, match="invalid action") as caught:
+        client.step("sim-ep-1", action_index=0)
+
+    assert caught.value.method == "step"
+    assert caught.value.response["accepted"] is False
+    client._rpc.assert_called_once_with("step", {"action": "proceed"}, timeout_s=20.0)
+
+
+def test_authoritative_pending_step_uses_only_bounded_read_only_polling() -> None:
+    client = _bare_client()
+    client._current_episode_id = "sim-ep-1"
+    client._last_legal_actions = [
+        {
+            "action_id": "sim:0:choose_map_node",
+            "_sim_raw": {"action": "choose_map_node", "col": 5, "row": 13},
+        }
+    ]
+    client._rpc = mock.Mock(
+        side_effect=[
+            {
+                "accepted": True,
+                "action_committed": True,
+                "settlement_status": "unsettled",
+                "transition_token": "transition-7",
+                "state": {
+                    "state_type": "combat_start_pending",
+                    "is_actionable": False,
+                    "terminal": False,
+                    "legal_actions": [],
+                },
+                "reward": 0.0,
+            },
+            {
+                "accepted": True,
+                "action_committed": True,
+                "settlement_status": "pending",
+                "transition_token": "transition-7",
+                "state": {
+                    "state_type": "combat_start_pending",
+                    "is_actionable": False,
+                    "terminal": False,
+                    "legal_actions": [],
+                },
+            },
+            {
+                "accepted": True,
+                "action_committed": True,
+                "settlement_status": "actionable",
+                "transition_token": "transition-7",
+                "state": {
+                    "state_type": "combat",
+                    "is_actionable": True,
+                    "terminal": False,
+                    "legal_actions": [{"action": "end_turn"}],
+                },
+            },
+        ]
+    )
+
+    result = client.step("sim-ep-1", action_index=0)
+
+    assert [call.args[0] for call in client._rpc.call_args_list] == [
+        "step",
+        "poll_transition",
+        "poll_transition",
+    ]
+    assert result["done"] is False
+    assert len(result["legal_actions"]) == 1
+    assert result["legal_actions"][0]["kind"] == "end_turn"
+
+
+def test_persistent_pending_poll_uses_real_wall_clock_budget() -> None:
+    client = _bare_client()
+    client._transition_poll_budget_s = 1.0
+    client._transition_poll_max_attempts = 8
+    client._current_episode_id = "sim-ep-1"
+    client._last_legal_actions = [
+        {"action_id": "sim:0:proceed", "_sim_raw": {"action": "proceed"}}
+    ]
+    response = {
+        "accepted": True,
+        "action_committed": True,
+        "settlement_status": "pending",
+        "transition_token": "transition-pending",
+        "state": {
+            "state_type": "combat_start_pending",
+            "is_actionable": False,
+            "terminal": False,
+            "legal_actions": [],
+        },
+    }
+    client._rpc = mock.Mock(return_value=response)
+
+    class FakeClock:
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, duration: float) -> None:
+            assert duration > 0.0
+            self.now += duration
+
+    clock = FakeClock()
+    with (
+        mock.patch.object(module.time, "monotonic", side_effect=clock.monotonic),
+        mock.patch.object(module.time, "sleep", side_effect=clock.sleep),
+        pytest.raises(HeadlessSimUnsettledError, match="bounded read-only poll budget"),
+    ):
+        client.step("sim-ep-1", action_index=0)
+
+    assert client._rpc.call_count == 1 + client._transition_poll_max_attempts
+    assert clock.now >= 0.75
+
+
+def test_combat_episode_stops_at_authoritative_post_end_boundary_without_polling() -> None:
+    client = _bare_client()
+    client._combat_episode_active = True
+    client._current_episode_id = "sim-ep-1"
+    client._last_observation = {
+        "state_type": "combat",
+        "player": {"hp": 17},
+        "combat": {"in_progress": True},
+        "available_actions": [{"action_id": "sim:0:end_turn"}],
+    }
+    client._last_legal_actions = [
+        {"action_id": "sim:0:end_turn", "_sim_raw": {"action": "end_turn"}}
+    ]
+    client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "action_committed": True,
+            "settlement_status": "unsettled",
+            "transition_token": "transition-combat-victory",
+            "state": {
+                "state_type": "combat_post_end_pending",
+                "is_actionable": False,
+                "terminal": False,
+                "legal_actions": [],
+            },
+        }
+    )
+
+    result = client.step("sim-ep-1", action_index=0)
+
+    assert result["done"] is True
+    assert result["terminal_reason"] == "combat_victory"
+    client._rpc.assert_called_once_with("step", {"action": "end_turn"}, timeout_s=20.0)
+
+
+def test_legacy_actionless_step_is_not_guessed_to_be_pending() -> None:
+    client = _bare_client()
+    client._current_episode_id = "sim-ep-1"
+    client._last_legal_actions = [
+        {"action_id": "sim:0:proceed", "_sim_raw": {"action": "proceed"}}
+    ]
+    client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "state": {
+                "state_type": "combat_start_pending",
+                "terminal": False,
+                "legal_actions": [],
+            },
+        }
+    )
+
+    with pytest.raises(HeadlessSimUnsettledError, match="zero legal actions"):
+        client.step("sim-ep-1", action_index=0)
+
+    # No state-type guess, no second mutation, and no uncorrelated state poll.
+    client._rpc.assert_called_once_with("step", {"action": "proceed"}, timeout_s=20.0)
+
+
+def test_authoritative_terminal_surface_rejects_legal_actions() -> None:
+    client = _bare_client()
+    client._current_episode_id = "sim-ep-1"
+    client._last_legal_actions = [
+        {"action_id": "sim:0:proceed", "_sim_raw": {"action": "proceed"}}
+    ]
+    client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "action_committed": True,
+            "settlement_status": "terminal",
+            "transition_token": "transition-8",
+            "state": {
+                "state_type": "game_over",
+                "is_actionable": False,
+                "terminal": True,
+                "legal_actions": [{"action": "proceed"}],
+            },
+        }
+    )
+
+    with pytest.raises(HeadlessSimProtocolError, match="inconsistent"):
+        client.step("sim-ep-1", action_index=0)
+
+    client._rpc.assert_called_once()
 
 
 class _Stream:

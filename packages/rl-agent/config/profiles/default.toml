@@ -46,6 +46,19 @@ collector_workers = 1
 policy_sync_interval_unrolls = 8
 max_policy_lag = 1024
 
+[transaction_learning]
+enabled = false
+replay_capacity = 4096
+replay_byte_capacity = 536870912
+sample_traces = 8
+burn_in_steps = 24
+effect_weight = 0.10
+transaction_q_weight = 0.25
+pairwise_ranking_weight = 0.0
+pairwise_margin = 0.10
+minimum_return_gap = 0.0
+maximum_pairs = 256
+
 [environment]
 backend = "headless"
 scenario = "full-run"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -38,7 +39,17 @@ from .seeding import (
 from .trajectory import (
     SemanticDeadlockDetector,
     TrajectoryJournal,
+    canonical_json,
+    semantic_action_fingerprint,
+    semantic_decision_fingerprint,
     semantic_fingerprint,
+    semantic_projection,
+)
+from .transaction import (
+    TransactionEffect,
+    TransactionStep,
+    TransactionTrace,
+    backfill_factual_monte_carlo_returns,
 )
 
 
@@ -92,6 +103,7 @@ class CollectedEpisode:
     actor_policy_version: int
     behavior_policy_version: int
     timings: CollectorTimings | None = None
+    transaction_traces: tuple[TransactionTrace, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +226,348 @@ def _number(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+_TRANSACTION_SURFACE_FIELDS = (
+    "mode",
+    "prompt_id",
+    "operation_type",
+    "source_zone",
+    "destination_zone",
+    "min_select",
+    "max_select",
+    "requires_manual_confirmation",
+    "can_skip",
+    "cancelable",
+)
+
+
+_TRANSACTION_DEFINITION_KEYS = (
+    "model_id",
+    "entity_id",
+    "id",
+    "card_id",
+    "definition_id",
+)
+_TRANSACTION_INSTANCE_KEYS = (
+    "instance_uuid",
+    "card_instance_id",
+    "instance_id",
+    "card_ref",
+    "ref",
+    "uuid",
+    "uid",
+)
+_TRANSACTION_PHYSICAL_SOURCE_KEYS = (
+    "source_pile",
+    "source_zone",
+    "physical_pile",
+    "physical_zone",
+)
+
+
+def _first_nonempty(value: Mapping[str, object], keys: tuple[str, ...]) -> object | None:
+    for key in keys:
+        item = value.get(key)
+        if item is not None and str(item).strip():
+            return item
+    return None
+
+
+def _transaction_option_identity(value: object) -> object:
+    """Return the stable physical identity of one selectable card.
+
+    Card DTOs contain resolved cost, previews, UI ordinals and membership
+    pseudo-zones.  None of those identifies the selectable *object*, and all of
+    them may change after a toggle.  This positive allowlist intentionally
+    retains only definition, concrete instance and physical source.  The
+    surrounding sorted tuple preserves duplicate-card multiplicity.
+    """
+
+    if not isinstance(value, Mapping):
+        return {"opaque_identity": semantic_projection(value)}
+    nested = value.get("card")
+    card = nested if isinstance(nested, Mapping) else value
+    definition = _first_nonempty(card, _TRANSACTION_DEFINITION_KEYS)
+    instance = _first_nonempty(card, _TRANSACTION_INSTANCE_KEYS)
+    physical_source: object | None = None
+    for key in _TRANSACTION_PHYSICAL_SOURCE_KEYS:
+        item = card.get(key)
+        if item is None or not str(item).strip():
+            continue
+        physical_source = item
+        break
+    identity: dict[str, object] = {
+        "definition": str(definition).strip() if definition is not None else "<unknown>",
+    }
+    if instance is not None:
+        identity["instance"] = str(instance).strip()
+    if physical_source is not None:
+        identity["physical_source"] = str(physical_source).strip()
+    return identity
+
+
+def _selection_actions(
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> tuple[Mapping[str, object], ...]:
+    return tuple(
+        action
+        for action in legal_actions
+        if str(action.get("model_action_kind") or "") == "card_selection"
+    )
+
+
+def _transaction_selection_context(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> Mapping[str, object] | None:
+    raw_selection = observation.get("card_selection")
+    if isinstance(raw_selection, Mapping):
+        return raw_selection
+    actions = _selection_actions(legal_actions)
+    if not actions:
+        return None
+    # Legacy/live surfaces may expose selection semantics only on candidates.
+    # Merge the stable prompt contract without depending on candidate order.
+    synthesized: dict[str, object] = {"mode": "action-derived"}
+    for field in _TRANSACTION_SURFACE_FIELDS:
+        values: list[object] = []
+        for action in actions:
+            nested = action.get("selection")
+            item = nested.get(field) if isinstance(nested, Mapping) else None
+            if item is None:
+                item = action.get(field)
+            if item is not None:
+                values.append(item)
+        if values:
+            canonical_values = sorted({canonical_json(semantic_projection(item)) for item in values})
+            synthesized[field] = canonical_values[0] if len(canonical_values) == 1 else canonical_values
+    return synthesized
+
+
+def _transaction_option_universe(
+    selection: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> tuple[str, ...]:
+    """Return an order-independent, multiplicity-preserving option universe."""
+
+    options = selection.get("options")
+    identities: list[object] = []
+    if isinstance(options, list | tuple) and options:
+        identities.extend(_transaction_option_identity(option) for option in options)
+    else:
+        # The simulator's canonical ``cards`` field is already the complete
+        # physical option universe; ``selected_cards`` is a membership subset
+        # of it.  Appending that subset would make the *surface* change after
+        # every select/deselect action.  Legacy bridge DTOs instead expose the
+        # universe as two disjoint ``selectable_cards``/``selected_cards``
+        # collections, so combine those only when ``cards`` is absent.
+        cards = selection.get("cards")
+        if isinstance(cards, list | tuple) and cards:
+            identities.extend(_transaction_option_identity(item) for item in cards)
+        else:
+            for field in ("selectable_cards", "selected_cards"):
+                items = selection.get(field)
+                if isinstance(items, list | tuple):
+                    identities.extend(_transaction_option_identity(item) for item in items)
+    if not identities:
+        # Last-resort projection for legacy DTOs: use only card-bearing
+        # selection candidates and erase the select/deselect membership role.
+        for action in legal_actions:
+            if str(action.get("model_action_kind") or "") != "card_selection":
+                continue
+            card = action.get("card")
+            if isinstance(card, Mapping):
+                identities.append(_transaction_option_identity(card))
+    return tuple(sorted(canonical_json(identity) for identity in identities))
+
+
+def _transaction_surface_key(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> str | None:
+    """Return a stable card-selection transaction kind, without membership.
+
+    Selection counts, selected cards and transport handles are intentionally
+    excluded.  Those values identify nodes *inside* one transaction and belong
+    in ``_transaction_node_key`` instead.
+    """
+
+    raw_selection = _transaction_selection_context(observation, legal_actions)
+    if raw_selection is None:
+        return None
+    selection = {
+        key: raw_selection[key]
+        for key in _TRANSACTION_SURFACE_FIELDS
+        if raw_selection.get(key) is not None
+    }
+    raw_run = observation.get("run")
+    run = raw_run if isinstance(raw_run, Mapping) else {}
+    return semantic_fingerprint(
+        {
+            "kind": "card_selection_transaction",
+            "locus": {
+                "act": run.get("act"),
+                "floor": run.get("floor"),
+                "room_type": run.get("room_type"),
+                "room_model_id": run.get("room_model_id"),
+            },
+            "selection": selection,
+            "option_universe": _transaction_option_universe(
+                raw_selection,
+                legal_actions,
+            ),
+        }
+    )
+
+
+def _transaction_selected_identities(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> tuple[str, ...]:
+    raw_selection = observation.get("card_selection")
+    identities: list[object] = []
+    if isinstance(raw_selection, Mapping):
+        options = raw_selection.get("options")
+        if isinstance(options, list | tuple):
+            identities.extend(
+                _transaction_option_identity(option)
+                for option in options
+                if isinstance(option, Mapping)
+                and (
+                    option.get("is_selected") is True
+                    or option.get("selected") is True
+                    or str(option.get("selection_membership") or "").lower() == "selected"
+                )
+            )
+        if not identities:
+            selected = raw_selection.get("selected_cards")
+            if isinstance(selected, list | tuple):
+                identities.extend(_transaction_option_identity(item) for item in selected)
+    if not identities:
+        for action in _selection_actions(legal_actions):
+            variant = str(action.get("model_action_variant") or action.get("kind") or "").lower()
+            card = action.get("card")
+            if isinstance(card, Mapping) and (
+                "deselect" in variant
+                or card.get("is_selected") is True
+                or str(card.get("selection_membership") or "").lower() == "selected"
+            ):
+                identities.append(_transaction_option_identity(card))
+    return tuple(sorted(canonical_json(identity) for identity in identities))
+
+
+def _transaction_selected_count(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...] = (),
+) -> int:
+    raw_selection = observation.get("card_selection")
+    if not isinstance(raw_selection, Mapping):
+        return len(_transaction_selected_identities(observation, legal_actions))
+    raw_count = raw_selection.get("selected_count")
+    if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+        return max(0, raw_count)
+    selected = raw_selection.get("selected_cards")
+    if isinstance(selected, list | tuple):
+        return len(selected)
+    options = raw_selection.get("options")
+    if isinstance(options, list | tuple):
+        return sum(
+            int(isinstance(option, Mapping) and option.get("is_selected") is True)
+            for option in options
+        )
+    return len(_transaction_selected_identities(observation, legal_actions))
+
+
+def _transaction_node_key(
+    surface_key: str | None,
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> str:
+    """Identify a selection node independent of DTO/candidate ordering."""
+
+    if surface_key is None:
+        return semantic_decision_fingerprint(observation, legal_actions)
+    selection = _transaction_selection_context(observation, legal_actions) or {}
+    remaining: object | None = None
+    for key in ("remaining_select", "remaining_picks", "remaining", "required_remaining"):
+        if selection.get(key) is not None:
+            remaining = selection[key]
+            break
+    can_confirm = selection.get("can_confirm")
+    if can_confirm is None:
+        can_confirm = any(
+            str(action.get("model_action_variant") or action.get("kind") or "").lower()
+            in {"confirm", "confirm_selection"}
+            for action in _selection_actions(legal_actions)
+        )
+    # Pairwise factual outcomes may only meet at the same reward-relevant
+    # world state.  A selection prompt/membership alone is insufficient: the
+    # same discard/transform UI at different HP, decks, relics or cumulative
+    # revival cost is a different decision.  Remove only the transaction DTO
+    # and duplicated candidate surfaces whose membership/order is represented
+    # below; preserve the complete remaining semantic observation.  Reward
+    # counters live under an underscore-prefixed transport namespace, so copy
+    # that exact mapping under a semantic key before canonicalization drops
+    # private transport fields.
+    world_context = {
+        key: value
+        for key, value in observation.items()
+        if key not in {"card_selection", "available_actions", "legal_actions"}
+        and not str(key).startswith("_")
+    }
+    training_reward_state = observation.get("_training")
+    if isinstance(training_reward_state, Mapping):
+        world_context["training_reward_state"] = training_reward_state
+    return semantic_fingerprint(
+        {
+            "kind": "card_selection_node",
+            "surface_key": surface_key,
+            "world_context": world_context,
+            "selected": _transaction_selected_identities(observation, legal_actions),
+            "selected_count": _transaction_selected_count(observation, legal_actions),
+            "remaining": remaining,
+            "can_confirm": bool(can_confirm),
+            "legal_action_fingerprints": tuple(
+                sorted(semantic_action_fingerprint(action) for action in legal_actions)
+            ),
+        }
+    )
+
+
+def _signed_selection_delta(before: int, after: int) -> int:
+    return 1 if after > before else -1 if after < before else 0
+
+
+def _classify_transaction_transition(
+    *,
+    current_surface: str | None,
+    next_surface: str | None,
+    current_node: str,
+    next_node: str,
+    seen_nodes: set[str],
+    before_selected_count: int,
+    after_selected_count: int,
+) -> tuple[TransactionEffect, int]:
+    if current_surface is None:
+        return (
+            TransactionEffect.STAY if next_node == current_node else TransactionEffect.MOVE,
+            0,
+        )
+    if next_surface != current_surface:
+        # Exit tears down the selection DTO.  That is not a factual deselect.
+        return TransactionEffect.EXIT, 0
+    effect = (
+        TransactionEffect.STAY
+        if next_node == current_node
+        else TransactionEffect.REVISIT
+        if next_node in seen_nodes
+        else TransactionEffect.MOVE
+    )
+    return effect, _signed_selection_delta(
+        before_selected_count,
+        after_selected_count,
+    )
 
 
 def _run_position(observation: Mapping[str, object]) -> tuple[int, int]:
@@ -972,6 +1326,7 @@ class GroundedCollector:
         revival_relic_id: str | None = None,
         training_revival_budget: int | None = None,
         horizon_as_failure: bool = False,
+        transaction_burn_in_steps: int | None = None,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -996,6 +1351,12 @@ class GroundedCollector:
             raise TypeError("unroll_length must be an integer")
         if unroll_length <= 0:
             raise ValueError("unroll_length must be positive")
+        if transaction_burn_in_steps is not None and (
+            isinstance(transaction_burn_in_steps, bool)
+            or not isinstance(transaction_burn_in_steps, int)
+            or transaction_burn_in_steps < 0
+        ):
+            raise ValueError("transaction_burn_in_steps must be non-negative or null")
         if isinstance(journal_policy_topk, bool) or not isinstance(journal_policy_topk, int):
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
@@ -1037,6 +1398,7 @@ class GroundedCollector:
         )
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
+        self.transaction_burn_in_steps = transaction_burn_in_steps
         if self.revival_relic_id is not None and self.revival_relic_id not in {
             item.upper() for item in self.additional_relics
         }:
@@ -1106,6 +1468,17 @@ class GroundedCollector:
             raise ValueError("collector rng_state is invalid") from exc
         self._episode_seed = episode_seed
         self._rng = candidate_rng
+
+    def replace_backend(self, backend: EnvironmentBackend) -> None:
+        """Adopt a fresh backend at a quiescent incident boundary.
+
+        A poisoned simulator may already have committed the mutation whose
+        result was rejected.  Its active revision must never leak into a new
+        process/session, so the collector deliberately forgets that revision.
+        """
+
+        self.backend = backend
+        self._active_state_version = None
 
     def _state_version(self) -> int:
         state = self.backend.get_state()
@@ -1374,11 +1747,15 @@ class GroundedCollector:
         maximum_steps: int | None = None,
         unroll_sink: Callable[[SequenceUnroll], int | None] | None = None,
         progress_sink: Callable[[EpisodeProgress], None] | None = None,
+        accepted_step_sink: Callable[[int, int], None] | None = None,
+        journal_episode_id_prefix: str = "",
     ) -> CollectedEpisode:
         if isinstance(policy_version, bool) or not isinstance(policy_version, int):
             raise TypeError("policy_version must be an integer")
         if policy_version < 0:
             raise ValueError("policy_version must be non-negative")
+        if not isinstance(journal_episode_id_prefix, str):
+            raise TypeError("journal_episode_id_prefix must be a string")
         episode_limit = self.max_episode_steps
         if maximum_steps is not None:
             if isinstance(maximum_steps, bool) or not isinstance(maximum_steps, int):
@@ -1437,6 +1814,20 @@ class GroundedCollector:
         final_behavior_policy_version = policy_version
         selected_action_kind_counts: dict[str, int] = {}
         last_selected_action_kind = ""
+        transaction_enabled = bool(record and self.transaction_burn_in_steps is not None)
+        transaction_context: deque[tuple[int, TransactionStep]] = deque(
+            maxlen=self.transaction_burn_in_steps or 0
+        )
+        transaction_traces_pending: list[TransactionTrace] = []
+        active_transaction_surface: str | None = None
+        active_transaction_steps: list[TransactionStep] = []
+        active_transaction_start_step = 0
+        active_transaction_burn_in = 0
+        active_transaction_policy_version = policy_version
+        active_transaction_seen_nodes: set[str] = set()
+        episode_rewards: list[float] = []
+        episode_discounts: list[float] = []
+        last_task_terminal = False
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -1470,6 +1861,35 @@ class GroundedCollector:
             selected_action_kind_counts[last_selected_action_kind] = (
                 selected_action_kind_counts.get(last_selected_action_kind, 0) + 1
             )
+            current_transaction_surface = (
+                _transaction_surface_key(state.observation, state.legal_actions)
+                if transaction_enabled
+                else None
+            )
+            current_transaction_node = (
+                _transaction_node_key(
+                    current_transaction_surface,
+                    state.observation,
+                    state.legal_actions,
+                )
+                if transaction_enabled
+                else ""
+            )
+            if current_transaction_surface is not None:
+                if active_transaction_surface is None:
+                    context = tuple(transaction_context)
+                    active_transaction_surface = current_transaction_surface
+                    active_transaction_steps = [item[1] for item in context]
+                    active_transaction_start_step = (
+                        context[0][0] if context else step_offset
+                    )
+                    active_transaction_burn_in = len(context)
+                    active_transaction_policy_version = segment_policy_version
+                    active_transaction_seen_nodes = {current_transaction_node}
+                elif active_transaction_surface != current_transaction_surface:
+                    raise RuntimeError(
+                        "transaction surface changed without an observed exit transition"
+                    )
             deadlock_evidence = self.deadlock_detector.observe(
                 step_index=state.step_index,
                 observation=state.observation,
@@ -1486,6 +1906,19 @@ class GroundedCollector:
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
+            # The validated transition may itself expose a much wider next
+            # decision than the pre-action state.  Record that accepted state
+            # now, before a later mutation from it has a chance to fault.
+            maximum_observed_candidates = max(
+                maximum_observed_candidates,
+                len(next_state.legal_actions),
+            )
+            # Publish only fully validated environment steps.  The asynchronous
+            # supervisor uses this monotonic count to distinguish valid but
+            # unflushed tail steps from recurrent unrolls already emitted to
+            # the learner when an infrastructure incident aborts an episode.
+            if accepted_step_sink is not None:
+                accepted_step_sink(steps_taken, maximum_observed_candidates)
             next_combat_in_progress = _combat_in_progress(next_state.observation)
             combat_progress_status = combat_progress.observe(
                 step=steps_taken,
@@ -1534,6 +1967,7 @@ class GroundedCollector:
                 horizon_exhausted=bool(curriculum_horizon and self.horizon_as_failure),
             )
             reward_total += breakdown.reward
+            last_task_terminal = breakdown.task_terminal
             revivals_used += breakdown.revivals_used_delta
             player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
@@ -1549,6 +1983,79 @@ class GroundedCollector:
                         policy_decision=choice.valid_count > 1,
                     )
                 )
+            if transaction_enabled:
+                episode_rewards.append(float(breakdown.reward))
+                episode_discounts.append(float(breakdown.discount))
+                next_transaction_surface = _transaction_surface_key(
+                    next_state.observation,
+                    next_state.legal_actions,
+                )
+                next_transaction_node = _transaction_node_key(
+                    next_transaction_surface,
+                    next_state.observation,
+                    next_state.legal_actions,
+                )
+                effect, selected_count_delta = _classify_transaction_transition(
+                    current_surface=current_transaction_surface,
+                    next_surface=next_transaction_surface,
+                    current_node=current_transaction_node,
+                    next_node=next_transaction_node,
+                    seen_nodes=active_transaction_seen_nodes,
+                    before_selected_count=_transaction_selected_count(
+                        state.observation,
+                        state.legal_actions,
+                    ),
+                    after_selected_count=_transaction_selected_count(
+                        next_state.observation,
+                        next_state.legal_actions,
+                    ),
+                )
+                factual_transaction_step = TransactionStep(
+                    snapshot=choice.snapshot,
+                    action_index=choice.action_index,
+                    node_key=current_transaction_node,
+                    next_node_key=next_transaction_node,
+                    action_fingerprint=semantic_action_fingerprint(selected_action),
+                    effect=effect,
+                    selected_count_delta=selected_count_delta,
+                    transaction_return=None,
+                    return_steps=None,
+                )
+                if current_transaction_surface is not None:
+                    active_transaction_steps.append(factual_transaction_step)
+                    active_transaction_seen_nodes.add(next_transaction_node)
+                    transaction_ended = bool(
+                        next_transaction_surface != current_transaction_surface
+                        or result_terminal
+                        or breakdown.task_terminal
+                        or forced_horizon
+                    )
+                    if transaction_ended:
+                        if active_transaction_surface is None:  # pragma: no cover - start invariant
+                            raise RuntimeError("active transaction lost its surface")
+                        transaction_traces_pending.append(
+                            TransactionTrace(
+                                trace_id=(
+                                    f"seed-{reset_seed}:{state.episode_id}:"
+                                    f"{active_transaction_start_step}:"
+                                    f"{step_offset}:{active_transaction_surface}"
+                                ),
+                                episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                                surface_key=active_transaction_surface,
+                                start_step=active_transaction_start_step,
+                                policy_version=active_transaction_policy_version,
+                                initial_recurrent_state=np.zeros(
+                                    self.model.config.recurrent_hidden_dim,
+                                    dtype=np.float32,
+                                ),
+                                steps=tuple(active_transaction_steps),
+                                burn_in_steps=active_transaction_burn_in,
+                            )
+                        )
+                        active_transaction_surface = None
+                        active_transaction_steps = []
+                        active_transaction_seen_nodes = set()
+                transaction_context.append((step_offset, factual_transaction_step))
             if trajectory_journal is not None:
                 journal_deadlock: Mapping[str, object] | None = None
                 if combat_progress_stalled:
@@ -1590,7 +2097,7 @@ class GroundedCollector:
                 )[: self.journal_policy_topk]
                 journal_event: dict[str, object] = {
                     "event": "decision",
-                    "episode_id": state.episode_id,
+                    "episode_id": f"{journal_episode_id_prefix}{state.episode_id}",
                     "reset_seed": reset_seed,
                     "step_index": state.step_index,
                     # The journal performs compact per-step projection and
@@ -1732,6 +2239,20 @@ class GroundedCollector:
 
         if segment_steps:
             raise RuntimeError("collector exited with an unflushed rollout segment")
+        if active_transaction_surface is not None:
+            raise RuntimeError("collector exited with an unclosed transaction trace")
+        transaction_traces: tuple[TransactionTrace, ...] = ()
+        if transaction_traces_pending:
+            authoritative_outcome = bool(state.terminated or last_task_terminal)
+            transaction_traces = tuple(
+                backfill_factual_monte_carlo_returns(
+                    trace,
+                    episode_rewards=tuple(episode_rewards),
+                    episode_discounts=tuple(episode_discounts),
+                    authoritative_outcome=authoritative_outcome,
+                )
+                for trace in transaction_traces_pending
+            )
         run_won = self.objective == "run" and final_outcome == "success"
         combat_won = self.objective == "combat" and final_outcome == "success"
         return CollectedEpisode(
@@ -1777,6 +2298,7 @@ class GroundedCollector:
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,
             timings=timings.snapshot(),
+            transaction_traces=transaction_traces,
         )
 
 

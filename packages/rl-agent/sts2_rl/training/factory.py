@@ -18,6 +18,7 @@ from sts2_rl.models import RecurrentCandidateModel
 from .collector import GroundedCollector
 from .config import TrainingConfig
 from .learner import VTraceLearner
+from .transaction import BoundedTransactionReplay
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class TrainingResources:
     optimizer: torch.optim.Optimizer
     collector: GroundedCollector
     learner: VTraceLearner
+    transaction_replay: BoundedTransactionReplay | None
     device: torch.device
 
     def publish_collector_policy(self) -> float:
@@ -70,12 +72,21 @@ def resolve_device(requested: str) -> torch.device:
     return device
 
 
-def seed_everything(seed: int) -> None:
+def seed_everything(seed: int, *, seed_accelerators: bool = True) -> None:
+    """Seed the requested training RNG domains without waking unused devices.
+
+    ``torch.manual_seed`` also queues CUDA/MPS/XPU seed callbacks.  A frozen
+    CPU evaluator must not leave such a callback behind when CUDA was
+    previously uninitialized, because that would alter the first later GPU
+    initialization even though the evaluator restores the CPU RNG state.
+    """
+
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if seed_accelerators:
+        torch.manual_seed(seed)
+    else:
+        torch.default_generator.manual_seed(seed)
 
 
 def build_backend(config: TrainingConfig) -> EnvironmentBackend:
@@ -96,9 +107,16 @@ def _build_collector_model(
     """Build a replica without advancing the checkpointed Torch RNG streams."""
 
     cpu_rng = torch.get_rng_state()
-    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    cuda_rng = (
+        torch.cuda.get_rng_state_all()
+        if torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+        else []
+    )
     try:
-        collector_model = RecurrentCandidateModel(config.model.to_model_config()).to(
+        collector_model = RecurrentCandidateModel(
+            config.model.to_model_config(),
+            enable_transaction_heads=config.transaction_learning.enabled,
+        ).to(
             resolve_device(config.runtime.collector_device)
         )
         collector_model.load_state_dict(learner_model.state_dict(), strict=True)
@@ -114,15 +132,34 @@ def build_training_resources(
     *,
     backend: EnvironmentBackend | None = None,
 ) -> TrainingResources:
-    seed_everything(config.runtime.seed)
     device = resolve_device(config.runtime.device)
-    model = RecurrentCandidateModel(config.model.to_model_config()).to(device)
+    collector_device = resolve_device(config.runtime.collector_device)
+    seed_everything(
+        config.runtime.seed,
+        seed_accelerators=(
+            device.type == "cuda"
+            or collector_device.type == "cuda"
+            or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+        ),
+    )
+    model = RecurrentCandidateModel(
+        config.model.to_model_config(),
+        enable_transaction_heads=config.transaction_learning.enabled,
+    ).to(device)
     collector_model = _build_collector_model(config, learner_model=model)
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
     rollout_queue = BoundedRolloutQueue(
         config.rollout.queue_capacity,
     )
-    environment_backend = backend or build_backend(config)
+    transaction_replay = (
+        BoundedTransactionReplay(
+            capacity=config.transaction_learning.replay_capacity,
+            byte_capacity=config.transaction_learning.replay_byte_capacity,
+            seed=config.runtime.seed,
+        )
+        if config.transaction_learning.enabled
+        else None
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.optimization.learning_rate,
@@ -140,60 +177,78 @@ def build_training_resources(
         and revival_relic_id is not None
         else None
     )
-    collector = GroundedCollector(
-        model=collector_model,
-        encoder=encoder,
-        backend=environment_backend,
-        scenario=config.environment.scenario,
-        objective=config.curriculum.reward_objective,
-        discount=config.optimization.discount,
-        max_episode_steps=config.environment.max_episode_steps,
-        character=config.environment.character,
-        encounter_id=config.environment.encounter_id,
-        seed=config.runtime.seed,
-        unroll_length=config.rollout.unroll_length,
-        deadlock_window=config.diagnostics.deadlock_window,
-        deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
-        combat_net_progress_window=(
-            config.diagnostics.combat_net_progress_window
-        ),
-        noncombat_durable_progress_window=(
-            config.diagnostics.noncombat_durable_progress_window
-        ),
-        combat_min_net_hp_fraction=(
-            config.diagnostics.combat_min_net_hp_fraction
-        ),
-        journal_policy_topk=config.diagnostics.journal_policy_topk,
-        reward_calculator=reward_calculator,
-        additional_relics=(
-            (revival_relic_id,)
-            if config.curriculum.mode == "native-revival-preheat"
-            and revival_relic_id is not None
-            else ()
-        ),
-        revival_relic_id=revival_relic_id,
-        training_revival_budget=config.curriculum.revival_budget,
-        horizon_as_failure=config.curriculum.mode == "native-revival-preheat",
-    )
-    learner = VTraceLearner(
-        model=model,
-        encoder=encoder,
-        optimizer=optimizer,
-        config=config.optimization,
-        maximum_unroll_length=config.rollout.unroll_length,
-        maximum_policy_lag=config.rollout.max_policy_lag,
-    )
-    return TrainingResources(
-        model=model,
-        collector_model=collector_model,
-        encoder=encoder,
-        rollout_queue=rollout_queue,
-        backend=environment_backend,
-        optimizer=optimizer,
-        collector=collector,
-        learner=learner,
-        device=device,
-    )
+    owns_backend = backend is None
+    environment_backend = backend if backend is not None else build_backend(config)
+    try:
+        collector = GroundedCollector(
+            model=collector_model,
+            encoder=encoder,
+            backend=environment_backend,
+            scenario=config.environment.scenario,
+            objective=config.curriculum.reward_objective,
+            discount=config.optimization.discount,
+            max_episode_steps=config.environment.max_episode_steps,
+            character=config.environment.character,
+            encounter_id=config.environment.encounter_id,
+            seed=config.runtime.seed,
+            unroll_length=config.rollout.unroll_length,
+            deadlock_window=config.diagnostics.deadlock_window,
+            deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
+            combat_net_progress_window=(
+                config.diagnostics.combat_net_progress_window
+            ),
+            noncombat_durable_progress_window=(
+                config.diagnostics.noncombat_durable_progress_window
+            ),
+            combat_min_net_hp_fraction=(
+                config.diagnostics.combat_min_net_hp_fraction
+            ),
+            journal_policy_topk=config.diagnostics.journal_policy_topk,
+            reward_calculator=reward_calculator,
+            additional_relics=(
+                (revival_relic_id,)
+                if config.curriculum.mode == "native-revival-preheat"
+                and revival_relic_id is not None
+                else ()
+            ),
+            revival_relic_id=revival_relic_id,
+            training_revival_budget=config.curriculum.revival_budget,
+            horizon_as_failure=config.curriculum.mode == "native-revival-preheat",
+            transaction_burn_in_steps=(
+                config.transaction_learning.burn_in_steps
+                if config.transaction_learning.enabled
+                else None
+            ),
+        )
+        learner = VTraceLearner(
+            model=model,
+            encoder=encoder,
+            optimizer=optimizer,
+            config=config.optimization,
+            maximum_unroll_length=config.rollout.unroll_length,
+            maximum_policy_lag=config.rollout.max_policy_lag,
+            transaction_config=config.transaction_learning,
+        )
+        return TrainingResources(
+            model=model,
+            collector_model=collector_model,
+            encoder=encoder,
+            rollout_queue=rollout_queue,
+            backend=environment_backend,
+            optimizer=optimizer,
+            collector=collector,
+            learner=learner,
+            transaction_replay=transaction_replay,
+            device=device,
+        )
+    except BaseException:
+        # Once returned, TrainingResources owns and closes any backend.  If
+        # composition fails before return, close only a backend created here;
+        # an injected backend remains the caller's responsibility.
+        rollout_queue.close()
+        if owns_backend:
+            environment_backend.close()
+        raise
 
 
 __all__ = [

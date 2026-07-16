@@ -16,7 +16,8 @@ from sts2_rl.encoding.grounded import grounding_encoding_identity
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.models import RecurrentCandidateModel
 
-from .config import OptimizationConfig
+from .config import OptimizationConfig, TransactionLearningConfig
+from .transaction import TransactionTrace, observed_outcome_pairs, selection_delta_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,14 @@ class LearnerMetrics:
     environment_steps: int
     policy_decisions: int
     maximum_policy_lag: int
+    transaction_effect_loss: float
+    transaction_delta_loss: float
+    transaction_q_loss: float
+    transaction_pairwise_ranking_loss: float
+    transaction_traces: int
+    transaction_effect_labels: int
+    transaction_q_labels: int
+    transaction_pairs: int
     timings: LearnerTimings
 
     def to_mapping(self) -> dict[str, float | int | dict[str, float]]:
@@ -83,6 +92,7 @@ class VTraceLearner:
         config: OptimizationConfig,
         maximum_unroll_length: int,
         maximum_policy_lag: int,
+        transaction_config: TransactionLearningConfig | None = None,
     ) -> None:
         if maximum_unroll_length <= 0 or maximum_policy_lag <= 0:
             raise ValueError("unroll length and policy lag limits must be positive")
@@ -92,6 +102,11 @@ class VTraceLearner:
         self.config = config
         self.maximum_unroll_length = maximum_unroll_length
         self.maximum_policy_lag = maximum_policy_lag
+        self.transaction_config = transaction_config or TransactionLearningConfig()
+        if self.transaction_config.enabled != self.model.transaction_heads_enabled:
+            raise ValueError(
+                "transaction learner config and model-head configuration differ"
+            )
 
     @property
     def device(self) -> torch.device:
@@ -102,6 +117,7 @@ class VTraceLearner:
         unrolls: tuple[SequenceUnroll, ...],
         *,
         current_policy_version: int,
+        transaction_traces: tuple[TransactionTrace, ...] = (),
         progress: Callable[[str, dict[str, int | float]], None] | None = None,
     ) -> LearnerMetrics:
         total_started_ns = time.perf_counter_ns()
@@ -121,6 +137,12 @@ class VTraceLearner:
             raise TypeError("current_policy_version must be an integer")
         if current_policy_version < 0:
             raise ValueError("current_policy_version must be non-negative")
+        if not isinstance(transaction_traces, tuple) or not all(
+            isinstance(trace, TransactionTrace) for trace in transaction_traces
+        ):
+            raise TypeError("transaction_traces must be a TransactionTrace tuple")
+        if transaction_traces and not self.transaction_config.enabled:
+            raise ValueError("transaction traces require transaction learning to be enabled")
 
         validation_started_ns = time.perf_counter_ns()
         encoding_fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
@@ -370,12 +392,33 @@ class VTraceLearner:
             + self.config.value_weight * value_loss
             - self.config.entropy_weight * entropy
         )
+        (
+            transaction_effect_loss,
+            transaction_delta_loss,
+            transaction_q_loss,
+            transaction_pairwise_loss,
+            transaction_effect_labels,
+            transaction_q_labels,
+            transaction_pair_count,
+        ) = self._transaction_losses(transaction_traces)
+        total_loss = (
+            total_loss
+            + self.transaction_config.effect_weight
+            * (transaction_effect_loss + transaction_delta_loss)
+            + self.transaction_config.transaction_q_weight * transaction_q_loss
+            + self.transaction_config.pairwise_ranking_weight
+            * transaction_pairwise_loss
+        )
         _require_finite(
             "targets/loss",
             (
                 ("value_targets", value_targets),
                 ("advantages", advantages),
                 ("loss", total_loss),
+                ("transaction_effect_loss", transaction_effect_loss),
+                ("transaction_delta_loss", transaction_delta_loss),
+                ("transaction_q_loss", transaction_q_loss),
+                ("transaction_pairwise_loss", transaction_pairwise_loss),
             ),
         )
         target_and_loss_ms = _elapsed_ms(target_started_ns)
@@ -444,7 +487,150 @@ class VTraceLearner:
             environment_steps=int(valid.sum().item()),
             policy_decisions=int(policy_decisions.sum().item()),
             maximum_policy_lag=max(lags),
+            transaction_effect_loss=float(transaction_effect_loss.detach().item()),
+            transaction_delta_loss=float(transaction_delta_loss.detach().item()),
+            transaction_q_loss=float(transaction_q_loss.detach().item()),
+            transaction_pairwise_ranking_loss=float(
+                transaction_pairwise_loss.detach().item()
+            ),
+            transaction_traces=len(transaction_traces),
+            transaction_effect_labels=transaction_effect_labels,
+            transaction_q_labels=transaction_q_labels,
+            transaction_pairs=transaction_pair_count,
             timings=timings,
+        )
+
+    def _transaction_losses(
+        self,
+        traces: tuple[TransactionTrace, ...],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, int, int, int]:
+        """Compute auxiliary losses only from actions with factual outcomes."""
+
+        zero = next(self.model.parameters()).sum() * 0.0
+        if not traces:
+            return zero, zero, zero, zero, 0, 0, 0
+        fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+        effect_logits: list[Tensor] = []
+        effect_targets: list[int] = []
+        delta_logits: list[Tensor] = []
+        delta_targets: list[int] = []
+        q_values: list[Tensor] = []
+        q_targets: list[float] = []
+        selected_policy_log_probabilities: dict[tuple[int, int], Tensor] = {}
+
+        for trace_index, trace in enumerate(traces):
+            configured_burn_in = self.transaction_config.burn_in_steps
+            if trace.burn_in_steps > configured_burn_in:
+                raise ValueError("transaction trace exceeds configured burn-in length")
+            if trace.start_step > 0 and trace.burn_in_steps != configured_burn_in:
+                raise ValueError(
+                    "non-initial transaction context must provide the configured burn-in"
+                )
+            if trace.initial_recurrent_state.shape != (
+                self.model.config.recurrent_hidden_dim,
+            ):
+                raise ValueError("transaction recurrent state differs from model hidden size")
+            hidden = torch.from_numpy(trace.initial_recurrent_state.copy()).to(
+                device=self.device,
+                dtype=next(self.model.parameters()).dtype,
+            )[None, :]
+            for step_index, step in enumerate(trace.steps):
+                step.snapshot.validate(
+                    expected_config=self.encoder.config,
+                    expected_fingerprint=fingerprint,
+                )
+                encoded = collate_encoded_snapshots(
+                    (step.snapshot,),
+                    expected_config=self.encoder.config,
+                    expected_fingerprint=fingerprint,
+                    device=self.device,
+                )
+                output = self.model(encoded, hidden, validate=False)
+                hidden = output.recurrent_state
+                if step_index + 1 == trace.burn_in_steps:
+                    hidden = hidden.detach()
+                if step_index < trace.burn_in_steps:
+                    continue
+                if (
+                    output.candidate_effect_logits is None
+                    or output.selection_delta_logits is None
+                    or output.transaction_q_values is None
+                ):
+                    raise RuntimeError("transaction-enabled learner received a headless model")
+                action_index = step.action_index
+                effect_logits.append(output.candidate_effect_logits[0, action_index])
+                effect_targets.append(int(step.effect))
+                delta_logits.append(output.selection_delta_logits[0, action_index])
+                delta_targets.append(selection_delta_index(step.selected_count_delta))
+                # Ranking compares candidate preference, not an unconstrained
+                # state-level logit offset.  Normalize on each factual legal
+                # candidate set before selecting the executed action so adding
+                # a constant to all logits cannot reduce the ranking loss.
+                selected_policy_log_probabilities[(trace_index, step_index)] = (
+                    F.log_softmax(output.policy_logits.float(), dim=-1)[
+                        0, action_index
+                    ]
+                )
+                if step.q_observed:
+                    if step.transaction_return is None:  # pragma: no cover - property invariant
+                        raise RuntimeError("q_observed transaction has no return")
+                    q_values.append(output.transaction_q_values[0, action_index])
+                    q_targets.append(step.transaction_return)
+
+        effect_loss = F.cross_entropy(
+            torch.stack(effect_logits),
+            torch.tensor(effect_targets, device=self.device, dtype=torch.long),
+        )
+        delta_loss = F.cross_entropy(
+            torch.stack(delta_logits),
+            torch.tensor(delta_targets, device=self.device, dtype=torch.long),
+        )
+        if q_values:
+            q_loss = F.smooth_l1_loss(
+                torch.stack(q_values).float(),
+                torch.tensor(q_targets, device=self.device, dtype=torch.float32),
+            )
+        else:
+            q_loss = zero
+
+        pairs = (
+            observed_outcome_pairs(
+                traces,
+                minimum_return_gap=self.transaction_config.minimum_return_gap,
+            )[: self.transaction_config.maximum_pairs]
+            if self.transaction_config.pairwise_ranking_weight > 0.0
+            else ()
+        )
+        if pairs:
+            better = torch.stack(
+                [
+                    selected_policy_log_probabilities[
+                        (pair.better_trace, pair.better_step)
+                    ]
+                    for pair in pairs
+                ]
+            ).float()
+            worse = torch.stack(
+                [
+                    selected_policy_log_probabilities[
+                        (pair.worse_trace, pair.worse_step)
+                    ]
+                    for pair in pairs
+                ]
+            ).float()
+            pairwise_loss = F.softplus(
+                self.transaction_config.pairwise_margin - (better - worse)
+            ).mean()
+        else:
+            pairwise_loss = zero
+        return (
+            effect_loss,
+            delta_loss,
+            q_loss,
+            pairwise_loss,
+            len(effect_targets),
+            len(q_targets),
+            len(pairs),
         )
 
 

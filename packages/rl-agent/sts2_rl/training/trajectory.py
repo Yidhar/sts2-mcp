@@ -687,6 +687,25 @@ class TrajectoryJournal:
         if reasons:
             self._write_snapshot(current, reasons=reasons)
 
+    def write_episode_boundary(self, event: Mapping[str, Any]) -> None:
+        """Finish the active diagnostic episode, then write a boundary event.
+
+        Infrastructure retry markers must not be written through ``write``:
+        a failed attempt can end between two successful decisions, and the
+        journal otherwise defers its forced final snapshot until it sees the
+        *next* decision episode id.  That would place an attempt-1 snapshot
+        after the attempt-2 ``started`` marker.  This explicit operation keeps
+        attempt boundaries auditable without teaching the journal anything
+        about evaluation retry policy.
+        """
+
+        if self._handle is None:
+            raise RuntimeError("trajectory journal must be opened before writing")
+        if event.get("event") == "decision":
+            raise ValueError("decision events must be written with write()")
+        self._finish_episode()
+        self._write_payload(diagnostic_projection(event))
+
     def _reset_episode(self, episode_id: str) -> None:
         self._episode_id = episode_id
         self._episode_decisions = 0

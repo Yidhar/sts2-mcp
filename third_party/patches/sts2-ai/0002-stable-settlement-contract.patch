@@ -1,0 +1,2020 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
+index ccaae295449e750a79b83925d77e4252db592b65..fa4019d6046312fd448a29cd33ea7303eaa03bf8 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
+@@ -487,7 +487,9 @@ internal static class BinaryProtocol
+ 
+ 	public static byte[] BuildStepResponse(BinarySessionState session, FullRunSimulationStepResult result, FullRunSimulationStateSnapshot snapshot)
+ 	{
+-		BinaryStatus status = result.Accepted ? BinaryStatus.Ok : BinaryStatus.RejectedAction;
++		BinaryStatus status = ResolveSettlementWireStatus(
++			result.Accepted,
++			result.SettlementStatus);
+ 		byte[] statePayload = BuildStatePayload(session, snapshot);
+ 		using MemoryStream stream = new();
+ 		using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
+@@ -503,7 +505,9 @@ internal static class BinaryProtocol
+ 
+ 	public static byte[] BuildBatchStepResponse(BinarySessionState session, FullRunSimulationBatchStepResult result, FullRunSimulationStateSnapshot snapshot)
+ 	{
+-		BinaryStatus status = result.Accepted ? BinaryStatus.Ok : BinaryStatus.RejectedAction;
++		BinaryStatus status = ResolveSettlementWireStatus(
++			result.Accepted,
++			result.SettlementStatus);
+ 		byte[] statePayload = BuildStatePayload(session, snapshot);
+ 		using MemoryStream stream = new();
+ 		using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
+@@ -518,6 +522,18 @@ internal static class BinaryProtocol
+ 		return stream.ToArray();
+ 	}
+ 
++	internal static BinaryStatus ResolveSettlementWireStatus(bool accepted, string? settlementStatus)
++	{
++		if (!accepted)
++		{
++			return BinaryStatus.RejectedAction;
++		}
++		return settlementStatus == FullRunSettlementContract.Actionable
++			|| settlementStatus == FullRunSettlementContract.Terminal
++			? BinaryStatus.Ok
++			: BinaryStatus.SimulatorError;
++	}
++
+ 	public static byte[] BuildSearchCombatMctsResponse(CombatMctsResult result)
+ 	{
+ 		using MemoryStream stream = new();
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+index df3b192a3a0339117bdbec55fe524e8613daf854..665e676f3724121344adc9c54728537f6dc17a35 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+@@ -59,6 +59,12 @@ internal static class Program
+ 		}
+ 
+ 		HostOptions options = HostOptions.Parse(args);
++		if (options.RunSettlementContractSelfTest)
++		{
++			FullRunSettlementContract.RunSelfTests();
++			Console.WriteLine("HeadlessSim settlement contract self-test: PASS");
++			return;
++		}
+ 		BootstrapStandaloneRuntime();
+ 		if (options.ExportCardRuntimeTextsPath != null)
+ 		{
+@@ -67,6 +73,12 @@ internal static class Program
+ 		}
+ 		using IDisposable standaloneScope = FullRunTrainingEnvService.EnterStandaloneMode();
+ 		FullRunTrainingEnvService service = FullRunTrainingEnvService.Instance;
++		if (options.RunSettlementRuntimeSelfTest)
++		{
++			await service.RunSettlementRuntimeSelfTestsAsync();
++			Console.WriteLine("HeadlessSim settlement runtime self-test: PASS");
++			return;
++		}
+ 
+ 		if (options.UseStdio)
+ 		{
+@@ -561,37 +573,6 @@ internal static class Program
+ 			result = await service.StepAsync(action);
+ 		}
+ 		FullRunSimulationStateSnapshot snapshot = result.State ?? GetSnapshot(service, cache);
+-		// Auto-advance through non-decision states (same logic as binary)
+-		int autoAdvanceCount = 0;
+-		const int maxAutoAdvance = 50;
+-		while (!IsDecisionState(snapshot) && autoAdvanceCount < maxAutoAdvance)
+-		{
+-			autoAdvanceCount++;
+-			FullRunSimulationDiagnostics.Increment("step.auto_advance");
+-			if (snapshot.LegalActions.Count == 0)
+-			{
+-				var waitResult = await service.StepAsync(new FullRunSimulationActionRequest { Action = "wait" });
+-				snapshot = waitResult.State ?? GetSnapshot(service, cache);
+-			}
+-			else
+-			{
+-				var la = snapshot.LegalActions[0];
+-				var autoAction = new FullRunSimulationActionRequest
+-				{
+-					Action = la.Action ?? "",
+-					Index = la.Index,
+-					Col = la.Col,
+-					Row = la.Row,
+-					Slot = la.Slot,
+-					TargetId = la.TargetId,
+-					Target = la.Target,
+-					CardIndex = la.CardIndex,
+-					Value = la.Label,
+-				};
+-				var autoResult = await service.StepAsync(autoAction);
+-				snapshot = autoResult.State ?? GetSnapshot(service, cache);
+-			}
+-		}
+ 		using (FullRunSimulationDiagnostics.Measure("request.proto_encode_ms"))
+ 		{
+ 			return ProtoStateBuilder.BuildStepResponse(result, snapshot);
+@@ -955,42 +936,6 @@ internal static class Program
+ 
+ 		FullRunSimulationStateSnapshot snapshot = result.State ?? GetSnapshot(service, cache);
+ 
+-		// Auto-advance through non-decision states (combat_rewards, card_select, etc.)
+-		// This reduces Python↔C# round-trips by ~96% (only return on real decisions).
+-		int autoAdvanceCount = 0;
+-		const int maxAutoAdvance = 50; // safety cap
+-		while (!IsDecisionState(snapshot) && autoAdvanceCount < maxAutoAdvance)
+-		{
+-			autoAdvanceCount++;
+-			FullRunSimulationDiagnostics.Increment("step.auto_advance");
+-
+-			if (snapshot.LegalActions.Count == 0)
+-			{
+-				// No legal actions — send wait
+-				var waitResult = await service.StepAsync(new FullRunSimulationActionRequest { Action = "wait" });
+-				snapshot = waitResult.State ?? GetSnapshot(service, cache);
+-			}
+-			else
+-			{
+-				// Auto-pick first legal action (convert LegalAction → ActionRequest)
+-				var la = snapshot.LegalActions[0];
+-				var autoAction = new FullRunSimulationActionRequest
+-				{
+-					Action = la.Action ?? "",
+-					Index = la.Index,
+-					Col = la.Col,
+-					Row = la.Row,
+-					Slot = la.Slot,
+-					TargetId = la.TargetId,
+-					Target = la.Target,
+-					CardIndex = la.CardIndex,
+-					Value = la.Label,
+-				};
+-				var autoResult = await service.StepAsync(autoAction);
+-				snapshot = autoResult.State ?? GetSnapshot(service, cache);
+-			}
+-		}
+-
+ 		using (FullRunSimulationDiagnostics.Measure("request.binary_encode_ms"))
+ 		{
+ 			return BinaryProtocol.BuildStepResponse(session, result, snapshot);
+@@ -1312,7 +1257,7 @@ internal static class Program
+ 			// (replay writer, music, achievements, save, map screen, etc.)
+ 			// This makes it safe to call EndCombatInternal from both headless sim
+ 			// AND visible Godot client — same logic path.
+-			service.ResetCombatFollowupStateForExternalCombatResolution();
++			await service.ResetCombatFollowupStateForExternalCombatResolutionAsync();
+ 			using (CombatSimulationRuntime.EnterPureCombatSimulator())
+ 			{
+ 				await CombatManager.Instance.EndCombatInternal();
+@@ -1596,6 +1541,7 @@ internal static class Program
+ 			// 规范见 STS2AI/docs/design/SCHEMA_CONVENTION.md
+ 			"game_catalog" => BuildGameCatalog(),
+ 			"step" => await StepAsync(service, paramsElement, cache),
++			"poll_transition" => await PollTransitionAsync(service, paramsElement, cache),
+ 			"batch_step" => await BatchStepAsync(service, paramsElement, cache),
+ 			"save_state" => new Dictionary<string, object?>
+ 			{
+@@ -1760,31 +1706,17 @@ internal static class Program
+ 				result = await service.StepAsync(action);
+ 			}
+ 
+-			// Advance until the agent needs to make a decision.
+-			// Eliminates Python round-trips for combat_pending / empty legal actions.
+-			const int maxAutoAdvance = 30;
+-			for (int autoIter = 0; autoIter < maxAutoAdvance && result.Accepted && result.State != null; autoIter++)
+-			{
+-				FullRunSimulationStateSnapshot advState = result.State;
+-				if (advState.IsTerminal || advState.StateType == "game_over")
+-					break;
+-				if (advState.LegalActions.Count > 0)
+-					break;
+-				// No legal actions — auto-advance with "wait"
+-				using (FullRunSimulationDiagnostics.Measure("request.step.auto_advance_ms"))
+-				{
+-					result = await service.StepAsync(new FullRunSimulationActionRequest { Action = "wait" });
+-				}
+-				FullRunSimulationDiagnostics.Increment("request.step.auto_advance_count");
+-			}
+-
+ 			FullRunApiState state = BuildApiState(result.State ?? GetSnapshot(service, cache), cache);
+ 			FullRunSimulationTrace.Write(
+ 				$"headless_pipe.step.done accepted={result.Accepted} error={result.Error ?? "null"} state_type={state.state_type} floor={state.run.floor} terminal={state.terminal}");
+ 			return new Dictionary<string, object?>
+ 			{
+ 				["accepted"] = result.Accepted,
++				["action_committed"] = result.ActionCommitted,
++				["settlement_status"] = result.SettlementStatus,
++				["transition_token"] = result.TransitionToken,
+ 				["error"] = result.Error,
++				["failure_code"] = result.FailureCode,
+ 				["state"] = state,
+ 				["reward"] = ComputeTerminalReward(state.run_outcome, state.terminal),
+ 				["done"] = state.terminal,
+@@ -1803,6 +1735,33 @@ internal static class Program
+ 		}
+ 	}
+ 
++	private static async Task<Dictionary<string, object?>> PollTransitionAsync(
++		FullRunTrainingEnvService service,
++		JsonElement paramsElement,
++		RequestStateCache cache)
++	{
++		string transitionToken = GetRequiredString(paramsElement, "transition_token");
++		FullRunSimulationStepResult result = await service.PollTransitionAsync(transitionToken);
++		FullRunApiState state = BuildApiState(result.State ?? GetSnapshot(service, cache), cache);
++		return new Dictionary<string, object?>
++		{
++			["accepted"] = result.Accepted,
++			["action_committed"] = result.ActionCommitted,
++			["settlement_status"] = result.SettlementStatus,
++			["transition_token"] = result.TransitionToken,
++			["error"] = result.Error,
++			["failure_code"] = result.FailureCode,
++			["state"] = state,
++			["reward"] = ComputeTerminalReward(state.run_outcome, state.terminal),
++			["done"] = state.terminal,
++			["info"] = new Dictionary<string, object?>
++			{
++				["state_type"] = state.state_type,
++				["run_outcome"] = state.run_outcome
++			}
++		};
++	}
++
+ 	private static async Task<Dictionary<string, object?>> CombatStepAsync(JsonElement paramsElement)
+ 	{
+ 		CombatTrainingActionRequest action = ParseCombatActionRequest(paramsElement);
+@@ -1852,7 +1811,11 @@ internal static class Program
+ 			return new Dictionary<string, object?>
+ 			{
+ 				["accepted"] = result.Accepted,
++				["action_committed"] = result.ActionCommitted,
++				["settlement_status"] = result.SettlementStatus,
++				["transition_token"] = result.TransitionToken,
+ 				["error"] = result.Error,
++				["failure_code"] = result.FailureCode,
+ 				["steps_executed"] = result.StepsExecuted,
+ 				["state"] = state
+ 			};
+@@ -2669,6 +2632,10 @@ internal static class Program
+ 
+ 		public IReadOnlyList<string> ExportLocales { get; private set; } = new[] { "eng", "zhs" };
+ 
++		public bool RunSettlementContractSelfTest { get; private set; }
++
++		public bool RunSettlementRuntimeSelfTest { get; private set; }
++
+ 		public string PipeName => BinaryProtocol.PipeName(Port, Protocol);
+ 
+ 		public static HostOptions Parse(IEnumerable<string> args)
+@@ -2679,6 +2646,12 @@ internal static class Program
+ 			{
+ 				switch (values[i])
+ 				{
++					case "--settlement-contract-self-test":
++						options.RunSettlementContractSelfTest = true;
++						break;
++					case "--settlement-runtime-self-test":
++						options.RunSettlementRuntimeSelfTest = true;
++						break;
+ 					case "--stdio":
+ 						options.UseStdio = true;
+ 						break;
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
+index 008a8471fbbca0361c8adfc93a99193ff72d84e7..ea12366ec7efdb06475546af5b778cd56994a60e 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
+@@ -79,7 +79,9 @@ internal static class ProtoStateBuilder
+ 
+ 	public static byte[] BuildStepResponse(FullRunSimulationStepResult result, FullRunSimulationStateSnapshot snapshot)
+ 	{
+-		BinaryStatus status = result.Accepted ? BinaryStatus.Ok : BinaryStatus.RejectedAction;
++		BinaryStatus status = BinaryProtocol.ResolveSettlementWireStatus(
++			result.Accepted,
++			result.SettlementStatus);
+ 		byte[] statePayload = BuildProtoStatePayload(snapshot);
+ 		using MemoryStream stream = new();
+ 		using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
+@@ -94,7 +96,9 @@ internal static class ProtoStateBuilder
+ 
+ 	public static byte[] BuildBatchStepResponse(FullRunSimulationBatchStepResult result, FullRunSimulationStateSnapshot snapshot)
+ 	{
+-		BinaryStatus status = result.Accepted ? BinaryStatus.Ok : BinaryStatus.RejectedAction;
++		BinaryStatus status = BinaryProtocol.ResolveSettlementWireStatus(
++			result.Accepted,
++			result.SettlementStatus);
+ 		byte[] statePayload = BuildProtoStatePayload(snapshot);
+ 		using MemoryStream stream = new();
+ 		using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 7c945619079209a63f3d72a74eb070d9627e3ac4..784f6352bce2c7c542532b73fc6cec5f0196a879 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -42,6 +42,7 @@ public static class FullRunApiStateBuilder
+ 		{
+ 			state_type = snapshot.StateType,
+ 			terminal = snapshot.IsTerminal,
++			is_actionable = snapshot.IsActionable,
+ 			is_pure_simulator = snapshot.IsPureSimulator,
+ 			backend_kind = snapshot.BackendKind,
+ 			coverage_tier = snapshot.CoverageTier,
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+index 8e56f53fd376d247306bf31c55ca189b66abeb16..9b7c5c80a33de1c0603335f5293ba43f41287fe0 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+@@ -803,6 +803,12 @@ public sealed class FullRunApiState
+ 
+ 	public bool terminal { get; set; }
+ 
++	/// <summary>
++	/// True only when this non-terminal snapshot has at least one legal action.
++	/// It is an authoritative protocol field, not a UI/state-type guess.
++	/// </summary>
++	public bool is_actionable { get; set; }
++
+ 	public bool is_pure_simulator { get; set; }
+ 
+ 	public string? backend_kind { get; set; }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e34c48ca706239e3ee5a250ef6c490e4dac0982f
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+@@ -0,0 +1,265 @@
++using System;
++using System.Collections.Generic;
++using System.Threading;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Stable-surface protocol shared by the runtime facade and every transport.
++/// A mutating step may be committed before its asynchronous game transition is
++/// settled, but a non-terminal snapshot with no legal actions is never a valid
++/// environment result.
++/// </summary>
++public static class FullRunSettlementContract
++{
++	public const string Actionable = "actionable";
++	public const string Terminal = "terminal";
++	public const string Pending = "pending";
++	public const string Unsettled = "unsettled";
++	public const string Rejected = "rejected";
++	public const string Invalid = "invalid";
++	public const string PostCombatRewards = "rewards";
++	public const string PostCombatProceedWithoutRewards = "proceed_without_rewards";
++
++	/// <summary>
++	/// Mirrors NCombatUi.OnCombatWon. Rewardless encounters must not construct a
++	/// RewardsSet because the native UI bypasses reward generation and every
++	/// reward hook for that branch.
++	/// </summary>
++	public static string ResolvePostCombatContinuation(bool shouldGiveRewards)
++	{
++		return shouldGiveRewards
++			? PostCombatRewards
++			: PostCombatProceedWithoutRewards;
++	}
++
++	public static string ClassifySnapshot(FullRunSimulationStateSnapshot snapshot)
++	{
++		ArgumentNullException.ThrowIfNull(snapshot);
++		int legalCount = snapshot.LegalActions?.Count ?? 0;
++		if (snapshot.IsTerminal)
++		{
++			return legalCount == 0 ? Terminal : Invalid;
++		}
++		if (legalCount > 0)
++		{
++			return Actionable;
++		}
++		return Pending;
++	}
++
++	public static bool IsStableSurface(FullRunSimulationStateSnapshot snapshot)
++	{
++		string status = ClassifySnapshot(snapshot);
++		return status == Actionable || status == Terminal;
++	}
++
++	/// <summary>
++	/// Deterministic contract/property tests runnable without bootstrapping game
++	/// assets.  Kept beside the production classifier so future state types
++	/// cannot silently reintroduce the old default-ready behavior.
++	/// </summary>
++	public static void RunSelfTests()
++	{
++		FullRunSimulationLegalAction action = new FullRunSimulationLegalAction
++		{
++			Action = "test",
++			IsSupported = true
++		};
++
++		AssertStatus(
++			new FullRunSimulationStateSnapshot { IsRunActive = true, StateType = "monster" },
++			Pending,
++			"map-to-combat intermediate frame must remain pending");
++		AssertStatus(
++			new FullRunSimulationStateSnapshot
++			{
++				IsRunActive = true,
++				StateType = "monster",
++				LegalActions = new List<FullRunSimulationLegalAction> { action }
++			},
++			Actionable,
++			"combat becomes actionable only after legal actions exist");
++		AssertStatus(
++			new FullRunSimulationStateSnapshot { IsTerminal = true, StateType = "game_over" },
++			Terminal,
++			"terminal zero-action state");
++		AssertStatus(
++			new FullRunSimulationStateSnapshot
++			{
++				IsTerminal = true,
++				StateType = "game_over",
++				LegalActions = new List<FullRunSimulationLegalAction> { action }
++			},
++			Invalid,
++			"terminal state must not expose legal actions");
++
++		if (ResolvePostCombatContinuation(shouldGiveRewards: true) != PostCombatRewards
++			|| ResolvePostCombatContinuation(shouldGiveRewards: false) != PostCombatProceedWithoutRewards)
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: rewardless combat must use the native proceed-without-rewards route."
++			);
++		}
++
++		// Reset/load invalidation and continuation registration share the same
++		// generation gate. Prove that a stale or cancelled continuation cannot
++		// register a choice after invalidation, while a fresh generation can.
++		FullRunContinuationGeneration generation = new FullRunContinuationGeneration();
++		using CancellationTokenSource staleCancellation = new CancellationTokenSource();
++		long stale = generation.Capture();
++		int registrations = 0;
++		if (!generation.TryRun(
++			stale,
++			staleCancellation.Token,
++			() => ++registrations,
++			out int firstRegistration)
++			|| firstRegistration != 1)
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: current continuation could not register."
++			);
++		}
++		generation.Invalidate(() => staleCancellation.Cancel());
++		if (generation.TryRun(
++			stale,
++			staleCancellation.Token,
++			() => ++registrations,
++			out _))
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: stale continuation registered after reset."
++			);
++		}
++		using CancellationTokenSource currentCancellation = new CancellationTokenSource();
++		long current = generation.Capture();
++		if (!generation.TryRun(
++			current,
++			currentCancellation.Token,
++			() => ++registrations,
++			out int secondRegistration)
++			|| secondRegistration != 2)
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: fresh continuation generation was rejected."
++			);
++		}
++
++		// Property sweep over representative current and future state names.  The
++		// classification is intentionally independent of state_type: no unknown
++		// state is allowed to inherit an implicit ready=true default.
++		string[] stateTypes =
++		{
++			"menu", "run_bootstrap", "map", "event", "rest_site", "shop",
++			"treasure", "monster", "elite", "boss", "hand_select",
++			"card_select", "combat_start_pending", "combat_post_end_pending",
++			"future_unknown_state"
++		};
++		foreach (string stateType in stateTypes)
++		{
++			foreach (bool runActive in new[] { false, true })
++			{
++				foreach (bool terminal in new[] { false, true })
++				{
++					foreach (int legalCount in new[] { 0, 1, 7 })
++					{
++						List<FullRunSimulationLegalAction> legal = new List<FullRunSimulationLegalAction>();
++						for (int i = 0; i < legalCount; i++)
++						{
++							legal.Add(action);
++						}
++						FullRunSimulationStateSnapshot snapshot = new FullRunSimulationStateSnapshot
++						{
++							IsRunActive = runActive,
++							IsTerminal = terminal,
++							StateType = stateType,
++							LegalActions = legal
++						};
++						string expected = terminal
++							? (legalCount == 0 ? Terminal : Invalid)
++							: (legalCount > 0 ? Actionable : Pending);
++						AssertStatus(snapshot, expected, $"property sweep {stateType}/{runActive}/{terminal}/{legalCount}");
++					}
++				}
++			}
++		}
++	}
++
++	private static void AssertStatus(
++		FullRunSimulationStateSnapshot snapshot,
++		string expected,
++		string context)
++	{
++		string actual = ClassifySnapshot(snapshot);
++		if (!string.Equals(actual, expected, StringComparison.Ordinal))
++		{
++			throw new InvalidOperationException(
++				$"Settlement contract self-test failed ({context}): expected={expected}, actual={actual}.");
++		}
++		bool expectedStable = expected == Actionable || expected == Terminal;
++		if (IsStableSurface(snapshot) != expectedStable)
++		{
++			throw new InvalidOperationException(
++				$"Settlement stability self-test failed ({context}): expected_stable={expectedStable}.");
++		}
++	}
++}
++
++/// <summary>
++/// Small synchronization primitive shared by post-combat continuation
++/// registration and reset/load invalidation. Actions passed to TryRun execute
++/// while the generation lock is held, making "check then register" atomic with
++/// Invalidate.
++/// </summary>
++internal sealed class FullRunContinuationGeneration
++{
++	private readonly object _gate = new object();
++
++	private long _generation;
++
++	public long Capture()
++	{
++		lock (_gate)
++		{
++			return _generation;
++		}
++	}
++
++	public long Invalidate(Action invalidateUnderLock)
++	{
++		ArgumentNullException.ThrowIfNull(invalidateUnderLock);
++		lock (_gate)
++		{
++			_generation = checked(_generation + 1L);
++			invalidateUnderLock();
++			return _generation;
++		}
++	}
++
++	public bool IsCurrent(long generation, CancellationToken cancellationToken)
++	{
++		lock (_gate)
++		{
++			return generation == _generation && !cancellationToken.IsCancellationRequested;
++		}
++	}
++
++	public bool TryRun<T>(
++		long generation,
++		CancellationToken cancellationToken,
++		Func<T> action,
++		out T result)
++	{
++		ArgumentNullException.ThrowIfNull(action);
++		lock (_gate)
++		{
++			if (generation != _generation || cancellationToken.IsCancellationRequested)
++			{
++				result = default!;
++				return false;
++			}
++			result = action();
++			return true;
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementUnsettledException.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementUnsettledException.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..286f0a8df91517d21be55aa03cf1bd20159ef12d
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementUnsettledException.cs
+@@ -0,0 +1,21 @@
++using System;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Internal control-flow signal: the preceding action was committed, but the
++/// simulator exhausted its bounded settlement budget before observing a
++/// stable agent decision surface.
++/// </summary>
++public sealed class FullRunSettlementUnsettledException : InvalidOperationException
++{
++	public FullRunSimulationStateSnapshot Snapshot { get; }
++
++	public FullRunSettlementUnsettledException(
++		FullRunSimulationStateSnapshot snapshot,
++		string message)
++		: base(message)
++	{
++		Snapshot = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
++	}
++}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
+index 10841df2b6bc23e8dc4d50cd2dc6b53e694b140e..1da0df4be5638fd2b7fa6938827c58f8a1e16cae 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
+@@ -222,6 +222,30 @@ public sealed class FullRunSimulationStepResult
+ {
+ 	public bool Accepted { get; set; }
+ 
++	/// <summary>
++	/// Whether the mutating action was committed by the simulator.  This is
++	/// deliberately distinct from <see cref="Accepted"/> so transports can
++	/// report a committed transition that failed to settle without inviting a
++	/// caller to retry the non-idempotent action.
++	/// </summary>
++	[JsonPropertyName("action_committed")]
++	public bool ActionCommitted { get; set; }
++
++	/// <summary>
++	/// Authoritative transition outcome: actionable, terminal, pending,
++	/// unsettled, or rejected.  Only actionable and terminal are valid RL step
++	/// surfaces; pending is exposed only by the read-only transition poll.
++	/// </summary>
++	[JsonPropertyName("settlement_status")]
++	public string SettlementStatus { get; set; } = FullRunSettlementContract.Rejected;
++
++	/// <summary>
++	/// Opaque identity for the most recently committed transition.  It is used
++	/// by the read-only poll API and must never be interpreted by clients.
++	/// </summary>
++	[JsonPropertyName("transition_token")]
++	public string? TransitionToken { get; set; }
++
+ 	public string? Error { get; set; }
+ 
+ 	public string? FailureCode { get; set; }
+@@ -233,6 +257,15 @@ public sealed class FullRunSimulationBatchStepResult
+ {
+ 	public bool Accepted { get; set; }
+ 
++	[JsonPropertyName("action_committed")]
++	public bool ActionCommitted { get; set; }
++
++	[JsonPropertyName("settlement_status")]
++	public string SettlementStatus { get; set; } = FullRunSettlementContract.Rejected;
++
++	[JsonPropertyName("transition_token")]
++	public string? TransitionToken { get; set; }
++
+ 	public string? Error { get; set; }
+ 
+ 	public string? FailureCode { get; set; }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+index d2e7d6422f9a28bd6acf5e7eafe1fab1f72b675c..6cfe338cc6d1fb57d8d7ccd939d4c377d732e066 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+@@ -74,7 +74,10 @@ internal static class FullRunSimulationStateBuilder
+ 			snapshot.RoomModelId = null;
+ 		}
+ 		snapshot.IsTerminal = snapshot.StateType == "game_over";
+-		snapshot.IsActionable = !snapshot.IsTerminal;
++		// IsActionable is finalized only after legal actions have been built.  A
++		// room/state type by itself is not evidence that the transition surface is
++		// ready for an agent decision.
++		snapshot.IsActionable = false;
+ 		snapshot.RunOutcome = snapshot.IsTerminal
+ 			? (RunManager.Instance.WinTime > 0 ? "victory" : "defeat")
+ 			: null;
+@@ -95,6 +98,7 @@ internal static class FullRunSimulationStateBuilder
+ 		// Filter out unsupported actions (e.g., shop items player can't afford).
+ 		// Only truly executable actions should reach the AI.
+ 		snapshot.LegalActions.RemoveAll(a => !a.IsSupported);
++		snapshot.IsActionable = !snapshot.IsTerminal && snapshot.LegalActions.Count > 0;
+ 		return snapshot;
+ 	}
+ 
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index a7d1ae35b58f72cb63c62911dfad82cb84a26987..efa60df44a370af25ef96bfca982d5be261f3d66 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -5,6 +5,7 @@ using System.Linq;
+ using System.Reflection;
+ using System.Text.Json;
+ using System.Text.Json.Serialization.Metadata;
++using System.Threading;
+ using System.Threading.Tasks;
+ using Godot;
+ using MegaCrit.Sts2.Core.Assets;
+@@ -19,6 +20,7 @@ using MegaCrit.Sts2.Core.Entities.Players;
+ using MegaCrit.Sts2.Core.Events;
+ using MegaCrit.Sts2.Core.Map;
+ using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Encounters.Mocks;
+ using MegaCrit.Sts2.Core.Multiplayer;
+ using MegaCrit.Sts2.Core.Nodes;
+ using MegaCrit.Sts2.Core.Nodes.Events;
+@@ -51,12 +53,37 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 
+ 	private FullRunSimulationStateSnapshot? _lastObservedState;
+ 
++	private long _nextTransitionId;
++
++	private string? _activeTransitionToken;
++
++	/// <summary>
++	/// Serializes continuation registration against reset/load invalidation.  A
++	/// stale continuation may either register its choice before invalidation (in
++	/// which case ChoiceBridge.Reset releases it), or observe a new generation
++	/// and exit.  It can never register an old-episode choice after reset.
++	/// </summary>
++	private readonly FullRunContinuationGeneration _postCombatGeneration = new();
++
++	private CancellationTokenSource? _postCombatCancellation;
++
++	private string? _postCombatContinuationFailure;
++
+ 	/// <summary>
+ 	/// Prevents calling OfferForRoomEnd more than once per combat.
+ 	/// Reset in ResetAsync (new episode) and StepCombatAsync (new combat action).
+ 	/// </summary>
+ 	private bool _rewardsTriggered;
+ 
++	/// <summary>
++	/// Natural continuation of the combat-ending action.  TestMode deliberately
++	/// suppresses CombatRoom's UI-owned reward-screen task, so the full-run
++	/// runtime owns the equivalent headless continuation and keeps its Task here.
++	/// PollTransitionAsync may yield to this already-committed work, but must
++	/// never create it or submit a synthetic action.
++	/// </summary>
++	private Task? _postCombatRewardsTask;
++
+ 	private bool _suppressTerminalRewardsTransitionOnce;
+ 
+ 	/// <summary>
+@@ -283,7 +310,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 	public async Task<FullRunSimulationStateSnapshot> ResetAsync(FullRunSimulationResetRequest? request = null)
+ 	{
+ 		FullRunSimulationTrace.Write("headless_reset.begin");
+-		CleanUpPreviousEpisode();
++		await CleanUpPreviousEpisodeAsync("reset");
+ 		FullRunSimulationTrace.Write("headless_reset.after_cleanup");
+ 		// TestMode makes the entire engine skip Godot-specific code:
+ 		// PreloadManager skips asset loading, MapRoom.Enter() skips scene creation,
+@@ -294,6 +321,8 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		FullRunSimulationChoiceBridge.Instance.Reset();
+ 		_forceMapView = false;
+ 		_rewardsTriggered = false;
++		_nextTransitionId = 0;
++		_activeTransitionToken = null;
+ 		FullRunSimulationTrace.Write("headless_reset.after_runtime_scope");
+ 		SaveManager.Instance?.SetFtuesEnabled(enabled: false);
+ 		if (SaveManager.Instance != null)
+@@ -367,13 +396,109 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		return snapshot;
+ 	}
+ 
+-	public Task<FullRunSimulationStepResult> StepAsync(FullRunSimulationActionRequest action)
++	public async Task<FullRunSimulationStepResult> StepAsync(FullRunSimulationActionRequest action)
+ 	{
+ 		if (action == null)
+ 		{
+-			return Task.FromResult(BuildRejected("Action request is required.", "full_run_action_required"));
++			return FinalizeStepResult(
++				BuildRejected("Action request is required.", "full_run_action_required"),
++				transitionToken: null);
++		}
++
++		string transitionToken = $"episode-{EpisodeNumber}:transition-{++_nextTransitionId}";
++		_activeTransitionToken = transitionToken;
++		try
++		{
++			FullRunSimulationStepResult result = await StepInternalAsync(action);
++			return FinalizeStepResult(result, transitionToken);
++		}
++		catch (FullRunSettlementUnsettledException ex)
++		{
++			// Reset/start_run may replace episode-local bookkeeping while the
++			// outer step is in flight; re-bind the token to the committed mutation.
++			_activeTransitionToken = transitionToken;
++			FullRunSimulationDiagnostics.Increment("settle.transition.unsettled");
++			FullRunSimulationTrace.Write(
++				$"settle.transition.unsettled token={transitionToken} state={ex.Snapshot.StateType} legal={ex.Snapshot.LegalActions.Count} terminal={ex.Snapshot.IsTerminal} detail={ex.Message}");
++			return new FullRunSimulationStepResult
++			{
++				Accepted = true,
++				ActionCommitted = true,
++				SettlementStatus = FullRunSettlementContract.Unsettled,
++				TransitionToken = transitionToken,
++				Error = ex.Message,
++				FailureCode = "full_run_settlement_unsettled",
++				State = ex.Snapshot
++			};
++		}
++	}
++
++	/// <summary>
++	/// Observe the most recently committed transition without executing another
++	/// game action.  Callers may use this with a bounded retry budget after an
++	/// unsettled response.  A mismatched token is rejected fail-closed.
++	/// </summary>
++	public async Task<FullRunSimulationStepResult> PollTransitionAsync(string? transitionToken)
++	{
++		if (string.IsNullOrWhiteSpace(transitionToken)
++			|| !string.Equals(transitionToken, _activeTransitionToken, StringComparison.Ordinal))
++		{
++			// A bad read-only poll must not destroy the valid active token.  It did
++			// not commit a mutation and callers may still retry with the right token.
++			return BuildRejected(
++				"Transition token does not identify the active committed transition.",
++				"full_run_transition_token_mismatch");
++		}
++
++		// This is deliberately read-only: yield only to work already scheduled by
++		// the committed transition.  In particular, this method never starts the
++		// post-combat reward continuation and never submits wait/proceed/end-turn.
++		ThrowIfPostCombatContinuationFailed();
++		FullRunSimulationStateSnapshot snapshot = GetState();
++		for (int attempt = 0; attempt < 16 && !IsReadySnapshot(snapshot); attempt++)
++		{
++			await CombatSimulationRuntime.Clock.YieldAsync();
++			await Task.Yield();
++
++			Task? postCombatTask = _postCombatRewardsTask;
++			if (postCombatTask?.IsCompleted == true)
++			{
++				// The wrapper observes every exception and records active-generation
++				// failures for the protocol below. Never await an incomplete task here:
++				// once rewards are exposed it intentionally waits for the next decision.
++				await postCombatTask;
++			}
++			ThrowIfPostCombatContinuationFailed();
++			if (RunManager.Instance.IsInProgress)
++			{
++				Task executor = RunManager.Instance.ActionExecutor.FinishedExecutingActions();
++				if (executor.IsCompleted)
++				{
++					await executor;
++				}
++			}
++			snapshot = GetState();
++		}
++		ThrowIfPostCombatContinuationFailed();
++		string status = FullRunSettlementContract.ClassifySnapshot(snapshot);
++		if (status == FullRunSettlementContract.Invalid)
++		{
++			status = FullRunSettlementContract.Unsettled;
+ 		}
+-		return StepInternalAsync(action);
++		return new FullRunSimulationStepResult
++		{
++			Accepted = true,
++			ActionCommitted = true,
++			SettlementStatus = status,
++			TransitionToken = transitionToken,
++			FailureCode = status == FullRunSettlementContract.Unsettled
++				? "full_run_settlement_invalid"
++				: null,
++			Error = status == FullRunSettlementContract.Unsettled
++				? "Committed transition produced an invalid stable-surface snapshot."
++				: null,
++			State = snapshot
++		};
+ 	}
+ 
+ 	/// <summary>
+@@ -399,7 +524,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		FullRunSimulationStateSnapshot? lastState = _lastObservedState;
+ 		for (int i = 0; i < actions.Count; i++)
+ 		{
+-			var result = await StepInternalAsync(actions[i]);
++			var result = await StepAsync(actions[i]);
+ 			executed++;
+ 			if (!result.Accepted)
+ 			{
+@@ -408,16 +533,39 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 					Accepted = false,
+ 					Error = result.Error,
+ 					FailureCode = result.FailureCode,
++					ActionCommitted = result.ActionCommitted,
++					SettlementStatus = result.SettlementStatus,
++					TransitionToken = result.TransitionToken,
+ 					StepsExecuted = executed,
+ 					State = result.State ?? GetState()
+ 				};
+ 			}
++			if (result.SettlementStatus != FullRunSettlementContract.Actionable
++				&& result.SettlementStatus != FullRunSettlementContract.Terminal)
++			{
++				// Never execute a later batch mutation against an unsettled prior
++				// transition.  The caller must poll or discard the session.
++				return new FullRunSimulationBatchStepResult
++				{
++					Accepted = true,
++					ActionCommitted = true,
++					SettlementStatus = result.SettlementStatus,
++					TransitionToken = result.TransitionToken,
++					Error = result.Error,
++					FailureCode = result.FailureCode,
++					StepsExecuted = executed,
++					State = result.State
++				};
++			}
+ 			// If terminal, stop early
+ 			if (result.State?.IsTerminal == true)
+ 			{
+ 				return new FullRunSimulationBatchStepResult
+ 				{
+ 					Accepted = true,
++					ActionCommitted = result.ActionCommitted,
++					SettlementStatus = result.SettlementStatus,
++					TransitionToken = result.TransitionToken,
+ 					StepsExecuted = executed,
+ 					State = result.State
+ 				};
+@@ -427,6 +575,11 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		return new FullRunSimulationBatchStepResult
+ 		{
+ 			Accepted = true,
++			ActionCommitted = true,
++			SettlementStatus = lastState?.IsTerminal == true
++				? FullRunSettlementContract.Terminal
++				: FullRunSettlementContract.Actionable,
++			TransitionToken = _activeTransitionToken,
+ 			StepsExecuted = executed,
+ 			State = lastState ?? _lastObservedState ?? GetState()
+ 		};
+@@ -441,6 +594,10 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 	{
+ 		FullRunSimulationStateSnapshot state = _lastObservedState ?? GetState();
+ 		string actionType = NormalizeActionType(action);
++		if (actionType != "start_run")
++		{
++			ThrowIfPostCombatContinuationFailed();
++		}
+ 		switch (actionType)
+ 		{
+ 			case "start_run":
+@@ -1113,6 +1270,22 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			return BuildRejected($"'{actionType}' is only valid during combat.", "full_run_invalid_state");
+ 		}
+ 		CombatTrainingActionRequest combatAction = TranslateCombatAction(state, actionType, action);
++		// Reset the per-combat-action continuation owner before executing the
++		// mutation.  EndCombatInternal may synchronously publish CombatWon while
++		// this await is in flight; resetting afterwards could erase that ownership
++		// and generate rewards twice if another headless listener is added later.
++		_forceMapView = false;
++		_rewardsTriggered = false;
++		ThrowIfPostCombatContinuationFailed();
++		if (_postCombatRewardsTask?.IsCompleted == false)
++		{
++			throw new FullRunSimulationRuntimeException(
++				"post_combat_continuation_overlap",
++				"A new combat action cannot start while the previous post-combat continuation is still active."
++			);
++		}
++		_postCombatRewardsTask = null;
++		_postCombatCancellation = null;
+ 		CombatTrainingStepResult result;
+ 		using (FullRunSimulationDiagnostics.Measure("combat_step.game_logic_ms"))
+ 		{
+@@ -1128,8 +1301,17 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				State = _lastObservedState ?? state
+ 			};
+ 		}
+-		_forceMapView = false;
+-		_rewardsTriggered = false;
++		if (!CombatManager.Instance.IsInProgress)
++		{
++			// EndCombatInternal is part of the accepted card/potion action.  In
++			// TestMode the normal NCombatUi reward-screen continuation is absent,
++			// so schedule its headless equivalent here as part of the same committed
++			// transition rather than requiring a later synthetic "wait" action.
++			RunState? completedRunState = RunManager.Instance.DebugOnlyGetState();
++			TryTriggerPostCombatRewards(
++				completedRunState,
++				completedRunState?.CurrentRoom as CombatRoom);
++		}
+ 		if (result.State != null && IsActionableCombatState(result.State))
+ 		{
+ 			FullRunSimulationStepResult fastResult;
+@@ -1250,22 +1432,15 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			}
+ 		}
+ 
+-		// Phase 2: fallback for scene transitions (map -> room, room -> map).
+-		// In pure simulator mode (ImmediateSimulatorClock), Phase 1 is sufficient -
+-		// all game logic runs synchronously, so state is always settled after Phase 1.
+-		// Skip Phase 2 entirely when Godot engine is absent or in pure sim mode.
++		// Phase 2: bounded settlement for scene transitions (map -> room,
++		// room -> map).  Pure-simulator game logic still uses async continuations;
++		// ImmediateSimulatorClock being a no-op does not prove those continuations
++		// have run.  Task.Yield is therefore required even without a Godot frame.
+ 		ISimulatorClock clock = CombatSimulationRuntime.Clock;
+ 		bool canUseFrameDeadline = Engine.GetMainLoop() != null && !CombatSimulationRuntime.IsPureCombatSimulator;
+ 		ulong stateTimeout = 30UL;
+ 		ulong stateDeadline = canUseFrameDeadline ? Time.GetTicksMsec() + stateTimeout : 0UL;
+-		// When no frame-based deadline is available (pure-sim or no engine),
+-		// Clock.YieldAsync() is a no-op and we never Task.Yield(), so state
+-		// cannot change between iterations - Phase 2 is pure waste. Skip it.
+-		int maxPhase2Iters = canUseFrameDeadline ? 100 : 0;
+-		if (maxPhase2Iters == 0)
+-		{
+-			FullRunSimulationDiagnostics.Increment("settle.wait_state_change.phase2_skipped_no_frame");
+-		}
++		int maxPhase2Iters = canUseFrameDeadline ? 100 : 64;
+ 		for (int iter = 0; iter < maxPhase2Iters; iter++)
+ 		{
+ 			FullRunSimulationDiagnostics.Increment("settle.wait_state_change.phase2_iterations");
+@@ -1275,10 +1450,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				break;
+ 			}
+ 			await clock.YieldAsync();
+-			if (canUseFrameDeadline)
+-			{
+-				await Task.Yield();
+-			}
++			await Task.Yield();
+ 			if (RunManager.Instance.IsInProgress)
+ 			{
+ 				Task execTask = RunManager.Instance.ActionExecutor.FinishedExecutingActions();
+@@ -1334,7 +1506,19 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				return advancedStartup;
+ 			}
+ 		}
+-		return fallback;
++		bool changed = previousSignature == null
++			|| !string.Equals(BuildStateChangeSignature(fallback), previousSignature, StringComparison.Ordinal);
++		if (changed && IsReadySnapshot(fallback))
++		{
++			FullRunSimulationDiagnostics.Increment("settle.wait_state_change.fallback_stable_hits");
++			return fallback;
++		}
++
++		FullRunSimulationDiagnostics.Increment("settle.wait_state_change.unsettled");
++		throw new FullRunSettlementUnsettledException(
++			fallback,
++			$"Committed transition did not reach a stable decision surface after {maxPhase2Iters} bounded settlement iterations " +
++			$"(state_type={fallback.StateType}, legal_actions={fallback.LegalActions.Count}, terminal={fallback.IsTerminal}, changed={changed}).");
+ 	}
+ 
+ 	private async Task<FullRunSimulationStateSnapshot> WaitForCombatFollowupAsync(FullRunSimulationStateSnapshot previousState)
+@@ -1877,118 +2061,16 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 	{
+ 		try
+ 		{
+-		if (!_stateCache.TryGetValue(stateId, out SavedRunSnapshot? savedSnapshot))
+-			throw new FullRunSimulationRuntimeException("state_not_found", $"State '{stateId}' not found in cache.");
+-
+-		return savedSnapshot.Kind switch
+-		{
+-			SavedSnapshotKind.CombatSearch => await LoadCombatSearchSnapshotAsync(stateId, savedSnapshot),
+-			_ => await LoadFullSnapshotAsync(stateId, savedSnapshot)
+-		};
+-
+-		Saves.SerializableRun snapshot = savedSnapshot.RunSnapshot;
+-
+-		// Tear down current episode state
+-		_forceMapView = false;
+-		_rewardsTriggered = false;
+-		_suppressTerminalRewardsTransitionOnce = false;
+-		FullRunSimulationChoiceBridge.Instance.Reset();
+-		if (RunManager.Instance.IsInProgress)
+-		{
+-			RunManager.Instance.CleanUp();
+-		}
+-		// Keep runtime scope active (we're still in a simulation session)
+-		// Don't dispose _runtimeScope or _selectorScope
+-
+-		// Restore RunState using the game's saved-run path
+-		RunState restored = RunState.FromSerializable(snapshot);
+-		RunManager.Instance.SetUpSavedSinglePlayer(restored, snapshot);
+-
+-		await PreloadManager.LoadRunAssets(restored.Players.Select(static p => p.Character));
+-		if (restored.CurrentActIndex < restored.Acts.Count)
+-			await PreloadManager.LoadActAssets(restored.Acts[restored.CurrentActIndex]);
+-
+-		RunManager.Instance.Launch();
+-		// Pure simulator: skip NRun.Create (no Godot nodes needed) and EnterAct
+-		// (which would call SetActInternal -> ClearVisitedMapCoordsDebug, destroying
+-		// the restored visit history, and FadeIn/NRun Godot UI calls).
+-		// Instead: generate the map from SavedMapsToLoad (set by InitializeSavedRun)
+-		// then either re-enter the saved room (combat/event) or show the map.
+-		await RunManager.Instance.GenerateMap();
+-
+-		CurrentSeed = snapshot.SerializableRng?.Seed;
+-		CurrentAscensionLevel = snapshot.Ascension;
+-		CurrentCharacterId = restored.Players
+-			.FirstOrDefault(static player => player.NetId == NetSingleplayerGameService.defaultNetId)
+-			?.Character.Id.Entry
+-			?? restored.Players.FirstOrDefault()?.Character.Id.Entry;
+-
+-		if (snapshot.PreFinishedRoom != null)
+-		{
+-			// Snapshot was taken mid-room (e.g., in combat): restore the full room state.
+-			// ClearScreens() inside LoadIntoLatestMapCoord is guarded by !TestMode.IsOn.
+-			// FadeIn() is also guarded. This path is safe in pure-sim mode.
+-			AbstractRoom preFinishedRoom = AbstractRoom.FromSerializable(snapshot.PreFinishedRoom, restored)!;
+-			await RunManager.Instance.LoadIntoLatestMapCoord(preFinishedRoom);
+-			_forceMapView = false;
+-			// Room bootstrap can consume run/player RNG (shop rolls, combat setup, etc.).
+-			// Reapply saved RNG state after the room is reconstructed so subsequent
+-			// random branches match the saved snapshot as closely as possible.
+-			// This matters for MCTS save/load parity: even when visible room state
+-			// matches, drifted RNG will make later simulated branches diverge.
+-			RestoreRunAndPlayerRandomState(restored, snapshot);
+-
+-			switch (savedSnapshot.StateType)
++			if (!_stateCache.TryGetValue(stateId, out SavedRunSnapshot? savedSnapshot))
+ 			{
+-				case "shop":
+-					if (RunManager.Instance.DebugOnlyGetState()?.CurrentRoom is MerchantRoom restoredMerchantRoom && savedSnapshot.ShopSnapshot != null)
+-					{
+-						ApplyShopSnapshot(restoredMerchantRoom, savedSnapshot.ShopSnapshot);
+-					}
+-					break;
+-				case "treasure":
+-					if (savedSnapshot.TreasureSnapshot != null)
+-					{
+-						ApplyTreasureSnapshot(savedSnapshot.TreasureSnapshot, restored);
+-					}
+-					break;
++				throw new FullRunSimulationRuntimeException("state_not_found", $"State '{stateId}' not found in cache.");
+ 			}
+-		}
+-		else
+-		{
+-			// Snapshot was taken at map screen: push a MapRoom so state_type = "map".
+-			RunManager.Instance.DebugOnlyGetState()?.PushRoom(new MapRoom());
+-			_forceMapView = true; // After load, show map so player can choose next node
+-		}
+ 
+-		bool hasCombatSnapshot = savedSnapshot.CombatSnapshot != null && RunManager.Instance.DebugOnlyGetState()?.CurrentRoom is CombatRoom;
+-		if (hasCombatSnapshot)
+-		{
+-			await WaitForCombatRoomBootstrapAsync();
+-			if (RunManager.Instance.DebugOnlyGetState()?.CurrentRoom is CombatRoom restoredCombatRoom)
+-			{
+-				ApplyCombatSnapshot(restoredCombatRoom, savedSnapshot.CombatSnapshot!);
+-				_forceMapView = false;
+-			}
+-		}
+-
+-		FullRunSimulationStateSnapshot restoredState = hasCombatSnapshot
+-			? GetState()
+-			: await WaitForLoadedStateAsync(savedSnapshot.StateType);
+-		// Skip signature verification for combat states - combat save/load
+-		// is inherently lossy (restores to encounter start, not exact mid-turn).
+-		if (SupportsExactSnapshot(savedSnapshot.StateType))
+-		{
+-			string restoredSignature = BuildExactSnapshotSignature(restored, restoredState);
+-			if (!string.Equals(restoredSignature, savedSnapshot.ExactSignature, StringComparison.Ordinal))
++			return savedSnapshot.Kind switch
+ 			{
+-				throw new FullRunSimulationRuntimeException(
+-					"restore_signature_mismatch",
+-					$"Loaded state '{stateId}' did not match the saved snapshot signature (saved={savedSnapshot.StateType}, restored={restoredState.StateType}, saved_sig={TruncateForRestoreError(savedSnapshot.ExactSignature)}, restored_sig={TruncateForRestoreError(restoredSignature)}).");
+-			}
+-		}
+-
+-		return restoredState;
++				SavedSnapshotKind.CombatSearch => await LoadCombatSearchSnapshotAsync(stateId, savedSnapshot),
++				_ => await LoadFullSnapshotAsync(stateId, savedSnapshot)
++			};
+ 		}
+ 		catch (FullRunSimulationRuntimeException)
+ 		{
+@@ -2005,11 +2087,10 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		Saves.SerializableRun snapshot = savedSnapshot.RunSnapshot
+ 			?? throw new FullRunSimulationRuntimeException("snapshot_missing_full_run", $"State '{stateId}' does not contain a full run snapshot.");
+ 
++		await InvalidateAndQuiescePostCombatContinuationAsync("load_full_snapshot");
+ 		_forceMapView = false;
+-		_rewardsTriggered = false;
+ 		_suppressTerminalRewardsTransitionOnce = false;
+ 		_lastObservedState = null;
+-		FullRunSimulationChoiceBridge.Instance.Reset();
+ 		if (RunManager.Instance.IsInProgress)
+ 		{
+ 			RunManager.Instance.CleanUp();
+@@ -2124,6 +2205,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			return await LoadFullSnapshotAsync(stateId, savedSnapshot);
+ 		}
+ 
++		await InvalidateAndQuiescePostCombatContinuationAsync("load_combat_search_snapshot");
+ 		try
+ 		{
+ 			RunState? runState = RunManager.Instance.DebugOnlyGetState();
+@@ -2133,10 +2215,8 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			}
+ 
+ 			_forceMapView = false;
+-			_rewardsTriggered = false;
+ 			_suppressTerminalRewardsTransitionOnce = false;
+ 			_lastObservedState = null;
+-			FullRunSimulationChoiceBridge.Instance.Reset();
+ 
+ 			AbstractRoom restoredRoom = AbstractRoom.FromSerializable(savedSnapshot.CombatRoomSnapshot, runState)
+ 				?? throw new FullRunSimulationRuntimeException("combat_fast_room_restore_failed", $"State '{stateId}' could not restore its combat room snapshot.");
+@@ -2369,7 +2449,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		{
+ 			CardReward reward = FullRunSimulationChoiceBridge.RestoreCardRewardForOffer(snapshot.CardRewardSelection, localPlayer);
+ 			reward.MarkContentAsSeen();
+-			Task<bool> rewardTask = ResolveCardRewardAsync(reward);
++			Task rewardTask = StartRestoredCardRewardContinuation(reward);
+ 			for (int waitIter = 0; waitIter < 8; waitIter++)
+ 			{
+ 				if (FullRunSimulationChoiceBridge.Instance.IsCardRewardSelectionActive)
+@@ -2389,6 +2469,47 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		}
+ 	}
+ 
++	private Task StartRestoredCardRewardContinuation(CardReward reward)
++	{
++		CancellationTokenSource cancellation = new CancellationTokenSource();
++		long generation = _postCombatGeneration.Capture();
++		Task? observedTask = null;
++		bool enteredGate = _postCombatGeneration.TryRun(
++			generation,
++			cancellation.Token,
++			() =>
++			{
++				_rewardsTriggered = true;
++				_postCombatContinuationFailure = null;
++				_postCombatCancellation = cancellation;
++				observedTask = ObservePostCombatContinuationAsync(
++					generation,
++					cancellation,
++					async () =>
++					{
++						await ResolveCardRewardAsync(
++							reward,
++							generation,
++							cancellation.Token);
++					});
++				_postCombatRewardsTask = observedTask;
++				return true;
++			},
++			out bool started);
++		if (!enteredGate || !started || observedTask == null)
++		{
++			cancellation.Dispose();
++			throw new FullRunSimulationRuntimeException(
++				"post_combat_continuation_stale",
++				"The restored card-reward continuation was invalidated before it could start.");
++		}
++
++		FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.started.restored_card_reward");
++		FullRunSimulationTrace.Write(
++			$"settle.post_combat_continuation.started route=restored_card_reward generation={generation}");
++		return observedTask;
++	}
++
+ 	private static async Task WaitForCombatRoomBootstrapAsync()
+ 	{
+ 		bool canUseFrameYield = !CombatSimulationRuntime.IsPureCombatSimulator && Engine.GetMainLoop() != null;
+@@ -2414,58 +2535,259 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 
+ 	private bool TryTriggerPostCombatRewards(RunState? runState, CombatRoom? pendingCombatRoom)
+ 	{
+-		if (_rewardsTriggered || runState == null || pendingCombatRoom == null || runState.IsGameOver)
++		if (_rewardsTriggered
++			|| runState == null
++			|| pendingCombatRoom == null
++			|| runState.IsGameOver
++			|| CombatManager.Instance.IsInProgress
++			|| !pendingCombatRoom.IsPreFinished)
+ 		{
+ 			return false;
+ 		}
+ 
+ 		Player? me = LocalContext.GetMe(runState);
+-		if (me == null)
++		CombatState? combatState = CombatManager.Instance.DebugOnlyGetState();
++		if (me == null
++			|| me.Creature.IsDead
++			|| combatState?.Enemies.Any(static enemy => !enemy.IsDead) == true)
++		{
++			return false;
++		}
++
++		CancellationTokenSource cancellation = new CancellationTokenSource();
++		long generation = _postCombatGeneration.Capture();
++		bool enteredGate = _postCombatGeneration.TryRun(
++			generation,
++			cancellation.Token,
++			() =>
++			{
++				if (_rewardsTriggered)
++				{
++					return false;
++				}
++				_rewardsTriggered = true;
++				_postCombatContinuationFailure = null;
++				_postCombatCancellation = cancellation;
++				_postCombatRewardsTask = RunPostCombatContinuationObservedAsync(
++					me,
++					pendingCombatRoom,
++					generation,
++					cancellation);
++				return true;
++			},
++			out bool started);
++		if (!enteredGate || !started)
+ 		{
++			cancellation.Dispose();
+ 			return false;
+ 		}
+ 
+-		_rewardsTriggered = true;
+-		TaskHelper.RunSafely(OfferPostCombatRewardsAsync(me, pendingCombatRoom));
++		string route = FullRunSettlementContract.ResolvePostCombatContinuation(
++			pendingCombatRoom.Encounter.ShouldGiveRewards);
++		FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.started");
++		FullRunSimulationDiagnostics.Increment($"settle.post_combat_continuation.started.{route}");
++		FullRunSimulationTrace.Write(
++			$"settle.post_combat_continuation.started route={route} generation={generation} room={pendingCombatRoom.RoomType} floor={runState.TotalFloor}");
+ 		return true;
+ 	}
+ 
+-	private async Task OfferPostCombatRewardsAsync(Player player, CombatRoom room)
++	private Task RunPostCombatContinuationObservedAsync(
++		Player player,
++		CombatRoom room,
++		long generation,
++		CancellationTokenSource cancellation)
+ 	{
++		return ObservePostCombatContinuationAsync(
++			generation,
++			cancellation,
++			async () =>
++			{
++				string route = FullRunSettlementContract.ResolvePostCombatContinuation(
++					room.Encounter.ShouldGiveRewards);
++				if (route == FullRunSettlementContract.PostCombatProceedWithoutRewards)
++				{
++					await ProceedWithoutRewardsAsync(generation, cancellation.Token);
++				}
++				else
++				{
++					await OfferPostCombatRewardsAsync(
++						player,
++						room,
++						generation,
++						cancellation.Token);
++				}
++			});
++	}
++
++	private async Task ObservePostCombatContinuationAsync(
++		long generation,
++		CancellationTokenSource cancellation,
++		Func<Task> continuation)
++	{
++		try
++		{
++			await continuation();
++		}
++		catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
++		{
++			FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.cancelled");
++			FullRunSimulationTrace.Write(
++				$"settle.post_combat_continuation.cancelled generation={generation}");
++		}
++		catch (Exception ex)
++		{
++			// Observe every exception here so reset/dispose can never abandon a
++			// faulted Task. Active-generation failures are surfaced by the read-only
++			// poll API and poison the client process; retired failures remain logged.
++			bool recorded = _postCombatGeneration.TryRun(
++				generation,
++				cancellation.Token,
++				() =>
++				{
++					_postCombatContinuationFailure = ex.ToString();
++					return true;
++				},
++				out _);
++			FullRunSimulationDiagnostics.Increment(
++				recorded
++					? "settle.post_combat_continuation.failed_active"
++					: "settle.post_combat_continuation.failed_retired");
++			FullRunSimulationTrace.Write(
++				$"settle.post_combat_continuation.failed generation={generation} active={recorded} detail={ex}");
++		}
++		finally
++		{
++			_postCombatGeneration.TryRun(
++				generation,
++				cancellation.Token,
++				() =>
++				{
++					if (ReferenceEquals(_postCombatCancellation, cancellation))
++					{
++						_postCombatCancellation = null;
++					}
++					return true;
++				},
++				out _);
++			cancellation.Dispose();
++		}
++	}
++
++	private async Task ProceedWithoutRewardsAsync(
++		long generation,
++		CancellationToken cancellationToken)
++	{
++		// Strictly mirror NCombatUi.ProceedWithoutRewards. In particular, do not
++		// construct RewardsSet.EmptyForRoom and do not run reward hooks.
++		Task waitTask = RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			() => Cmd.Wait(1f));
++		await waitTask;
++		EnsurePostCombatCurrent(generation, cancellationToken);
++
++		Task proceedTask = RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			() => RunManager.Instance.ProceedFromTerminalRewardsScreen());
++		await proceedTask;
++		EnsurePostCombatCurrent(generation, cancellationToken);
++	}
++
++	private async Task OfferPostCombatRewardsAsync(
++		Player player,
++		CombatRoom room,
++		long generation,
++		CancellationToken cancellationToken)
++	{
++		if (!room.Encounter.ShouldGiveRewards)
++		{
++			throw new InvalidOperationException(
++				"Rewardless combat must use ProceedWithoutRewardsAsync and may not enter reward generation."
++			);
++		}
++
+ 		RewardsSet rewardsSet = BuildRewardsSetForRoomEnd(player, room);
+-		List<Reward> rewards = await rewardsSet.GenerateWithoutOffering();
+-		await Hook.BeforeRewardsOffered(player.RunState, player, rewards);
++		Task<List<Reward>> generateTask = RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			rewardsSet.GenerateWithoutOffering);
++		List<Reward> rewards = await generateTask;
++		EnsurePostCombatCurrent(generation, cancellationToken);
++
++		Task beforeRewardsTask = RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			() => Hook.BeforeRewardsOffered(player.RunState, player, rewards));
++		await beforeRewardsTask;
++		EnsurePostCombatCurrent(generation, cancellationToken);
+ 		if (!LocalContext.IsMe(player))
+ 		{
+ 			return;
+ 		}
+ 
+-		foreach (Reward reward in rewards)
+-		{
+-			reward.MarkContentAsSeen();
+-		}
++		RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			() =>
++			{
++				foreach (Reward reward in rewards)
++				{
++					reward.MarkContentAsSeen();
++				}
++				return true;
++			});
+ 
+ 		while (true)
+ 		{
+-			Reward? selectedReward = await FullRunSimulationChoiceBridge.Instance.GetSelectedRewardAsync(rewards, canProceed: true);
++			Task<Reward?> rewardSelectionTask = RunPostCombatCurrent(
++				generation,
++				cancellationToken,
++				() => FullRunSimulationChoiceBridge.Instance.GetSelectedRewardAsync(
++					rewards,
++					canProceed: true));
++			Reward? selectedReward = await rewardSelectionTask;
++			EnsurePostCombatCurrent(generation, cancellationToken);
+ 			if (selectedReward == null)
+ 			{
+-				foreach (Reward reward in rewards.ToList())
+-				{
+-					reward.OnSkipped();
+-				}
++				RunPostCombatCurrent(
++					generation,
++					cancellationToken,
++					() =>
++					{
++						foreach (Reward reward in rewards.ToList())
++						{
++							reward.OnSkipped();
++						}
++						return true;
++					});
+ 				return;
+ 			}
+ 
+-			bool removeReward = selectedReward switch
++			bool removeReward;
++			if (selectedReward is CardReward cardReward)
+ 			{
+-				CardReward cardReward => await ResolveCardRewardAsync(cardReward),
+-				_ => await selectedReward.OnSelectWrapper()
+-			};
++				removeReward = await ResolveCardRewardAsync(
++					cardReward,
++					generation,
++					cancellationToken);
++			}
++			else
++			{
++				Task<bool> selectTask = RunPostCombatCurrent(
++					generation,
++					cancellationToken,
++					selectedReward.OnSelectWrapper);
++				removeReward = await selectTask;
++				EnsurePostCombatCurrent(generation, cancellationToken);
++			}
+ 
+ 			if (removeReward)
+ 			{
+-				rewards.Remove(selectedReward);
++				RunPostCombatCurrent(
++					generation,
++					cancellationToken,
++					() => rewards.Remove(selectedReward));
+ 			}
+ 		}
+ 	}
+@@ -2473,57 +2795,124 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 	private static RewardsSet BuildRewardsSetForRoomEnd(Player player, CombatRoom room)
+ 	{
+ 		RewardsSet rewardsSet = new RewardsSet(player);
+-		EncounterModel? encounter = room.Encounter;
+-		if (encounter != null && !encounter.ShouldGiveRewards)
+-		{
+-			return rewardsSet.EmptyForRoom(room);
+-		}
+-
+ 		return rewardsSet.WithRewardsFromRoom(room);
+ 	}
+ 
+-	private async Task<bool> ResolveCardRewardAsync(CardReward reward)
++	private async Task<bool> ResolveCardRewardAsync(
++		CardReward reward,
++		long generation,
++		CancellationToken cancellationToken)
+ 	{
+ 		List<CardModel> chosenCards = new List<CardModel>();
+ 		List<CardCreationResult> options = FullRunUpstreamCompat.GetMutableCardRewardOptions(reward);
+ 
+ 		while (true)
+ 		{
++			EnsurePostCombatCurrent(generation, cancellationToken);
+ 			IReadOnlyList<CardRewardAlternative> alternatives = CardRewardAlternative.Generate(reward);
+-			_suppressTerminalRewardsTransitionOnce = true;
+-			CardModel? selectedCard = await FullRunSimulationChoiceBridge.Instance.GetSelectedCardRewardAsync(options, alternatives, reward.CanSkip);
++			Task<CardModel?> cardSelectionTask = RunPostCombatCurrent(
++				generation,
++				cancellationToken,
++				() =>
++				{
++					_suppressTerminalRewardsTransitionOnce = true;
++					return FullRunSimulationChoiceBridge.Instance.GetSelectedCardRewardAsync(
++						options,
++						alternatives,
++						reward.CanSkip);
++				});
++			CardModel? selectedCard = await cardSelectionTask;
++			EnsurePostCombatCurrent(generation, cancellationToken);
+ 			if (selectedCard == null)
+ 			{
+-				reward.OnSkipped();
++				RunPostCombatCurrent(
++					generation,
++					cancellationToken,
++					() =>
++					{
++						reward.OnSkipped();
++						return true;
++					});
+ 				return true;
+ 			}
+ 
+-			CardPileAddResult addResult = await CardPileCmd.Add(selectedCard, PileType.Deck);
++			Task<CardPileAddResult> addTask = RunPostCombatCurrent(
++				generation,
++				cancellationToken,
++				() => CardPileCmd.Add(selectedCard, PileType.Deck));
++			CardPileAddResult addResult = await addTask;
++			EnsurePostCombatCurrent(generation, cancellationToken);
+ 			if (!addResult.success || addResult.cardAdded == null)
+ 			{
+ 				return false;
+ 			}
+ 
+ 			CardModel addedCard = addResult.cardAdded;
+-			chosenCards.Add(addedCard);
+-			options.RemoveAll((CardCreationResult option) => option.Card == selectedCard);
+-			RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(addedCard);
+-
+-			if (!Hook.ShouldAllowSelectingMoreCardRewards(reward.Player.RunState, reward.Player, reward))
++			RunPostCombatCurrent(
++				generation,
++				cancellationToken,
++				() =>
++				{
++					chosenCards.Add(addedCard);
++					options.RemoveAll((CardCreationResult option) => option.Card == selectedCard);
++					RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(addedCard);
++					return true;
++				});
++
++			bool selectMore = RunPostCombatCurrent(
++				generation,
++				cancellationToken,
++				() => Hook.ShouldAllowSelectingMoreCardRewards(
++					reward.Player.RunState,
++					reward.Player,
++					reward));
++			if (!selectMore)
+ 			{
+ 				break;
+ 			}
+ 		}
+ 
+-		foreach (CardModel chosenCard in chosenCards)
++		RunPostCombatCurrent(
++			generation,
++			cancellationToken,
++			() =>
++			{
++				foreach (CardModel chosenCard in chosenCards)
++				{
++					reward.Player.RunState.CurrentMapPointHistoryEntry
++						.GetEntry(LocalContext.NetId.Value)
++						.CardChoices.Add(new CardChoiceHistoryEntry(chosenCard, wasPicked: true));
++				}
++				reward.OnSkipped();
++				return true;
++			});
++		return true;
++	}
++
++	private T RunPostCombatCurrent<T>(
++		long generation,
++		CancellationToken cancellationToken,
++		Func<T> action)
++	{
++		if (_postCombatGeneration.TryRun(
++			generation,
++			cancellationToken,
++			action,
++			out T result))
+ 		{
+-			reward.Player.RunState.CurrentMapPointHistoryEntry
+-				.GetEntry(LocalContext.NetId.Value)
+-				.CardChoices.Add(new CardChoiceHistoryEntry(chosenCard, wasPicked: true));
++			return result;
+ 		}
++		throw new OperationCanceledException(cancellationToken);
++	}
+ 
+-		reward.OnSkipped();
+-		return true;
++	private void EnsurePostCombatCurrent(
++		long generation,
++		CancellationToken cancellationToken)
++	{
++		if (!_postCombatGeneration.IsCurrent(generation, cancellationToken))
++		{
++			throw new OperationCanceledException(cancellationToken);
++		}
+ 	}
+ 
+ 	private static bool MatchesLoadedTargetState(FullRunSimulationStateSnapshot state, string expectedStateType)
+@@ -2601,19 +2990,169 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 	/// </summary>
+ 	public int StateCacheCount => _stateCache.Count;
+ 
+-	internal void ResetCombatFollowupStateForExternalCombatResolution()
++	internal async Task ResetCombatFollowupStateForExternalCombatResolutionAsync()
+ 	{
++		await InvalidateAndQuiescePostCombatContinuationAsync("external_combat_resolution");
+ 		_forceMapView = false;
+-		_rewardsTriggered = false;
+ 		_suppressTerminalRewardsTransitionOnce = false;
+ 	}
+ 
++	internal async Task RunSettlementRuntimeSelfTestsAsync()
++	{
++		await ResetAsync(new FullRunSimulationResetRequest
++		{
++			CharacterId = "ironclad",
++			Seed = "settlement-runtime-self-test",
++			AscensionLevel = 0
++		});
++		try
++		{
++			RunState runState = RunManager.Instance.DebugOnlyGetState()
++				?? throw new InvalidOperationException("Settlement runtime self-test could not resolve its run state.");
++			Player player = LocalContext.GetMe(runState)
++				?? throw new InvalidOperationException("Settlement runtime self-test could not resolve its local player.");
++			CombatRoom rewardlessRoom = new CombatRoom(
++				ModelDb.Encounter<MockNoRewardsEncounter>().ToMutable(),
++				runState)
++			{
++				ShouldCreateCombat = false,
++				ShouldResumeParentEventAfterCombat = false
++			};
++			rewardlessRoom.MarkPreFinished();
++			runState.PushRoom(rewardlessRoom);
++			_forceMapView = false;
++			_lastObservedState = null;
++
++			if (!TryTriggerPostCombatRewards(runState, rewardlessRoom))
++			{
++				throw new InvalidOperationException(
++					"Settlement runtime self-test could not start the rewardless post-combat continuation.");
++			}
++			Task continuation = _postCombatRewardsTask
++				?? throw new InvalidOperationException("Settlement runtime self-test lost its continuation task.");
++			Task completed = await Task.WhenAny(continuation, Task.Delay(TimeSpan.FromSeconds(2)));
++			if (!ReferenceEquals(completed, continuation))
++			{
++				throw new InvalidOperationException(
++					"Rewardless post-combat continuation exposed or waited on a reward choice instead of proceeding natively.");
++			}
++			await continuation;
++			ThrowIfPostCombatContinuationFailed();
++			if (FullRunSimulationChoiceBridge.Instance.IsSelectionActive)
++			{
++				throw new InvalidOperationException(
++					"Rewardless post-combat continuation registered a reward/card selection.");
++			}
++			if (ReferenceEquals(runState.CurrentRoom, rewardlessRoom))
++			{
++				throw new InvalidOperationException(
++					"Rewardless post-combat continuation did not leave the pre-finished combat room.");
++			}
++			FullRunSimulationStateSnapshot snapshot = GetState();
++			if (snapshot.StateType == "combat_rewards" || snapshot.StateType == "card_reward")
++			{
++				throw new InvalidOperationException(
++					$"Rewardless post-combat continuation exposed forbidden state '{snapshot.StateType}'.");
++			}
++			if (player.Creature.IsDead)
++			{
++				throw new InvalidOperationException("Settlement runtime self-test unexpectedly killed the local player.");
++			}
++		}
++		finally
++		{
++			await CleanUpPreviousEpisodeAsync("settlement_runtime_self_test");
++		}
++	}
++
++	private void ThrowIfPostCombatContinuationFailed()
++	{
++		long generation = _postCombatGeneration.Capture();
++		if (!_postCombatGeneration.TryRun(
++			generation,
++			CancellationToken.None,
++			() => _postCombatContinuationFailure,
++			out string? failure)
++			|| string.IsNullOrWhiteSpace(failure))
++		{
++			return;
++		}
++
++		throw new FullRunSimulationRuntimeException(
++			"post_combat_continuation_failed",
++			$"The active post-combat continuation failed: {failure}");
++	}
++
++	private Task? InvalidatePostCombatContinuation(string reason)
++	{
++		Task? retiredTask = null;
++		CancellationTokenSource? retiredCancellation = null;
++		long nextGeneration = _postCombatGeneration.Invalidate(
++			() =>
++			{
++				retiredTask = _postCombatRewardsTask;
++				retiredCancellation = _postCombatCancellation;
++				_postCombatRewardsTask = null;
++				_postCombatCancellation = null;
++				_postCombatContinuationFailure = null;
++				_rewardsTriggered = false;
++				retiredCancellation?.Cancel();
++				// Reset completes every outstanding bridge selection. Because this
++				// happens under the same generation gate used to register choices,
++				// an old continuation cannot publish a choice after this point.
++				FullRunSimulationChoiceBridge.Instance.Reset();
++			});
++		FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.invalidated");
++		FullRunSimulationTrace.Write(
++			$"settle.post_combat_continuation.invalidated reason={reason} generation={nextGeneration} had_task={retiredTask != null}");
++		return retiredTask;
++	}
++
++	private async Task InvalidateAndQuiescePostCombatContinuationAsync(string reason)
++	{
++		Task? retiredTask = InvalidatePostCombatContinuation(reason);
++		if (retiredTask == null)
++		{
++			return;
++		}
++
++		const int maxQuiesceIterations = 256;
++		for (int attempt = 0; attempt < maxQuiesceIterations && !retiredTask.IsCompleted; attempt++)
++		{
++			await CombatSimulationRuntime.Clock.YieldAsync();
++			await Task.Yield();
++		}
++		if (!retiredTask.IsCompleted)
++		{
++			FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.quiesce_timeout");
++			throw new FullRunSimulationRuntimeException(
++				"post_combat_continuation_quiesce_timeout",
++				$"Retired post-combat continuation did not quiesce during '{reason}' after {maxQuiesceIterations} bounded yields.");
++		}
++
++		// Observe the wrapper task explicitly. It consumes all inner exceptions,
++		// but awaiting here also establishes that cleanup cannot overtake it.
++		await retiredTask;
++		FullRunSimulationDiagnostics.Increment("settle.post_combat_continuation.quiesced");
++	}
++
++	private async Task CleanUpPreviousEpisodeAsync(string reason)
++	{
++		await InvalidateAndQuiescePostCombatContinuationAsync(reason);
++		FinishPreviousEpisodeCleanup();
++	}
++
+ 	private void CleanUpPreviousEpisode()
++	{
++		InvalidatePostCombatContinuation("dispose");
++		FinishPreviousEpisodeCleanup();
++	}
++
++	private void FinishPreviousEpisodeCleanup()
+ 	{
+ 		_forceMapView = false;
+ 		_lastObservedState = null;
+ 		_suppressTerminalRewardsTransitionOnce = false;
+-		FullRunSimulationChoiceBridge.Instance.Reset();
+ 		if (RunManager.Instance.IsInProgress)
+ 		{
+ 			RunManager.Instance.CleanUp();
+@@ -3573,24 +4112,18 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 
+ 	private static bool IsReadySnapshot(FullRunSimulationStateSnapshot snapshot)
+ 	{
+-		if (!snapshot.IsRunActive || snapshot.StateType == "menu" || snapshot.StateType == "run_bootstrap")
++		if (snapshot.IsTerminal)
+ 		{
+-			return false;
++			return FullRunSettlementContract.IsStableSurface(snapshot);
+ 		}
+-		if (IsCombatStartPendingState(snapshot.StateType))
++		if (!snapshot.IsRunActive
++			|| snapshot.StateType == "menu"
++			|| snapshot.StateType == "run_bootstrap"
++			|| IsCombatStartPendingState(snapshot.StateType))
+ 		{
+ 			return false;
+ 		}
+-		if (snapshot.StateType == "map")
+-		{
+-			return snapshot.MapOptions.Count > 0;
+-		}
+-		if (snapshot.StateType == "event")
+-		{
+-			return snapshot.LegalActions.Count > 0
+-				|| RunManager.Instance.DebugOnlyGetState()?.CurrentRoom is EventRoom { LocalMutableEvent.IsFinished: true };
+-		}
+-		return true;
++		return FullRunSettlementContract.IsStableSurface(snapshot);
+ 	}
+ 
+ 	private static bool IsActionableCombatSnapshot(FullRunSimulationStateSnapshot snapshot)
+@@ -3857,11 +4390,50 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		return null;
+ 	}
+ 
++	private FullRunSimulationStepResult FinalizeStepResult(
++		FullRunSimulationStepResult result,
++		string? transitionToken)
++	{
++		if (!result.Accepted)
++		{
++			result.ActionCommitted = false;
++			result.SettlementStatus = FullRunSettlementContract.Rejected;
++			result.TransitionToken = null;
++			_activeTransitionToken = null;
++			return result;
++		}
++
++		FullRunSimulationStateSnapshot snapshot = result.State ?? GetState();
++		result.State = snapshot;
++		result.ActionCommitted = true;
++		result.TransitionToken = transitionToken;
++		_activeTransitionToken = transitionToken;
++		string status = FullRunSettlementContract.ClassifySnapshot(snapshot);
++		if ((status == FullRunSettlementContract.Actionable && IsReadySnapshot(snapshot))
++			|| status == FullRunSettlementContract.Terminal)
++		{
++			result.SettlementStatus = status;
++			return result;
++		}
++
++		FullRunSimulationDiagnostics.Increment("settle.transition.finalize_unsettled");
++		result.SettlementStatus = FullRunSettlementContract.Unsettled;
++		result.FailureCode ??= status == FullRunSettlementContract.Invalid
++			? "full_run_settlement_invalid"
++			: "full_run_settlement_unsettled";
++		result.Error ??=
++			$"Committed transition returned a non-stable snapshot (state_type={snapshot.StateType}, " +
++			$"legal_actions={snapshot.LegalActions.Count}, terminal={snapshot.IsTerminal}).";
++		return result;
++	}
++
+ 	private FullRunSimulationStepResult BuildRejected(string error, string failureCode)
+ 	{
+ 		return new FullRunSimulationStepResult
+ 		{
+ 			Accepted = false,
++			ActionCommitted = false,
++			SettlementStatus = FullRunSettlementContract.Rejected,
+ 			Error = error,
+ 			FailureCode = failureCode,
+ 			State = _lastObservedState ?? GetState()
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunTrainingEnvService.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunTrainingEnvService.cs
+index 1fb0387e7eda0e337a8532f6034bd9a57b117efc..5307fc1e4e0f44fce473c20703a43c482944f773 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunTrainingEnvService.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunTrainingEnvService.cs
+@@ -31,6 +31,16 @@ public sealed class FullRunTrainingEnvService
+ 		return ExecuteSerializedAsync(() => SimulatorRuntime.StepAsync(action));
+ 	}
+ 
++	/// <summary>
++	/// Read-only observation of the currently committed transition.  This never
++	/// replays the original action and is safe for bounded transport recovery.
++	/// </summary>
++	public Task<FullRunSimulationStepResult> PollTransitionAsync(string transitionToken)
++	{
++		return ExecuteSerializedAsync(
++			() => ((FullRunSimulatorRuntimeFacade)SimulatorRuntime).PollTransitionAsync(transitionToken));
++	}
++
+ 	public Task<FullRunSimulationBatchStepResult> BatchStepAsync(System.Collections.Generic.IReadOnlyList<FullRunSimulationActionRequest> actions)
+ 	{
+ 		return ExecuteSerializedAsync(() => ((FullRunSimulatorRuntimeFacade)SimulatorRuntime).BatchStepAsync(actions));
+@@ -94,9 +104,26 @@ public sealed class FullRunTrainingEnvService
+ 		}
+ 	}
+ 
+-	internal void ResetCombatFollowupStateForExternalCombatResolution()
++	internal Task ResetCombatFollowupStateForExternalCombatResolutionAsync()
+ 	{
+-		ExecuteSerialized(() => ((FullRunSimulatorRuntimeFacade)SimulatorRuntime).ResetCombatFollowupStateForExternalCombatResolution());
++		return ExecuteSerializedAsync(
++			async () =>
++			{
++				await ((FullRunSimulatorRuntimeFacade)SimulatorRuntime)
++					.ResetCombatFollowupStateForExternalCombatResolutionAsync();
++				return true;
++			});
++	}
++
++	internal Task RunSettlementRuntimeSelfTestsAsync()
++	{
++		return ExecuteSerializedAsync(
++			async () =>
++			{
++				await ((FullRunSimulatorRuntimeFacade)SimulatorRuntime)
++					.RunSettlementRuntimeSelfTestsAsync();
++				return true;
++			});
+ 	}
+ 
+ 	/// <summary>

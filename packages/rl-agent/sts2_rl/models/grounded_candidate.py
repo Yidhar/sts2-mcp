@@ -37,6 +37,8 @@ from torch import Tensor, nn
 # disagree about that tensor ABI.
 MIN_TOKEN_FEATURE_DIM: Final = 224
 COMBAT_DOMAIN_ID: Final = 1
+TRANSACTION_EFFECT_COUNT: Final = 4
+SELECTION_DELTA_COUNT: Final = 3
 _INTEGER_DTYPES = frozenset({torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8})
 
 
@@ -491,6 +493,9 @@ class RecurrentCandidateOutput:
     policy_logits: Tensor  # [B, A], invalid candidates use dtype minimum
     value: Tensor  # [B]
     action_mask: Tensor  # [B, A] bool
+    candidate_effect_logits: Tensor | None = None  # [B, A, 4]
+    selection_delta_logits: Tensor | None = None  # [B, A, 3]
+    transaction_q_values: Tensor | None = None  # [B, A]
 
     def policy_probabilities(self) -> Tensor:
         """Return float32 masked probabilities; all-invalid rows are all zero.
@@ -646,9 +651,17 @@ class _StructuredTokenEmbedder(nn.Module):
 class RecurrentCandidateModel(nn.Module):
     """Candidate-order-equivariant recurrent actor/value baseline."""
 
-    def __init__(self, config: GroundedCandidateConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: GroundedCandidateConfig | None = None,
+        *,
+        enable_transaction_heads: bool = False,
+    ) -> None:
         super().__init__()
+        if not isinstance(enable_transaction_heads, bool):
+            raise TypeError("enable_transaction_heads must be a boolean")
         self.config = config or GroundedCandidateConfig()
+        self.transaction_heads_enabled = enable_transaction_heads
         cfg = self.config
 
         self.token_embedder = _StructuredTokenEmbedder(cfg)
@@ -738,6 +751,23 @@ class RecurrentCandidateModel(nn.Module):
         self.policy_feature_norm = nn.LayerNorm(cfg.d_model)
         self.policy_head = self._scalar_head(cfg.d_model)
         self.value_head = self._scalar_head(cfg.recurrent_hidden_dim)
+        if enable_transaction_heads:
+            self.candidate_effect_head: nn.Module | None = self._categorical_head(
+                cfg.d_model,
+                TRANSACTION_EFFECT_COUNT,
+            )
+            self.selection_delta_head: nn.Module | None = self._categorical_head(
+                cfg.d_model,
+                SELECTION_DELTA_COUNT,
+            )
+            self.transaction_q_head: nn.Module | None = self._scalar_head(cfg.d_model)
+        else:
+            # Keeping disabled heads as ``None`` preserves the exact v10 state
+            # dict ABI.  Enabling them is therefore an explicit model-parameter
+            # initialization migration rather than a disguised exact resume.
+            self.candidate_effect_head = None
+            self.selection_delta_head = None
+            self.transaction_q_head = None
 
         nn.init.normal_(self.world_null_token, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_queries, mean=0.0, std=0.02)
@@ -749,6 +779,17 @@ class RecurrentCandidateModel(nn.Module):
             nn.Linear(input_dim, input_dim),
             nn.GELU(),
             nn.Linear(input_dim, 1),
+        )
+
+    @staticmethod
+    def _categorical_head(input_dim: int, classes: int) -> nn.Sequential:
+        if classes <= 1:
+            raise ValueError("categorical head requires at least two classes")
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, classes),
         )
 
     def initial_state(
@@ -1050,6 +1091,29 @@ class RecurrentCandidateModel(nn.Module):
         invalid_logit = torch.finfo(raw_policy_logits.dtype).min
         policy_logits = raw_policy_logits.masked_fill(~mask, invalid_logit)
 
+        candidate_effect_logits = None
+        selection_delta_logits = None
+        transaction_q_values = None
+        if self.transaction_heads_enabled:
+            if (
+                self.candidate_effect_head is None
+                or self.selection_delta_head is None
+                or self.transaction_q_head is None
+            ):  # pragma: no cover - constructor invariant
+                raise RuntimeError("transaction head configuration is inconsistent")
+            candidate_effect_logits = self.candidate_effect_head(policy_features)
+            selection_delta_logits = self.selection_delta_head(policy_features)
+            transaction_q_values = self.transaction_q_head(policy_features).squeeze(-1)
+            candidate_effect_logits = candidate_effect_logits.masked_fill(
+                ~mask.unsqueeze(-1),
+                0.0,
+            )
+            selection_delta_logits = selection_delta_logits.masked_fill(
+                ~mask.unsqueeze(-1),
+                0.0,
+            )
+            transaction_q_values = transaction_q_values.masked_fill(~mask, 0.0)
+
         return RecurrentCandidateOutput(
             world_latents=world.latents,
             state_embedding=world.state_embedding,
@@ -1058,10 +1122,15 @@ class RecurrentCandidateModel(nn.Module):
             policy_logits=policy_logits,
             value=self.value_head(next_recurrent_state).squeeze(-1),
             action_mask=mask,
+            candidate_effect_logits=candidate_effect_logits,
+            selection_delta_logits=selection_delta_logits,
+            transaction_q_values=transaction_q_values,
         )
 
 
 __all__ = [
+    "SELECTION_DELTA_COUNT",
+    "TRANSACTION_EFFECT_COUNT",
     "CandidateEncoding",
     "CandidateTokenBatch",
     "GroundedCandidateBatch",

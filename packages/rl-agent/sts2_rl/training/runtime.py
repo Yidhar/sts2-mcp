@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import statistics
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -23,7 +24,9 @@ from sts2_rl.encoding import GroundedObservationEncoder, grounding_encoding_iden
 from sts2_rl.models import RecurrentCandidateModel
 
 from .checkpointing import (
+    ActorSupervisorState,
     TrainingState,
+    actor_supervisor_state_from_metadata,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
     preflight_model_initialization,
@@ -32,8 +35,13 @@ from .checkpointing import (
 )
 from .collector import EpisodeMetrics
 from .config import TrainingConfig
-from .factory import TrainingResources, build_training_resources, resolve_device
-from .pipeline import ActorLearnerPipeline
+from .factory import (
+    TrainingResources,
+    build_backend,
+    build_training_resources,
+    resolve_device,
+)
+from .pipeline import ActorLearnerPipeline, RecoverableActorIncident
 from .seeding import held_out_evaluation_seeds
 from .trajectory import TrajectoryJournal
 
@@ -66,6 +74,10 @@ class JsonlMetrics:
                 )
                 + "\n"
             )
+
+
+class EvaluationInfrastructureError(RuntimeError):
+    """A held-out gate could not produce a policy-valid episode."""
 
 
 def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | int]:
@@ -143,6 +155,8 @@ def evaluate_policy(
     episodes: int,
     base_seed: int = 0,
     journal_path: str | Path | None = None,
+    backend_factory: Callable[[], EnvironmentBackend] | None = None,
+    infrastructure_retries_per_seed: int = 1,
 ) -> tuple[list[EpisodeMetrics], dict[str, float | int]]:
     """Evaluate on fixed odd seeds with compact journals and sparse snapshots."""
 
@@ -154,16 +168,91 @@ def evaluate_policy(
         journal.__enter__()
     try:
         results: list[EpisodeMetrics] = []
+        infrastructure_retries = 0
         for evaluation_seed in evaluation_seeds:
-            episode = resources.collector.collect_episode(
-                epsilon=0.0,
-                deterministic=True,
-                record=False,
-                evaluation_seed=evaluation_seed,
-                trajectory_journal=journal,
-            )
+            attempts = 0
+            while True:
+                attempt_number = attempts + 1
+                if journal is not None:
+                    journal.write_episode_boundary(
+                        {
+                            "event": "evaluation_attempt_started",
+                            "evaluation_seed": evaluation_seed,
+                            "attempt": attempt_number,
+                            "journal_episode_namespace": (
+                                f"heldout-seed-{evaluation_seed}-attempt-{attempt_number}:"
+                            ),
+                        }
+                    )
+                try:
+                    episode = resources.collector.collect_episode(
+                        epsilon=0.0,
+                        deterministic=True,
+                        record=False,
+                        evaluation_seed=evaluation_seed,
+                        trajectory_journal=journal,
+                        journal_episode_id_prefix=(
+                            f"heldout-seed-{evaluation_seed}-attempt-{attempt_number}:"
+                        ),
+                    )
+                    if journal is not None:
+                        journal.write_episode_boundary(
+                            {
+                                "event": "evaluation_attempt_completed",
+                                "evaluation_seed": evaluation_seed,
+                                "attempt": attempt_number,
+                                "episode_id": (
+                                    f"heldout-seed-{evaluation_seed}-attempt-"
+                                    f"{attempt_number}:{episode.metrics.episode_id}"
+                                ),
+                                "steps": episode.metrics.steps,
+                            }
+                        )
+                    break
+                except BaseException as exc:
+                    if journal is not None:
+                        journal.write_episode_boundary(
+                            {
+                                "event": "evaluation_attempt_aborted",
+                                "evaluation_seed": evaluation_seed,
+                                "attempt": attempt_number,
+                                "exception_type": (
+                                    f"{type(exc).__module__}.{type(exc).__qualname__}"
+                                ),
+                                "fingerprint": str(
+                                    getattr(exc, "incident_fingerprint", None)
+                                    or getattr(exc, "fingerprint", None)
+                                    or ""
+                                ),
+                                "message": str(exc)[:1024],
+                                "retryable": getattr(exc, "recoverable", False) is True,
+                            }
+                        )
+                    if getattr(exc, "recoverable", False) is not True:
+                        raise
+                    if (
+                        backend_factory is None
+                        or attempts >= infrastructure_retries_per_seed
+                    ):
+                        raise EvaluationInfrastructureError(
+                            "held-out evaluation is infrastructure-invalid for "
+                            f"seed={evaluation_seed}: {exc}"
+                        ) from exc
+                    attempts += 1
+                    infrastructure_retries += 1
+                    replacement = backend_factory()
+                    old_backend = resources.backend
+                    try:
+                        old_backend.close()
+                        resources.backend = replacement
+                        resources.collector.replace_backend(replacement)
+                    except BaseException:
+                        replacement.close()
+                        raise
             results.append(episode.metrics)
-        return results, summarize_evaluation(results)
+        summary = summarize_evaluation(results)
+        summary["infrastructure_retries"] = infrastructure_retries
+        return results, summary
     finally:
         if journal is not None:
             journal.close()
@@ -174,7 +263,10 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     """Validate the v2 config/model/encoder without launching a simulator."""
 
     model_config = config.model.to_model_config()
-    model = RecurrentCandidateModel(model_config).eval()
+    model = RecurrentCandidateModel(
+        model_config,
+        enable_transaction_heads=config.transaction_learning.enabled,
+    ).eval()
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
     decision = encoder.encode(
         {
@@ -209,6 +301,13 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
         "unroll_length": config.rollout.unroll_length,
         "rollout_queue_capacity": config.rollout.queue_capacity,
+        "transaction_learning": {
+            "enabled": config.transaction_learning.enabled,
+            "replay_capacity": config.transaction_learning.replay_capacity,
+            "replay_byte_capacity": config.transaction_learning.replay_byte_capacity,
+            "sample_traces": config.transaction_learning.sample_traces,
+            "burn_in_steps": config.transaction_learning.burn_in_steps,
+        },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
             "version": reward_identity["version"],
@@ -248,6 +347,7 @@ def _save(
     parent_checkpoint: Path | None,
     run_id: str,
     load_mode: str,
+    actor_supervisor_state: ActorSupervisorState,
 ) -> Path:
     return save_training_checkpoint(
         _checkpoint_path(checkpoint_root, state, prefix=prefix),
@@ -257,6 +357,7 @@ def _save(
         parent_checkpoint=parent_checkpoint,
         run_id=run_id,
         checkpoint_load_mode=load_mode,
+        actor_supervisor_state=actor_supervisor_state,
         parent_relation=(
             "model_parameter_initialization"
             if parent_checkpoint is not None and load_mode == "model_initialization"
@@ -304,10 +405,14 @@ def run_training(
     run_log_root = log_root / f"run-{run_id}"
     metrics = JsonlMetrics(run_log_root / "metrics.jsonl")
     resources = build_training_resources(config, backend=backend)
+    recovery_backend_factory: Callable[[], EnvironmentBackend] | None = (
+        None if backend is not None else lambda: build_backend(config)
+    )
     pipeline: ActorLearnerPipeline | None = None
     parent_checkpoint: Path | None = None
     load_mode = "fresh"
     state = TrainingState()
+    actor_supervisor_state = ActorSupervisorState()
     try:
         if prevalidated_resume is not None:
             parent_checkpoint = prevalidated_resume.root
@@ -316,6 +421,9 @@ def run_training(
                 prevalidated_resume.root,
                 config=config,
                 resources=resources,
+            )
+            actor_supervisor_state = actor_supervisor_state_from_metadata(
+                prevalidated_resume.metadata
             )
         elif prevalidated_initialization is not None:
             parent_checkpoint = initialize_model_from_checkpoint(
@@ -330,6 +438,7 @@ def run_training(
             {
                 "run_id": run_id,
                 "state": asdict(state),
+                "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
                 "pipeline": "bounded-fifo-async-vtrace-v3",
                 "checkpoint_load": {
@@ -357,7 +466,12 @@ def run_training(
         completed_evaluations = {
             step
             for step in config.runtime.evaluation_steps
-            if step < state.environment_steps
+            # A checkpoint is published only after all crossed evaluation
+            # gates have completed.  On exact resume, the gate at the exact
+            # checkpoint step is therefore already complete as well.  Treat
+            # newly configured past gates as historical rather than executing
+            # them later under a false gate identity.
+            if step <= state.environment_steps
         }
         if (
             0 in config.runtime.evaluation_steps
@@ -369,6 +483,7 @@ def run_training(
                 episodes=config.runtime.evaluation_episodes,
                 base_seed=config.runtime.seed,
                 journal_path=run_log_root / "evaluation-step-000000000.jsonl",
+                backend_factory=recovery_backend_factory,
             )
             state = replace(
                 state,
@@ -398,6 +513,7 @@ def run_training(
             starting_environment_steps=state.environment_steps,
             starting_policy_version=state.actor_policy_version,
             epsilon=lambda steps: exploration_epsilon(config, steps),
+            supervisor_state=actor_supervisor_state,
         )
         next_checkpoint = (
             (state.environment_steps // config.runtime.checkpoint_interval_steps) + 1
@@ -405,6 +521,101 @@ def run_training(
         unrolls_since_publication = 0
         maintenance_requested = False
         pipeline.start()
+
+        def handle_actor_incident(incident: RecoverableActorIncident) -> None:
+            """Commit an infrastructure abort and replace its poisoned session."""
+
+            nonlocal state, maintenance_requested
+            state = replace(
+                state,
+                environment_steps=(
+                    state.environment_steps + incident.emitted_environment_steps
+                ),
+                actor_policy_version=incident.actor_policy_version,
+                maximum_observed_candidates=max(
+                    state.maximum_observed_candidates,
+                    incident.maximum_observed_candidates,
+                ),
+            )
+            metrics.write(
+                "backend_protocol_incident",
+                {
+                    **asdict(incident),
+                    "environment_steps": state.environment_steps,
+                    "learner_updates": state.learner_updates,
+                    "policy_version": state.policy_version,
+                },
+            )
+            metrics.write(
+                "episode_aborted",
+                {
+                    "incident_id": incident.incident_id,
+                    "reason": "infrastructure_protocol_fault",
+                    "environment_steps": state.environment_steps,
+                    "emitted_environment_steps": (
+                        incident.emitted_environment_steps
+                    ),
+                    "lost_valid_prefix_steps": incident.lost_valid_prefix_steps,
+                    "task_terminal_or_reward_fabricated": False,
+                },
+            )
+            if state.environment_steps != pipeline.environment_steps:
+                raise RuntimeError(
+                    "incident environment-step reconciliation failed: "
+                    f"training_state={state.environment_steps} "
+                    f"pipeline={pipeline.environment_steps}"
+                )
+            if incident.circuit_breaker_open:
+                metrics.write(
+                    "circuit_breaker_open",
+                    {
+                        "incident_id": incident.incident_id,
+                        "fingerprint": incident.fingerprint,
+                        "environment_steps": state.environment_steps,
+                        "fingerprint_occurrences": (
+                            incident.fingerprint_occurrences
+                        ),
+                        "consecutive_incidents": incident.consecutive_incidents,
+                        "incidents_last_100_attempts": (
+                            incident.incidents_last_100_attempts
+                        ),
+                    },
+                )
+                raise RuntimeError(
+                    "actor infrastructure circuit breaker opened for "
+                    f"{incident.fingerprint}"
+                )
+            if recovery_backend_factory is None:
+                raise RuntimeError(
+                    "recoverable actor incident requires an explicit backend "
+                    "recovery factory when the runtime backend was injected"
+                )
+            replacement = recovery_backend_factory()
+            try:
+                old_session, new_session = pipeline.replace_backend(replacement)
+            except BaseException:
+                replacement.close()
+                raise
+            metrics.write(
+                "backend_restart",
+                {
+                    "incident_id": incident.incident_id,
+                    "environment_steps": state.environment_steps,
+                    "old_session_id": old_session,
+                    "new_session_id": new_session,
+                    "fresh_backend": True,
+                },
+            )
+            crossed_evaluation = any(
+                step <= state.environment_steps
+                and step not in completed_evaluations
+                for step in config.runtime.evaluation_steps
+            )
+            crossed_checkpoint = state.environment_steps >= next_checkpoint
+            if crossed_evaluation or crossed_checkpoint:
+                maintenance_requested = True
+                pipeline.request_pause()
+            pipeline.release_incident_boundary()
 
         while pipeline.alive or len(resources.rollout_queue) > 0:
             try:
@@ -421,6 +632,13 @@ def run_training(
             if batch:
                 update_number = state.learner_updates + 1
                 batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
+                transaction_traces = (
+                    resources.transaction_replay.sample(
+                        config.transaction_learning.sample_traces
+                    )
+                    if resources.transaction_replay is not None
+                    else ()
+                )
                 metrics.write(
                     "learner_update_start",
                     {
@@ -429,6 +647,12 @@ def run_training(
                         "policy_version": state.policy_version,
                         "unrolls": len(batch),
                         "batch_environment_steps": batch_environment_steps,
+                        "transaction_traces": len(transaction_traces),
+                        "transaction_replay": (
+                            resources.transaction_replay.metrics()
+                            if resources.transaction_replay is not None
+                            else None
+                        ),
                     },
                 )
 
@@ -453,6 +677,7 @@ def run_training(
                 learner_metrics = resources.learner.update(
                     batch,
                     current_policy_version=state.policy_version,
+                    transaction_traces=transaction_traces,
                     progress=learner_progress,
                 )
                 state = replace(
@@ -485,9 +710,23 @@ def run_training(
                     unrolls_since_publication = 0
 
             while True:
-                episode = pipeline.next_episode(timeout=0.0)
-                if episode is None:
+                actor_result = pipeline.next_episode(timeout=0.0)
+                if actor_result is None:
                     break
+                if isinstance(actor_result, RecoverableActorIncident):
+                    handle_actor_incident(actor_result)
+                    continue
+                episode = actor_result
+                transaction_traces_stored = 0
+                if resources.transaction_replay is not None:
+                    transaction_traces_stored = sum(
+                        int(resources.transaction_replay.put(trace))
+                        for trace in episode.transaction_traces
+                    )
+                elif episode.transaction_traces:
+                    raise RuntimeError(
+                        "collector emitted transaction traces while replay is disabled"
+                    )
                 state = replace(
                     state,
                     environment_steps=state.environment_steps + episode.metrics.steps,
@@ -519,6 +758,24 @@ def run_training(
                             else None
                         ),
                         "rollout_queue": resources.rollout_queue.metrics(),
+                        "transaction_traces_emitted": len(
+                            episode.transaction_traces
+                        ),
+                        "transaction_traces_stored": transaction_traces_stored,
+                        "transaction_learn_steps": sum(
+                            len(trace.learn_steps)
+                            for trace in episode.transaction_traces
+                        ),
+                        "transaction_q_labels": sum(
+                            int(step.q_observed)
+                            for trace in episode.transaction_traces
+                            for step in trace.learn_steps
+                        ),
+                        "transaction_replay": (
+                            resources.transaction_replay.metrics()
+                            if resources.transaction_replay is not None
+                            else None
+                        ),
                     },
                 )
                 crossed_evaluation = any(
@@ -554,6 +811,7 @@ def run_training(
                                     run_log_root
                                     / f"evaluation-step-{evaluation_step:09d}.jsonl"
                                 ),
+                                backend_factory=recovery_backend_factory,
                             )
                             state = replace(
                                 state,
@@ -591,6 +849,7 @@ def run_training(
                         parent_checkpoint=parent_checkpoint,
                         run_id=run_id,
                         load_mode=load_mode,
+                        actor_supervisor_state=pipeline.supervisor_state,
                     )
                     parent_checkpoint = checkpoint
                     load_mode = "in_process_successor"
@@ -604,9 +863,22 @@ def run_training(
         pipeline.join(timeout=30.0)
         # Episode messages can arrive immediately before the actor exits.
         while True:
-            episode = pipeline.next_episode(timeout=0.0)
-            if episode is None:
+            actor_result = pipeline.next_episode(timeout=0.0)
+            if actor_result is None:
                 break
+            if isinstance(actor_result, RecoverableActorIncident):
+                raise RuntimeError(
+                    "actor exited with an unhandled recoverable incident: "
+                    f"{actor_result.incident_id}"
+                )
+            episode = actor_result
+            if resources.transaction_replay is not None:
+                for trace in episode.transaction_traces:
+                    resources.transaction_replay.put(trace)
+            elif episode.transaction_traces:
+                raise RuntimeError(
+                    "collector emitted transaction traces while replay is disabled"
+                )
             state = replace(
                 state,
                 environment_steps=state.environment_steps + episode.metrics.steps,
@@ -632,6 +904,7 @@ def run_training(
                             run_log_root
                             / f"evaluation-step-{evaluation_step:09d}.jsonl"
                         ),
+                        backend_factory=recovery_backend_factory,
                     )
                     state = replace(
                         state,
@@ -669,6 +942,7 @@ def run_training(
             parent_checkpoint=parent_checkpoint,
             run_id=run_id,
             load_mode=load_mode,
+            actor_supervisor_state=pipeline.supervisor_state,
         )
         metrics.write(
             "run_complete",

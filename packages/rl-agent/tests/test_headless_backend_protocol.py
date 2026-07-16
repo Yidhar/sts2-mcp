@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import gzip
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from sts2_rl.backends import HeadlessBackend, HeadlessProtocolError
+from sts2_rl.backends import (
+    HeadlessBackend,
+    HeadlessBackendPoisonedError,
+    HeadlessProtocolError,
+    HeadlessRecoverableProtocolError,
+)
 from sts2_rl.backends.headless import DEFAULT_REQUEST_CACHE_SIZE, DEFAULT_REQUEST_CACHE_TTL_S
 from sts2_rl.contracts import ResetRequest, StepRequest
 
@@ -20,6 +28,7 @@ class FakeHeadlessClient:
         self.reset_calls = 0
         self.step_calls = 0
         self.close_calls = 0
+        self.step_payload: dict[str, Any] | None = None
 
     @staticmethod
     def _payload(*, after: bool, reward: float) -> dict[str, Any]:
@@ -53,7 +62,7 @@ class FakeHeadlessClient:
 
     def step(self, **kwargs: Any) -> dict[str, Any]:
         self.step_calls += 1
-        return self._payload(after=True, reward=99.0)
+        return self.step_payload or self._payload(after=True, reward=99.0)
 
     def combat_reset(self, **kwargs: Any) -> dict[str, Any]:
         return self.reset(**kwargs)
@@ -215,3 +224,136 @@ def test_headless_request_store_refuses_capacity_without_evicting_unexpired_ids(
     clock["now"] = 111.0
     backend.reset(third)
     assert client.reset_calls == 3
+
+
+def test_invalid_post_mutation_surface_is_quarantined_without_revision_or_cache_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(artifact_root))
+    client = FakeHeadlessClient()
+    backend = HeadlessBackend(client=client)
+    reset = backend.reset(reset_request())
+    client.step_payload = {
+        "ok": True,
+        "episode_id": reset.episode_id,
+        "step_index": 999,
+        "reward": 0.0,
+        "done": False,
+        "truncated": False,
+        "obs": {
+            "state_type": "combat_start_pending",
+            # Ensure the incident crosses the compression threshold and the
+            # raw response remains available for post-mortem inspection.
+            "diagnostic_blob": "x" * 70_000,
+        },
+        "legal_actions": [],
+        "info": {},
+    }
+    request = StepRequest(
+        request_id=STEP_ID,
+        session_id=backend.session_id,
+        episode_id=reset.episode_id,
+        expected_step_index=reset.step_index,
+        action_id="end_turn",
+        timeout_ms=100,
+    )
+
+    with pytest.raises(HeadlessRecoverableProtocolError) as caught:
+        backend.step(request)
+
+    incident = caught.value
+    assert incident.recoverable is True
+    assert incident.poisoned is True
+    assert incident.operation == "step"
+    assert len(incident.fingerprint) == 24
+    assert incident.quarantine_path is not None
+    evidence_path = Path(incident.quarantine_path)
+    assert evidence_path.is_file()
+    assert evidence_path.name.endswith(".json.gz")
+    with gzip.open(evidence_path, "rt", encoding="utf-8") as handle:
+        evidence = json.load(handle)
+    assert evidence["fingerprint"] == incident.fingerprint
+    assert evidence["incident"]["legal_action_count"] == 0
+    assert evidence["raw_response"]["obs"]["diagnostic_blob"] == "x" * 70_000
+
+    # The invalid result never becomes a typed transition, revision, cached
+    # request result, or new active observation.
+    assert backend._state_version == 1
+    assert backend._logical_step_index == 0
+    assert STEP_ID not in backend._request_cache
+    assert backend._observation == dict(reset.observation)
+    assert client.step_calls == 1
+    assert backend.is_connected is False
+    assert backend.health()["poisoned"] is True
+
+    with pytest.raises(HeadlessBackendPoisonedError) as reused:
+        backend.step(request)
+    assert reused.value.fingerprint == incident.fingerprint
+    assert client.step_calls == 1
+    with pytest.raises(HeadlessBackendPoisonedError):
+        backend.get_state()
+
+
+def test_predispatch_ordering_errors_are_not_recoverable_or_poisoning() -> None:
+    client = FakeHeadlessClient()
+    backend = HeadlessBackend(client=client)
+    reset = backend.reset(reset_request())
+    request = StepRequest(
+        request_id=STEP_ID,
+        session_id=backend.session_id,
+        episode_id=reset.episode_id,
+        expected_step_index=99,
+        action_id="end_turn",
+        timeout_ms=100,
+    )
+
+    with pytest.raises(HeadlessProtocolError) as caught:
+        backend.step(request)
+
+    assert not isinstance(caught.value, HeadlessRecoverableProtocolError)
+    assert caught.value.recoverable is False
+    assert backend.is_connected is True
+    assert client.step_calls == 0
+
+
+def test_terminal_surface_with_actions_uses_plain_json_incident_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    client = FakeHeadlessClient()
+    backend = HeadlessBackend(client=client)
+    reset = backend.reset(reset_request())
+    client.step_payload = {
+        "ok": True,
+        "episode_id": reset.episode_id,
+        "step_index": 1,
+        "reward": 0.0,
+        "done": True,
+        "truncated": False,
+        "terminal_reason": "victory",
+        "obs": {"state_type": "game_over", "terminated": True},
+        "legal_actions": [{"action_id": "must-not-exist"}],
+        "info": {},
+    }
+    request = StepRequest(
+        request_id=STEP_ID,
+        session_id=backend.session_id,
+        episode_id=reset.episode_id,
+        expected_step_index=reset.step_index,
+        action_id="end_turn",
+        timeout_ms=100,
+    )
+
+    with pytest.raises(HeadlessRecoverableProtocolError) as caught:
+        backend.step(request)
+
+    evidence_path = Path(str(caught.value.quarantine_path))
+    assert evidence_path.name.endswith(".json")
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["incident"]["terminal"] is True
+    assert evidence["incident"]["legal_action_count"] == 1
+    assert backend._state_version == 1
+    assert STEP_ID not in backend._request_cache

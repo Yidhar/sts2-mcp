@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -39,9 +41,13 @@ from sts2_rl.training import (
     save_training_checkpoint,
 )
 from sts2_rl.training import checkpointing as checkpointing_module
-from sts2_rl.training.checkpointing import TrainingState
+from sts2_rl.training import factory as factory_module
+from sts2_rl.training import runtime as runtime_module
+from sts2_rl.training.checkpoint_evaluation import evaluate_checkpoint_policy
+from sts2_rl.training.checkpointing import ActorSupervisorState, TrainingState
 from sts2_rl.training.collector import CollectionProtocolError
-from sts2_rl.training.pipeline import ActorLearnerPipeline
+from sts2_rl.training.pipeline import ActorLearnerPipeline, RecoverableActorIncident
+from sts2_rl.training.runtime import EvaluationInfrastructureError
 from sts2_rl.training.trajectory import TrajectoryJournal
 
 
@@ -181,6 +187,42 @@ class StaleRevisionBackend(FakeCombatBackend):
                 result.transition,
                 before_state_version=result.transition.before_state_version - 1,
             ),
+        )
+
+
+class RecoverableTestProtocolError(RuntimeError):
+    recoverable = True
+    incident_kind = "test_committed_unsettled"
+    fingerprint = "test:step:committed-unsettled"
+    quarantine_path = "tests/quarantine/incident.json.gz"
+
+
+class RecoverableIncidentBackend(FakeCombatBackend):
+    def __init__(self, *, fail_step: int) -> None:
+        super().__init__(terminal_step=100)
+        self.fail_step = fail_step
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        if self._step + 1 == self.fail_step:
+            raise RecoverableTestProtocolError("simulator committed but did not settle")
+        return super().step(request)
+
+
+class WideRecoverableIncidentBackend(RecoverableIncidentBackend):
+    """Expose a 111-candidate accepted tail before a recoverable failure."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        if self._step == 0:
+            return FakeCombatBackend._actions()
+        return tuple(
+            {
+                "action_handle": f"attack-{index}",
+                "kind": "play_card",
+                "model_action_kind": "play_card",
+                "card": {"id": "attack", "cost": 1},
+                "target": {"id": "enemy", "side": "enemy"},
+            }
+            for index in range(111)
         )
 
 
@@ -580,6 +622,80 @@ def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() 
     assert report["active_shape_batching"] is True
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
+
+
+def test_cpu_resource_build_does_not_seed_or_initialize_unused_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accelerator_seed_calls: list[int] = []
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "manual_seed_all",
+        lambda seed: accelerator_seed_calls.append(int(seed)),
+    )
+
+    def unexpected_cuda_rng_read() -> list[torch.Tensor]:
+        raise AssertionError("CPU resource construction initialized CUDA RNG state")
+
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", unexpected_cuda_rng_read)
+    resources = build_training_resources(_config(), backend=FakeCombatBackend())
+    try:
+        assert resources.device.type == "cpu"
+        assert accelerator_seed_calls == []
+    finally:
+        resources.close()
+
+
+def test_resource_composition_failure_closes_only_factory_owned_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    internally_created = FakeCombatBackend()
+    externally_owned = FakeCombatBackend()
+    monkeypatch.setattr(
+        factory_module,
+        "build_backend",
+        lambda _config: internally_created,
+    )
+
+    def fail_learner_construction(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected learner construction failure")
+
+    monkeypatch.setattr(
+        factory_module,
+        "VTraceLearner",
+        fail_learner_construction,
+    )
+
+    with pytest.raises(RuntimeError, match="injected learner construction failure"):
+        build_training_resources(_config())
+    assert internally_created.closed
+
+    with pytest.raises(RuntimeError, match="injected learner construction failure"):
+        build_training_resources(_config(), backend=externally_owned)
+    assert not externally_owned.closed
+
+
+def test_in_process_frozen_cuda_evaluation_fails_before_untracked_rng_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires CUDA to be initialized"):
+        evaluate_checkpoint_policy(
+            tmp_path / "checkpoint-not-read",
+            output_directory=tmp_path / "evaluation-not-created",
+            episodes=1,
+            device="cuda",
+            collector_device="cpu",
+            backend=FakeCombatBackend(),
+        )
+
+    assert not (tmp_path / "evaluation-not-created").exists()
 
 
 def test_collector_can_adopt_new_policy_only_between_complete_unrolls() -> None:
@@ -1010,6 +1126,110 @@ def test_actor_waits_for_main_thread_at_episode_boundary() -> None:
         resources.close()
 
 
+def test_actor_incident_preserves_emitted_prefix_and_replaces_backend() -> None:
+    first_backend = RecoverableIncidentBackend(fail_step=4)
+    replacement = FakeCombatBackend(terminal_step=2)
+    resources = build_training_resources(_config(total_steps=4), backend=first_backend)
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=4,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        epsilon=lambda _: 0.1,
+    )
+    try:
+        pipeline.start()
+        incident = pipeline.next_episode(timeout=5.0)
+        assert isinstance(incident, RecoverableActorIncident)
+        assert incident.emitted_environment_steps == 2
+        assert incident.validated_environment_steps == 3
+        assert incident.lost_valid_prefix_steps == 1
+        assert not incident.circuit_breaker_open
+        old_session, new_session = pipeline.replace_backend(replacement)
+        assert old_session == "fake-session"
+        assert new_session == "fake-session"
+        assert first_backend.closed
+        assert resources.backend is replacement
+        assert resources.collector.backend is replacement
+        pipeline.release_incident_boundary()
+
+        episode = pipeline.next_episode(timeout=5.0)
+        assert episode is not None
+        assert not isinstance(episode, RecoverableActorIncident)
+        assert episode.metrics.steps == 2
+        pipeline.release_episode_boundary()
+        pipeline.join(timeout=10.0)
+        assert pipeline.environment_steps == 4
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
+def test_actor_incident_circuit_breaks_on_second_same_fingerprint() -> None:
+    first_backend = RecoverableIncidentBackend(fail_step=1)
+    second_backend = RecoverableIncidentBackend(fail_step=1)
+    resources = build_training_resources(_config(total_steps=2), backend=first_backend)
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=2,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        epsilon=lambda _: 0.1,
+    )
+    try:
+        pipeline.start()
+        first = pipeline.next_episode(timeout=5.0)
+        assert isinstance(first, RecoverableActorIncident)
+        assert not first.circuit_breaker_open
+        pipeline.replace_backend(second_backend)
+        pipeline.release_incident_boundary()
+
+        second = pipeline.next_episode(timeout=5.0)
+        assert isinstance(second, RecoverableActorIncident)
+        assert second.fingerprint_occurrences == 2
+        assert second.consecutive_incidents == 2
+        assert second.circuit_breaker_open
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
+def test_actor_incident_keeps_unflushed_tail_candidate_maximum() -> None:
+    base = _config(total_steps=4)
+    config = replace(base, model=replace(base.model, max_candidates=256))
+    resources = build_training_resources(
+        config,
+        backend=WideRecoverableIncidentBackend(fail_step=2),
+    )
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=4,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        epsilon=lambda _: 0.1,
+    )
+    try:
+        pipeline.start()
+        incident = pipeline.next_episode(timeout=5.0)
+        assert isinstance(incident, RecoverableActorIncident)
+        # The one accepted step is shorter than the two-step unroll, so there
+        # is no EpisodeProgress snapshot to carry this diagnostic.
+        assert incident.emitted_environment_steps == 0
+        assert incident.validated_environment_steps == 1
+        assert incident.lost_valid_prefix_steps == 1
+        assert pipeline.actor_progress is None
+        assert incident.maximum_observed_candidates == 111
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
 def test_runtime_checkpoints_each_crossed_episode_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1059,6 +1279,125 @@ def test_runtime_checkpoints_each_crossed_episode_boundary(
     assert '"actor_progress": {' in metrics_text
     assert '"maximum_observed_candidates": 2' in metrics_text
     assert '"run_maximum_observed_candidates": 2' in metrics_text
+
+
+def test_runtime_recovers_one_infrastructure_abort_without_fabricating_episode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    first = RecoverableIncidentBackend(fail_step=4)
+    replacement = FakeCombatBackend(terminal_step=2)
+    backends = iter((first, replacement))
+
+    def next_backend(_config: TrainingConfig) -> FakeCombatBackend:
+        return next(backends)
+
+    monkeypatch.setattr(factory_module, "build_backend", next_backend)
+    monkeypatch.setattr(runtime_module, "build_backend", next_backend)
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/recoverable-incident",
+            checkpoint_dir="checkpoints/recoverable-incident",
+        ),
+    )
+
+    state = run_training(config)
+
+    assert state.environment_steps == 4
+    assert state.episodes == 1
+    assert first.closed
+    metrics_path = next(
+        (tmp_path / "runs" / "recoverable-incident").glob("run-*/metrics.jsonl")
+    )
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    assert sum(item["event"] == "backend_protocol_incident" for item in events) == 1
+    assert sum(item["event"] == "episode_aborted" for item in events) == 1
+    assert sum(item["event"] == "backend_restart" for item in events) == 1
+    assert sum(item["event"] == "train_episode" for item in events) == 1
+    aborted = next(item for item in events if item["event"] == "episode_aborted")
+    assert aborted["emitted_environment_steps"] == 2
+    assert aborted["lost_valid_prefix_steps"] == 1
+    assert aborted["task_terminal_or_reward_fabricated"] is False
+
+
+def test_exact_resume_restores_actor_incident_circuit_breaker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=2)
+    first_config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/supervisor-source",
+            checkpoint_dir="checkpoints/supervisor-source",
+        ),
+    )
+    first_backends = iter(
+        (
+            RecoverableIncidentBackend(fail_step=1),
+            FakeCombatBackend(terminal_step=2),
+        )
+    )
+
+    def first_next_backend(_config: TrainingConfig) -> FakeCombatBackend:
+        return next(first_backends)
+
+    monkeypatch.setattr(factory_module, "build_backend", first_next_backend)
+    monkeypatch.setattr(runtime_module, "build_backend", first_next_backend)
+    first_state = run_training(first_config)
+    assert first_state.environment_steps == 2
+    assert first_state.episodes == 1
+
+    checkpoint = next(
+        (tmp_path / "checkpoints" / "supervisor-source").glob("run-*/final-*")
+    )
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    restored_supervisor = checkpointing_module.actor_supervisor_state_from_metadata(
+        metadata
+    )
+    assert restored_supervisor == ActorSupervisorState(
+        episode_attempts=2,
+        consecutive_incidents=0,
+        incident_fingerprints=((RecoverableTestProtocolError.fingerprint, 1),),
+        recent_incident_attempts=(1,),
+    )
+
+    second_backend = RecoverableIncidentBackend(fail_step=1)
+
+    def second_next_backend(_config: TrainingConfig) -> FakeCombatBackend:
+        return second_backend
+
+    monkeypatch.setattr(factory_module, "build_backend", second_next_backend)
+    monkeypatch.setattr(runtime_module, "build_backend", second_next_backend)
+    second_config = replace(
+        first_config,
+        runtime=replace(
+            first_config.runtime,
+            total_environment_steps=4,
+            log_dir="runs/supervisor-resume",
+            checkpoint_dir="checkpoints/supervisor-resume",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="circuit breaker opened"):
+        run_training(second_config, resume_from=checkpoint)
+
+    metrics_path = next(
+        (tmp_path / "runs" / "supervisor-resume").glob("run-*/metrics.jsonl")
+    )
+    events = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    breaker = next(item for item in events if item["event"] == "circuit_breaker_open")
+    assert breaker["fingerprint"] == RecoverableTestProtocolError.fingerprint
+    assert breaker["fingerprint_occurrences"] == 2
+    assert breaker["consecutive_incidents"] == 1
 
 
 def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
@@ -1113,6 +1452,59 @@ def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
     assert final_metadata["provenance"]["parent_checkpoint"]["checkpoint_id"] == periodic_metadata["checkpoint_id"]
 
 
+def test_exact_resume_does_not_repeat_evaluation_gate_at_checkpoint_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/evaluation-resume",
+            checkpoint_dir="checkpoints/evaluation-resume",
+            checkpoint_interval_steps=2,
+            evaluation_steps=(2,),
+            evaluation_episodes=1,
+        ),
+    )
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        source_checkpoint = save_training_checkpoint(
+            tmp_path / "evaluation-resume-source",
+            config=config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                evaluation_episodes=1,
+                maximum_observed_candidates=2,
+            ),
+            run_id="evaluation-resume-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    state = run_training(
+        config,
+        backend=FakeCombatBackend(),
+        resume_from=source_checkpoint,
+    )
+
+    assert state.environment_steps == 4
+    assert state.evaluation_episodes == 1
+    metrics_path = next(
+        (tmp_path / "runs" / "evaluation-resume").glob("run-*/metrics.jsonl")
+    )
+    events = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not [event for event in events if event["event"] == "evaluation"]
+
+
 def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
     tmp_path: Path,
 ) -> None:
@@ -1136,6 +1528,229 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         assert (tmp_path / "trajectory.jsonl").read_text(encoding="utf-8")
     finally:
         resources.close()
+
+
+def test_evaluation_retries_same_seed_once_on_fresh_backend(tmp_path: Path) -> None:
+    first = RecoverableIncidentBackend(fail_step=2)
+    replacement = FakeCombatBackend(terminal_step=2)
+    resources = build_training_resources(_config(), backend=first)
+    try:
+        episodes, summary = evaluate_policy(
+            resources,
+            episodes=2,
+            base_seed=6,
+            journal_path=tmp_path / "retry-trajectory.jsonl",
+            backend_factory=lambda: replacement,
+        )
+        assert len(episodes) == 2
+        assert summary["infrastructure_retries"] == 1
+        assert first.closed
+        assert replacement.reset_seeds[0] == first.reset_seeds[0]
+        assert replacement.reset_seeds == [13, 15]
+        journal_events = [
+            json.loads(line)
+            for line in (tmp_path / "retry-trajectory.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        boundaries = [item for item in journal_events if item.get("event", "").startswith("evaluation_attempt_")]
+        assert [item["event"] for item in boundaries[:4]] == [
+            "evaluation_attempt_started",
+            "evaluation_attempt_aborted",
+            "evaluation_attempt_started",
+            "evaluation_attempt_completed",
+        ]
+        first_seed_episode_ids = {
+            str(item["episode_id"])
+            for item in journal_events
+            if item.get("event") in {"decision", "decision_snapshot"}
+            and item.get("reset_seed") == 13
+        }
+        assert any("attempt-1:" in item for item in first_seed_episode_ids)
+        assert any("attempt-2:" in item for item in first_seed_episode_ids)
+        assert not any(item == "combat-episode-1" for item in first_seed_episode_ids)
+        first_abort_index = next(
+            index
+            for index, item in enumerate(journal_events)
+            if item.get("event") == "evaluation_attempt_aborted"
+            and item.get("evaluation_seed") == 13
+        )
+        second_start_index = next(
+            index
+            for index, item in enumerate(journal_events)
+            if item.get("event") == "evaluation_attempt_started"
+            and item.get("evaluation_seed") == 13
+            and item.get("attempt") == 2
+        )
+        first_attempt_records = [
+            index
+            for index, item in enumerate(journal_events)
+            if item.get("event") in {"decision", "decision_snapshot"}
+            and "heldout-seed-13-attempt-1:" in str(item.get("episode_id", ""))
+        ]
+        assert first_attempt_records
+        assert max(first_attempt_records) < first_abort_index < second_start_index
+    finally:
+        resources.close()
+
+
+def test_evaluation_marks_gate_invalid_after_repeated_infrastructure_fault() -> None:
+    first = RecoverableIncidentBackend(fail_step=1)
+    replacement = RecoverableIncidentBackend(fail_step=1)
+    resources = build_training_resources(_config(), backend=first)
+    try:
+        with pytest.raises(EvaluationInfrastructureError, match="infrastructure-invalid"):
+            evaluate_policy(
+                resources,
+                episodes=1,
+                base_seed=6,
+                backend_factory=lambda: replacement,
+            )
+    finally:
+        resources.close()
+
+
+def test_frozen_checkpoint_evaluation_never_loads_or_consumes_pending_queue(
+    tmp_path: Path,
+) -> None:
+    config = _config(total_steps=4)
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        pending = source.collector.collect_episode(record=True).unrolls[0]
+        source.rollout_queue.put(pending)
+        checkpoint = save_training_checkpoint(
+            tmp_path / "frozen-eval-source",
+            config=config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                policy_version=7,
+                actor_policy_version=7,
+            ),
+            run_id="frozen-eval-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    queue_path = checkpoint / "rollout_queue.pkl"
+    queue_before = queue_path.read_bytes()
+    random.seed(119)
+    np.random.seed(223)
+    torch.manual_seed(337)
+    python_rng_before = random.getstate()
+    numpy_rng_before = np.random.get_state()
+    torch_rng_before = torch.get_rng_state().clone()
+    cuda_rng_before = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else None
+    )
+    result = evaluate_checkpoint_policy(
+        checkpoint,
+        output_directory=tmp_path / "frozen-evaluation",
+        episodes=2,
+        base_seed=6,
+        device="cpu",
+        collector_device="cpu",
+        backend=FakeCombatBackend(),
+    )
+
+    assert result.source_environment_steps == 2
+    assert result.source_policy_version == 7
+    assert result.summary["episodes"] == 2
+    assert queue_path.read_bytes() == queue_before
+    audit = json.loads(result.audit_path.read_text(encoding="utf-8"))
+    assert audit["policy_source"] == "network.pt"
+    assert audit["learner_updates_performed"] == 0
+    assert audit["optimizer_loaded"] is False
+    assert audit["rollout_queue_loaded"] is False
+    assert audit["training_rng_loaded"] is False
+    assert audit["training_checkpoint_published"] is False
+    assert audit["evaluation_of"]["training_state"]["policy_version"] == 7
+    assert random.getstate() == python_rng_before
+    numpy_rng_after = np.random.get_state()
+    assert numpy_rng_after[0] == numpy_rng_before[0]
+    np.testing.assert_array_equal(numpy_rng_after[1], numpy_rng_before[1])
+    assert numpy_rng_after[2:] == numpy_rng_before[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_before)
+    if cuda_rng_before is not None:
+        assert all(
+            torch.equal(after, before)
+            for after, before in zip(
+                torch.cuda.get_rng_state_all(),
+                cuda_rng_before,
+                strict=True,
+            )
+        )
+
+
+def test_failed_frozen_evaluation_cleans_staging_and_allows_same_output_retry(
+    tmp_path: Path,
+) -> None:
+    config = _config(total_steps=4)
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        checkpoint = save_training_checkpoint(
+            tmp_path / "failed-frozen-eval-source",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=2, episodes=1),
+            run_id="failed-frozen-eval-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    output = tmp_path / "atomic-frozen-evaluation"
+    random.seed(421)
+    np.random.seed(431)
+    torch.manual_seed(433)
+    python_rng_before = random.getstate()
+    numpy_rng_before = np.random.get_state()
+    torch_rng_before = torch.get_rng_state().clone()
+    cuda_rng_before = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else None
+    )
+    with pytest.raises(EvaluationInfrastructureError, match="infrastructure-invalid"):
+        evaluate_checkpoint_policy(
+            checkpoint,
+            output_directory=output,
+            episodes=1,
+            base_seed=6,
+            device="cpu",
+            collector_device="cpu",
+            backend=RecoverableIncidentBackend(fail_step=1),
+        )
+    assert not output.exists()
+    assert not tuple(tmp_path.glob(".atomic-frozen-evaluation.staging-*"))
+    assert random.getstate() == python_rng_before
+    numpy_rng_after = np.random.get_state()
+    assert numpy_rng_after[0] == numpy_rng_before[0]
+    np.testing.assert_array_equal(numpy_rng_after[1], numpy_rng_before[1])
+    assert numpy_rng_after[2:] == numpy_rng_before[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_before)
+    if cuda_rng_before is not None:
+        assert all(
+            torch.equal(after, before)
+            for after, before in zip(
+                torch.cuda.get_rng_state_all(),
+                cuda_rng_before,
+                strict=True,
+            )
+        )
+
+    result = evaluate_checkpoint_policy(
+        checkpoint,
+        output_directory=output,
+        episodes=1,
+        base_seed=6,
+        device="cpu",
+        collector_device="cpu",
+        backend=FakeCombatBackend(),
+    )
+    assert result.audit_path.is_file()
 
 
 def test_v2_checkpoint_roundtrip_restores_models_optimizer_queue_and_rng(
@@ -1198,6 +1813,35 @@ def test_exact_resume_accepts_legacy_checkpoint_without_candidate_diagnostic() -
     assert migrated.learner_updates == 7
     assert migrated.episodes == 3
     assert migrated.maximum_observed_candidates == 0
+
+
+def test_actor_supervisor_metadata_has_strict_legacy_compatibility() -> None:
+    # Absence is the sole legacy migration: old exact-resume checkpoints start
+    # with a clean supervisor rather than being rejected.
+    assert checkpointing_module.actor_supervisor_state_from_metadata({}) == (
+        ActorSupervisorState()
+    )
+
+    valid = ActorSupervisorState(
+        episode_attempts=3,
+        consecutive_incidents=1,
+        incident_fingerprints=(("test:fingerprint", 2),),
+        recent_incident_attempts=(1, 3),
+    )
+    assert checkpointing_module.actor_supervisor_state_from_metadata(
+        {"actor_supervisor_state": valid.to_mapping()}
+    ) == valid
+
+    malformed = valid.to_mapping()
+    malformed["unexpected"] = True
+    with pytest.raises(ValueError, match="keys mismatch"):
+        checkpointing_module.actor_supervisor_state_from_metadata(
+            {"actor_supervisor_state": malformed}
+        )
+    with pytest.raises(TypeError, match="must be an object"):
+        checkpointing_module.actor_supervisor_state_from_metadata(
+            {"actor_supervisor_state": None}
+        )
 
 
 def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(

@@ -1,7 +1,9 @@
 """Recurrent v2 collection, V-trace learning, evaluation and checkpointing."""
 
 from .checkpointing import (
+    ActorSupervisorState,
     TrainingState,
+    actor_supervisor_state_from_metadata,
     checkpoint_summary,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
@@ -25,6 +27,7 @@ from .config import (
     RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
+    TransactionLearningConfig,
     load_training_config,
     training_config_from_mapping,
 )
@@ -44,10 +47,21 @@ from .runtime import (
     run_training,
     summarize_evaluation,
 )
+from .transaction import (
+    BoundedTransactionReplay,
+    ObservedTransactionPair,
+    TransactionEffect,
+    TransactionStep,
+    TransactionTrace,
+    backfill_factual_monte_carlo_returns,
+    observed_outcome_pairs,
+)
 
 __all__ = [
     "CONFIG_VERSION",
     "ActorLearnerPipeline",
+    "ActorSupervisorState",
+    "BoundedTransactionReplay",
     "CollectedEpisode",
     "CollectionProtocolError",
     "CurriculumConfig",
@@ -57,13 +71,20 @@ __all__ = [
     "GroundedCollector",
     "LearnerMetrics",
     "ModelConfig",
+    "ObservedTransactionPair",
     "OptimizationConfig",
     "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
     "TrainingResources",
     "TrainingState",
+    "TransactionEffect",
+    "TransactionLearningConfig",
+    "TransactionStep",
+    "TransactionTrace",
     "VTraceLearner",
+    "actor_supervisor_state_from_metadata",
+    "backfill_factual_monte_carlo_returns",
     "build_backend",
     "build_training_resources",
     "checkpoint_summary",
@@ -73,6 +94,7 @@ __all__ = [
     "inspect_baseline",
     "load_training_checkpoint",
     "load_training_config",
+    "observed_outcome_pairs",
     "preflight_model_initialization",
     "preflight_training_checkpoint",
     "resolve_device",

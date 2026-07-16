@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 sts2-train = "sts2_rl.train:main"
+sts2-evaluate-checkpoint = "sts2_rl.evaluate_checkpoint:main"
 
 [tool.setuptools]
 py-modules = [

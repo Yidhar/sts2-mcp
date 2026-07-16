@@ -251,6 +251,64 @@ class RolloutConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TransactionLearningConfig:
+    """Optional factual-outcome replay sidecar for multi-step transactions.
+
+    Disabled is the v10-compatible default.  Enabling this section adds model
+    parameters and checkpoint state, so it always starts a new training lineage
+    through ``model_parameter_initialization`` rather than exact resume.
+    """
+
+    enabled: bool = False
+    replay_capacity: int = 4_096
+    replay_byte_capacity: int = 536_870_912
+    sample_traces: int = 8
+    burn_in_steps: int = 24
+    effect_weight: float = 0.10
+    transaction_q_weight: float = 0.25
+    # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
+    # effect and selection-delta heads are safe by default; pairwise policy
+    # supervision requires context-equivalent repeated states and must not be
+    # inferred merely from superficially similar selection panes.
+    pairwise_ranking_weight: float = 0.0
+    pairwise_margin: float = 0.10
+    minimum_return_gap: float = 0.0
+    maximum_pairs: int = 256
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("transaction_learning.enabled must be a boolean")
+        for name in (
+            "replay_capacity",
+            "replay_byte_capacity",
+            "sample_traces",
+            "maximum_pairs",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"transaction_learning.{name}",
+                minimum=1,
+            )
+        _require_int(
+            self.burn_in_steps,
+            label="transaction_learning.burn_in_steps",
+            minimum=0,
+        )
+        for name in (
+            "effect_weight",
+            "transaction_q_weight",
+            "pairwise_ranking_weight",
+            "pairwise_margin",
+            "minimum_return_gap",
+        ):
+            _require_finite_number(
+                getattr(self, name),
+                label=f"transaction_learning.{name}",
+                minimum=0.0,
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class EnvironmentConfig:
     backend: Literal["live", "headless"] = "headless"
     scenario: Literal["full-run", "combat"] = "full-run"
@@ -440,6 +498,9 @@ class TrainingConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    transaction_learning: TransactionLearningConfig = field(
+        default_factory=TransactionLearningConfig
+    )
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -456,6 +517,7 @@ class TrainingConfig:
             ("model", ModelConfig),
             ("optimization", OptimizationConfig),
             ("rollout", RolloutConfig),
+            ("transaction_learning", TransactionLearningConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
             ("runtime", RuntimeConfig),
@@ -577,6 +639,11 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
         model=_construct(ModelConfig, _table(payload, "model"), label="model"),
         optimization=_construct(OptimizationConfig, _table(payload, "optimization"), label="optimization"),
         rollout=_construct(RolloutConfig, _table(payload, "rollout"), label="rollout"),
+        transaction_learning=_construct(
+            TransactionLearningConfig,
+            _table(payload, "transaction_learning"),
+            label="transaction_learning",
+        ),
         environment=_construct(EnvironmentConfig, _table(payload, "environment"), label="environment"),
         curriculum=_construct(CurriculumConfig, _table(payload, "curriculum"), label="curriculum"),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
@@ -626,6 +693,7 @@ __all__ = [
     "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
+    "TransactionLearningConfig",
     "load_training_config",
     "replace_runtime",
     "training_config_from_mapping",

@@ -2,6 +2,8 @@
 
 from .grounded_candidate import (
     MIN_TOKEN_FEATURE_DIM,
+    SELECTION_DELTA_COUNT,
+    TRANSACTION_EFFECT_COUNT,
     CandidateEncoding,
     CandidateTokenBatch,
     GroundedCandidateBatch,
@@ -14,6 +16,8 @@ from .grounded_candidate import (
 
 __all__ = [
     "MIN_TOKEN_FEATURE_DIM",
+    "SELECTION_DELTA_COUNT",
+    "TRANSACTION_EFFECT_COUNT",
     "CandidateEncoding",
     "CandidateTokenBatch",
     "GroundedCandidateBatch",

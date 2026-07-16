@@ -15,7 +15,7 @@ import time
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO, cast
 
 # Use the shared transport exception so typed live/headless callers have one
 # failure boundary without importing simulator-specific exception classes.
@@ -65,10 +65,41 @@ def resolve_headless_sim_exe(exe_path: str | Path | None = None) -> Path:
     )
 
 
-class HeadlessSimError(BridgeError):
+class HeadlessSimError(BridgeError):  # type: ignore[misc]
     """Raised when the HeadlessSim subprocess returns an error, dies, or
     fails to respond to an RPC within the configured timeout.
     """
+
+
+class HeadlessSimProtocolError(HeadlessSimError):
+    """The simulator returned a response that cannot be committed safely.
+
+    ``response`` and ``params`` are deliberately retained on the exception so
+    the typed backend can write one bounded, local incident record before it
+    poisons the process-local session.  They are transport evidence only and
+    never enter an observation or learner sample.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str,
+        params: dict[str, Any] | None = None,
+        response: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = str(method)
+        self.params = deepcopy(params) if params is not None else None
+        self.response = deepcopy(response)
+
+
+class HeadlessSimStepRejected(HeadlessSimProtocolError):
+    """A mutation was authoritatively rejected by HeadlessSim."""
+
+
+class HeadlessSimUnsettledError(HeadlessSimProtocolError):
+    """A committed mutation did not reach an actionable/terminal surface."""
 
 
 class HeadlessSimBridgeClient:
@@ -98,6 +129,8 @@ class HeadlessSimBridgeClient:
         # raise a clean BridgeError before the collector hard-restarts
         # the worker (which otherwise leaves the sim subprocess orphaned).
         rpc_timeout_s: float = 25.0,
+        transition_poll_budget_s: float = 5.0,
+        transition_poll_max_attempts: int = 32,
     ):
         self._exe_path = resolve_headless_sim_exe(exe_path)
         if protocol != "json":
@@ -105,8 +138,14 @@ class HeadlessSimBridgeClient:
 
         self._request_timeout_s = float(request_timeout_s)
         self._rpc_timeout_s = float(rpc_timeout_s)
+        if float(transition_poll_budget_s) <= 0.0:
+            raise ValueError("transition_poll_budget_s must be positive")
+        if int(transition_poll_max_attempts) <= 0:
+            raise ValueError("transition_poll_max_attempts must be positive")
+        self._transition_poll_budget_s = float(transition_poll_budget_s)
+        self._transition_poll_max_attempts = int(transition_poll_max_attempts)
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._proc: subprocess.Popen[str] | None = None
         self._episode_counter = 0
         self._current_episode_id: str = ""
         # ``combat_reset`` creates a combat-scoped episode on top of the
@@ -134,7 +173,7 @@ class HeadlessSimBridgeClient:
         # that made the sim stop responding. File name includes the sim
         # PID once it's up so 4 parallel sims don't clobber each other.
         self._hang_log_path: Path | None = None
-        self._hang_log_handle = None
+        self._hang_log_handle: TextIO | None = None
         self._start_subprocess(startup_timeout_s)
 
     # ------------------------------------------------------------------
@@ -203,13 +242,14 @@ class HeadlessSimBridgeClient:
             )
             directory.mkdir(parents=True, exist_ok=True)
             self._hang_log_path = directory / f"sim_hang_debug_pid{proc.pid}.log"
-            self._hang_log_handle = self._hang_log_path.open("w", encoding="utf-8")
-            self._hang_log_handle.write(
+            handle = self._hang_log_path.open("w", encoding="utf-8")
+            self._hang_log_handle = handle
+            handle.write(
                 f"# sim hang-debug log for pid={proc.pid} started at {time.time()}\n"
             )
             for line in self._startup_stderr_tail:
                 self._hang_log("sim_startup_stderr", line=line)
-            self._hang_log_handle.flush()
+            handle.flush()
         except (OSError, ValueError):
             self._hang_log_path = None
             self._hang_log_handle = None
@@ -256,6 +296,8 @@ class HeadlessSimBridgeClient:
         if proc is None:
             return
         stdout = proc.stdout
+        if stdout is None:
+            return
         try:
             while not self._reader_stop.is_set():
                 # Phase A instrumentation: record before/after each readline
@@ -367,7 +409,7 @@ class HeadlessSimBridgeClient:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
-    def __del__(self):
+    def __del__(self) -> None:
         try:
             self.close()
         except Exception:
@@ -383,7 +425,7 @@ class HeadlessSimBridgeClient:
         *,
         timeout_s: float | None = None,
     ) -> dict[str, Any]:
-        request = {"method": method}
+        request: dict[str, Any] = {"method": method}
         if params is not None:
             request["params"] = params
         # text mode — write str, not bytes
@@ -452,11 +494,19 @@ class HeadlessSimBridgeClient:
             )
         # `line` is already a str in text mode.
         try:
-            return json.loads(line)
+            response = json.loads(line)
         except json.JSONDecodeError as exc:
             raise HeadlessSimError(
                 f"HeadlessSim returned non-JSON for {method}: {line[:400]!r}"
             ) from exc
+        if not isinstance(response, dict):
+            raise HeadlessSimProtocolError(
+                f"HeadlessSim returned a non-object JSON response for {method}",
+                method=method,
+                params=params,
+                response=response,
+            )
+        return response
 
     # ------------------------------------------------------------------
     # BridgeClient-compatible public API
@@ -516,9 +566,12 @@ class HeadlessSimBridgeClient:
     def get_state(self) -> dict[str, Any]:
         sim_state = self._rpc("state")
         from sts2_env._sim_translate import translate_to_bridge_shape
-        return translate_to_bridge_shape(
-            sim_state,
-            episode_id=self._current_episode_id,
+        return cast(
+            dict[str, Any],
+            translate_to_bridge_shape(
+                sim_state,
+                episode_id=self._current_episode_id,
+            ),
         )
 
     def reset(
@@ -539,6 +592,7 @@ class HeadlessSimBridgeClient:
             return _build_bridge_step_response(
                 self, sim_state, episode_started=False, reward=0.0,
                 info_extra={"sim_rebound_active_run": True},
+                source_method="state",
             )
         params: dict[str, Any] = {}
         if character is not None:
@@ -566,6 +620,7 @@ class HeadlessSimBridgeClient:
         sim_state = self._rpc("reset", params, timeout_s=timeout_s)
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
+            source_method="reset",
         )
 
     def step(
@@ -611,19 +666,266 @@ class HeadlessSimBridgeClient:
                 params[field] = raw[field]
 
         wrapped = self._rpc("step", params, timeout_s=max(float(timeout_ms) / 1000.0, 0.001))
-        # Sim step wraps the new state under {accepted, state, error}. Unwrap.
-        sim_state = wrapped.get("state") or {}
-        accepted = bool(wrapped.get("accepted", True))
+        wrapped = self._resolve_authoritative_settlement(wrapped, step_params=params)
+        # Sim step wraps the new state under {accepted, state, error}.  Never
+        # coerce this authority bit with bool(...): strings such as "false"
+        # are truthy in Python and used to turn a rejected action into an
+        # apparently successful transition here.
+        accepted_value = wrapped.get("accepted")
+        if not isinstance(accepted_value, bool):
+            raise HeadlessSimProtocolError(
+                "HeadlessSim step response has no exact boolean accepted field",
+                method="step",
+                params=params,
+                response=wrapped,
+            )
+        if not accepted_value:
+            error = str(wrapped.get("error") or "unspecified simulator rejection")
+            raise HeadlessSimStepRejected(
+                f"HeadlessSim rejected step: {error[:500]}",
+                method="step",
+                params=params,
+                response=wrapped,
+            )
+
+        sim_state_value = wrapped.get("state")
+        if not isinstance(sim_state_value, dict):
+            raise HeadlessSimProtocolError(
+                "accepted HeadlessSim step response has no state object",
+                method="step",
+                params=params,
+                response=wrapped,
+            )
+        sim_state = sim_state_value
         reward = float(wrapped.get("reward", 0.0) or 0.0)
-        info_extra: dict[str, Any] = {}
-        if not accepted:
-            info_extra["sim_step_rejected"] = True
-            info_extra["sim_error"] = str(wrapped.get("error") or "")
 
         return _build_bridge_step_response(
             self, sim_state, episode_started=False, reward=reward,
-            info_extra=info_extra,
+            source_method="step",
         )
+
+    def _resolve_authoritative_settlement(
+        self,
+        wrapped: dict[str, Any],
+        *,
+        step_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve an explicitly typed committed transition without retrying it.
+
+        Older simulators do not expose settlement authority.  Their stable
+        actionable/terminal responses continue through the legacy structural
+        checks, but an actionless response is *not* guessed to be pending.
+        Read-only polling is enabled only when the simulator supplies the
+        authoritative ``settlement_status``, ``action_committed`` and
+        ``transition_token`` protocol added for this purpose.
+        """
+
+        authority_keys = {"settlement_status", "action_committed", "transition_token"}
+        if not authority_keys.intersection(wrapped):
+            return wrapped
+
+        status_value = wrapped.get("settlement_status")
+        committed_value = wrapped.get("action_committed")
+        accepted_value = wrapped.get("accepted")
+        if not isinstance(status_value, str) or not status_value.strip():
+            raise HeadlessSimProtocolError(
+                "authoritative step response has no settlement_status",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+        status = status_value.strip().lower()
+        if status not in {"actionable", "terminal", "pending", "unsettled", "rejected"}:
+            raise HeadlessSimProtocolError(
+                f"authoritative step response has unknown settlement_status={status!r}",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+        if not isinstance(committed_value, bool):
+            raise HeadlessSimProtocolError(
+                "authoritative step response has no exact boolean action_committed field",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+        if not isinstance(accepted_value, bool):
+            raise HeadlessSimProtocolError(
+                "authoritative step response has no exact boolean accepted field",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+
+        if not accepted_value:
+            if committed_value or status != "rejected":
+                raise HeadlessSimProtocolError(
+                    "rejected step response has inconsistent settlement authority",
+                    method="step",
+                    params=step_params,
+                    response=wrapped,
+                )
+            error = str(wrapped.get("error") or "unspecified simulator rejection")
+            raise HeadlessSimStepRejected(
+                f"HeadlessSim rejected step: {error[:500]}",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+
+        if not committed_value or status == "rejected":
+            raise HeadlessSimProtocolError(
+                "accepted step response has inconsistent settlement authority",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+        if status in {"actionable", "terminal"}:
+            self._validate_authoritative_settled_surface(
+                wrapped,
+                status=status,
+                method="step",
+                params=step_params,
+            )
+            return wrapped
+
+        state_value = wrapped.get("state")
+        if (
+            self._combat_episode_active
+            and isinstance(state_value, dict)
+            and str(state_value.get("state_type") or "").lower()
+            == "combat_post_end_pending"
+        ):
+            # The simulator authority is scoped to the full run, while a
+            # combat_reset episode intentionally terminates at the first
+            # post-combat boundary.  Preserve that explicit local episode
+            # contract instead of polling through it into full-run rewards.
+            # Full-run episodes never take this branch.
+            return wrapped
+
+        token_value = wrapped.get("transition_token")
+        if not isinstance(token_value, str) or not token_value.strip():
+            raise HeadlessSimProtocolError(
+                "committed pending step response has no transition_token",
+                method="step",
+                params=step_params,
+                response=wrapped,
+            )
+        transition_token = token_value.strip()
+        initial_reward = wrapped.get("reward", 0.0)
+        deadline = time.monotonic() + self._transition_poll_budget_s
+        last_response = wrapped
+        for attempt in range(self._transition_poll_max_attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            poll_params = {"transition_token": transition_token}
+            polled = self._rpc(
+                "poll_transition",
+                poll_params,
+                timeout_s=min(remaining, self._rpc_timeout_s),
+            )
+            last_response = polled
+            poll_status_value = polled.get("settlement_status")
+            poll_accepted = polled.get("accepted")
+            poll_committed = polled.get("action_committed")
+            poll_token = polled.get("transition_token")
+            if (
+                not isinstance(poll_status_value, str)
+                or poll_status_value.strip().lower()
+                not in {"actionable", "terminal", "pending", "unsettled"}
+                or poll_accepted is not True
+                or poll_committed is not True
+                or poll_token != transition_token
+            ):
+                raise HeadlessSimProtocolError(
+                    "poll_transition returned inconsistent settlement authority",
+                    method="poll_transition",
+                    params=poll_params,
+                    response=polled,
+                )
+            poll_status = poll_status_value.strip().lower()
+            if poll_status in {"actionable", "terminal"}:
+                resolved = dict(polled)
+                resolved.setdefault("reward", initial_reward)
+                self._validate_authoritative_settled_surface(
+                    resolved,
+                    status=poll_status,
+                    method="poll_transition",
+                    params=poll_params,
+                )
+                return resolved
+
+            # A read-only poll is deliberately not a mutation replay, but it
+            # must also give the simulator's asynchronous continuation real
+            # wall-clock time to run.  Without pacing, an in-process/fake-fast
+            # transport can burn all attempts in effectively 0 ms even though
+            # this contract advertises a multi-second settlement budget.
+            # Spread remaining attempts across the remaining deadline.  The
+            # first poll stays immediate and ordinary already-settled steps
+            # never sleep, so throughput is affected only while authority is
+            # explicitly pending.
+            polls_left = self._transition_poll_max_attempts - attempt - 1
+            remaining_after_poll = deadline - time.monotonic()
+            if polls_left > 0 and remaining_after_poll > 0.0:
+                time.sleep(
+                    remaining_after_poll / float(polls_left + 1)
+                )
+
+        raise HeadlessSimUnsettledError(
+            "committed HeadlessSim transition did not settle within the bounded read-only poll budget",
+            method="poll_transition",
+            params={"transition_token": transition_token},
+            response=last_response,
+        )
+
+    @staticmethod
+    def _validate_authoritative_settled_surface(
+        wrapped: dict[str, Any],
+        *,
+        status: str,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        state = wrapped.get("state")
+        if not isinstance(state, dict):
+            raise HeadlessSimProtocolError(
+                f"authoritative {status} response has no state object",
+                method=method,
+                params=params,
+                response=wrapped,
+            )
+        is_actionable = state.get("is_actionable")
+        if not isinstance(is_actionable, bool):
+            raise HeadlessSimProtocolError(
+                f"authoritative {status} state has no exact boolean is_actionable field",
+                method=method,
+                params=params,
+                response=wrapped,
+            )
+        terminal = state.get("terminal") is True or state.get("truncated") is True
+        actions = state.get("legal_actions")
+        if not isinstance(actions, list):
+            raise HeadlessSimProtocolError(
+                f"authoritative {status} state has no legal_actions array",
+                method=method,
+                params=params,
+                response=wrapped,
+            )
+        if status == "actionable" and (not is_actionable or terminal or not actions):
+            raise HeadlessSimProtocolError(
+                "settlement_status=actionable is inconsistent with the state surface",
+                method=method,
+                params=params,
+                response=wrapped,
+            )
+        if status == "terminal" and (is_actionable or not terminal or actions):
+            raise HeadlessSimProtocolError(
+                "settlement_status=terminal is inconsistent with the state surface",
+                method=method,
+                params=params,
+                response=wrapped,
+            )
 
     def combat_reset(
         self,
@@ -739,6 +1041,7 @@ class HeadlessSimBridgeClient:
         sim_state = self._rpc("state", timeout_s=timeout_s)
         return _build_bridge_step_response(
             self, sim_state, episode_started=True, reward=0.0,
+            source_method="combat_reset",
         )
 
 
@@ -769,6 +1072,7 @@ def _build_bridge_step_response(
     episode_started: bool,
     reward: float,
     info_extra: dict[str, Any] | None = None,
+    source_method: str = "state_projection",
 ) -> dict[str, Any]:
     """Wrap a translated sim state into the shape our envs expect from
     ``BridgeClient.step/reset/combat_reset``.
@@ -794,6 +1098,14 @@ def _build_bridge_step_response(
         sim_state["run_outcome"] = "victory"
         sim_state["legal_actions"] = []
 
+    for flag_name in ("terminal", "truncated"):
+        flag_value = sim_state.get(flag_name, False)
+        if not isinstance(flag_value, bool):
+            raise HeadlessSimProtocolError(
+                f"HeadlessSim state {flag_name} flag must be an exact boolean",
+                method=source_method,
+                response=sim_state,
+            )
     terminal = bool(sim_state.get("terminal", False))
     truncated = bool(sim_state.get("truncated", False))
 
@@ -830,6 +1142,37 @@ def _build_bridge_step_response(
     else:
         bridge_obs = translated_obs
     legal_actions = bridge_obs.get("available_actions") or []
+    # A successful public environment result is either terminal or
+    # actionable, never both and never neither.  Validate before mutating the
+    # client's action/observation cache: once an invalid post-mutation surface
+    # is seen the owning typed backend must poison and replace this client.
+    if (terminal or truncated) and legal_actions:
+        raise HeadlessSimProtocolError(
+            "terminal HeadlessSim surface returned legal actions",
+            method=source_method,
+            response=sim_state,
+        )
+    if not terminal and not truncated and not legal_actions:
+        raise HeadlessSimUnsettledError(
+            "non-terminal HeadlessSim surface returned zero legal actions",
+            method=source_method,
+            response=sim_state,
+        )
+    if "is_actionable" in sim_state:
+        is_actionable = sim_state["is_actionable"]
+        if not isinstance(is_actionable, bool):
+            raise HeadlessSimProtocolError(
+                "HeadlessSim state is_actionable flag must be an exact boolean",
+                method=source_method,
+                response=sim_state,
+            )
+        expected_actionable = not terminal and not truncated and bool(legal_actions)
+        if is_actionable is not expected_actionable:
+            raise HeadlessSimProtocolError(
+                "HeadlessSim state is_actionable flag contradicts terminal/action surface",
+                method=source_method,
+                response=sim_state,
+            )
     # Cache so the next step() call can map an action_index back to the raw
     # sim action dict stored under ``_sim_raw``.
     client._last_legal_actions = legal_actions
