@@ -95,16 +95,26 @@ historical RL artifacts.
   compact per-unroll Act/floor/revival/reward snapshot. The preheat outer
   transport ceiling is 30,000 decisions so one native run can traverse Acts
   1--3, while exact semantic deadlock detection remains the early loop exit.
-- Replaced the five-run evaluation block at the first 10,000-step boundary with
-  one held-out run at 30k/100k/250k. This keeps validation without preventing
-  the updated actor from immediately continuing its training trajectory.
-- Added an observation-grounded combat-progress stall boundary: a combat that
-  produces no enemy HP loss for 256 consecutive decisions ends as a diagnosed
-  deadlock and starts a fresh native run. This addresses irreversible exhaust
-  states under unlimited revival without card-name rules, revival-count gates,
-  or verbose per-decision journals. Compact actor progress now also reports
-  enemy HP, pile sizes, decision surface, legal/selected action-kind counts,
-  last selected action kind, and no-damage age.
+- Restored a statistically useful deterministic preheat evaluation: 12 fixed
+  held-out odd seeds at fresh-lineage step zero and again at 30k/100k/250k.
+  Evaluation summaries now report both counts and rates for Act 1 clears and
+  Act 3 reaches instead of relying on the maximum floor of training episodes.
+- Replaced the damage-event combat stall boundary with observation-grounded net
+  progress. The 256-decision anchor advances only after a 5% net reduction in
+  enemy-health burden or a real phase/wave transition; damage that is healed
+  back, summon churn and repeated low-value hits no longer keep an exhausted
+  unlimited-revival combat alive until the 30,000-step transport ceiling.
+  Compact actor progress records the anchor, required reduction and no-net-
+  progress age without enabling verbose per-decision training journals.
+- Raised fail-closed legal-candidate capacity from 96 to 256 without truncation.
+  Sparse snapshots and learner collation still pad only to the largest active
+  candidate count in each batch; regression coverage includes a 111-candidate
+  multi-select/reselect discard/transform state backed by a 600-card deck.
+- Added a tested model-parameter initialization migration for capacity/config
+  changes that preserve learned tensor and feature ABI. It imports only the
+  learner network, republishes it to the actor, resets optimizer/queue/RNG/
+  counters into a new lineage, and records `model_parameter_initialization` as
+  parent provenance. Exact resume remains fail-closed and is never imitated.
 - Raised the relational world-token ceiling from 512 to 1,024 after the first
   complete 10,000-decision run reached Act 1 floor 17 and the following run
   exposed 61 additional pending factual nodes beyond the old limit. Overflow

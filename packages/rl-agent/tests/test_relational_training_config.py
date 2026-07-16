@@ -40,12 +40,16 @@ def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
     assert combat.model.max_world_tokens == 2048
     assert preheat.model.max_world_tokens == 2048
     assert preheat.model.max_candidate_local_tokens == 64
+    assert default.model.max_candidates == 256
+    assert combat.model.max_candidates == 256
+    assert preheat.model.max_candidates == 256
     assert preheat.rollout.minimum_unrolls == 4
-    assert preheat.runtime.evaluation_steps == (30_000, 100_000, 250_000)
-    assert preheat.runtime.evaluation_episodes == 1
-    assert preheat.diagnostics.combat_no_damage_window == 256
-    assert preheat.runtime.log_dir.endswith("v8-counted-card-multiset")
-    assert preheat.runtime.checkpoint_dir.endswith("v8-counted-card-multiset")
+    assert preheat.runtime.evaluation_steps == (0, 30_000, 100_000, 250_000)
+    assert preheat.runtime.evaluation_episodes == 12
+    assert preheat.diagnostics.combat_net_progress_window == 256
+    assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
+    assert preheat.runtime.log_dir.endswith("v9-candidate256-net-progress")
+    assert preheat.runtime.checkpoint_dir.endswith("v9-candidate256-net-progress")
     assert preheat.runtime.checkpoint_interval_steps == 10_000
     assert "direct" in preheat.runtime.log_dir
     assert "direct" in preheat.runtime.checkpoint_dir
@@ -74,8 +78,10 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
         OptimizationConfig(vtrace_rho_clip=0.0)
     with pytest.raises(ValueError, match="deadlock_repeat_threshold"):
         DiagnosticsConfig(deadlock_window=4, deadlock_repeat_threshold=5)
-    with pytest.raises(ValueError, match="combat_no_damage_window"):
-        DiagnosticsConfig(combat_no_damage_window=0)
+    with pytest.raises(ValueError, match="combat_net_progress_window"):
+        DiagnosticsConfig(combat_net_progress_window=0)
+    with pytest.raises(ValueError, match="combat_min_net_hp_fraction"):
+        DiagnosticsConfig(combat_min_net_hp_fraction=0.0)
     with pytest.raises(ValueError, match="strictly increasing"):
         RuntimeConfig(evaluation_steps=(0, 10, 10))
 

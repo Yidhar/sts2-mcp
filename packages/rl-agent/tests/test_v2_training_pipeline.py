@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -29,7 +30,11 @@ from sts2_rl.training import (
     TrainingConfig,
     build_training_resources,
     evaluate_policy,
+    initialize_model_from_checkpoint,
+    inspect_baseline,
     load_training_checkpoint,
+    preflight_model_initialization,
+    preflight_training_checkpoint,
     run_training,
     save_training_checkpoint,
 )
@@ -178,6 +183,28 @@ class StaleRevisionBackend(FakeCombatBackend):
         )
 
 
+class OscillatingDamageBackend(FakeCombatBackend):
+    """Deals damage every other step, then heals it all back."""
+
+    def _observation(self, *, terminal: bool) -> dict[str, Any]:
+        return {
+            "phase": "combat",
+            "decision_domain": "combat",
+            "player": {"id": "player", "hp": 50, "max_hp": 80},
+            "combat": {
+                "in_progress": not terminal,
+                "enemies": [
+                    {
+                        "id": "enemy",
+                        "hp": 95 if self._step % 2 else 100,
+                        "max_hp": 100,
+                    }
+                ],
+            },
+            "run": {"act": 1, "floor": 1},
+        }
+
+
 def _config(*, total_steps: int = 4) -> TrainingConfig:
     return TrainingConfig(
         profile="v2-test",
@@ -259,6 +286,14 @@ def test_collector_emits_contiguous_recurrent_unroll() -> None:
         resources.close()
 
 
+def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
+    config = _config()
+    report = inspect_baseline(config)
+    assert report["active_shape_batching"] is True
+    assert report["encoding_capacities"]["candidates"] == 6
+    assert report["candidate_shape"][1] < 6
+
+
 def test_collector_can_adopt_new_policy_only_between_complete_unrolls() -> None:
     resources = build_training_resources(
         _config(total_steps=4),
@@ -322,7 +357,7 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         resources.close()
 
 
-def test_combat_without_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
+def test_combat_without_net_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
     base = _config(total_steps=12)
     config = replace(
         base,
@@ -330,7 +365,8 @@ def test_combat_without_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
         diagnostics=DiagnosticsConfig(
             deadlock_window=128,
             deadlock_repeat_threshold=8,
-            combat_no_damage_window=3,
+            combat_net_progress_window=3,
+            combat_min_net_hp_fraction=0.05,
             journal_policy_topk=5,
         ),
     )
@@ -348,9 +384,10 @@ def test_combat_without_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
         assert episode.metrics.deadlocked
         assert episode.metrics.combat_progress_stalled
         assert episode.metrics.terminal_reason == "combat_progress_stall"
-        assert episode.metrics.maximum_combat_no_damage_steps == 3
+        assert episode.metrics.maximum_combat_no_net_progress_steps == 3
         assert progress[-1].combat_in_progress
-        assert progress[-1].combat_no_damage_steps == 3
+        assert progress[-1].combat_no_net_progress_steps == 3
+        assert progress[-1].combat_anchor_enemy_hp_total == 1.0
         assert progress[-1].enemy_hp_total == 1.0
         assert progress[-1].legal_action_kinds == {
             "end_turn": 1,
@@ -361,6 +398,33 @@ def test_combat_without_enemy_hp_progress_ends_as_diagnosed_deadlock() -> None:
             "end_turn",
             "play_card",
         }
+    finally:
+        resources.close()
+
+
+def test_transient_damage_followed_by_healing_does_not_fake_combat_progress() -> None:
+    base = _config(total_steps=12)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=12),
+        diagnostics=DiagnosticsConfig(
+            deadlock_window=128,
+            deadlock_repeat_threshold=8,
+            combat_net_progress_window=4,
+            combat_min_net_hp_fraction=0.10,
+            journal_policy_topk=5,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=OscillatingDamageBackend(terminal_step=100),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 4
+        assert episode.metrics.combat_progress_stalled
+        assert episode.metrics.terminal_reason == "combat_progress_stall"
+        assert episode.metrics.maximum_combat_no_net_progress_steps == 4
     finally:
         resources.close()
 
@@ -532,6 +596,9 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         )
         assert len(episodes) == 2
         assert summary["combat_win_rate"] == 1.0
+        assert summary["act1_clear_count"] == 0
+        assert summary["act3_reach_count"] == 0
+        assert summary["act3_reach_rate"] == 0.0
         assert all(int(seed) % 2 == 1 for seed in backend.reset_seeds)
         assert (tmp_path / "trajectory.jsonl").read_text(encoding="utf-8")
     finally:
@@ -579,6 +646,98 @@ def test_v2_checkpoint_roundtrip_restores_models_optimizer_queue_and_rng(
         assert not (checkpoint / "replay_buffer.pkl").exists()
     finally:
         restored.close()
+
+
+def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(
+    tmp_path: Path,
+) -> None:
+    source_config = _config()
+    source = build_training_resources(source_config, backend=FakeCombatBackend())
+    try:
+        source.rollout_queue.put(
+            source.collector.collect_episode(record=True).unrolls[0]
+        )
+        source.optimizer.zero_grad(set_to_none=True)
+        objective = sum(
+            parameter.square().mean() for parameter in source.model.parameters()
+        )
+        objective.backward()
+        source.optimizer.step()
+        source_state = {
+            key: value.detach().clone()
+            for key, value in source.model.state_dict().items()
+        }
+        source_training_state = TrainingState(
+            environment_steps=40_737,
+            learner_updates=638,
+            episodes=14,
+            evaluation_episodes=1,
+            policy_version=638,
+            actor_policy_version=638,
+            consumed_unrolls=2_552,
+        )
+        checkpoint = save_training_checkpoint(
+            tmp_path / "policy-638",
+            config=source_config,
+            resources=source,
+            state=source_training_state,
+            run_id="source-policy-638",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    target_config = replace(
+        source_config,
+        model=replace(source_config.model, max_candidates=256),
+    )
+    with pytest.raises(ValueError, match="identical immutable.*lineage"):
+        preflight_training_checkpoint(
+            checkpoint,
+            config=target_config,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+        )
+    validated = preflight_model_initialization(
+        checkpoint,
+        config=target_config,
+    )
+    assert validated.metadata["training_state"]["policy_version"] == 638
+
+    target = build_training_resources(target_config, backend=FakeCombatBackend())
+    try:
+        initial_collector_state = target.collector.state_dict()
+        parent = initialize_model_from_checkpoint(
+            checkpoint,
+            config=target_config,
+            resources=target,
+        )
+        assert parent == checkpoint.resolve()
+        assert len(target.optimizer.state) == 0
+        assert len(target.rollout_queue) == 0
+        assert target.collector.state_dict() == initial_collector_state
+        for key, expected in source_state.items():
+            assert torch.equal(target.model.state_dict()[key], expected), key
+            assert torch.equal(target.collector_model.state_dict()[key], expected), key
+
+        migrated = save_training_checkpoint(
+            tmp_path / "new-lineage-step-zero",
+            config=target_config,
+            resources=target,
+            state=TrainingState(),
+            parent_checkpoint=checkpoint,
+            run_id="candidate256-lineage",
+            checkpoint_load_mode="model_initialization",
+            parent_relation="model_parameter_initialization",
+        )
+        metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["training_state"] == asdict(TrainingState())
+        assert metadata["provenance"]["checkpoint_load_mode"] == "model_initialization"
+        parent_metadata = metadata["provenance"]["parent_checkpoint"]
+        assert parent_metadata["relation"] == "model_parameter_initialization"
+        assert parent_metadata["training_state"]["policy_version"] == 638
+    finally:
+        target.close()
 
 
 def test_previous_selection_abi_checkpoint_is_rejected_before_tensor_load(

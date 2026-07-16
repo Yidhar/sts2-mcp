@@ -208,8 +208,10 @@ the learner applies bounded-lag V-trace correction and republishes parameters on
 at actor episode boundaries.
 
 The v1/v2 runs are retained only as failure evidence and are not model or replay
-initialization sources. No v3 Act 1 clear-rate claim exists until fixed odd-seed
-evaluations at steps 0, 10k, 25k and 50k complete.
+initialization sources. A compatible v3 network may be imported explicitly with
+`--initialize-from`; this initializes model parameters only and starts a new
+optimizer/queue/RNG/counter lineage rather than pretending to resume. No v3
+performance claim exists without fixed odd-seed evaluation counts and rates.
 
 ## Contracts and game data
 

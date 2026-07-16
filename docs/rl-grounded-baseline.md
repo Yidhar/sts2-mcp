@@ -123,8 +123,10 @@ simulator reset.
 Each completed unroll also updates one compact actor-progress snapshot with the
 current maximum Act/floor, cumulative reward, revivals, HP loss, enemy HP,
 hand/draw/discard/exhaust counts, decision surface, legal/selected action-kind
-counts, the last selected action, no-damage age, and the exact behavior-policy
-version. Learner metrics attach that snapshot without
+counts, the last selected action, no-net-progress age, and the exact behavior-policy
+version. The combat age is now measured from the last meaningful net-health or
+phase/wave advance, not the last transient damage event. Learner metrics attach
+that snapshot without
 writing a verbose per-decision training journal, so an in-flight Act 1--3 run
 remains observable without sacrificing simulator throughput.
 
@@ -223,8 +225,9 @@ forward run distance with three bounded costs:
 
 The profile keeps a 30,000-decision outer transport-safety ceiling and uses
 undiscounted return. Exact semantic deadlock detection terminates a genuine
-reversible UI loop earlier. Separately, 256 consecutive combat decisions with
-no observed enemy HP loss terminate as a diagnosed progress deadlock. This
+reversible UI loop earlier. Separately, a 256-decision combat window requires a
+5% net reduction in current enemy-health burden or a real phase/wave advance.
+Damage followed by healing and summon churn do not reset the window. This
 generic fact boundary prevents an irreversibly exhausted unlimited-revival
 combat from consuming the rest of the run; it does not inspect card IDs,
 preferred actions, damage estimates, or revival counts. The outer ceiling is
@@ -254,7 +257,7 @@ schema and one real event-to-combat transport path; it does not score actions or
 truncate the training curriculum.
 
 Learner collation pads only to the largest active world/candidate/local shape
-in each batch. The configured 512/96/64 capacities remain fail-closed input
+in each batch. The configured 2048/256/64 capacities remain fail-closed input
 limits, but are not paid on every small decision. The preheat profile uses
 16-step recurrent unrolls in batches of four so an initial ROCm update completes
 before the asynchronous collector can accumulate hours of unusable rollout.
@@ -278,7 +281,8 @@ Training seeds are even; held-out evaluation seeds are odd. The default v3 gates
 are steps 0, 10,000, 25,000 and 50,000, with fixed seeds and deterministic policy.
 Reports include:
 
-- Act 1 clear rate;
+- Act 1 clear count and rate;
+- Act 3 reach count and rate;
 - run/combat win rate as applicable;
 - semantic deadlock rate;
 - mean and maximum floor;
@@ -289,6 +293,9 @@ Reports include:
 
 No Act 1 performance claim is valid without these held-out evaluations and their
 trajectory journals.
+
+The native-revival preheat profile evaluates 12 fixed held-out seeds at step
+zero (including after model-parameter initialization) and at 30k/100k/250k.
 
 ## Checkpoint ABI
 
@@ -309,6 +316,14 @@ the contract/reward/dependency identities, model and encoding config, learner an
 actor tensor specifications, optimizer layout, pending unrolls, devices, RNGs and
 collector continuation state before mutating live resources. Old checkpoints
 containing `replay_buffer.pkl` are rejected; there is no v1 compatibility loader.
+
+`--initialize-from` is a different, explicit operation. When the learned tensor
+shapes and grounded feature ABI are unchanged, capacity/config changes such as
+`max_candidates = 96` to `256` may import the learner network into a fresh
+lineage. Optimizer state, queued unrolls, RNGs, collector continuation, counters
+and policy-version numbers are not imported. Child checkpoint provenance uses
+the `model_parameter_initialization` relation, so this cannot be confused with
+exact resume.
 
 ## Commands
 

@@ -22,7 +22,7 @@ zone_vocab_size = 32
 order_vocab_size = 128
 domain_count = 8
 max_world_tokens = 2048
-max_candidates = 96
+max_candidates = 256
 max_candidate_local_tokens = 64
 
 [optimization]
@@ -72,5 +72,6 @@ evaluation_episodes = 50
 [diagnostics]
 deadlock_window = 128
 deadlock_repeat_threshold = 8
-combat_no_damage_window = 256
+combat_net_progress_window = 256
+combat_min_net_hp_fraction = 0.05
 journal_policy_topk = 5

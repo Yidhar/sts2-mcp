@@ -1261,6 +1261,154 @@ def test_encoder_never_silently_truncates_legal_candidates() -> None:
         encoder.encode(_observation(), actions)
 
 
+def test_111_candidate_multiselect_discard_transform_and_huge_deck_regression() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=2048,
+            max_candidates=256,
+            max_candidate_local_tokens=64,
+        )
+    )
+    selectable = [
+        {
+            "option_index": index,
+            "is_selected": index >= 100,
+            "card": {
+                "id": f"CARD.OPTION_{index % 13}",
+                "instance_uuid": f"option-{index}",
+                "pile": "Hand" if index < 100 else "Selected",
+                "cost": index % 4,
+            },
+        }
+        for index in range(109)
+    ]
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 3, "floor": 46},
+        "player": {
+            "id": "ironclad",
+            "hp": 80,
+            "max_hp": 80,
+            "deck": [
+                {
+                    "id": f"CARD.DECK_{index % 17}",
+                    "instance_uuid": f"deck-{index}",
+                    "type": "Attack" if index % 2 else "Skill",
+                    "cost": index % 4,
+                    "is_upgraded": index >= 400,
+                }
+                for index in range(600)
+            ],
+        },
+        "combat": {
+            "in_progress": True,
+            "draw_pile": [],
+            "discard_pile": [],
+            "exhaust_pile": [],
+            "enemies": [{"id": "MONSTER.BOSS", "hp": 111, "max_hp": 200}],
+        },
+        "card_selection": {
+            "mode": "SimpleGrid",
+            "prompt_id": "card.REGRESSION.large_checkbox",
+            "operation_type": "discard",
+            "source_zone": "Hand",
+            "destination_zone": "Discard",
+            "selected_count": 9,
+            "min_select": 1,
+            "max_select": 20,
+            "remaining_select": 11,
+            "requires_manual_confirmation": True,
+            "can_confirm": True,
+            "options": selectable,
+        },
+    }
+    actions = [
+        {
+            "action_handle": f"select:{index}",
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "is_enabled": True,
+            "card": {
+                **selectable[index]["card"],
+                "selection_membership": "selectable",
+            },
+        }
+        for index in range(100)
+    ]
+    actions.extend(
+        {
+            "action_handle": f"deselect:{index}",
+            "kind": "deselect_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "deselect",
+            "is_enabled": True,
+            "card": {
+                **selectable[100 + index]["card"],
+                "selection_membership": "selected",
+                "is_selected": True,
+            },
+        }
+        for index in range(9)
+    )
+    actions.extend(
+        [
+            {
+                "action_handle": "selection:confirm",
+                "kind": "confirm_selection",
+                "model_action_kind": "card_selection",
+                "model_action_variant": "confirm",
+                "is_enabled": True,
+            },
+            {
+                "action_handle": "selection:cancel",
+                "kind": "cancel_selection",
+                "model_action_kind": "card_selection",
+                "model_action_variant": "cancel_prompt",
+                "is_enabled": True,
+            },
+        ]
+    )
+    assert len(actions) == 111
+
+    discard = encoder.encode(observation, actions)
+    transform_observation = deepcopy(observation)
+    transform_selection = transform_observation["card_selection"]
+    assert isinstance(transform_selection, dict)
+    transform_selection["operation_type"] = "transform"
+    transform_selection["destination_zone"] = "Transformed"
+    transformed = encoder.encode(transform_observation, actions)
+    batch = encoder.stack([discard, transformed])
+
+    assert discard.snapshot.candidate_count == 111
+    assert transformed.snapshot.candidate_count == 111
+    assert batch.candidates.features.shape[:2] == (2, 111)
+    assert batch.candidates.features.shape[1] < encoder.config.max_candidates
+    assert batch.candidates.action_mask.all()
+    assert discard.action(0).handle == "select:0"
+    assert discard.action(100).handle == "deselect:0"
+    assert discard.action(109).handle == "selection:confirm"
+    assert not torch.equal(discard.batch.world.features, transformed.batch.world.features)
+    assert not torch.equal(
+        discard.batch.candidates.role_ids[:, 0],
+        discard.batch.candidates.role_ids[:, 100],
+    )
+
+    overflow = [
+        {
+            "action_handle": f"overflow:{index}",
+            "kind": "choose",
+            "is_enabled": True,
+        }
+        for index in range(257)
+    ]
+    with pytest.raises(ValueError, match=r"count=257 capacity=256"):
+        encoder.encode(observation, overflow)
+
+
 def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
     model = _small_model_config()
     world_limited = GroundedObservationEncoder(

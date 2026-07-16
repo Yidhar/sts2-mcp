@@ -219,7 +219,12 @@ def build_checkpoint_provenance(
         parent_path = Path(parent_checkpoint).expanduser().resolve(strict=False)
         parent = {"path": str(parent_path)}
         relation = parent_relation or "unspecified_parent"
-        if relation not in {"loaded_parent", "in_process_successor", "unspecified_parent"}:
+        if relation not in {
+            "loaded_parent",
+            "model_parameter_initialization",
+            "in_process_successor",
+            "unspecified_parent",
+        }:
             raise ValueError("checkpoint parent relation is missing or unsupported")
         parent["relation"] = relation
         manifest = _hashed_file(parent_path / "checkpoint.manifest.json")
@@ -230,6 +235,7 @@ def build_checkpoint_provenance(
             parent["checkpoint_id"] = parent_manifest_payload.get("checkpoint_id")
         if parent_metadata_payload is not None:
             parent["total_steps"] = parent_metadata_payload.get("total_steps")
+            parent["training_state"] = parent_metadata_payload.get("training_state")
             parent_provenance = parent_metadata_payload.get("provenance")
             if isinstance(parent_provenance, dict):
                 parent_reward = parent_provenance.get("reward_spec")

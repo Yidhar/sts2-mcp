@@ -72,7 +72,10 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
     if not episodes:
         return {
             "episodes": 0,
+            "act1_clear_count": 0,
             "act1_clear_rate": 0.0,
+            "act3_reach_count": 0,
+            "act3_reach_rate": 0.0,
             "run_win_rate": 0.0,
             "combat_win_rate": 0.0,
             "deadlock_rate": 0.0,
@@ -91,7 +94,10 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
     count = len(episodes)
     return {
         "episodes": count,
+        "act1_clear_count": sum(item.act1_cleared for item in episodes),
         "act1_clear_rate": sum(item.act1_cleared for item in episodes) / count,
+        "act3_reach_count": sum(item.max_act >= 3 for item in episodes),
+        "act3_reach_rate": sum(item.max_act >= 3 for item in episodes) / count,
         "run_win_rate": sum(item.run_won for item in episodes) / count,
         "combat_win_rate": sum(item.combat_won for item in episodes) / count,
         "deadlock_rate": sum(item.deadlocked for item in episodes) / count,
@@ -207,6 +213,12 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "recurrent_state_shape": list(output.recurrent_state.shape),
         "world_shape": list(decision.batch.world.features.shape),
         "candidate_shape": list(decision.batch.candidates.features.shape),
+        "active_shape_batching": True,
+        "encoding_capacities": {
+            "world": config.model.max_world_tokens,
+            "candidates": config.model.max_candidates,
+            "candidate_local": config.model.max_candidate_local_tokens,
+        },
         "reward_objective": config.curriculum.reward_objective,
         "curriculum_mode": config.curriculum.mode,
         "revival_relic_id": config.curriculum.revival_relic_id,
@@ -238,7 +250,11 @@ def _save(
         run_id=run_id,
         checkpoint_load_mode=load_mode,
         parent_relation=(
-            "loaded_parent" if parent_checkpoint is not None else None
+            "model_parameter_initialization"
+            if parent_checkpoint is not None and load_mode == "model_initialization"
+            else "loaded_parent"
+            if parent_checkpoint is not None
+            else None
         ),
     )
 
@@ -306,6 +322,25 @@ def run_training(
                 "state": asdict(state),
                 "config": config.to_mapping(),
                 "pipeline": "bounded-fifo-async-vtrace-v3",
+                "checkpoint_load": {
+                    "mode": load_mode,
+                    "parent_checkpoint": (
+                        str(parent_checkpoint)
+                        if parent_checkpoint is not None
+                        else None
+                    ),
+                    "source_training_state": (
+                        prevalidated_initialization.metadata.get("training_state")
+                        if prevalidated_initialization is not None
+                        else None
+                    ),
+                    "network_parameters_initialized": (
+                        load_mode == "model_initialization"
+                    ),
+                    "optimizer_rollouts_rng_and_counters_reset": (
+                        load_mode == "model_initialization"
+                    ),
+                },
             },
         )
 

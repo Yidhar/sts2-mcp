@@ -22,7 +22,7 @@ zone_vocab_size = 32
 order_vocab_size = 128
 domain_count = 8
 max_world_tokens = 2048
-max_candidates = 96
+max_candidates = 256
 max_candidate_local_tokens = 64
 
 [optimization]
@@ -68,17 +68,18 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-direct-v8-counted-card-multiset"
-checkpoint_dir = "checkpoints/full-run-revival-direct-v8-counted-card-multiset"
+log_dir = "runs/full-run-revival-direct-v9-candidate256-net-progress"
+checkpoint_dir = "checkpoints/full-run-revival-direct-v9-candidate256-net-progress"
 checkpoint_interval_steps = 10000
-# Do not block actor/learner startup on a deterministic evaluation of the
-# randomly initialized policy. The short simulator/mechanics preflight and a
-# real GPU update smoke test cover plumbing; held-out evaluation begins later.
-evaluation_steps = [30000, 100000, 250000]
-evaluation_episodes = 1
+# A model-initialization lineage starts at step zero even when its network
+# parameters came from an older policy. Validate that inherited policy on a
+# fixed, statistically useful held-out seed prefix before collecting updates.
+evaluation_steps = [0, 30000, 100000, 250000]
+evaluation_episodes = 12
 
 [diagnostics]
 deadlock_window = 128
 deadlock_repeat_threshold = 8
-combat_no_damage_window = 256
+combat_net_progress_window = 256
+combat_min_net_hp_fraction = 0.05
 journal_policy_topk = 5

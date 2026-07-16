@@ -119,6 +119,7 @@ def test_checkpoint_provenance_captures_reproducibility_and_parent_lineage(
         config_version="sts2-training-config-v1",
         config_profile="combat",
         checkpoint_load_mode="model_initialization",
+        parent_relation="model_parameter_initialization",
     )
 
     assert provenance["provenance_schema_version"] == "sts2-checkpoint-provenance-v1"
@@ -147,7 +148,10 @@ def test_checkpoint_provenance_captures_reproducibility_and_parent_lineage(
     )
     assert "commit" in provenance["git"]
     assert provenance["parent_checkpoint"]["checkpoint_id"] == "parent-id"
-    assert provenance["parent_checkpoint"]["relation"] == "unspecified_parent"
+    assert (
+        provenance["parent_checkpoint"]["relation"]
+        == "model_parameter_initialization"
+    )
     assert provenance["parent_checkpoint"]["total_steps"] == 42
     assert provenance["parent_checkpoint"]["manifest"]["sha256"]
     assert provenance["parent_checkpoint"]["metadata"]["sha256"]

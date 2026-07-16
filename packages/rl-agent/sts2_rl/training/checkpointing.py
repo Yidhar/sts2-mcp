@@ -460,7 +460,13 @@ def initialize_model_from_checkpoint(
     config: TrainingConfig,
     resources: TrainingResources,
 ) -> Path:
-    """Initialize only from a complete same-ABI v2 model, never from v1."""
+    """Migrate only network parameters into a fresh training lineage.
+
+    This is deliberately not exact resume: optimizer moments, queued unrolls,
+    collector/RNG state, environment counters, and policy-version counters are
+    left at their newly constructed values.  The source must still match the
+    exact learned-parameter and grounded feature ABI.
+    """
 
     validated = preflight_model_initialization(checkpoint, config=config)
     state = torch.load(

@@ -29,7 +29,6 @@ from sts2_rl.contracts import (
 )
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.models import RecurrentCandidateModel
-from sts2_rl.transitions import TransitionFacts
 
 from .seeding import (
     EVALUATION_SEED_PARITY,
@@ -75,7 +74,7 @@ class EpisodeMetrics:
     forced_decisions: int
     deadlocked: bool
     combat_progress_stalled: bool
-    maximum_combat_no_damage_steps: int
+    maximum_combat_no_net_progress_steps: int
     revivals_used: int
     revival_free_combat_win: bool
     revival_free_act1_clear: bool
@@ -109,7 +108,9 @@ class EpisodeProgress:
     combat_in_progress: bool
     phase: str
     decision_domain: str
-    combat_no_damage_steps: int
+    combat_no_net_progress_steps: int
+    combat_anchor_enemy_hp_total: float
+    combat_required_net_hp_progress: float
     enemy_hp_total: float
     enemy_max_hp_total: float
     hand_cards: int
@@ -244,6 +245,235 @@ def _enemy_hp_totals(observation: Mapping[str, object]) -> tuple[float, float]:
     return current, maximum
 
 
+def _enemy_roster_signature(observation: Mapping[str, object]) -> tuple[str, ...]:
+    """Return a stable multiset identity without volatile HP/status fields."""
+
+    combat = observation.get("combat")
+    enemies = combat.get("enemies") if isinstance(combat, Mapping) else None
+    if not isinstance(enemies, list | tuple):
+        return ()
+    identities: list[str] = []
+    for index, enemy in enumerate(enemies):
+        if not isinstance(enemy, Mapping):
+            continue
+        definition = next(
+            (
+                str(enemy[key])
+                for key in (
+                    "instance_uuid",
+                    "instance_id",
+                    "entity_uuid",
+                    "entity_id",
+                    "monster_id",
+                    "id",
+                )
+                if enemy.get(key) not in (None, "")
+            ),
+            f"anonymous:{index}",
+        )
+        identities.append(definition.strip().lower())
+    return tuple(sorted(identities))
+
+
+def _combat_phase_signature(observation: Mapping[str, object]) -> tuple[str, ...]:
+    """Extract explicit phase/wave identities, deliberately excluding turns."""
+
+    combat = observation.get("combat")
+    if not isinstance(combat, Mapping):
+        return ()
+    markers: list[str] = []
+    for key in (
+        "encounter_id",
+        "combat_id",
+        "wave",
+        "wave_id",
+        "wave_index",
+        "stage",
+        "stage_id",
+    ):
+        value = combat.get(key)
+        if isinstance(value, str | int | float) and not isinstance(value, bool):
+            markers.append(f"combat.{key}={value}")
+    enemies = combat.get("enemies")
+    if isinstance(enemies, list | tuple):
+        for index, enemy in enumerate(enemies):
+            if not isinstance(enemy, Mapping):
+                continue
+            for key in ("stage", "stage_id"):
+                value = enemy.get(key)
+                if isinstance(value, str | int | float) and not isinstance(value, bool):
+                    markers.append(f"enemy[{index}].{key}={value}")
+    return tuple(markers)
+
+
+@dataclass(frozen=True, slots=True)
+class _CombatNetProgressStatus:
+    age_steps: int
+    maximum_age_steps: int
+    stalled: bool
+    current_hp: float
+    maximum_hp: float
+    anchor_hp: float
+    required_hp_progress: float
+    net_hp_progress: float
+    progress_kind: str
+
+
+class _CombatNetProgressTracker:
+    """Detect combat loops by monotonic net progress, not transient damage.
+
+    A hit followed by healing no longer resets the window.  The anchor advances
+    only after a meaningful *net* reduction in the current enemy health burden,
+    or after an explicit phase/wave transition.  Adding summons is not progress;
+    defeating them without reducing the pre-summon burden is intentionally
+    neutral.  This closes the old loophole where tiny recurring damage kept a
+    hopeless combat alive until the 30,000-step transport ceiling.
+    """
+
+    def __init__(self, *, window: int, minimum_hp_fraction: float) -> None:
+        self.window = int(window)
+        self.minimum_hp_fraction = float(minimum_hp_fraction)
+        self.reset()
+
+    def reset(self) -> None:
+        self._active = False
+        self._anchor_step = 0
+        self._anchor_hp = 0.0
+        self._anchor_max_hp = 0.0
+        self._last_hp = 0.0
+        self._last_max_hp = 0.0
+        self._roster: tuple[str, ...] = ()
+        self._phase: tuple[str, ...] = ()
+        self._maximum_age = 0
+
+    def _start(
+        self,
+        *,
+        step: int,
+        current_hp: float,
+        maximum_hp: float,
+        roster: tuple[str, ...],
+        phase: tuple[str, ...],
+    ) -> None:
+        self._active = True
+        self._anchor_step = step
+        self._anchor_hp = current_hp
+        self._anchor_max_hp = maximum_hp
+        self._last_hp = current_hp
+        self._last_max_hp = maximum_hp
+        self._roster = roster
+        self._phase = phase
+
+    def observe(
+        self,
+        *,
+        step: int,
+        observation: Mapping[str, object],
+    ) -> _CombatNetProgressStatus:
+        current_hp, maximum_hp = _enemy_hp_totals(observation)
+        if not _combat_in_progress(observation):
+            maximum_age = self._maximum_age
+            self.reset()
+            self._maximum_age = maximum_age
+            return _CombatNetProgressStatus(
+                age_steps=0,
+                maximum_age_steps=self._maximum_age,
+                stalled=False,
+                current_hp=current_hp,
+                maximum_hp=maximum_hp,
+                anchor_hp=current_hp,
+                required_hp_progress=0.0,
+                net_hp_progress=0.0,
+                progress_kind="outside_combat",
+            )
+
+        roster = _enemy_roster_signature(observation)
+        phase = _combat_phase_signature(observation)
+        if not self._active:
+            self._start(
+                step=step,
+                current_hp=current_hp,
+                maximum_hp=maximum_hp,
+                roster=roster,
+                phase=phase,
+            )
+            return _CombatNetProgressStatus(
+                age_steps=0,
+                maximum_age_steps=self._maximum_age,
+                stalled=False,
+                current_hp=current_hp,
+                maximum_hp=maximum_hp,
+                anchor_hp=current_hp,
+                required_hp_progress=max(1.0, maximum_hp * self.minimum_hp_fraction),
+                net_hp_progress=0.0,
+                progress_kind="combat_started",
+            )
+
+        prior_roster = self._roster
+        prior_phase = self._phase
+        required = max(
+            1.0,
+            max(self._anchor_max_hp, maximum_hp) * self.minimum_hp_fraction,
+        )
+        net_progress = self._anchor_hp - current_hp
+        roster_replaced = bool(
+            roster != prior_roster
+            and prior_roster
+            and roster
+            and not set(prior_roster).intersection(roster)
+        )
+        advanced_from_defeated_wave = bool(
+            roster != prior_roster
+            and self._last_hp <= max(1.0, self._last_max_hp * self.minimum_hp_fraction)
+            and current_hp > self._last_hp
+        )
+        explicit_phase_advance = bool(phase != prior_phase and prior_phase and phase)
+        progress_kind = "waiting_for_net_progress"
+        if explicit_phase_advance or roster_replaced or advanced_from_defeated_wave:
+            self._start(
+                step=step,
+                current_hp=current_hp,
+                maximum_hp=maximum_hp,
+                roster=roster,
+                phase=phase,
+            )
+            progress_kind = "phase_or_wave_advanced"
+            net_progress = 0.0
+            required = max(1.0, maximum_hp * self.minimum_hp_fraction)
+        elif net_progress >= required:
+            self._start(
+                step=step,
+                current_hp=current_hp,
+                maximum_hp=maximum_hp,
+                roster=roster,
+                phase=phase,
+            )
+            progress_kind = "meaningful_net_hp_reduction"
+            net_progress = 0.0
+            required = max(1.0, maximum_hp * self.minimum_hp_fraction)
+        else:
+            # A summon/addition changes the burden but must not reset the age.
+            # Retain the old anchor while tracking the latest structural facts.
+            self._roster = roster
+            self._phase = phase
+            self._last_hp = current_hp
+            self._last_max_hp = maximum_hp
+
+        age = step - self._anchor_step
+        self._maximum_age = max(self._maximum_age, age)
+        return _CombatNetProgressStatus(
+            age_steps=age,
+            maximum_age_steps=self._maximum_age,
+            stalled=age >= self.window,
+            current_hp=current_hp,
+            maximum_hp=maximum_hp,
+            anchor_hp=self._anchor_hp,
+            required_hp_progress=required,
+            net_hp_progress=self._anchor_hp - current_hp,
+            progress_kind=progress_kind,
+        )
+
+
 def _zone_count(observation: Mapping[str, object], key: str) -> int:
     player = observation.get("player")
     value = player.get(key) if isinstance(player, Mapping) else None
@@ -284,7 +514,8 @@ class GroundedCollector:
         unroll_length: int = 64,
         deadlock_window: int = 128,
         deadlock_repeat_threshold: int = 8,
-        combat_no_damage_window: int = 256,
+        combat_net_progress_window: int = 256,
+        combat_min_net_hp_fraction: float = 0.05,
         journal_policy_topk: int = 5,
         reward_calculator: RewardCalculator | None = None,
         additional_relics: tuple[str, ...] = (),
@@ -325,12 +556,19 @@ class GroundedCollector:
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
             raise ValueError("journal_policy_topk must be positive")
-        if isinstance(combat_no_damage_window, bool) or not isinstance(
-            combat_no_damage_window, int
+        if isinstance(combat_net_progress_window, bool) or not isinstance(
+            combat_net_progress_window, int
         ):
-            raise TypeError("combat_no_damage_window must be an integer")
-        if combat_no_damage_window <= 0:
-            raise ValueError("combat_no_damage_window must be positive")
+            raise TypeError("combat_net_progress_window must be an integer")
+        if combat_net_progress_window <= 0:
+            raise ValueError("combat_net_progress_window must be positive")
+        if (
+            isinstance(combat_min_net_hp_fraction, bool)
+            or not isinstance(combat_min_net_hp_fraction, int | float)
+            or not math.isfinite(float(combat_min_net_hp_fraction))
+            or not 0.0 < float(combat_min_net_hp_fraction) <= 1.0
+        ):
+            raise ValueError("combat_min_net_hp_fraction must be in (0, 1]")
         self.model = model
         self.encoder = encoder
         self.backend = backend
@@ -342,7 +580,10 @@ class GroundedCollector:
         self.encounter_id = encounter_id
         self.unroll_length = unroll_length
         self.journal_policy_topk = journal_policy_topk
-        self.combat_no_damage_window = combat_no_damage_window
+        self.combat_net_progress_window = combat_net_progress_window
+        self.combat_min_net_hp_fraction = float(
+            combat_min_net_hp_fraction
+        )
         self.additional_relics = tuple(str(item) for item in additional_relics)
         self.revival_relic_id = (
             revival_relic_id.strip().upper()
@@ -768,10 +1009,19 @@ class GroundedCollector:
         final_outcome = "ongoing"
         deadlocked = False
         combat_progress_stalled = False
+        combat_progress = _CombatNetProgressTracker(
+            window=self.combat_net_progress_window,
+            minimum_hp_fraction=self.combat_min_net_hp_fraction,
+        )
+        combat_progress_status = combat_progress.observe(
+            step=0,
+            observation=state.observation,
+        )
         combat_in_progress = _combat_in_progress(state.observation)
-        last_enemy_damage_step = 0
-        combat_no_damage_steps = 0
-        maximum_combat_no_damage_steps = 0
+        combat_no_net_progress_steps = combat_progress_status.age_steps
+        maximum_combat_no_net_progress_steps = (
+            combat_progress_status.maximum_age_steps
+        )
         forced_horizon = False
         curriculum_horizon = False
         revivals_used = 0
@@ -829,37 +1079,17 @@ class GroundedCollector:
             )
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
-            transition_facts = TransitionFacts.from_mapping(
-                next_state.transition.facts
-            )
-            observed_enemy_hp_delta = (
-                _enemy_hp_totals(state.observation)[0]
-                - _enemy_hp_totals(next_state.observation)[0]
-            )
-            enemy_hp_loss = max(
-                transition_facts.enemy_hp_delta,
-                observed_enemy_hp_delta,
-            )
             next_combat_in_progress = _combat_in_progress(next_state.observation)
-            if next_combat_in_progress and not combat_in_progress:
-                last_enemy_damage_step = steps_taken
-            elif next_combat_in_progress and enemy_hp_loss > 0.0:
-                last_enemy_damage_step = steps_taken
-            elif not next_combat_in_progress:
-                last_enemy_damage_step = steps_taken
-            combat_no_damage_steps = (
-                steps_taken - last_enemy_damage_step
-                if next_combat_in_progress
-                else 0
+            combat_progress_status = combat_progress.observe(
+                step=steps_taken,
+                observation=next_state.observation,
             )
-            maximum_combat_no_damage_steps = max(
-                maximum_combat_no_damage_steps,
-                combat_no_damage_steps,
+            combat_no_net_progress_steps = combat_progress_status.age_steps
+            maximum_combat_no_net_progress_steps = max(
+                maximum_combat_no_net_progress_steps,
+                combat_progress_status.maximum_age_steps,
             )
-            combat_progress_stalled = bool(
-                next_combat_in_progress
-                and combat_no_damage_steps >= self.combat_no_damage_window
-            )
+            combat_progress_stalled = combat_progress_status.stalled
             combat_in_progress = next_combat_in_progress
             # ``maximum_steps`` may be a runtime's remaining global budget,
             # which can cut an otherwise healthy episode after only one or a
@@ -897,6 +1127,27 @@ class GroundedCollector:
                     )
                 )
             if trajectory_journal is not None:
+                journal_deadlock: Mapping[str, object] | None = None
+                if deadlock_evidence is not None:
+                    journal_deadlock = deadlock_evidence.to_mapping()
+                elif combat_progress_stalled:
+                    journal_deadlock = {
+                        "kind": "combat_no_net_progress",
+                        "window": self.combat_net_progress_window,
+                        "steps_without_net_progress": (
+                            combat_no_net_progress_steps
+                        ),
+                        "anchor_enemy_hp_total": combat_progress_status.anchor_hp,
+                        "current_enemy_hp_total": combat_progress_status.current_hp,
+                        "net_enemy_hp_progress": (
+                            combat_progress_status.net_hp_progress
+                        ),
+                        "required_net_enemy_hp_progress": (
+                            combat_progress_status.required_hp_progress
+                        ),
+                        "progress_kind": combat_progress_status.progress_kind,
+                        "detected_step": state.step_index,
+                    }
                 valid_indices = np.flatnonzero(choice.snapshot.action_mask)
                 ranked = sorted(
                     valid_indices.tolist(),
@@ -930,18 +1181,7 @@ class GroundedCollector:
                         "player_hp_lost": player_hp_lost,
                         "revivals_used": revivals_used,
                         "outcome": breakdown.outcome,
-                        "deadlock": (
-                            deadlock_evidence.to_mapping()
-                            if deadlock_evidence is not None
-                            else {
-                                "kind": "combat_no_enemy_hp_loss",
-                                "window": self.combat_no_damage_window,
-                                "steps_without_enemy_hp_loss": combat_no_damage_steps,
-                                "detected_step": state.step_index,
-                            }
-                            if combat_progress_stalled
-                            else None
-                        ),
+                        "deadlock": journal_deadlock,
                     }
                 )
             timings.record("reward_and_diagnostics", reward_started_ns)
@@ -1011,7 +1251,15 @@ class GroundedCollector:
                             decision_domain=str(
                                 state.observation.get("decision_domain") or ""
                             ),
-                            combat_no_damage_steps=combat_no_damage_steps,
+                            combat_no_net_progress_steps=(
+                                combat_no_net_progress_steps
+                            ),
+                            combat_anchor_enemy_hp_total=(
+                                combat_progress_status.anchor_hp
+                            ),
+                            combat_required_net_hp_progress=(
+                                combat_progress_status.required_hp_progress
+                            ),
                             enemy_hp_total=_enemy_hp_totals(state.observation)[0],
                             enemy_max_hp_total=_enemy_hp_totals(state.observation)[1],
                             hand_cards=_zone_count(state.observation, "hand"),
@@ -1075,7 +1323,9 @@ class GroundedCollector:
                 forced_decisions=forced_decisions,
                 deadlocked=deadlocked,
                 combat_progress_stalled=combat_progress_stalled,
-                maximum_combat_no_damage_steps=maximum_combat_no_damage_steps,
+                maximum_combat_no_net_progress_steps=(
+                    maximum_combat_no_net_progress_steps
+                ),
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
                 revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),

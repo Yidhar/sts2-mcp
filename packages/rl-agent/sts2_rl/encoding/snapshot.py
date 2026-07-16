@@ -40,7 +40,7 @@ class GroundedEncodingConfig:
 
     feature_dim: int = 224
     max_world_tokens: int = 2048
-    max_candidates: int = 96
+    max_candidates: int = 256
     max_candidate_local_tokens: int = 64
     type_vocab_size: int = 128
     role_vocab_size: int = 64
@@ -56,7 +56,7 @@ class GroundedEncodingConfig:
         model: GroundedCandidateConfig,
         *,
         max_world_tokens: int = 2048,
-        max_candidates: int = 96,
+        max_candidates: int = 256,
         max_candidate_local_tokens: int = 64,
     ) -> GroundedEncodingConfig:
         return cls(

@@ -80,7 +80,7 @@ class ModelConfig:
     order_vocab_size: int = 128
     domain_count: int = 8
     max_world_tokens: int = 2048
-    max_candidates: int = 96
+    max_candidates: int = 256
     max_candidate_local_tokens: int = 64
 
     def __post_init__(self) -> None:
@@ -397,14 +397,15 @@ class RuntimeConfig:
 class DiagnosticsConfig:
     deadlock_window: int = 128
     deadlock_repeat_threshold: int = 8
-    combat_no_damage_window: int = 256
+    combat_net_progress_window: int = 256
+    combat_min_net_hp_fraction: float = 0.05
     journal_policy_topk: int = 5
 
     def __post_init__(self) -> None:
         for name in (
             "deadlock_window",
             "deadlock_repeat_threshold",
-            "combat_no_damage_window",
+            "combat_net_progress_window",
             "journal_policy_topk",
         ):
             _require_int(
@@ -418,6 +419,16 @@ class DiagnosticsConfig:
             raise ValueError("diagnostics.deadlock_repeat_threshold must be at least 2")
         if self.deadlock_repeat_threshold > self.deadlock_window:
             raise ValueError("diagnostics.deadlock_repeat_threshold cannot exceed deadlock_window")
+        minimum_fraction = _require_finite_number(
+            self.combat_min_net_hp_fraction,
+            label="diagnostics.combat_min_net_hp_fraction",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if minimum_fraction <= 0.0:
+            raise ValueError(
+                "diagnostics.combat_min_net_hp_fraction must be greater than zero"
+            )
 
 
 @dataclass(frozen=True, slots=True)

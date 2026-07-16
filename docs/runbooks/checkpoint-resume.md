@@ -90,10 +90,15 @@ python -m sts2_rl.train `
   --initialize-from "$env:STS2_ARTIFACT_ROOT/checkpoints/recurrent-vtrace-combat/run-<uuid>/final-step-<steps>"
 ```
 
-This remains strict: atomic manifest, hashes, v3 format, current identities,
-identical model/encoding configuration and strict state keys/shapes are required.
-A deliberate architecture or encoder change starts from random initialization.
-The initial v2 mainline should therefore start fresh rather than importing v1.
+This remains strict: atomic manifest, hashes, v3 format, the learned-parameter
+configuration, grounded feature ABI, and strict state keys/shapes are required.
+Tensor-independent encoding capacities may change because they do not alter
+network parameter shapes; exact resume still rejects that changed lineage.
+Initialization imports only `network.pt`, republishes it to the actor, and leaves
+optimizer, queue, counters, collector/RNG state and policy-version counters fresh.
+The first child checkpoint records a `model_parameter_initialization` parent
+relation. A deliberate architecture or feature-encoding change starts randomly;
+v1 remains unsupported.
 
 ## Operational verification
 

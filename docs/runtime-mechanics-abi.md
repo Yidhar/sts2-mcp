@@ -116,6 +116,9 @@ runtime field mismatch blocks training.
 ## Checkpoint boundary
 
 The feature ABI minimum is now 224 and the encoding fingerprint/version are
-new. Exact resume and model initialization compare the complete encoding
-contract before loading tensors. Checkpoints from the previous card/selection
-ABI therefore fail closed; they must not be shape-padded or silently migrated.
+new. Exact resume compares the complete immutable training lineage, including
+encoding capacities. Model-parameter initialization compares the learned tensor
+configuration and grounded feature contract, so a tensor-independent capacity
+increase can start a clearly recorded fresh lineage. Checkpoints from the
+previous card/selection feature ABI still fail closed; they must not be shape-
+padded or silently migrated.
