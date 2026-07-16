@@ -322,6 +322,14 @@ class EnvironmentTransition:
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentResult:
+    """One immutable environment state envelope.
+
+    Backends must not mutate this result, its observation, legal actions, or
+    their nested DTOs after returning it.  The collector and bounded evaluation
+    journal deliberately retain read-only references across a small number of
+    decisions to avoid a full-state deep copy on every environment step.
+    """
+
     episode_id: str
     step_index: int
     observation: JsonObject
@@ -403,6 +411,8 @@ class EnvironmentResult:
 
 @runtime_checkable
 class EnvironmentBackend(Protocol):
+    """Backend contract returning immutable-per-step ``EnvironmentResult`` DTOs."""
+
     @property
     def capabilities(self) -> BackendCapabilities: ...
 

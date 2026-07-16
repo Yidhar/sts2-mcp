@@ -78,6 +78,35 @@ historical RL artifacts.
 
 ### Fixed
 
+- Added a generic 256-decision non-combat durable-progress boundary. It advances
+  only when the run locus changes or a previously unseen same-locus persistent
+  resource state appears; remembered resource fingerprints prevent bounded
+  `A -> B -> A` cycles from resetting it forever. Dynamic event previews such as
+  an ever-increasing `HpLoss`, changing option labels, and select/cancel or
+  select/deselect UI cycles therefore cannot consume the 30,000-step transport
+  ceiling. The detector records compact fingerprints and room context, never
+  card/event-specific policy rules.
+- Replaced full-state-per-decision held-out journals with trajectory journal v3.
+  Every decision keeps a compact auditable summary, while complete semantic
+  snapshots are limited to episode boundaries, every 256 decisions, detected
+  anomalies, and eight preceding context decisions. Evaluation metrics remain
+  unchanged, and the collector no longer deep-copies the complete observation
+  and legal-action surface on every held-out step. Version 3 consumers must read
+  the `summary` / `rich_snapshot` record union; compact strings are byte-bounded
+  with prefix, length, and SHA-256 identity when necessary. Stall snapshots keep
+  both the pre-action decision and the exact transition-result state that
+  triggered the detector.
+- Corrected checkpoint provenance after the first save in a live process.
+  Subsequent periodic/final checkpoints now use `in_process_successor` rather
+  than claiming `exact_resume`; genuine fresh, exact-resume, and model-parameter-
+  initialization starts retain their distinct first-checkpoint relationships.
+  Every non-fresh parent is now required to be a complete, hash-verified atomic
+  training checkpoint with consistent IDs, metadata and semantic identity.
+- Added the lightweight `maximum_observed_candidates` scalar to episode, actor,
+  held-out, run, and checkpoint metrics. It is measured from active snapshot
+  shapes without per-step logging or fixed 256-wide padding; legacy v3
+  checkpoints may migrate only this absent diagnostic field to zero.
+
 - Replaced copy-proportional Deck/Draw/Discard/Exhaust/Play expansion with an
   exact counted multiset of fact-identical card variants. Concrete hand,
   selection and legal-action entities remain unaggregated, while upgrade,

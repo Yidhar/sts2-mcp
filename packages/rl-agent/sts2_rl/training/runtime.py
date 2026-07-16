@@ -80,6 +80,7 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "combat_win_rate": 0.0,
             "deadlock_rate": 0.0,
             "combat_progress_stall_rate": 0.0,
+            "noncombat_progress_stall_rate": 0.0,
             "mean_max_floor": 0.0,
             "maximum_floor": 0,
             "mean_max_act": 0.0,
@@ -87,6 +88,7 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "mean_environment_steps": 0.0,
             "mean_revivals_used": 0.0,
             "mean_player_hp_lost": 0.0,
+            "maximum_observed_candidates": 0,
             "revival_free_combat_win_rate": 0.0,
             "revival_free_act1_clear_rate": 0.0,
             "revival_free_run_win_rate": 0.0,
@@ -104,6 +106,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "combat_progress_stall_rate": (
             sum(item.combat_progress_stalled for item in episodes) / count
         ),
+        "noncombat_progress_stall_rate": (
+            sum(item.noncombat_progress_stalled for item in episodes) / count
+        ),
         "mean_max_floor": statistics.fmean(item.max_floor for item in episodes),
         "maximum_floor": max(item.max_floor for item in episodes),
         "mean_max_act": statistics.fmean(item.max_act for item in episodes),
@@ -116,6 +121,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         ),
         "mean_player_hp_lost": statistics.fmean(
             item.player_hp_lost for item in episodes
+        ),
+        "maximum_observed_candidates": max(
+            item.maximum_observed_candidates for item in episodes
         ),
         "revival_free_combat_win_rate": (
             sum(item.revival_free_combat_win for item in episodes) / count
@@ -136,7 +144,7 @@ def evaluate_policy(
     base_seed: int = 0,
     journal_path: str | Path | None = None,
 ) -> tuple[list[EpisodeMetrics], dict[str, float | int]]:
-    """Evaluate current learner parameters on fixed odd seeds with full journals."""
+    """Evaluate on fixed odd seeds with compact journals and sparse snapshots."""
 
     resources.publish_collector_policy()
     evaluation_seeds = held_out_evaluation_seeds(base_seed, int(episodes))
@@ -252,6 +260,8 @@ def _save(
         parent_relation=(
             "model_parameter_initialization"
             if parent_checkpoint is not None and load_mode == "model_initialization"
+            else "in_process_successor"
+            if parent_checkpoint is not None and load_mode == "in_process_successor"
             else "loaded_parent"
             if parent_checkpoint is not None
             else None
@@ -354,7 +364,7 @@ def run_training(
             and state.environment_steps == 0
             and config.runtime.evaluation_episodes > 0
         ):
-            _, summary = evaluate_policy(
+            evaluation_results, summary = evaluate_policy(
                 resources,
                 episodes=config.runtime.evaluation_episodes,
                 base_seed=config.runtime.seed,
@@ -365,9 +375,22 @@ def run_training(
                 evaluation_episodes=(
                     state.evaluation_episodes + config.runtime.evaluation_episodes
                 ),
+                maximum_observed_candidates=max(
+                    state.maximum_observed_candidates,
+                    *(item.maximum_observed_candidates for item in evaluation_results),
+                ),
             )
             completed_evaluations.add(0)
-            metrics.write("evaluation", {"environment_steps": 0, **summary})
+            metrics.write(
+                "evaluation",
+                {
+                    "environment_steps": 0,
+                    "run_maximum_observed_candidates": (
+                        state.maximum_observed_candidates
+                    ),
+                    **summary,
+                },
+            )
 
         pipeline = ActorLearnerPipeline(
             resources,
@@ -470,6 +493,10 @@ def run_training(
                     environment_steps=state.environment_steps + episode.metrics.steps,
                     episodes=state.episodes + 1,
                     actor_policy_version=episode.actor_policy_version,
+                    maximum_observed_candidates=max(
+                        state.maximum_observed_candidates,
+                        episode.metrics.maximum_observed_candidates,
+                    ),
                 )
                 metrics.write(
                     "train_episode",
@@ -480,6 +507,9 @@ def run_training(
                         "policy_version": state.policy_version,
                         "actor_policy_version": state.actor_policy_version,
                         "behavior_policy_version": episode.behavior_policy_version,
+                        "run_maximum_observed_candidates": (
+                            state.maximum_observed_candidates
+                        ),
                         "epsilon": exploration_epsilon(
                             config, state.environment_steps
                         ),
@@ -516,7 +546,7 @@ def run_training(
                         and evaluation_step not in completed_evaluations
                     ):
                         if config.runtime.evaluation_episodes > 0:
-                            _, summary = evaluate_policy(
+                            evaluation_results, summary = evaluate_policy(
                                 resources,
                                 episodes=config.runtime.evaluation_episodes,
                                 base_seed=config.runtime.seed,
@@ -531,12 +561,22 @@ def run_training(
                                     state.evaluation_episodes
                                     + config.runtime.evaluation_episodes
                                 ),
+                                maximum_observed_candidates=max(
+                                    state.maximum_observed_candidates,
+                                    *(
+                                        item.maximum_observed_candidates
+                                        for item in evaluation_results
+                                    ),
+                                ),
                             )
                             metrics.write(
                                 "evaluation",
                                 {
                                     "environment_steps": state.environment_steps,
                                     "evaluation_gate": evaluation_step,
+                                    "run_maximum_observed_candidates": (
+                                        state.maximum_observed_candidates
+                                    ),
                                     **summary,
                                 },
                             )
@@ -553,7 +593,7 @@ def run_training(
                         load_mode=load_mode,
                     )
                     parent_checkpoint = checkpoint
-                    load_mode = "exact_resume"
+                    load_mode = "in_process_successor"
                     metrics.write("checkpoint", {"path": str(checkpoint), **asdict(state)})
                     while next_checkpoint <= state.environment_steps:
                         next_checkpoint += config.runtime.checkpoint_interval_steps
@@ -571,6 +611,10 @@ def run_training(
                 state,
                 environment_steps=state.environment_steps + episode.metrics.steps,
                 episodes=state.episodes + 1,
+                maximum_observed_candidates=max(
+                    state.maximum_observed_candidates,
+                    episode.metrics.maximum_observed_candidates,
+                ),
             )
             pipeline.release_episode_boundary()
         resources.publish_collector_policy()
@@ -580,7 +624,7 @@ def run_training(
                 and evaluation_step not in completed_evaluations
             ):
                 if config.runtime.evaluation_episodes > 0:
-                    _, summary = evaluate_policy(
+                    evaluation_results, summary = evaluate_policy(
                         resources,
                         episodes=config.runtime.evaluation_episodes,
                         base_seed=config.runtime.seed,
@@ -595,12 +639,22 @@ def run_training(
                             state.evaluation_episodes
                             + config.runtime.evaluation_episodes
                         ),
+                        maximum_observed_candidates=max(
+                            state.maximum_observed_candidates,
+                            *(
+                                item.maximum_observed_candidates
+                                for item in evaluation_results
+                            ),
+                        ),
                     )
                     metrics.write(
                         "evaluation",
                         {
                             "environment_steps": state.environment_steps,
                             "evaluation_gate": evaluation_step,
+                            "run_maximum_observed_candidates": (
+                                state.maximum_observed_candidates
+                            ),
                             **summary,
                         },
                     )

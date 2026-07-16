@@ -41,6 +41,7 @@ class TrainingState:
     policy_version: int = 0
     actor_policy_version: int = 0
     consumed_unrolls: int = 0
+    maximum_observed_candidates: int = 0
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -236,7 +237,16 @@ def training_state_from_metadata(metadata: dict[str, Any]) -> TrainingState:
     if not isinstance(raw, dict):
         raise ValueError("checkpoint has no training_state")
     expected = set(TrainingState.__dataclass_fields__)
-    if set(raw) != expected:
+    actual = set(raw)
+    # ``maximum_observed_candidates`` is diagnostic-only and was added to the
+    # v3 payload without changing any optimizer/RNG continuation semantics.
+    # Existing exact-resume checkpoints therefore migrate this one absent
+    # scalar to zero while every other missing or unknown key remains a hard
+    # ABI failure.
+    legacy_missing = {"maximum_observed_candidates"}
+    if actual == expected - legacy_missing:
+        raw = {**raw, "maximum_observed_candidates": 0}
+    elif actual != expected:
         raise ValueError("checkpoint training_state keys mismatch")
     return TrainingState(**raw)
 

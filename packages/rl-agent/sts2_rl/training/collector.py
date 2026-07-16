@@ -38,7 +38,7 @@ from .seeding import (
 from .trajectory import (
     SemanticDeadlockDetector,
     TrajectoryJournal,
-    semantic_projection,
+    semantic_fingerprint,
 )
 
 
@@ -72,9 +72,12 @@ class EpisodeMetrics:
     max_floor: int
     policy_decisions: int
     forced_decisions: int
+    maximum_observed_candidates: int
     deadlocked: bool
     combat_progress_stalled: bool
     maximum_combat_no_net_progress_steps: int
+    noncombat_progress_stalled: bool
+    maximum_noncombat_no_durable_progress_steps: int
     revivals_used: int
     revival_free_combat_win: bool
     revival_free_act1_clear: bool
@@ -103,12 +106,14 @@ class EpisodeProgress:
     max_floor: int
     policy_decisions: int
     forced_decisions: int
+    maximum_observed_candidates: int
     revivals_used: int
     player_hp_lost: float
     combat_in_progress: bool
     phase: str
     decision_domain: str
     combat_no_net_progress_steps: int
+    noncombat_no_durable_progress_steps: int
     combat_anchor_enemy_hp_total: float
     combat_required_net_hp_progress: float
     enemy_hp_total: float
@@ -147,10 +152,7 @@ class CollectorTimings:
     stages: dict[str, CollectorStageTiming]
 
     def to_mapping(self) -> dict[str, dict[str, float | int]]:
-        return {
-            name: timing.to_mapping()
-            for name, timing in sorted(self.stages.items())
-        }
+        return {name: timing.to_mapping() for name, timing in sorted(self.stages.items())}
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,10 +419,7 @@ class _CombatNetProgressTracker:
         )
         net_progress = self._anchor_hp - current_hp
         roster_replaced = bool(
-            roster != prior_roster
-            and prior_roster
-            and roster
-            and not set(prior_roster).intersection(roster)
+            roster != prior_roster and prior_roster and roster and not set(prior_roster).intersection(roster)
         )
         advanced_from_defeated_wave = bool(
             roster != prior_roster
@@ -474,6 +473,459 @@ class _CombatNetProgressTracker:
         )
 
 
+def _first_durable_scalar(
+    value: Mapping[str, object],
+    *keys: str,
+) -> object | None:
+    """Return the first scalar fact from a positive durable-state allowlist."""
+
+    for key in keys:
+        item = value.get(key)
+        if item is None or isinstance(item, Mapping | list | tuple):
+            continue
+        if isinstance(item, str | int | float | bool):
+            return item
+    return None
+
+
+def _durable_entity_id(
+    value: Mapping[str, object],
+    *keys: str,
+) -> str:
+    item = _first_durable_scalar(value, *keys)
+    return str(item).strip() if item not in (None, "") else "<unknown>"
+
+
+def _nested_modifier_signature(value: object) -> tuple[tuple[object, ...], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    result: list[tuple[object, ...]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        result.append(
+            (
+                _durable_entity_id(item, "id", "model_id", "name", "type"),
+                _first_durable_scalar(item, "level", "amount", "stacks"),
+                _first_durable_scalar(item, "is_active", "is_enabled"),
+            )
+        )
+    return tuple(sorted(result, key=repr))
+
+
+def _durable_card_signature(value: Mapping[str, object]) -> tuple[object, ...]:
+    """Describe permanent card composition without preview/dynamic values."""
+
+    return (
+        _durable_entity_id(value, "id", "card_id", "model_id", "name", "title"),
+        _first_durable_scalar(
+            value,
+            "upgrade_level",
+            "upgrade_count",
+            "times_upgraded",
+            "is_upgraded",
+            "upgraded",
+        ),
+        _nested_modifier_signature(value.get("enchantments")),
+        _nested_modifier_signature(value.get("afflictions")),
+    )
+
+
+def _durable_relic_signature(value: Mapping[str, object]) -> tuple[object, ...]:
+    return (
+        _durable_entity_id(value, "id", "relic_id", "model_id", "name", "title"),
+        _first_durable_scalar(value, "stack_count", "quantity"),
+        _first_durable_scalar(value, "is_used_up"),
+        _first_durable_scalar(value, "is_melted"),
+        _first_durable_scalar(value, "status"),
+    )
+
+
+def _durable_potion_signature(value: Mapping[str, object]) -> tuple[object, ...]:
+    return (
+        _durable_entity_id(value, "id", "potion_id", "model_id", "name", "title"),
+        _first_durable_scalar(value, "slot_index", "slot"),
+    )
+
+
+def _durable_collection(
+    value: object,
+    projector: Callable[[Mapping[str, object]], tuple[object, ...]],
+) -> tuple[tuple[object, ...], ...]:
+    if isinstance(value, Mapping):
+        nested = value.get("cards", value.get("items"))
+        value = nested if isinstance(nested, list | tuple) else ()
+    if not isinstance(value, list | tuple):
+        return ()
+    projected = [projector(item) for item in value if isinstance(item, Mapping)]
+    return tuple(sorted(projected, key=repr))
+
+
+def _noncombat_durable_projections(
+    observation: Mapping[str, object],
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Split forward run locus from same-locus persistent resources.
+
+    This deliberately excludes event/card/relic ``dynamic_vars``, descriptions,
+    pages, screens, selection membership, damage/heal previews, counters and
+    legal-option text.  Those values are reversible or may change forever
+    without moving the run.  The positive allowlist keeps the detector generic
+    across events while preventing a newly exposed preview counter from
+    silently disabling it.
+    """
+
+    raw_run = observation.get("run")
+    run = raw_run if isinstance(raw_run, Mapping) else {}
+    raw_player = observation.get("player")
+    player = raw_player if isinstance(raw_player, Mapping) else {}
+    raw_event = observation.get("event")
+    event = raw_event if isinstance(raw_event, Mapping) else {}
+    raw_map = observation.get("map")
+    map_state = raw_map if isinstance(raw_map, Mapping) else {}
+
+    run_projection: dict[str, object] = {}
+    for key, aliases in {
+        "active": ("active", "run_active"),
+        "game_over": ("game_over",),
+        "act": ("act", "act_index"),
+        "floor": ("floor", "total_floor"),
+        "room_type": ("room_type",),
+        "room_model_id": ("room_model_id", "room_model"),
+    }.items():
+        item = _first_durable_scalar(run, *aliases)
+        if item is None:
+            item = _first_durable_scalar(observation, *aliases)
+        if item is not None:
+            run_projection[key] = item
+    coord = run.get("coord", map_state.get("current_coord"))
+    if isinstance(coord, Mapping):
+        run_projection["coord"] = tuple(
+            _first_durable_scalar(coord, *aliases) for aliases in (("x", "col", "column"), ("y", "row"))
+        )
+
+    player_projection: dict[str, object] = {}
+    for key, aliases in {
+        "character": ("character_id", "character", "id"),
+        "hp": ("hp", "current_hp"),
+        "max_hp": ("max_hp", "maximum_hp"),
+        "gold": ("gold",),
+        "open_potion_slots": ("open_potion_slots",),
+    }.items():
+        item = _first_durable_scalar(player, *aliases)
+        if item is not None:
+            player_projection[key] = item
+    # The live bridge exposes ``deck`` as a count and the inspectable card
+    # collection as ``deck_cards``; the headless bridge exposes ``deck`` as the
+    # collection itself.  Prefer the explicit collection and only fall back to
+    # ``deck`` when it actually has collection shape.
+    deck_value = player.get("deck_cards")
+    if not isinstance(deck_value, Mapping | list | tuple):
+        deck_value = player.get("deck")
+    player_projection["deck"] = _durable_collection(
+        deck_value,
+        _durable_card_signature,
+    )
+    player_projection["relics"] = _durable_collection(
+        player.get("relics"),
+        _durable_relic_signature,
+    )
+    player_projection["potions"] = _durable_collection(
+        player.get("potions"),
+        _durable_potion_signature,
+    )
+
+    event_projection: dict[str, object] = {}
+    for key, aliases in {
+        "event_id": ("event_id", "id", "model_id"),
+        "encounter_id": ("encounter_id", "canonical_encounter_id"),
+        "is_finished": ("is_finished",),
+    }.items():
+        item = _first_durable_scalar(event, *aliases)
+        if item is not None:
+            event_projection[key] = item
+
+    completion_projection: dict[str, object] = {}
+    for key in ("terminated", "truncated"):
+        item = _first_durable_scalar(observation, key)
+        if item is not None:
+            completion_projection[key] = item
+
+    locus = {
+        "run": run_projection,
+        "event": event_projection,
+        "completion": completion_projection,
+    }
+    resources = {"player": player_projection}
+    return locus, resources
+
+
+def _durable_action_projection(action: Mapping[str, object]) -> Mapping[str, object]:
+    """Identify a chosen operation without transport handles or preview text."""
+
+    result: dict[str, object] = {}
+    for key in (
+        "action",
+        "kind",
+        "model_action_kind",
+        "model_action_variant",
+        "transport_kind",
+        "index",
+        "idx",
+        "action_index",
+        "card_index",
+        "target_id",
+        "target_index",
+        "slot",
+        "slot_index",
+        "selection_operation",
+        "is_selected",
+    ):
+        item = _first_durable_scalar(action, key)
+        if item is not None:
+            result[key] = item
+    for key, projector in (
+        ("card", _durable_card_signature),
+        ("relic", _durable_relic_signature),
+        ("potion", _durable_potion_signature),
+    ):
+        item = action.get(key)
+        if isinstance(item, Mapping):
+            result[key] = projector(item)
+    option = action.get("option")
+    if isinstance(option, Mapping):
+        result["option_index"] = _first_durable_scalar(
+            option,
+            "option_index",
+            "index",
+        )
+    return result
+
+
+def _noncombat_context_summary(
+    observation: Mapping[str, object],
+) -> Mapping[str, object]:
+    run = observation.get("run")
+    run = run if isinstance(run, Mapping) else {}
+    event = observation.get("event")
+    event = event if isinstance(event, Mapping) else {}
+    return {
+        "phase": str(observation.get("phase") or ""),
+        "decision_domain": str(observation.get("decision_domain") or ""),
+        "state_type": str(observation.get("state_type") or ""),
+        "act": int(max(0.0, _number(run.get("act", observation.get("act"))))),
+        "floor": int(max(0.0, _number(run.get("floor", observation.get("floor"))))),
+        "room_type": str(run.get("room_type") or ""),
+        "room_model_id": str(run.get("room_model_id", run.get("room_model")) or ""),
+        "event_id": str(event.get("event_id", event.get("id")) or ""),
+        "event_finished": event.get("is_finished") is True,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _NonCombatDurableProgressStatus:
+    age_steps: int
+    maximum_age_steps: int
+    stalled: bool
+    durable_state_fingerprint: str
+    locus_fingerprint: str
+    resource_fingerprint: str
+    action_fingerprint: str
+    progress_kind: str
+    context: Mapping[str, object]
+
+
+class _NonCombatDurableProgressTracker:
+    """Bound a repeated non-combat action that makes no durable run progress."""
+
+    def __init__(self, *, window: int) -> None:
+        self.window = int(window)
+        self.reset()
+
+    def reset(self) -> None:
+        self._active = False
+        self._anchor_step = 0
+        self._locus_fingerprint = ""
+        self._resource_fingerprint = ""
+        self._durable_state_fingerprint = ""
+        self._action_fingerprint = ""
+        self._seen_resource_fingerprints: set[str] = set()
+        self._maximum_age = 0
+
+    @staticmethod
+    def _outside_noncombat(
+        observation: Mapping[str, object],
+        *,
+        terminated: bool = False,
+        truncated: bool = False,
+    ) -> bool:
+        return bool(
+            _combat_in_progress(observation)
+            or terminated
+            or truncated
+            or observation.get("terminated") is True
+            or observation.get("truncated") is True
+        )
+
+    @staticmethod
+    def _fingerprints(
+        observation: Mapping[str, object],
+    ) -> tuple[str, str, str]:
+        locus, resources = _noncombat_durable_projections(observation)
+        locus_fingerprint = semantic_fingerprint(locus)
+        resource_fingerprint = semantic_fingerprint(resources)
+        durable_fingerprint = semantic_fingerprint(
+            {
+                "locus": locus_fingerprint,
+                "resources": resource_fingerprint,
+            }
+        )
+        return locus_fingerprint, resource_fingerprint, durable_fingerprint
+
+    def _start_locus(
+        self,
+        *,
+        step: int,
+        locus_fingerprint: str,
+        resource_fingerprint: str,
+        durable_fingerprint: str,
+        action_fingerprint: str,
+    ) -> None:
+        self._active = True
+        self._anchor_step = step
+        self._locus_fingerprint = locus_fingerprint
+        self._resource_fingerprint = resource_fingerprint
+        self._durable_state_fingerprint = durable_fingerprint
+        self._action_fingerprint = action_fingerprint
+        self._seen_resource_fingerprints = {resource_fingerprint}
+
+    def _status(
+        self,
+        *,
+        age: int,
+        progress_kind: str,
+        context: Mapping[str, object],
+    ) -> _NonCombatDurableProgressStatus:
+        self._maximum_age = max(self._maximum_age, age)
+        return _NonCombatDurableProgressStatus(
+            age_steps=age,
+            maximum_age_steps=self._maximum_age,
+            stalled=age >= self.window,
+            durable_state_fingerprint=self._durable_state_fingerprint,
+            locus_fingerprint=self._locus_fingerprint,
+            resource_fingerprint=self._resource_fingerprint,
+            action_fingerprint=self._action_fingerprint,
+            progress_kind=progress_kind,
+            context=context,
+        )
+
+    def seed(
+        self,
+        *,
+        step: int,
+        observation: Mapping[str, object],
+        terminated: bool = False,
+        truncated: bool = False,
+    ) -> _NonCombatDurableProgressStatus:
+        """Seed the reset state so the configured window starts at step zero."""
+
+        context = _noncombat_context_summary(observation)
+        if self._outside_noncombat(
+            observation,
+            terminated=terminated,
+            truncated=truncated,
+        ):
+            return self._status(
+                age=0,
+                progress_kind="outside_noncombat_decision",
+                context=context,
+            )
+        locus, resources, durable = self._fingerprints(observation)
+        self._start_locus(
+            step=step,
+            locus_fingerprint=locus,
+            resource_fingerprint=resources,
+            durable_fingerprint=durable,
+            action_fingerprint="",
+        )
+        return self._status(
+            age=0,
+            progress_kind="noncombat_seeded",
+            context=context,
+        )
+
+    def observe(
+        self,
+        *,
+        step: int,
+        observation: Mapping[str, object],
+        selected_action: Mapping[str, object],
+        terminated: bool = False,
+        truncated: bool = False,
+    ) -> _NonCombatDurableProgressStatus:
+        context = _noncombat_context_summary(observation)
+        if self._outside_noncombat(
+            observation,
+            terminated=terminated,
+            truncated=truncated,
+        ):
+            maximum_age = self._maximum_age
+            self.reset()
+            self._maximum_age = maximum_age
+            return self._status(
+                age=0,
+                progress_kind="outside_noncombat_decision",
+                context=context,
+            )
+
+        locus_fingerprint, resource_fingerprint, durable_fingerprint = self._fingerprints(observation)
+        action_fingerprint = semantic_fingerprint(_durable_action_projection(selected_action))
+        if not self._active:
+            progress_kind = "noncombat_started"
+            self._start_locus(
+                step=step,
+                locus_fingerprint=locus_fingerprint,
+                resource_fingerprint=resource_fingerprint,
+                durable_fingerprint=durable_fingerprint,
+                action_fingerprint=action_fingerprint,
+            )
+            return self._status(age=0, progress_kind=progress_kind, context=context)
+        if locus_fingerprint != self._locus_fingerprint:
+            self._start_locus(
+                step=step,
+                locus_fingerprint=locus_fingerprint,
+                resource_fingerprint=resource_fingerprint,
+                durable_fingerprint=durable_fingerprint,
+                action_fingerprint=action_fingerprint,
+            )
+            return self._status(
+                age=0,
+                progress_kind="forward_locus_changed",
+                context=context,
+            )
+        if resource_fingerprint not in self._seen_resource_fingerprints:
+            self._seen_resource_fingerprints.add(resource_fingerprint)
+            self._anchor_step = step
+            self._resource_fingerprint = resource_fingerprint
+            self._durable_state_fingerprint = durable_fingerprint
+            self._action_fingerprint = action_fingerprint
+            return self._status(
+                age=0,
+                progress_kind="new_durable_resource_state",
+                context=context,
+            )
+        # Recurring A<->B (or larger finite) resource cycles are not forward
+        # progress. Only the first sighting of a state at this locus earns a
+        # reset; subsequent visits age from the last genuinely novel state.
+        self._resource_fingerprint = resource_fingerprint
+        self._durable_state_fingerprint = durable_fingerprint
+        self._action_fingerprint = action_fingerprint
+        return self._status(
+            age=step - self._anchor_step,
+            progress_kind="recurring_durable_resource_state",
+            context=context,
+        )
+
+
 def _zone_count(observation: Mapping[str, object], key: str) -> int:
     player = observation.get("player")
     value = player.get(key) if isinstance(player, Mapping) else None
@@ -487,10 +939,7 @@ def _legal_action_kind_counts(
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     for action in legal_actions:
-        kind = str(
-            action.get("model_action_kind", action.get("kind", "unknown"))
-            or "unknown"
-        )
+        kind = str(action.get("model_action_kind", action.get("kind", "unknown")) or "unknown")
         counts[kind] = counts.get(kind, 0) + 1
     return dict(sorted(counts.items()))
 
@@ -515,6 +964,7 @@ class GroundedCollector:
         deadlock_window: int = 128,
         deadlock_repeat_threshold: int = 8,
         combat_net_progress_window: int = 256,
+        noncombat_durable_progress_window: int = 256,
         combat_min_net_hp_fraction: float = 0.05,
         journal_policy_topk: int = 5,
         reward_calculator: RewardCalculator | None = None,
@@ -538,11 +988,7 @@ class GroundedCollector:
             or not 0.0 < float(discount) <= 1.0
         ):
             raise ValueError("discount must be in (0, 1]")
-        if (
-            isinstance(max_episode_steps, bool)
-            or not isinstance(max_episode_steps, int)
-            or max_episode_steps <= 0
-        ):
+        if isinstance(max_episode_steps, bool) or not isinstance(max_episode_steps, int) or max_episode_steps <= 0:
             raise ValueError("max_episode_steps must be positive")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("collector seed must be a non-negative integer")
@@ -550,18 +996,20 @@ class GroundedCollector:
             raise TypeError("unroll_length must be an integer")
         if unroll_length <= 0:
             raise ValueError("unroll_length must be positive")
-        if isinstance(journal_policy_topk, bool) or not isinstance(
-            journal_policy_topk, int
-        ):
+        if isinstance(journal_policy_topk, bool) or not isinstance(journal_policy_topk, int):
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
             raise ValueError("journal_policy_topk must be positive")
-        if isinstance(combat_net_progress_window, bool) or not isinstance(
-            combat_net_progress_window, int
-        ):
+        if isinstance(combat_net_progress_window, bool) or not isinstance(combat_net_progress_window, int):
             raise TypeError("combat_net_progress_window must be an integer")
         if combat_net_progress_window <= 0:
             raise ValueError("combat_net_progress_window must be positive")
+        if isinstance(noncombat_durable_progress_window, bool) or not isinstance(
+            noncombat_durable_progress_window, int
+        ):
+            raise TypeError("noncombat_durable_progress_window must be an integer")
+        if noncombat_durable_progress_window <= 0:
+            raise ValueError("noncombat_durable_progress_window must be positive")
         if (
             isinstance(combat_min_net_hp_fraction, bool)
             or not isinstance(combat_min_net_hp_fraction, int | float)
@@ -581,14 +1029,11 @@ class GroundedCollector:
         self.unroll_length = unroll_length
         self.journal_policy_topk = journal_policy_topk
         self.combat_net_progress_window = combat_net_progress_window
-        self.combat_min_net_hp_fraction = float(
-            combat_min_net_hp_fraction
-        )
+        self.noncombat_durable_progress_window = noncombat_durable_progress_window
+        self.combat_min_net_hp_fraction = float(combat_min_net_hp_fraction)
         self.additional_relics = tuple(str(item) for item in additional_relics)
         self.revival_relic_id = (
-            revival_relic_id.strip().upper()
-            if isinstance(revival_relic_id, str) and revival_relic_id.strip()
-            else None
+            revival_relic_id.strip().upper() if isinstance(revival_relic_id, str) and revival_relic_id.strip() else None
         )
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
@@ -598,9 +1043,7 @@ class GroundedCollector:
             raise ValueError("revival_relic_id must be one of the injected additional relics")
         if self.training_revival_budget is not None:
             if self.revival_relic_id is None:
-                raise ValueError(
-                    "training_revival_budget requires an injected revival relic"
-                )
+                raise ValueError("training_revival_budget requires an injected revival relic")
             if self.training_revival_budget < -1:
                 raise ValueError("training_revival_budget must be -1 or non-negative")
         self._rng = np.random.default_rng(int(seed))
@@ -670,9 +1113,7 @@ class GroundedCollector:
             raise CollectionProtocolError("backend state read was not explicitly successful")
         revision = state.get("state_version")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            raise CollectionProtocolError(
-                "backend state_version must be an exact non-negative integer"
-            )
+            raise CollectionProtocolError("backend state_version must be an exact non-negative integer")
         return revision
 
     @staticmethod
@@ -681,28 +1122,14 @@ class GroundedCollector:
             raise CollectionProtocolError(f"{surface} result was not explicitly successful")
         if not isinstance(result.episode_id, str) or not result.episode_id.strip():
             raise CollectionProtocolError(f"{surface} result has no episode identity")
-        if (
-            isinstance(result.step_index, bool)
-            or not isinstance(result.step_index, int)
-            or result.step_index < 0
-        ):
-            raise CollectionProtocolError(
-                f"{surface} result step_index must be an exact non-negative integer"
-            )
+        if isinstance(result.step_index, bool) or not isinstance(result.step_index, int) or result.step_index < 0:
+            raise CollectionProtocolError(f"{surface} result step_index must be an exact non-negative integer")
         if not isinstance(result.terminated, bool) or not isinstance(result.truncated, bool):
-            raise CollectionProtocolError(
-                f"{surface} terminated/truncated flags must be booleans"
-            )
+            raise CollectionProtocolError(f"{surface} terminated/truncated flags must be booleans")
         if result.terminated and result.truncated:
-            raise CollectionProtocolError(
-                f"{surface} result cannot be both terminated and truncated"
-            )
-        if result.terminal_reason is not None and not isinstance(
-            result.terminal_reason, str
-        ):
-            raise CollectionProtocolError(
-                f"{surface} terminal_reason must be a string or null"
-            )
+            raise CollectionProtocolError(f"{surface} result cannot be both terminated and truncated")
+        if result.terminal_reason is not None and not isinstance(result.terminal_reason, str):
+            raise CollectionProtocolError(f"{surface} terminal_reason must be a string or null")
         if not isinstance(result.info, Mapping):
             raise CollectionProtocolError(f"{surface} info must be an object")
 
@@ -721,9 +1148,7 @@ class GroundedCollector:
         if not result.legal_actions:
             raise CollectionProtocolError("fresh reset returned zero legal actions")
         if result.info.get("reward_authority") != "external-rl":
-            raise CollectionProtocolError(
-                "reset result must delegate reward authority to external-rl"
-            )
+            raise CollectionProtocolError("reset result must delegate reward authority to external-rl")
         transition = result.transition
         if transition is None:
             raise CollectionProtocolError("reset result has no typed transition")
@@ -744,23 +1169,14 @@ class GroundedCollector:
     ) -> None:
         self._validate_common_result(after, surface="step")
         if after.episode_id != before.episode_id:
-            raise CollectionProtocolError(
-                "step result episode_id differs from the active episode"
-            )
+            raise CollectionProtocolError("step result episode_id differs from the active episode")
         if after.step_index != before.step_index + 1:
-            raise CollectionProtocolError(
-                "step result must advance step_index by exactly one"
-            )
+            raise CollectionProtocolError("step result must advance step_index by exactly one")
         transition = after.transition
         if transition is None:
             raise CollectionProtocolError("step result has no typed transition")
-        if (
-            transition.episode_id != after.episode_id
-            or transition.step_index != after.step_index
-        ):
-            raise CollectionProtocolError(
-                "step transition episode/step identity differs from result"
-            )
+        if transition.episode_id != after.episode_id or transition.step_index != after.step_index:
+            raise CollectionProtocolError("step transition episode/step identity differs from result")
         if not isinstance(transition.facts, Mapping):
             raise CollectionProtocolError("step transition facts must be an object")
         active_revision = self._active_state_version
@@ -776,25 +1192,15 @@ class GroundedCollector:
             or before_revision < 0
             or after_revision < 0
         ):
-            raise CollectionProtocolError(
-                "step transition revisions must be exact non-negative integers"
-            )
+            raise CollectionProtocolError("step transition revisions must be exact non-negative integers")
         if before_revision != active_revision or after_revision != before_revision + 1:
-            raise CollectionProtocolError(
-                "step transition revision chain is stale or non-contiguous"
-            )
+            raise CollectionProtocolError("step transition revision chain is stale or non-contiguous")
         if after.info.get("reward_authority") != "external-rl":
-            raise CollectionProtocolError(
-                "step result must delegate reward authority to external-rl"
-            )
+            raise CollectionProtocolError("step result must delegate reward authority to external-rl")
         if not after.terminated and not after.truncated and not after.legal_actions:
-            raise CollectionProtocolError(
-                "non-terminal step result returned zero legal actions"
-            )
+            raise CollectionProtocolError("non-terminal step result returned zero legal actions")
         if (after.terminated or after.truncated) and after.legal_actions:
-            raise CollectionProtocolError(
-                "terminal/truncated step result returned legal actions"
-            )
+            raise CollectionProtocolError("terminal/truncated step result returned legal actions")
         self._active_state_version = after_revision
 
     def reset(self, *, evaluation_seed: int | None = None) -> EnvironmentResult:
@@ -841,9 +1247,7 @@ class GroundedCollector:
             )
         committed_state_version = self._state_version()
         if committed_state_version != expected_state_version + 1:
-            raise CollectionProtocolError(
-                "reset did not advance state_version by exactly one"
-            )
+            raise CollectionProtocolError("reset did not advance state_version by exactly one")
         self._validate_reset_result(
             result,
             before_state_version=expected_state_version,
@@ -907,9 +1311,7 @@ class GroundedCollector:
             selected = int(valid_indices[int(np.argmax(valid_policy))])
             return _ActionChoice(
                 action_index=selected,
-                behavior_log_probability=float(
-                    math.log(max(float(valid_policy.max() / policy_mass), 1e-30))
-                ),
+                behavior_log_probability=float(math.log(max(float(valid_policy.max() / policy_mass), 1e-30))),
                 valid_count=valid_count,
                 snapshot=encoded.snapshot,
                 recurrent_state=next_recurrent_state,
@@ -921,18 +1323,15 @@ class GroundedCollector:
 
         behavior = np.zeros_like(policy, dtype=np.float64)
         behavior[valid_indices] = (
-            (1.0 - normalized_epsilon) * valid_policy / policy_mass
-            + normalized_epsilon / valid_count
-        )
+            1.0 - normalized_epsilon
+        ) * valid_policy / policy_mass + normalized_epsilon / valid_count
         behavior /= behavior.sum()
         if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0):
             raise CollectionProtocolError("collector produced an invalid behavior policy")
         selected = int(self._rng.choice(len(behavior), p=behavior))
         return _ActionChoice(
             action_index=selected,
-            behavior_log_probability=float(
-                math.log(max(float(behavior[selected]), 1e-30))
-            ),
+            behavior_log_probability=float(math.log(max(float(behavior[selected]), 1e-30))),
             valid_count=valid_count,
             snapshot=encoded.snapshot,
             recurrent_state=next_recurrent_state,
@@ -994,9 +1393,7 @@ class GroundedCollector:
         timings.record("reset", reset_started_ns)
         self.deadlock_detector.reset()
         recurrent_state = self.model.initial_state(1, device=self.device)
-        segment_initial_state = (
-            recurrent_state[0].detach().float().cpu().numpy().copy()
-        )
+        segment_initial_state = recurrent_state[0].detach().float().cpu().numpy().copy()
         segment_start_step = state.step_index
         segment_policy_version = policy_version
         segment_steps: list[RolloutStep] = []
@@ -1005,13 +1402,24 @@ class GroundedCollector:
         max_act, max_floor = _run_position(state.observation)
         policy_decisions = 0
         forced_decisions = 0
+        maximum_observed_candidates = 0
         steps_taken = 0
         final_outcome = "ongoing"
         deadlocked = False
         combat_progress_stalled = False
+        noncombat_progress_stalled = False
         combat_progress = _CombatNetProgressTracker(
             window=self.combat_net_progress_window,
             minimum_hp_fraction=self.combat_min_net_hp_fraction,
+        )
+        noncombat_progress = _NonCombatDurableProgressTracker(
+            window=self.noncombat_durable_progress_window,
+        )
+        noncombat_progress_status = noncombat_progress.seed(
+            step=0,
+            observation=state.observation,
+            terminated=state.terminated,
+            truncated=state.truncated,
         )
         combat_progress_status = combat_progress.observe(
             step=0,
@@ -1019,9 +1427,9 @@ class GroundedCollector:
         )
         combat_in_progress = _combat_in_progress(state.observation)
         combat_no_net_progress_steps = combat_progress_status.age_steps
-        maximum_combat_no_net_progress_steps = (
-            combat_progress_status.maximum_age_steps
-        )
+        maximum_combat_no_net_progress_steps = combat_progress_status.maximum_age_steps
+        noncombat_no_durable_progress_steps = noncombat_progress_status.age_steps
+        maximum_noncombat_no_durable_progress_steps = noncombat_progress_status.maximum_age_steps
         forced_horizon = False
         curriculum_horizon = False
         revivals_used = 0
@@ -1045,6 +1453,10 @@ class GroundedCollector:
             )
             timings.add("observation_encoding", choice.encoding_ms)
             timings.add("policy_forward", choice.policy_forward_ms)
+            maximum_observed_candidates = max(
+                maximum_observed_candidates,
+                choice.snapshot.candidate_count,
+            )
             policy_decisions += int(choice.valid_count > 1)
             forced_decisions += int(choice.valid_count == 1)
             selected_action = state.legal_actions[choice.action_index]
@@ -1069,14 +1481,9 @@ class GroundedCollector:
             timings.record("sim_step", sim_step_started_ns)
             steps_taken += 1
             if next_state.truncated:
-                raise CollectionProtocolError(
-                    "transport/outcome-unknown truncation discarded before rollout"
-                )
-            forced_horizon = (
-                step_offset + 1 >= episode_limit
-                and not next_state.terminated
-                and not next_state.truncated
-            )
+                raise CollectionProtocolError("transport/outcome-unknown truncation discarded before rollout")
+            result_terminal = next_state.terminated or next_state.truncated
+            forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
             next_combat_in_progress = _combat_in_progress(next_state.observation)
@@ -1089,26 +1496,42 @@ class GroundedCollector:
                 maximum_combat_no_net_progress_steps,
                 combat_progress_status.maximum_age_steps,
             )
-            combat_progress_stalled = combat_progress_status.stalled
-            combat_in_progress = next_combat_in_progress
+            combat_progress_stalled = bool(combat_progress_status.stalled and not result_terminal)
+            combat_in_progress = bool(next_combat_in_progress and not result_terminal)
+            noncombat_progress_status = noncombat_progress.observe(
+                step=steps_taken,
+                observation=next_state.observation,
+                selected_action=selected_action,
+                terminated=next_state.terminated,
+                truncated=next_state.truncated,
+            )
+            noncombat_no_durable_progress_steps = noncombat_progress_status.age_steps
+            maximum_noncombat_no_durable_progress_steps = max(
+                maximum_noncombat_no_durable_progress_steps,
+                noncombat_progress_status.maximum_age_steps,
+            )
+            noncombat_progress_stalled = bool(noncombat_progress_status.stalled and not result_terminal)
             # ``maximum_steps`` may be a runtime's remaining global budget,
             # which can cut an otherwise healthy episode after only one or a
             # few decisions. Only the configured task horizon is a semantic
             # failure. A shorter collection-budget cut keeps a positive
             # discount and a bootstrap snapshot instead of fabricating a loss.
-            curriculum_horizon = bool(
-                forced_horizon and episode_limit >= self.max_episode_steps
-            )
+            curriculum_horizon = bool(forced_horizon and episode_limit >= self.max_episode_steps)
             reward_started_ns = time.perf_counter_ns()
+            # EnvironmentResult is the terminal authority.  Neither a
+            # pre-action semantic recurrence nor a progress tracker may turn a
+            # real terminal transition into a synthetic deadlock outcome.
+            effective_deadlock_evidence = None if result_terminal else deadlock_evidence
             breakdown = self.reward_calculator.evaluate(
                 state,
                 next_state,
                 deadlock=(
-                    deadlock_evidence is not None or combat_progress_stalled
+                    not result_terminal
+                    and (
+                        effective_deadlock_evidence is not None or combat_progress_stalled or noncombat_progress_stalled
+                    )
                 ),
-                horizon_exhausted=bool(
-                    curriculum_horizon and self.horizon_as_failure
-                ),
+                horizon_exhausted=bool(curriculum_horizon and self.horizon_as_failure),
             )
             reward_total += breakdown.reward
             revivals_used += breakdown.revivals_used_delta
@@ -1128,62 +1551,92 @@ class GroundedCollector:
                 )
             if trajectory_journal is not None:
                 journal_deadlock: Mapping[str, object] | None = None
-                if deadlock_evidence is not None:
-                    journal_deadlock = deadlock_evidence.to_mapping()
-                elif combat_progress_stalled:
+                if combat_progress_stalled:
                     journal_deadlock = {
                         "kind": "combat_no_net_progress",
                         "window": self.combat_net_progress_window,
-                        "steps_without_net_progress": (
-                            combat_no_net_progress_steps
-                        ),
+                        "steps_without_net_progress": (combat_no_net_progress_steps),
                         "anchor_enemy_hp_total": combat_progress_status.anchor_hp,
                         "current_enemy_hp_total": combat_progress_status.current_hp,
-                        "net_enemy_hp_progress": (
-                            combat_progress_status.net_hp_progress
-                        ),
-                        "required_net_enemy_hp_progress": (
-                            combat_progress_status.required_hp_progress
-                        ),
+                        "net_enemy_hp_progress": (combat_progress_status.net_hp_progress),
+                        "required_net_enemy_hp_progress": (combat_progress_status.required_hp_progress),
                         "progress_kind": combat_progress_status.progress_kind,
-                        "detected_step": state.step_index,
+                        # Net progress is evaluated on the transition result,
+                        # not the pre-action decision state recorded below.
+                        "detected_step": next_state.step_index,
                     }
+                elif noncombat_progress_stalled:
+                    journal_deadlock = {
+                        "kind": "noncombat_no_durable_progress",
+                        "window": self.noncombat_durable_progress_window,
+                        "steps_without_durable_progress": (noncombat_no_durable_progress_steps),
+                        "durable_state_fingerprint": (noncombat_progress_status.durable_state_fingerprint),
+                        "locus_fingerprint": (noncombat_progress_status.locus_fingerprint),
+                        "resource_fingerprint": (noncombat_progress_status.resource_fingerprint),
+                        "action_fingerprint": (noncombat_progress_status.action_fingerprint),
+                        "progress_kind": (noncombat_progress_status.progress_kind),
+                        "context": dict(noncombat_progress_status.context),
+                        # Durable progress is evaluated on the transition
+                        # result, not the pre-action decision state below.
+                        "detected_step": next_state.step_index,
+                    }
+                elif effective_deadlock_evidence is not None:
+                    journal_deadlock = effective_deadlock_evidence.to_mapping()
                 valid_indices = np.flatnonzero(choice.snapshot.action_mask)
                 ranked = sorted(
                     valid_indices.tolist(),
                     key=lambda index: float(choice.policy[index]),
                     reverse=True,
                 )[: self.journal_policy_topk]
-                trajectory_journal.write(
-                    {
-                        "event": "decision",
-                        "episode_id": state.episode_id,
-                        "reset_seed": reset_seed,
-                        "step_index": state.step_index,
-                        "observation": semantic_projection(state.observation),
-                        "legal_actions": semantic_projection(state.legal_actions),
-                        "selected_index": choice.action_index,
-                        "selected_action": semantic_projection(selected_action),
-                        "policy_topk": [
-                            {
-                                "index": index,
-                                "probability": float(choice.policy[index]),
-                            }
-                            for index in ranked
-                        ],
-                        "value": choice.value,
-                        "reward": breakdown.reward,
-                        "terminal_reward": breakdown.terminal_reward,
-                        "potential_reward": breakdown.potential_reward,
-                        "revival_penalty": breakdown.revival_penalty,
-                        "pace_penalty": breakdown.pace_penalty,
-                        "hp_loss_penalty": breakdown.hp_loss_penalty,
-                        "player_hp_lost": player_hp_lost,
-                        "revivals_used": revivals_used,
-                        "outcome": breakdown.outcome,
-                        "deadlock": journal_deadlock,
-                    }
-                )
+                journal_event: dict[str, object] = {
+                    "event": "decision",
+                    "episode_id": state.episode_id,
+                    "reset_seed": reset_seed,
+                    "step_index": state.step_index,
+                    # The journal performs compact per-step projection and
+                    # only canonicalizes complete DTOs for bounded rich
+                    # snapshots. Avoid copying the entire game state on
+                    # every held-out decision.
+                    "observation": state.observation,
+                    "legal_actions": state.legal_actions,
+                    "selected_index": choice.action_index,
+                    "selected_action": selected_action,
+                    "policy_topk": [
+                        {
+                            "index": index,
+                            "probability": float(choice.policy[index]),
+                        }
+                        for index in ranked
+                    ],
+                    "value": choice.value,
+                    "reward": breakdown.reward,
+                    "terminal_reward": breakdown.terminal_reward,
+                    "potential_reward": breakdown.potential_reward,
+                    "revival_penalty": breakdown.revival_penalty,
+                    "pace_penalty": breakdown.pace_penalty,
+                    "hp_loss_penalty": breakdown.hp_loss_penalty,
+                    "player_hp_lost": player_hp_lost,
+                    "revivals_used": revivals_used,
+                    "outcome": breakdown.outcome,
+                    "deadlock": journal_deadlock,
+                }
+                if journal_deadlock is not None:
+                    # The decision record is anchored at the pre-action state,
+                    # while progress stalls are evaluated on the transition
+                    # result.  Preserve the exact result DTO only for the
+                    # bounded rich anomaly snapshot so the trigger is auditable
+                    # without restoring full-state logging on ordinary steps.
+                    journal_event.update(
+                        {
+                            "result_step_index": next_state.step_index,
+                            "result_observation": next_state.observation,
+                            "result_legal_actions": next_state.legal_actions,
+                            "result_terminated": next_state.terminated,
+                            "result_truncated": next_state.truncated,
+                            "result_terminal_reason": next_state.terminal_reason,
+                        }
+                    )
+                trajectory_journal.write(journal_event)
             timings.record("reward_and_diagnostics", reward_started_ns)
             recurrent_state = choice.recurrent_state
             state = next_state
@@ -1194,11 +1647,7 @@ class GroundedCollector:
             flush_segment = bool(
                 record
                 and segment_steps
-                and (
-                    len(segment_steps) >= self.unroll_length
-                    or breakdown.task_terminal
-                    or forced_horizon
-                )
+                and (len(segment_steps) >= self.unroll_length or breakdown.task_terminal or forced_horizon)
             )
             if flush_segment:
                 bootstrap_snapshot: EncodedDecisionSnapshot | None = None
@@ -1209,6 +1658,10 @@ class GroundedCollector:
                         state.legal_actions,
                         device="cpu",
                     ).snapshot
+                    maximum_observed_candidates = max(
+                        maximum_observed_candidates,
+                        bootstrap_snapshot.candidate_count,
+                    )
                     timings.record("bootstrap_encoding", bootstrap_started_ns)
                 completed_unroll = SequenceUnroll(
                     episode_id=state.episode_id,
@@ -1229,9 +1682,7 @@ class GroundedCollector:
                             or not isinstance(adopted_policy_version, int)
                             or adopted_policy_version < segment_policy_version
                         ):
-                            raise ValueError(
-                                "unroll sink returned an invalid actor policy version"
-                            )
+                            raise ValueError("unroll sink returned an invalid actor policy version")
                         segment_policy_version = adopted_policy_version
                 if progress_sink is not None:
                     progress_sink(
@@ -1244,22 +1695,16 @@ class GroundedCollector:
                             max_floor=max_floor,
                             policy_decisions=policy_decisions,
                             forced_decisions=forced_decisions,
+                            maximum_observed_candidates=(maximum_observed_candidates),
                             revivals_used=revivals_used,
                             player_hp_lost=player_hp_lost,
                             combat_in_progress=combat_in_progress,
                             phase=str(state.observation.get("phase") or ""),
-                            decision_domain=str(
-                                state.observation.get("decision_domain") or ""
-                            ),
-                            combat_no_net_progress_steps=(
-                                combat_no_net_progress_steps
-                            ),
-                            combat_anchor_enemy_hp_total=(
-                                combat_progress_status.anchor_hp
-                            ),
-                            combat_required_net_hp_progress=(
-                                combat_progress_status.required_hp_progress
-                            ),
+                            decision_domain=str(state.observation.get("decision_domain") or ""),
+                            combat_no_net_progress_steps=(combat_no_net_progress_steps),
+                            noncombat_no_durable_progress_steps=(noncombat_no_durable_progress_steps),
+                            combat_anchor_enemy_hp_total=(combat_progress_status.anchor_hp),
+                            combat_required_net_hp_progress=(combat_progress_status.required_hp_progress),
                             enemy_hp_total=_enemy_hp_totals(state.observation)[0],
                             enemy_max_hp_total=_enemy_hp_totals(state.observation)[1],
                             hand_cards=_zone_count(state.observation, "hand"),
@@ -1272,20 +1717,14 @@ class GroundedCollector:
                                 state.observation,
                                 "exhaust_pile",
                             ),
-                            legal_action_kinds=_legal_action_kind_counts(
-                                state.legal_actions
-                            ),
-                            selected_action_kinds=dict(
-                                sorted(selected_action_kind_counts.items())
-                            ),
+                            legal_action_kinds=_legal_action_kind_counts(state.legal_actions),
+                            selected_action_kinds=dict(sorted(selected_action_kind_counts.items())),
                             last_selected_action_kind=last_selected_action_kind,
                             behavior_policy_version=completed_unroll.policy_version,
                         )
                     )
                 segment_steps = []
-                segment_initial_state = (
-                    recurrent_state[0].detach().float().cpu().numpy().copy()
-                )
+                segment_initial_state = recurrent_state[0].detach().float().cpu().numpy().copy()
                 segment_start_step = state.step_index
 
             if state.terminated or breakdown.task_terminal or forced_horizon:
@@ -1305,6 +1744,8 @@ class GroundedCollector:
                 terminal_reason=(
                     "combat_progress_stall"
                     if combat_progress_stalled
+                    else "noncombat_progress_stall"
+                    if noncombat_progress_stalled
                     else "semantic_deadlock"
                     if deadlocked
                     else "curriculum_horizon"
@@ -1321,11 +1762,12 @@ class GroundedCollector:
                 max_floor=max_floor,
                 policy_decisions=policy_decisions,
                 forced_decisions=forced_decisions,
+                maximum_observed_candidates=maximum_observed_candidates,
                 deadlocked=deadlocked,
                 combat_progress_stalled=combat_progress_stalled,
-                maximum_combat_no_net_progress_steps=(
-                    maximum_combat_no_net_progress_steps
-                ),
+                maximum_combat_no_net_progress_steps=(maximum_combat_no_net_progress_steps),
+                noncombat_progress_stalled=noncombat_progress_stalled,
+                maximum_noncombat_no_durable_progress_steps=(maximum_noncombat_no_durable_progress_steps),
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
                 revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),

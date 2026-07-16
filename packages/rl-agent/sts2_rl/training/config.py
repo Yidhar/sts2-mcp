@@ -398,6 +398,7 @@ class DiagnosticsConfig:
     deadlock_window: int = 128
     deadlock_repeat_threshold: int = 8
     combat_net_progress_window: int = 256
+    noncombat_durable_progress_window: int = 256
     combat_min_net_hp_fraction: float = 0.05
     journal_policy_topk: int = 5
 
@@ -406,6 +407,7 @@ class DiagnosticsConfig:
             "deadlock_window",
             "deadlock_repeat_threshold",
             "combat_net_progress_window",
+            "noncombat_durable_progress_window",
             "journal_policy_topk",
         ):
             _require_int(

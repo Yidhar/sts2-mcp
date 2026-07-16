@@ -42,6 +42,7 @@ from sts2_rl.training import checkpointing as checkpointing_module
 from sts2_rl.training.checkpointing import TrainingState
 from sts2_rl.training.collector import CollectionProtocolError
 from sts2_rl.training.pipeline import ActorLearnerPipeline
+from sts2_rl.training.trajectory import TrajectoryJournal
 
 
 class FakeCombatBackend:
@@ -205,6 +206,272 @@ class OscillatingDamageBackend(FakeCombatBackend):
         }
 
 
+class DynamicPreviewLoopBackend(FakeCombatBackend):
+    """Non-combat event whose preview counter changes but run state does not."""
+
+    def __init__(
+        self,
+        *,
+        durable_change_step: int | None = None,
+        durable_change_kind: str = "gold",
+        durable_resource_cycle: tuple[int, ...] = (),
+        alternate_ui_actions: bool = False,
+        live_deck_shape: bool = False,
+    ) -> None:
+        super().__init__(terminal_step=100_000)
+        self.durable_change_step = durable_change_step
+        self.durable_change_kind = durable_change_kind
+        self.durable_resource_cycle = durable_resource_cycle
+        self.alternate_ui_actions = alternate_ui_actions
+        self.live_deck_shape = live_deck_shape
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        if self.alternate_ui_actions:
+            if self._step % 2 == 0:
+                return (
+                    {
+                        "action_handle": f"select:{self._step}",
+                        "action": "select_card",
+                        "kind": "select_card",
+                        "model_action_kind": "card_selection",
+                        "model_action_variant": "select",
+                        "card": {
+                            "id": "CARD.STRIKE",
+                            "pile": "Selectable",
+                            "is_selected": False,
+                        },
+                    },
+                )
+            return (
+                {
+                    "action_handle": f"cancel:{self._step}",
+                    "action": "cancel_selection",
+                    "kind": "cancel_selection",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "cancel_prompt",
+                },
+            )
+        return (
+            {
+                "action_handle": f"hold:{self._step}",
+                "action": "choose_event_option",
+                "kind": "choose_event_option",
+                "model_action_kind": "event_option",
+                "transport_kind": "event_option",
+                "index": 1,
+                "label": f"EVENT.LOOP.options.HOLD_{self._step}",
+                "option": {
+                    "index": 1,
+                    "text_key": f"EVENT.LOOP.options.HOLD_{self._step}",
+                    "is_locked": False,
+                    "is_chosen": False,
+                    "is_proceed": False,
+                },
+            },
+        )
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, Any]:
+        durable_changed = bool(self.durable_change_step is not None and self._step >= self.durable_change_step)
+        if self.durable_resource_cycle:
+            gold = self.durable_resource_cycle[self._step % len(self.durable_resource_cycle)]
+        else:
+            gold = 100 if durable_changed and self.durable_change_kind == "gold" else 99
+        deck = [
+            {"id": "CARD.STRIKE", "is_upgraded": False},
+            {"id": "CARD.DEFEND", "is_upgraded": False},
+        ]
+        if durable_changed and self.durable_change_kind == "deck":
+            deck.append({"id": "CARD.BASH", "is_upgraded": True})
+        room_changed = durable_changed and self.durable_change_kind == "room"
+        observation: dict[str, Any] = {
+            "phase": "selection" if self._step % 2 else "event",
+            "decision_domain": "build",
+            "state_type": "event",
+            "screen": "SELECTION" if self._step % 2 else "EVENT",
+            "terminated": terminal,
+            "truncated": False,
+            "player": {
+                "character": "IRONCLAD",
+                "hp": 33,
+                "max_hp": 67,
+                "gold": gold,
+                "open_potion_slots": 2,
+                "deck": len(deck) if self.live_deck_shape else deck,
+                "relics": [
+                    {"id": "RELIC.LIZARD_TAIL", "is_used_up": False},
+                ],
+                "potions": [{"id": "POTION.FIRE", "slot_index": 0}],
+            },
+            "combat": {"in_progress": False, "enemies": []},
+            "run": {
+                "active": True,
+                "act": 1,
+                "floor": 10 if room_changed else 9,
+                "room_type": "event",
+                "room_model_id": "EVENT.NEXT" if room_changed else "EVENT.LOOP",
+            },
+            "event": {
+                "event_id": "EVENT.NEXT" if room_changed else "EVENT.LOOP",
+                "description_key": f"EVENT.LOOP.pages.PREVIEW_{self._step}",
+                "is_finished": False,
+                "dynamic_vars": [
+                    {
+                        "name": "HpLoss",
+                        "family": "value",
+                        "int_value": self._step,
+                        "preview_value": self._step,
+                    }
+                ],
+                "options": [
+                    {
+                        "index": 1,
+                        "text_key": "EVENT.LOOP.options.HOLD",
+                        "is_locked": False,
+                        "is_chosen": False,
+                        "is_proceed": False,
+                    }
+                ],
+            },
+        }
+        if self.live_deck_shape:
+            player = observation["player"]
+            assert isinstance(player, dict)
+            player["deck_cards"] = deck
+        if self.alternate_ui_actions:
+            observation["card_selection"] = {
+                "mode": "SimpleGrid",
+                "prompt_id": "EVENT.LOOP.select_or_cancel",
+                "selected_count": self._step % 2,
+                "min_select": 0,
+                "max_select": 1,
+                "requires_manual_confirmation": True,
+                "can_confirm": bool(self._step % 2),
+                "options": [
+                    {
+                        "option_index": 0,
+                        "is_selected": bool(self._step % 2),
+                        "card": {"id": "CARD.STRIKE", "pile": "Selectable"},
+                    }
+                ],
+            }
+        return observation
+
+    def reset(self, request: ResetRequest) -> EnvironmentResult:
+        assert request.expected_state_version == self._state_version
+        self.reset_seeds.append(request.seed)
+        before = self._state_version
+        self._state_version += 1
+        self._step = 0
+        self._episode += 1
+        episode_id = f"event-episode-{self._episode}"
+        return EnvironmentResult(
+            episode_id=episode_id,
+            step_index=0,
+            observation=self._observation(),
+            legal_actions=self._actions(),
+            transition=EnvironmentTransition(
+                episode_id=episode_id,
+                step_index=0,
+                before_state_version=before,
+                after_state_version=self._state_version,
+                facts={"combat_result": "none", "terminal_reason": None},
+            ),
+            info={"reward_authority": "external-rl"},
+        )
+
+    def combat_reset(self, request: CombatResetRequest) -> EnvironmentResult:
+        raise AssertionError("event fake must use reset")
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        assert request.expected_step_index == self._step
+        before = self._state_version
+        self._state_version += 1
+        self._step += 1
+        episode_id = f"event-episode-{self._episode}"
+        return EnvironmentResult(
+            episode_id=episode_id,
+            step_index=self._step,
+            observation=self._observation(),
+            legal_actions=self._actions(),
+            transition=EnvironmentTransition(
+                episode_id=episode_id,
+                step_index=self._step,
+                before_state_version=before,
+                after_state_version=self._state_version,
+                facts={"combat_result": "none", "terminal_reason": None},
+            ),
+            info={"reward_authority": "external-rl"},
+        )
+
+
+class TerminalWithoutObservationFlagsBackend(DynamicPreviewLoopBackend):
+    """Terminates at the stall boundary without mirroring result flags in obs."""
+
+    def __init__(self, *, terminal_step: int) -> None:
+        super().__init__()
+        self.result_terminal_step = terminal_step
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, Any]:
+        observation = super()._observation(terminal=terminal)
+        observation.pop("terminated", None)
+        observation.pop("truncated", None)
+        return observation
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        assert request.expected_step_index == self._step
+        before = self._state_version
+        self._state_version += 1
+        self._step += 1
+        episode_id = f"event-episode-{self._episode}"
+        terminal = self._step >= self.result_terminal_step
+        terminal_reason = "run_victory" if terminal else None
+        return EnvironmentResult(
+            episode_id=episode_id,
+            step_index=self._step,
+            observation=self._observation(terminal=terminal),
+            legal_actions=() if terminal else self._actions(),
+            transition=EnvironmentTransition(
+                episode_id=episode_id,
+                step_index=self._step,
+                before_state_version=before,
+                after_state_version=self._state_version,
+                facts={
+                    "combat_result": "victory" if terminal else "none",
+                    "terminal_reason": terminal_reason,
+                },
+            ),
+            terminated=terminal,
+            terminal_reason=terminal_reason,
+            info={"reward_authority": "external-rl"},
+        )
+
+
+class StaticEventLoopBackend(DynamicPreviewLoopBackend):
+    """Exact semantic loop used to make both detectors fire together."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        return (
+            {
+                "action_handle": f"hold:{self._step}",
+                "action": "choose_event_option",
+                "kind": "choose_event_option",
+                "model_action_kind": "event_option",
+                "transport_kind": "event_option",
+                "index": 1,
+                "label": "EVENT.LOOP.options.HOLD",
+            },
+        )
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, Any]:
+        observation = super()._observation(terminal=terminal)
+        observation["phase"] = "event"
+        event = observation["event"]
+        assert isinstance(event, dict)
+        event["description_key"] = "EVENT.LOOP.pages.HOLD"
+        event["dynamic_vars"] = []
+        return observation
+
+
 def _config(*, total_steps: int = 4) -> TrainingConfig:
     return TrainingConfig(
         profile="v2-test",
@@ -264,6 +531,27 @@ def _config(*, total_steps: int = 4) -> TrainingConfig:
     )
 
 
+def _event_loop_config(*, durable_window: int = 4) -> TrainingConfig:
+    base = _config(total_steps=20)
+    return replace(
+        base,
+        environment=replace(
+            base.environment,
+            scenario="full-run",
+            max_episode_steps=20,
+        ),
+        curriculum=replace(base.curriculum, reward_objective="run"),
+        diagnostics=DiagnosticsConfig(
+            deadlock_window=128,
+            deadlock_repeat_threshold=8,
+            combat_net_progress_window=256,
+            noncombat_durable_progress_window=durable_window,
+            combat_min_net_hp_fraction=0.05,
+            journal_policy_topk=5,
+        ),
+    )
+
+
 def test_collector_emits_contiguous_recurrent_unroll() -> None:
     resources = build_training_resources(_config(), backend=FakeCombatBackend())
     try:
@@ -317,6 +605,8 @@ def test_collector_can_adopt_new_policy_only_between_complete_unrolls() -> None:
         assert [item.steps for item in progress] == [2, 4]
         assert [item.behavior_policy_version for item in progress] == [0, 7]
         assert all(item.max_act == 1 and item.max_floor == 1 for item in progress)
+        assert all(item.maximum_observed_candidates == 2 for item in progress)
+        assert episode.metrics.maximum_observed_candidates == 2
         assert episode.behavior_policy_version == 7
         assert episode.actor_policy_version == 9
     finally:
@@ -429,6 +719,186 @@ def test_transient_damage_followed_by_healing_does_not_fake_combat_progress() ->
         resources.close()
 
 
+def test_noncombat_dynamic_preview_and_changing_labels_cannot_evade_stall(
+    tmp_path: Path,
+) -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=DynamicPreviewLoopBackend(),
+    )
+    progress = []
+    journal_path = tmp_path / "event-loop.jsonl"
+    try:
+        with TrajectoryJournal(
+            journal_path,
+            snapshot_interval=1_000,
+            anomaly_context_steps=1,
+        ) as journal:
+            episode = resources.collector.collect_episode(
+                record=True,
+                progress_sink=progress.append,
+                trajectory_journal=journal,
+            )
+        assert episode.metrics.steps == 4
+        assert episode.metrics.deadlocked
+        assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.combat_progress_stalled
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.maximum_noncombat_no_durable_progress_steps == 4
+        assert progress[-1].noncombat_no_durable_progress_steps == 4
+
+        records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+        evidence = [
+            item["deadlock"]
+            for item in records
+            if isinstance(item.get("deadlock"), dict)
+            and item["deadlock"].get("kind") == "noncombat_no_durable_progress"
+        ]
+        assert evidence
+        assert evidence[-1]["steps_without_durable_progress"] == 4
+        assert len(evidence[-1]["durable_state_fingerprint"]) == 64
+        assert len(evidence[-1]["locus_fingerprint"]) == 64
+        assert len(evidence[-1]["resource_fingerprint"]) == 64
+        assert len(evidence[-1]["action_fingerprint"]) == 64
+        assert evidence[-1]["detected_step"] == 4
+        assert evidence[-1]["context"]["room_model_id"] == "EVENT.LOOP"
+        assert "observation" not in evidence[-1]
+        anomaly = next(
+            item
+            for item in records
+            if item.get("record_kind") == "rich_snapshot"
+            and isinstance(item.get("deadlock"), dict)
+            and item["deadlock"].get("kind") == "noncombat_no_durable_progress"
+        )
+        assert anomaly["step_index"] == 3
+        assert anomaly["result_step_index"] == 4
+        assert anomaly["result_observation"]["event"]["dynamic_vars"][0]["int_value"] == 4
+        assert anomaly["observation"]["event"]["dynamic_vars"][0]["int_value"] == 3
+        assert "action_handle" not in anomaly["result_legal_actions"][0]
+    finally:
+        resources.close()
+
+
+def test_alternating_select_cancel_and_ui_state_do_not_reset_durable_window() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=DynamicPreviewLoopBackend(alternate_ui_actions=True),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 4
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.maximum_noncombat_no_durable_progress_steps == 4
+    finally:
+        resources.close()
+
+
+def test_three_state_durable_resource_cycle_cannot_reset_window_forever() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=DynamicPreviewLoopBackend(
+            durable_resource_cycle=(99, 100, 101),
+        ),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 6
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.maximum_noncombat_no_durable_progress_steps == 4
+    finally:
+        resources.close()
+
+
+@pytest.mark.parametrize("change_kind", ["gold", "deck", "room"])
+def test_true_noncombat_durable_progress_resets_stall_window(
+    change_kind: str,
+) -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=DynamicPreviewLoopBackend(
+            durable_change_step=3,
+            durable_change_kind=change_kind,
+        ),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 7
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.maximum_noncombat_no_durable_progress_steps == 4
+    finally:
+        resources.close()
+
+
+def test_live_integer_deck_uses_deck_cards_for_durable_progress() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=DynamicPreviewLoopBackend(
+            durable_change_step=3,
+            durable_change_kind="deck",
+            live_deck_shape=True,
+        ),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 7
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.maximum_noncombat_no_durable_progress_steps == 4
+    finally:
+        resources.close()
+
+
+def test_environment_result_terminal_flags_prevent_deadlock_override() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=TerminalWithoutObservationFlagsBackend(terminal_step=4),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert episode.metrics.steps == 4
+        assert episode.metrics.run_won
+        assert not episode.metrics.deadlocked
+        assert not episode.metrics.combat_progress_stalled
+        assert not episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.terminal_reason == "run_victory"
+        assert episode.unrolls[-1].steps[-1].discount == 0.0
+    finally:
+        resources.close()
+
+
+def test_noncombat_stall_evidence_precedes_simultaneous_semantic_evidence(
+    tmp_path: Path,
+) -> None:
+    base = _event_loop_config(durable_window=4)
+    config = replace(
+        base,
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=4,
+        ),
+    )
+    resources = build_training_resources(config, backend=StaticEventLoopBackend())
+    journal_path = tmp_path / "simultaneous-deadlock.jsonl"
+    try:
+        with TrajectoryJournal(journal_path) as journal:
+            episode = resources.collector.collect_episode(
+                record=True,
+                trajectory_journal=journal,
+            )
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+        terminal_summary = next(
+            item for item in records if item.get("record_kind") == "summary" and item.get("outcome") == "deadlock"
+        )
+        assert terminal_summary["deadlock"]["kind"] == ("noncombat_no_durable_progress")
+    finally:
+        resources.close()
+
+
 def test_collector_fails_closed_on_stale_transition_revision() -> None:
     resources = build_training_resources(_config(), backend=StaleRevisionBackend())
     try:
@@ -443,10 +913,7 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
     try:
         unroll = resources.collector.collect_episode(record=True).unrolls[0]
         progress: list[tuple[str, dict[str, int | float]]] = []
-        before = {
-            name: value.detach().clone()
-            for name, value in resources.model.state_dict().items()
-        }
+        before = {name: value.detach().clone() for name, value in resources.model.state_dict().items()}
         metrics = resources.learner.update(
             (unroll,),
             current_policy_version=0,
@@ -462,10 +929,7 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
         assert progress[-1][0] == "optimizer_complete"
         assert any(stage == "backward_complete" for stage, _ in progress)
         assert all(payload["elapsed_ms"] >= 0.0 for _, payload in progress)
-        assert any(
-            not torch.equal(before[name], value)
-            for name, value in resources.model.state_dict().items()
-        )
+        assert any(not torch.equal(before[name], value) for name, value in resources.model.state_dict().items())
     finally:
         resources.close()
 
@@ -566,20 +1030,87 @@ def test_runtime_checkpoints_each_crossed_episode_boundary(
 
     assert state.environment_steps == 4
     assert state.episodes == 2
+    assert state.maximum_observed_candidates == 2
     checkpoint_root = tmp_path / "checkpoints" / "boundary-checkpoint"
     periodic = sorted(checkpoint_root.glob("run-*/periodic-*"))
     assert len(periodic) == 2
     assert all((path / "checkpoint.manifest.json").is_file() for path in periodic)
     assert all((path / "metadata.json").is_file() for path in periodic)
+    first_metadata, second_metadata = [
+        json.loads((path / "metadata.json").read_text(encoding="utf-8")) for path in periodic
+    ]
+    assert first_metadata["provenance"]["checkpoint_load_mode"] == "fresh"
+    assert first_metadata["provenance"]["parent_checkpoint"] is None
+    assert second_metadata["provenance"]["checkpoint_load_mode"] == "in_process_successor"
+    assert second_metadata["provenance"]["parent_checkpoint"]["relation"] == "in_process_successor"
+    assert second_metadata["provenance"]["parent_checkpoint"]["checkpoint_id"] == first_metadata["checkpoint_id"]
+    assert second_metadata["training_state"]["maximum_observed_candidates"] == 2
+    final = next(checkpoint_root.glob("run-*/final-*"))
+    final_metadata = json.loads((final / "metadata.json").read_text(encoding="utf-8"))
+    assert final_metadata["provenance"]["checkpoint_load_mode"] == "in_process_successor"
+    assert final_metadata["provenance"]["parent_checkpoint"]["checkpoint_id"] == second_metadata["checkpoint_id"]
+    assert final_metadata["provenance"]["parent_checkpoint"]["relation"] == "in_process_successor"
 
-    metrics_path = next(
-        (tmp_path / "runs" / "boundary-checkpoint").glob("run-*/metrics.jsonl")
-    )
+    metrics_path = next((tmp_path / "runs" / "boundary-checkpoint").glob("run-*/metrics.jsonl"))
     metrics_text = metrics_path.read_text(encoding="utf-8")
     assert metrics_text.count('"event": "train_episode"') == 2
     assert metrics_text.count('"event": "checkpoint"') == 2
     assert '"behavior_policy_version": 0' in metrics_text
     assert '"actor_progress": {' in metrics_text
+    assert '"maximum_observed_candidates": 2' in metrics_text
+    assert '"run_maximum_observed_candidates": 2' in metrics_text
+
+
+def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/exact-resume-lineage",
+            checkpoint_dir="checkpoints/exact-resume-lineage",
+            checkpoint_interval_steps=2,
+        ),
+    )
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        unroll = source.collector.collect_episode(record=True).unrolls[0]
+        source.rollout_queue.put(unroll)
+        source_checkpoint = save_training_checkpoint(
+            tmp_path / "resume-source",
+            config=config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                maximum_observed_candidates=2,
+            ),
+            run_id="resume-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    state = run_training(
+        config,
+        backend=FakeCombatBackend(),
+        resume_from=source_checkpoint,
+    )
+
+    assert state.environment_steps == 4
+    checkpoint_root = tmp_path / "checkpoints" / "exact-resume-lineage"
+    periodic = next(checkpoint_root.glob("run-*/periodic-*"))
+    periodic_metadata = json.loads((periodic / "metadata.json").read_text(encoding="utf-8"))
+    assert periodic_metadata["provenance"]["checkpoint_load_mode"] == "exact_resume"
+    assert periodic_metadata["provenance"]["parent_checkpoint"]["relation"] == "loaded_parent"
+    final = next(checkpoint_root.glob("run-*/final-*"))
+    final_metadata = json.loads((final / "metadata.json").read_text(encoding="utf-8"))
+    assert final_metadata["provenance"]["checkpoint_load_mode"] == "in_process_successor"
+    assert final_metadata["provenance"]["parent_checkpoint"]["checkpoint_id"] == periodic_metadata["checkpoint_id"]
 
 
 def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
@@ -599,6 +1130,8 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         assert summary["act1_clear_count"] == 0
         assert summary["act3_reach_count"] == 0
         assert summary["act3_reach_rate"] == 0.0
+        assert summary["maximum_observed_candidates"] == 2
+        assert all(item.maximum_observed_candidates == 2 for item in episodes)
         assert all(int(seed) % 2 == 1 for seed in backend.reset_seeds)
         assert (tmp_path / "trajectory.jsonl").read_text(encoding="utf-8")
     finally:
@@ -619,6 +1152,7 @@ def test_v2_checkpoint_roundtrip_restores_models_optimizer_queue_and_rng(
             episodes=1,
             policy_version=0,
             actor_policy_version=0,
+            maximum_observed_candidates=2,
         )
         checkpoint = save_training_checkpoint(
             tmp_path / "checkpoint",
@@ -648,25 +1182,36 @@ def test_v2_checkpoint_roundtrip_restores_models_optimizer_queue_and_rng(
         restored.close()
 
 
+def test_exact_resume_accepts_legacy_checkpoint_without_candidate_diagnostic() -> None:
+    legacy_state = asdict(
+        TrainingState(
+            environment_steps=123,
+            learner_updates=7,
+            episodes=3,
+        )
+    )
+    legacy_state.pop("maximum_observed_candidates")
+
+    migrated = checkpointing_module.training_state_from_metadata({"training_state": legacy_state})
+
+    assert migrated.environment_steps == 123
+    assert migrated.learner_updates == 7
+    assert migrated.episodes == 3
+    assert migrated.maximum_observed_candidates == 0
+
+
 def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(
     tmp_path: Path,
 ) -> None:
     source_config = _config()
     source = build_training_resources(source_config, backend=FakeCombatBackend())
     try:
-        source.rollout_queue.put(
-            source.collector.collect_episode(record=True).unrolls[0]
-        )
+        source.rollout_queue.put(source.collector.collect_episode(record=True).unrolls[0])
         source.optimizer.zero_grad(set_to_none=True)
-        objective = sum(
-            parameter.square().mean() for parameter in source.model.parameters()
-        )
+        objective = sum(parameter.square().mean() for parameter in source.model.parameters())
         objective.backward()
         source.optimizer.step()
-        source_state = {
-            key: value.detach().clone()
-            for key, value in source.model.state_dict().items()
-        }
+        source_state = {key: value.detach().clone() for key, value in source.model.state_dict().items()}
         source_training_state = TrainingState(
             environment_steps=40_737,
             learner_updates=638,

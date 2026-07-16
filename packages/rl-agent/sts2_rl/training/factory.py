@@ -157,6 +157,9 @@ def build_training_resources(
         combat_net_progress_window=(
             config.diagnostics.combat_net_progress_window
         ),
+        noncombat_durable_progress_window=(
+            config.diagnostics.noncombat_durable_progress_window
+        ),
         combat_min_net_hp_fraction=(
             config.diagnostics.combat_min_net_hp_fraction
         ),

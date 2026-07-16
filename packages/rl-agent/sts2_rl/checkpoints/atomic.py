@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sts2_baseline import (
     revival_efficiency_reward_identity,
@@ -38,6 +38,22 @@ _DEPENDENCY_LOCK_NAMES = (
     "requirements-dev.lock",
     "requirements-wsl-rocm.txt",
 )
+_TRAINING_CHECKPOINT_REQUIRED_FILES = frozenset(
+    {
+        "metadata.json",
+        "network.pt",
+        "actor_network.pt",
+        "optimizer.pt",
+        "rollout_queue.pkl",
+        "stochastic_state.pkl",
+    }
+)
+_PARENT_RELATION_BY_LOAD_MODE: dict[str, str | None] = {
+    "fresh": None,
+    "exact_resume": "loaded_parent",
+    "model_initialization": "model_parameter_initialization",
+    "in_process_successor": "in_process_successor",
+}
 
 
 class CheckpointIntegrityError(RuntimeError):
@@ -192,6 +208,226 @@ def checkpoint_runtime_identity() -> dict[str, Any]:
     }
 
 
+def _require_uuid(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CheckpointIntegrityError(f"{label} must be a UUID string")
+    try:
+        UUID(value)
+    except ValueError as exc:
+        raise CheckpointIntegrityError(f"{label} must be a valid UUID") from exc
+    return value
+
+
+def _require_hash_descriptor(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CheckpointIntegrityError(f"{label} must be a file descriptor")
+    payload = {str(key): item for key, item in value.items()}
+    path = payload.get("path")
+    size_bytes = payload.get("size_bytes")
+    sha256 = payload.get("sha256")
+    if not isinstance(path, str) or not path.strip():
+        raise CheckpointIntegrityError(f"{label}.path must be non-empty")
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+    ):
+        raise CheckpointIntegrityError(f"{label}.size_bytes must be non-negative")
+    if not isinstance(sha256, str) or not _SHA256_PATTERN.fullmatch(sha256):
+        raise CheckpointIntegrityError(f"{label}.sha256 must be a valid SHA-256")
+    return payload
+
+
+def _validate_embedded_checkpoint_lineage(provenance: dict[str, Any]) -> None:
+    mode = provenance.get("checkpoint_load_mode")
+    if mode not in _PARENT_RELATION_BY_LOAD_MODE:
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance has an unsupported checkpoint_load_mode"
+        )
+    expected_relation = _PARENT_RELATION_BY_LOAD_MODE[mode]
+    parent = provenance.get("parent_checkpoint")
+    if expected_relation is None:
+        if parent is not None:
+            raise CheckpointIntegrityError(
+                "fresh parent checkpoint provenance cannot contain a parent descriptor"
+            )
+        return
+    if not isinstance(parent, dict):
+        raise CheckpointIntegrityError(
+            "non-fresh parent checkpoint provenance requires a parent descriptor"
+        )
+    if parent.get("relation") != expected_relation:
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance relation does not match its load mode"
+        )
+    path = parent.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance descriptor has no path"
+        )
+    _require_uuid(
+        parent.get("checkpoint_id"),
+        label="parent checkpoint provenance descriptor checkpoint_id",
+    )
+    _require_hash_descriptor(
+        parent.get("manifest"),
+        label="parent checkpoint provenance manifest descriptor",
+    )
+    _require_hash_descriptor(
+        parent.get("metadata"),
+        label="parent checkpoint provenance metadata descriptor",
+    )
+
+
+def _validated_parent_checkpoint_descriptor(
+    parent_checkpoint: str | Path,
+    *,
+    expected_contract: dict[str, str],
+    expected_reward_spec: dict[str, Any],
+    expected_dependency_locks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate and describe one immutable parent without importing resume.py."""
+
+    parent_path = Path(parent_checkpoint).expanduser().resolve(strict=False)
+    manifest = verify_checkpoint_directory(
+        parent_path,
+        require_manifest=True,
+        require_hashes=True,
+        require_all_files_listed=True,
+    )
+    if manifest is None:  # pragma: no cover - strict verifier cannot return None
+        raise CheckpointIntegrityError(
+            f"parent checkpoint has no atomic manifest: {parent_path}"
+        )
+    raw_files = manifest.get("files")
+    entries = raw_files if isinstance(raw_files, list) else []
+    listed = {
+        str(entry.get("path"))
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    missing = sorted(_TRAINING_CHECKPOINT_REQUIRED_FILES - listed)
+    if missing:
+        raise CheckpointIntegrityError(
+            f"parent checkpoint is missing required manifest entries: {missing}"
+        )
+
+    metadata_path = parent_path / "metadata.json"
+    metadata = _json_object(metadata_path)
+    if metadata is None:
+        raise CheckpointIntegrityError(
+            f"parent checkpoint metadata is missing or invalid: {metadata_path}"
+        )
+    checkpoint_id = _require_uuid(
+        manifest.get("checkpoint_id"),
+        label="parent checkpoint manifest checkpoint_id",
+    )
+    if metadata.get("checkpoint_id") != checkpoint_id:
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata checkpoint_id does not match its manifest"
+        )
+    if manifest.get("contract") != expected_contract:
+        raise CheckpointIntegrityError(
+            "parent checkpoint contract does not match the current runtime"
+        )
+    if metadata.get("contract") != manifest.get("contract"):
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata contract does not match its manifest"
+        )
+    raw_provenance = manifest.get("provenance")
+    if not isinstance(raw_provenance, dict):
+        raise CheckpointIntegrityError(
+            "parent checkpoint manifest has no provenance object"
+        )
+    provenance = {str(key): item for key, item in raw_provenance.items()}
+    if provenance.get("provenance_schema_version") != "sts2-checkpoint-provenance-v1":
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance schema is missing or unsupported"
+        )
+    if metadata.get("provenance") != provenance:
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata provenance does not match its manifest"
+        )
+    if provenance.get("reward_spec") != expected_reward_spec:
+        raise CheckpointIntegrityError(
+            "parent checkpoint reward identity does not match the current runtime"
+        )
+    if provenance.get("dependency_locks") != expected_dependency_locks:
+        raise CheckpointIntegrityError(
+            "parent checkpoint dependency-lock identity does not match the current runtime"
+        )
+    _validate_embedded_checkpoint_lineage(provenance)
+
+    metadata_format = metadata.get("format")
+    if not isinstance(metadata_format, str) or not metadata_format.strip():
+        raise CheckpointIntegrityError("parent checkpoint metadata has no format")
+    training_state = metadata.get("training_state")
+    if not isinstance(training_state, dict):
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata has no training_state object"
+        )
+    total_steps = metadata.get("total_steps")
+    if (
+        isinstance(total_steps, bool)
+        or not isinstance(total_steps, int)
+        or total_steps < 0
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata total_steps must be non-negative"
+        )
+    if training_state.get("environment_steps") != total_steps:
+        raise CheckpointIntegrityError(
+            "parent checkpoint training_state does not match total_steps"
+        )
+
+    manifest_descriptor = _hashed_file(parent_path / "checkpoint.manifest.json")
+    metadata_descriptor = _hashed_file(metadata_path)
+    if manifest_descriptor is None or metadata_descriptor is None:
+        raise CheckpointIntegrityError(
+            "parent checkpoint manifest/metadata descriptions are unavailable"
+        )
+    _require_hash_descriptor(
+        manifest_descriptor,
+        label="parent checkpoint manifest descriptor",
+    )
+    _require_hash_descriptor(
+        metadata_descriptor,
+        label="parent checkpoint metadata descriptor",
+    )
+    metadata_entry = next(
+        (
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("path") == "metadata.json"
+        ),
+        None,
+    )
+    if not isinstance(metadata_entry, dict) or (
+        metadata_entry.get("sha256") != metadata_descriptor["sha256"]
+        or metadata_entry.get("size_bytes") != metadata_descriptor["size_bytes"]
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint metadata descriptor does not match its manifest entry"
+        )
+    parent_reward = provenance.get("reward_spec")
+    if not isinstance(parent_reward, dict) or not isinstance(
+        parent_reward.get("fingerprint"), str
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance has no reward fingerprint"
+        )
+    return {
+        "path": str(parent_path),
+        "relation": None,
+        "checkpoint_id": checkpoint_id,
+        "total_steps": total_steps,
+        "training_state": training_state,
+        "reward_spec_fingerprint": parent_reward["fingerprint"],
+        "manifest": manifest_descriptor,
+        "metadata": metadata_descriptor,
+    }
+
+
 def build_checkpoint_provenance(
     *,
     parent_checkpoint: str | Path | None = None,
@@ -202,8 +438,29 @@ def build_checkpoint_provenance(
     parent_relation: str | None = None,
 ) -> dict[str, Any]:
     """Capture reproducibility inputs shared by metadata and atomic manifest."""
-    if checkpoint_load_mode not in {"fresh", "exact_resume", "model_initialization"}:
+    if checkpoint_load_mode not in _PARENT_RELATION_BY_LOAD_MODE:
         raise ValueError("checkpoint load mode is missing or unsupported")
+    expected_parent_relation = _PARENT_RELATION_BY_LOAD_MODE[checkpoint_load_mode]
+    parent_was_supplied = parent_checkpoint is not None
+    if expected_parent_relation is None:
+        if parent_was_supplied or parent_relation is not None:
+            raise ValueError(
+                "fresh checkpoint provenance cannot have a parent checkpoint or relation"
+            )
+    else:
+        if not parent_was_supplied or (
+            isinstance(parent_checkpoint, str) and not parent_checkpoint.strip()
+        ):
+            raise ValueError(
+                f"{checkpoint_load_mode} checkpoint provenance requires a parent checkpoint"
+            )
+        if parent_relation is None:
+            parent_relation = expected_parent_relation
+        elif parent_relation != expected_parent_relation:
+            raise ValueError(
+                f"{checkpoint_load_mode} checkpoint provenance requires "
+                f"parent_relation={expected_parent_relation!r}"
+            )
     root = _repository_root()
     reward_payload = reward_spec_metadata()
     game_manifest_path = root / "game-data" / "manifest.json"
@@ -215,36 +472,14 @@ def build_checkpoint_provenance(
     )
     locks = dependency_lock_metadata()
     parent: dict[str, Any] | None = None
-    if parent_checkpoint:
-        parent_path = Path(parent_checkpoint).expanduser().resolve(strict=False)
-        parent = {"path": str(parent_path)}
-        relation = parent_relation or "unspecified_parent"
-        if relation not in {
-            "loaded_parent",
-            "model_parameter_initialization",
-            "in_process_successor",
-            "unspecified_parent",
-        }:
-            raise ValueError("checkpoint parent relation is missing or unsupported")
-        parent["relation"] = relation
-        manifest = _hashed_file(parent_path / "checkpoint.manifest.json")
-        metadata = _hashed_file(parent_path / "metadata.json")
-        parent_manifest_payload = _json_object(parent_path / "checkpoint.manifest.json")
-        parent_metadata_payload = _json_object(parent_path / "metadata.json")
-        if parent_manifest_payload is not None:
-            parent["checkpoint_id"] = parent_manifest_payload.get("checkpoint_id")
-        if parent_metadata_payload is not None:
-            parent["total_steps"] = parent_metadata_payload.get("total_steps")
-            parent["training_state"] = parent_metadata_payload.get("training_state")
-            parent_provenance = parent_metadata_payload.get("provenance")
-            if isinstance(parent_provenance, dict):
-                parent_reward = parent_provenance.get("reward_spec")
-                if isinstance(parent_reward, dict):
-                    parent["reward_spec_fingerprint"] = parent_reward.get("fingerprint")
-        if manifest is not None:
-            parent["manifest"] = manifest
-        if metadata is not None:
-            parent["metadata"] = metadata
+    if parent_checkpoint is not None:
+        parent = _validated_parent_checkpoint_descriptor(
+            parent_checkpoint,
+            expected_contract=contract_metadata(),
+            expected_reward_spec=reward_payload,
+            expected_dependency_locks=locks,
+        )
+        parent["relation"] = parent_relation
     return {
         "provenance_schema_version": "sts2-checkpoint-provenance-v1",
         "runtime": {

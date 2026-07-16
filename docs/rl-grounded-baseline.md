@@ -227,12 +227,18 @@ The profile keeps a 30,000-decision outer transport-safety ceiling and uses
 undiscounted return. Exact semantic deadlock detection terminates a genuine
 reversible UI loop earlier. Separately, a 256-decision combat window requires a
 5% net reduction in current enemy-health burden or a real phase/wave advance.
-Damage followed by healing and summon churn do not reset the window. This
-generic fact boundary prevents an irreversibly exhausted unlimited-revival
-combat from consuming the rest of the run; it does not inspect card IDs,
-preferred actions, damage estimates, or revival counts. The outer ceiling is
-not an Act boundary or curriculum gate. All survival/pace costs together are
-bounded below one point, so the
+Damage followed by healing and summon churn do not reset the window. A second
+256-decision non-combat window advances only on durable run progress: run/room/
+event identity, HP/max HP, gold, permanent deck, relic or potion composition,
+or completion. Dynamic preview counters, page/option text, screen/phase and
+selection membership do not reset it, so changing `HpLoss` values and alternating
+select/cancel operations cannot evade the bound. Same-room resource fingerprints
+are remembered: a new durable resource state may reset the window once, but a
+bounded `A -> B -> A` or multi-state cycle cannot reset it again. These generic
+fact boundaries do not branch on any particular card/event ID and contain no
+handwritten card, event, preferred-action, damage-estimate, or revival-count
+policy. The outer ceiling is not an Act boundary or curriculum gate. All
+survival/pace costs together are bounded below one point, so the
 terminal margin guarantees every victory ranks above every failure. Forward
 floor progress gives failed runs useful ordering without paying for damage or
 specific choices. Within the same outcome the weighted objective prefers:
@@ -268,12 +274,44 @@ Evaluation canonicalizes the complete observation and legal candidates after
 removing only transport identities such as request UUIDs, dispatch handles,
 timestamps and revision counters. Repeated semantic decision/action pairs in a
 bounded window produce explicit `DeadlockEvidence` and terminate the task as a
-failure.
+failure. Combat and non-combat progress trackers independently catch changing-
+state loops that cannot recur under an exact semantic fingerprint.
 
-This is a generic loop detector, not a card/UI/boss heuristic. Evaluation writes
-versioned JSONL with compact observations, legal actions, selected action, policy
-top-k, value, reward breakdown and deadlock evidence. These journals are
-diagnostic artifacts and never enter the rollout queue.
+These are generic loop detectors, not card/UI/boss heuristics. Trajectory journal
+v3 writes a compact record for every held-out decision, including position,
+resource/entity counts, selected action, candidate-kind counts, policy top-k,
+value, reward and stall evidence. Complete semantic observation/candidate
+snapshots are bounded to the first and last decision, every 256 decisions,
+anomalies, and the preceding eight-decision context. Journals are diagnostic
+artifacts and never enter the rollout queue.
+
+Trajectory journal v3 is a record union rather than the v2 full-state row:
+
+- `event=decision`, `record_kind=summary` is the one-per-decision compact row.
+  It uses `observation_summary` plus action counts/fingerprints and does not have
+  top-level `observation` or `legal_actions`. Long scalar strings are represented
+  by a bounded prefix, UTF-8 length and SHA-256 digest.
+- `event=decision_snapshot`, `record_kind=rich_snapshot` carries complete
+  semantic `observation`, `legal_actions` and `selected_action`, plus
+  `snapshot_reasons`. When a progress stall is detected on the transition
+  result it also carries `result_step_index`, semantic `result_observation` and
+  `result_legal_actions`, and result terminal flags; the pre-action decision is
+  retained rather than silently replaced.
+- Consumers should identify a record by `(episode_id, step_index, record_kind)`.
+  A decision normally has one summary and may also have a rich snapshot. Context
+  snapshots are appended only when a later anomaly is detected, so file order is
+  append order rather than guaranteed `step_index` order; reconstruct a timeline
+  by grouping by episode and sorting numerically by step. If more than one rich
+  snapshot exists for the same step, merge the union of `snapshot_reasons` and
+  retain the last payload. A first/periodic snapshot that already covers a later
+  anomaly-context step is reused rather than duplicated, so its original reason
+  remains while its payload still satisfies the context window.
+
+The backend contract treats each returned `EnvironmentResult` and all nested
+DTOs as immutable after return. This allows the journal to retain read-only
+references for its eight-record anomaly context without reintroducing a full
+deep copy on every held-out decision. The built-in headless and live backends
+construct a new decoded result for every state.
 
 ## Evaluation schedule
 
@@ -285,6 +323,8 @@ Reports include:
 - Act 3 reach count and rate;
 - run/combat win rate as applicable;
 - semantic deadlock rate;
+- combat and non-combat progress-stall rates;
+- maximum active legal-candidate count observed by the held-out batch and run;
 - mean and maximum floor;
 - mean maximum act;
 - mean undiscounted reward.
@@ -324,6 +364,20 @@ lineage. Optimizer state, queued unrolls, RNGs, collector continuation, counters
 and policy-version numbers are not imported. Child checkpoint provenance uses
 the `model_parameter_initialization` relation, so this cannot be confused with
 exact resume.
+
+Checkpoint provenance describes the operation that actually produced each
+checkpoint. The first checkpoint of a process retains `fresh`, `exact_resume`,
+or `model_initialization`; later periodic/final checkpoints in that same process
+use `in_process_successor` and point to the immediately preceding checkpoint.
+`maximum_observed_candidates` is a diagnostic training-state scalar; a legacy v3
+checkpoint missing only that field may initialize it to zero, while every other
+unknown or missing state field remains fail-closed.
+
+Non-fresh provenance is itself fail-closed: before publication, the direct
+parent must be an existing atomic training checkpoint with a complete manifest,
+all payload sizes and SHA-256 hashes valid, no unlisted files, matching manifest/
+metadata checkpoint UUIDs, and current contract, reward and dependency-lock
+identity. A non-empty path is not accepted as lineage evidence by itself.
 
 ## Commands
 
