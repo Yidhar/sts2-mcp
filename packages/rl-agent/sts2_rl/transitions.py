@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 CombatResult = Literal["none", "victory", "defeat", "escaped"]
+RunResult = Literal["none", "victory", "defeat"]
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -41,6 +42,7 @@ class TransitionFacts:
     player_hp_lost_delta: float = 0.0
     room_entered: str | None = None
     combat_result: CombatResult = "none"
+    run_result: RunResult = "none"
     terminal_reason: str | None = None
     enemy_hp_delta: float = 0.0
 
@@ -51,6 +53,12 @@ class TransitionFacts:
         combat_result = (
             cast(CombatResult, raw_combat_result)
             if raw_combat_result in {"none", "victory", "defeat", "escaped"}
+            else "none"
+        )
+        raw_run_result = str(data.get("run_result") or "none").lower()
+        run_result = (
+            cast(RunResult, raw_run_result)
+            if raw_run_result in {"none", "victory", "defeat"}
             else "none"
         )
         return cls(
@@ -68,6 +76,7 @@ class TransitionFacts:
                 str(data["room_entered"]) if data.get("room_entered") is not None else None
             ),
             combat_result=combat_result,
+            run_result=run_result,
             terminal_reason=(
                 str(data["terminal_reason"])
                 if data.get("terminal_reason") is not None
@@ -204,23 +213,27 @@ def derive_transition_facts(
     before_floor = int(_number(before_run.get("floor", before.get("floor"))))
     after_floor = int(_number(after_run.get("floor", after.get("floor"))))
 
-    reason = str(terminal_reason or "").lower()
+    reason = str(terminal_reason or "").strip().lower()
     combat_result: CombatResult = "none"
+    run_result: RunResult = "none"
     if terminated:
-        # An explicit transport outcome is authoritative. Combat-scoped
-        # simulator victories cross a post-combat DTO that no longer carries
-        # a player object, so checking its default HP=0 first would invert a
-        # real victory into a defeat.
-        if any(token in reason for token in ("victory", "won", "win")):
+        # Episode-scoped terminal reasons are authoritative. Full-run and
+        # combat results deliberately remain separate facts: terminal game-over
+        # DTOs may omit the player block, so HP is never a run-outcome source.
+        if reason == "combat_victory":
             combat_result = "victory"
-        elif after_hp <= 0.0 or any(
-            token in reason for token in ("death", "defeat", "died")
-        ):
+        elif reason == "combat_defeat":
             combat_result = "defeat"
-        elif "escape" in reason:
+        elif reason == "combat_escaped":
             combat_result = "escaped"
+        elif reason == "run_victory":
+            run_result = "victory"
+        elif reason == "run_defeat":
+            run_result = "defeat"
         else:
-            combat_result = "victory"
+            raise ValueError(
+                "terminated transition requires a canonical combat_* or run_* terminal_reason"
+            )
     return TransitionFacts(
         hp_delta=after_hp - before_hp,
         gold_delta=after_gold - before_gold,
@@ -245,9 +258,10 @@ def derive_transition_facts(
             else None
         ),
         combat_result=combat_result,
+        run_result=run_result,
         terminal_reason=terminal_reason,
         enemy_hp_delta=_enemy_hp_total(before) - _enemy_hp_total(after),
     )
 
 
-__all__ = ["CombatResult", "TransitionFacts", "derive_transition_facts"]
+__all__ = ["CombatResult", "RunResult", "TransitionFacts", "derive_transition_facts"]

@@ -124,6 +124,27 @@ def _training_counter(result: EnvironmentResult, key: str) -> float:
     return normalized
 
 
+def _validated_full_run_result(result: EnvironmentResult) -> str:
+    facts = result.transition.facts if result.transition is not None else {}
+    run_result = facts.get("run_result")
+    if not result.terminated:
+        if run_result not in {None, "none"}:
+            raise RuntimeError("non-terminal full-run probe exposed a final run_result")
+        return "none"
+
+    if run_result not in {"victory", "defeat"}:
+        raise RuntimeError("terminal full-run probe has no typed run_result")
+    expected_reason = f"run_{run_result}"
+    if (
+        result.terminal_reason != expected_reason
+        or facts.get("terminal_reason") != expected_reason
+    ):
+        raise RuntimeError(
+            "terminal full-run probe result and terminal_reason are inconsistent"
+        )
+    return str(run_result)
+
+
 def _enemy_hp(result: EnvironmentResult) -> float:
     combat = result.observation.get("combat")
     enemies = combat.get("enemies") if isinstance(combat, dict) else None
@@ -311,7 +332,7 @@ def _run_full_run_episode(
             raise RuntimeError("full-run simulator returned an outcome-unknown truncation")
 
     act, floor = _run_position(result)
-    facts = result.transition.facts if result.transition is not None else {}
+    run_result = _validated_full_run_result(result)
     return FullRunGateStats(
         seed=episode_seed,
         steps=min(result.step_index, episode_limit),
@@ -322,7 +343,7 @@ def _run_full_run_episode(
         player_hp_lost=_training_counter(result, "player_hp_lost"),
         decision_domains=tuple(sorted(domains)),
         terminated=result.terminated,
-        run_won=bool(result.terminated and facts.get("combat_result") == "victory"),
+        run_won=run_result == "victory",
         terminal_reason=result.terminal_reason,
     )
 

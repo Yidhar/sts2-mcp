@@ -23,6 +23,7 @@ def _result(
     enemy_hp: int = 10,
     terminated: bool = False,
     combat_result: str = "none",
+    run_result: str = "none",
     terminal_reason: str | None = None,
     truncated: bool = False,
     relics_used: tuple[str, ...] = (),
@@ -33,7 +34,10 @@ def _result(
 ) -> EnvironmentResult:
     reason = terminal_reason
     if terminated and reason is None:
-        reason = "combat_victory" if combat_result == "victory" else "combat_defeat"
+        if run_result in {"victory", "defeat"}:
+            reason = f"run_{run_result}"
+        else:
+            reason = "combat_victory" if combat_result == "victory" else "combat_defeat"
     return EnvironmentResult(
         episode_id="episode",
         step_index=step,
@@ -54,6 +58,7 @@ def _result(
             after_state_version=step + 1,
             facts={
                 "combat_result": combat_result,
+                "run_result": run_result,
                 "terminal_reason": reason,
                 "relics_used": list(relics_used),
                 "revivals_used_delta": revivals_used_delta,
@@ -68,7 +73,7 @@ def _result(
 
 def test_reward_identity_is_versioned_hashed_and_forbids_damage_shaping() -> None:
     identity = task_reward_identity()
-    assert identity["version"] == "sts2-task-reward-v3"
+    assert identity["version"] == "sts2-task-reward-v4"
     assert len(identity["fingerprint_sha256"]) == 64
     assert identity["forbidden_shaping"] == "enemy_hp_delta+damage_dealt+cards_played"
 
@@ -155,9 +160,56 @@ def test_combat_objective_uses_typed_terminal_outcome() -> None:
     assert defeat.outcome == "failure"
 
 
+def test_run_objective_uses_run_result_not_combat_result() -> None:
+    calculator = TaskRewardCalculator("run")
+    victory = calculator.evaluate(
+        _result(step=0),
+        _result(
+            step=1,
+            floor=46,
+            terminated=True,
+            combat_result="none",
+            run_result="victory",
+        ),
+    )
+    defeat = calculator.evaluate(
+        _result(step=0),
+        _result(
+            step=1,
+            terminated=True,
+            combat_result="victory",
+            run_result="defeat",
+        ),
+    )
+    assert victory.outcome == "success"
+    assert victory.terminal_reward == 1.0
+    assert defeat.outcome == "failure"
+    assert defeat.terminal_reward == -1.0
+
+
+def test_run_objective_rejects_result_reason_contradiction() -> None:
+    with pytest.raises(ValueError, match="disagrees"):
+        TaskRewardCalculator("run").evaluate(
+            _result(step=0),
+            _result(
+                step=1,
+                terminated=True,
+                run_result="victory",
+                terminal_reason="run_defeat",
+            ),
+        )
+
+
+def test_run_objective_fails_closed_without_typed_run_result() -> None:
+    with pytest.raises(ValueError, match="typed run_result"):
+        TaskRewardCalculator("run").evaluate(
+            _result(step=0),
+            _result(step=1, terminated=True, combat_result="victory"),
+        )
+
 def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
-    assert identity["version"] == "sts2-run-survival-efficiency-v3"
+    assert identity["version"] == "sts2-run-survival-efficiency-v4"
     calculator = RevivalEfficiencyRewardCalculator(
         revival_relic_id="RELIC.LIZARD_TAIL",
         maximum_episode_steps=512,
@@ -323,6 +375,26 @@ def test_relic_consumption_fact_uses_native_used_state_not_hp_heuristics() -> No
     after["player"]["relics"] = []  # type: ignore[index]
     assert derive_transition_facts(before, after).relics_used == ()
 
+
+def test_explicit_run_victory_survives_missing_terminal_player_block() -> None:
+    facts = derive_transition_facts(
+        {"player": {"hp": 20}},
+        {},
+        terminated=True,
+        terminal_reason="run_victory",
+    )
+    assert facts.run_result == "victory"
+    assert facts.combat_result == "none"
+
+
+def test_terminated_transition_without_canonical_reason_is_rejected() -> None:
+    with pytest.raises(ValueError, match="canonical"):
+        derive_transition_facts(
+            {"player": {"hp": 20}},
+            {},
+            terminated=True,
+            terminal_reason=None,
+        )
 
 def test_explicit_combat_victory_reason_precedes_missing_terminal_player_hp() -> None:
     facts = derive_transition_facts(

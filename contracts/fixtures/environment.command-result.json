@@ -1,7 +1,7 @@
 {
   "ok": true,
   "api_version": "2.0.0",
-  "schema_version": "2026-07-13.1",
+  "schema_version": "2026-07-17.1",
   "request_id": "e497939c-d893-4f19-bfcf-59486855416a",
   "status": "committed",
   "replayed_result": false,
@@ -47,6 +47,7 @@
         "relics_used": [],
         "room_entered": null,
         "combat_result": "victory",
+        "run_result": "none",
         "terminal_reason": null
       }
     },
@@ -66,6 +67,7 @@
         "relics_used": [],
         "room_entered": null,
         "combat_result": "victory",
+        "run_result": "none",
         "terminal_reason": null
       }
     },

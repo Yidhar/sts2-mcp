@@ -14,6 +14,7 @@
     <Compile Include="..\..\Scripts\BridgeGameCompatibilityGate.cs" Link="BridgeGameCompatibilityGate.cs" />
     <Compile Include="..\..\Scripts\BridgeLegalActionProjector.cs" Link="BridgeLegalActionProjector.cs" />
     <Compile Include="..\..\Scripts\BridgePlayerStateProjector.cs" Link="BridgePlayerStateProjector.cs" />
+    <Compile Include="..\..\Scripts\BridgeEnvOutcome.cs" Link="BridgeEnvOutcome.cs" />
     <Compile Include="..\..\Scripts\BridgeCommandStore.cs" Link="BridgeCommandStore.cs" />
     <Compile Include="..\..\Scripts\BridgeMutationGate.cs" Link="BridgeMutationGate.cs" />
     <Compile Include="..\..\Scripts\BridgeCommandService.cs" Link="BridgeCommandService.cs" />

@@ -1,0 +1,20 @@
+{
+  "episode_id": "episode-run-victory-0001",
+  "step_index": 912,
+  "before_state_version": 1000,
+  "after_state_version": 1001,
+  "facts": {
+    "hp_delta": 0,
+    "gold_delta": 0,
+    "floor_delta": 0,
+    "cards_added": [],
+    "cards_removed": [],
+    "potions_added": [],
+    "potions_removed": [],
+    "relics_used": [],
+    "room_entered": null,
+    "combat_result": "none",
+    "run_result": "victory",
+    "terminal_reason": "run_victory"
+  }
+}

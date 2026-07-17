@@ -318,6 +318,48 @@ def test_predispatch_ordering_errors_are_not_recoverable_or_poisoning() -> None:
     assert client.step_calls == 0
 
 
+@pytest.mark.parametrize("outcome", ["victory", "defeat"])
+def test_full_run_terminal_projects_typed_run_result_without_player_block(outcome: str) -> None:
+    client = FakeHeadlessClient()
+    backend = HeadlessBackend(client=client)
+    reset = backend.reset(reset_request())
+    client.step_payload = {
+        "ok": True,
+        "episode_id": reset.episode_id,
+        "step_index": 1,
+        "reward": 0.0,
+        "done": True,
+        "truncated": False,
+        "terminal_reason": f"run_{outcome}",
+        "obs": {
+            "state_type": "game_over",
+            "terminated": True,
+            "run": {"act": 3, "floor": 46},
+        },
+        "legal_actions": [],
+        "info": {"sim_run_outcome": outcome},
+    }
+
+    result = backend.step(
+        StepRequest(
+            request_id=STEP_ID,
+            session_id=backend.session_id,
+            episode_id=reset.episode_id,
+            expected_step_index=reset.step_index,
+            action_id="end_turn",
+            timeout_ms=100,
+        )
+    )
+
+    assert result.terminated
+    assert result.terminal_reason == f"run_{outcome}"
+    assert result.transition is not None
+    assert result.transition.facts["run_result"] == outcome
+    assert result.transition.facts["combat_result"] == "none"
+    assert result.observation.get("player") is None
+    assert backend._state_version == 2
+    assert STEP_ID in backend._request_cache
+
 def test_terminal_surface_with_actions_uses_plain_json_incident_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

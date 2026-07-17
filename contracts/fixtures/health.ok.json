@@ -4,7 +4,7 @@
   "session_id": "example-session-0001",
   "authorized_capability": "training",
   "api_version": "2.0.0",
-  "schema_version": "2026-07-13.1",
+  "schema_version": "2026-07-17.1",
   "pump_tick": 1234,
   "ms_since_last_pump": 12,
   "queue_depth": 0,

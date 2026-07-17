@@ -32,7 +32,7 @@ const V2_DESCRIPTOR = {
   created_at_utc: "2026-07-11T11:59:00Z",
   base_url: "http://localhost:7777",
   api_versions: ["2.0.0"],
-  schema_version: "2026-07-13.1",
+  schema_version: "2026-07-17.1",
   action_schema_version: "2.1.0",
   legal_action_ordering_version: "2.0.0",
   capability_tokens: {

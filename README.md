@@ -218,7 +218,7 @@ performance claim exists without fixed odd-seed evaluation counts and rates.
 The current contract identity is:
 
 - API: `2.0.0`
-- schema: `2026-07-13.1`
+- schema: `2026-07-17.1`
 - action schema: `2.1.0`
 - action ordering: `2.0.0`
 - observation schema: `5.0.0`

@@ -44,7 +44,7 @@ function v2Descriptor(
     created_at_utc: "2026-07-11T11:59:00Z",
     base_url: `http://127.0.0.1:${port}`,
     api_versions: ["2.0.0"],
-    schema_version: "2026-07-13.1",
+    schema_version: "2026-07-17.1",
     action_schema_version: "2.1.0",
     legal_action_ordering_version: "2.0.0",
     capabilities: training ? ["player-control", "training"] : ["player-control"],
@@ -120,7 +120,7 @@ test("real v2 handle wire reaches command endpoint and rejected envelope is an M
           JSON.stringify({
             ok: false,
             api_version: "2.0.0",
-            schema_version: "2026-07-13.1",
+            schema_version: "2026-07-17.1",
             request_id: commandBody.request_id,
             status: "rejected_before_execution",
             replayed_result: false,
@@ -211,7 +211,7 @@ test("debug training reads use scoped v2 routes and rejected reset is an MCP err
           JSON.stringify({
             ok: false,
             api_version: "2.0.0",
-            schema_version: "2026-07-13.1",
+            schema_version: "2026-07-17.1",
             request_id: requestId,
             status: "rejected_before_execution",
             replayed_result: false,
@@ -232,7 +232,7 @@ test("debug training reads use scoped v2 routes and rejected reset is an MCP err
           JSON.stringify({
             ok: true,
             api_version: "2.0.0",
-            schema_version: "2026-07-13.1",
+            schema_version: "2026-07-17.1",
             request_id: stepRequestId,
             status: "committed",
             replayed_result: false,

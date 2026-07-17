@@ -24,7 +24,7 @@ from tools.artifacts.path_policy import (  # noqa: E402
     resolve_external_input_path,
 )
 
-SESSION_SCHEMA_VERSION = "2026-07-13.1"
+SESSION_SCHEMA_VERSION = "2026-07-17.1"
 API_VERSION = "2.0.0"
 ACTION_SCHEMA_VERSION = "2.1.0"
 LEGAL_ACTION_ORDERING_VERSION = "2.0.0"

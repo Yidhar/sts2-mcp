@@ -1065,6 +1065,104 @@ def _strip_model_prefix(raw: Any, prefix: str) -> str:
     return value
 
 
+def _canonical_terminal_reason(
+    client: HeadlessSimBridgeClient,
+    sim_state: dict[str, Any],
+    *,
+    terminal: bool,
+    truncated: bool,
+    combat_victory_boundary: bool,
+    source_method: str,
+) -> tuple[str | None, str | None]:
+    """Project the simulator's authoritative run outcome into episode scope.
+
+    ``FullRunSimulationStateSnapshot.run_outcome`` is the game-owned terminal
+    truth. A full-run episode and a ``combat_reset`` episode share that DTO,
+    so the same simulator value becomes either ``run_*`` or ``combat_*`` at
+    this transport boundary. In particular, never infer a full-run outcome
+    from the terminal DTO's player block: game-over snapshots may no longer
+    contain that block.
+    """
+
+    info_value = sim_state.get("info")
+    info = info_value if isinstance(info_value, dict) else {}
+    existing_reason = sim_state.get("terminal_reason", info.get("terminal_reason"))
+    raw_outcome = sim_state.get("run_outcome")
+    if not terminal or truncated:
+        if raw_outcome is not None:
+            raise HeadlessSimProtocolError(
+                "non-terminal HeadlessSim state exposed a final run_outcome",
+                method=source_method,
+                response=sim_state,
+            )
+        if truncated:
+            if not isinstance(existing_reason, str) or not existing_reason.strip():
+                raise HeadlessSimProtocolError(
+                    "truncated HeadlessSim state requires a non-empty terminal_reason",
+                    method=source_method,
+                    response=sim_state,
+                )
+            return existing_reason, None
+        if existing_reason is not None:
+            raise HeadlessSimProtocolError(
+                "non-terminal HeadlessSim state exposed a terminal_reason",
+                method=source_method,
+                response=sim_state,
+            )
+        return None, None
+
+    if combat_victory_boundary:
+        if raw_outcome is not None:
+            raise HeadlessSimProtocolError(
+                "combat post-end boundary exposed a full-run run_outcome",
+                method=source_method,
+                response=sim_state,
+            )
+        if existing_reason is not None:
+            if (
+                not isinstance(existing_reason, str)
+                or existing_reason.strip().lower() not in {"combat_victory", "victory"}
+            ):
+                raise HeadlessSimProtocolError(
+                    "combat post-end boundary has a contradictory terminal_reason",
+                    method=source_method,
+                    response=sim_state,
+                )
+        return "combat_victory", None
+
+    if not isinstance(raw_outcome, str):
+        raise HeadlessSimProtocolError(
+            "terminal HeadlessSim state has no authoritative string run_outcome",
+            method=source_method,
+            response=sim_state,
+        )
+    outcome = raw_outcome.strip().lower()
+    if outcome not in {"victory", "defeat"}:
+        raise HeadlessSimProtocolError(
+            "terminal HeadlessSim run_outcome must be victory or defeat",
+            method=source_method,
+            response=sim_state,
+        )
+
+    scope = "combat" if client._combat_episode_active or combat_victory_boundary else "run"
+    canonical_reason = f"{scope}_{outcome}"
+    if existing_reason is not None:
+        if not isinstance(existing_reason, str):
+            raise HeadlessSimProtocolError(
+                "terminal HeadlessSim terminal_reason must be a string when present",
+                method=source_method,
+                response=sim_state,
+            )
+        normalized_existing = existing_reason.strip().lower()
+        if normalized_existing not in {canonical_reason, outcome}:
+            raise HeadlessSimProtocolError(
+                "terminal HeadlessSim terminal_reason contradicts run_outcome or episode scope",
+                method=source_method,
+                response=sim_state,
+            )
+    return canonical_reason, outcome
+
+
 def _build_bridge_step_response(
     client: HeadlessSimBridgeClient,
     sim_state: dict[str, Any],
@@ -1095,7 +1193,6 @@ def _build_bridge_step_response(
     )
     if combat_victory_boundary:
         sim_state["terminal"] = True
-        sim_state["run_outcome"] = "victory"
         sim_state["legal_actions"] = []
 
     for flag_name in ("terminal", "truncated"):
@@ -1173,21 +1270,35 @@ def _build_bridge_step_response(
                 method=source_method,
                 response=sim_state,
             )
-    # Cache so the next step() call can map an action_index back to the raw
-    # sim action dict stored under ``_sim_raw``.
-    client._last_legal_actions = legal_actions
-    client._last_observation = deepcopy(bridge_obs)
-
-    info = dict(sim_state.get("info") or {})
+    info_value = sim_state.get("info")
+    if info_value is not None and not isinstance(info_value, dict):
+        raise HeadlessSimProtocolError(
+            "HeadlessSim state info field must be an object",
+            method=source_method,
+            response=sim_state,
+        )
+    info = dict(info_value or {})
     if info_extra:
         info.update(info_extra)
-    terminal_reason = (
-        "combat_victory"
-        if combat_victory_boundary
-        else sim_state.get("terminal_reason", info.get("terminal_reason"))
+    terminal_reason, authoritative_run_outcome = _canonical_terminal_reason(
+        client,
+        sim_state,
+        terminal=terminal,
+        truncated=truncated,
+        combat_victory_boundary=combat_victory_boundary,
+        source_method=source_method,
     )
     if terminal_reason is not None:
         info["terminal_reason"] = str(terminal_reason)
+    if authoritative_run_outcome is not None:
+        # Diagnostic provenance only; the typed transition receives the
+        # episode-scoped result through ``terminal_reason`` below.
+        info["sim_run_outcome"] = authoritative_run_outcome
+
+    # Cache only after the complete terminal/outcome protocol has validated so
+    # an uncommittable game-over DTO can never become the next dispatch state.
+    client._last_legal_actions = legal_actions
+    client._last_observation = deepcopy(bridge_obs)
 
     # This adapter preserves the simulator scalar as transport data only.
     # HeadlessBackend projects transition facts and replaces it before any

@@ -500,6 +500,7 @@ internal static class BridgeCommandService
                 ["potions_removed"] = new JsonArray(),
                 ["room_entered"] = null,
                 ["combat_result"] = "none",
+                ["run_result"] = "none",
                 ["terminal_reason"] = null,
                 ["facts_incomplete"] = true
             }

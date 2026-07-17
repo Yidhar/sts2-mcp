@@ -478,13 +478,69 @@ class TerminalWithoutObservationFlagsBackend(DynamicPreviewLoopBackend):
                 before_state_version=before,
                 after_state_version=self._state_version,
                 facts={
-                    "combat_result": "victory" if terminal else "none",
+                    "combat_result": "none",
+                    "run_result": "victory" if terminal else "none",
                     "terminal_reason": terminal_reason,
                 },
             ),
             terminated=terminal,
             terminal_reason=terminal_reason,
             info={"reward_authority": "external-rl"},
+        )
+
+
+class RunTerminalWithoutRunResultBackend(TerminalWithoutObservationFlagsBackend):
+    """Emulates the old bug: a run terminal mislabeled only as combat victory."""
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        result = super().step(request)
+        if not result.terminated:
+            return result
+        assert result.transition is not None
+        return replace(
+            result,
+            transition=replace(
+                result.transition,
+                facts={
+                    "combat_result": "victory",
+                    "terminal_reason": "run_victory",
+                },
+            ),
+        )
+
+
+class RunDefeatBackend(TerminalWithoutObservationFlagsBackend):
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        result = super().step(request)
+        if not result.terminated:
+            return result
+        assert result.transition is not None
+        return replace(
+            result,
+            transition=replace(
+                result.transition,
+                facts={
+                    "combat_result": "none",
+                    "run_result": "defeat",
+                    "terminal_reason": "run_defeat",
+                },
+            ),
+            terminal_reason="run_defeat",
+        )
+
+
+class Act1ContradictoryTerminalReasonBackend(RunDefeatBackend):
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        result = super().step(request)
+        if not result.terminated:
+            return result
+        assert result.transition is not None
+        return replace(
+            result,
+            transition=replace(
+                result.transition,
+                facts={**result.transition.facts, "terminal_reason": "run_victory"},
+            ),
         )
 
 
@@ -975,11 +1031,58 @@ def test_environment_result_terminal_flags_prevent_deadlock_override() -> None:
         episode = resources.collector.collect_episode(record=True)
         assert episode.metrics.steps == 4
         assert episode.metrics.run_won
+        assert not episode.metrics.combat_won
         assert not episode.metrics.deadlocked
         assert not episode.metrics.combat_progress_stalled
         assert not episode.metrics.noncombat_progress_stalled
         assert episode.metrics.terminal_reason == "run_victory"
+        assert episode.unrolls[-1].steps[-1].reward > 0.0
         assert episode.unrolls[-1].steps[-1].discount == 0.0
+    finally:
+        resources.close()
+
+
+def test_collector_records_typed_run_defeat() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=RunDefeatBackend(terminal_step=2),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert not episode.metrics.run_won
+        assert not episode.metrics.combat_won
+        assert episode.metrics.terminal_reason == "run_defeat"
+        assert episode.unrolls[-1].steps[-1].reward < 0.0
+        assert episode.unrolls[-1].steps[-1].discount == 0.0
+    finally:
+        resources.close()
+
+
+def test_act1_collector_rejects_transition_reason_contradiction() -> None:
+    base = _event_loop_config()
+    config = replace(
+        base,
+        curriculum=replace(base.curriculum, reward_objective="act1"),
+    )
+    resources = build_training_resources(
+        config,
+        backend=Act1ContradictoryTerminalReasonBackend(terminal_step=2),
+    )
+    try:
+        with pytest.raises(CollectionProtocolError, match="facts/result reason"):
+            resources.collector.collect_episode(record=True)
+    finally:
+        resources.close()
+
+
+def test_collector_rejects_run_terminal_without_typed_run_result() -> None:
+    resources = build_training_resources(
+        _event_loop_config(),
+        backend=RunTerminalWithoutRunResultBackend(terminal_step=2),
+    )
+    try:
+        with pytest.raises(CollectionProtocolError, match="typed run_result"):
+            resources.collector.collect_episode(record=True)
     finally:
         resources.close()
 

@@ -179,7 +179,7 @@ actor/learner overlap.
 
 ## Reward and initial curriculum
 
-`sts2-task-reward-v3` has no action-quality or damage heuristic. It combines:
+`sts2-task-reward-v4` has no action-quality or damage heuristic. It combines:
 
 - task success: +1;
 - task failure, semantic deadlock or an explicit curriculum horizon: -1;
@@ -215,7 +215,8 @@ from actual HP removed, so overkill is not counted and later healing cannot
 erase prior loss. These counters are translated under `observation._training`:
 they are reward/evaluation facts and the grounded encoder never sees them.
 
-`sts2-run-survival-efficiency-v3` combines the final run outcome and monotonic
+`sts2-run-survival-efficiency-v4` combines the authoritative typed
+`transition.facts.run_result` final run outcome and monotonic
 forward run distance with three bounded costs:
 
 - a terminal margin that makes every run victory rank above every failure;

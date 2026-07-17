@@ -27,7 +27,7 @@ TaskOutcome = Literal["ongoing", "success", "failure", "deadlock", "horizon"]
 class TaskRewardSpec:
     """Normal-task reward: terminal outcome plus bounded forward distance."""
 
-    version: str = field(default="sts2-task-reward-v3", init=False)
+    version: str = field(default="sts2-task-reward-v4", init=False)
     discount: float = field(default=0.997, init=False)
     success_reward: float = field(default=1.0, init=False)
     failure_reward: float = field(default=-1.0, init=False)
@@ -52,7 +52,7 @@ class RevivalEfficiencyRewardSpec:
     fewer native revivals, and fewer decisions; it does not reward damage.
     """
 
-    version: str = field(default="sts2-run-survival-efficiency-v3", init=False)
+    version: str = field(default="sts2-run-survival-efficiency-v4", init=False)
     required_discount: float = field(default=1.0, init=False)
     hp_loss_weight: float = field(default=0.55, init=False)
     revival_weight: float = field(default=0.20, init=False)
@@ -69,11 +69,12 @@ def task_reward_identity() -> dict[str, Any]:
         "spec": asdict(TASK_REWARD_SPEC),
         "outcome_source": (
             "environment_result.terminated+typed_transition.facts.combat_result+"
-            "typed_transition.facts.terminal_reason+observation.run.act"
+            "typed_transition.facts.run_result+typed_transition.facts.terminal_reason+"
+            "observation.run.act"
         ),
         "progress_source": "positive_delta(observation.run.progress_or_floor)",
         "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
-        "terminal_reason_policy": "transition/result exact equality",
+        "terminal_reason_policy": "transition/result exact equality+objective-scoped canonical result",
         "transport_truncation": "reject",
         "collector_horizon": "explicit_horizon_outcome_when_configured",
     }
@@ -140,20 +141,21 @@ def _bounded_resource_score(amount: float, scale: float) -> float:
     return normalized_amount / (normalized_amount + normalized_scale)
 
 
-def _typed_combat_result(result: EnvironmentResult) -> str:
+def _typed_terminal_result(result: EnvironmentResult, *, objective: TaskObjective) -> str:
     transition = result.transition
     if transition is None or not isinstance(transition.facts, Mapping):
         if result.terminated:
             raise ValueError("terminal task result has no typed transition facts")
         return "none"
-    raw = transition.facts.get("combat_result")
-    if not isinstance(raw, str) or raw not in {
-        "none",
-        "victory",
-        "defeat",
-        "escaped",
-    }:
-        raise ValueError("typed combat_result is missing or unsupported")
+    fact_name = "combat_result" if objective == "combat" else "run_result"
+    supported = (
+        {"none", "victory", "defeat", "escaped"}
+        if objective == "combat"
+        else {"none", "victory", "defeat"}
+    )
+    raw = transition.facts.get(fact_name)
+    if not isinstance(raw, str) or raw not in supported or (result.terminated and raw == "none"):
+        raise ValueError(f"typed {fact_name} is missing or unsupported")
     if "terminal_reason" not in transition.facts:
         raise ValueError("typed terminal_reason is missing")
     fact_reason = transition.facts["terminal_reason"]
@@ -161,6 +163,9 @@ def _typed_combat_result(result: EnvironmentResult) -> str:
         raise ValueError("typed terminal_reason must be text or null")
     if fact_reason != result.terminal_reason:
         raise ValueError("transition and result terminal_reason identities differ")
+    expected_reason = f"{'combat' if objective == 'combat' else 'run'}_{raw}"
+    if fact_reason != expected_reason:
+        raise ValueError(f"typed {fact_name} disagrees with terminal_reason")
     return raw
 
 
@@ -206,12 +211,10 @@ class TaskRewardCalculator:
             return "success"
         if not after.terminated:
             return "ongoing"
-        combat_result = _typed_combat_result(after)
-        if self.objective == "combat":
-            return "success" if combat_result == "victory" else "failure"
         if self.objective == "act1":
             return "failure"
-        return "success" if combat_result == "victory" else "failure"
+        terminal_result = _typed_terminal_result(after, objective=self.objective)
+        return "success" if terminal_result == "victory" else "failure"
 
     def evaluate(
         self,

@@ -86,6 +86,7 @@ def test_manifest_lists_parseable_schemas_and_resolvable_local_refs() -> None:
         ("command.play-card.json", "command.schema.json"),
         ("command-result.committed.json", "command-result.schema.json"),
         ("transition.combat-victory.json", "transition.schema.json"),
+        ("transition.run-victory.json", "transition.schema.json"),
     ],
 )
 def test_contract_fixture_validates_with_cross_file_registry(
@@ -113,6 +114,15 @@ def test_contract_fixture_validates_with_cross_file_registry(
     )
     errors = sorted(validator.iter_errors(fixture), key=lambda error: list(error.path))
     assert errors == [], "\n".join(error.message for error in errors)
+
+
+def test_transition_outcome_scope_fields_are_required() -> None:
+    schema = _load(CONTRACT_ROOT / "schemas" / "transition.schema.json")
+    assert set(schema["properties"]["facts"]["required"]) >= {
+        "combat_result",
+        "run_result",
+        "terminal_reason",
+    }
 
 
 def test_environment_reset_fixture_matches_schema_and_typed_request() -> None:

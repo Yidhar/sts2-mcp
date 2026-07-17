@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "name": "sts2-contracts",
   "api_version": "2.0.0",
-  "schema_version": "2026-07-13.1",
+  "schema_version": "2026-07-17.1",
   "action_schema_version": "2.1.0",
   "legal_action_ordering_version": "2.0.0",
   "observation_schema_version": "5.0.0",
@@ -43,6 +43,7 @@
     "fixtures/environment.state.json": "schemas/environment.schema.json#/$defs/state_response",
     "fixtures/environment.combat-catalog.json": "schemas/environment.schema.json#/$defs/combat_catalog_response",
     "fixtures/environment.command-result.json": "schemas/environment.schema.json#/$defs/operation_result",
-    "fixtures/transition.combat-victory.json": "schemas/transition.schema.json"
+    "fixtures/transition.combat-victory.json": "schemas/transition.schema.json",
+    "fixtures/transition.run-victory.json": "schemas/transition.schema.json"
   }
 }

@@ -132,7 +132,214 @@ def test_combat_post_end_boundary_is_a_typed_victory_not_a_deadlock() -> None:
     assert victory["obs"]["state_type"] == "combat_victory"
     assert victory["obs"]["player"]["hp"] == 17
     assert victory["obs"]["_training"]["revivals_used"] == 3
+    assert "run_outcome" not in victory["obs"]["_sim_raw"]
+    assert "sim_run_outcome" not in victory["info"]
     assert victory["legal_actions"] == []
+
+
+@pytest.mark.parametrize("outcome", ["victory", "defeat"])
+def test_full_run_terminal_uses_authoritative_outcome_without_player(
+    outcome: str,
+) -> None:
+    client = _bare_client()
+    result = module._build_bridge_step_response(
+        client,
+        {
+            "state_type": "game_over",
+            "terminal": True,
+            "truncated": False,
+            "is_actionable": False,
+            "run_outcome": outcome,
+            "legal_actions": [],
+        },
+        episode_started=True,
+        reward=0.0,
+    )
+
+    assert result["done"] is True
+    assert result["terminal_reason"] == f"run_{outcome}"
+    assert result["info"]["terminal_reason"] == f"run_{outcome}"
+    assert result["info"]["sim_run_outcome"] == outcome
+    assert result["obs"]["player"] == {}
+    assert result["obs"]["_sim_raw"]["run_outcome"] == outcome
+    assert result["legal_actions"] == []
+
+
+def test_combat_episode_terminal_defeat_keeps_combat_scope() -> None:
+    client = _bare_client()
+    client._combat_episode_active = True
+    result = module._build_bridge_step_response(
+        client,
+        {
+            "state_type": "game_over",
+            "terminal": True,
+            "truncated": False,
+            "is_actionable": False,
+            "run_outcome": "defeat",
+            "legal_actions": [],
+        },
+        episode_started=True,
+        reward=0.0,
+    )
+
+    assert result["terminal_reason"] == "combat_defeat"
+    assert result["info"]["sim_run_outcome"] == "defeat"
+
+
+@pytest.mark.parametrize("run_outcome", [None, "ongoing", 7])
+def test_full_run_terminal_rejects_missing_or_invalid_outcome_before_cache_commit(
+    run_outcome: object,
+) -> None:
+    client = _bare_client()
+    previous_observation = {"sentinel": True}
+    previous_actions = [{"action_id": "previous"}]
+    client._last_observation = previous_observation
+    client._last_legal_actions = previous_actions
+    state = {
+        "state_type": "game_over",
+        "terminal": True,
+        "truncated": False,
+        "is_actionable": False,
+        "legal_actions": [],
+    }
+    if run_outcome is not None:
+        state["run_outcome"] = run_outcome
+
+    with pytest.raises(HeadlessSimProtocolError, match="run_outcome"):
+        module._build_bridge_step_response(
+            client,
+            state,
+            episode_started=False,
+            reward=0.0,
+        )
+
+    assert client._last_observation is previous_observation
+    assert client._last_legal_actions is previous_actions
+
+
+def test_full_run_terminal_rejects_reason_outcome_contradiction() -> None:
+    client = _bare_client()
+    with pytest.raises(HeadlessSimProtocolError, match="contradicts"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "game_over",
+                "terminal": True,
+                "is_actionable": False,
+                "run_outcome": "victory",
+                "terminal_reason": "run_defeat",
+                "legal_actions": [],
+            },
+            episode_started=False,
+            reward=0.0,
+        )
+
+
+@pytest.mark.parametrize("terminal_reason", ["death", "action_execution_error", "", 7])
+def test_full_run_terminal_rejects_noncanonical_reason(terminal_reason: object) -> None:
+    client = _bare_client()
+    with pytest.raises(HeadlessSimProtocolError, match="terminal_reason"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "game_over",
+                "terminal": True,
+                "is_actionable": False,
+                "run_outcome": "victory",
+                "terminal_reason": terminal_reason,
+                "legal_actions": [],
+            },
+            episode_started=False,
+            reward=0.0,
+        )
+
+
+def test_nonterminal_state_cannot_expose_terminal_reason() -> None:
+    client = _bare_client()
+    with pytest.raises(HeadlessSimProtocolError, match="non-terminal.*terminal_reason"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "map",
+                "terminal": False,
+                "is_actionable": True,
+                "terminal_reason": "death",
+                "legal_actions": [{"action": "choose_map_node", "col": 0, "row": 1}],
+            },
+            episode_started=False,
+            reward=0.0,
+        )
+
+
+def test_truncated_state_requires_reason_and_accepts_explicit_reason() -> None:
+    client = _bare_client()
+    state = {
+        "state_type": "map",
+        "terminal": False,
+        "truncated": True,
+        "is_actionable": False,
+        "legal_actions": [],
+    }
+    with pytest.raises(HeadlessSimProtocolError, match="requires.*terminal_reason"):
+        module._build_bridge_step_response(
+            client, state, episode_started=False, reward=0.0
+        )
+
+    accepted = module._build_bridge_step_response(
+        client,
+        {**state, "terminal_reason": "collection_budget"},
+        episode_started=False,
+        reward=0.0,
+    )
+    assert accepted["truncated"] is True
+    assert accepted["terminal_reason"] == "collection_budget"
+
+
+def test_combat_post_end_boundary_rejects_full_run_outcome() -> None:
+    client = _bare_client()
+    client._combat_episode_active = True
+    with pytest.raises(HeadlessSimProtocolError, match="post-end.*run_outcome"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "combat_post_end_pending",
+                "terminal": False,
+                "is_actionable": False,
+                "run_outcome": "defeat",
+                "legal_actions": [],
+            },
+            episode_started=True,
+            reward=0.0,
+        )
+
+
+def test_nonterminal_or_truncated_state_cannot_expose_final_run_outcome() -> None:
+    client = _bare_client()
+    with pytest.raises(HeadlessSimProtocolError, match="non-terminal"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "map",
+                "terminal": False,
+                "run_outcome": "victory",
+                "legal_actions": [{"action": "choose_map_node", "col": 0, "row": 1}],
+            },
+            episode_started=False,
+            reward=0.0,
+        )
+    with pytest.raises(HeadlessSimProtocolError, match="non-terminal"):
+        module._build_bridge_step_response(
+            client,
+            {
+                "state_type": "game_over",
+                "terminal": False,
+                "truncated": True,
+                "run_outcome": "defeat",
+                "legal_actions": [],
+            },
+            episode_started=False,
+            reward=0.0,
+        )
 
 
 def test_step_rejection_is_typed_and_mutation_is_sent_once() -> None:

@@ -29,6 +29,7 @@ internal static partial class BridgeGameApi
         public required string SurfaceFingerprint { get; init; }
         public required bool Actionable { get; init; }
         public required bool Done { get; init; }
+        public required string RunResult { get; init; }
         public required int CurrentHp { get; init; }
         public required int MaxHp { get; init; }
         public required int PlayerBlock { get; init; }

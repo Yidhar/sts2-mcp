@@ -59,7 +59,7 @@ def _session_file(tmp_path, *, base_url="http://127.0.0.1:27100/", training=TRAI
                 "base_url": base_url,
                 "capability_tokens": capabilities,
                 "api_versions": ["2.0.0"],
-                "schema_version": "2026-07-13.1",
+                "schema_version": "2026-07-17.1",
                 "action_schema_version": "2.1.0",
                 "legal_action_ordering_version": "2.0.0",
                 "capabilities": list(capabilities),

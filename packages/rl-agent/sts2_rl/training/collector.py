@@ -1552,6 +1552,26 @@ class GroundedCollector:
             raise CollectionProtocolError("step transition episode/step identity differs from result")
         if not isinstance(transition.facts, Mapping):
             raise CollectionProtocolError("step transition facts must be an object")
+        if after.terminated:
+            fact_name = "combat_result" if self.objective == "combat" else "run_result"
+            terminal_result = transition.facts.get(fact_name)
+            supported_results = (
+                {"victory", "defeat", "escaped"}
+                if self.objective == "combat"
+                else {"victory", "defeat"}
+            )
+            if terminal_result not in supported_results:
+                raise CollectionProtocolError(
+                    f"terminated {self.objective} step has no authoritative typed {fact_name}"
+                )
+            expected_reason = f"{'combat' if self.objective == 'combat' else 'run'}_{terminal_result}"
+            if (
+                after.terminal_reason != expected_reason
+                or transition.facts.get("terminal_reason") != expected_reason
+            ):
+                raise CollectionProtocolError(
+                    "terminated step facts/result reason disagrees with its objective-scoped result"
+                )
         active_revision = self._active_state_version
         if active_revision is None:
             raise CollectionProtocolError("collector has no active state revision")
@@ -2253,8 +2273,23 @@ class GroundedCollector:
                 )
                 for trace in transaction_traces_pending
             )
-        run_won = self.objective == "run" and final_outcome == "success"
-        combat_won = self.objective == "combat" and final_outcome == "success"
+        terminal_facts = state.transition.facts if state.transition is not None else {}
+        run_won = bool(
+            self.objective == "run"
+            and state.terminated
+            and terminal_facts.get("run_result") == "victory"
+        )
+        combat_won = bool(
+            self.objective == "combat"
+            and state.terminated
+            and terminal_facts.get("combat_result") == "victory"
+        )
+        if state.terminated and self.objective in {"run", "combat"}:
+            typed_success = run_won if self.objective == "run" else combat_won
+            if typed_success != (final_outcome == "success"):
+                raise CollectionProtocolError(
+                    "typed terminal result disagrees with the reward outcome"
+                )
         return CollectedEpisode(
             unrolls=tuple(unrolls),
             metrics=EpisodeMetrics(

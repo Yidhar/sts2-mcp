@@ -539,6 +539,7 @@ internal static partial class BridgeGameApi
                 potions_removed = Array.Empty<string>(),
                 room_entered = state.RoomModelId ?? state.RoomType,
                 combat_result = "none",
+                run_result = "none",
                 terminal_reason = (string?)null,
                 reset = true
             }
@@ -571,14 +572,19 @@ internal static partial class BridgeGameApi
             .ToArray();
 
         var combatResult = "none";
-        if (done && after.CurrentHp <= 0)
+        if (episode.EpisodeMode == "combat_sandbox" && done)
         {
-            combatResult = "defeat";
+            combatResult = after.CurrentHp > 0 ? "victory" : "defeat";
         }
-        else if ((before.CombatInProgress && !after.CombatInProgress) ||
-                 (done && after.CurrentHp > 0))
+        else if (!done && before.CombatInProgress && !after.CombatInProgress)
         {
             combatResult = "victory";
+        }
+
+        var runResult = "none";
+        if (done && episode.EpisodeMode != "combat_sandbox")
+        {
+            runResult = after.RunResult;
         }
 
         var terminalReason = !string.IsNullOrWhiteSpace(actionError)
@@ -586,7 +592,9 @@ internal static partial class BridgeGameApi
             : !string.IsNullOrWhiteSpace(truncationReason)
                 ? truncationReason
                 : done
-                    ? combatResult
+                    ? episode.EpisodeMode == "combat_sandbox"
+                        ? $"combat_{combatResult}"
+                        : $"run_{runResult}"
                     : null;
         var stepIndex = Math.Max(0, episode.StepIndex);
         var legacyStepIndexBefore = selectedAction is null ? stepIndex : Math.Max(0, stepIndex - 1);
@@ -617,6 +625,7 @@ internal static partial class BridgeGameApi
                     ? after.RoomModelId ?? after.RoomType
                     : null,
                 combat_result = combatResult,
+                run_result = runResult,
                 terminal_reason = terminalReason,
                 action_handle = selectedAction?.Action.ActionId,
                 action_error = actionError,
@@ -967,6 +976,7 @@ internal static partial class BridgeGameApi
             SurfaceFingerprint = snapshot.SurfaceFingerprint,
             Actionable = snapshot.Actionable,
             Done = snapshot.Done,
+            RunResult = snapshot.RunResult,
             CurrentHp = snapshot.CurrentHp,
             MaxHp = snapshot.MaxHp,
             PlayerBlock = snapshot.PlayerBlock,

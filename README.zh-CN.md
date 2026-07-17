@@ -198,7 +198,7 @@ Collector 与 learner 默认异步重叠。独立 actor 模型在 collector devi
 当前契约标识：
 
 - API：`2.0.0`
-- schema：`2026-07-13.1`
+- schema：`2026-07-17.1`
 - action schema：`2.1.0`
 - action ordering：`2.0.0`
 - observation schema：`5.0.0`

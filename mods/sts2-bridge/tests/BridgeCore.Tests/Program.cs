@@ -116,6 +116,25 @@ Assert(supportedAssessment.PassedProbeCount == currentRetailProfile.RequiredCapa
 BridgeGameCompatibilityState.Publish(supportedAssessment);
 Console.WriteLine("Bridge retail game compatibility gate tests passed.");
 
+Assert(BridgeEnvOutcome.ResolveRunResult(done: false, winTime: null) == "none",
+    "a non-terminal environment snapshot must not expose a final run result");
+Assert(BridgeEnvOutcome.ResolveRunResult(done: true, winTime: 123) == "victory",
+    "terminal RunManager.WinTime > 0 must authoritatively project victory");
+Assert(BridgeEnvOutcome.ResolveRunResult(done: true, winTime: 0) == "defeat",
+    "terminal RunManager.WinTime == 0 must authoritatively project defeat");
+var missingTerminalClockRejected = false;
+try
+{
+    _ = BridgeEnvOutcome.ResolveRunResult(done: true, winTime: null);
+}
+catch (InvalidOperationException)
+{
+    missingTerminalClockRejected = true;
+}
+Assert(missingTerminalClockRejected,
+    "terminal outcome projection must fail closed when RunManager is unavailable");
+Console.WriteLine("Bridge authoritative environment outcome tests passed.");
+
 var now = new DateTimeOffset(2026, 7, 11, 0, 0, 0, TimeSpan.Zero);
 var store = new BoundedCommandResultStore(2, TimeSpan.FromMinutes(10), () => now);
 var firstDisposition = store.GetOrCreate(

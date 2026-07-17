@@ -192,7 +192,7 @@ class FakeV2Client(FakeLegacyClient):
         return {
             "ok": True,
             "api_version": "2.0.0",
-            "schema_version": "2026-07-13.1",
+            "schema_version": "2026-07-17.1",
             "request_id": request_id,
             "status": "committed",
             "replayed_result": False,
@@ -271,7 +271,7 @@ def test_live_backend_does_not_fallback_on_v2_rejection() -> None:
     client.reset_v2 = lambda **kwargs: {
         "ok": False,
         "api_version": "2.0.0",
-        "schema_version": "2026-07-13.1",
+        "schema_version": "2026-07-17.1",
         "request_id": kwargs["request_id"],
         "status": "rejected_before_execution",
         "replayed_result": False,

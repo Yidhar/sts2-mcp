@@ -13,6 +13,7 @@
     "facts": {
       "type": "object",
       "additionalProperties": true,
+      "required": ["combat_result", "run_result", "terminal_reason"],
       "properties": {
         "hp_delta": { "type": "number" },
         "gold_delta": { "type": "number" },
@@ -24,6 +25,7 @@
         "relics_used": { "type": "array", "items": { "type": "string" } },
         "room_entered": { "type": ["string", "null"] },
         "combat_result": { "enum": ["none", "victory", "defeat", "escaped"] },
+        "run_result": { "enum": ["none", "victory", "defeat"] },
         "terminal_reason": { "type": ["string", "null"] }
       }
     }

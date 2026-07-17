@@ -59,6 +59,7 @@ internal static partial class BridgeGameApi
             SurfaceFingerprint = surfaceFingerprint,
             Actionable = actionable,
             Done = done,
+            RunResult = BridgeEnvOutcome.ResolveRunResult(done, context.RunManager?.WinTime),
             CurrentHp = GetPrimaryPlayerCurrentHp(context),
             MaxHp = GetPrimaryPlayerMaxHp(context),
             PlayerBlock = GetPrimaryPlayerCurrentBlock(context),

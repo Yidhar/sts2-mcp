@@ -41,7 +41,7 @@ def _write_session(path: Path, *, token: str, port: int) -> None:
                 "legacy-privileged": token,
             },
             "api_versions": ["2.0.0", "legacy-v1"],
-            "schema_version": "2026-07-13.1",
+            "schema_version": "2026-07-17.1",
             "action_schema_version": "2.1.0",
             "legal_action_ordering_version": "2.0.0",
             "capabilities": ["player-control", "training", "legacy-privileged"],
