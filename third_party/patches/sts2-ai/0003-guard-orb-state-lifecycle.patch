@@ -1,0 +1,435 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+index 665e676..8d802e4 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+@@ -65,6 +65,12 @@ internal static class Program
+ 			Console.WriteLine("HeadlessSim settlement contract self-test: PASS");
+ 			return;
+ 		}
++		if (options.RunPlayerResourceLifecycleSelfTest)
++		{
++			FullRunPlayerResourceLifecycle.RunSelfTests();
++			Console.WriteLine("HeadlessSim player-resource lifecycle self-test: PASS");
++			return;
++		}
+ 		BootstrapStandaloneRuntime();
+ 		if (options.ExportCardRuntimeTextsPath != null)
+ 		{
+@@ -2636,6 +2642,8 @@ internal static class Program
+ 
+ 		public bool RunSettlementRuntimeSelfTest { get; private set; }
+ 
++		public bool RunPlayerResourceLifecycleSelfTest { get; private set; }
++
+ 		public string PipeName => BinaryProtocol.PipeName(Port, Protocol);
+ 
+ 		public static HostOptions Parse(IEnumerable<string> args)
+@@ -2652,6 +2660,9 @@ internal static class Program
+ 					case "--settlement-runtime-self-test":
+ 						options.RunSettlementRuntimeSelfTest = true;
+ 						break;
++					case "--player-resource-lifecycle-self-test":
++						options.RunPlayerResourceLifecycleSelfTest = true;
++						break;
+ 					case "--stdio":
+ 						options.UseStdio = true;
+ 						break;
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 784f635..407e087 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -34,7 +34,9 @@ public static class FullRunApiStateBuilder
+ 		{
+ 			if (cachedPlayerState == null)
+ 			{
+-				cachedPlayerState = player == null ? new FullRunApiPlayerState() : BuildPlayerState(player);
++				cachedPlayerState = player == null
++					? new FullRunApiPlayerState()
++					: BuildPlayerStateForLifecycle(player, snapshot.StateType);
+ 			}
+ 			return cachedPlayerState;
+ 		}
+@@ -204,7 +206,11 @@ public static class FullRunApiStateBuilder
+ 		}
+ 
+ 		List<FullRunApiBattleEnemy> enemies = SafeBuildCombatEnemies(combat);
+-		FullRunApiPlayerState combatPlayerState = SafeBuildCombatPlayerState(player, combat, basePlayerState);
++		FullRunApiPlayerState combatPlayerState = SafeBuildCombatPlayerState(
++			player,
++			combat,
++			basePlayerState,
++			snapshot.StateType);
+ 
+ 		try
+ 		{
+@@ -516,8 +522,22 @@ public static class FullRunApiStateBuilder
+ 		};
+ 	}
+ 
+-	private static FullRunApiPlayerState BuildPlayerState(Player player)
++	internal static FullRunApiPlayerState BuildPlayerStateForLifecycle(Player player, string? stateType)
+ 	{
++		bool includeCombatResources = FullRunPlayerResourceLifecycle.ShouldProjectCombatResources(
++			stateType,
++			hasPlayerCombatState: player.PlayerCombatState != null,
++			hasCreatureCombatState: player.Creature.CombatState != null);
++		return BuildPlayerState(player, includeCombatResources);
++	}
++
++	private static FullRunApiPlayerState BuildPlayerState(Player player, bool includeCombatResources)
++	{
++		// PlayerCombatState can remain attached briefly after Creature.CombatState is
++		// cleared during a room transition. Orb values execute combat hooks, so they
++		// must never be evaluated from that stale, non-combat lifecycle.
++		var combatState = includeCombatResources ? player.PlayerCombatState : null;
++
+ 		var state = new FullRunApiPlayerState
+ 		{
+ 			character = SafeValue(() => player.Character.Id.Entry, player.Character?.Id?.Entry),
+@@ -525,20 +545,19 @@ public static class FullRunApiStateBuilder
+ 			max_hp = SafeValue(() => player.Creature.MaxHp),
+ 			block = SafeValue(() => player.Creature.Block),
+ 			gold = SafeValue(() => player.Gold),
+-			energy = SafeValue(() => player.PlayerCombatState?.Energy ?? 0),
+-			max_energy = SafeValue(() => player.PlayerCombatState?.MaxEnergy ?? player.MaxEnergy, player.MaxEnergy),
+-			draw_pile_count = SafeValue(() => player.PlayerCombatState?.DrawPile.Cards.Count ?? 0),
+-			discard_pile_count = SafeValue(() => player.PlayerCombatState?.DiscardPile.Cards.Count ?? 0),
+-			exhaust_pile_count = SafeValue(() => player.PlayerCombatState?.ExhaustPile.Cards.Count ?? 0),
++			energy = SafeValue(() => combatState?.Energy ?? 0),
++			max_energy = SafeValue(() => combatState?.MaxEnergy ?? player.MaxEnergy, player.MaxEnergy),
++			draw_pile_count = SafeValue(() => combatState?.DrawPile.Cards.Count ?? 0),
++			discard_pile_count = SafeValue(() => combatState?.DiscardPile.Cards.Count ?? 0),
++			exhaust_pile_count = SafeValue(() => combatState?.ExhaustPile.Cards.Count ?? 0),
+ 			open_potion_slots = SafeValue(() => player.PotionSlots.Count(static potion => potion == null)),
+ 			status = SafeBuildPlayerPowers(player),
+ 			deck = SafeBuildDeck(player),
+ 			relics = SafeBuildRelics(player),
+-			potions = SafeBuildPotions(player)
++			potions = SafeBuildPotions(player, canUseInCombat: combatState != null)
+ 		};
+ 
+ 		// Stars (The Regent resource)
+-		var combatState = player.PlayerCombatState;
+ 		if (combatState != null)
+ 		{
+ 			if (player.Character.ShouldAlwaysShowStarCounter || combatState.Stars > 0)
+@@ -593,10 +612,18 @@ public static class FullRunApiStateBuilder
+ 		}
+ 	}
+ 
+-	private static FullRunApiPlayerState BuildCombatPlayerState(Player player, CombatTrainingStateSnapshot? combat, FullRunApiPlayerState? baseState)
++	private static FullRunApiPlayerState BuildCombatPlayerState(
++		Player player,
++		CombatTrainingStateSnapshot? combat,
++		FullRunApiPlayerState? baseState,
++		string? stateType)
+ 	{
+-		FullRunApiPlayerState state = baseState ?? BuildPlayerState(player);
+-		if (combat == null)
++		FullRunApiPlayerState state = baseState ?? BuildPlayerStateForLifecycle(player, stateType);
++		bool includeCombatResources = FullRunPlayerResourceLifecycle.ShouldProjectCombatResources(
++			stateType,
++			hasPlayerCombatState: player.PlayerCombatState != null,
++			hasCreatureCombatState: player.Creature.CombatState != null);
++		if (combat == null || !includeCombatResources)
+ 		{
+ 			return state;
+ 		}
+@@ -1138,26 +1165,30 @@ public static class FullRunApiStateBuilder
+ 		}
+ 	}
+ 
+-	private static FullRunApiPlayerState SafeBuildCombatPlayerState(Player player, CombatTrainingStateSnapshot? combat, FullRunApiPlayerState? baseState)
++	private static FullRunApiPlayerState SafeBuildCombatPlayerState(
++		Player player,
++		CombatTrainingStateSnapshot? combat,
++		FullRunApiPlayerState? baseState,
++		string? stateType)
+ 	{
+ 		try
+ 		{
+-			return BuildCombatPlayerState(player, combat, baseState);
++			return BuildCombatPlayerState(player, combat, baseState, stateType);
+ 		}
+ 		catch (Exception ex)
+ 		{
+ 			FullRunSimulationDiagnostics.Increment("combat_api.player_exception");
+ 			FullRunSimulationDiagnostics.Increment("combat_api.fallback_hits");
+ 			FullRunSimulationTrace.Write($"headless_api_build_combat_state.player_exception exception={ex}");
+-			return baseState ?? SafeBuildPlayerState(player);
++			return baseState ?? SafeBuildPlayerState(player, stateType);
+ 		}
+ 	}
+ 
+-	private static FullRunApiPlayerState SafeBuildPlayerState(Player player)
++	private static FullRunApiPlayerState SafeBuildPlayerState(Player player, string? stateType)
+ 	{
+ 		try
+ 		{
+-			return BuildPlayerState(player);
++			return BuildPlayerStateForLifecycle(player, stateType);
+ 		}
+ 		catch (Exception ex)
+ 		{
+@@ -1247,12 +1278,12 @@ public static class FullRunApiStateBuilder
+ 		}
+ 	}
+ 
+-	private static List<FullRunApiPotionState> SafeBuildPotions(Player player)
++	private static List<FullRunApiPotionState> SafeBuildPotions(Player player, bool canUseInCombat)
+ 	{
+ 		try
+ 		{
+ 			return player.PotionSlots?
+-				.Select((potion, index) => potion == null ? null : ToApiPotionState(potion, index, canUseInCombat: player.PlayerCombatState != null))
++				.Select((potion, index) => potion == null ? null : ToApiPotionState(potion, index, canUseInCombat))
+ 				.OfType<FullRunApiPotionState>()
+ 				.ToList()
+ 				?? new List<FullRunApiPotionState>();
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs
+new file mode 100644
+index 0000000..2c108c2
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs
+@@ -0,0 +1,75 @@
++using System;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Defines when the API may evaluate player resources whose getters execute
++/// combat hooks. PlayerCombatState can outlive Creature.CombatState briefly
++/// while the simulator advances from combat to rewards, map, or another room.
++/// </summary>
++public static class FullRunPlayerResourceLifecycle
++{
++	public static bool ShouldProjectCombatResources(
++		string? stateType,
++		bool hasPlayerCombatState,
++		bool hasCreatureCombatState)
++	{
++		bool isCombatSurface = stateType is "monster" or "elite" or "boss" or "hand_select";
++		return isCombatSurface && hasPlayerCombatState && hasCreatureCombatState;
++	}
++
++	/// <summary>
++	/// Regression for the map/rest transition that previously evaluated retained
++	/// Lightning/Frost orb values after Creature.CombatState was torn down.
++	/// </summary>
++	public static void RunSelfTests()
++	{
++		AssertProjection("monster", hasPlayerCombatState: true, hasCreatureCombatState: true, expected: true);
++		AssertProjection("elite", hasPlayerCombatState: true, hasCreatureCombatState: true, expected: true);
++		AssertProjection("boss", hasPlayerCombatState: true, hasCreatureCombatState: true, expected: true);
++		AssertProjection("hand_select", hasPlayerCombatState: true, hasCreatureCombatState: true, expected: true);
++
++		// Exact failure shape: the player wrapper is stale while the creature's
++		// authoritative combat lifecycle has already ended.
++		AssertProjection("map", hasPlayerCombatState: true, hasCreatureCombatState: false, expected: false);
++		AssertProjection("rest_site", hasPlayerCombatState: true, hasCreatureCombatState: false, expected: false);
++		AssertProjection("combat_rewards", hasPlayerCombatState: true, hasCreatureCombatState: false, expected: false);
++		AssertProjection("combat_post_end_pending", hasPlayerCombatState: true, hasCreatureCombatState: false, expected: false);
++
++		// A combat-looking surface is still not allowed to dereference orb values
++		// while either half of the lifecycle is absent.
++		AssertProjection("monster", hasPlayerCombatState: true, hasCreatureCombatState: false, expected: false);
++		AssertProjection("monster", hasPlayerCombatState: false, hasCreatureCombatState: true, expected: false);
++		AssertProjection("monster", hasPlayerCombatState: false, hasCreatureCombatState: false, expected: false);
++
++		string[] nonCombatSurfaces =
++		{
++			"menu", "run_bootstrap", "map", "event", "rest_site", "shop", "treasure",
++			"combat_rewards", "combat_post_end_pending", "card_reward", "card_select",
++			"relic_select", "game_over", "future_unknown_state"
++		};
++		foreach (string stateType in nonCombatSurfaces)
++		{
++			AssertProjection(stateType, hasPlayerCombatState: true, hasCreatureCombatState: true, expected: false);
++		}
++	}
++
++	private static void AssertProjection(
++		string stateType,
++		bool hasPlayerCombatState,
++		bool hasCreatureCombatState,
++		bool expected)
++	{
++		bool actual = ShouldProjectCombatResources(
++			stateType,
++			hasPlayerCombatState,
++			hasCreatureCombatState);
++		if (actual != expected)
++		{
++			throw new InvalidOperationException(
++				$"Player-resource lifecycle self-test failed: state_type={stateType}, " +
++				$"player_combat={hasPlayerCombatState}, creature_combat={hasCreatureCombatState}, " +
++				$"expected={expected}, actual={actual}.");
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index efa60df..3ec25a2 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -21,6 +21,8 @@ using MegaCrit.Sts2.Core.Events;
+ using MegaCrit.Sts2.Core.Map;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Encounters.Mocks;
++using MegaCrit.Sts2.Core.Models.Orbs;
++using MegaCrit.Sts2.Core.Models.Potions;
+ using MegaCrit.Sts2.Core.Multiplayer;
+ using MegaCrit.Sts2.Core.Nodes;
+ using MegaCrit.Sts2.Core.Nodes.Events;
+@@ -3058,6 +3060,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			{
+ 				throw new InvalidOperationException("Settlement runtime self-test unexpectedly killed the local player.");
+ 			}
++			RunPlayerResourceProjectionLifecycleRuntimeSelfTests(runState, player);
+ 		}
+ 		finally
+ 		{
+@@ -3065,6 +3068,144 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		}
+ 	}
+ 
++	private static void RunPlayerResourceProjectionLifecycleRuntimeSelfTests(
++		RunState runState,
++		Player player)
++	{
++		if (player.PlayerCombatState == null)
++		{
++			player.ResetCombatState();
++		}
++
++		var potionResult = player.AddPotionInternal(
++			ModelDb.Potion<AttackPotion>().ToMutable(),
++			silent: true);
++		if (!potionResult.success)
++		{
++			throw new InvalidOperationException(
++				"Player-resource lifecycle runtime self-test could not add its combat-only potion.");
++		}
++
++		AssertOrbProjectionLifecycle(runState, player, ModelDb.Orb<FrostOrb>().ToMutable());
++		AssertOrbProjectionLifecycle(runState, player, ModelDb.Orb<LightningOrb>().ToMutable());
++	}
++
++	private static void AssertOrbProjectionLifecycle(
++		RunState runState,
++		Player player,
++		OrbModel orb)
++	{
++		var playerCombatState = player.PlayerCombatState
++			?? throw new InvalidOperationException(
++				"Player-resource lifecycle runtime self-test requires PlayerCombatState.");
++		playerCombatState.OrbQueue.Clear();
++		playerCombatState.OrbQueue.AddCapacity(1);
++		orb.Owner = player;
++		playerCombatState.OrbQueue.Insert(0, orb);
++
++		if (player.Creature.CombatState != null)
++		{
++			player.Creature.CombatState.RemoveCreature(player.Creature);
++		}
++
++		foreach (string stateType in new[] { "map", "rest_site" })
++		{
++			if (stateType == "rest_site")
++			{
++				RunManager.Instance.RestSiteSynchronizer.BeginRestSite();
++			}
++
++			var snapshot = new FullRunSimulationStateSnapshot
++			{
++				IsRunActive = true,
++				IsPureSimulator = true,
++				StateType = stateType,
++				RoomType = stateType,
++				CachedBridgeSnapshots = new FullRunChoiceBridgeSnapshotCache()
++			};
++			FullRunApiState apiState = FullRunApiStateBuilder.Build(
++				runState,
++				snapshot,
++				FullRunSimulationChoiceBridge.Instance,
++				forceMapView: false);
++			FullRunApiPlayerState projected = stateType switch
++			{
++				"map" => apiState.map?.player
++					?? throw new InvalidOperationException("Map player projection was absent."),
++				"rest_site" => apiState.rest_site?.player
++					?? throw new InvalidOperationException("Rest-site player projection was absent."),
++				_ => throw new InvalidOperationException($"Unexpected lifecycle surface '{stateType}'.")
++			};
++			AssertNonCombatPlayerProjection(player, projected, stateType, orb.Id.Entry);
++		}
++
++		var activeCombatState = new CombatState(runState: runState);
++		activeCombatState.AddPlayer(player);
++		try
++		{
++			foreach (string stateType in new[] { "monster", "elite", "boss", "hand_select" })
++			{
++				FullRunApiPlayerState projected =
++					FullRunApiStateBuilder.BuildPlayerStateForLifecycle(player, stateType);
++				if (projected.orbs is not { Count: 1 }
++					|| projected.orbs[0].id != orb.Id.Entry
++					|| projected.orb_slots != 1
++					|| projected.orb_empty_slots != 0)
++				{
++					throw new InvalidOperationException(
++						$"Active-combat orb projection failed for state_type={stateType}, orb={orb.Id.Entry}.");
++				}
++				if (projected.orbs[0].passive_val != (int)orb.PassiveVal
++					|| projected.orbs[0].evoke_val != (int)orb.EvokeVal)
++				{
++					throw new InvalidOperationException(
++						$"Active-combat orb values drifted for state_type={stateType}, orb={orb.Id.Entry}.");
++				}
++			}
++		}
++		finally
++		{
++			activeCombatState.RemoveCreature(player.Creature);
++		}
++	}
++
++	private static void AssertNonCombatPlayerProjection(
++		Player player,
++		FullRunApiPlayerState projected,
++		string stateType,
++		string orbId)
++	{
++		if (projected.energy != 0
++			|| projected.max_energy != player.MaxEnergy
++			|| projected.draw_pile_count != 0
++			|| projected.discard_pile_count != 0
++			|| projected.exhaust_pile_count != 0
++			|| projected.stars != null
++			|| projected.orbs != null
++			|| projected.orb_slots != null
++			|| projected.orb_empty_slots != null
++			|| projected.draw_pile != null
++			|| projected.discard_pile != null
++			|| projected.exhaust_pile != null)
++		{
++			throw new InvalidOperationException(
++				$"Non-combat player projection leaked combat resources for state_type={stateType}, orb={orbId}.");
++		}
++		if (projected.hp != player.Creature.CurrentHp
++			|| projected.max_hp != player.Creature.MaxHp
++			|| projected.deck.Count != player.Deck.Cards.Count)
++		{
++			throw new InvalidOperationException(
++				$"Non-combat player projection lost persistent fields for state_type={stateType}, orb={orbId}.");
++		}
++		if (projected.potions.Count == 0
++			|| projected.potions.Any(static potion => potion.can_use_in_combat))
++		{
++			throw new InvalidOperationException(
++				$"Non-combat potion projection was not lifecycle-gated for state_type={stateType}, orb={orbId}.");
++		}
++	}
++
+ 	private void ThrowIfPostCombatContinuationFailed()
+ 	{
+ 		long generation = _postCombatGeneration.Capture();

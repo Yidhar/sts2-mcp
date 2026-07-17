@@ -22,6 +22,10 @@
     {
       "path": "third_party/patches/sts2-ai/0002-stable-settlement-contract.patch",
       "sha256": "97337ec2859e2fe4ba624ea14da864a1890399abac5d71ad90f94d180910e207"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0003-guard-orb-state-lifecycle.patch",
+      "sha256": "cd7adc3a4e5697facbc42b6adafd2109e34ef5b8917b4c16a855e14211b0835b"
     }
   ]
 }
