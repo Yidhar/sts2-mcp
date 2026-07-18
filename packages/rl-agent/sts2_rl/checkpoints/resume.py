@@ -7,6 +7,7 @@ can therefore establish checkpoint identity before a caller invokes
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -62,6 +63,50 @@ def _require_equal(actual: Any, expected: Any, *, label: str) -> None:
         )
 
 
+def _require_sha256(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise CheckpointIntegrityError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _dependency_lock_identity(value: Any, *, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise CheckpointIntegrityError(f"{label} must be a non-empty list")
+    result: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for index, item in enumerate(value):
+        payload = _object(item, label=f"{label}[{index}]")
+        if set(payload) != {"path", "size_bytes", "sha256"}:
+            raise CheckpointIntegrityError(
+                f"{label}[{index}] has unsupported identity fields"
+            )
+        path = payload.get("path")
+        size_bytes = payload.get("size_bytes")
+        if not isinstance(path, str) or not path.strip():
+            raise CheckpointIntegrityError(f"{label}[{index}].path must be non-empty text")
+        if path in seen_paths:
+            raise CheckpointIntegrityError(f"{label} contains duplicate path: {path}")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise CheckpointIntegrityError(
+                f"{label}[{index}].size_bytes must be non-negative"
+            )
+        sha256 = _require_sha256(
+            payload.get("sha256"),
+            label=f"{label}[{index}].sha256",
+        )
+        seen_paths.add(path)
+        result.append({"path": path, "size_bytes": size_bytes, "sha256": sha256})
+    return result
+
+
 def _game_data_identity(value: Any, *, label: str) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -97,6 +142,7 @@ def _validate_semantic_identity(
     *,
     manifest: dict[str, Any],
     metadata: dict[str, Any],
+    require_current_runtime_identity: bool,
 ) -> None:
     expected = checkpoint_runtime_identity()
     expected_contract = expected["contract"]
@@ -104,7 +150,14 @@ def _validate_semantic_identity(
     expected_locks = expected["dependency_locks"]
 
     manifest_contract = _object(manifest.get("contract"), label="manifest.contract")
-    _require_equal(manifest_contract, expected_contract, label="contract identity")
+    if set(manifest_contract) != set(expected_contract) or not all(
+        isinstance(value, str) and value.strip() for value in manifest_contract.values()
+    ):
+        raise CheckpointIntegrityError(
+            "checkpoint manifest.contract has an unsupported identity shape"
+        )
+    if require_current_runtime_identity:
+        _require_equal(manifest_contract, expected_contract, label="contract identity")
 
     manifest_provenance = _object(
         manifest.get("provenance"), label="manifest.provenance"
@@ -117,7 +170,24 @@ def _validate_semantic_identity(
         manifest_provenance.get("reward_spec"),
         label="manifest.provenance.reward_spec",
     )
-    _require_equal(manifest_reward, expected_reward, label="reward identity")
+    if not isinstance(manifest_reward.get("fingerprint"), str) or not str(
+        manifest_reward["fingerprint"]
+    ).strip():
+        raise CheckpointIntegrityError(
+            "manifest.provenance.reward_spec has no fingerprint"
+        )
+    reward_fingerprint_sha256 = _require_sha256(
+        manifest_reward.get("fingerprint_sha256"),
+        label="manifest.provenance.reward_spec.fingerprint_sha256",
+    )
+    if hashlib.sha256(manifest_reward["fingerprint"].encode("utf-8")).hexdigest() != (
+        reward_fingerprint_sha256
+    ):
+        raise CheckpointIntegrityError(
+            "manifest.provenance.reward_spec fingerprint digest does not match"
+        )
+    if require_current_runtime_identity:
+        _require_equal(manifest_reward, expected_reward, label="reward identity")
     # Static catalog facts are recorded for provenance, but the grounded model
     # never reads them.  They therefore must not create false exact-resume
     # incompatibilities.  Validate their shape only; encoder semantics have a
@@ -126,8 +196,12 @@ def _validate_semantic_identity(
         manifest_provenance.get("game_data_manifest"),
         label="manifest.provenance.game_data_manifest",
     )
-    manifest_locks = manifest_provenance.get("dependency_locks")
-    _require_equal(manifest_locks, expected_locks, label="dependency-lock identity")
+    manifest_locks = _dependency_lock_identity(
+        manifest_provenance.get("dependency_locks"),
+        label="manifest.provenance.dependency_locks",
+    )
+    if require_current_runtime_identity:
+        _require_equal(manifest_locks, expected_locks, label="dependency-lock identity")
 
     metadata_contract = _object(metadata.get("contract"), label="metadata.contract")
     _require_equal(metadata_contract, manifest_contract, label="metadata contract identity")
@@ -156,18 +230,13 @@ def _validate_semantic_identity(
     )
 
 
-def validate_resume_checkpoint(
+def _validate_checkpoint(
     checkpoint: str | Path,
     *,
-    required_files: Collection[str] = EXACT_RESUME_REQUIRED_FILES,
+    required_files: Collection[str],
+    require_current_runtime_identity: bool,
+    operation: str,
 ) -> ValidatedResumeCheckpoint:
-    """Validate an exact-resume checkpoint without deserializing executable data.
-
-    Exact resume requires an atomic completion manifest, a valid SHA-256 for
-    every payload file, no unlisted payload, and exact contract/reward/dependency
-    identity. Optional static game-data provenance is shape-validated only.
-    """
-
     root = Path(checkpoint).expanduser().resolve(strict=False)
     manifest = verify_checkpoint_directory(
         root,
@@ -188,9 +257,55 @@ def validate_resume_checkpoint(
     missing = sorted(set(required_files) - listed)
     if missing:
         raise CheckpointIntegrityError(
-            f"exact resume checkpoint is missing required manifest entries: {missing}"
+            f"{operation} checkpoint is missing required manifest entries: {missing}"
         )
 
     metadata = _read_json_object(root / "metadata.json", label="checkpoint metadata")
-    _validate_semantic_identity(manifest=manifest, metadata=metadata)
+    _validate_semantic_identity(
+        manifest=manifest,
+        metadata=metadata,
+        require_current_runtime_identity=require_current_runtime_identity,
+    )
     return ValidatedResumeCheckpoint(root=root, manifest=manifest, metadata=metadata)
+
+
+def validate_resume_checkpoint(
+    checkpoint: str | Path,
+    *,
+    required_files: Collection[str] = EXACT_RESUME_REQUIRED_FILES,
+) -> ValidatedResumeCheckpoint:
+    """Validate an exact-resume checkpoint without deserializing executable data.
+
+    Exact resume requires an atomic completion manifest, a valid SHA-256 for
+    every payload file, no unlisted payload, and exact contract/reward/dependency
+    identity. Optional static game-data provenance is shape-validated only.
+    """
+
+    return _validate_checkpoint(
+        checkpoint,
+        required_files=required_files,
+        require_current_runtime_identity=True,
+        operation="exact resume",
+    )
+
+
+def validate_model_initialization_checkpoint(
+    checkpoint: str | Path,
+    *,
+    required_files: Collection[str] = EXACT_RESUME_REQUIRED_FILES,
+) -> ValidatedResumeCheckpoint:
+    """Validate a complete model-only source without current task semantics.
+
+    The source remains an immutable atomic training checkpoint. Its recorded
+    contract, reward, and dependency identities must be structurally valid and
+    internally identical between manifest and metadata, but their values may
+    predate the active runtime. Learned model and encoding ABI checks run before
+    any tensor is loaded. Exact resume never calls this migration path.
+    """
+
+    return _validate_checkpoint(
+        checkpoint,
+        required_files=required_files,
+        require_current_runtime_identity=False,
+        operation="model initialization",
+    )

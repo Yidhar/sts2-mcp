@@ -90,15 +90,23 @@ python -m sts2_rl.train `
   --initialize-from "$env:STS2_ARTIFACT_ROOT/checkpoints/recurrent-vtrace-combat/run-<uuid>/final-step-<steps>"
 ```
 
-This remains strict: atomic manifest, hashes, v3 format, the learned-parameter
-configuration, grounded feature ABI, and strict state keys/shapes are required.
-Tensor-independent encoding capacities may change because they do not alter
-network parameter shapes; exact resume still rejects that changed lineage.
-Initialization imports only `network.pt`, republishes it to the actor, and leaves
-optimizer, queue, counters, collector/RNG state and policy-version counters fresh.
-The first child checkpoint records a `model_parameter_initialization` parent
-relation. A deliberate architecture or feature-encoding change starts randomly;
-v1 remains unsupported.
+This remains strict: the source must be a complete immutable atomic checkpoint;
+every listed payload hash and the closed directory set are verified before any
+tensor load. The recorded source contract, reward, and dependency identities must
+be structurally valid and identical between its manifest and metadata. Their
+values may predate the active runtime because this operation starts a new task
+lineage; exact resume still requires them to equal the current runtime exactly.
+
+The learned-parameter configuration, grounded feature ABI, and strict state
+keys/shapes must match. Tensor-independent encoding capacities may change because
+they do not alter network parameter shapes. Initialization imports only
+`network.pt`, republishes it to the actor, and leaves optimizer, rollout queue,
+transaction replay, counters, collector/RNG state, and policy-version counters
+fresh. The first child checkpoint records a `model_parameter_initialization`
+parent relation plus the source contract, reward-fingerprint SHA-256, dependency
+locks, manifest hash, and metadata hash. Never edit an archived manifest to make
+it look current. A deliberate architecture or feature-encoding change starts
+randomly; v1 remains unsupported.
 
 ## Operational verification
 

@@ -285,6 +285,7 @@ def _validated_parent_checkpoint_descriptor(
     expected_contract: dict[str, str],
     expected_reward_spec: dict[str, Any],
     expected_dependency_locks: list[dict[str, Any]],
+    require_current_runtime_identity: bool,
 ) -> dict[str, Any]:
     """Validate and describe one immutable parent without importing resume.py."""
 
@@ -326,11 +327,21 @@ def _validated_parent_checkpoint_descriptor(
         raise CheckpointIntegrityError(
             "parent checkpoint metadata checkpoint_id does not match its manifest"
         )
-    if manifest.get("contract") != expected_contract:
+    manifest_contract = manifest.get("contract")
+    if not isinstance(manifest_contract, dict) or set(manifest_contract) != set(
+        expected_contract
+    ) or not all(
+        isinstance(value, str) and value.strip()
+        for value in manifest_contract.values()
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint contract has an unsupported identity shape"
+        )
+    if require_current_runtime_identity and manifest_contract != expected_contract:
         raise CheckpointIntegrityError(
             "parent checkpoint contract does not match the current runtime"
         )
-    if metadata.get("contract") != manifest.get("contract"):
+    if metadata.get("contract") != manifest_contract:
         raise CheckpointIntegrityError(
             "parent checkpoint metadata contract does not match its manifest"
         )
@@ -348,11 +359,49 @@ def _validated_parent_checkpoint_descriptor(
         raise CheckpointIntegrityError(
             "parent checkpoint metadata provenance does not match its manifest"
         )
-    if provenance.get("reward_spec") != expected_reward_spec:
+    parent_reward = provenance.get("reward_spec")
+    if (
+        not isinstance(parent_reward, dict)
+        or not isinstance(parent_reward.get("fingerprint"), str)
+        or not parent_reward["fingerprint"].strip()
+        or not isinstance(parent_reward.get("fingerprint_sha256"), str)
+        or not _SHA256_PATTERN.fullmatch(parent_reward["fingerprint_sha256"])
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint provenance has no valid reward identity"
+        )
+    if hashlib.sha256(parent_reward["fingerprint"].encode("utf-8")).hexdigest() != (
+        parent_reward["fingerprint_sha256"]
+    ):
+        raise CheckpointIntegrityError(
+            "parent checkpoint reward fingerprint digest does not match"
+        )
+    if require_current_runtime_identity and parent_reward != expected_reward_spec:
         raise CheckpointIntegrityError(
             "parent checkpoint reward identity does not match the current runtime"
         )
-    if provenance.get("dependency_locks") != expected_dependency_locks:
+    parent_locks = provenance.get("dependency_locks")
+    if not isinstance(parent_locks, list) or not parent_locks:
+        raise CheckpointIntegrityError(
+            "parent checkpoint dependency-lock identity must be a non-empty list"
+        )
+    seen_lock_paths: set[str] = set()
+    for index, lock in enumerate(parent_locks):
+        descriptor = _require_hash_descriptor(
+            lock,
+            label=f"parent checkpoint dependency lock [{index}]",
+        )
+        if set(descriptor) != {"path", "size_bytes", "sha256"}:
+            raise CheckpointIntegrityError(
+                f"parent checkpoint dependency lock [{index}] has unsupported identity fields"
+            )
+        lock_path = descriptor["path"]
+        if lock_path in seen_lock_paths:
+            raise CheckpointIntegrityError(
+                f"parent checkpoint dependency-lock identity has duplicate path: {lock_path}"
+            )
+        seen_lock_paths.add(lock_path)
+    if require_current_runtime_identity and parent_locks != expected_dependency_locks:
         raise CheckpointIntegrityError(
             "parent checkpoint dependency-lock identity does not match the current runtime"
         )
@@ -409,13 +458,6 @@ def _validated_parent_checkpoint_descriptor(
         raise CheckpointIntegrityError(
             "parent checkpoint metadata descriptor does not match its manifest entry"
         )
-    parent_reward = provenance.get("reward_spec")
-    if not isinstance(parent_reward, dict) or not isinstance(
-        parent_reward.get("fingerprint"), str
-    ):
-        raise CheckpointIntegrityError(
-            "parent checkpoint provenance has no reward fingerprint"
-        )
     return {
         "path": str(parent_path),
         "relation": None,
@@ -423,6 +465,11 @@ def _validated_parent_checkpoint_descriptor(
         "total_steps": total_steps,
         "training_state": training_state,
         "reward_spec_fingerprint": parent_reward["fingerprint"],
+        "source_runtime_identity": {
+            "contract": manifest_contract,
+            "reward_spec_fingerprint_sha256": parent_reward["fingerprint_sha256"],
+            "dependency_locks": parent_locks,
+        },
         "manifest": manifest_descriptor,
         "metadata": metadata_descriptor,
     }
@@ -478,6 +525,9 @@ def build_checkpoint_provenance(
             expected_contract=contract_metadata(),
             expected_reward_spec=reward_payload,
             expected_dependency_locks=locks,
+            require_current_runtime_identity=(
+                checkpoint_load_mode != "model_initialization"
+            ),
         )
         parent["relation"] = parent_relation
     return {

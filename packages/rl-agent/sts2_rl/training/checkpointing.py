@@ -20,6 +20,7 @@ from sts2_rl.checkpoints import (
     ValidatedResumeCheckpoint,
     build_checkpoint_provenance,
     contract_metadata,
+    validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
 from sts2_rl.encoding import grounding_encoding_identity
@@ -467,7 +468,7 @@ def preflight_model_initialization(
     *,
     config: TrainingConfig,
 ) -> ValidatedResumeCheckpoint:
-    validated = validate_resume_checkpoint(checkpoint)
+    validated = validate_model_initialization_checkpoint(checkpoint)
     _validate_metadata(
         validated,
         config=config,

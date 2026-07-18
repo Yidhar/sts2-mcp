@@ -14,6 +14,7 @@ from .atomic import (
 from .resume import (
     EXACT_RESUME_REQUIRED_FILES,
     ValidatedResumeCheckpoint,
+    validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "dependency_lock_metadata",
     "game_data_manifest_metadata",
     "reward_spec_metadata",
+    "validate_model_initialization_checkpoint",
     "validate_resume_checkpoint",
     "verify_checkpoint_directory",
 ]

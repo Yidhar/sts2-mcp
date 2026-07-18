@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -279,10 +280,25 @@ def test_checkpoint_provenance_accepts_and_normalizes_legal_combinations(
     monkeypatch.setattr(
         atomic_module,
         "reward_spec_metadata",
-        lambda: {"fingerprint": "test-reward-fingerprint"},
+        lambda: {
+            "fingerprint": "test-reward-fingerprint",
+            "fingerprint_sha256": hashlib.sha256(
+                b"test-reward-fingerprint"
+            ).hexdigest(),
+        },
     )
     monkeypatch.setattr(atomic_module, "game_data_manifest_metadata", lambda: None)
-    monkeypatch.setattr(atomic_module, "dependency_lock_metadata", lambda: [])
+    monkeypatch.setattr(
+        atomic_module,
+        "dependency_lock_metadata",
+        lambda: [
+            {
+                "path": "test.lock",
+                "size_bytes": 0,
+                "sha256": "0" * 64,
+            }
+        ],
+    )
     monkeypatch.setattr(atomic_module, "_git_metadata", lambda _root: {})
     parent = None
     if has_parent:

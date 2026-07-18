@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -11,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from sts2_rl.checkpoints import ValidatedResumeCheckpoint
+from sts2_rl.checkpoints import CheckpointIntegrityError, ValidatedResumeCheckpoint
 from sts2_rl.contracts import (
     BackendCapabilities,
     CombatResetRequest,
@@ -627,6 +628,54 @@ def _config(*, total_steps: int = 4) -> TrainingConfig:
             evaluation_episodes=0,
         ),
     )
+
+
+def _rewrite_checkpoint_runtime_identity(
+    checkpoint: Path,
+    *,
+    mismatch: str,
+) -> dict[str, Any]:
+    manifest_path = checkpoint / "checkpoint.manifest.json"
+    metadata_path = checkpoint / "metadata.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    contract = dict(manifest["contract"])
+    provenance = json.loads(json.dumps(manifest["provenance"]))
+
+    if mismatch == "contract":
+        contract["schema_version"] = "2026-07-13.1"
+    elif mismatch == "reward":
+        reward = dict(provenance["reward_spec"])
+        reward["fingerprint"] = reward["fingerprint"] + "|archived-reward"
+        reward["fingerprint_sha256"] = hashlib.sha256(
+            reward["fingerprint"].encode("utf-8")
+        ).hexdigest()
+        provenance["reward_spec"] = reward
+    elif mismatch == "dependency":
+        locks = [dict(item) for item in provenance["dependency_locks"]]
+        locks[0]["sha256"] = "0" * 64
+        provenance["dependency_locks"] = locks
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(mismatch)
+
+    manifest["contract"] = contract
+    manifest["provenance"] = provenance
+    metadata["contract"] = contract
+    metadata["provenance"] = provenance
+    metadata_bytes = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
+    metadata_path.write_bytes(metadata_bytes)
+    for entry in manifest["files"]:
+        if entry["path"] == "metadata.json":
+            entry["size_bytes"] = len(metadata_bytes)
+            entry["sha256"] = hashlib.sha256(metadata_bytes).hexdigest()
+            break
+    else:  # pragma: no cover - publisher always lists metadata
+        raise AssertionError("metadata entry missing")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"contract": contract, "provenance": provenance}
 
 
 def _event_loop_config(*, durable_window: int = 4) -> TrainingConfig:
@@ -2028,6 +2077,87 @@ def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(
         parent_metadata = metadata["provenance"]["parent_checkpoint"]
         assert parent_metadata["relation"] == "model_parameter_initialization"
         assert parent_metadata["training_state"]["policy_version"] == 638
+    finally:
+        target.close()
+
+
+@pytest.mark.parametrize("mismatch", ("contract", "reward", "dependency"))
+def test_model_initialization_migrates_only_parameters_across_runtime_identities(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    config = _config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        source.optimizer.zero_grad(set_to_none=True)
+        objective = sum(parameter.square().mean() for parameter in source.model.parameters())
+        objective.backward()
+        source.optimizer.step()
+        source_state = {
+            key: value.detach().clone() for key, value in source.model.state_dict().items()
+        }
+        checkpoint = save_training_checkpoint(
+            tmp_path / f"archived-{mismatch}",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=21_023, policy_version=268),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    archived = _rewrite_checkpoint_runtime_identity(checkpoint, mismatch=mismatch)
+    with pytest.raises(CheckpointIntegrityError, match=f"{mismatch}.*identity"):
+        preflight_training_checkpoint(
+            checkpoint,
+            config=config,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+        )
+    validated = preflight_model_initialization(checkpoint, config=config)
+    assert validated.root == checkpoint.resolve()
+
+    target = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        initial_collector_state = target.collector.state_dict()
+        parent = initialize_model_from_checkpoint(
+            checkpoint,
+            config=config,
+            resources=target,
+        )
+        assert parent == checkpoint.resolve()
+        assert len(target.optimizer.state) == 0
+        assert len(target.rollout_queue) == 0
+        assert target.collector.state_dict() == initial_collector_state
+        for key, expected in source_state.items():
+            assert torch.equal(target.model.state_dict()[key], expected), key
+            assert torch.equal(target.collector_model.state_dict()[key], expected), key
+
+        migrated = save_training_checkpoint(
+            tmp_path / f"current-{mismatch}",
+            config=config,
+            resources=target,
+            state=TrainingState(),
+            parent_checkpoint=checkpoint,
+            checkpoint_load_mode="model_initialization",
+            parent_relation="model_parameter_initialization",
+        )
+        migrated_metadata = json.loads(
+            (migrated / "metadata.json").read_text(encoding="utf-8")
+        )
+        assert migrated_metadata["training_state"] == asdict(TrainingState())
+        provenance = migrated_metadata["provenance"]
+        assert provenance["checkpoint_load_mode"] == "model_initialization"
+        parent_metadata = provenance["parent_checkpoint"]
+        assert parent_metadata["relation"] == "model_parameter_initialization"
+        source_identity = parent_metadata["source_runtime_identity"]
+        assert source_identity["contract"] == archived["contract"]
+        assert source_identity["reward_spec_fingerprint_sha256"] == (
+            archived["provenance"]["reward_spec"]["fingerprint_sha256"]
+        )
+        assert source_identity["dependency_locks"] == (
+            archived["provenance"]["dependency_locks"]
+        )
     finally:
         target.close()
 
