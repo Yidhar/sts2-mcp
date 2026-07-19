@@ -26,6 +26,10 @@
     {
       "path": "third_party/patches/sts2-ai/0003-guard-orb-state-lifecycle.patch",
       "sha256": "cd7adc3a4e5697facbc42b6adafd2109e34ef5b8917b4c16a855e14211b0835b"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0004-fail-closed-legal-action-eligibility.patch",
+      "sha256": "0cefdeaa44262132d5916f829607b770f3e5c8d001dc713301fca614603a870b"
     }
   ]
 }

@@ -8,6 +8,7 @@ import pytest
 from sts2_rl.simulator_identity import (
     IDENTITY_SCHEMA_VERSION,
     SimulatorIdentityError,
+    repository_root,
     sha256_file,
     simulator_identity_path,
     verify_headless_simulator,
@@ -104,6 +105,119 @@ def _simulator_for_repository_lock(tmp_path: Path) -> Path:
     return executable
 
 
+def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable() -> None:
+    root = repository_root()
+    lock = json.loads((root / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8"))
+    matching = [
+        record
+        for record in lock["patches"]
+        if record["path"].endswith("0004-fail-closed-legal-action-eligibility.patch")
+    ]
+    assert len(matching) == 1
+
+    patch_path = root / matching[0]["path"]
+    assert matching[0]["sha256"] == sha256_file(patch_path)
+    patch = patch_path.read_text(encoding="utf-8")
+    sections: dict[str, str] = {}
+    for section in patch.split("diff --git ")[1:]:
+        before, after = section.splitlines()[0].split()
+        assert before.startswith("a/") and after.startswith("b/")
+        assert before[2:] == after[2:]
+        sections[after[2:]] = section
+
+    headless_helper_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs"
+    settlement_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs"
+    headless_builder_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs"
+    overlay_helper_path = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs"
+    overlay_builder_path = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs"
+    assert set(sections) == {
+        headless_helper_path,
+        settlement_path,
+        headless_builder_path,
+        overlay_helper_path,
+        overlay_builder_path,
+    }
+
+    def changed_lines(section: str, prefix: str) -> list[str]:
+        header_prefix = prefix * 3
+        return [
+            line[1:] for line in section.splitlines() if line.startswith(prefix) and not line.startswith(header_prefix)
+        ]
+
+    def added_source(section: str) -> str:
+        return "\n".join(changed_lines(section, "+"))
+
+    headless_helper = added_source(sections[headless_helper_path])
+    overlay_helper = added_source(sections[overlay_helper_path])
+    assert headless_helper == overlay_helper
+    assert "internal static bool IsShopPurchaseSupported(" in headless_helper
+    assert "bool hasOpenPotionSlots," in headless_helper
+    assert "bool canProcurePotion)" in headless_helper
+    assert "&& (!isPotionEntry || (hasOpenPotionSlots && canProcurePotion));" in headless_helper
+    assert "full potion slots must suppress an otherwise affordable potion purchase" in headless_helper
+    assert "Sozu must suppress an otherwise affordable potion purchase even with an open slot" in headless_helper
+    assert "an ordinary open-slot player must preserve an otherwise affordable potion purchase" in headless_helper
+
+    assert "internal static IEnumerable<uint?> EnumerateCardPlayTargets(" in headless_helper
+    assert "if (!requiresTarget)" in headless_helper
+    assert "yield return null;" in headless_helper
+    assert "foreach (uint targetId in validTargetIds)" in headless_helper
+    assert "yield return targetId;" in headless_helper
+    assert "noTargets.Count == 0" in headless_helper
+    assert "new uint[] { 17u, 42u }" in headless_helper
+    assert "multipleTargets.Count == 2" in headless_helper
+    assert "multipleTargets[0] == 17u" in headless_helper
+    assert "multipleTargets[1] == 42u" in headless_helper
+    assert "targetless.Count == 1 && targetless[0] == null" in headless_helper
+
+    settlement_added = changed_lines(sections[settlement_path], "+")
+    assert settlement_added == ["\t\tFullRunLegalActionEligibility.RunSelfTests();", ""]
+
+    headless_builder_added = changed_lines(sections[headless_builder_path], "+")
+    overlay_builder_added = changed_lines(sections[overlay_builder_path], "+")
+    headless_builder_removed = changed_lines(sections[headless_builder_path], "-")
+    overlay_builder_removed = changed_lines(sections[overlay_builder_path], "-")
+    assert headless_builder_added == overlay_builder_added
+    assert headless_builder_removed == overlay_builder_removed
+    builder_added_source = "\n".join(headless_builder_added)
+
+    assert "using MegaCrit.Sts2.Core.Hooks;" in headless_builder_added
+    hook_lines = [
+        "\t\t\t\tPotionModel? potion = potionEntry.Model;",
+        "\t\t\t\tcanProcurePotion = potion != null",
+        "\t\t\t\t\t&& Hook.ShouldProcurePotion(",
+        "\t\t\t\t\t\tlocalPlayer.RunState,",
+        "\t\t\t\t\t\tlocalPlayer.Creature.CombatState,",
+        "\t\t\t\t\t\tpotion,",
+        "\t\t\t\t\t\tlocalPlayer);",
+    ]
+    hook_positions = [headless_builder_added.index(line) for line in hook_lines]
+    assert hook_positions == sorted(hook_positions)
+    assert "FullRunLegalActionEligibility.IsShopPurchaseSupported(" in builder_added_source
+    assert "\t\t\t\t\tlocalPlayer.HasOpenPotionSlots," in headless_builder_added
+    assert "\t\t\t\t\tcanProcurePotion)" in headless_builder_added
+
+    # Raw merchant indices remain attached before support filtering; a sparse
+    # simulator slot such as 11 must never be replaced by candidate ordinal 1.
+    for builder_path in (headless_builder_path, overlay_builder_path):
+        section = sections[builder_path]
+        context = changed_lines(section, " ")
+        added = changed_lines(section, "+")
+        removed = changed_lines(section, "-")
+        assert "\t\t\t\tIndex = index++," in context
+        assert not any(line.lstrip().startswith("Index =") for line in added + removed)
+
+    old_guard = "\t\t\t\tif (card3.RequiresTarget && validTargetIds.Count > 0)"
+    assert old_guard in headless_builder_removed
+    assert old_guard not in headless_builder_added
+    assert (
+        "\t\t\t\tforeach (uint? targetId in "
+        "FullRunLegalActionEligibility.EnumerateCardPlayTargets("
+        "card3.RequiresTarget, validTargetIds))"
+    ) in headless_builder_added
+    assert "\t\t\t\t\t\tTargetId = targetId," in headless_builder_added
+
+
 def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     executable, identity_path, lock_path, _ = _simulator(tmp_path)
 
@@ -116,9 +230,7 @@ def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     assert identity.executable == executable.resolve()
     assert identity.source_commit == "1" * 40
     assert identity.binary_sha256 == sha256_file(executable)
-    assert identity.managed_assembly_sha256 == sha256_file(
-        executable.with_suffix(".dll")
-    )
+    assert identity.managed_assembly_sha256 == sha256_file(executable.with_suffix(".dll"))
     assert identity.build_configuration == "Release"
 
 
@@ -186,10 +298,7 @@ def test_verified_identity_can_be_persisted_as_external_audit(
     assert audit.parent == artifact_root / "logs" / "simulator-preflight"
     assert payload["event"] == "simulator_identity_verified"
     assert payload["binary"]["sha256"] == identity.binary_sha256
-    assert (
-        payload["managed_binary"]["sha256"]
-        == identity.managed_assembly_sha256
-    )
+    assert payload["managed_binary"]["sha256"] == identity.managed_assembly_sha256
 
 
 def test_training_cli_gates_and_pins_headless_executable_before_run(

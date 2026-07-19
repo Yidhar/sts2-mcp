@@ -1,0 +1,398 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs
+new file mode 100644
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs
+@@ -0,0 +1,89 @@
++using System;
++using System.Collections.Generic;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++internal static class FullRunLegalActionEligibility
++{
++	internal static bool IsShopPurchaseSupported(
++		bool isStocked,
++		bool enoughGold,
++		bool isPotionEntry,
++		bool hasOpenPotionSlots,
++		bool canProcurePotion)
++	{
++		return isStocked
++			&& enoughGold
++			&& (!isPotionEntry || (hasOpenPotionSlots && canProcurePotion));
++	}
++
++	internal static IEnumerable<uint?> EnumerateCardPlayTargets(
++		bool requiresTarget,
++		IReadOnlyList<uint> validTargetIds)
++	{
++		ArgumentNullException.ThrowIfNull(validTargetIds);
++		if (!requiresTarget)
++		{
++			yield return null;
++			yield break;
++		}
++		foreach (uint targetId in validTargetIds)
++		{
++			yield return targetId;
++		}
++	}
++
++	internal static void RunSelfTests()
++	{
++		Assert(
++			!IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: false,
++				canProcurePotion: true),
++			"full potion slots must suppress an otherwise affordable potion purchase");
++		Assert(
++			!IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: true,
++				canProcurePotion: false),
++			"Sozu must suppress an otherwise affordable potion purchase even with an open slot");
++		Assert(
++			IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: true,
++				canProcurePotion: true),
++			"an ordinary open-slot player must preserve an otherwise affordable potion purchase");
++
++		List<uint?> noTargets = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: true, Array.Empty<uint>()));
++		Assert(noTargets.Count == 0, "target-required cards with zero valid targets must emit no action");
++
++		List<uint?> multipleTargets = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: true, new uint[] { 17u, 42u }));
++		Assert(
++			multipleTargets.Count == 2
++				&& multipleTargets[0] == 17u
++				&& multipleTargets[1] == 42u,
++			"target-required cards must emit one action per valid target id in order");
++
++		List<uint?> targetless = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: false, Array.Empty<uint>()));
++		Assert(
++			targetless.Count == 1 && targetless[0] == null,
++			"targetless cards must emit exactly one action with no target id");
++	}
++
++	private static void Assert(bool condition, string detail)
++	{
++		if (!condition)
++		{
++			throw new InvalidOperationException($"Legal-action eligibility self-test failed: {detail}.");
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+@@ -61,6 +61,8 @@
+ 	/// </summary>
+ 	public static void RunSelfTests()
+ 	{
++		FullRunLegalActionEligibility.RunSelfTests();
++
+ 		FullRunSimulationLegalAction action = new FullRunSimulationLegalAction
+ 		{
+ 			Action = "test",
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+@@ -10,6 +10,7 @@
+ using MegaCrit.Sts2.Core.Entities.Potions;
+ using MegaCrit.Sts2.Core.Entities.RestSite;
+ using MegaCrit.Sts2.Core.Events;
++using MegaCrit.Sts2.Core.Hooks;
+ using MegaCrit.Sts2.Core.Localization;
+ using MegaCrit.Sts2.Core.Map;
+ using MegaCrit.Sts2.Core.Models;
+@@ -231,7 +232,7 @@
+ 			case "rest_site":
+ 				return BuildRestSiteLegalActions();
+ 			case "shop":
+-				return BuildShopLegalActions(currentRoom as MerchantRoom);
++				return BuildShopLegalActions(currentRoom as MerchantRoom, localPlayer);
+ 			case "treasure":
+ 				return BuildTreasureLegalActions();
+ 			case "hand_select":
+@@ -574,7 +575,7 @@
+ 		return actions;
+ 	}
+ 
+-	private static List<FullRunSimulationLegalAction> BuildShopLegalActions(MerchantRoom? merchantRoom)
++	private static List<FullRunSimulationLegalAction> BuildShopLegalActions(MerchantRoom? merchantRoom, Player localPlayer)
+ 	{
+ 		List<FullRunSimulationLegalAction> actions = new List<FullRunSimulationLegalAction>();
+ 		if (merchantRoom == null)
+@@ -584,12 +585,29 @@
+ 		int index = 0;
+ 		foreach (MerchantEntry entry in EnumerateShopEntries(merchantRoom.Inventory))
+ 		{
++			bool isPotionEntry = entry is MerchantPotionEntry;
++			bool canProcurePotion = true;
++			if (entry is MerchantPotionEntry potionEntry)
++			{
++				PotionModel? potion = potionEntry.Model;
++				canProcurePotion = potion != null
++					&& Hook.ShouldProcurePotion(
++						localPlayer.RunState,
++						localPlayer.Creature.CombatState,
++						potion,
++						localPlayer);
++			}
+ 			actions.Add(new FullRunSimulationLegalAction
+ 			{
+ 				Action = "shop_purchase",
+ 				Index = index++,
+ 				Label = GetMerchantEntryLabel(entry),
+-				IsSupported = entry.IsStocked && entry.EnoughGold
++				IsSupported = FullRunLegalActionEligibility.IsShopPurchaseSupported(
++					entry.IsStocked,
++					entry.EnoughGold,
++					isPotionEntry,
++					localPlayer.HasOpenPotionSlots,
++					canProcurePotion)
+ 			});
+ 		}
+ 		actions.Add(new FullRunSimulationLegalAction
+@@ -793,28 +811,17 @@
+ 					continue;
+ 				}
+ 				List<uint> validTargetIds = card3.ValidTargetIds ?? new List<uint>();
+-				if (card3.RequiresTarget && validTargetIds.Count > 0)
+-				{
+-					foreach (uint targetId in validTargetIds)
++				foreach (uint? targetId in FullRunLegalActionEligibility.EnumerateCardPlayTargets(card3.RequiresTarget, validTargetIds))
++				{
++					actions.Add(new FullRunSimulationLegalAction
+ 					{
+-						actions.Add(new FullRunSimulationLegalAction
+-						{
+-							Action = "play_card",
+-							CardIndex = card3.HandIndex,
+-							TargetId = targetId,
+-							Label = card3.Title,
+-							IsSupported = true
+-						});
+-					}
+-					continue;
+-				}
+-				actions.Add(new FullRunSimulationLegalAction
+-				{
+-					Action = "play_card",
+-					CardIndex = card3.HandIndex,
+-					Label = card3.Title,
+-					IsSupported = true
+-				});
++						Action = "play_card",
++						CardIndex = card3.HandIndex,
++						TargetId = targetId,
++						Label = card3.Title,
++						IsSupported = true
++					});
++				}
+ 			}
+ 			foreach (PotionModel potion in localPlayer.Potions ?? Enumerable.Empty<PotionModel>())
+ 			{
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs
+new file mode 100644
+--- /dev/null
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs
+@@ -0,0 +1,89 @@
++using System;
++using System.Collections.Generic;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++internal static class FullRunLegalActionEligibility
++{
++	internal static bool IsShopPurchaseSupported(
++		bool isStocked,
++		bool enoughGold,
++		bool isPotionEntry,
++		bool hasOpenPotionSlots,
++		bool canProcurePotion)
++	{
++		return isStocked
++			&& enoughGold
++			&& (!isPotionEntry || (hasOpenPotionSlots && canProcurePotion));
++	}
++
++	internal static IEnumerable<uint?> EnumerateCardPlayTargets(
++		bool requiresTarget,
++		IReadOnlyList<uint> validTargetIds)
++	{
++		ArgumentNullException.ThrowIfNull(validTargetIds);
++		if (!requiresTarget)
++		{
++			yield return null;
++			yield break;
++		}
++		foreach (uint targetId in validTargetIds)
++		{
++			yield return targetId;
++		}
++	}
++
++	internal static void RunSelfTests()
++	{
++		Assert(
++			!IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: false,
++				canProcurePotion: true),
++			"full potion slots must suppress an otherwise affordable potion purchase");
++		Assert(
++			!IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: true,
++				canProcurePotion: false),
++			"Sozu must suppress an otherwise affordable potion purchase even with an open slot");
++		Assert(
++			IsShopPurchaseSupported(
++				isStocked: true,
++				enoughGold: true,
++				isPotionEntry: true,
++				hasOpenPotionSlots: true,
++				canProcurePotion: true),
++			"an ordinary open-slot player must preserve an otherwise affordable potion purchase");
++
++		List<uint?> noTargets = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: true, Array.Empty<uint>()));
++		Assert(noTargets.Count == 0, "target-required cards with zero valid targets must emit no action");
++
++		List<uint?> multipleTargets = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: true, new uint[] { 17u, 42u }));
++		Assert(
++			multipleTargets.Count == 2
++				&& multipleTargets[0] == 17u
++				&& multipleTargets[1] == 42u,
++			"target-required cards must emit one action per valid target id in order");
++
++		List<uint?> targetless = new List<uint?>(
++			EnumerateCardPlayTargets(requiresTarget: false, Array.Empty<uint>()));
++		Assert(
++			targetless.Count == 1 && targetless[0] == null,
++			"targetless cards must emit exactly one action with no target id");
++	}
++
++	private static void Assert(bool condition, string detail)
++	{
++		if (!condition)
++		{
++			throw new InvalidOperationException($"Legal-action eligibility self-test failed: {detail}.");
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
+--- a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
+@@ -10,6 +10,7 @@
+ using MegaCrit.Sts2.Core.Entities.Potions;
+ using MegaCrit.Sts2.Core.Entities.RestSite;
+ using MegaCrit.Sts2.Core.Events;
++using MegaCrit.Sts2.Core.Hooks;
+ using MegaCrit.Sts2.Core.Localization;
+ using MegaCrit.Sts2.Core.Map;
+ using MegaCrit.Sts2.Core.Models;
+@@ -217,7 +218,7 @@
+ 			case "rest_site":
+ 				return BuildRestSiteLegalActions();
+ 			case "shop":
+-				return BuildShopLegalActions(currentRoom as MerchantRoom);
++				return BuildShopLegalActions(currentRoom as MerchantRoom, localPlayer);
+ 			case "treasure":
+ 				return BuildTreasureLegalActions();
+ 			case "hand_select":
+@@ -527,7 +528,7 @@
+ 		return actions;
+ 	}
+ 
+-	private static List<FullRunSimulationLegalAction> BuildShopLegalActions(MerchantRoom? merchantRoom)
++	private static List<FullRunSimulationLegalAction> BuildShopLegalActions(MerchantRoom? merchantRoom, Player localPlayer)
+ 	{
+ 		List<FullRunSimulationLegalAction> actions = new List<FullRunSimulationLegalAction>();
+ 		if (merchantRoom == null)
+@@ -537,12 +538,29 @@
+ 		int index = 0;
+ 		foreach (MerchantEntry entry in EnumerateShopEntries(merchantRoom.Inventory))
+ 		{
++			bool isPotionEntry = entry is MerchantPotionEntry;
++			bool canProcurePotion = true;
++			if (entry is MerchantPotionEntry potionEntry)
++			{
++				PotionModel? potion = potionEntry.Model;
++				canProcurePotion = potion != null
++					&& Hook.ShouldProcurePotion(
++						localPlayer.RunState,
++						localPlayer.Creature.CombatState,
++						potion,
++						localPlayer);
++			}
+ 			actions.Add(new FullRunSimulationLegalAction
+ 			{
+ 				Action = "shop_purchase",
+ 				Index = index++,
+ 				Label = GetMerchantEntryLabel(entry),
+-				IsSupported = entry.IsStocked && entry.EnoughGold
++				IsSupported = FullRunLegalActionEligibility.IsShopPurchaseSupported(
++					entry.IsStocked,
++					entry.EnoughGold,
++					isPotionEntry,
++					localPlayer.HasOpenPotionSlots,
++					canProcurePotion)
+ 			});
+ 		}
+ 		actions.Add(new FullRunSimulationLegalAction
+@@ -709,28 +727,17 @@
+ 					continue;
+ 				}
+ 				List<uint> validTargetIds = card3.ValidTargetIds ?? new List<uint>();
+-				if (card3.RequiresTarget && validTargetIds.Count > 0)
+-				{
+-					foreach (uint targetId in validTargetIds)
++				foreach (uint? targetId in FullRunLegalActionEligibility.EnumerateCardPlayTargets(card3.RequiresTarget, validTargetIds))
++				{
++					actions.Add(new FullRunSimulationLegalAction
+ 					{
+-						actions.Add(new FullRunSimulationLegalAction
+-						{
+-							Action = "play_card",
+-							CardIndex = card3.HandIndex,
+-							TargetId = targetId,
+-							Label = card3.Title,
+-							IsSupported = true
+-						});
+-					}
+-					continue;
+-				}
+-				actions.Add(new FullRunSimulationLegalAction
+-				{
+-					Action = "play_card",
+-					CardIndex = card3.HandIndex,
+-					Label = card3.Title,
+-					IsSupported = true
+-				});
++						Action = "play_card",
++						CardIndex = card3.HandIndex,
++						TargetId = targetId,
++						Label = card3.Title,
++						IsSupported = true
++					});
++				}
+ 			}
+ 			foreach (PotionModel potion in localPlayer.Potions ?? Enumerable.Empty<PotionModel>())
+ 			{

@@ -78,6 +78,15 @@ historical RL artifacts.
 
 ### Fixed
 
+- Closed two HeadlessSim legal-action/executor gaps exposed by long full-run
+  native-revival training. Merchant potion actions are now published only when
+  the item is stocked and affordable, the player has an open potion slot, and
+  the game's authoritative `ShouldProcurePotion` hook permits acquisition
+  (including Sozu); raw merchant inventory indices remain unchanged. Cards that
+  require a target now publish no action when no valid target exists and retain
+  one candidate per real target otherwise. The pinned simulator patch includes
+  mirrored Headless/Overlay helpers, direct dependency self-tests, lock/hash
+  identity binding, and opaque raw-action round-trip regression coverage.
 - Added a generic 256-decision non-combat durable-progress boundary. It advances
   only when the run locus changes or a previously unseen same-locus persistent
   resource state appears; remembered resource fingerprints prevent bounded

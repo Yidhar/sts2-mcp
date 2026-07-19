@@ -421,6 +421,113 @@ def test_runtime_instances_and_sparse_potion_slots_bind_state_to_actions() -> No
     assert actions[1]["potion"]["slot_index"] == 2
 
 
+def test_opaque_handles_round_trip_sparse_shop_and_target_parameters_without_reindexing() -> None:
+    shop_state = {
+        "state_type": "shop",
+        "shop": {
+            "player": _player(),
+            "items": [
+                {"index": 2, "card": {"id": "STRIKE"}, "price": 50},
+                {"index": 11, "potion": {"id": "FIRE_POTION"}, "price": 75},
+            ],
+        },
+        "legal_actions": [
+            {"action": "shop_purchase", "index": 2},
+            {"action": "shop_purchase", "index": 11},
+            {"action": "shop_skip"},
+        ],
+    }
+    translated_shop = translate_to_bridge_shape(shop_state, episode_id="ep-shop-sparse")
+    shop_actions = translated_shop["available_actions"]
+
+    assert [action["action_handle"] for action in shop_actions] == [
+        "sim:0:shop_purchase",
+        "sim:1:shop_purchase",
+        "sim:2:shop_skip",
+    ]
+    assert shop_actions[1]["idx"] == 1
+    assert shop_actions[1]["item"]["slot_index"] == 11
+    assert shop_actions[1]["_sim_raw"] == {"action": "shop_purchase", "index": 11}
+
+    shop_client = HeadlessSimBridgeClient.__new__(HeadlessSimBridgeClient)
+    shop_client._current_episode_id = "ep-shop-sparse"
+    shop_client._last_legal_actions = shop_actions
+    shop_client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "state": {"state_type": "map", "legal_actions": [{"action": "proceed"}]},
+        }
+    )
+    with mock.patch.object(
+        client_module,
+        "_build_bridge_step_response",
+        return_value={"episode_id": "ep-shop-sparse"},
+    ):
+        shop_client.step("ep-shop-sparse", action_id="sim:1:shop_purchase")
+
+    shop_client._rpc.assert_called_once_with(
+        "step",
+        {"action": "shop_purchase", "index": 11},
+        timeout_s=20.0,
+    )
+
+    combat_state = {
+        "state_type": "combat",
+        "battle": {
+            "player": {
+                "current_hp": 70,
+                "max_hp": 80,
+                "hand": [{"index": 5, "id": "IRON_WAVE", "cost": 1}],
+            },
+            "enemies": [
+                {"entity_id": "CULTIST", "combat_id": 41, "hp": 50, "max_hp": 50},
+                {"entity_id": "JAW_WORM", "combat_id": 99, "hp": 42, "max_hp": 42},
+            ],
+        },
+        "legal_actions": [
+            {"action": "play_card", "card_index": 5, "target_id": 41},
+            {"action": "play_card", "card_index": 5, "target_id": 99},
+            {"action": "end_turn"},
+        ],
+    }
+    translated_combat = translate_to_bridge_shape(combat_state, episode_id="ep-two-targets")
+    combat_actions = translated_combat["available_actions"]
+
+    assert [action["action_handle"] for action in combat_actions] == [
+        "sim:0:play_card",
+        "sim:1:play_card",
+        "sim:2:end_turn",
+    ]
+    assert [action["target"]["instance_id"] for action in combat_actions[:2]] == ["41", "99"]
+    assert combat_actions[1]["_sim_raw"] == {
+        "action": "play_card",
+        "card_index": 5,
+        "target_id": 99,
+    }
+
+    combat_client = HeadlessSimBridgeClient.__new__(HeadlessSimBridgeClient)
+    combat_client._current_episode_id = "ep-two-targets"
+    combat_client._last_legal_actions = combat_actions
+    combat_client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "state": {"state_type": "combat", "legal_actions": [{"action": "end_turn"}]},
+        }
+    )
+    with mock.patch.object(
+        client_module,
+        "_build_bridge_step_response",
+        return_value={"episode_id": "ep-two-targets"},
+    ):
+        combat_client.step("ep-two-targets", action_id="sim:1:play_card")
+
+    combat_client._rpc.assert_called_once_with(
+        "step",
+        {"action": "play_card", "card_index": 5, "target_id": 99},
+        timeout_s=20.0,
+    )
+
+
 def test_runtime_mechanics_fields_survive_transport_without_inference() -> None:
     dynamic_var = {
         "name": "Amount",
