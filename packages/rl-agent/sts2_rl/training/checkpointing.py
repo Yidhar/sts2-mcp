@@ -431,7 +431,7 @@ def _validate_metadata(
                 "transaction_learning": transaction_section,
             }
     if checkpoint_lineage != active_lineage:
-        raise ValueError("exact resume requires identical immutable v2 lineage")
+        raise ValueError("exact resume requires identical immutable training lineage")
     if metadata.get("resolved_device") != resolved_device:
         raise ValueError("exact resume requires the same learner device")
     if metadata.get("resolved_collector_device") != resolved_collector_device:
@@ -704,8 +704,11 @@ def _model_parameter_initialization_state(
 ) -> dict[str, Any]:
     """Fail-closed overlay used only by explicit parameter initialization.
 
-    Exact resume never calls this path.  The only permitted source/target ABI
-    difference is the three freshly initialized v11 transaction heads.
+    Exact resume never calls this path. The only permitted source/target model
+    ABI difference is the complete set of freshly initialized transaction
+    heads. Config/replay ABI changes (including the v4 factual completion-policy
+    objective) reuse compatible network tensors here and deliberately start with
+    a fresh optimizer, rollout queue, RNG lineage, and transaction replay.
     """
 
     if not isinstance(source_state, dict):

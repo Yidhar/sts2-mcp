@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from sts2_baseline import RolloutStep, SequenceUnroll
+from sts2_env._sim_translate_decisions import _translate_card_sel_block
 from sts2_rl.checkpoints import ValidatedResumeCheckpoint
 from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.encoding import (
@@ -27,10 +28,13 @@ from sts2_rl.training import (
     TrainingState,
     TransactionEffect,
     TransactionLearningConfig,
+    TransactionOutcome,
+    TransactionPolicyTarget,
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
     build_training_resources,
+    factual_transaction_policy_targets,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
     observed_outcome_pairs,
@@ -260,93 +264,105 @@ def test_action_only_selection_surface_is_captured_without_observation_dto() -> 
     assert _transaction_surface_key(observation, tuple(reversed(actions))) == surface
 
 
-def test_canonical_cards_universe_does_not_duplicate_selected_membership_subset() -> None:
-    """The simulator exposes ``cards`` as a full universe plus a selected subset."""
+def test_real_translated_selection_membership_keeps_surface_and_changes_node() -> None:
+    """Selectable/selected movement is one transaction, not a false completion."""
 
-    base = {
-        "run": {"act": 1, "floor": 3, "room_type": "combat"},
-        "card_selection": {
-            "mode": "SimpleGrid",
-            "prompt_id": "card.HEADBUTT.selection",
-            "operation_type": "select",
-            "source_zone": "Discard",
-            "min_select": 1,
-            "max_select": 2,
-            "cards": [
-                {
-                    "id": "CARD.STRIKE",
-                    "instance_id": "strike-1",
-                    "source_pile": "Discard",
-                },
-                {
-                    "id": "CARD.DEFEND",
-                    "instance_id": "defend-1",
-                    "source_pile": "Discard",
-                },
-            ],
-            "selected_cards": [
-                {
-                    "id": "CARD.STRIKE",
-                    "instance_id": "strike-1",
-                    "source_pile": "Discard",
-                }
-            ],
-            "selected_count": 1,
-            "remaining_picks": 1,
-            "can_confirm": True,
-        },
+    selection_contract = {
+        "mode": "SimpleGrid",
+        "prompt_id": "card.HEADBUTT.selection",
+        "operation_type": "select",
+        "source_zone": "Discard",
+        "min_select": 1,
+        "max_select": 2,
+        "selected_count": 1,
+        "remaining_picks": 1,
+        "can_confirm": True,
     }
-    actions = (
+    strike = {
+        "id": "STRIKE",
+        "instance_id": "strike-1",
+        "source_pile": "Discard",
+    }
+    defend = {
+        "id": "DEFEND",
+        "instance_id": "defend-1",
+        "source_pile": "Discard",
+    }
+    before_selection = _translate_card_sel_block(
         {
-            "kind": "deselect_card",
-            "model_action_kind": "card_selection",
-            "model_action_variant": "deselect",
-            "card": {
-                "id": "CARD.STRIKE",
-                "instance_id": "strike-1",
-                "source_pile": "Discard",
-            },
+            **selection_contract,
+            # Real translation marks both aliases selectable. The explicit
+            # field is authoritative so exposing both must not double-count it.
+            "cards": [defend],
+            "selectable_cards": [defend],
+            "selected_cards": [strike],
         },
-        {
-            "kind": "select_card",
-            "model_action_kind": "card_selection",
-            "model_action_variant": "select",
-            "card": {
-                "id": "CARD.DEFEND",
-                "instance_id": "defend-1",
-                "source_pile": "Discard",
-            },
-        },
+        {},
+        None,
     )
-    deselected = {
-        **base,
-        "card_selection": {
-            **base["card_selection"],
+    after_selection = _translate_card_sel_block(
+        {
+            **selection_contract,
+            "cards": [defend, strike],
+            "selectable_cards": [defend, strike],
             "selected_cards": [],
             "selected_count": 0,
             "remaining_picks": 2,
             "can_confirm": False,
         },
+        {},
+        None,
+    )
+    assert before_selection["cards"][0]["selection_membership"] == "selectable"
+    assert before_selection["selectable_cards"][0]["selection_membership"] == "selectable"
+    assert before_selection["selected_cards"][0]["selection_membership"] == "selected"
+
+    before = {
+        "run": {"act": 1, "floor": 3, "room_type": "combat"},
+        "card_selection": before_selection,
     }
-    deselected_actions = (
+    after = {
+        "run": before["run"],
+        "card_selection": after_selection,
+    }
+    before_actions = (
         {
-            **actions[0],
             "kind": "select_card",
+            "model_action_kind": "card_selection",
             "model_action_variant": "select",
+            "card": before_selection["selectable_cards"][0],
         },
-        actions[1],
+        {
+            "kind": "deselect_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "deselect",
+            "card": before_selection["selected_cards"][0],
+        },
+        {
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+        },
+    )
+    after_actions = tuple(
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "card": card,
+        }
+        for card in after_selection["selectable_cards"]
     )
 
-    surface = _transaction_surface_key(base, actions)
-    deselected_surface = _transaction_surface_key(deselected, deselected_actions)
-    assert surface is not None
-    assert deselected_surface == surface
-    assert _transaction_node_key(surface, base, actions) != _transaction_node_key(
-        deselected_surface,
-        deselected,
-        deselected_actions,
+    before_surface = _transaction_surface_key(before, before_actions)
+    after_surface = _transaction_surface_key(after, after_actions)
+    assert before_surface is not None
+    assert after_surface == before_surface
+    assert _transaction_node_key(before_surface, before, before_actions) != _transaction_node_key(
+        after_surface,
+        after,
+        after_actions,
     )
-
 
 def test_transaction_exit_is_not_mislabeled_as_selection_teardown_delta() -> None:
     effect, delta = _classify_transaction_transition(
@@ -430,6 +446,7 @@ def _trace(
     transaction_return: float | None,
     node_key: str = "same-node",
     partition: str = "training",
+    outcome: TransactionOutcome = TransactionOutcome.CENSORED,
 ) -> TransactionTrace:
     return TransactionTrace(
         trace_id=trace_id,
@@ -451,8 +468,242 @@ def _trace(
                 return_steps=1 if transaction_return is not None else None,
             ),
         ),
+        outcome=outcome,
         data_partition=partition,
     )
+
+
+
+def _sequence_trace(
+    snapshot: EncodedDecisionSnapshot,
+    *,
+    trace_id: str,
+    outcome: TransactionOutcome,
+    steps: tuple[tuple[str, str, str, int, TransactionEffect], ...],
+) -> TransactionTrace:
+    return TransactionTrace(
+        trace_id=trace_id,
+        episode_id=f"episode-{trace_id}",
+        surface_key=f"surface-{trace_id}",
+        start_step=0,
+        policy_version=0,
+        initial_recurrent_state=np.zeros(32, dtype=np.float32),
+        steps=tuple(
+            TransactionStep(
+                snapshot=snapshot,
+                action_index=action_index,
+                node_key=node_key,
+                next_node_key=next_node_key,
+                action_fingerprint=action_fingerprint,
+                effect=effect,
+                selected_count_delta=0,
+                transaction_return=None,
+                return_steps=None,
+            )
+            for (
+                node_key,
+                next_node_key,
+                action_fingerprint,
+                action_index,
+                effect,
+            ) in steps
+        ),
+        outcome=outcome,
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "steps"),
+    (
+        (
+            "fixed-multiselect-auto-submit",
+            (
+                ("empty", "one", "select:first", 0, TransactionEffect.MOVE),
+                ("one", "exit", "select:second", 1, TransactionEffect.EXIT),
+            ),
+        ),
+        (
+            "manual-confirm-discard",
+            (
+                ("empty", "one", "select:discard", 0, TransactionEffect.MOVE),
+                ("one", "exit", "confirm", 1, TransactionEffect.EXIT),
+            ),
+        ),
+        (
+            "optional-cancel-transform",
+            (("empty", "exit", "cancel_prompt", 1, TransactionEffect.EXIT),),
+        ),
+        (
+            "manual-confirm-remove-duplicate-card",
+            (
+                ("empty", "one", "select:duplicate-copy", 0, TransactionEffect.MOVE),
+                ("one", "exit", "confirm", 1, TransactionEffect.EXIT),
+            ),
+        ),
+    ),
+)
+def test_completed_transaction_paths_prefer_factual_actions_generically(
+    surface: str,
+    steps: tuple[tuple[str, str, str, int, TransactionEffect], ...],
+) -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    trace = _sequence_trace(
+        _snapshot(encoding),
+        trace_id=surface,
+        outcome=TransactionOutcome.COMPLETED,
+        steps=steps,
+    )
+
+    labels = factual_transaction_policy_targets(trace)
+
+    assert [label.step_index for label in labels] == list(range(len(steps)))
+    assert all(label.target is TransactionPolicyTarget.PREFER for label in labels)
+
+
+def test_exact_transaction_cycle_is_avoided_but_corrective_deselect_is_preferred() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    cycle = _sequence_trace(
+        snapshot,
+        trace_id="select-deselect-cycle",
+        outcome=TransactionOutcome.DEADLOCK,
+        steps=(
+            ("empty", "selected", "select:a", 0, TransactionEffect.MOVE),
+            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+            ("empty", "selected", "select:a", 0, TransactionEffect.REVISIT),
+            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+        ),
+    )
+    corrected = _sequence_trace(
+        snapshot,
+        trace_id="corrected-selection",
+        outcome=TransactionOutcome.COMPLETED,
+        steps=(
+            ("empty", "wrong", "select:wrong", 0, TransactionEffect.MOVE),
+            ("wrong", "empty", "deselect:wrong", 1, TransactionEffect.REVISIT),
+            ("empty", "right", "select:right", 1, TransactionEffect.MOVE),
+            ("right", "exit", "confirm", 0, TransactionEffect.EXIT),
+        ),
+    )
+
+    cycle_labels = factual_transaction_policy_targets(cycle)
+    corrected_labels = factual_transaction_policy_targets(corrected)
+
+    assert len(cycle_labels) == 4
+    assert all(
+        label.target is TransactionPolicyTarget.AVOID for label in cycle_labels
+    )
+    assert {
+        label.step_index: label.target for label in corrected_labels
+    } == {
+        1: TransactionPolicyTarget.PREFER,
+        2: TransactionPolicyTarget.PREFER,
+        3: TransactionPolicyTarget.PREFER,
+    }
+
+
+def test_transaction_liveness_targets_directly_update_policy_head() -> None:
+    model_config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+
+    def optimize_probability(*, completed: bool) -> tuple[float, float]:
+        torch.manual_seed(9)
+        model = RecurrentCandidateModel(
+            model_config,
+            enable_transaction_heads=True,
+        )
+        learner = VTraceLearner(
+            model=model,
+            encoder=GroundedObservationEncoder(encoding),
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
+            config=TrainingConfig().optimization,
+            maximum_unroll_length=4,
+            maximum_policy_lag=10,
+            transaction_config=TransactionLearningConfig(
+                enabled=True,
+                replay_byte_capacity=10_000_000,
+                burn_in_steps=0,
+                pairwise_ranking_weight=0.0,
+            ),
+        )
+        if completed:
+            trace = _sequence_trace(
+                snapshot,
+                trace_id="completed-policy",
+                outcome=TransactionOutcome.COMPLETED,
+                steps=(("node", "exit", "confirm", 0, TransactionEffect.EXIT),),
+            )
+        else:
+            trace = _sequence_trace(
+                snapshot,
+                trace_id="cycle-policy",
+                outcome=TransactionOutcome.DEADLOCK,
+                steps=(
+                    ("node", "next", "deselect", 0, TransactionEffect.REVISIT),
+                    ("node", "next", "deselect", 0, TransactionEffect.REVISIT),
+                ),
+            )
+
+        def probability() -> float:
+            encoded = learner.encoder.collate_snapshots((snapshot,))
+            with torch.no_grad():
+                logits = model(encoded).policy_logits
+            return float(torch.softmax(logits, dim=-1)[0, 0].item())
+
+        before = probability()
+        losses = learner._transaction_losses((trace,))
+        learner.optimizer.zero_grad(set_to_none=True)
+        losses[4].backward()
+        policy_gradients = [
+            parameter.grad
+            for name, parameter in model.named_parameters()
+            if name.startswith("policy_head.") and parameter.grad is not None
+        ]
+        assert policy_gradients
+        assert any(bool(torch.count_nonzero(gradient)) for gradient in policy_gradients)
+        learner.optimizer.step()
+        return before, probability()
+
+    completed_before, completed_after = optimize_probability(completed=True)
+    cycle_before, cycle_after = optimize_probability(completed=False)
+
+    assert completed_after > completed_before
+    assert cycle_after < cycle_before
+
+
+def test_censored_transaction_has_no_liveness_policy_target() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    trace = _sequence_trace(
+        _snapshot(encoding),
+        trace_id="censored",
+        outcome=TransactionOutcome.CENSORED,
+        steps=(("node", "next", "select", 0, TransactionEffect.MOVE),),
+    )
+    assert factual_transaction_policy_targets(trace) == ()
 
 
 def test_transaction_heads_are_opt_in_and_candidate_equivariant() -> None:
@@ -551,6 +802,11 @@ def test_replay_is_bounded_checkpointable_and_rejects_heldout() -> None:
     assert restored.snapshot() == replay.snapshot()
     assert restored.metrics() == replay.metrics()
     assert restored.sample(1)[0].trace_id == "second"
+
+    legacy_payload = dict(payload)
+    legacy_payload["version"] = "sts2-transaction-replay-v1"
+    with pytest.raises(ValueError, match="unsupported transaction replay"):
+        restored.load_state_dict(legacy_payload)
 
 
 def test_pairwise_labels_require_same_node_distinct_factual_actions() -> None:
@@ -708,8 +964,8 @@ def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() ->
         handle.remove()
 
     assert forward_calls == 2
-    assert losses[4] == 1
     assert losses[5] == 1
+    assert losses[6] == 1
     with pytest.raises(ValueError, match="zero initial state"):
         replace(
             trace,
@@ -717,7 +973,7 @@ def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() ->
         )
 
 
-def test_learner_uses_only_factual_effect_q_and_pairwise_targets() -> None:
+def test_learner_uses_factual_heads_pairwise_and_direct_policy_targets() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
         model_config,
@@ -771,6 +1027,7 @@ def test_learner_uses_only_factual_effect_q_and_pairwise_targets() -> None:
         action_fingerprint="observed-a",
         effect=TransactionEffect.EXIT,
         transaction_return=1.0,
+        outcome=TransactionOutcome.COMPLETED,
     )
     worse = _trace(
         snapshot,
@@ -804,6 +1061,10 @@ def test_learner_uses_only_factual_effect_q_and_pairwise_targets() -> None:
     assert metrics.transaction_delta_loss > 0.0
     assert metrics.transaction_q_loss > 0.0
     assert metrics.transaction_pairwise_ranking_loss > 0.0
+    assert metrics.transaction_completion_policy_loss > 0.0
+    assert metrics.transaction_policy_labels == 1
+    assert metrics.transaction_policy_preferred_labels == 1
+    assert metrics.transaction_policy_avoided_labels == 0
 
 
 def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> None:
@@ -835,6 +1096,7 @@ def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> Non
         assert trace.data_partition == "training"
         assert trace.start_step == 0
         assert trace.burn_in_steps == 0
+        assert trace.outcome is TransactionOutcome.DEADLOCK
         assert all(step.transaction_return is not None for step in trace.learn_steps)
 
         evaluation_episode = resources.collector.collect_episode(
@@ -846,6 +1108,160 @@ def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> Non
     finally:
         resources.close()
 
+
+@pytest.mark.parametrize("novel_exit", [False, True])
+def test_post_step_deadlock_agrees_with_transaction_exit_outcome(novel_exit: bool) -> None:
+    from tests.test_v2_training_pipeline import (  # local import avoids fixture coupling
+        TerminalWithoutObservationFlagsBackend,
+        _event_loop_config,
+    )
+
+    class SelectionCycleThenExitBackend(TerminalWithoutObservationFlagsBackend):
+        def __init__(self, *, exit_at_threshold: bool) -> None:
+            super().__init__(terminal_step=6)
+            self.exit_at_threshold = exit_at_threshold
+
+        def _exited(self) -> bool:
+            return bool(self.exit_at_threshold and self._step >= 5)
+
+        def _actions(self) -> tuple[dict[str, object], ...]:
+            if self._exited():
+                return (
+                    {
+                        "action": "choose_event_option",
+                        "kind": "choose_event_option",
+                        "model_action_kind": "event_option",
+                        "index": 0,
+                        "label": "EVENT.AFTER_SELECTION.options.CONTINUE",
+                    },
+                )
+            selected = bool(self._step % 2)
+            return (
+                {
+                    "action": "deselect_card" if selected else "select_card",
+                    "kind": "deselect_card" if selected else "select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "deselect" if selected else "select",
+                    "card": {
+                        "id": "CARD.STRIKE",
+                        "instance_id": "strike-1",
+                        "source_pile": "Discard",
+                        "selection_membership": "selected" if selected else "selectable",
+                        "is_selected": selected,
+                    },
+                },
+            )
+
+        def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+            player: dict[str, object] = {
+                "character": "IRONCLAD",
+                "hp": 33,
+                "max_hp": 67,
+                "gold": 99,
+                "open_potion_slots": 2,
+                "deck": [
+                    {"id": "CARD.STRIKE", "is_upgraded": False},
+                    {"id": "CARD.DEFEND", "is_upgraded": False},
+                ],
+                "relics": [],
+                "potions": [],
+            }
+            observation: dict[str, object] = {
+                "phase": "event" if self._exited() else "selection",
+                "decision_domain": "build",
+                "state_type": "event" if self._exited() else "card_select",
+                "screen": "EVENT" if self._exited() else "SELECTION",
+                "player": player,
+                "combat": {"in_progress": False, "enemies": []},
+                "run": {
+                    "active": not terminal,
+                    "act": 1,
+                    "floor": 9,
+                    "room_type": "event",
+                    "room_model_id": "EVENT.TRANSACTION_TEST",
+                },
+            }
+            if self._exited():
+                observation["event"] = {
+                    "event_id": "EVENT.AFTER_SELECTION",
+                    "description_key": "EVENT.AFTER_SELECTION.pages.DONE",
+                    "is_finished": False,
+                    "dynamic_vars": [],
+                    "options": [
+                        {
+                            "index": 0,
+                            "text_key": "EVENT.AFTER_SELECTION.options.CONTINUE",
+                            "is_locked": False,
+                            "is_chosen": False,
+                            "is_proceed": True,
+                        }
+                    ],
+                }
+                return observation
+
+            selected = bool(self._step % 2)
+            card = {
+                "id": "CARD.STRIKE",
+                "instance_id": "strike-1",
+                "source_pile": "Discard",
+            }
+            observation["card_selection"] = {
+                "mode": "SimpleGrid",
+                "prompt_id": "card.TRANSACTION_TEST.selection",
+                "operation_type": "select",
+                "source_zone": "Discard",
+                "min_select": 0,
+                "max_select": 1,
+                "cards": [] if selected else [card],
+                "selected_cards": [card] if selected else [],
+                "selected_count": int(selected),
+                "remaining_picks": int(not selected),
+                "requires_manual_confirmation": False,
+                "can_confirm": selected,
+            }
+            return observation
+
+    base = _event_loop_config(durable_window=20)
+    config = replace(
+        base,
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=20,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=8,
+            replay_byte_capacity=10_000_000,
+            sample_traces=2,
+            burn_in_steps=0,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=SelectionCycleThenExitBackend(exit_at_threshold=novel_exit),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True)
+        assert len(episode.transaction_traces) == 1
+        trace = episode.transaction_traces[0]
+        if novel_exit:
+            assert episode.metrics.steps == 6
+            assert episode.metrics.run_won
+            assert not episode.metrics.deadlocked
+            assert episode.metrics.terminal_reason == "run_victory"
+            assert trace.outcome is TransactionOutcome.COMPLETED
+            assert trace.steps[-1].effect is TransactionEffect.EXIT
+        else:
+            assert episode.metrics.steps == 5
+            assert not episode.metrics.run_won
+            assert episode.metrics.deadlocked
+            assert episode.metrics.terminal_reason == "semantic_deadlock"
+            assert trace.outcome is TransactionOutcome.DEADLOCK
+            assert trace.steps[-1].effect is TransactionEffect.REVISIT
+    finally:
+        resources.close()
 
 def test_model_initialization_adds_only_new_heads_and_replay_roundtrips(
     tmp_path: Path,
@@ -1024,6 +1440,71 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
         )
 
 
+
+def test_completion_policy_abi_requires_new_lineage_but_keeps_model_initialization_compatible(
+    tmp_path: Path,
+) -> None:
+    config = TrainingConfig()
+    enabled = replace(
+        config,
+        transaction_learning=replace(config.transaction_learning, enabled=True),
+    )
+    legacy_lineage = enabled.lineage_mapping()
+    legacy_lineage["version"] = "sts2-relational-curriculum-config-v3"
+    legacy_transaction = dict(legacy_lineage["transaction_learning"])
+    legacy_transaction.pop("completion_policy_weight")
+    legacy_lineage["transaction_learning"] = legacy_transaction
+    validated = ValidatedResumeCheckpoint(
+        root=tmp_path,
+        manifest={},
+        metadata={
+            "format": "sts2-recurrent-vtrace-checkpoint-v3",
+            "model_config": asdict(enabled.model.to_model_config()),
+            "encoding_contract": grounding_encoding_identity(),
+            "model_state_spec": {},
+            "training_state": asdict(TrainingState()),
+            "lineage_config": legacy_lineage,
+            "resolved_device": "cpu",
+            "resolved_collector_device": "cpu",
+            "queue_spec": {},
+            "transaction_heads_enabled": True,
+            "transaction_replay_spec": {},
+        },
+    )
+
+    with pytest.raises(ValueError, match="identical immutable training lineage"):
+        checkpointing_module._validate_metadata(
+            validated,
+            config=enabled,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+            model_only=False,
+        )
+    checkpointing_module._validate_metadata(
+        validated,
+        config=enabled,
+        resolved_device=None,
+        resolved_collector_device=None,
+        model_only=True,
+    )
+
+    source = RecurrentCandidateModel(
+        enabled.model.to_model_config(),
+        enable_transaction_heads=True,
+    ).state_dict()
+    target = RecurrentCandidateModel(
+        enabled.model.to_model_config(),
+        enable_transaction_heads=True,
+    ).state_dict()
+    migrated = checkpointing_module._model_parameter_initialization_state(
+        source,
+        target_state=target,
+        allow_missing_transaction_heads=True,
+    )
+    assert set(migrated) == set(target)
+    assert all(torch.equal(migrated[key], value) for key, value in source.items())
+
+
 def test_legacy_v10_lineage_without_transaction_section_exact_resumes_only_disabled(
     tmp_path: Path,
 ) -> None:
@@ -1058,7 +1539,7 @@ def test_legacy_v10_lineage_without_transaction_section_exact_resumes_only_disab
         config,
         transaction_learning=replace(config.transaction_learning, enabled=True),
     )
-    with pytest.raises(ValueError, match="identical immutable v2 lineage"):
+    with pytest.raises(ValueError, match="identical immutable training lineage"):
         checkpointing_module._validate_metadata(
             validated,
             config=enabled,

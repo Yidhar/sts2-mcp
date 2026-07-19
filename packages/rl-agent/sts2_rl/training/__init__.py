@@ -49,11 +49,15 @@ from .runtime import (
 )
 from .transaction import (
     BoundedTransactionReplay,
+    FactualTransactionPolicyTarget,
     ObservedTransactionPair,
     TransactionEffect,
+    TransactionOutcome,
+    TransactionPolicyTarget,
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
+    factual_transaction_policy_targets,
     observed_outcome_pairs,
 )
 
@@ -68,6 +72,7 @@ __all__ = [
     "DiagnosticsConfig",
     "EnvironmentConfig",
     "EpisodeMetrics",
+    "FactualTransactionPolicyTarget",
     "GroundedCollector",
     "LearnerMetrics",
     "ModelConfig",
@@ -80,6 +85,8 @@ __all__ = [
     "TrainingState",
     "TransactionEffect",
     "TransactionLearningConfig",
+    "TransactionOutcome",
+    "TransactionPolicyTarget",
     "TransactionStep",
     "TransactionTrace",
     "VTraceLearner",
@@ -90,6 +97,7 @@ __all__ = [
     "checkpoint_summary",
     "evaluate_policy",
     "exploration_epsilon",
+    "factual_transaction_policy_targets",
     "initialize_model_from_checkpoint",
     "inspect_baseline",
     "load_training_checkpoint",

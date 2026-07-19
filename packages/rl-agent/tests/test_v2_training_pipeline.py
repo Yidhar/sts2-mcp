@@ -46,7 +46,7 @@ from sts2_rl.training import factory as factory_module
 from sts2_rl.training import runtime as runtime_module
 from sts2_rl.training.checkpoint_evaluation import evaluate_checkpoint_policy
 from sts2_rl.training.checkpointing import ActorSupervisorState, TrainingState
-from sts2_rl.training.collector import CollectionProtocolError
+from sts2_rl.training.collector import CollectionProtocolError, _CombatNetProgressTracker
 from sts2_rl.training.pipeline import ActorLearnerPipeline, RecoverableActorIncident
 from sts2_rl.training.runtime import EvaluationInfrastructureError
 from sts2_rl.training.trajectory import TrajectoryJournal
@@ -246,6 +246,47 @@ class OscillatingDamageBackend(FakeCombatBackend):
                 ],
             },
             "run": {"act": 1, "floor": 1},
+        }
+
+
+class ExhaustedOnlyEndTurnBackend(FakeCombatBackend):
+    """Combat tail with cards in hand but no legal play and no draw/discard recovery."""
+
+    @staticmethod
+    def _actions() -> tuple[dict[str, Any], ...]:
+        return (
+            {
+                "action_handle": "end",
+                "kind": "end_turn",
+                "model_action_kind": "end_turn",
+            },
+        )
+
+    def _observation(self, *, terminal: bool) -> dict[str, Any]:
+        hand = [
+            {
+                "id": "CARD.BURN" if index % 2 else "CARD.STATUS",
+                "is_playable": False,
+            }
+            for index in range(10)
+        ]
+        return {
+            "phase": "combat",
+            "decision_domain": "combat",
+            "player": {
+                "id": "player",
+                "hp": 50,
+                "max_hp": 80,
+                "hand": {"cards": hand},
+                "draw_pile": {"cards": []},
+                "discard_pile": {"cards": []},
+                "exhaust_pile": {"cards": [{"id": "CARD.EXHAUSTED"}]},
+            },
+            "combat": {
+                "in_progress": not terminal,
+                "enemies": [{"id": "enemy", "hp": 100, "max_hp": 100}],
+            },
+            "run": {"act": 3, "floor": 46},
         }
 
 
@@ -828,6 +869,7 @@ def test_collector_can_adopt_new_policy_only_between_complete_unrolls() -> None:
         assert all(item.max_act == 1 and item.max_floor == 1 for item in progress)
         assert all(item.maximum_observed_candidates == 2 for item in progress)
         assert episode.metrics.maximum_observed_candidates == 2
+        assert episode.metrics.stall_evidence is None
         assert episode.behavior_policy_version == 7
         assert episode.actor_policy_version == 9
     finally:
@@ -864,6 +906,124 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         assert len(episode.unrolls) == 1
         assert episode.unrolls[0].steps[-1].discount == 1.0
         assert episode.unrolls[0].bootstrap_snapshot is not None
+    finally:
+        resources.close()
+
+
+@pytest.mark.parametrize("marker_key", ["wave_index", "stage_id"])
+def test_combat_progress_tracker_preserves_phase_and_wave_resets(
+    marker_key: str,
+) -> None:
+    tracker = _CombatNetProgressTracker(window=3, minimum_hp_fraction=0.10)
+
+    def observation(marker: int) -> dict[str, object]:
+        return {
+            "combat": {
+                "in_progress": True,
+                marker_key: marker,
+                "enemies": [{"id": "enemy", "hp": 100, "max_hp": 100}],
+            }
+        }
+
+    assert tracker.observe(step=0, observation=observation(1)).age_steps == 0
+    assert tracker.observe(step=1, observation=observation(1)).age_steps == 1
+    reset = tracker.observe(step=2, observation=observation(2))
+    assert reset.progress_kind == "phase_or_wave_advanced"
+    assert reset.age_steps == 0
+    after_reset = tracker.observe(step=3, observation=observation(2))
+    assert after_reset.age_steps == 1
+    assert not after_reset.stalled
+
+
+def test_combat_progress_tracker_preserves_meaningful_net_hp_reset() -> None:
+    tracker = _CombatNetProgressTracker(window=3, minimum_hp_fraction=0.10)
+
+    def observation(hp: int) -> dict[str, object]:
+        return {
+            "combat": {
+                "in_progress": True,
+                "enemies": [{"id": "enemy", "hp": hp, "max_hp": 100}],
+            }
+        }
+
+    assert tracker.observe(step=0, observation=observation(100)).age_steps == 0
+    assert tracker.observe(step=1, observation=observation(100)).age_steps == 1
+    reset = tracker.observe(step=2, observation=observation(89))
+    assert reset.progress_kind == "meaningful_net_hp_reduction"
+    assert reset.age_steps == 0
+    after_reset = tracker.observe(step=3, observation=observation(89))
+    assert after_reset.age_steps == 1
+    assert not after_reset.stalled
+
+
+def test_combat_stall_records_one_bounded_exhausted_hand_evidence(
+    tmp_path: Path,
+) -> None:
+    base = _config(total_steps=8)
+    config = replace(
+        base,
+        model=replace(base.model, max_world_tokens=64),
+        environment=replace(base.environment, max_episode_steps=8),
+        diagnostics=DiagnosticsConfig(
+            deadlock_window=128,
+            deadlock_repeat_threshold=8,
+            combat_net_progress_window=3,
+            combat_min_net_hp_fraction=0.10,
+            journal_policy_topk=5,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=ExhaustedOnlyEndTurnBackend(terminal_step=100),
+    )
+    journal_path = tmp_path / "combat-stall.jsonl"
+    try:
+        with TrajectoryJournal(
+            journal_path,
+            snapshot_interval=1_000,
+            anomaly_context_steps=0,
+        ) as journal:
+            episode = resources.collector.collect_episode(
+                record=True,
+                trajectory_journal=journal,
+            )
+
+        assert episode.metrics.terminal_reason == "combat_progress_stall"
+        evidence = episode.metrics.stall_evidence
+        assert evidence is not None
+        assert evidence["anchor_enemy_hp_total"] == 100.0
+        assert evidence["current_enemy_hp_total"] == 100.0
+        assert evidence["net_enemy_hp_progress"] == 0.0
+        assert evidence["required_net_enemy_hp_progress"] == 10.0
+        assert evidence["hand_cards"] == 10
+        assert evidence["draw_cards"] == 0
+        assert evidence["discard_cards"] == 0
+        assert evidence["exhaust_cards"] == 1
+        assert evidence["legal_action_kinds"] == {"end_turn": 1}
+        preview = evidence["hand_card_preview"]
+        assert isinstance(preview, tuple)
+        assert len(preview) == 8
+        assert all(card["is_playable"] is False for card in preview)
+        assert evidence["hand_card_preview_truncated"] is True
+        assert len(json.dumps(evidence, sort_keys=True)) < 4_096
+
+        records = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+        terminal_stalls = [
+            record
+            for record in records
+            if record.get("record_kind") == "summary"
+            and isinstance(record.get("deadlock"), dict)
+            and record["deadlock"].get("kind") == "combat_no_net_progress"
+        ]
+        assert len(terminal_stalls) == 1
+        assert terminal_stalls[0]["deadlock"]["draw_cards"] == 0
+        assert terminal_stalls[0]["deadlock"]["discard_cards"] == 0
+        assert terminal_stalls[0]["deadlock"]["legal_action_kinds"] == {
+            "end_turn": 1
+        }
     finally:
         resources.close()
 

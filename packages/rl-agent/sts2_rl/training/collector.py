@@ -47,6 +47,7 @@ from .trajectory import (
 )
 from .transaction import (
     TransactionEffect,
+    TransactionOutcome,
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
@@ -94,6 +95,7 @@ class EpisodeMetrics:
     revival_free_act1_clear: bool
     revival_free_run_win: bool
     player_hp_lost: float
+    stall_evidence: dict[str, object] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,20 +358,17 @@ def _transaction_option_universe(
     if isinstance(options, list | tuple) and options:
         identities.extend(_transaction_option_identity(option) for option in options)
     else:
-        # The simulator's canonical ``cards`` field is already the complete
-        # physical option universe; ``selected_cards`` is a membership subset
-        # of it.  Appending that subset would make the *surface* change after
-        # every select/deselect action.  Legacy bridge DTOs instead expose the
-        # universe as two disjoint ``selectable_cards``/``selected_cards``
-        # collections, so combine those only when ``cards`` is absent.
-        cards = selection.get("cards")
-        if isinstance(cards, list | tuple) and cards:
-            identities.extend(_transaction_option_identity(item) for item in cards)
-        else:
-            for field in ("selectable_cards", "selected_cards"):
-                items = selection.get(field)
-                if isinstance(items, list | tuple):
-                    identities.extend(_transaction_option_identity(item) for item in items)
+        # Simulator translation marks ``cards`` as the *currently selectable*
+        # membership, not as the complete physical universe. A toggle moves a
+        # card between that collection and ``selected_cards``, so the stable
+        # universe is their union. Some bridge DTOs also emit the explicit
+        # ``selectable_cards`` alias; when present it is authoritative and must
+        # replace, rather than duplicate, ``cards``.
+        selectable_field = "selectable_cards" if "selectable_cards" in selection else "cards"
+        for field in (selectable_field, "selected_cards"):
+            items = selection.get(field)
+            if isinstance(items, list | tuple):
+                identities.extend(_transaction_option_identity(item) for item in items)
     if not identities:
         # Last-resort projection for legacy DTOs: use only card-bearing
         # selection candidates and erase the select/deselect membership role.
@@ -1298,6 +1297,136 @@ def _legal_action_kind_counts(
     return dict(sorted(counts.items()))
 
 
+_COMBAT_STALL_HAND_PREVIEW_LIMIT = 8
+
+
+def _visible_zone_cards(
+    observation: Mapping[str, object],
+    key: str,
+) -> tuple[Mapping[str, object], ...] | None:
+    """Return visible cards for a diagnostic, without treating redaction as empty."""
+
+    player = observation.get("player")
+    combat = observation.get("combat")
+    value = player.get(key) if isinstance(player, Mapping) else None
+    if value is None and isinstance(combat, Mapping):
+        value = combat.get(key)
+    if isinstance(value, Mapping):
+        value = value.get("cards", value.get("items"))
+    if not isinstance(value, list | tuple):
+        return None
+    return tuple(card for card in value if isinstance(card, Mapping))
+
+
+def _diagnostic_zone_count(
+    observation: Mapping[str, object],
+    key: str,
+) -> int | None:
+    """Read a visible pile count while preserving unknown/redacted as None."""
+
+    player = observation.get("player")
+    combat = observation.get("combat")
+    owners = tuple(owner for owner in (player, combat) if isinstance(owner, Mapping))
+    for owner in owners:
+        value = owner.get(key)
+        if isinstance(value, Mapping):
+            explicit = value.get("count")
+            if isinstance(explicit, int | float) and not isinstance(explicit, bool):
+                return max(0, int(explicit))
+            value = value.get("cards", value.get("items"))
+        if isinstance(value, list | tuple):
+            return len(value)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return max(0, int(value))
+        count = owner.get(f"{key}_count")
+        if isinstance(count, int | float) and not isinstance(count, bool):
+            return max(0, int(count))
+    return None
+
+
+def _bounded_stable_id(value: object) -> str:
+    """Bound an externally supplied identifier while retaining stable identity."""
+
+    text = str(value).strip()
+    encoded = text.encode("utf-8")
+    if len(encoded) <= 128:
+        return text
+    prefix = encoded[:64].decode("utf-8", errors="ignore")
+    return f"{prefix}#sha256:{semantic_fingerprint({'stable_id': text})}"
+
+
+def _combat_stall_hand_preview(
+    observation: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    """Return at most a few stable hand identities and explicit playability facts."""
+
+    cards = _visible_zone_cards(observation, "hand")
+    if cards is None:
+        return ()
+    preview: list[dict[str, object]] = []
+    for card in cards:
+        identity = next(
+            (
+                card[key]
+                for key in (
+                    "id",
+                    "card_id",
+                    "model_id",
+                    "definition_id",
+                    "card_definition_id",
+                )
+                if card.get(key) not in (None, "")
+            ),
+            None,
+        )
+        if identity is None:
+            continue
+        item: dict[str, object] = {"id": _bounded_stable_id(identity)}
+        for key in ("is_playable", "playable", "can_play"):
+            playable = card.get(key)
+            if isinstance(playable, bool):
+                item["is_playable"] = playable
+                break
+        preview.append(item)
+    preview.sort(key=lambda item: (str(item["id"]), repr(item.get("is_playable"))))
+    return tuple(preview[:_COMBAT_STALL_HAND_PREVIEW_LIMIT])
+
+
+def _combat_stall_evidence(
+    *,
+    status: _CombatNetProgressStatus,
+    observation: Mapping[str, object],
+    legal_actions: tuple[dict[str, object], ...],
+    window: int,
+    detected_step: int,
+) -> dict[str, object]:
+    """Build one bounded, mechanics-agnostic diagnostic at stall termination."""
+
+    hand_preview = _combat_stall_hand_preview(observation)
+    hand_count = _diagnostic_zone_count(observation, "hand")
+    return {
+        "kind": "combat_no_net_progress",
+        "window": window,
+        "steps_without_net_progress": status.age_steps,
+        "anchor_enemy_hp_total": status.anchor_hp,
+        "current_enemy_hp_total": status.current_hp,
+        "current_enemy_max_hp_total": status.maximum_hp,
+        "net_enemy_hp_progress": status.net_hp_progress,
+        "required_net_enemy_hp_progress": status.required_hp_progress,
+        "progress_kind": status.progress_kind,
+        "detected_step": detected_step,
+        "hand_cards": hand_count,
+        "draw_cards": _diagnostic_zone_count(observation, "draw_pile"),
+        "discard_cards": _diagnostic_zone_count(observation, "discard_pile"),
+        "exhaust_cards": _diagnostic_zone_count(observation, "exhaust_pile"),
+        "legal_action_kinds": _legal_action_kind_counts(legal_actions),
+        "hand_card_preview": hand_preview,
+        "hand_card_preview_truncated": bool(
+            hand_count is not None and hand_count > len(hand_preview)
+        ),
+    }
+
+
 class GroundedCollector:
     """Collect policy trajectories with no MCTS, guard, or action rewrite."""
 
@@ -1805,6 +1934,7 @@ class GroundedCollector:
         deadlocked = False
         combat_progress_stalled = False
         noncombat_progress_stalled = False
+        stall_evidence: dict[str, object] | None = None
         combat_progress = _CombatNetProgressTracker(
             window=self.combat_net_progress_window,
             minimum_hp_fraction=self.combat_min_net_hp_fraction,
@@ -1924,6 +2054,11 @@ class GroundedCollector:
                 raise CollectionProtocolError("transport/outcome-unknown truncation discarded before rollout")
             result_terminal = next_state.terminated or next_state.truncated
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
+            deadlock_evidence = self.deadlock_detector.confirm_after_step(
+                deadlock_evidence,
+                observation=next_state.observation,
+                legal_actions=next_state.legal_actions,
+            )
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
             # The validated transition may itself expose a much wider next
@@ -1950,6 +2085,16 @@ class GroundedCollector:
                 combat_progress_status.maximum_age_steps,
             )
             combat_progress_stalled = bool(combat_progress_status.stalled and not result_terminal)
+            if combat_progress_stalled:
+                # Construct this bounded snapshot only for the terminating
+                # transition. Ordinary decisions retain no additional state.
+                stall_evidence = _combat_stall_evidence(
+                    status=combat_progress_status,
+                    observation=next_state.observation,
+                    legal_actions=next_state.legal_actions,
+                    window=self.combat_net_progress_window,
+                    detected_step=next_state.step_index,
+                )
             combat_in_progress = bool(next_combat_in_progress and not result_terminal)
             noncombat_progress_status = noncombat_progress.observe(
                 step=steps_taken,
@@ -1971,9 +2116,9 @@ class GroundedCollector:
             # discount and a bootstrap snapshot instead of fabricating a loss.
             curriculum_horizon = bool(forced_horizon and episode_limit >= self.max_episode_steps)
             reward_started_ns = time.perf_counter_ns()
-            # EnvironmentResult is the terminal authority.  Neither a
-            # pre-action semantic recurrence nor a progress tracker may turn a
-            # real terminal transition into a synthetic deadlock outcome.
+            # EnvironmentResult is the terminal authority. The pre-action
+            # recurrence has now also been confirmed against its factual
+            # successor, so a novel semantic exit is not a synthetic deadlock.
             effective_deadlock_evidence = None if result_terminal else deadlock_evidence
             breakdown = self.reward_calculator.evaluate(
                 state,
@@ -2070,6 +2215,14 @@ class GroundedCollector:
                                 ),
                                 steps=tuple(active_transaction_steps),
                                 burn_in_steps=active_transaction_burn_in,
+                                outcome=(
+                                    TransactionOutcome.COMPLETED
+                                    if next_transaction_surface
+                                    != current_transaction_surface
+                                    else TransactionOutcome.DEADLOCK
+                                    if breakdown.outcome == "deadlock"
+                                    else TransactionOutcome.CENSORED
+                                ),
                             )
                         )
                         active_transaction_surface = None
@@ -2079,19 +2232,9 @@ class GroundedCollector:
             if trajectory_journal is not None:
                 journal_deadlock: Mapping[str, object] | None = None
                 if combat_progress_stalled:
-                    journal_deadlock = {
-                        "kind": "combat_no_net_progress",
-                        "window": self.combat_net_progress_window,
-                        "steps_without_net_progress": (combat_no_net_progress_steps),
-                        "anchor_enemy_hp_total": combat_progress_status.anchor_hp,
-                        "current_enemy_hp_total": combat_progress_status.current_hp,
-                        "net_enemy_hp_progress": (combat_progress_status.net_hp_progress),
-                        "required_net_enemy_hp_progress": (combat_progress_status.required_hp_progress),
-                        "progress_kind": combat_progress_status.progress_kind,
-                        # Net progress is evaluated on the transition result,
-                        # not the pre-action decision state recorded below.
-                        "detected_step": next_state.step_index,
-                    }
+                    if stall_evidence is None:  # pragma: no cover - construction invariant
+                        raise RuntimeError("combat stall lost its terminal evidence")
+                    journal_deadlock = stall_evidence
                 elif noncombat_progress_stalled:
                     journal_deadlock = {
                         "kind": "noncombat_no_durable_progress",
@@ -2329,6 +2472,7 @@ class GroundedCollector:
                 revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
+                stall_evidence=stall_evidence,
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,

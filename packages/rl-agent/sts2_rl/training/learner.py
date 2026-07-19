@@ -17,7 +17,13 @@ from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.models import RecurrentCandidateModel
 
 from .config import OptimizationConfig, TransactionLearningConfig
-from .transaction import TransactionTrace, observed_outcome_pairs, selection_delta_index
+from .transaction import (
+    TransactionPolicyTarget,
+    TransactionTrace,
+    factual_transaction_policy_targets,
+    observed_outcome_pairs,
+    selection_delta_index,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,10 +59,14 @@ class LearnerMetrics:
     transaction_delta_loss: float
     transaction_q_loss: float
     transaction_pairwise_ranking_loss: float
+    transaction_completion_policy_loss: float
     transaction_traces: int
     transaction_effect_labels: int
     transaction_q_labels: int
     transaction_pairs: int
+    transaction_policy_labels: int
+    transaction_policy_preferred_labels: int
+    transaction_policy_avoided_labels: int
     timings: LearnerTimings
 
     def to_mapping(self) -> dict[str, float | int | dict[str, float]]:
@@ -81,7 +91,7 @@ def _require_finite(stage: str, values: tuple[tuple[str, Tensor], ...]) -> None:
 
 
 class VTraceLearner:
-    """Consume FIFO unrolls once; no replay sampling or priority updates."""
+    """Consume main-policy unrolls FIFO with an optional factual transaction sidecar."""
 
     def __init__(
         self,
@@ -397,9 +407,13 @@ class VTraceLearner:
             transaction_delta_loss,
             transaction_q_loss,
             transaction_pairwise_loss,
+            transaction_completion_policy_loss,
             transaction_effect_labels,
             transaction_q_labels,
             transaction_pair_count,
+            transaction_policy_labels,
+            transaction_policy_preferred_labels,
+            transaction_policy_avoided_labels,
         ) = self._transaction_losses(transaction_traces)
         total_loss = (
             total_loss
@@ -408,6 +422,8 @@ class VTraceLearner:
             + self.transaction_config.transaction_q_weight * transaction_q_loss
             + self.transaction_config.pairwise_ranking_weight
             * transaction_pairwise_loss
+            + self.transaction_config.completion_policy_weight
+            * transaction_completion_policy_loss
         )
         _require_finite(
             "targets/loss",
@@ -419,6 +435,10 @@ class VTraceLearner:
                 ("transaction_delta_loss", transaction_delta_loss),
                 ("transaction_q_loss", transaction_q_loss),
                 ("transaction_pairwise_loss", transaction_pairwise_loss),
+                (
+                    "transaction_completion_policy_loss",
+                    transaction_completion_policy_loss,
+                ),
             ),
         )
         target_and_loss_ms = _elapsed_ms(target_started_ns)
@@ -493,22 +513,40 @@ class VTraceLearner:
             transaction_pairwise_ranking_loss=float(
                 transaction_pairwise_loss.detach().item()
             ),
+            transaction_completion_policy_loss=float(
+                transaction_completion_policy_loss.detach().item()
+            ),
             transaction_traces=len(transaction_traces),
             transaction_effect_labels=transaction_effect_labels,
             transaction_q_labels=transaction_q_labels,
             transaction_pairs=transaction_pair_count,
+            transaction_policy_labels=transaction_policy_labels,
+            transaction_policy_preferred_labels=transaction_policy_preferred_labels,
+            transaction_policy_avoided_labels=transaction_policy_avoided_labels,
             timings=timings,
         )
 
     def _transaction_losses(
         self,
         traces: tuple[TransactionTrace, ...],
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, int, int, int]:
-        """Compute auxiliary losses only from actions with factual outcomes."""
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+    ]:
+        """Compute factual transaction heads and direct policy liveness loss."""
 
         zero = next(self.model.parameters()).sum() * 0.0
         if not traces:
-            return zero, zero, zero, zero, 0, 0, 0
+            return zero, zero, zero, zero, zero, 0, 0, 0, 0, 0, 0
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         effect_logits: list[Tensor] = []
         effect_targets: list[int] = []
@@ -517,6 +555,9 @@ class VTraceLearner:
         q_values: list[Tensor] = []
         q_targets: list[float] = []
         selected_policy_log_probabilities: dict[tuple[int, int], Tensor] = {}
+        completion_policy_trace_losses: list[Tensor] = []
+        completion_policy_preferred_labels = 0
+        completion_policy_avoided_labels = 0
 
         for trace_index, trace in enumerate(traces):
             configured_burn_in = self.transaction_config.burn_in_steps
@@ -534,6 +575,11 @@ class VTraceLearner:
                 device=self.device,
                 dtype=next(self.model.parameters()).dtype,
             )[None, :]
+            policy_targets = {
+                item.step_index: item.target
+                for item in factual_transaction_policy_targets(trace)
+            }
+            trace_policy_losses: list[Tensor] = []
             for step_index, step in enumerate(trace.steps):
                 step.snapshot.validate(
                     expected_config=self.encoder.config,
@@ -562,20 +608,56 @@ class VTraceLearner:
                 effect_targets.append(int(step.effect))
                 delta_logits.append(output.selection_delta_logits[0, action_index])
                 delta_targets.append(selection_delta_index(step.selected_count_delta))
-                # Ranking compares candidate preference, not an unconstrained
-                # state-level logit offset.  Normalize on each factual legal
-                # candidate set before selecting the executed action so adding
-                # a constant to all logits cannot reduce the ranking loss.
-                selected_policy_log_probabilities[(trace_index, step_index)] = (
-                    F.log_softmax(output.policy_logits.float(), dim=-1)[
-                        0, action_index
-                    ]
+                # Both pairwise outcome ranking and factual liveness supervise
+                # normalized legal-candidate preference, never a free logit
+                # offset or a fabricated unexecuted action target.
+                policy_log_probabilities = F.log_softmax(
+                    output.policy_logits.float(),
+                    dim=-1,
                 )
+                selected_policy_log_probability = policy_log_probabilities[
+                    0, action_index
+                ]
+                selected_policy_log_probabilities[(trace_index, step_index)] = (
+                    selected_policy_log_probability
+                )
+                policy_target = policy_targets.get(step_index)
+                if policy_target is TransactionPolicyTarget.PREFER:
+                    trace_policy_losses.append(-selected_policy_log_probability)
+                    completion_policy_preferred_labels += 1
+                elif policy_target is TransactionPolicyTarget.AVOID:
+                    other_action_indices = [
+                        index
+                        for index, enabled in enumerate(step.snapshot.action_mask)
+                        if bool(enabled) and index != action_index
+                    ]
+                    if not other_action_indices:  # pragma: no cover - target invariant
+                        raise RuntimeError(
+                            "transaction avoid target has no legal alternative"
+                        )
+                    other_indices = torch.tensor(
+                        other_action_indices,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    trace_policy_losses.append(
+                        -torch.logsumexp(
+                            policy_log_probabilities[0, other_indices],
+                            dim=0,
+                        )
+                    )
+                    completion_policy_avoided_labels += 1
                 if step.q_observed:
                     if step.transaction_return is None:  # pragma: no cover - property invariant
                         raise RuntimeError("q_observed transaction has no return")
                     q_values.append(output.transaction_q_values[0, action_index])
                     q_targets.append(step.transaction_return)
+            if trace_policy_losses:
+                # Equal trace weight prevents a long repeated cycle from
+                # overwhelming many short, factual completion paths.
+                completion_policy_trace_losses.append(
+                    torch.stack(trace_policy_losses).mean()
+                )
 
         effect_loss = F.cross_entropy(
             torch.stack(effect_logits),
@@ -623,14 +705,26 @@ class VTraceLearner:
             ).mean()
         else:
             pairwise_loss = zero
+        completion_policy_loss = (
+            torch.stack(completion_policy_trace_losses).mean()
+            if completion_policy_trace_losses
+            else zero
+        )
+        completion_policy_labels = (
+            completion_policy_preferred_labels + completion_policy_avoided_labels
+        )
         return (
             effect_loss,
             delta_loss,
             q_loss,
             pairwise_loss,
+            completion_policy_loss,
             len(effect_targets),
             len(q_targets),
             len(pairs),
+            completion_policy_labels,
+            completion_policy_preferred_labels,
+            completion_policy_avoided_labels,
         )
 
 

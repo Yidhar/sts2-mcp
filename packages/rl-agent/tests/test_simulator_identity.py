@@ -218,6 +218,191 @@ def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable()
     assert "\t\t\t\t\t\tTargetId = targetId," in headless_builder_added
 
 
+def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed() -> None:
+    root = repository_root()
+    lock = json.loads((root / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8"))
+    matching = [
+        record
+        for record in lock["patches"]
+        if record["path"].endswith("0005-authoritative-victory-and-reward-claims.patch")
+    ]
+    assert len(matching) == 1
+
+    patch_path = root / matching[0]["path"]
+    assert matching[0]["sha256"] == sha256_file(patch_path)
+    patch = patch_path.read_text(encoding="utf-8")
+    sections: dict[str, str] = {}
+    for section in patch.split("diff --git ")[1:]:
+        before, after = section.splitlines()[0].split()
+        assert before.startswith("a/") and after.startswith("b/")
+        assert before[2:] == after[2:]
+        sections[after[2:]] = section
+
+    headless_eligibility = (
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs"
+    )
+    settlement = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs"
+    headless_outcome = (
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationOutcomeContract.cs"
+    )
+    headless_builder = (
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs"
+    )
+    headless_runtime = (
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs"
+    )
+    overlay_eligibility = (
+        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs"
+    )
+    overlay_outcome = (
+        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationOutcomeContract.cs"
+    )
+    overlay_builder = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs"
+    overlay_runtime = (
+        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs"
+    )
+    combat_manager = "STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs"
+    run_manager = "src/Core/Runs/RunManager.cs"
+    assert set(sections) == {
+        headless_eligibility,
+        settlement,
+        headless_outcome,
+        headless_builder,
+        headless_runtime,
+        overlay_eligibility,
+        overlay_outcome,
+        overlay_builder,
+        overlay_runtime,
+        combat_manager,
+        run_manager,
+    }
+
+    def changed_lines(section: str, prefix: str) -> list[str]:
+        header_prefix = prefix * 3
+        return [
+            line[1:]
+            for line in section.splitlines()
+            if line.startswith(prefix) and not line.startswith(header_prefix)
+        ]
+
+    def added_source(section: str) -> str:
+        return "\n".join(changed_lines(section, "+"))
+
+    headless_eligibility_added = added_source(sections[headless_eligibility])
+    overlay_eligibility_added = added_source(sections[overlay_eligibility])
+    assert headless_eligibility_added == overlay_eligibility_added
+    assert "internal static bool IsRewardClaimSupported(bool claimable)" in headless_eligibility_added
+    assert "return claimable;" in headless_eligibility_added
+    assert "unclaimable rewards must never be emitted as supported legal actions" in (
+        headless_eligibility_added
+    )
+    assert "claimable rewards must preserve their executable claim action" in (
+        headless_eligibility_added
+    )
+    assert "internal static bool IsRewardClaimRequestSupported(" in headless_eligibility_added
+    assert 'string.Equals(action.Action, "claim_reward", StringComparison.Ordinal)' in (
+        headless_eligibility_added
+    )
+    assert "action.Claimable == true" in headless_eligibility_added
+    assert "&& action.IsSupported" in headless_eligibility_added
+    assert "executor must accept the exact current claimable reward action" in (
+        headless_eligibility_added
+    )
+    assert "executor must reject a raw or stale reward index" in headless_eligibility_added
+    assert "executor must reject claimable=false" in headless_eligibility_added
+    assert "executor must reject an unsupported claim" in headless_eligibility_added
+
+    headless_outcome_added = added_source(sections[headless_outcome])
+    overlay_outcome_added = added_source(sections[overlay_outcome])
+    assert headless_outcome_added == overlay_outcome_added
+    assert "internal static long NormalizeVictoryTime(long runTime)" in headless_outcome_added
+    assert "return Math.Max(1L, runTime);" in headless_outcome_added
+    assert "NormalizeVictoryTime(0L) == 1L" in headless_outcome_added
+    assert "internal static bool IsFinalBossVictory(" in headless_outcome_added
+    assert "primary final boss must latch victory independently of presentation" in (
+        headless_outcome_added
+    )
+    assert "second final boss must latch victory independently of presentation" in (
+        headless_outcome_added
+    )
+    assert "internal static string? ResolveTerminalOutcome(" in headless_outcome_added
+    assert "return winTime > 0 ? Victory : Defeat;" in headless_outcome_added
+
+    settlement_added = changed_lines(sections[settlement], "+")
+    assert settlement_added == ["\t\tFullRunSimulationOutcomeContract.RunSelfTests();"]
+
+    headless_builder_added = changed_lines(sections[headless_builder], "+")
+    overlay_builder_added = changed_lines(sections[overlay_builder], "+")
+    headless_builder_removed = changed_lines(sections[headless_builder], "-")
+    overlay_builder_removed = changed_lines(sections[overlay_builder], "-")
+    assert headless_builder_added == overlay_builder_added
+    assert headless_builder_removed == overlay_builder_removed
+    builder_added_source = "\n".join(headless_builder_added)
+    builder_context = changed_lines(sections[headless_builder], " ")
+    assert "FullRunSimulationOutcomeContract.ResolveTerminalOutcome(" in builder_added_source
+    assert "\t\t\tRunManager.Instance.WinTime);" in headless_builder_added
+    assert (
+        "\t\t\t\tIsSupported = "
+        "FullRunLegalActionEligibility.IsRewardClaimSupported(claimable)"
+    ) in headless_builder_added
+    assert "Hook vetoes such as Sozu consume the reward selection" in builder_added_source
+    assert "\t\t\t\tClaimable = claimable," in builder_context
+    assert "\t\t\t\tClaimBlockReason = blockReason," in builder_context
+    assert not any("Action = \"proceed\"" in line for line in headless_builder_added)
+    assert any(
+        "? (RunManager.Instance.WinTime > 0 ? \"victory\" : \"defeat\")" in line
+        for line in headless_builder_removed
+    )
+
+    runtime_added = added_source(sections[headless_runtime])
+    overlay_runtime_added = added_source(sections[overlay_runtime])
+    runtime_removed = "\n".join(changed_lines(sections[headless_runtime], "-"))
+    overlay_runtime_removed = "\n".join(changed_lines(sections[overlay_runtime], "-"))
+    runtime_section = sections[headless_runtime]
+    overlay_runtime_section = sections[overlay_runtime]
+    assert runtime_added == overlay_runtime_added
+    assert runtime_removed == overlay_runtime_removed
+    assert "FullRunPendingRewardSelectionSnapshot? rewardSelection =" in runtime_added
+    assert "state.CachedBridgeSnapshots?.RewardSelection;" in runtime_added
+    assert "rewardIndex >= rewardSelection.Rewards.Count" in runtime_added
+    assert "FullRunLegalActionEligibility.IsRewardClaimRequestSupported(" in runtime_added
+    assert "\t\t\t\t\tstate.LegalActions," in changed_lines(
+        sections[headless_runtime], "+"
+    )
+    assert '"full_run_reward_not_claimable"' in runtime_added
+    assert "TrySelectReward(action.Index.Value" in runtime_removed
+    assert runtime_section.index("IsRewardClaimRequestSupported(") < runtime_section.index(
+        "TrySelectReward(rewardIndex"
+    )
+    assert runtime_section.index('"full_run_reward_not_claimable"') < runtime_section.index(
+        "TrySelectReward(rewardIndex"
+    )
+    assert overlay_runtime_section.index("IsRewardClaimRequestSupported(") < (
+        overlay_runtime_section.index("TrySelectReward(rewardIndex")
+    )
+    assert overlay_runtime_section.index('"full_run_reward_not_claimable"') < (
+        overlay_runtime_section.index("TrySelectReward(rewardIndex")
+    )
+
+    # Reward observation projection remains independent and visible. This patch
+    # only closes the executable claim surface; it must not delete or rewrite
+    # FullRunApiStateBuilder's rewards.items projection.
+    assert not any(path.endswith("FullRunApiStateBuilder.cs") for path in sections)
+
+    combat_added = added_source(sections[combat_manager])
+    combat_removed = "\n".join(changed_lines(sections[combat_manager], "-"))
+    assert "FullRunSimulationOutcomeContract.IsFinalBossVictory(" in combat_added
+    assert "FullRunSimulationOutcomeContract.NormalizeVictoryTime(" in combat_added
+    assert "SkipCombatPresentation" not in combat_added
+    assert "!SkipCombatPresentation" in combat_removed
+
+    run_added = added_source(sections[run_manager])
+    assert "WinRun is the authoritative Architect closeout" in run_added
+    assert "WinTime = Math.Max(1L, RunTime);" in run_added
+    run_section = sections[run_manager]
+    assert run_section.index("WinTime = Math.Max(1L, RunTime);") < run_section.index(
+        "((TheArchitect)eventRoom.LocalMutableEvent).TriggerVictory();"
+    )
 def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     executable, identity_path, lock_path, _ = _simulator(tmp_path)
 

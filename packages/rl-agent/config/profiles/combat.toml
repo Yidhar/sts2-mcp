@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v3"
+version = "sts2-relational-curriculum-config-v4"
 profile = "combat"
 
 [model]
@@ -54,6 +54,7 @@ sample_traces = 8
 burn_in_steps = 24
 effect_weight = 0.10
 transaction_q_weight = 0.25
+completion_policy_weight = 0.25
 pairwise_ranking_weight = 0.0
 pairwise_margin = 0.10
 minimum_return_gap = 0.0

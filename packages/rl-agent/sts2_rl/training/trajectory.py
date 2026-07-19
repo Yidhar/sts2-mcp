@@ -532,6 +532,7 @@ class _DecisionAction:
     step_index: int
     decision_fingerprint: str
     action_fingerprint: str
+    next_decision_fingerprint: str | None = None
 
 
 class SemanticDeadlockDetector:
@@ -596,6 +597,51 @@ class SemanticDeadlockDetector:
             last_step=last,
             cycle_span=cycle_span,
         )
+
+    def confirm_after_step(
+        self,
+        evidence: DeadlockEvidence | None,
+        *,
+        observation: Mapping[str, Any],
+        legal_actions: Sequence[Mapping[str, Any]],
+    ) -> DeadlockEvidence | None:
+        """Confirm a pre-action recurrence against its factual successor.
+
+        Every accepted step records the semantic decision reached by the most
+        recent ``observe`` call. A threshold recurrence is a deadlock only when
+        the same exact decision/action pair has factually reached that successor
+        before. A novel successor therefore gets one chance to make progress,
+        while fixed points and known A↔B cycles still terminate.
+        """
+
+        if not self._history:
+            raise RuntimeError("deadlock post-step confirmation requires a preceding observation")
+        latest = self._history[-1]
+        if latest.next_decision_fingerprint is not None:
+            raise RuntimeError("deadlock observation already has a factual successor")
+        next_decision_fingerprint = semantic_decision_fingerprint(observation, legal_actions)
+        prior_history = tuple(self._history)[:-1]
+        self._history[-1] = _DecisionAction(
+            step_index=latest.step_index,
+            decision_fingerprint=latest.decision_fingerprint,
+            action_fingerprint=latest.action_fingerprint,
+            next_decision_fingerprint=next_decision_fingerprint,
+        )
+        if evidence is None:
+            return None
+        if (
+            evidence.decision_fingerprint != latest.decision_fingerprint
+            or evidence.action_fingerprint != latest.action_fingerprint
+        ):
+            raise RuntimeError("deadlock evidence does not describe the latest observation")
+        prior_successors = {
+            item.next_decision_fingerprint
+            for item in prior_history
+            if item.decision_fingerprint == latest.decision_fingerprint
+            and item.action_fingerprint == latest.action_fingerprint
+            and item.next_decision_fingerprint is not None
+        }
+        return evidence if next_decision_fingerprint in prior_successors else None
 
 
 class TrajectoryJournal:

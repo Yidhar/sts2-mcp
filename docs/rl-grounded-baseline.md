@@ -278,10 +278,18 @@ bounded window produce explicit `DeadlockEvidence` and terminate the task as a
 failure. Combat and non-combat progress trackers independently catch changing-
 state loops that cannot recur under an exact semantic fingerprint.
 
-These are generic loop detectors, not card/UI/boss heuristics. Trajectory journal
-v3 writes a compact record for every held-out decision, including position,
-resource/entity counts, selected action, candidate-kind counts, policy top-k,
-value, reward and stall evidence. Complete semantic observation/candidate
+These are generic loop detectors, not card/UI/boss heuristics. A combat-progress
+termination populates `EpisodeMetrics.stall_evidence` exactly once; every
+non-stall episode leaves it null. The bounded mapping records the tracker anchor,
+current and required net-HP progress, hand/draw/discard/exhaust counts, legal
+action-kind counts, and at most eight stable hand-card IDs with explicit
+playability when the bridge provides it. The same mapping is attached to the
+existing terminal anomaly record; no additional per-decision payload or rolling
+card history is retained.
+
+Trajectory journal v3 writes a compact record for every held-out decision,
+including position, resource/entity counts, selected action, candidate-kind
+counts, policy top-k, value and reward. Complete semantic observation/candidate
 snapshots are bounded to the first and last decision, every 256 decisions,
 anomalies, and the preceding eight-decision context. Journals are diagnostic
 artifacts and never enter the rollout queue.

@@ -1,0 +1,582 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs
+index ebc037ad18a19fcba4858a53140404295a089822..bc138b8b7340acbb1ac9c7a512188fecd0f1574c 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs
+@@ -17,6 +17,38 @@ internal static class FullRunLegalActionEligibility
+ 			&& (!isPotionEntry || (hasOpenPotionSlots && canProcurePotion));
+ 	}
+ 
++	/// <summary>
++	/// A reward may remain visible in the observation while being absent from
++	/// the executable action surface. Keep this gate fail-closed.
++	/// </summary>
++	internal static bool IsRewardClaimSupported(bool claimable)
++	{
++		return claimable;
++	}
++
++	/// <summary>
++	/// Executor-side parity gate. A raw or stale request must match the exact
++	/// supported claim action on the current legal surface before it may mutate
++	/// the pending reward selection.
++	/// </summary>
++	internal static bool IsRewardClaimRequestSupported(
++		IReadOnlyList<FullRunSimulationLegalAction> legalActions,
++		int rewardIndex)
++	{
++		ArgumentNullException.ThrowIfNull(legalActions);
++		foreach (FullRunSimulationLegalAction action in legalActions)
++		{
++			if (string.Equals(action.Action, "claim_reward", StringComparison.Ordinal)
++				&& action.Index == rewardIndex
++				&& action.Claimable == true
++				&& action.IsSupported)
++			{
++				return true;
++			}
++		}
++		return false;
++	}
++
+ 	internal static IEnumerable<uint?> EnumerateCardPlayTargets(
+ 		bool requiresTarget,
+ 		IReadOnlyList<uint> validTargetIds)
+@@ -60,6 +92,56 @@ internal static class FullRunLegalActionEligibility
+ 				canProcurePotion: true),
+ 			"an ordinary open-slot player must preserve an otherwise affordable potion purchase");
+ 
++		Assert(
++			!IsRewardClaimSupported(claimable: false),
++			"unclaimable rewards must never be emitted as supported legal actions");
++		Assert(
++			IsRewardClaimSupported(claimable: true),
++			"claimable rewards must preserve their executable claim action");
++
++		List<FullRunSimulationLegalAction> rewardClaimSurface = new List<FullRunSimulationLegalAction>
++		{
++			new FullRunSimulationLegalAction
++			{
++				Action = "claim_reward",
++				Index = 2,
++				Claimable = true,
++				IsSupported = true
++			},
++			new FullRunSimulationLegalAction
++			{
++				Action = "proceed",
++				Index = 2,
++				IsSupported = true
++			}
++		};
++		Assert(
++			IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 2),
++			"executor must accept the exact current claimable reward action");
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 1),
++			"executor must reject a raw or stale reward index absent from the legal surface");
++		rewardClaimSurface.Add(new FullRunSimulationLegalAction
++		{
++			Action = "claim_reward",
++			Index = 3,
++			Claimable = false,
++			IsSupported = true
++		});
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 3),
++			"executor must reject claimable=false even if malformed metadata marks it supported");
++		rewardClaimSurface.Add(new FullRunSimulationLegalAction
++		{
++			Action = "claim_reward",
++			Index = 4,
++			Claimable = true,
++			IsSupported = false
++		});
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 4),
++			"executor must reject an unsupported claim even if claimable metadata is true");
++
+ 		List<uint?> noTargets = new List<uint?>(
+ 			EnumerateCardPlayTargets(requiresTarget: true, Array.Empty<uint>()));
+ 		Assert(noTargets.Count == 0, "target-required cards with zero valid targets must emit no action");
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+index 7569f0e47215d961e5845d0c7f50086aa2ee098f..d8384373062bcb852ad19892551d44765c74254a 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+@@ -62,6 +62,7 @@ public static class FullRunSettlementContract
+ 	public static void RunSelfTests()
+ 	{
+ 		FullRunLegalActionEligibility.RunSelfTests();
++		FullRunSimulationOutcomeContract.RunSelfTests();
+ 
+ 		FullRunSimulationLegalAction action = new FullRunSimulationLegalAction
+ 		{
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationOutcomeContract.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationOutcomeContract.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..957b073f8c0b0495812fb8227f6ed9a24d0fe0c1
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationOutcomeContract.cs
+@@ -0,0 +1,90 @@
++using System;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Authoritative full-run terminal outcome rules. Presentation may report or
++/// render a victory, but it must never decide whether the simulator won.
++/// </summary>
++internal static class FullRunSimulationOutcomeContract
++{
++	internal const string Victory = "victory";
++	internal const string Defeat = "defeat";
++
++	internal static long NormalizeVictoryTime(long runTime)
++	{
++		// Pure simulation can finish within the same Unix-second tick in which it
++		// started. WinTime doubles as the upstream persisted victory latch, so zero
++		// must be promoted to a positive sentinel.
++		return Math.Max(1L, runTime);
++	}
++
++	internal static bool IsFinalBossVictory(
++		bool isBossRoom,
++		bool isFinalAct,
++		bool isSecondBossMapPoint,
++		bool isPrimaryBossMapPoint)
++	{
++		return isBossRoom
++			&& isFinalAct
++			&& (isSecondBossMapPoint || isPrimaryBossMapPoint);
++	}
++
++	internal static string? ResolveTerminalOutcome(bool isTerminal, long winTime)
++	{
++		if (!isTerminal)
++		{
++			return null;
++		}
++		return winTime > 0 ? Victory : Defeat;
++	}
++
++	internal static void RunSelfTests()
++	{
++		Assert(NormalizeVictoryTime(0L) == 1L, "zero-duration pure-sim victory must latch positively");
++		Assert(NormalizeVictoryTime(-5L) == 1L, "invalid negative run time must not erase victory");
++		Assert(NormalizeVictoryTime(17L) == 17L, "positive victory time must remain stable");
++		Assert(ResolveTerminalOutcome(isTerminal: false, winTime: 1L) == null,
++			"non-terminal snapshots must not publish an outcome");
++		Assert(ResolveTerminalOutcome(isTerminal: true, winTime: 0L) == Defeat,
++			"terminal snapshots without a victory latch must remain defeat");
++		Assert(ResolveTerminalOutcome(isTerminal: true, winTime: 1L) == Victory,
++			"terminal snapshots with a positive victory latch must be victory");
++		Assert(
++			IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: true,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"primary final boss must latch victory independently of presentation");
++		Assert(
++			IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: true,
++				isSecondBossMapPoint: true,
++				isPrimaryBossMapPoint: false),
++			"second final boss must latch victory independently of presentation");
++		Assert(
++			!IsFinalBossVictory(
++				isBossRoom: false,
++				isFinalAct: true,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"non-boss rooms must never latch final victory");
++		Assert(
++			!IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: false,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"earlier-act bosses must never latch final victory");
++	}
++
++	private static void Assert(bool condition, string detail)
++	{
++		if (!condition)
++		{
++			throw new InvalidOperationException($"Full-run outcome contract self-test failed: {detail}.");
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+index 33536d9b79dd5ac04e4320ce1497803a1ac4314a..43072ce6a9787d9610f2b7ddc87cfdbbb77bd5cb 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
+@@ -79,9 +79,9 @@ internal static class FullRunSimulationStateBuilder
+ 		// room/state type by itself is not evidence that the transition surface is
+ 		// ready for an agent decision.
+ 		snapshot.IsActionable = false;
+-		snapshot.RunOutcome = snapshot.IsTerminal
+-			? (RunManager.Instance.WinTime > 0 ? "victory" : "defeat")
+-			: null;
++		snapshot.RunOutcome = FullRunSimulationOutcomeContract.ResolveTerminalOutcome(
++			snapshot.IsTerminal,
++			RunManager.Instance.WinTime);
+ 		FullRunChoiceBridgeSnapshotCache bridgeSnapshots = BuildRelevantBridgeSnapshots(bridge, snapshot.StateType);
+ 		snapshot.CachedBridgeSnapshots = bridgeSnapshots;
+ 		snapshot.CachedCombatState = cachedCombatState;
+@@ -353,7 +353,7 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 				RewardSource = rewardSource,
+ 				Claimable = claimable,
+ 				ClaimBlockReason = blockReason,
+-				IsSupported = true
++				IsSupported = FullRunLegalActionEligibility.IsRewardClaimSupported(claimable)
+ 			});
+ 		}
+ 		if (rewards.CanProceed)
+@@ -402,6 +402,9 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 	private static bool IsRewardClaimableForAction(Reward reward, Player? player, out string? claimBlockReason)
+ 	{
+ 		claimBlockReason = null;
++		// Match PotionReward.OnSelect exactly: TooFull returns false and leaves the
++		// reward pending. Hook vetoes such as Sozu consume the reward selection,
++		// so they remain executable and must not be conflated with claimable=false.
+ 		if (reward is PotionReward && player != null && !player.HasOpenPotionSlots)
+ 		{
+ 			claimBlockReason = "potion_slots_full";
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index 3ec25a25c3b46434193d38632784ec60c79553f3..d51be31286c7389fc0f744e12f430f11c4218731 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -829,7 +829,27 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				{
+ 					return BuildRejected("claim_reward requires an index.", "full_run_action_required");
+ 				}
+-				if (!FullRunSimulationChoiceBridge.Instance.TrySelectReward(action.Index.Value, out string rewardError))
++				int rewardIndex = action.Index.Value;
++				FullRunPendingRewardSelectionSnapshot? rewardSelection =
++					state.CachedBridgeSnapshots?.RewardSelection;
++				if (rewardSelection == null || rewardIndex < 0 || rewardIndex >= rewardSelection.Rewards.Count)
++				{
++					return BuildRejected(
++						$"Reward index {rewardIndex} is not present in the current reward selection.",
++						"full_run_reward_not_found");
++				}
++				// Do not trust callers to originate from LegalActions. Raw or stale
++				// requests must pass the same fail-closed claimability surface before
++				// the bridge clears and commits the pending selection.
++				if (!FullRunLegalActionEligibility.IsRewardClaimRequestSupported(
++					state.LegalActions,
++					rewardIndex))
++				{
++					return BuildRejected(
++						$"Reward index {rewardIndex} is not currently claimable.",
++						"full_run_reward_not_claimable");
++				}
++				if (!FullRunSimulationChoiceBridge.Instance.TrySelectReward(rewardIndex, out string rewardError))
+ 				{
+ 					return BuildRejected(rewardError, "full_run_reward_not_found");
+ 				}
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs
+index ebc037ad18a19fcba4858a53140404295a089822..bc138b8b7340acbb1ac9c7a512188fecd0f1574c 100644
+--- a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs
+@@ -17,6 +17,38 @@ internal static class FullRunLegalActionEligibility
+ 			&& (!isPotionEntry || (hasOpenPotionSlots && canProcurePotion));
+ 	}
+ 
++	/// <summary>
++	/// A reward may remain visible in the observation while being absent from
++	/// the executable action surface. Keep this gate fail-closed.
++	/// </summary>
++	internal static bool IsRewardClaimSupported(bool claimable)
++	{
++		return claimable;
++	}
++
++	/// <summary>
++	/// Executor-side parity gate. A raw or stale request must match the exact
++	/// supported claim action on the current legal surface before it may mutate
++	/// the pending reward selection.
++	/// </summary>
++	internal static bool IsRewardClaimRequestSupported(
++		IReadOnlyList<FullRunSimulationLegalAction> legalActions,
++		int rewardIndex)
++	{
++		ArgumentNullException.ThrowIfNull(legalActions);
++		foreach (FullRunSimulationLegalAction action in legalActions)
++		{
++			if (string.Equals(action.Action, "claim_reward", StringComparison.Ordinal)
++				&& action.Index == rewardIndex
++				&& action.Claimable == true
++				&& action.IsSupported)
++			{
++				return true;
++			}
++		}
++		return false;
++	}
++
+ 	internal static IEnumerable<uint?> EnumerateCardPlayTargets(
+ 		bool requiresTarget,
+ 		IReadOnlyList<uint> validTargetIds)
+@@ -60,6 +92,56 @@ internal static class FullRunLegalActionEligibility
+ 				canProcurePotion: true),
+ 			"an ordinary open-slot player must preserve an otherwise affordable potion purchase");
+ 
++		Assert(
++			!IsRewardClaimSupported(claimable: false),
++			"unclaimable rewards must never be emitted as supported legal actions");
++		Assert(
++			IsRewardClaimSupported(claimable: true),
++			"claimable rewards must preserve their executable claim action");
++
++		List<FullRunSimulationLegalAction> rewardClaimSurface = new List<FullRunSimulationLegalAction>
++		{
++			new FullRunSimulationLegalAction
++			{
++				Action = "claim_reward",
++				Index = 2,
++				Claimable = true,
++				IsSupported = true
++			},
++			new FullRunSimulationLegalAction
++			{
++				Action = "proceed",
++				Index = 2,
++				IsSupported = true
++			}
++		};
++		Assert(
++			IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 2),
++			"executor must accept the exact current claimable reward action");
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 1),
++			"executor must reject a raw or stale reward index absent from the legal surface");
++		rewardClaimSurface.Add(new FullRunSimulationLegalAction
++		{
++			Action = "claim_reward",
++			Index = 3,
++			Claimable = false,
++			IsSupported = true
++		});
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 3),
++			"executor must reject claimable=false even if malformed metadata marks it supported");
++		rewardClaimSurface.Add(new FullRunSimulationLegalAction
++		{
++			Action = "claim_reward",
++			Index = 4,
++			Claimable = true,
++			IsSupported = false
++		});
++		Assert(
++			!IsRewardClaimRequestSupported(rewardClaimSurface, rewardIndex: 4),
++			"executor must reject an unsupported claim even if claimable metadata is true");
++
+ 		List<uint?> noTargets = new List<uint?>(
+ 			EnumerateCardPlayTargets(requiresTarget: true, Array.Empty<uint>()));
+ 		Assert(noTargets.Count == 0, "target-required cards with zero valid targets must emit no action");
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationOutcomeContract.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationOutcomeContract.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..957b073f8c0b0495812fb8227f6ed9a24d0fe0c1
+--- /dev/null
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationOutcomeContract.cs
+@@ -0,0 +1,90 @@
++using System;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++/// <summary>
++/// Authoritative full-run terminal outcome rules. Presentation may report or
++/// render a victory, but it must never decide whether the simulator won.
++/// </summary>
++internal static class FullRunSimulationOutcomeContract
++{
++	internal const string Victory = "victory";
++	internal const string Defeat = "defeat";
++
++	internal static long NormalizeVictoryTime(long runTime)
++	{
++		// Pure simulation can finish within the same Unix-second tick in which it
++		// started. WinTime doubles as the upstream persisted victory latch, so zero
++		// must be promoted to a positive sentinel.
++		return Math.Max(1L, runTime);
++	}
++
++	internal static bool IsFinalBossVictory(
++		bool isBossRoom,
++		bool isFinalAct,
++		bool isSecondBossMapPoint,
++		bool isPrimaryBossMapPoint)
++	{
++		return isBossRoom
++			&& isFinalAct
++			&& (isSecondBossMapPoint || isPrimaryBossMapPoint);
++	}
++
++	internal static string? ResolveTerminalOutcome(bool isTerminal, long winTime)
++	{
++		if (!isTerminal)
++		{
++			return null;
++		}
++		return winTime > 0 ? Victory : Defeat;
++	}
++
++	internal static void RunSelfTests()
++	{
++		Assert(NormalizeVictoryTime(0L) == 1L, "zero-duration pure-sim victory must latch positively");
++		Assert(NormalizeVictoryTime(-5L) == 1L, "invalid negative run time must not erase victory");
++		Assert(NormalizeVictoryTime(17L) == 17L, "positive victory time must remain stable");
++		Assert(ResolveTerminalOutcome(isTerminal: false, winTime: 1L) == null,
++			"non-terminal snapshots must not publish an outcome");
++		Assert(ResolveTerminalOutcome(isTerminal: true, winTime: 0L) == Defeat,
++			"terminal snapshots without a victory latch must remain defeat");
++		Assert(ResolveTerminalOutcome(isTerminal: true, winTime: 1L) == Victory,
++			"terminal snapshots with a positive victory latch must be victory");
++		Assert(
++			IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: true,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"primary final boss must latch victory independently of presentation");
++		Assert(
++			IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: true,
++				isSecondBossMapPoint: true,
++				isPrimaryBossMapPoint: false),
++			"second final boss must latch victory independently of presentation");
++		Assert(
++			!IsFinalBossVictory(
++				isBossRoom: false,
++				isFinalAct: true,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"non-boss rooms must never latch final victory");
++		Assert(
++			!IsFinalBossVictory(
++				isBossRoom: true,
++				isFinalAct: false,
++				isSecondBossMapPoint: false,
++				isPrimaryBossMapPoint: true),
++			"earlier-act bosses must never latch final victory");
++	}
++
++	private static void Assert(bool condition, string detail)
++	{
++		if (!condition)
++		{
++			throw new InvalidOperationException($"Full-run outcome contract self-test failed: {detail}.");
++		}
++	}
++}
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
+index 8bd8a26c0fb0d78e7239564f537374f1ef75ad19..0ade0ed14b3d08c73e439a2615c654d96cc26f6e 100644
+--- a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs
+@@ -76,9 +76,9 @@ internal static class FullRunSimulationStateBuilder
+ 		}
+ 		snapshot.IsTerminal = snapshot.StateType == "game_over";
+ 		snapshot.IsActionable = !snapshot.IsTerminal;
+-		snapshot.RunOutcome = snapshot.IsTerminal
+-			? (RunManager.Instance.WinTime > 0 ? "victory" : "defeat")
+-			: null;
++		snapshot.RunOutcome = FullRunSimulationOutcomeContract.ResolveTerminalOutcome(
++			snapshot.IsTerminal,
++			RunManager.Instance.WinTime);
+ 		FullRunChoiceBridgeSnapshotCache bridgeSnapshots = BuildRelevantBridgeSnapshots(bridge, snapshot.StateType);
+ 		snapshot.CachedBridgeSnapshots = bridgeSnapshots;
+ 		snapshot.CachedCombatState = cachedCombatState;
+@@ -323,7 +323,7 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 				RewardSource = rewardSource,
+ 				Claimable = claimable,
+ 				ClaimBlockReason = blockReason,
+-				IsSupported = true
++				IsSupported = FullRunLegalActionEligibility.IsRewardClaimSupported(claimable)
+ 			});
+ 		}
+ 		if (rewards.CanProceed)
+@@ -372,6 +372,9 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
+ 	private static bool IsRewardClaimableForAction(Reward reward, Player? player, out string? claimBlockReason)
+ 	{
+ 		claimBlockReason = null;
++		// Match PotionReward.OnSelect exactly: TooFull returns false and leaves the
++		// reward pending. Hook vetoes such as Sozu consume the reward selection,
++		// so they remain executable and must not be conflated with claimable=false.
+ 		if (reward is PotionReward && player != null && !player.HasOpenPotionSlots)
+ 		{
+ 			claimBlockReason = "potion_slots_full";
+diff --git a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs
+index 591364f4adde405b90f2ebe81ea9506531a82314..5caa0aded3f3839ecab332d3a658aa5ba0354ab6 100644
+--- a/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -666,7 +666,27 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				{
+ 					return BuildRejected("claim_reward requires an index.", "full_run_action_required");
+ 				}
+-				if (!FullRunSimulationChoiceBridge.Instance.TrySelectReward(action.Index.Value, out string rewardError))
++				int rewardIndex = action.Index.Value;
++				FullRunPendingRewardSelectionSnapshot? rewardSelection =
++					state.CachedBridgeSnapshots?.RewardSelection;
++				if (rewardSelection == null || rewardIndex < 0 || rewardIndex >= rewardSelection.Rewards.Count)
++				{
++					return BuildRejected(
++						$"Reward index {rewardIndex} is not present in the current reward selection.",
++						"full_run_reward_not_found");
++				}
++				// Do not trust callers to originate from LegalActions. Raw or stale
++				// requests must pass the same fail-closed claimability surface before
++				// the bridge clears and commits the pending selection.
++				if (!FullRunLegalActionEligibility.IsRewardClaimRequestSupported(
++					state.LegalActions,
++					rewardIndex))
++				{
++					return BuildRejected(
++						$"Reward index {rewardIndex} is not currently claimable.",
++						"full_run_reward_not_claimable");
++				}
++				if (!FullRunSimulationChoiceBridge.Instance.TrySelectReward(rewardIndex, out string rewardError))
+ 				{
+ 					return BuildRejected(rewardError, "full_run_reward_not_found");
+ 				}
+diff --git a/STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs b/STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs
+index 5a403740e6a1cca01965964e7d36a402256d2a0d..a4378ee66f08e229d0d9774d37db0d6c815b697e 100644
+--- a/STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs
++++ b/STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs
+@@ -730,11 +730,15 @@ public class CombatManager
+         {
+             runState.CurrentMapPointHistoryEntry.Rooms.Last().TurnsTaken = combatState.RoundNumber;
+         }
+-        bool flag = !SkipCombatPresentation && runState.Map.SecondBossMapPoint != null && runState.CurrentMapCoord == runState.Map.SecondBossMapPoint.coord;
+-        bool flag2 = !SkipCombatPresentation && runState.Map.SecondBossMapPoint == null && runState.CurrentMapCoord == runState.Map.BossMapPoint.coord;
+-        if (!SkipCombatPresentation && room.RoomType == RoomType.Boss && runState.CurrentActIndex == runState.Acts.Count - 1 && (flag || flag2))
+-        {
+-            RunManager.Instance.WinTime = RunManager.Instance.RunTime;
++        bool isSecondBossMapPoint = runState.Map.SecondBossMapPoint != null && runState.CurrentMapCoord == runState.Map.SecondBossMapPoint.coord;
++        bool isPrimaryBossMapPoint = runState.Map.SecondBossMapPoint == null && runState.CurrentMapCoord == runState.Map.BossMapPoint.coord;
++        if (FullRunSimulationOutcomeContract.IsFinalBossVictory(
++            room.RoomType == RoomType.Boss,
++            runState.CurrentActIndex == runState.Acts.Count - 1,
++            isSecondBossMapPoint,
++            isPrimaryBossMapPoint))
++        {
++            RunManager.Instance.WinTime = FullRunSimulationOutcomeContract.NormalizeVictoryTime(RunManager.Instance.RunTime);
+         }
+         room.MarkPreFinished();
+         if (!SkipCombatPresentation && !CombatTrainingMode.IsActive)
+diff --git a/src/Core/Runs/RunManager.cs b/src/Core/Runs/RunManager.cs
+index ccec3ce3847193372c99e21790fe360dd8992362..7b31b8287e60b8e7d462c25762ac158921f75af2 100644
+--- a/src/Core/Runs/RunManager.cs
++++ b/src/Core/Runs/RunManager.cs
+@@ -991,6 +991,10 @@ public class RunManager : IRunLobbyListener
+ 	{
+ 		if (State != null)
+ 		{
++			// WinRun is the authoritative Architect closeout. Keep the persisted
++			// victory latch independent of combat presentation and non-zero even
++			// when a pure-simulator run finishes within its starting clock tick.
++			WinTime = Math.Max(1L, RunTime);
+ 			EventRoom eventRoom = (EventRoom)State.CurrentRoom;
+ 			((TheArchitect)eventRoom.LocalMutableEvent).TriggerVictory();
+ 			OnEnded(isVictory: true);

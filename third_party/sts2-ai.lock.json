@@ -30,6 +30,10 @@
     {
       "path": "third_party/patches/sts2-ai/0004-fail-closed-legal-action-eligibility.patch",
       "sha256": "0cefdeaa44262132d5916f829607b770f3e5c8d001dc713301fca614603a870b"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0005-authoritative-victory-and-reward-claims.patch",
+      "sha256": "80f331708d1da6261ab9fb864ddcd01536539d4ae8522eb680089fc32fa63deb"
     }
   ]
 }

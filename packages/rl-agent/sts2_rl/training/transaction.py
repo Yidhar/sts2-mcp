@@ -35,8 +35,8 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v1"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v1"
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v2"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v2"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -48,6 +48,42 @@ class TransactionEffect(IntEnum):
     MOVE = 1
     EXIT = 2
     REVISIT = 3
+
+
+class TransactionOutcome(IntEnum):
+    """Authoritative liveness outcome for one observed transaction surface.
+
+    This is deliberately independent of the game/run return. A selection
+    transaction can complete even when the run later loses, and a run-level
+    return must not proxy whether select/deselect/confirm mechanics progressed.
+    """
+
+    CENSORED = 0
+    COMPLETED = 1
+    DEADLOCK = 2
+
+
+class TransactionPolicyTarget(IntEnum):
+    """Binary factual target applied directly to the legal-candidate policy."""
+
+    AVOID = 0
+    PREFER = 1
+
+
+@dataclass(frozen=True, slots=True)
+class FactualTransactionPolicyTarget:
+    """One observed policy preference at an exact recurrent trace step."""
+
+    step_index: int
+    target: TransactionPolicyTarget
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step_index, bool) or not isinstance(self.step_index, int):
+            raise TypeError("transaction policy target step_index must be an integer")
+        if self.step_index < 0:
+            raise ValueError("transaction policy target step_index must be non-negative")
+        if not isinstance(self.target, TransactionPolicyTarget):
+            raise TypeError("transaction policy target must be TransactionPolicyTarget")
 
 
 def selection_delta_index(delta: int) -> int:
@@ -171,6 +207,7 @@ class TransactionTrace:
     initial_recurrent_state: npt.NDArray[np.float32]
     steps: tuple[TransactionStep, ...]
     burn_in_steps: int = 0
+    outcome: TransactionOutcome = TransactionOutcome.CENSORED
     data_partition: str = "training"
     version: str = TRANSACTION_TRACE_VERSION
 
@@ -192,6 +229,8 @@ class TransactionTrace:
                 raise ValueError(f"transaction {integer_label} must be non-negative")
         if self.data_partition != "training":
             raise ValueError("transaction replay rejects held-out/evaluation data")
+        if not isinstance(self.outcome, TransactionOutcome):
+            raise TypeError("transaction outcome must be TransactionOutcome")
         if self.version != TRANSACTION_TRACE_VERSION:
             raise ValueError(f"unsupported transaction trace version: {self.version!r}")
         if not isinstance(self.steps, tuple) or not self.steps:
@@ -220,6 +259,83 @@ class TransactionTrace:
             + 128
         )
 
+
+def factual_transaction_policy_targets(
+    trace: TransactionTrace,
+) -> tuple[FactualTransactionPolicyTarget, ...]:
+    """Build policy-coupled liveness labels from factual transaction paths.
+
+    A completed trace is traversed backwards from its factual exit. For each
+    semantic node, only its last factual action whose successor is already
+    known to reach the exit is preferred. This erases an early wrong branch
+    after the trace later revisits and corrects the same node, without globally
+    penalizing the corrective deselect that returned there. Exact repeated
+    ``(node, action)`` pairs are factual cycles and receive an avoid target
+    instead, even if random exploration eventually escaped. A deadlocked trace
+    contributes only those repeated pairs. Censored traces contribute no
+    policy target.
+
+    The key includes the full semantic transaction node, so a deselect used
+    once to correct a choice on a subsequently completed route is preferred;
+    deselect is never globally penalized or masked. Forced singleton choices
+    are omitted because the policy cannot change their outcome.
+    """
+
+    if not isinstance(trace, TransactionTrace):
+        raise TypeError("trace must be a TransactionTrace")
+    if trace.outcome is TransactionOutcome.CENSORED:
+        return ()
+
+    learn_steps = trace.learn_steps
+    pair_counts: dict[tuple[str, str], int] = {}
+    for step in learn_steps:
+        pair = (step.node_key, step.action_fingerprint)
+        pair_counts[pair] = pair_counts.get(pair, 0) + 1
+
+    preferred_indices: set[int] = set()
+    if trace.outcome is TransactionOutcome.COMPLETED:
+        exit_nodes = {
+            step.next_node_key
+            for step in learn_steps
+            if step.effect is TransactionEffect.EXIT
+        }
+        reachable_nodes = set(exit_nodes)
+        handled_nodes: set[str] = set()
+        for local_index in range(len(learn_steps) - 1, -1, -1):
+            step = learn_steps[local_index]
+            if step.node_key in handled_nodes:
+                continue
+            handled_nodes.add(step.node_key)
+            pair = (step.node_key, step.action_fingerprint)
+            if pair_counts[pair] > 1 or step.next_node_key not in reachable_nodes:
+                continue
+            reachable_nodes.add(step.node_key)
+            if step.effect is not TransactionEffect.STAY:
+                preferred_indices.add(trace.burn_in_steps + local_index)
+
+    labels: list[FactualTransactionPolicyTarget] = []
+    for step_index, step in enumerate(
+        learn_steps,
+        start=trace.burn_in_steps,
+    ):
+        if int(np.count_nonzero(step.snapshot.action_mask)) <= 1:
+            continue
+        repeated = pair_counts[(step.node_key, step.action_fingerprint)] > 1
+        if repeated:
+            labels.append(
+                FactualTransactionPolicyTarget(
+                    step_index=step_index,
+                    target=TransactionPolicyTarget.AVOID,
+                )
+            )
+        elif step_index in preferred_indices:
+            labels.append(
+                FactualTransactionPolicyTarget(
+                    step_index=step_index,
+                    target=TransactionPolicyTarget.PREFER,
+                )
+            )
+    return tuple(labels)
 
 @dataclass(frozen=True, slots=True)
 class ObservedTransactionPair:
@@ -492,11 +608,15 @@ __all__ = [
     "TRANSACTION_REPLAY_VERSION",
     "TRANSACTION_TRACE_VERSION",
     "BoundedTransactionReplay",
+    "FactualTransactionPolicyTarget",
     "ObservedTransactionPair",
     "TransactionEffect",
+    "TransactionOutcome",
+    "TransactionPolicyTarget",
     "TransactionStep",
     "TransactionTrace",
     "backfill_factual_monte_carlo_returns",
+    "factual_transaction_policy_targets",
     "observed_outcome_pairs",
     "selection_delta_index",
 ]

@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v3"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v4"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -254,9 +254,12 @@ class RolloutConfig:
 class TransactionLearningConfig:
     """Optional factual-outcome replay sidecar for multi-step transactions.
 
-    Disabled is the v10-compatible default.  Enabling this section adds model
-    parameters and checkpoint state, so it always starts a new training lineage
-    through ``model_parameter_initialization`` rather than exact resume.
+    Disabled remains parameter-compatible with the base model. Enabling this
+    section adds model heads and replay state. Changing its factual policy
+    objective also changes immutable training semantics. Both require a fresh
+    lineage through ``model_parameter_initialization`` rather than exact resume;
+    compatible network tensors are inherited, while optimizer/replay/RNG state
+    is intentionally reset.
     """
 
     enabled: bool = False
@@ -266,6 +269,10 @@ class TransactionLearningConfig:
     burn_in_steps: int = 24
     effect_weight: float = 0.10
     transaction_q_weight: float = 0.25
+    # Factual completed paths and exact repeated node/action cycles supervise the
+    # shared legal-candidate policy directly. This is not a reward, action mask,
+    # action rewrite, or card/prompt-specific rule.
+    completion_policy_weight: float = 0.25
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -297,6 +304,7 @@ class TransactionLearningConfig:
         for name in (
             "effect_weight",
             "transaction_q_weight",
+            "completion_policy_weight",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",

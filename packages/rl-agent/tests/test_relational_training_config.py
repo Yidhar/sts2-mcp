@@ -18,11 +18,11 @@ from sts2_rl.training import (
 )
 
 
-def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
+def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v3"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v4"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -30,6 +30,8 @@ def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
     assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
     assert preheat.curriculum.revival_budget == -1
     assert preheat.optimization.discount == 1.0
+    assert preheat.transaction_learning.enabled
+    assert preheat.transaction_learning.completion_policy_weight == 0.25
     assert preheat.environment.scenario == "full-run"
     assert preheat.curriculum.reward_objective == "run"
     assert preheat.environment.encounter_id is None
@@ -49,11 +51,11 @@ def test_profiles_use_relational_recurrent_vtrace_v3_without_replay() -> None:
     assert preheat.diagnostics.combat_net_progress_window == 256
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
-    assert preheat.runtime.log_dir.endswith("v9-candidate256-net-progress")
-    assert preheat.runtime.checkpoint_dir.endswith("v9-candidate256-net-progress")
+    assert preheat.runtime.log_dir.endswith("v14-transaction-liveness-terminal-fix")
+    assert preheat.runtime.checkpoint_dir.endswith("v14-transaction-liveness-terminal-fix")
     assert preheat.runtime.checkpoint_interval_steps == 10_000
-    assert "direct" in preheat.runtime.log_dir
-    assert "direct" in preheat.runtime.checkpoint_dir
+    assert "transaction-liveness-terminal-fix" in preheat.runtime.log_dir
+    assert "transaction-liveness-terminal-fix" in preheat.runtime.checkpoint_dir
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
     mapping = default.to_mapping()
     assert "rollout" in mapping

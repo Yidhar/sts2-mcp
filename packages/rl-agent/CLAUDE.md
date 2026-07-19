@@ -90,10 +90,16 @@ sts2_rl.train
   curriculum truncations. The short binary/schema/runtime-mechanics preflight
   validates transport facts only; it does not score a policy.
 - Forced singleton actions generate no policy target or policy-gradient term.
-- Training data is consumed once in FIFO order; replay sampling, PER and
-  long-lived sample retention are forbidden.
-- The recurrent model has exactly a legal-candidate policy head and one scalar
-  value head. Q, reward-prediction and terminal-prediction heads are forbidden.
+- Main V-trace data is consumed once in FIFO order. The only maintained replay
+  is the bounded, training-partition transaction sidecar: it stores factual
+  select/deselect/confirm/cancel transitions, never held-out diagnostics or
+  fabricated counterfactual actions.
+- The recurrent model keeps one legal-candidate policy and scalar task-value
+  head. Optional transaction effect/delta/Q heads may train the shared factual
+  representation. Transaction liveness must also optimize normalized policy
+  logits directly: completed unique factual steps are preferred and exact
+  repeated semantic node/action cycles are avoided. Deselect stays legal; no
+  action rewrite, prompt/card ID rule, or forced confirmation is allowed.
 - Evaluation uses generic semantic state/action recurrence detection and writes
   diagnostic trajectories; diagnostics never become training samples.
 
@@ -106,10 +112,11 @@ never appear in logs.
 
 All mutable output lives below `STS2_ARTIFACT_ROOT`, outside the checkout.
 Checkpoint publication is atomic and hashes learner model, actor model, optimizer,
-the pending rollout queue and
-metadata. Exact resume rejects contract, reward projection, dependency lock,
-encoding, model/config or payload drift; optional static catalog provenance is not a
-gate. Old model checkpoints are not migration inputs.
+the pending rollout queue, bounded transaction replay, and metadata. Exact resume
+rejects contract, reward projection, dependency lock, encoding, model/config or
+payload drift; optional static catalog provenance is not a gate. A declared
+`model_parameter_initialization` may inherit only shape-compatible network tensors
+into a new lineage; optimizer, queue, RNG, counters, and transaction replay reset.
 
 ## Change discipline
 

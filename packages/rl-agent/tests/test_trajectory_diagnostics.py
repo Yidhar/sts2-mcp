@@ -62,6 +62,72 @@ def test_semantic_deadlock_requires_exact_recurrent_state_action_pair() -> None:
         assert evidence is None
 
 
+def test_semantic_deadlock_post_step_keeps_known_cycle_but_clears_novel_exit() -> None:
+    action = {"kind": "continue", "action_handle": "volatile"}
+    actions = (action,)
+
+    known_cycle = SemanticDeadlockDetector(window_size=8, repeat_threshold=2)
+    first = known_cycle.observe(
+        step_index=0,
+        observation={"state": "A"},
+        legal_actions=actions,
+        selected_action=action,
+    )
+    assert known_cycle.confirm_after_step(
+        first,
+        observation={"state": "B"},
+        legal_actions=actions,
+    ) is None
+    middle = known_cycle.observe(
+        step_index=1,
+        observation={"state": "B"},
+        legal_actions=actions,
+        selected_action=action,
+    )
+    assert known_cycle.confirm_after_step(
+        middle,
+        observation={"state": "A"},
+        legal_actions=actions,
+    ) is None
+    repeated = known_cycle.observe(
+        step_index=2,
+        observation={"state": "A"},
+        legal_actions=actions,
+        selected_action=action,
+    )
+    assert repeated is not None
+    assert known_cycle.confirm_after_step(
+        repeated,
+        observation={"state": "B"},
+        legal_actions=actions,
+    ) is repeated
+
+    novel_exit = SemanticDeadlockDetector(window_size=8, repeat_threshold=2)
+    for step, before, after in ((0, "A", "B"), (1, "B", "A")):
+        evidence = novel_exit.observe(
+            step_index=step,
+            observation={"state": before},
+            legal_actions=actions,
+            selected_action=action,
+        )
+        assert novel_exit.confirm_after_step(
+            evidence,
+            observation={"state": after},
+            legal_actions=actions,
+        ) is None
+    repeated = novel_exit.observe(
+        step_index=2,
+        observation={"state": "A"},
+        legal_actions=actions,
+        selected_action=action,
+    )
+    assert repeated is not None
+    assert novel_exit.confirm_after_step(
+        repeated,
+        observation={"state": "EXIT"},
+        legal_actions=actions,
+    ) is None
+
 def _journal_decision(
     *,
     episode_id: str,

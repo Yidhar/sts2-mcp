@@ -307,6 +307,14 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "replay_byte_capacity": config.transaction_learning.replay_byte_capacity,
             "sample_traces": config.transaction_learning.sample_traces,
             "burn_in_steps": config.transaction_learning.burn_in_steps,
+            "effect_weight": config.transaction_learning.effect_weight,
+            "transaction_q_weight": config.transaction_learning.transaction_q_weight,
+            "completion_policy_weight": (
+                config.transaction_learning.completion_policy_weight
+            ),
+            "pairwise_ranking_weight": (
+                config.transaction_learning.pairwise_ranking_weight
+            ),
         },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
