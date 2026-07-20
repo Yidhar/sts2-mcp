@@ -43,16 +43,144 @@ from sts2_rl.training import (
 from sts2_rl.training import checkpointing as checkpointing_module
 from sts2_rl.training.collector import (
     _classify_transaction_transition,
+    _deadlock_semantic_observation,
+    _semantic_action_surface,
     _transaction_node_key,
+    _transaction_option_universe,
     _transaction_surface_key,
 )
 from sts2_rl.training.learner import VTraceLearner
 from sts2_rl.training.runtime import run_training
+from sts2_rl.training.trajectory import (
+    semantic_action_fingerprint,
+    semantic_decision_fingerprint,
+)
 
 
 class _NoopBackend:
     def close(self) -> None:
         pass
+
+
+def test_strict_group_surface_removes_physical_selection_instance_noise() -> None:
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig(max_candidates=4)
+    )
+    raw_actions = tuple(
+        {
+            "action_handle": f"select-{index}",
+            "kind": "combat_select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card_index": index,
+            "card": {
+                "id": "CARD.WOUND",
+                "instance_uuid": f"wound-{index}",
+                "source_pile": "Discard",
+                "cost": -2,
+            },
+        }
+        for index in range(2_040)
+    )
+    raw_cards = [
+        {
+            "id": "CARD.WOUND",
+            "instance_uuid": f"wound-{index}",
+            "source_pile": "Discard",
+            "cost": -2,
+        }
+        for index in range(2_040)
+    ]
+    observation = {
+        "run": {"act": 3, "floor": 46, "room_type": "combat"},
+        "card_selection": {
+            "mode": "SimpleGrid",
+            "prompt_id": "card.HEADBUTT.selection",
+            "operation_type": "select",
+            "source_zone": "Discard",
+            "selected_count": 0,
+            "min_select": 1,
+            "max_select": 1,
+            "cards": raw_cards,
+            "selected_cards": [],
+        },
+    }
+
+    groups = encoder.semantic_action_groups(raw_actions)
+    assert len(groups) == 1
+    assert groups[0].multiplicity == 2_040
+    semantic_actions = _semantic_action_surface(groups)
+    universe = _transaction_option_universe(
+        observation["card_selection"],
+        semantic_actions,
+    )
+    assert len(universe) == 1
+    assert json.loads(universe[0]) == {
+        "identity": {
+            "definition": "CARD.WOUND",
+            "physical_source": "Discard",
+        },
+        "multiplicity": 2_040,
+    }
+    assert "wound-" not in universe[0]
+
+    surface = _transaction_surface_key(observation, semantic_actions)
+    assert surface is not None
+    node = _transaction_node_key(
+        surface,
+        observation,
+        semantic_actions,
+    )
+    deadlock_observation = _deadlock_semantic_observation(
+        observation,
+        semantic_actions,
+    )
+    decision = semantic_decision_fingerprint(
+        deadlock_observation,
+        semantic_actions,
+    )
+
+    reversed_actions = tuple(reversed(raw_actions))
+    reversed_observation = {
+        **observation,
+        "card_selection": {
+            **observation["card_selection"],
+            "cards": list(reversed(raw_cards)),
+        },
+    }
+    reversed_semantic_actions = _semantic_action_surface(
+        encoder.semantic_action_groups(reversed_actions)
+    )
+    assert (
+        _transaction_surface_key(
+            reversed_observation,
+            reversed_semantic_actions,
+        )
+        == surface
+    )
+    assert (
+        _transaction_node_key(
+            surface,
+            reversed_observation,
+            reversed_semantic_actions,
+        )
+        == node
+    )
+    assert (
+        semantic_decision_fingerprint(
+            _deadlock_semantic_observation(
+                reversed_observation,
+                reversed_semantic_actions,
+            ),
+            reversed_semantic_actions,
+        )
+        == decision
+    )
+    assert semantic_action_fingerprint(
+        reversed_semantic_actions[0]
+    ) == semantic_action_fingerprint(semantic_actions[0])
+    assert len(json.dumps(deadlock_observation, sort_keys=True)) < 2_000
 
 
 def test_transaction_surface_and_node_are_order_independent_but_membership_sensitive() -> None:

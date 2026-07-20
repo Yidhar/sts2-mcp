@@ -34,6 +34,32 @@ _CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v3"
 _QUEUE_PAYLOAD_VERSION = "sts2-rollout-queue-pickle-v2"
 _ACTOR_SUPERVISOR_STATE_VERSION = "sts2-actor-supervisor-state-v1"
 
+# Exact resume always requires the complete active encoding identity.  Model
+# parameter initialization has one deliberately narrower exception: v9 added
+# strict equivalence grouping for card-selection candidates while preserving
+# every v8 feature slot, every model input tensor dimension, and every learned
+# parameter shape.  The sole new input lives in the formerly unused feature
+# slot 214.  Queue/replay action indexes and behavior probabilities do change
+# meaning, so this exception is valid only for the model-only path.
+#
+# Keep both sides as complete, immutable identities rather than accepting a
+# version prefix or dimensions alone.  Any later encoder edit changes the
+# fingerprint and fails closed until it receives a separately reviewed entry.
+_STRICT_CARD_SELECTION_GROUPING_ENCODING_MIGRATION = (
+    {
+        "version": "grounded-relational-runtime-encoding-v8",
+        "min_token_feature_dim": 224,
+        "feature_abi_end": 214,
+        "fingerprint_sha256": "8bc0204fe3201871cf3bdb3be39deaac9cc1b02f830ac2ba72d3e29bef0ddf58",
+    },
+    {
+        "version": "grounded-relational-runtime-encoding-v9",
+        "min_token_feature_dim": 224,
+        "feature_abi_end": 215,
+        "fingerprint_sha256": "a953c6a01cd0ae85e77f0916ee6f072f7a97a59cbfdae6967003f9e8894dba1b",
+    },
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TrainingState:
@@ -398,6 +424,35 @@ def actor_supervisor_state_from_metadata(
     return ActorSupervisorState.from_mapping(metadata["actor_supervisor_state"])
 
 
+def _validate_encoding_contract(
+    source: object,
+    *,
+    model_only: bool,
+) -> None:
+    """Validate the full decision ABI before any checkpoint tensor is read.
+
+    Exact continuation may never cross a changed decision space: queued
+    ``action_index`` values, behavior probabilities, transaction replay and
+    recurrent state all belong to the source encoder.  Explicit model
+    parameter initialization may cross only the one reviewed v8 -> v9
+    migration whose existing feature slots and parameter tensors are stable.
+    Shape-compatible but otherwise unknown encoders remain rejected.
+    """
+
+    target = grounding_encoding_identity()
+    if source == target:
+        return
+    migration = (source, target)
+    if model_only and migration == _STRICT_CARD_SELECTION_GROUPING_ENCODING_MIGRATION:
+        return
+    if model_only:
+        raise ValueError(
+            "checkpoint encoding contract does not match; no reviewed "
+            "model-parameter initialization migration"
+        )
+    raise ValueError("checkpoint encoding contract does not match")
+
+
 def _validate_metadata(
     validated: ValidatedResumeCheckpoint,
     *,
@@ -411,8 +466,10 @@ def _validate_metadata(
         raise ValueError(f"unsupported v2 checkpoint format: {metadata.get('format')!r}")
     if metadata.get("model_config") != asdict(config.model.to_model_config()):
         raise ValueError("checkpoint recurrent model config does not match")
-    if metadata.get("encoding_contract") != grounding_encoding_identity():
-        raise ValueError("checkpoint encoding contract does not match")
+    _validate_encoding_contract(
+        metadata.get("encoding_contract"),
+        model_only=model_only,
+    )
     if not isinstance(metadata.get("model_state_spec"), dict):
         raise ValueError("checkpoint has no model tensor specification")
     if model_only:

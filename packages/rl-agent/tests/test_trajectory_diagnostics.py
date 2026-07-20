@@ -249,7 +249,7 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     snapshots = [item for item in records if item["record_kind"] == "rich_snapshot"]
     assert len(summaries) == 5
     assert {item["step_index"] for item in snapshots} == {0, 2, 4}
-    assert all(item["journal_version"] == "sts2-trajectory-journal-v3" for item in records)
+    assert all(item["journal_version"] == "sts2-trajectory-journal-v4" for item in records)
 
     ordinary = summaries[1]
     assert "observation" not in ordinary
@@ -276,6 +276,71 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     assert last["snapshot_reasons"] == ["episode_last"]
     assert len(first["observation"]["player"]["deck"]) == 16
     assert "action_handle" not in first["selected_action"]
+
+
+def test_trajectory_journal_separates_model_candidate_and_raw_dispatch_indexes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "grouped-indexes.jsonl"
+    event = _journal_decision(
+        episode_id="grouped-episode",
+        step_index=0,
+        outcome="success",
+    )
+    raw_actions = [
+        {
+            "action_handle": f"select-{index}",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "card": {"id": "CARD.WOUND", "pile": "Discard"},
+        }
+        for index in range(3)
+    ]
+    event.update(
+        {
+            "legal_actions": raw_actions,
+            "raw_legal_action_count": 3,
+            "semantic_candidate_count": 1,
+            "selected_index": 0,
+            "selected_candidate_index": 0,
+            "selected_dispatch_index": 2,
+            "selected_action": raw_actions[2],
+            "selected_action_multiplicity": 3,
+            "selected_action_equivalence_fingerprint": "strict-wound-group",
+            "policy_topk": [
+                {
+                    "index": 0,
+                    "candidate_index": 0,
+                    "dispatch_index": 2,
+                    "multiplicity": 3,
+                    "equivalence_fingerprint": "strict-wound-group",
+                    "probability": 1.0,
+                }
+            ],
+        }
+    )
+
+    with TrajectoryJournal(path) as journal:
+        journal.write(event)
+
+    records = _read_jsonl(path)
+    summary = next(item for item in records if item["record_kind"] == "summary")
+    assert summary["selected_index"] == 0
+    assert summary["selected_candidate_index"] == 0
+    assert summary["selected_dispatch_index"] == 2
+    assert summary["selected_action_multiplicity"] == 3
+    assert summary["selected_action"]["card"]["id"] == "CARD.WOUND"
+    assert summary["raw_legal_action_count"] == 3
+    assert summary["semantic_candidate_count"] == 1
+    assert len(summary["policy_topk"]) == 1
+    top = summary["policy_topk"][0]
+    assert top["candidate_index"] == 0
+    assert top["dispatch_index"] == 2
+    assert top["multiplicity"] == 3
+    assert top["equivalence_fingerprint"] == "strict-wound-group"
+    assert top["action"]["action_handle"] == "select-2"
+    assert top["action"]["card"]["id"] == "CARD.WOUND"
+    assert top["action_fingerprint"]
 
 
 def test_trajectory_journal_retains_bounded_rich_anomaly_context(

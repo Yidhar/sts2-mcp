@@ -227,6 +227,67 @@ class WideRecoverableIncidentBackend(RecoverableIncidentBackend):
         )
 
 
+class StrictGroupedSelectionBackend(FakeCombatBackend):
+    """Two strict card groups whose learned and dispatch indexes differ."""
+
+    def __init__(self) -> None:
+        super().__init__(terminal_step=1)
+        self.step_requests: list[StepRequest] = []
+
+    @staticmethod
+    def _actions() -> tuple[dict[str, Any], ...]:
+        actions: list[dict[str, Any]] = []
+        for card_id, enabled in (("CARD.WOUND", False), ("CARD.BURN", True)):
+            for copy_index in range(3):
+                actions.append(
+                    {
+                        "action_handle": f"select-{card_id}-{copy_index}",
+                        "action": "combat_select_card",
+                        "kind": "combat_select_card",
+                        "model_action_kind": "card_selection",
+                        "model_action_variant": "select",
+                        "selection_operation": "select",
+                        "enabled": enabled,
+                        "card_index": len(actions),
+                        "card": {
+                            "id": card_id,
+                            "pile": "Discard",
+                            "cost": -2,
+                            "is_selected": False,
+                        },
+                    }
+                )
+        return tuple(actions)
+
+    def _observation(self, *, terminal: bool) -> dict[str, Any]:
+        observation = super()._observation(terminal=terminal)
+        observation["phase"] = "selection"
+        observation["card_selection"] = {
+            "mode": "SimpleGrid",
+            "prompt_id": "TEST.STRICT_GROUPING",
+            "selected_count": 0,
+            "min_select": 1,
+            "max_select": 1,
+            "requires_manual_confirmation": False,
+            "can_confirm": False,
+            "cards": [
+                {
+                    "card_instance_id": f"instance-{index}",
+                    "id": "CARD.WOUND" if index < 3 else "CARD.BURN",
+                    "pile": "Discard",
+                    "cost": -2,
+                    "is_selected": False,
+                }
+                for index in range(6)
+            ],
+        }
+        return observation
+
+    def step(self, request: StepRequest) -> EnvironmentResult:
+        self.step_requests.append(request)
+        return super().step(request)
+
+
 class OscillatingDamageBackend(FakeCombatBackend):
     """Deals damage every other step, then heals it all back."""
 
@@ -758,6 +819,76 @@ def test_collector_emits_contiguous_recurrent_unroll() -> None:
         assert unroll.bootstrap_snapshot is None
         assert unroll.steps[-1].discount == 0.0
         assert unroll.initial_recurrent_state.shape == (32,)
+    finally:
+        resources.close()
+
+
+def test_collector_learns_group_index_but_dispatches_raw_representative(
+    tmp_path: Path,
+) -> None:
+    backend = StrictGroupedSelectionBackend()
+    base = _config(total_steps=1)
+    config = replace(
+        base,
+        transaction_learning=replace(
+            base.transaction_learning,
+            enabled=True,
+            burn_in_steps=0,
+        ),
+    )
+    resources = build_training_resources(config, backend=backend)
+    journal_path = tmp_path / "grouped-collector.jsonl"
+    try:
+        initial_decision = resources.encoder.encode(
+            backend._observation(terminal=False),
+            backend._actions(),
+            device="cpu",
+        )
+        assert initial_decision.snapshot.candidate_count == 2
+        selected_reference = initial_decision.action(1)
+        assert selected_reference.position == 3
+        assert selected_reference.multiplicity == 3
+        assert selected_reference.equivalence_fingerprint is not None
+
+        with TrajectoryJournal(journal_path) as journal:
+            episode = resources.collector.collect_episode(
+                epsilon=0.0,
+                deterministic=True,
+                record=True,
+                trajectory_journal=journal,
+            )
+
+        assert len(backend.step_requests) == 1
+        request = backend.step_requests[0]
+        assert request.action_id == "select-CARD.BURN-0"
+        assert request.action_index is None
+
+        rollout_step = episode.unrolls[0].steps[0]
+        assert rollout_step.snapshot.candidate_count == 2
+        assert rollout_step.action_index == 1
+        assert rollout_step.behavior_log_probability == pytest.approx(0.0)
+        assert episode.metrics.maximum_observed_candidates == 6
+        assert episode.metrics.maximum_observed_semantic_candidates == 2
+        assert episode.metrics.maximum_equivalence_class_size == 3
+
+        assert len(episode.transaction_traces) == 1
+        transaction_step = episode.transaction_traces[0].steps[-1]
+        assert transaction_step.action_index == 1
+        assert transaction_step.action_fingerprint == selected_reference.equivalence_fingerprint
+
+        records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+        summary = next(item for item in records if item.get("record_kind") == "summary")
+        assert summary["selected_candidate_index"] == 1
+        assert summary["selected_dispatch_index"] == 3
+        assert summary["selected_action_multiplicity"] == 3
+        assert summary["semantic_candidate_count"] == 2
+        assert summary["raw_legal_action_count"] == 6
+        assert summary["maximum_candidate_multiplicity"] == 3
+        assert summary["selected_action"]["card"]["id"] == "CARD.BURN"
+        selected_topk = next(item for item in summary["policy_topk"] if item["candidate_index"] == 1)
+        assert selected_topk["dispatch_index"] == 3
+        assert selected_topk["multiplicity"] == 3
+        assert selected_topk["action"]["card"]["id"] == "CARD.BURN"
     finally:
         resources.close()
 

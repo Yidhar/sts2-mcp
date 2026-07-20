@@ -15,6 +15,7 @@ from sts2_rl.encoding import (
     grounding_encoding_identity,
 )
 from sts2_rl.encoding.grounded import (
+    _ACTION_GROUP_MULTIPLICITY_SLOT,
     _DYNAMIC_VALUE_SLOT_BY_KEY,
     _NUMERIC_SLOT_BY_KEY,
     _ZONE_IDS,
@@ -26,6 +27,7 @@ from sts2_rl.encoding.grounded import (
     _canonical_power,
     _canonical_relic,
     _hash_id,
+    _strict_card_selection_projection,
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 
@@ -1278,6 +1280,10 @@ def test_111_candidate_multiselect_discard_transform_and_huge_deck_regression() 
             "card": {
                 "id": f"CARD.OPTION_{index % 13}",
                 "instance_uuid": f"option-{index}",
+                # Unknown future card facts participate in strict action
+                # equality, so this legacy 111-distinct-candidate regression
+                # remains intentionally ungrouped.
+                "strict_test_variant": index,
                 "pile": "Hand" if index < 100 else "Selected",
                 "cost": index % 4,
             },
@@ -1407,6 +1413,245 @@ def test_111_candidate_multiselect_discard_transform_and_huge_deck_regression() 
     ]
     with pytest.raises(ValueError, match=r"count=257 capacity=256"):
         encoder.encode(observation, overflow)
+
+
+def test_2068_strictly_equal_card_selection_instances_form_16_semantic_groups() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=2048,
+            max_candidates=256,
+            max_candidate_local_tokens=64,
+        )
+    )
+    variants = [
+        ("CARD.WOUND", 1, 2_040),
+        ("CARD.ANGER", 0, 6),
+        ("CARD.BURN", 0, 6),
+        ("CARD.GIANT_ROCK", 2, 3),
+        ("CARD.STRIKE_IRONCLAD", 1, 2),
+        *[(f"CARD.UNIQUE_{index}", index % 4, 1) for index in range(11)],
+    ]
+    cards: list[dict[str, object]] = []
+    actions: list[dict[str, object]] = []
+    position = 0
+    for variant, (card_id, cost, count) in enumerate(variants):
+        for copy_index in range(count):
+            instance = f"instance-{variant}-{copy_index}"
+            card: dict[str, object] = {
+                "index": position,
+                "id": card_id,
+                "instance_uuid": instance,
+                "pile": "Discard",
+                "source_pile": "Discard",
+                "selection_membership": "selectable",
+                "is_selected": False,
+                "cost": cost,
+                # This future field is deliberately copied verbatim.  Copies
+                # of one variant remain equal while different variants cannot
+                # alias if the maintained card projection has not learned the
+                # field yet.
+                "future_runtime_fact": {"variant": variant},
+            }
+            cards.append(card)
+            actions.append(
+                {
+                    "action": "combat_select_card",
+                    "kind": "combat_select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "select",
+                    "selection_operation": "select",
+                    "index": position,
+                    "idx": position,
+                    "action_index": position,
+                    "action_id": f"sim:{position}:combat_select_card",
+                    "action_handle": f"sim:{position}:combat_select_card",
+                    "is_enabled": True,
+                    "card": dict(card),
+                    "selection": {
+                        "operation_type": "select",
+                        "mode": "SimpleGrid",
+                        "prompt_id": "card.HEADBUTT.selection",
+                        "source_zone": "Discard",
+                        "min_select": 1,
+                        "max_select": 1,
+                        "selected_count": 0,
+                    },
+                    "_sim_raw": {
+                        "action": "combat_select_card",
+                        "selection_operation": "select",
+                        "is_selected": False,
+                        "index": position,
+                    },
+                }
+            )
+            position += 1
+    assert len(actions) == 2_068
+
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {"id": "ironclad", "hp": 40, "max_hp": 80},
+        "card_selection": {
+            "mode": "SimpleGrid",
+            "prompt_id": "card.HEADBUTT.selection",
+            "operation_type": "select",
+            "source_zone": "Discard",
+            "selected_count": 0,
+            "min_select": 1,
+            "max_select": 1,
+            "cards": cards,
+        },
+    }
+
+    groups = encoder.semantic_action_groups(actions)
+    encoded = encoder.encode(observation, actions)
+
+    assert len(groups) == 16
+    assert encoded.snapshot.candidate_count == 16
+    assert encoded.batch.candidates.features.shape[1] == 16
+    assert encoded.snapshot.world.token_count < encoder.config.max_world_tokens
+    wound = groups[0]
+    assert wound.multiplicity == 2_040
+    assert wound.reference.position == 0
+    assert wound.reference.representative_position == 0
+    assert wound.reference.handle == "sim:0:combat_select_card"
+    assert wound.reference.member_positions == tuple(range(2_040))
+    assert wound.reference.equivalence_fingerprint is not None
+    assert len(wound.reference.equivalence_fingerprint) == 64
+    assert encoded.action(0) == wound.reference
+    assert sorted(group.multiplicity for group in groups) == sorted(
+        [2_040, 6, 6, 3, 2, *([1] * 11)]
+    )
+    wound_locals = encoded.batch.candidates.local_features[
+        0,
+        0,
+        :,
+        _ACTION_GROUP_MULTIPLICITY_SLOT,
+    ]
+    assert torch.isclose(
+        wound_locals.max(),
+        torch.tensor(
+            _bounded_number(2_040),
+            dtype=wound_locals.dtype,
+            device=wound_locals.device,
+        ),
+    )
+
+    projection = _strict_card_selection_projection(actions[0])
+    assert projection is not None
+    prototype, _, _ = projection
+    prototype_card = prototype["card"]
+    assert isinstance(prototype_card, dict)
+    assert "instance_uuid" not in prototype_card
+    assert "instance_id" not in prototype_card
+    assert "index" not in prototype_card
+    assert prototype["_sim_raw"] == {
+        "action": "combat_select_card",
+        "selection_operation": "select",
+        "is_selected": False,
+    }
+
+
+def test_strict_card_selection_grouping_keeps_unknown_and_relation_differences() -> None:
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            _small_model_config(),
+            max_world_tokens=24,
+            max_candidates=16,
+            max_candidate_local_tokens=16,
+        )
+    )
+
+    def action(
+        position: int,
+        *,
+        card_extra: dict[str, object] | None = None,
+        action_extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        card: dict[str, object] = {
+            "id": "CARD.WOUND",
+            "instance_uuid": f"physical-{position}",
+            "pile": "Discard",
+            "selection_membership": "selectable",
+            "cost": 1,
+        }
+        card.update(card_extra or {})
+        result: dict[str, object] = {
+            "action_handle": f"select:{position}",
+            "action_index": position,
+            "index": position,
+            "kind": "combat_select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": card,
+            "_sim_raw": {"action": "combat_select_card", "index": position},
+        }
+        result.update(action_extra or {})
+        return result
+
+    actions = [
+        action(0),
+        action(1),
+        # These runtime relationship fields are not mere dispatcher identity;
+        # differences must remain singleton semantic actions.
+        action(2, card_extra={"ref": "relation-a"}),
+        action(3, card_extra={"ref": "relation-b"}),
+        action(4, card_extra={"clone_of": "origin-a", "deck_version": 3}),
+        action(5, card_extra={"clone_of": "origin-b", "deck_version": 3}),
+        action(6, action_extra={"target": {"combat_id": "enemy-a"}}),
+        action(7, action_extra={"target": {"combat_id": "enemy-b"}}),
+        action(8, card_extra={"future_unknown": {"value": "a"}}),
+        action(9, card_extra={"future_unknown": {"value": "b"}}),
+    ]
+
+    groups = encoder.semantic_action_groups(actions)
+    encoded = encoder.encode(_observation(), actions)
+
+    assert encoded.snapshot.candidate_count == 9
+    assert [group.multiplicity for group in groups] == [2, *([1] * 8)]
+    assert groups[0].reference.member_positions == (0, 1)
+    assert groups[1].prototype["card"]["ref"] == "relation-a"
+    assert groups[2].prototype["card"]["ref"] == "relation-b"
+    assert groups[5].prototype["target"]["combat_id"] == "enemy-a"
+    assert groups[6].prototype["target"]["combat_id"] == "enemy-b"
+
+
+def test_257_strictly_unique_semantic_card_selections_still_fail_closed() -> None:
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            _small_model_config(),
+            max_world_tokens=24,
+            max_candidates=256,
+            max_candidate_local_tokens=16,
+        )
+    )
+    actions = [
+        {
+            "action_handle": f"select:{index}",
+            "action_index": index,
+            "index": index,
+            "kind": "combat_select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": {
+                "id": f"CARD.STRICT_UNIQUE_{index}",
+                "instance_uuid": f"physical-{index}",
+                "pile": "Discard",
+                "selection_membership": "selectable",
+            },
+        }
+        for index in range(257)
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"count=257 capacity=256 raw_count=257",
+    ):
+        encoder.encode(_observation(), actions)
 
 
 def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:

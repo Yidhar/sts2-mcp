@@ -28,7 +28,12 @@ from sts2_rl.contracts import (
     ResetRequest,
     StepRequest,
 )
-from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
+from sts2_rl.encoding import (
+    ActionReference,
+    EncodedDecisionSnapshot,
+    GroundedObservationEncoder,
+    SemanticActionGroup,
+)
 from sts2_rl.models import RecurrentCandidateModel
 
 from .seeding import (
@@ -96,6 +101,8 @@ class EpisodeMetrics:
     revival_free_run_win: bool
     player_hp_lost: float
     stall_evidence: dict[str, object] | None
+    maximum_observed_semantic_candidates: int = 0
+    maximum_equivalence_class_size: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +147,8 @@ class EpisodeProgress:
     selected_action_kinds: dict[str, int]
     last_selected_action_kind: str
     behavior_policy_version: int
+    maximum_observed_semantic_candidates: int = 0
+    maximum_equivalence_class_size: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +180,21 @@ class CollectorTimings:
 
 @dataclass(frozen=True, slots=True)
 class _ActionChoice:
-    action_index: int
+    """One model-space choice and its non-learned dispatch projection.
+
+    ``candidate_index`` is the index whose probability was sampled and is the
+    only index that may enter rollout/replay learning.  ``dispatch_position``
+    and ``dispatch_handle`` identify the representative raw backend action for
+    that semantic candidate.  They deliberately remain outside model tensors.
+    """
+
+    candidate_index: int
+    dispatch_position: int
+    dispatch_handle: str | None
+    equivalence_fingerprint: str | None
+    multiplicity: int
+    action_references: tuple[ActionReference, ...]
+    semantic_actions: tuple[Mapping[str, object], ...]
     behavior_log_probability: float
     valid_count: int
     snapshot: EncodedDecisionSnapshot
@@ -230,6 +253,70 @@ def _number(value: object, default: float = 0.0) -> float:
         return float(default)
 
 
+def _transaction_action_fingerprint(
+    selected_action: Mapping[str, object],
+    *,
+    equivalence_fingerprint: str | None,
+) -> str:
+    """Fingerprint the learned semantic action, never a chosen group member.
+
+    Strict action grouping supplies a fingerprint of the complete normalized
+    equivalence payload.  Falling back to the representative raw action keeps
+    pre-grouping/non-groupable decisions byte-for-byte compatible.
+    """
+
+    if equivalence_fingerprint is not None:
+        normalized = str(equivalence_fingerprint).strip()
+        if not normalized:
+            raise CollectionProtocolError(
+                "grouped candidate exposed an empty equivalence fingerprint"
+            )
+        return normalized
+    return semantic_action_fingerprint(selected_action)
+
+
+_SEMANTIC_ACTION_SURFACE_KIND = "strict_action_group"
+
+
+def _semantic_action_surface(
+    groups: tuple[SemanticActionGroup, ...],
+) -> tuple[Mapping[str, object], ...]:
+    """Return an order-stable, counted surface for diagnostics/transactions."""
+
+    return tuple(
+        {
+            "surface_kind": _SEMANTIC_ACTION_SURFACE_KIND,
+            "prototype": group.prototype,
+            "multiplicity": group.reference.multiplicity,
+            "equivalence_fingerprint": (
+                group.reference.equivalence_fingerprint
+            ),
+            "enabled": group.reference.enabled,
+        }
+        for group in groups
+    )
+
+
+def _semantic_action_prototype(
+    action: Mapping[str, object],
+) -> Mapping[str, object]:
+    if action.get("surface_kind") != _SEMANTIC_ACTION_SURFACE_KIND:
+        return action
+    prototype = action.get("prototype")
+    if not isinstance(prototype, Mapping):
+        raise CollectionProtocolError("semantic action group lost its prototype")
+    return prototype
+
+
+def _semantic_action_multiplicity(action: Mapping[str, object]) -> int:
+    if action.get("surface_kind") != _SEMANTIC_ACTION_SURFACE_KIND:
+        return 1
+    raw = action.get("multiplicity")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise CollectionProtocolError("semantic action group has invalid multiplicity")
+    return raw
+
+
 _TRANSACTION_SURFACE_FIELDS = (
     "mode",
     "prompt_id",
@@ -276,14 +363,19 @@ def _first_nonempty(value: Mapping[str, object], keys: tuple[str, ...]) -> objec
     return None
 
 
-def _transaction_option_identity(value: object) -> object:
-    """Return the stable physical identity of one selectable card.
+def _transaction_option_identity(
+    value: object,
+    *,
+    include_instance: bool = True,
+) -> object:
+    """Return a stable selectable-card identity.
 
     Card DTOs contain resolved cost, previews, UI ordinals and membership
     pseudo-zones.  None of those identifies the selectable *object*, and all of
-    them may change after a toggle.  This positive allowlist intentionally
-    retains only definition, concrete instance and physical source.  The
-    surrounding sorted tuple preserves duplicate-card multiplicity.
+    them may change after a toggle.  This positive allowlist retains definition
+    and physical source; callers may additionally retain concrete identity for
+    selected-membership tracking.  Option universes instead use counted strict
+    groups and deliberately omit arbitrary physical instance IDs.
     """
 
     if not isinstance(value, Mapping):
@@ -302,7 +394,7 @@ def _transaction_option_identity(value: object) -> object:
     identity: dict[str, object] = {
         "definition": str(definition).strip() if definition is not None else "<unknown>",
     }
-    if instance is not None:
+    if include_instance and instance is not None:
         identity["instance"] = str(instance).strip()
     if physical_source is not None:
         identity["physical_source"] = str(physical_source).strip()
@@ -313,9 +405,15 @@ def _selection_actions(
     legal_actions: tuple[Mapping[str, object], ...],
 ) -> tuple[Mapping[str, object], ...]:
     return tuple(
-        action
+        prototype
         for action in legal_actions
-        if str(action.get("model_action_kind") or "") == "card_selection"
+        if str(
+            (prototype := _semantic_action_prototype(action)).get(
+                "model_action_kind"
+            )
+            or ""
+        )
+        == "card_selection"
     )
 
 
@@ -351,34 +449,79 @@ def _transaction_option_universe(
     selection: Mapping[str, object],
     legal_actions: tuple[Mapping[str, object], ...],
 ) -> tuple[str, ...]:
-    """Return an order-independent, multiplicity-preserving option universe."""
+    """Return an order-independent, compact counted option universe."""
 
-    options = selection.get("options")
-    identities: list[object] = []
-    if isinstance(options, list | tuple) and options:
-        identities.extend(_transaction_option_identity(option) for option in options)
-    else:
-        # Simulator translation marks ``cards`` as the *currently selectable*
-        # membership, not as the complete physical universe. A toggle moves a
-        # card between that collection and ``selected_cards``, so the stable
-        # universe is their union. Some bridge DTOs also emit the explicit
-        # ``selectable_cards`` alias; when present it is authoritative and must
-        # replace, rather than duplicate, ``cards``.
-        selectable_field = "selectable_cards" if "selectable_cards" in selection else "cards"
-        for field in (selectable_field, "selected_cards"):
-            items = selection.get(field)
-            if isinstance(items, list | tuple):
-                identities.extend(_transaction_option_identity(item) for item in items)
-    if not identities:
+    counted: dict[str, tuple[object, int]] = {}
+
+    def add(identity: object, count: int = 1) -> None:
+        key = canonical_json(identity)
+        previous = counted.get(key)
+        counted[key] = (identity, count + (previous[1] if previous is not None else 0))
+
+    # Grouped legal actions are authoritative when they expose card-bearing
+    # select/deselect operations.  This keeps a 2,040-Wound prompt as one
+    # counted semantic option rather than embedding 2,040 physical instances
+    # into every transaction surface key.
+    for grouped_action in legal_actions:
+        action = _semantic_action_prototype(grouped_action)
+        if str(action.get("model_action_kind") or "") != "card_selection":
+            continue
+        variant = str(
+            action.get("selection_operation")
+            or action.get("model_action_variant")
+            or action.get("kind")
+            or ""
+        ).lower()
+        if "select" not in variant:
+            continue
+        card = action.get("card")
+        if isinstance(card, Mapping):
+            add(
+                _transaction_option_identity(card, include_instance=False),
+                _semantic_action_multiplicity(grouped_action),
+            )
+
+    if not counted:
+        options = selection.get("options")
+        if isinstance(options, list | tuple) and options:
+            for option in options:
+                add(_transaction_option_identity(option, include_instance=False))
+        else:
+            # Simulator translation marks ``cards`` as the *currently
+            # selectable* membership. A toggle moves a card between that
+            # collection and ``selected_cards``, so their union is stable.
+            selectable_field = (
+                "selectable_cards"
+                if "selectable_cards" in selection
+                else "cards"
+            )
+            for field in (selectable_field, "selected_cards"):
+                items = selection.get(field)
+                if isinstance(items, list | tuple):
+                    for item in items:
+                        add(
+                            _transaction_option_identity(
+                                item,
+                                include_instance=False,
+                            )
+                        )
+    if not counted:
         # Last-resort projection for legacy DTOs: use only card-bearing
         # selection candidates and erase the select/deselect membership role.
-        for action in legal_actions:
+        for grouped_action in legal_actions:
+            action = _semantic_action_prototype(grouped_action)
             if str(action.get("model_action_kind") or "") != "card_selection":
                 continue
             card = action.get("card")
             if isinstance(card, Mapping):
-                identities.append(_transaction_option_identity(card))
-    return tuple(sorted(canonical_json(identity) for identity in identities))
+                add(
+                    _transaction_option_identity(card, include_instance=False),
+                    _semantic_action_multiplicity(grouped_action),
+                )
+    return tuple(
+        canonical_json({"identity": identity, "multiplicity": count})
+        for _, (identity, count) in sorted(counted.items())
+    )
 
 
 def _transaction_surface_key(
@@ -476,6 +619,49 @@ def _transaction_selected_count(
             for option in options
         )
     return len(_transaction_selected_identities(observation, legal_actions))
+
+
+def _deadlock_semantic_observation(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> Mapping[str, object]:
+    """Remove duplicated physical selection surfaces from deadlock identity.
+
+    The complete strict action prototypes and their multiplicities are already
+    supplied separately to ``SemanticDeadlockDetector``.  Re-hashing raw
+    ``cards/options/available_actions`` would both retain arbitrary instance
+    ordering and turn a 2,040-copy prompt back into a 2,040-item diagnostic
+    surface.  Scalar prompt state and every non-selection world fact remain.
+    """
+
+    result = {
+        key: value
+        for key, value in observation.items()
+        if key not in {"available_actions", "legal_actions"}
+    }
+    raw_selection = observation.get("card_selection")
+    if not isinstance(raw_selection, Mapping):
+        return result
+    selection = {
+        key: value
+        for key, value in raw_selection.items()
+        if key
+        not in {
+            "cards",
+            "options",
+            "selectable_cards",
+            "selected_cards",
+        }
+    }
+    selection["semantic_option_universe"] = _transaction_option_universe(
+        raw_selection,
+        semantic_actions,
+    )
+    selection["semantic_selected_identities"] = (
+        _transaction_selected_identities(observation, semantic_actions)
+    )
+    result["card_selection"] = selection
+    return result
 
 
 def _transaction_node_key(
@@ -1831,8 +2017,17 @@ class GroundedCollector:
             raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
         if deterministic:
             selected = int(valid_indices[int(np.argmax(valid_policy))])
+            reference = encoded.action(selected)
             return _ActionChoice(
-                action_index=selected,
+                candidate_index=selected,
+                dispatch_position=reference.position,
+                dispatch_handle=reference.handle,
+                equivalence_fingerprint=reference.equivalence_fingerprint,
+                multiplicity=reference.multiplicity,
+                action_references=encoded.actions,
+                semantic_actions=_semantic_action_surface(
+                    encoded.semantic_groups
+                ),
                 behavior_log_probability=float(math.log(max(float(valid_policy.max() / policy_mass), 1e-30))),
                 valid_count=valid_count,
                 snapshot=encoded.snapshot,
@@ -1851,8 +2046,15 @@ class GroundedCollector:
         if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0):
             raise CollectionProtocolError("collector produced an invalid behavior policy")
         selected = int(self._rng.choice(len(behavior), p=behavior))
+        reference = encoded.action(selected)
         return _ActionChoice(
-            action_index=selected,
+            candidate_index=selected,
+            dispatch_position=reference.position,
+            dispatch_handle=reference.handle,
+            equivalence_fingerprint=reference.equivalence_fingerprint,
+            multiplicity=reference.multiplicity,
+            action_references=encoded.actions,
+            semantic_actions=_semantic_action_surface(encoded.semantic_groups),
             behavior_log_probability=float(math.log(max(float(behavior[selected]), 1e-30))),
             valid_count=valid_count,
             snapshot=encoded.snapshot,
@@ -1867,22 +2069,34 @@ class GroundedCollector:
         self,
         state: EnvironmentResult,
         *,
-        action_index: int,
+        dispatch_position: int,
+        dispatch_handle: str | None,
     ) -> tuple[EnvironmentResult, str]:
-        action = state.legal_actions[action_index]
+        if not 0 <= dispatch_position < len(state.legal_actions):
+            raise CollectionProtocolError(
+                "encoder dispatch position is outside the raw legal-action range: "
+                f"position={dispatch_position} count={len(state.legal_actions)}"
+            )
+        action = state.legal_actions[dispatch_position]
         handle_value = action.get("action_handle", action.get("action_id"))
-        handle = str(handle_value) if handle_value is not None and str(handle_value) else ""
+        raw_handle = str(handle_value) if handle_value is not None and str(handle_value) else ""
+        encoded_handle = str(dispatch_handle) if dispatch_handle is not None else ""
+        if encoded_handle and raw_handle and encoded_handle != raw_handle:
+            raise CollectionProtocolError(
+                "encoder dispatch handle disagrees with the representative raw action"
+            )
+        handle = encoded_handle or raw_handle
         request = StepRequest(
             request_id=str(uuid4()),
             session_id=self.backend.session_id,
             episode_id=state.episode_id,
             expected_step_index=state.step_index,
             action_id=handle or None,
-            action_index=None if handle else action_index,
+            action_index=None if handle else dispatch_position,
         )
         result = self.backend.step(request)
         self._validate_step_result(state, result)
-        return result, handle or f"index:{action_index}"
+        return result, handle or f"index:{dispatch_position}"
 
     def collect_episode(
         self,
@@ -1928,7 +2142,12 @@ class GroundedCollector:
         max_act, max_floor = _run_position(state.observation)
         policy_decisions = 0
         forced_decisions = 0
+        # Historical/checkpoint consumers interpret this field as the raw
+        # backend surface.  Keep that meaning explicit; semantic model width
+        # and strict-equivalence multiplicity are tracked separately below.
         maximum_observed_candidates = 0
+        maximum_observed_semantic_candidates = 0
+        maximum_equivalence_class_size = 0
         steps_taken = 0
         final_outcome = "ongoing"
         deadlocked = False
@@ -1996,11 +2215,23 @@ class GroundedCollector:
             timings.add("policy_forward", choice.policy_forward_ms)
             maximum_observed_candidates = max(
                 maximum_observed_candidates,
+                len(state.legal_actions),
+            )
+            maximum_observed_semantic_candidates = max(
+                maximum_observed_semantic_candidates,
                 choice.snapshot.candidate_count,
+            )
+            maximum_equivalence_class_size = max(
+                maximum_equivalence_class_size,
+                *(reference.multiplicity for reference in choice.action_references),
             )
             policy_decisions += int(choice.valid_count > 1)
             forced_decisions += int(choice.valid_count == 1)
-            selected_action = state.legal_actions[choice.action_index]
+            selected_action = state.legal_actions[choice.dispatch_position]
+            transaction_action_fingerprint = _transaction_action_fingerprint(
+                selected_action,
+                equivalence_fingerprint=choice.equivalence_fingerprint,
+            )
             last_selected_action_kind = str(
                 selected_action.get(
                     "model_action_kind",
@@ -2012,7 +2243,10 @@ class GroundedCollector:
                 selected_action_kind_counts.get(last_selected_action_kind, 0) + 1
             )
             current_transaction_surface = (
-                _transaction_surface_key(state.observation, state.legal_actions)
+                _transaction_surface_key(
+                    state.observation,
+                    choice.semantic_actions,
+                )
                 if transaction_enabled
                 else None
             )
@@ -2020,7 +2254,7 @@ class GroundedCollector:
                 _transaction_node_key(
                     current_transaction_surface,
                     state.observation,
-                    state.legal_actions,
+                    choice.semantic_actions,
                 )
                 if transaction_enabled
                 else ""
@@ -2042,22 +2276,44 @@ class GroundedCollector:
                     )
             deadlock_evidence = self.deadlock_detector.observe(
                 step_index=state.step_index,
-                observation=state.observation,
-                legal_actions=state.legal_actions,
-                selected_action=selected_action,
+                observation=_deadlock_semantic_observation(
+                    state.observation,
+                    choice.semantic_actions,
+                ),
+                legal_actions=choice.semantic_actions,
+                # The detector must follow the semantic action sampled by the
+                # policy, not the arbitrary physical representative used for
+                # backend dispatch.  In particular, a selection grid may
+                # reorder equal card instances after every toggle; hashing the
+                # raw representative would reintroduce card_index/instance
+                # churn and hide an otherwise exact select/deselect cycle.
+                selected_action=choice.semantic_actions[
+                    choice.candidate_index
+                ],
             )
             sim_step_started_ns = time.perf_counter_ns()
-            next_state, _ = self._step(state, action_index=choice.action_index)
+            next_state, _ = self._step(
+                state,
+                dispatch_position=choice.dispatch_position,
+                dispatch_handle=choice.dispatch_handle,
+            )
             timings.record("sim_step", sim_step_started_ns)
             steps_taken += 1
             if next_state.truncated:
                 raise CollectionProtocolError("transport/outcome-unknown truncation discarded before rollout")
+            next_action_groups = self.encoder.semantic_action_groups(
+                next_state.legal_actions
+            )
+            next_semantic_actions = _semantic_action_surface(next_action_groups)
             result_terminal = next_state.terminated or next_state.truncated
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
             deadlock_evidence = self.deadlock_detector.confirm_after_step(
                 deadlock_evidence,
-                observation=next_state.observation,
-                legal_actions=next_state.legal_actions,
+                observation=_deadlock_semantic_observation(
+                    next_state.observation,
+                    next_semantic_actions,
+                ),
+                legal_actions=next_semantic_actions,
             )
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
@@ -2068,6 +2324,15 @@ class GroundedCollector:
                 maximum_observed_candidates,
                 len(next_state.legal_actions),
             )
+            maximum_observed_semantic_candidates = max(
+                maximum_observed_semantic_candidates,
+                len(next_action_groups),
+            )
+            if next_action_groups:
+                maximum_equivalence_class_size = max(
+                    maximum_equivalence_class_size,
+                    max(group.multiplicity for group in next_action_groups),
+                )
             # Publish only fully validated environment steps.  The asynchronous
             # supervisor uses this monotonic count to distinguish valid but
             # unflushed tail steps from recurrent unrolls already emitted to
@@ -2141,7 +2406,7 @@ class GroundedCollector:
                 segment_steps.append(
                     RolloutStep(
                         snapshot=choice.snapshot,
-                        action_index=choice.action_index,
+                        action_index=choice.candidate_index,
                         behavior_log_probability=choice.behavior_log_probability,
                         reward=breakdown.reward,
                         discount=breakdown.discount,
@@ -2153,12 +2418,12 @@ class GroundedCollector:
                 episode_discounts.append(float(breakdown.discount))
                 next_transaction_surface = _transaction_surface_key(
                     next_state.observation,
-                    next_state.legal_actions,
+                    next_semantic_actions,
                 )
                 next_transaction_node = _transaction_node_key(
                     next_transaction_surface,
                     next_state.observation,
-                    next_state.legal_actions,
+                    next_semantic_actions,
                 )
                 effect, selected_count_delta = _classify_transaction_transition(
                     current_surface=current_transaction_surface,
@@ -2168,19 +2433,19 @@ class GroundedCollector:
                     seen_nodes=active_transaction_seen_nodes,
                     before_selected_count=_transaction_selected_count(
                         state.observation,
-                        state.legal_actions,
+                        choice.semantic_actions,
                     ),
                     after_selected_count=_transaction_selected_count(
                         next_state.observation,
-                        next_state.legal_actions,
+                        next_semantic_actions,
                     ),
                 )
                 factual_transaction_step = TransactionStep(
                     snapshot=choice.snapshot,
-                    action_index=choice.action_index,
+                    action_index=choice.candidate_index,
                     node_key=current_transaction_node,
                     next_node_key=next_transaction_node,
-                    action_fingerprint=semantic_action_fingerprint(selected_action),
+                    action_fingerprint=transaction_action_fingerprint,
                     effect=effect,
                     selected_count_delta=selected_count_delta,
                     transaction_return=None,
@@ -2269,11 +2534,35 @@ class GroundedCollector:
                     # every held-out decision.
                     "observation": state.observation,
                     "legal_actions": state.legal_actions,
-                    "selected_index": choice.action_index,
+                    # ``selected_index`` remains the learned/model index for
+                    # backward-compatible journal readers.  The explicit
+                    # fields below remove all ambiguity once strict grouping
+                    # makes that differ from the raw dispatch position.
+                    "selected_index": choice.candidate_index,
+                    "selected_candidate_index": choice.candidate_index,
+                    "selected_dispatch_index": choice.dispatch_position,
+                    "selected_action_multiplicity": choice.multiplicity,
+                    "selected_action_equivalence_fingerprint": (
+                        choice.equivalence_fingerprint
+                    ),
+                    "semantic_candidate_count": choice.snapshot.candidate_count,
+                    "raw_legal_action_count": len(state.legal_actions),
+                    "maximum_candidate_multiplicity": max(
+                        reference.multiplicity
+                        for reference in choice.action_references
+                    ),
                     "selected_action": selected_action,
                     "policy_topk": [
                         {
                             "index": index,
+                            "candidate_index": index,
+                            "dispatch_index": choice.action_references[index].position,
+                            "multiplicity": choice.action_references[
+                                index
+                            ].multiplicity,
+                            "equivalence_fingerprint": choice.action_references[
+                                index
+                            ].equivalence_fingerprint,
                             "probability": float(choice.policy[index]),
                         }
                         for index in ranked
@@ -2328,8 +2617,8 @@ class GroundedCollector:
                         state.legal_actions,
                         device="cpu",
                     ).snapshot
-                    maximum_observed_candidates = max(
-                        maximum_observed_candidates,
+                    maximum_observed_semantic_candidates = max(
+                        maximum_observed_semantic_candidates,
                         bootstrap_snapshot.candidate_count,
                     )
                     timings.record("bootstrap_encoding", bootstrap_started_ns)
@@ -2391,6 +2680,12 @@ class GroundedCollector:
                             selected_action_kinds=dict(sorted(selected_action_kind_counts.items())),
                             last_selected_action_kind=last_selected_action_kind,
                             behavior_policy_version=completed_unroll.policy_version,
+                            maximum_observed_semantic_candidates=(
+                                maximum_observed_semantic_candidates
+                            ),
+                            maximum_equivalence_class_size=(
+                                maximum_equivalence_class_size
+                            ),
                         )
                     )
                 segment_steps = []
@@ -2473,6 +2768,12 @@ class GroundedCollector:
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
                 stall_evidence=stall_evidence,
+                maximum_observed_semantic_candidates=(
+                    maximum_observed_semantic_candidates
+                ),
+                maximum_equivalence_class_size=(
+                    maximum_equivalence_class_size
+                ),
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,

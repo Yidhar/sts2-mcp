@@ -24,7 +24,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final, TextIO
 
-TRAJECTORY_JOURNAL_VERSION: Final = "sts2-trajectory-journal-v3"
+TRAJECTORY_JOURNAL_VERSION: Final = "sts2-trajectory-journal-v4"
 SEMANTIC_FINGERPRINT_VERSION: Final = "sts2-semantic-decision-v1"
 
 _DEFAULT_SNAPSHOT_INTERVAL: Final = 256
@@ -803,19 +803,28 @@ class TrajectoryJournal:
             for item in raw_topk:
                 if not isinstance(item, Mapping):
                     continue
-                index_value = item.get("index")
+                candidate_index = item.get("candidate_index", item.get("index"))
+                dispatch_index = item.get("dispatch_index", candidate_index)
                 candidate: Mapping[str, Any] | None = None
                 if (
-                    isinstance(index_value, int)
-                    and not isinstance(index_value, bool)
-                    and 0 <= index_value < len(legal_actions)
-                    and isinstance(legal_actions[index_value], Mapping)
+                    isinstance(dispatch_index, int)
+                    and not isinstance(dispatch_index, bool)
+                    and 0 <= dispatch_index < len(legal_actions)
+                    and isinstance(legal_actions[dispatch_index], Mapping)
                 ):
-                    candidate = legal_actions[index_value]
+                    candidate = legal_actions[dispatch_index]
                 topk_item: dict[str, Any] = {
-                    "index": _compact_scalar(index_value),
+                    # ``index`` remains the model candidate index for legacy
+                    # readers; explicit fields disambiguate it from backend
+                    # dispatch after strict action grouping.
+                    "index": _compact_scalar(candidate_index),
+                    "candidate_index": _compact_scalar(candidate_index),
+                    "dispatch_index": _compact_scalar(dispatch_index),
                     "probability": _compact_scalar(item.get("probability")),
                 }
+                for key in ("multiplicity", "equivalence_fingerprint"):
+                    if key in item:
+                        topk_item[key] = _compact_scalar(item.get(key))
                 if candidate is not None:
                     topk_item["action"] = _compact_action(candidate)
                     topk_item["action_fingerprint"] = semantic_action_fingerprint(candidate)
@@ -829,12 +838,33 @@ class TrajectoryJournal:
             "step_index": _compact_scalar(event.get("step_index")),
             "observation_summary": _compact_observation(observation),
             "legal_action_count": len(legal_actions),
+            "raw_legal_action_count": _compact_scalar(
+                event.get("raw_legal_action_count", len(legal_actions))
+            ),
+            "semantic_candidate_count": _compact_scalar(
+                event.get("semantic_candidate_count", len(legal_actions))
+            ),
+            "maximum_candidate_multiplicity": _compact_scalar(
+                event.get("maximum_candidate_multiplicity", 1)
+            ),
             "legal_action_kinds": dict(sorted(candidate_kinds.items())),
             "selected_index": _compact_scalar(event.get("selected_index")),
+            "selected_candidate_index": _compact_scalar(
+                event.get("selected_candidate_index", event.get("selected_index"))
+            ),
+            "selected_dispatch_index": _compact_scalar(
+                event.get("selected_dispatch_index", event.get("selected_index"))
+            ),
             "selected_action": _compact_action(selected_action),
             "selected_action_fingerprint": (semantic_action_fingerprint(selected_action) if selected_action else None),
             "policy_topk": policy_topk,
         }
+        for key in (
+            "selected_action_multiplicity",
+            "selected_action_equivalence_fingerprint",
+        ):
+            if key in event:
+                summary[key] = _compact_scalar(event.get(key))
         for key in (
             "value",
             "reward",

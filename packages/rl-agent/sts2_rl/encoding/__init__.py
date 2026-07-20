@@ -8,6 +8,7 @@ from .grounded import (
     EncodedDecisionSnapshot,
     GroundedEncodingConfig,
     GroundedObservationEncoder,
+    SemanticActionGroup,
     grounding_encoding_identity,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "EncodedDecisionSnapshot",
     "GroundedEncodingConfig",
     "GroundedObservationEncoder",
+    "SemanticActionGroup",
     "grounding_encoding_identity",
 ]
