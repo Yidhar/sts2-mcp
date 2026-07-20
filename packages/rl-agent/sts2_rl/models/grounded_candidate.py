@@ -492,10 +492,125 @@ class RecurrentCandidateOutput:
     candidate_embeddings: Tensor  # [B, A, D]
     policy_logits: Tensor  # [B, A], invalid candidates use dtype minimum
     value: Tensor  # [B]
+    # Candidate-independent state values at the three learning boundaries.
+    # ``value`` above remains the legacy online-V-trace ABI; these heads are
+    # deliberately separate so an episodic learner can supervise combat, Act,
+    # and full-run outcomes without silently changing the meaning of the
+    # existing target.
+    combat_task_value: Tensor  # [B]
+    act_task_value: Tensor  # [B]
+    run_task_value: Tensor  # [B]
+    # Expected non-negative future revival costs to the corresponding
+    # boundary.  These are state values, not policy penalties by themselves;
+    # the learner owns conditioning, advantages, and primary-task protection.
+    combat_revival_cost_value: Tensor  # [B]
+    act_revival_cost_value: Tensor  # [B]
+    run_revival_cost_value: Tensor  # [B]
     action_mask: Tensor  # [B, A] bool
     candidate_effect_logits: Tensor | None = None  # [B, A, 4]
     selection_delta_logits: Tensor | None = None  # [B, A, 3]
     transaction_q_values: Tensor | None = None  # [B, A]
+
+    def validate(self, config: GroundedCandidateConfig) -> tuple[int, int]:
+        """Validate the complete model-output ABI and return ``(B, A)``.
+
+        The value heads are intentionally validated independently instead of
+        being stacked into a positional tensor.  This keeps their horizon
+        semantics explicit at every learner call site and prevents an index
+        mix-up from silently training the wrong target.
+        """
+
+        _require_rank("output.state_embedding", self.state_embedding, 2)
+        batch_size, model_dim = self.state_embedding.shape
+        if batch_size <= 0:
+            raise ValueError("output batch size must be positive")
+        if model_dim != config.d_model:
+            raise ValueError(
+                "output.state_embedding last dimension must equal " f"d_model={config.d_model}, got {model_dim}"
+            )
+        _require_shape(
+            "output.world_latents",
+            self.world_latents,
+            (batch_size, config.latent_slots, config.d_model),
+        )
+        _require_shape(
+            "output.recurrent_state",
+            self.recurrent_state,
+            (batch_size, config.recurrent_hidden_dim),
+        )
+        _require_rank("output.candidate_embeddings", self.candidate_embeddings, 3)
+        candidate_batch, action_count, candidate_dim = self.candidate_embeddings.shape
+        if candidate_batch != batch_size or candidate_dim != config.d_model:
+            raise ValueError(
+                "output.candidate_embeddings must have shape "
+                f"[B, A, {config.d_model}], got {tuple(self.candidate_embeddings.shape)}"
+            )
+        candidate_shape = (batch_size, action_count)
+        _require_shape("output.policy_logits", self.policy_logits, candidate_shape)
+        _require_shape("output.action_mask", self.action_mask, candidate_shape)
+        _require_bool("output.action_mask", self.action_mask)
+
+        floating_outputs = (
+            ("world_latents", self.world_latents),
+            ("state_embedding", self.state_embedding),
+            ("recurrent_state", self.recurrent_state),
+            ("candidate_embeddings", self.candidate_embeddings),
+            ("policy_logits", self.policy_logits),
+        )
+        for name, value in floating_outputs:
+            _require_finite_floating(f"output.{name}", value)
+            _require_same_device(f"output.{name}", self.state_embedding, value)
+        _require_same_device("output.action_mask", self.state_embedding, self.action_mask)
+
+        for name, value in (
+            ("value", self.value),
+            ("combat_task_value", self.combat_task_value),
+            ("act_task_value", self.act_task_value),
+            ("run_task_value", self.run_task_value),
+            ("combat_revival_cost_value", self.combat_revival_cost_value),
+            ("act_revival_cost_value", self.act_revival_cost_value),
+            ("run_revival_cost_value", self.run_revival_cost_value),
+        ):
+            _require_shape(f"output.{name}", value, (batch_size,))
+            _require_finite_floating(f"output.{name}", value)
+            _require_same_device(f"output.{name}", self.state_embedding, value)
+
+        for name, value in (
+            ("combat_revival_cost_value", self.combat_revival_cost_value),
+            ("act_revival_cost_value", self.act_revival_cost_value),
+            ("run_revival_cost_value", self.run_revival_cost_value),
+        ):
+            if bool((value < 0.0).any().item()):
+                raise ValueError(f"output.{name} must be non-negative")
+
+        for name, optional_value, shape in (
+            (
+                "candidate_effect_logits",
+                self.candidate_effect_logits,
+                (batch_size, action_count, TRANSACTION_EFFECT_COUNT),
+            ),
+            (
+                "selection_delta_logits",
+                self.selection_delta_logits,
+                (batch_size, action_count, SELECTION_DELTA_COUNT),
+            ),
+            (
+                "transaction_q_values",
+                self.transaction_q_values,
+                candidate_shape,
+            ),
+        ):
+            if optional_value is None:
+                continue
+            _require_shape(f"output.{name}", optional_value, shape)
+            _require_finite_floating(f"output.{name}", optional_value)
+            _require_same_device(
+                f"output.{name}",
+                self.state_embedding,
+                optional_value,
+            )
+
+        return batch_size, action_count
 
     def policy_probabilities(self) -> Tensor:
         """Return float32 masked probabilities; all-invalid rows are all zero.
@@ -751,6 +866,16 @@ class RecurrentCandidateModel(nn.Module):
         self.policy_feature_norm = nn.LayerNorm(cfg.d_model)
         self.policy_head = self._scalar_head(cfg.d_model)
         self.value_head = self._scalar_head(cfg.recurrent_hidden_dim)
+        # Keep the legacy value head intact and add independent state heads for
+        # completed-combat, completed-Act, and completed-run supervision.  The
+        # separation is structural only: no game identity or hand-written rule
+        # enters these generic boundary-value estimators.
+        self.combat_task_value_head = self._scalar_head(cfg.recurrent_hidden_dim)
+        self.act_task_value_head = self._scalar_head(cfg.recurrent_hidden_dim)
+        self.run_task_value_head = self._scalar_head(cfg.recurrent_hidden_dim)
+        self.combat_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
+        self.act_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
+        self.run_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
         if enable_transaction_heads:
             self.candidate_effect_head: nn.Module | None = self._categorical_head(
                 cfg.d_model,
@@ -779,6 +904,24 @@ class RecurrentCandidateModel(nn.Module):
             nn.Linear(input_dim, input_dim),
             nn.GELU(),
             nn.Linear(input_dim, 1),
+        )
+
+    @staticmethod
+    def _nonnegative_scalar_head(input_dim: int) -> nn.Sequential:
+        """Smooth non-negative state-cost estimator.
+
+        Revival-count targets cannot be negative.  Encoding that support in
+        the final activation avoids impossible negative predictions while
+        preserving gradients near zero; it does not impose any hand-authored
+        trade-off against the primary task.
+        """
+
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, 1),
+            nn.Softplus(),
         )
 
     @staticmethod
@@ -1114,18 +1257,27 @@ class RecurrentCandidateModel(nn.Module):
             )
             transaction_q_values = transaction_q_values.masked_fill(~mask, 0.0)
 
-        return RecurrentCandidateOutput(
+        output = RecurrentCandidateOutput(
             world_latents=world.latents,
             state_embedding=world.state_embedding,
             recurrent_state=next_recurrent_state,
             candidate_embeddings=policy_features,
             policy_logits=policy_logits,
             value=self.value_head(next_recurrent_state).squeeze(-1),
+            combat_task_value=self.combat_task_value_head(next_recurrent_state).squeeze(-1),
+            act_task_value=self.act_task_value_head(next_recurrent_state).squeeze(-1),
+            run_task_value=self.run_task_value_head(next_recurrent_state).squeeze(-1),
+            combat_revival_cost_value=self.combat_revival_cost_value_head(next_recurrent_state).squeeze(-1),
+            act_revival_cost_value=self.act_revival_cost_value_head(next_recurrent_state).squeeze(-1),
+            run_revival_cost_value=self.run_revival_cost_value_head(next_recurrent_state).squeeze(-1),
             action_mask=mask,
             candidate_effect_logits=candidate_effect_logits,
             selection_delta_logits=selection_delta_logits,
             transaction_q_values=transaction_q_values,
         )
+        if validate:
+            output.validate(self.config)
+        return output
 
 
 __all__ = [

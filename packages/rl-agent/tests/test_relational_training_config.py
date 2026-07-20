@@ -16,13 +16,14 @@ from sts2_rl.training import (
     load_training_config,
     training_config_from_mapping,
 )
+from sts2_rl.training.config import EpisodicLearningConfig
 
 
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v4"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v5"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -32,6 +33,22 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
     assert preheat.transaction_learning.completion_policy_weight == 0.25
+    assert not default.episodic_learning.enabled
+    assert not combat.episodic_learning.enabled
+    assert preheat.episodic_learning.enabled
+    assert preheat.episodic_learning.sample_sequences == 2
+    assert preheat.episodic_learning.burn_in_steps == 32
+    assert preheat.episodic_learning.learn_steps == 32
+    assert preheat.episodic_learning.primary_success_tie_tolerance == 0.05
+    assert (
+        preheat.episodic_learning.sample_sequences
+        * preheat.episodic_learning.learn_steps
+        == preheat.rollout.unroll_length * preheat.optimization.batch_unrolls
+        == 64
+    )
+    assert preheat.episodic_learning.per_episode_capacity_bytes <= (
+        preheat.episodic_learning.replay_capacity_bytes
+    )
     assert preheat.environment.scenario == "full-run"
     assert preheat.curriculum.reward_objective == "run"
     assert preheat.environment.encounter_id is None
@@ -51,14 +68,19 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.diagnostics.combat_net_progress_window == 256
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
-    assert preheat.runtime.log_dir.endswith("v14-transaction-liveness-terminal-fix")
-    assert preheat.runtime.checkpoint_dir.endswith("v14-transaction-liveness-terminal-fix")
+    assert preheat.runtime.log_dir.endswith("v16-episodic-long-credit")
+    assert preheat.runtime.checkpoint_dir.endswith("v16-episodic-long-credit")
     assert preheat.runtime.checkpoint_interval_steps == 10_000
-    assert "transaction-liveness-terminal-fix" in preheat.runtime.log_dir
-    assert "transaction-liveness-terminal-fix" in preheat.runtime.checkpoint_dir
+    assert "episodic-long-credit" in preheat.runtime.log_dir
+    assert "episodic-long-credit" in preheat.runtime.checkpoint_dir
+    assert default.runtime.log_dir.endswith("v9-long-horizon-heads")
+    assert default.runtime.checkpoint_dir.endswith("v9-long-horizon-heads")
+    assert combat.runtime.log_dir.endswith("v7-long-horizon-heads")
+    assert combat.runtime.checkpoint_dir.endswith("v7-long-horizon-heads")
     assert default.runtime.evaluation_steps == (0, 10_000, 25_000, 50_000)
     mapping = default.to_mapping()
     assert "rollout" in mapping
+    assert "episodic_learning" in mapping
     assert "replay" not in mapping
     assert "q_weight" not in mapping["optimization"]
     assert "reward_weight" not in mapping["optimization"]
@@ -162,3 +184,41 @@ def test_unknown_replay_section_is_rejected() -> None:
     payload["replay"] = {"capacity": 100_000}
     with pytest.raises(ValueError, match="unknown training config sections"):
         training_config_from_mapping(payload)
+
+
+def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
+    config = EpisodicLearningConfig(enabled=True)
+    assert config.replay_capacity_episodes == 64
+    assert config.sample_sequences * config.learn_steps == 64
+    with pytest.raises(TypeError, match="enabled must be a boolean"):
+        EpisodicLearningConfig(enabled=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="per_episode_capacity_bytes"):
+        EpisodicLearningConfig(
+            replay_capacity_bytes=1024,
+            per_episode_capacity_bytes=2048,
+        )
+    with pytest.raises(ValueError, match="secondary_advantage_fraction"):
+        EpisodicLearningConfig(secondary_advantage_fraction=1.01)
+    with pytest.raises(ValueError, match="primary_success_tie_tolerance"):
+        EpisodicLearningConfig(primary_success_tie_tolerance=0.51)
+    with pytest.raises(ValueError, match="importance_ratio_clip"):
+        EpisodicLearningConfig(importance_ratio_clip=0.0)
+    with pytest.raises(ValueError, match="task_value_weight"):
+        EpisodicLearningConfig(task_value_weight=float("nan"))
+
+
+def test_missing_episodic_section_uses_disabled_compatibility_defaults() -> None:
+    payload = TrainingConfig().to_mapping()
+    payload.pop("episodic_learning")
+    parsed = training_config_from_mapping(payload)
+    assert parsed.episodic_learning == EpisodicLearningConfig()
+    assert not parsed.episodic_learning.enabled
+
+
+def test_episodic_learning_contract_is_part_of_lineage_identity() -> None:
+    base = TrainingConfig()
+    enabled = replace(
+        base,
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    assert enabled.lineage_mapping() != base.lineage_mapping()

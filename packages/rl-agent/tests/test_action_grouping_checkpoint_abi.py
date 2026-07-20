@@ -245,7 +245,7 @@ def _validated_metadata(
         root=tmp_path,
         manifest={},
         metadata={
-            "format": "sts2-recurrent-vtrace-checkpoint-v3",
+            "format": "sts2-recurrent-vtrace-checkpoint-v4",
             "model_config": asdict(config.model.to_model_config()),
             "encoding_contract": encoding,
             "model_state_spec": {},

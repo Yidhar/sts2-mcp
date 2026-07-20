@@ -84,6 +84,20 @@ def test_queue_snapshot_restore_preserves_order() -> None:
     assert restored.get_batch(4, minimum=2) == payload
 
 
+def test_queue_restore_readiness_checks_empty_and_open_under_its_lock() -> None:
+    queue = BoundedRolloutQueue(2)
+    queue.validate_restore_ready()
+
+    queue.put(_unroll(5))
+    with pytest.raises(RuntimeError, match="empty"):
+        queue.validate_restore_ready()
+    queue.get_batch(1, minimum=1)
+
+    queue.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        queue.validate_restore_ready()
+
+
 def test_unroll_requires_bootstrap_exactly_for_continuing_sequence() -> None:
     snapshot = _snapshot()
     step = RolloutStep(

@@ -36,6 +36,13 @@ from sts2_rl.encoding import (
 )
 from sts2_rl.models import RecurrentCandidateModel
 
+from .episode_replay import (
+    BoundaryOutcome,
+    CompletedEpisode,
+    EpisodeCompletion,
+    EpisodeDecisionStep,
+    backfill_completed_episode,
+)
 from .seeding import (
     EVALUATION_SEED_PARITY,
     SIGNED_INT32_MAX,
@@ -103,6 +110,12 @@ class EpisodeMetrics:
     stall_evidence: dict[str, object] | None
     maximum_observed_semantic_candidates: int = 0
     maximum_equivalence_class_size: int = 0
+    # Cumulative efficiency counters at successful, real Act boundaries.  The
+    # tuples are ordered by completed Act and deliberately exclude the
+    # bootstrap act-0 -> act-1 transition.  Defaults keep archived metrics and
+    # focused tests source-compatible.
+    act_revival_counts: tuple[int, ...] = ()
+    act_hp_loss_counts: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +126,7 @@ class CollectedEpisode:
     behavior_policy_version: int
     timings: CollectorTimings | None = None
     transaction_traces: tuple[TransactionTrace, ...] = ()
+    completed_episode: CompletedEpisode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,6 +780,68 @@ def _run_position(observation: Mapping[str, object]) -> tuple[int, int]:
 def _combat_in_progress(observation: Mapping[str, object]) -> bool:
     combat = observation.get("combat")
     return bool(isinstance(combat, Mapping) and combat.get("in_progress") is True)
+
+
+def _episodic_combat_boundary(
+    *,
+    was_active: bool,
+    is_active: bool,
+    transition_facts: Mapping[str, object],
+    authoritative_run_result: str | None,
+    episode_censored: bool,
+) -> BoundaryOutcome:
+    """Classify a factual combat horizon without treating revival as exit.
+
+    Native revival keeps ``combat.in_progress`` true.  That observable state
+    has priority over any incidental result string and therefore never closes
+    a combat horizon.  In a full run the bridge normally emits
+    ``combat_result=victory`` on a true -> false transition.  The explicit
+    state transition remains a documented success fallback because older
+    bridge revisions did not emit that mid-run fact.
+    """
+
+    if not was_active:
+        return BoundaryOutcome.NONE
+    if authoritative_run_result == "defeat":
+        return BoundaryOutcome.FAILED
+    if is_active:
+        return BoundaryOutcome.CENSORED if episode_censored else BoundaryOutcome.NONE
+
+    combat_result = transition_facts.get("combat_result", "none")
+    if combat_result in {"defeat", "escaped"}:
+        return BoundaryOutcome.FAILED
+    if combat_result not in {None, "none", "victory"}:
+        raise CollectionProtocolError(
+            f"unsupported typed combat_result for episodic replay: {combat_result!r}"
+        )
+    # A mid-run active -> inactive transition is a factual completed combat,
+    # even when an older bridge omitted its explicit result.  A terminal run
+    # victory is the same final-combat success fallback.
+    return BoundaryOutcome.SUCCEEDED
+
+
+def _episodic_act_boundary(
+    *,
+    before_act: int,
+    after_act: int,
+    authoritative_run_result: str | None,
+    episode_censored: bool,
+) -> BoundaryOutcome:
+    """Classify the Act containing the pre-action decision."""
+
+    # Terminal DTOs may omit the run block and consequently decode as act 0;
+    # typed full-run outcome remains authoritative in that case.
+    if after_act > before_act:
+        return BoundaryOutcome.SUCCEEDED
+    if authoritative_run_result == "victory":
+        return BoundaryOutcome.SUCCEEDED
+    if authoritative_run_result == "defeat":
+        return BoundaryOutcome.FAILED
+    if after_act < before_act:
+        raise CollectionProtocolError(
+            "non-terminal full-run transition regressed its Act index"
+        )
+    return BoundaryOutcome.CENSORED if episode_censored else BoundaryOutcome.NONE
 
 
 def _enemy_hp_totals(observation: Mapping[str, object]) -> tuple[float, float]:
@@ -1642,6 +1718,7 @@ class GroundedCollector:
         training_revival_budget: int | None = None,
         horizon_as_failure: bool = False,
         transaction_burn_in_steps: int | None = None,
+        episodic_learning_enabled: bool = False,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -1672,6 +1749,14 @@ class GroundedCollector:
             or transaction_burn_in_steps < 0
         ):
             raise ValueError("transaction_burn_in_steps must be non-negative or null")
+        if not isinstance(episodic_learning_enabled, bool):
+            raise TypeError("episodic_learning_enabled must be a boolean")
+        if episodic_learning_enabled and (
+            scenario != "full-run" or objective != "run"
+        ):
+            raise ValueError(
+                "episodic learning requires the full-run scenario and run objective"
+            )
         if isinstance(journal_policy_topk, bool) or not isinstance(journal_policy_topk, int):
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
@@ -1714,6 +1799,7 @@ class GroundedCollector:
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
         self.transaction_burn_in_steps = transaction_burn_in_steps
+        self.episodic_learning_enabled = episodic_learning_enabled
         if self.revival_relic_id is not None and self.revival_relic_id not in {
             item.upper() for item in self.additional_relics
         }:
@@ -2119,6 +2205,10 @@ class GroundedCollector:
             raise ValueError("policy_version must be non-negative")
         if not isinstance(journal_episode_id_prefix, str):
             raise TypeError("journal_episode_id_prefix must be a string")
+        if record and evaluation_seed is not None:
+            raise ValueError(
+                "recorded training collection cannot use a held-out evaluation seed"
+            )
         episode_limit = self.max_episode_steps
         if maximum_steps is not None:
             if isinstance(maximum_steps, bool) or not isinstance(maximum_steps, int):
@@ -2197,6 +2287,21 @@ class GroundedCollector:
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
         last_task_terminal = False
+        # Complete-run replay is collected independently of fixed unroll
+        # streaming.  These are immutable CPU snapshots, never recurrent
+        # hidden tensors or autograd graphs.
+        episodic_enabled = bool(
+            record
+            and self.episodic_learning_enabled
+            and self.objective == "run"
+        )
+        episodic_steps: list[EpisodeDecisionStep] = []
+        next_combat_identity = 0
+        active_combat_id: str | None = None
+        if episodic_enabled and combat_in_progress:
+            active_combat_id = f"combat:{next_combat_identity}"
+            next_combat_identity += 1
+        act_boundary_efficiency: dict[int, tuple[int, float]] = {}
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -2205,6 +2310,13 @@ class GroundedCollector:
                 raise CollectionProtocolError(
                     f"episode={state.episode_id!r} step={state.step_index} returned zero legal actions"
                 )
+            pre_action_act, _ = _run_position(state.observation)
+            pre_action_combat = _combat_in_progress(state.observation)
+            if episodic_enabled and pre_action_combat != (active_combat_id is not None):
+                raise RuntimeError("episodic combat identity drifted from the factual state")
+            step_combat_id = active_combat_id
+            revivals_before_step = revivals_used
+            hp_loss_before_step = player_hp_lost
             choice = self._choose_action(
                 state,
                 recurrent_state,
@@ -2402,6 +2514,79 @@ class GroundedCollector:
             player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
             deadlocked = breakdown.outcome == "deadlock"
+            after_action_act, _ = _run_position(next_state.observation)
+            transition_facts = next_state.transition.facts
+            typed_run_result = transition_facts.get("run_result")
+            authoritative_run_result = (
+                str(typed_run_result)
+                if (
+                    self.scenario == "full-run"
+                    and next_state.terminated
+                    and typed_run_result in {"victory", "defeat"}
+                )
+                else None
+            )
+            episode_censored = bool(
+                forced_horizon
+                or (breakdown.task_terminal and authoritative_run_result is None)
+            )
+            combat_boundary = _episodic_combat_boundary(
+                was_active=pre_action_combat,
+                is_active=next_combat_in_progress,
+                transition_facts=transition_facts,
+                authoritative_run_result=authoritative_run_result,
+                episode_censored=episode_censored,
+            )
+            act_boundary = _episodic_act_boundary(
+                before_act=pre_action_act,
+                after_act=after_action_act,
+                authoritative_run_result=authoritative_run_result,
+                episode_censored=episode_censored,
+            )
+            if act_boundary is BoundaryOutcome.SUCCEEDED:
+                completed_acts: tuple[int, ...]
+                if after_action_act > pre_action_act:
+                    completed_acts = tuple(range(pre_action_act, after_action_act))
+                else:
+                    # A typed run victory closes the final Act without
+                    # requiring a synthetic act+1 terminal observation.
+                    completed_acts = (pre_action_act,)
+                for completed_act in completed_acts:
+                    if completed_act >= 1:
+                        act_boundary_efficiency.setdefault(
+                            completed_act,
+                            (revivals_used, player_hp_lost),
+                        )
+            if episodic_enabled:
+                episodic_steps.append(
+                    EpisodeDecisionStep(
+                        snapshot=choice.snapshot,
+                        step_index=len(episodic_steps),
+                        action_index=choice.candidate_index,
+                        behavior_log_probability=choice.behavior_log_probability,
+                        policy_decision=choice.valid_count > 1,
+                        policy_version=segment_policy_version,
+                        act=pre_action_act,
+                        combat_id=step_combat_id,
+                        # Long-horizon primary credit excludes every
+                        # efficiency/pace shaping term by construction.
+                        task_reward=float(
+                            breakdown.terminal_reward + breakdown.progress_reward
+                        ),
+                        discount=breakdown.discount,
+                        revivals_before=revivals_before_step,
+                        revivals_after=revivals_used,
+                        hp_loss_before=hp_loss_before_step,
+                        hp_loss_after=player_hp_lost,
+                        combat_boundary=combat_boundary,
+                        act_boundary=act_boundary,
+                    )
+                )
+                if pre_action_combat and not next_combat_in_progress:
+                    active_combat_id = None
+                elif not pre_action_combat and next_combat_in_progress:
+                    active_combat_id = f"combat:{next_combat_identity}"
+                    next_combat_identity += 1
             if record:
                 segment_steps.append(
                     RolloutStep(
@@ -2728,6 +2913,44 @@ class GroundedCollector:
                 raise CollectionProtocolError(
                     "typed terminal result disagrees with the reward outcome"
                 )
+        resolved_terminal_reason = (
+            "combat_progress_stall"
+            if combat_progress_stalled
+            else "noncombat_progress_stall"
+            if noncombat_progress_stalled
+            else "semantic_deadlock"
+            if deadlocked
+            else "curriculum_horizon"
+            if curriculum_horizon and self.horizon_as_failure
+            else "collection_budget"
+            if forced_horizon
+            else state.terminal_reason
+        )
+        completed_episode: CompletedEpisode | None = None
+        if episodic_enabled:
+            if not episodic_steps:  # reset validation and a positive horizon make this unreachable
+                raise RuntimeError("run episode ended without an accepted episodic decision")
+            typed_run_result = terminal_facts.get("run_result")
+            authoritative_run_outcome = bool(
+                state.terminated and typed_run_result in {"victory", "defeat"}
+            )
+            completion = EpisodeCompletion(
+                authoritative=authoritative_run_outcome,
+                won=(typed_run_result == "victory") if authoritative_run_outcome else None,
+                final_revivals=revivals_used,
+                final_hp_loss=player_hp_lost,
+                terminal_reason=str(resolved_terminal_reason or "censored_run"),
+            )
+            completed_episode = backfill_completed_episode(
+                episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                steps=tuple(episodic_steps),
+                completion=completion,
+                data_partition="training",
+            )
+        ordered_act_efficiency = tuple(
+            act_boundary_efficiency[act]
+            for act in sorted(act_boundary_efficiency)
+        )
         return CollectedEpisode(
             unrolls=tuple(unrolls),
             metrics=EpisodeMetrics(
@@ -2735,19 +2958,7 @@ class GroundedCollector:
                 reset_seed=reset_seed,
                 steps=steps_taken,
                 reward_total=reward_total,
-                terminal_reason=(
-                    "combat_progress_stall"
-                    if combat_progress_stalled
-                    else "noncombat_progress_stall"
-                    if noncombat_progress_stalled
-                    else "semantic_deadlock"
-                    if deadlocked
-                    else "curriculum_horizon"
-                    if curriculum_horizon and self.horizon_as_failure
-                    else "collection_budget"
-                    if forced_horizon
-                    else state.terminal_reason
-                ),
+                terminal_reason=resolved_terminal_reason,
                 truncated=forced_horizon,
                 run_won=run_won,
                 combat_won=combat_won,
@@ -2764,7 +2975,10 @@ class GroundedCollector:
                 maximum_noncombat_no_durable_progress_steps=(maximum_noncombat_no_durable_progress_steps),
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
-                revival_free_act1_clear=bool(max_act >= 2 and revivals_used == 0),
+                revival_free_act1_clear=bool(
+                    1 in act_boundary_efficiency
+                    and act_boundary_efficiency[1][0] == 0
+                ),
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
                 stall_evidence=stall_evidence,
@@ -2774,11 +2988,14 @@ class GroundedCollector:
                 maximum_equivalence_class_size=(
                     maximum_equivalence_class_size
                 ),
+                act_revival_counts=tuple(item[0] for item in ordered_act_efficiency),
+                act_hp_loss_counts=tuple(item[1] for item in ordered_act_efficiency),
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,
             timings=timings.snapshot(),
             transaction_traces=transaction_traces,
+            completed_episode=completed_episode,
         )
 
 

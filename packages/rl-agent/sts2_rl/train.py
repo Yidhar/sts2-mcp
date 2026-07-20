@@ -1,4 +1,4 @@
-"""CLI entrypoint for the recurrent V-trace v2 baseline."""
+"""CLI entrypoint for the recurrent V-trace v4 baseline."""
 
 from __future__ import annotations
 
@@ -59,7 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", help="exact baseline checkpoint directory")
     parser.add_argument(
         "--initialize-from",
-        help="same-ABI v2 checkpoint model for a new profile/horizon lineage",
+        help=(
+            "compatible atomic checkpoint model for a fresh lineage; "
+            "never exact resume"
+        ),
     )
     parser.add_argument(
         "--dry-run",

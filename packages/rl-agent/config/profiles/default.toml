@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v4"
+version = "sts2-relational-curriculum-config-v5"
 profile = "default"
 
 [model]
@@ -60,6 +60,25 @@ pairwise_margin = 0.10
 minimum_return_gap = 0.0
 maximum_pairs = 256
 
+[episodic_learning]
+# Complete episodes provide long-horizon labels while GPU autograd remains
+# bounded to sample_sequences x learn_steps; burn-in is always no-grad.
+enabled = false
+replay_capacity_episodes = 64
+replay_capacity_bytes = 2147483648
+per_episode_capacity_bytes = 536870912
+max_segments_per_episode = 8
+sample_sequences = 2
+burn_in_steps = 32
+learn_steps = 32
+primary_policy_weight = 0.25
+task_value_weight = 0.25
+revival_value_weight = 0.10
+revival_policy_weight = 0.05
+secondary_advantage_fraction = 0.25
+primary_success_tie_tolerance = 0.05
+importance_ratio_clip = 1.0
+
 [environment]
 backend = "headless"
 scenario = "full-run"
@@ -77,8 +96,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 1000000
 seed = 0
-log_dir = "runs/recurrent-vtrace-v8-counted-card-multiset"
-checkpoint_dir = "checkpoints/recurrent-vtrace-v8-counted-card-multiset"
+log_dir = "runs/recurrent-vtrace-v9-long-horizon-heads"
+checkpoint_dir = "checkpoints/recurrent-vtrace-v9-long-horizon-heads"
 checkpoint_interval_steps = 25000
 evaluation_steps = [0, 10000, 25000, 50000]
 evaluation_episodes = 20

@@ -15,6 +15,7 @@ from uuid import uuid4
 import torch
 
 from sts2_baseline import (
+    SequenceUnroll,
     revival_efficiency_reward_identity,
     task_reward_identity,
 )
@@ -104,8 +105,23 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "revival_free_combat_win_rate": 0.0,
             "revival_free_act1_clear_rate": 0.0,
             "revival_free_run_win_rate": 0.0,
+            "act1_clear_at_most_one_revival_rate": 0.0,
+            "run_win_at_most_one_revival_count": 0,
+            "run_win_at_most_one_revival_rate": 0.0,
+            "successful_run_count": 0,
+            "successful_run_mean_revivals": 0.0,
+            "successful_run_mean_hp_lost": 0.0,
+            "act1_boundary_count": 0,
+            "act1_boundary_mean_revivals": 0.0,
+            "act1_boundary_mean_hp_lost": 0.0,
         }
     count = len(episodes)
+    successful_runs = [item for item in episodes if item.run_won]
+    act1_boundaries = [
+        (item.act_revival_counts[0], item.act_hp_loss_counts[0])
+        for item in episodes
+        if item.act_revival_counts and item.act_hp_loss_counts
+    ]
     return {
         "episodes": count,
         "act1_clear_count": sum(item.act1_cleared for item in episodes),
@@ -145,6 +161,45 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         ),
         "revival_free_run_win_rate": (
             sum(item.revival_free_run_win for item in episodes) / count
+        ),
+        # Completion remains the primary denominator.  Efficiency metrics do
+        # not award an early loss merely because it spent fewer revivals.
+        "act1_clear_at_most_one_revival_rate": (
+            sum(
+                bool(item.act_revival_counts)
+                and item.act_revival_counts[0] <= 1
+                for item in episodes
+            )
+            / count
+        ),
+        "run_win_at_most_one_revival_count": sum(
+            item.run_won and item.revivals_used <= 1 for item in episodes
+        ),
+        "run_win_at_most_one_revival_rate": (
+            sum(item.run_won and item.revivals_used <= 1 for item in episodes)
+            / count
+        ),
+        "successful_run_count": len(successful_runs),
+        "successful_run_mean_revivals": (
+            statistics.fmean(item.revivals_used for item in successful_runs)
+            if successful_runs
+            else 0.0
+        ),
+        "successful_run_mean_hp_lost": (
+            statistics.fmean(item.player_hp_lost for item in successful_runs)
+            if successful_runs
+            else 0.0
+        ),
+        "act1_boundary_count": len(act1_boundaries),
+        "act1_boundary_mean_revivals": (
+            statistics.fmean(item[0] for item in act1_boundaries)
+            if act1_boundaries
+            else 0.0
+        ),
+        "act1_boundary_mean_hp_lost": (
+            statistics.fmean(item[1] for item in act1_boundaries)
+            if act1_boundaries
+            else 0.0
         ),
     }
 
@@ -295,7 +350,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     return {
         "config_version": config.version,
         "profile": config.profile,
-        "pipeline": "bounded-fifo-async-vtrace-v3",
+        "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
         "collector_device": config.runtime.collector_device,
         "architecture": config.model.architecture,
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
@@ -316,6 +371,35 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
                 config.transaction_learning.pairwise_ranking_weight
             ),
         },
+        "episodic_learning": {
+            "enabled": config.episodic_learning.enabled,
+            "replay_capacity_episodes": (
+                config.episodic_learning.replay_capacity_episodes
+            ),
+            "replay_capacity_bytes": config.episodic_learning.replay_capacity_bytes,
+            "per_episode_capacity_bytes": (
+                config.episodic_learning.per_episode_capacity_bytes
+            ),
+            "sample_sequences": config.episodic_learning.sample_sequences,
+            "burn_in_steps": config.episodic_learning.burn_in_steps,
+            "learn_steps": config.episodic_learning.learn_steps,
+            "primary_policy_weight": (
+                config.episodic_learning.primary_policy_weight
+            ),
+            "task_value_weight": config.episodic_learning.task_value_weight,
+            "revival_value_weight": (
+                config.episodic_learning.revival_value_weight
+            ),
+            "revival_policy_weight": (
+                config.episodic_learning.revival_policy_weight
+            ),
+            "secondary_advantage_fraction": (
+                config.episodic_learning.secondary_advantage_fraction
+            ),
+            "primary_success_tie_tolerance": (
+                config.episodic_learning.primary_success_tie_tolerance
+            ),
+        },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
             "version": reward_identity["version"],
@@ -325,6 +409,14 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "parameters": model.parameter_count,
         "policy_shape": list(output.policy_logits.shape),
         "value_shape": list(output.value.shape),
+        "combat_task_value_shape": list(output.combat_task_value.shape),
+        "act_task_value_shape": list(output.act_task_value.shape),
+        "run_task_value_shape": list(output.run_task_value.shape),
+        "combat_revival_cost_value_shape": list(
+            output.combat_revival_cost_value.shape
+        ),
+        "act_revival_cost_value_shape": list(output.act_revival_cost_value.shape),
+        "run_revival_cost_value_shape": list(output.run_revival_cost_value.shape),
         "recurrent_state_shape": list(output.recurrent_state.shape),
         "world_shape": list(decision.batch.world.features.shape),
         "candidate_shape": list(decision.batch.candidates.features.shape),
@@ -448,7 +540,7 @@ def run_training(
                 "state": asdict(state),
                 "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
-                "pipeline": "bounded-fifo-async-vtrace-v3",
+                "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
                 "checkpoint_load": {
                     "mode": load_mode,
                     "parent_checkpoint": (
@@ -625,9 +717,126 @@ def run_training(
                 pipeline.request_pause()
             pipeline.release_incident_boundary()
 
-        while pipeline.alive or len(resources.rollout_queue) > 0:
+        def learn_rollout_batch(batch: tuple[SequenceUnroll, ...]) -> None:
+            """Consume one FIFO batch exactly once, including replay sidecars."""
+
+            nonlocal state, unrolls_since_publication
+            if not batch:
+                raise ValueError("runtime cannot learn an empty rollout batch")
+            update_number = state.learner_updates + 1
+            batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
+            transaction_traces = (
+                resources.transaction_replay.sample(
+                    config.transaction_learning.sample_traces
+                )
+                if resources.transaction_replay is not None
+                else ()
+            )
+            episodic_sequences = (
+                resources.episodic_replay.sample(
+                    config.episodic_learning.sample_sequences,
+                    learn_steps=config.episodic_learning.learn_steps,
+                    burn_in_steps=config.episodic_learning.burn_in_steps,
+                )
+                if resources.episodic_replay is not None
+                else ()
+            )
+            metrics.write(
+                "learner_update_start",
+                {
+                    "update_number": update_number,
+                    "environment_steps": pipeline.environment_steps,
+                    "policy_version": state.policy_version,
+                    "unrolls": len(batch),
+                    "batch_environment_steps": batch_environment_steps,
+                    "transaction_traces": len(transaction_traces),
+                    "transaction_replay": (
+                        resources.transaction_replay.metrics()
+                        if resources.transaction_replay is not None
+                        else None
+                    ),
+                    "episodic_sequences": len(episodic_sequences),
+                    "episodic_learn_steps": sum(
+                        len(sequence.learn_steps)
+                        for sequence in episodic_sequences
+                    ),
+                    "episodic_replay": (
+                        resources.episodic_replay.metrics()
+                        if resources.episodic_replay is not None
+                        else None
+                    ),
+                },
+            )
+
+            def learner_progress(
+                stage: str,
+                payload: dict[str, int | float],
+                *,
+                _update_number: int = update_number,
+                _policy_version: int = state.policy_version,
+            ) -> None:
+                metrics.write(
+                    "learner_progress",
+                    {
+                        "update_number": _update_number,
+                        "stage": stage,
+                        "environment_steps": pipeline.environment_steps,
+                        "policy_version": _policy_version,
+                        **payload,
+                    },
+                )
+
+            learner_metrics = resources.learner.update(
+                batch,
+                current_policy_version=state.policy_version,
+                transaction_traces=transaction_traces,
+                episodic_sequences=episodic_sequences,
+                progress=learner_progress,
+            )
+            state = replace(
+                state,
+                learner_updates=state.learner_updates + 1,
+                policy_version=state.policy_version + 1,
+                consumed_unrolls=state.consumed_unrolls + len(batch),
+            )
+            unrolls_since_publication += len(batch)
+            metrics.write(
+                "learner_update",
+                {
+                    "environment_steps": pipeline.environment_steps,
+                    "policy_version": state.policy_version,
+                    "actor_progress": (
+                        asdict(pipeline.actor_progress)
+                        if pipeline.actor_progress is not None
+                        else None
+                    ),
+                    "rollout_queue": resources.rollout_queue.metrics(),
+                    **learner_metrics.to_mapping(),
+                },
+            )
+            if (
+                unrolls_since_publication
+                >= config.rollout.policy_sync_interval_unrolls
+                and pipeline.alive
+            ):
+                pipeline.request_policy_publication(state.policy_version)
+                unrolls_since_publication = 0
+
+        # With episodic learning enabled, retain at most one fetched FIFO batch.
+        # A following batch proves the retained one was not the episode's tail;
+        # an episode/incident boundary makes the tail outcome known.  This keeps
+        # actor/learner overlap and queue backpressure bounded while ensuring a
+        # one-episode run inserts its completed replay item before its final
+        # online batch samples that replay.  The local batch is always flushed
+        # before maintenance/final checkpointing and is never consumed twice.
+        pending_batch: tuple[SequenceUnroll, ...] = ()
+        while (
+            pipeline.alive
+            or len(resources.rollout_queue) > 0
+            or bool(pending_batch)
+        ):
             try:
-                batch = resources.rollout_queue.get_batch(
+                fetched_batch = resources.rollout_queue.get_batch(
                     config.optimization.batch_unrolls,
                     minimum=min(
                         config.optimization.batch_unrolls,
@@ -636,93 +845,23 @@ def run_training(
                     timeout=0.20,
                 )
             except TimeoutError:
-                batch = ()
-            if batch:
-                update_number = state.learner_updates + 1
-                batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
-                transaction_traces = (
-                    resources.transaction_replay.sample(
-                        config.transaction_learning.sample_traces
-                    )
-                    if resources.transaction_replay is not None
-                    else ()
-                )
-                metrics.write(
-                    "learner_update_start",
-                    {
-                        "update_number": update_number,
-                        "environment_steps": pipeline.environment_steps,
-                        "policy_version": state.policy_version,
-                        "unrolls": len(batch),
-                        "batch_environment_steps": batch_environment_steps,
-                        "transaction_traces": len(transaction_traces),
-                        "transaction_replay": (
-                            resources.transaction_replay.metrics()
-                            if resources.transaction_replay is not None
-                            else None
-                        ),
-                    },
-                )
+                fetched_batch = ()
 
-                def learner_progress(
-                    stage: str,
-                    payload: dict[str, int | float],
-                    *,
-                    _update_number: int = update_number,
-                    _policy_version: int = state.policy_version,
-                ) -> None:
-                    metrics.write(
-                        "learner_progress",
-                        {
-                            "update_number": _update_number,
-                            "stage": stage,
-                            "environment_steps": pipeline.environment_steps,
-                            "policy_version": _policy_version,
-                            **payload,
-                        },
-                    )
+            batch_to_learn: tuple[SequenceUnroll, ...] = ()
+            if resources.episodic_replay is None:
+                batch_to_learn = fetched_batch
+            elif fetched_batch:
+                batch_to_learn = pending_batch
+                pending_batch = fetched_batch
 
-                learner_metrics = resources.learner.update(
-                    batch,
-                    current_policy_version=state.policy_version,
-                    transaction_traces=transaction_traces,
-                    progress=learner_progress,
-                )
-                state = replace(
-                    state,
-                    learner_updates=state.learner_updates + 1,
-                    policy_version=state.policy_version + 1,
-                    consumed_unrolls=state.consumed_unrolls + len(batch),
-                )
-                unrolls_since_publication += len(batch)
-                metrics.write(
-                    "learner_update",
-                    {
-                        "environment_steps": pipeline.environment_steps,
-                        "policy_version": state.policy_version,
-                        "actor_progress": (
-                            asdict(pipeline.actor_progress)
-                            if pipeline.actor_progress is not None
-                            else None
-                        ),
-                        "rollout_queue": resources.rollout_queue.metrics(),
-                        **learner_metrics.to_mapping(),
-                    },
-                )
-                if (
-                    unrolls_since_publication
-                    >= config.rollout.policy_sync_interval_unrolls
-                    and pipeline.alive
-                ):
-                    pipeline.request_policy_publication(state.policy_version)
-                    unrolls_since_publication = 0
-
+            boundary_committed = False
             while True:
                 actor_result = pipeline.next_episode(timeout=0.0)
                 if actor_result is None:
                     break
                 if isinstance(actor_result, RecoverableActorIncident):
                     handle_actor_incident(actor_result)
+                    boundary_committed = True
                     continue
                 episode = actor_result
                 transaction_traces_stored = 0
@@ -734,6 +873,16 @@ def run_training(
                 elif episode.transaction_traces:
                     raise RuntimeError(
                         "collector emitted transaction traces while replay is disabled"
+                    )
+                episodic_episode_stored = False
+                if resources.episodic_replay is not None:
+                    if episode.completed_episode is None:
+                        raise RuntimeError(
+                            "episodic learning is enabled but the collector emitted no "
+                            "completed episode"
+                        )
+                    episodic_episode_stored = resources.episodic_replay.put(
+                        episode.completed_episode
                     )
                 state = replace(
                     state,
@@ -784,6 +933,20 @@ def run_training(
                             if resources.transaction_replay is not None
                             else None
                         ),
+                        "episodic_episode_emitted": (
+                            episode.completed_episode is not None
+                        ),
+                        "episodic_episode_stored": episodic_episode_stored,
+                        "episodic_episode_storage_nbytes": (
+                            episode.completed_episode.storage_nbytes()
+                            if episode.completed_episode is not None
+                            else 0
+                        ),
+                        "episodic_replay": (
+                            resources.episodic_replay.metrics()
+                            if resources.episodic_replay is not None
+                            else None
+                        ),
                     },
                 )
                 crossed_evaluation = any(
@@ -796,9 +959,22 @@ def run_training(
                     maintenance_requested = True
                     if pipeline.alive:
                         pipeline.request_pause()
+                boundary_committed = True
                 # The actor cannot reset into the next run until metrics and
                 # maintenance intent for this completed episode are committed.
                 pipeline.release_episode_boundary()
+
+            if batch_to_learn:
+                learn_rollout_batch(batch_to_learn)
+            if resources.episodic_replay is not None and pending_batch:
+                terminal_drain = bool(
+                    not pipeline.alive
+                    and resources.rollout_queue.closed
+                    and len(resources.rollout_queue) == 0
+                )
+                if boundary_committed or terminal_drain:
+                    learn_rollout_batch(pending_batch)
+                    pending_batch = ()
 
             actor_idle = not pipeline.alive or pipeline.paused
             if maintenance_requested and actor_idle:
@@ -887,6 +1063,13 @@ def run_training(
                 raise RuntimeError(
                     "collector emitted transaction traces while replay is disabled"
                 )
+            if resources.episodic_replay is not None:
+                if episode.completed_episode is None:
+                    raise RuntimeError(
+                        "episodic learning is enabled but the collector emitted no "
+                        "completed episode during drain"
+                    )
+                resources.episodic_replay.put(episode.completed_episode)
             state = replace(
                 state,
                 environment_steps=state.environment_steps + episode.metrics.steps,

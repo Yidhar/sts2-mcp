@@ -1586,7 +1586,7 @@ def test_completion_policy_abi_requires_new_lineage_but_keeps_model_initializati
         root=tmp_path,
         manifest={},
         metadata={
-            "format": "sts2-recurrent-vtrace-checkpoint-v3",
+            "format": "sts2-recurrent-vtrace-checkpoint-v4",
             "model_config": asdict(enabled.model.to_model_config()),
             "encoding_contract": grounding_encoding_identity(),
             "model_state_spec": {},
@@ -1643,7 +1643,7 @@ def test_legacy_v10_lineage_without_transaction_section_exact_resumes_only_disab
         root=tmp_path,
         manifest={},
         metadata={
-            "format": "sts2-recurrent-vtrace-checkpoint-v3",
+            "format": "sts2-recurrent-vtrace-checkpoint-v4",
             "model_config": asdict(config.model.to_model_config()),
             "encoding_contract": grounding_encoding_identity(),
             "model_state_spec": {},
@@ -1652,6 +1652,8 @@ def test_legacy_v10_lineage_without_transaction_section_exact_resumes_only_disab
             "resolved_device": "cpu",
             "resolved_collector_device": "cpu",
             "queue_spec": {},
+            "long_horizon_value_head_abi": "sts2-long-horizon-value-heads-v1",
+            "episodic_replay_enabled": False,
         },
     )
 

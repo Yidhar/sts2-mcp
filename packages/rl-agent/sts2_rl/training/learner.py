@@ -14,9 +14,14 @@ from sts2_baseline import SequenceUnroll
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.encoding.grounded import grounding_encoding_identity
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.models import RecurrentCandidateModel
+from sts2_rl.models import RecurrentCandidateModel, RecurrentCandidateOutput
 
-from .config import OptimizationConfig, TransactionLearningConfig
+from .config import (
+    EpisodicLearningConfig,
+    OptimizationConfig,
+    TransactionLearningConfig,
+)
+from .episode_replay import HorizonTargets, ReplaySequence
 from .transaction import (
     TransactionPolicyTarget,
     TransactionTrace,
@@ -32,6 +37,7 @@ class LearnerTimings:
     recurrent_forward_ms: float
     target_and_loss_ms: float
     backward_ms: float
+    episodic_replay_ms: float
     optimizer_step_ms: float
     total_ms: float
 
@@ -67,6 +73,22 @@ class LearnerMetrics:
     transaction_policy_labels: int
     transaction_policy_preferred_labels: int
     transaction_policy_avoided_labels: int
+    episodic_loss: float
+    episodic_primary_policy_loss: float
+    episodic_task_value_loss: float
+    episodic_revival_value_loss: float
+    episodic_revival_policy_loss: float
+    episodic_sequences: int
+    episodic_burn_in_steps: int
+    episodic_learn_steps: int
+    episodic_policy_labels: int
+    episodic_task_value_labels: int
+    episodic_revival_value_labels: int
+    episodic_efficiency_policy_labels: int
+    episodic_importance_ratio_mean: float
+    episodic_importance_ratio_max: float
+    episodic_importance_clip_fraction: float
+    episodic_maximum_policy_lag: int
     timings: LearnerTimings
 
     def to_mapping(self) -> dict[str, float | int | dict[str, float]]:
@@ -90,6 +112,23 @@ def _require_finite(stage: str, values: tuple[tuple[str, Tensor], ...]) -> None:
         raise FloatingPointError(f"non-finite learner {stage}: {', '.join(invalid)}")
 
 
+@dataclass(frozen=True, slots=True)
+class _EpisodicLossBatch:
+    total_loss: Tensor
+    primary_policy_loss: Tensor
+    task_value_loss: Tensor
+    revival_value_loss: Tensor
+    revival_policy_loss: Tensor
+    burn_in_steps: int
+    learn_steps: int
+    policy_labels: int
+    task_value_labels: int
+    revival_value_labels: int
+    efficiency_policy_labels: int
+    importance_ratios: Tensor
+    maximum_policy_lag: int
+
+
 class VTraceLearner:
     """Consume main-policy unrolls FIFO with an optional factual transaction sidecar."""
 
@@ -103,6 +142,7 @@ class VTraceLearner:
         maximum_unroll_length: int,
         maximum_policy_lag: int,
         transaction_config: TransactionLearningConfig | None = None,
+        episodic_config: EpisodicLearningConfig | None = None,
     ) -> None:
         if maximum_unroll_length <= 0 or maximum_policy_lag <= 0:
             raise ValueError("unroll length and policy lag limits must be positive")
@@ -113,6 +153,7 @@ class VTraceLearner:
         self.maximum_unroll_length = maximum_unroll_length
         self.maximum_policy_lag = maximum_policy_lag
         self.transaction_config = transaction_config or TransactionLearningConfig()
+        self.episodic_config = episodic_config or EpisodicLearningConfig()
         if self.transaction_config.enabled != self.model.transaction_heads_enabled:
             raise ValueError(
                 "transaction learner config and model-head configuration differ"
@@ -128,6 +169,7 @@ class VTraceLearner:
         *,
         current_policy_version: int,
         transaction_traces: tuple[TransactionTrace, ...] = (),
+        episodic_sequences: tuple[ReplaySequence, ...] = (),
         progress: Callable[[str, dict[str, int | float]], None] | None = None,
     ) -> LearnerMetrics:
         total_started_ns = time.perf_counter_ns()
@@ -153,6 +195,12 @@ class VTraceLearner:
             raise TypeError("transaction_traces must be a TransactionTrace tuple")
         if transaction_traces and not self.transaction_config.enabled:
             raise ValueError("transaction traces require transaction learning to be enabled")
+        if not isinstance(episodic_sequences, tuple) or not all(
+            isinstance(sequence, ReplaySequence) for sequence in episodic_sequences
+        ):
+            raise TypeError("episodic_sequences must be a ReplaySequence tuple")
+        if episodic_sequences and not self.episodic_config.enabled:
+            raise ValueError("episodic sequences require episodic learning to be enabled")
 
         validation_started_ns = time.perf_counter_ns()
         encoding_fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
@@ -447,6 +495,40 @@ class VTraceLearner:
         backward_started_ns = time.perf_counter_ns()
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        episodic_started_ns = time.perf_counter_ns()
+        episodic_losses = self._episodic_losses(
+            episodic_sequences,
+            current_policy_version=current_policy_version,
+        )
+        if episodic_sequences:
+            _require_finite(
+                "episodic targets/loss",
+                (
+                    ("episodic_loss", episodic_losses.total_loss),
+                    (
+                        "episodic_primary_policy_loss",
+                        episodic_losses.primary_policy_loss,
+                    ),
+                    ("episodic_task_value_loss", episodic_losses.task_value_loss),
+                    (
+                        "episodic_revival_value_loss",
+                        episodic_losses.revival_value_loss,
+                    ),
+                    (
+                        "episodic_revival_policy_loss",
+                        episodic_losses.revival_policy_loss,
+                    ),
+                ),
+            )
+            episodic_losses.total_loss.backward()  # type: ignore[no-untyped-call]
+        episodic_replay_ms = _elapsed_ms(episodic_started_ns)
+        report(
+            "episodic_replay_complete",
+            episodic_replay_ms=episodic_replay_ms,
+            episodic_sequences=len(episodic_sequences),
+            episodic_burn_in_steps=episodic_losses.burn_in_steps,
+            episodic_learn_steps=episodic_losses.learn_steps,
+        )
         gradients = tuple(
             (name, parameter.grad)
             for name, parameter in self.model.named_parameters()
@@ -485,11 +567,15 @@ class VTraceLearner:
             recurrent_forward_ms=recurrent_forward_ms,
             target_and_loss_ms=target_and_loss_ms,
             backward_ms=backward_ms,
+            episodic_replay_ms=episodic_replay_ms,
             optimizer_step_ms=optimizer_step_ms,
             total_ms=total_ms,
         )
         return LearnerMetrics(
-            loss=float(total_loss.detach().item()),
+            loss=float(
+                total_loss.detach().item()
+                + episodic_losses.total_loss.detach().item()
+            ),
             policy_loss=float(policy_loss.detach().item()),
             value_loss=float(value_loss.detach().item()),
             entropy=float(entropy.detach().item()),
@@ -523,7 +609,456 @@ class VTraceLearner:
             transaction_policy_labels=transaction_policy_labels,
             transaction_policy_preferred_labels=transaction_policy_preferred_labels,
             transaction_policy_avoided_labels=transaction_policy_avoided_labels,
+            episodic_loss=float(episodic_losses.total_loss.detach().item()),
+            episodic_primary_policy_loss=float(
+                episodic_losses.primary_policy_loss.detach().item()
+            ),
+            episodic_task_value_loss=float(
+                episodic_losses.task_value_loss.detach().item()
+            ),
+            episodic_revival_value_loss=float(
+                episodic_losses.revival_value_loss.detach().item()
+            ),
+            episodic_revival_policy_loss=float(
+                episodic_losses.revival_policy_loss.detach().item()
+            ),
+            episodic_sequences=len(episodic_sequences),
+            episodic_burn_in_steps=episodic_losses.burn_in_steps,
+            episodic_learn_steps=episodic_losses.learn_steps,
+            episodic_policy_labels=episodic_losses.policy_labels,
+            episodic_task_value_labels=episodic_losses.task_value_labels,
+            episodic_revival_value_labels=(
+                episodic_losses.revival_value_labels
+            ),
+            episodic_efficiency_policy_labels=(
+                episodic_losses.efficiency_policy_labels
+            ),
+            episodic_importance_ratio_mean=(
+                float(episodic_losses.importance_ratios.detach().mean().item())
+                if episodic_losses.importance_ratios.numel()
+                else 0.0
+            ),
+            episodic_importance_ratio_max=(
+                float(episodic_losses.importance_ratios.detach().max().item())
+                if episodic_losses.importance_ratios.numel()
+                else 0.0
+            ),
+            episodic_importance_clip_fraction=(
+                float(
+                    (
+                        episodic_losses.importance_ratios
+                        > self.episodic_config.importance_ratio_clip
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                )
+                if episodic_losses.importance_ratios.numel()
+                else 0.0
+            ),
+            episodic_maximum_policy_lag=episodic_losses.maximum_policy_lag,
             timings=timings,
+        )
+
+    @staticmethod
+    def _episodic_task_target(target: HorizonTargets) -> float:
+        """Return a completion-dominant, cost-free primary target.
+
+        ``task_return`` contains only the base terminal/progress reward captured
+        by the collector; revival, HP-loss, and pace shaping are deliberately
+        absent.  The explicit boundary outcome is added once so a successful
+        combat/Act remains supervised even when no run-progress reward happened
+        inside that short horizon.  This outcome term is primary-task evidence,
+        not a hand-authored action preference.
+        """
+
+        if (
+            not target.observed
+            or target.success is None
+            or target.task_return is None
+        ):
+            raise ValueError("episodic task target is not observed")
+        return float(target.task_return + (1.0 if target.success else -1.0))
+
+    @staticmethod
+    def _horizon_outputs(
+        output: RecurrentCandidateOutput,
+        row: int,
+        *,
+        combat: HorizonTargets,
+        act: HorizonTargets,
+        run: HorizonTargets,
+    ) -> tuple[tuple[str, HorizonTargets, Tensor, Tensor], ...]:
+        return (
+            (
+                "combat",
+                combat,
+                output.combat_task_value[row],
+                output.combat_revival_cost_value[row],
+            ),
+            (
+                "act",
+                act,
+                output.act_task_value[row],
+                output.act_revival_cost_value[row],
+            ),
+            (
+                "run",
+                run,
+                output.run_task_value[row],
+                output.run_revival_cost_value[row],
+            ),
+        )
+
+    def _episodic_losses(
+        self,
+        sequences: tuple[ReplaySequence, ...],
+        *,
+        current_policy_version: int,
+    ) -> _EpisodicLossBatch:
+        """Compute episodic losses with deterministic recurrent reconstruction.
+
+        Episodic sequences deliberately omit recurrently irrelevant combat
+        prefixes.  Dropout would nevertheless consume a different RNG stream
+        for the sparse and full histories and would make the supposedly exact
+        reconstruction depend on which irrelevant steps were skipped.  Run
+        both the no-grad prefix and differentiable suffix in evaluation mode so
+        the sparse replay has deterministic semantics, while preserving the
+        caller's model mode even when validation or collation raises.
+
+        Evaluation mode does not disable autograd.  The learning suffix still
+        owns the complete bounded graph; only dropout is disabled (the active
+        model contains no batch-normalization state).
+        """
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return self._episodic_losses_deterministic(
+                sequences,
+                current_policy_version=current_policy_version,
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _episodic_losses_deterministic(
+        self,
+        sequences: tuple[ReplaySequence, ...],
+        *,
+        current_policy_version: int,
+    ) -> _EpisodicLossBatch:
+        """Replay complete-episode labels through one bounded GPU graph.
+
+        The caller holds the model in evaluation mode.  Every sequence first
+        reconstructs the current model's split recurrent
+        state from its exact sparse prefix under ``torch.no_grad()``.  Only the
+        configured contiguous suffix is batched with autograd.  Thus a 30,000
+        step source episode can increase CPU storage and no-grad compute, but it
+        cannot increase activation memory beyond
+        ``len(sequences) * episodic_config.learn_steps``.
+
+        The selected-action replay gradient is clipped by the factual behavior
+        probability.  Revival cost can affect policy only for a successfully
+        completed horizon.  Outside a configured, success-classified primary
+        tie band, the already-weighted cost signal is capped below the absolute
+        primary residual.  Inside that narrow band, a small nominal-primary
+        floor keeps the cost tie-break alive even when the task advantage is
+        calibrated to zero.  This implements the staged ordering ``complete
+        first, then reduce revivals`` instead of silently deleting the
+        secondary objective at primary convergence.
+        """
+
+        zero = next(self.model.parameters()).sum() * 0.0
+        empty_ratios = torch.empty(0, device=self.device, dtype=torch.float32)
+        if not sequences:
+            return _EpisodicLossBatch(
+                total_loss=zero,
+                primary_policy_loss=zero,
+                task_value_loss=zero,
+                revival_value_loss=zero,
+                revival_policy_loss=zero,
+                burn_in_steps=0,
+                learn_steps=0,
+                policy_labels=0,
+                task_value_labels=0,
+                revival_value_labels=0,
+                efficiency_policy_labels=0,
+                importance_ratios=empty_ratios,
+                maximum_policy_lag=0,
+            )
+
+        fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+        hidden_rows: list[Tensor] = []
+        total_burn_in_steps = 0
+        total_learn_steps = 0
+        maximum_policy_lag = 0
+        for sequence in sequences:
+            if not sequence.exact_recurrent_reconstruction:
+                raise ValueError("episodic replay sequence is not an exact reconstruction")
+            if sequence.configured_burn_in_steps != self.episodic_config.burn_in_steps:
+                raise ValueError("episodic replay burn-in configuration differs from learner")
+            if not 0 < len(sequence.learn_steps) <= self.episodic_config.learn_steps:
+                raise ValueError("episodic replay learning suffix exceeds configured length")
+            hidden = self.model.initial_state(1, device=self.device)
+            with torch.no_grad():
+                for step in sequence.burn_in:
+                    step.snapshot.validate(
+                        expected_config=self.encoder.config,
+                        expected_fingerprint=fingerprint,
+                    )
+                    encoded = collate_encoded_snapshots(
+                        (step.snapshot,),
+                        expected_config=self.encoder.config,
+                        expected_fingerprint=fingerprint,
+                        device=self.device,
+                    )
+                    hidden = self.model(encoded, hidden, validate=False).recurrent_state
+            hidden_rows.append(hidden[0].detach())
+            total_burn_in_steps += len(sequence.burn_in)
+            total_learn_steps += len(sequence.learn_steps)
+            for step in sequence.learn_steps:
+                lag = current_policy_version - step.decision.policy_version
+                if lag < 0:
+                    raise ValueError(
+                        "episodic behavior policy version is newer than the learner"
+                    )
+                maximum_policy_lag = max(maximum_policy_lag, lag)
+
+        hidden = torch.stack(hidden_rows, dim=0)
+        maximum_time = max(len(sequence.learn_steps) for sequence in sequences)
+        task_predictions: list[Tensor] = []
+        task_targets: list[float] = []
+        revival_predictions: list[Tensor] = []
+        revival_targets: list[float] = []
+        primary_policy_terms: list[Tensor] = []
+        revival_policy_terms: list[Tensor] = []
+        combined_policy_terms: list[Tensor] = []
+        importance_ratios: list[Tensor] = []
+        efficiency_policy_labels = 0
+
+        for time_index in range(maximum_time):
+            active = [
+                index
+                for index, sequence in enumerate(sequences)
+                if time_index < len(sequence.learn_steps)
+            ]
+            active_tensor = torch.tensor(active, device=self.device, dtype=torch.long)
+            active_steps = tuple(
+                sequences[index].learn_steps[time_index] for index in active
+            )
+            snapshots = tuple(step.snapshot for step in active_steps)
+            encoded = collate_encoded_snapshots(
+                snapshots,
+                expected_config=self.encoder.config,
+                expected_fingerprint=fingerprint,
+                device=self.device,
+            )
+            output = self.model(
+                encoded,
+                hidden.index_select(0, active_tensor),
+                validate=False,
+            )
+            hidden = hidden.index_copy(0, active_tensor, output.recurrent_state)
+            log_policy = F.log_softmax(output.policy_logits.float(), dim=-1)
+
+            for row, step in enumerate(active_steps):
+                decision = step.decision
+                action_index = decision.action_index
+                selected_log_probability = log_policy[row, action_index]
+                horizons = self._horizon_outputs(
+                    output,
+                    row,
+                    combat=step.combat,
+                    act=step.act,
+                    run=step.run,
+                )
+
+                for _, target, task_prediction, revival_prediction in horizons:
+                    if not target.observed:
+                        continue
+                    task_predictions.append(task_prediction)
+                    task_targets.append(self._episodic_task_target(target))
+                    if target.efficiency_eligible:
+                        if target.future_revivals is None:  # pragma: no cover - invariant
+                            raise RuntimeError("successful horizon has no revival target")
+                        revival_predictions.append(revival_prediction)
+                        revival_targets.append(float(target.future_revivals))
+
+                if not decision.policy_decision:
+                    continue
+                primary = next(
+                    (
+                        item
+                        for item in reversed(horizons)
+                        if item[1].observed
+                    ),
+                    None,
+                )
+                if primary is None:
+                    continue
+                _, primary_target, primary_prediction, _ = primary
+                raw_ratio = torch.exp(
+                    (
+                        selected_log_probability
+                        - float(decision.behavior_log_probability)
+                    ).clamp(-20.0, 20.0)
+                )
+                # Importance sampling corrects the factual behavior/current
+                # distribution mismatch; it is not itself a differentiable
+                # policy objective.  Letting gradients flow through rho would
+                # add a ``rho * log(pi)`` product-rule term and can reverse a
+                # positive-advantage update whenever ``log(pi) < -1``.
+                detached_ratio = raw_ratio.detach()
+                importance_ratios.append(detached_ratio)
+                clipped_ratio = detached_ratio.clamp(
+                    max=self.episodic_config.importance_ratio_clip
+                )
+                primary_advantage = (
+                    primary_prediction.new_tensor(
+                        self._episodic_task_target(primary_target)
+                    )
+                    - primary_prediction
+                )
+                primary_signal = (
+                    self.episodic_config.primary_policy_weight
+                    * primary_advantage.detach()
+                )
+                primary_policy_terms.append(
+                    -clipped_ratio
+                    * selected_log_probability
+                    * primary_advantage.detach()
+                )
+
+                secondary_signal = primary_signal.new_zeros(())
+                efficiency = next(
+                    (
+                        item
+                        for item in reversed(horizons)
+                        if item[1].efficiency_eligible
+                    ),
+                    None,
+                )
+                if efficiency is not None:
+                    _, efficiency_target, _, cost_prediction = efficiency
+                    if efficiency_target.future_revivals is None:  # pragma: no cover
+                        raise RuntimeError("successful horizon has no revival target")
+                    cost_advantage = (
+                        cost_prediction.new_tensor(
+                            float(efficiency_target.future_revivals)
+                        )
+                        - cost_prediction
+                    )
+                    raw_secondary_signal = (
+                        self.episodic_config.revival_policy_weight
+                        * cost_advantage.detach()
+                    )
+                    # A pure ``fraction * abs(primary_advantage)`` cap makes
+                    # the revival objective exactly zero once the task value
+                    # is calibrated.  That prevents successful 0-revival and
+                    # 100-revival paths from ever becoming distinguishable at
+                    # the point where primary outcomes tie.
+                    #
+                    # Before the state value is on the successful side of the
+                    # signed task target, or while its residual lies outside
+                    # the explicit tie tolerance, retain the strict
+                    # residual-relative cap.  Only inside that narrow success
+                    # tie stratum admit a fraction of one nominal primary
+                    # policy unit. Failure/censored horizons never enter this
+                    # branch at all.
+                    primary_tie = (
+                        (primary_prediction.detach() > 0.0)
+                        & (
+                            primary_advantage.detach().abs()
+                            <= self.episodic_config.primary_success_tie_tolerance
+                        )
+                    ).to(dtype=primary_signal.dtype)
+                    success_tie_floor = primary_signal.new_tensor(
+                        self.episodic_config.primary_policy_weight
+                    ) * primary_tie
+                    protected_primary_scale = torch.maximum(
+                        primary_signal.abs(),
+                        success_tie_floor,
+                    )
+                    secondary_limit = (
+                        self.episodic_config.secondary_advantage_fraction
+                        * protected_primary_scale
+                    )
+                    secondary_signal = torch.maximum(
+                        torch.minimum(raw_secondary_signal, secondary_limit),
+                        -secondary_limit,
+                    )
+                    revival_policy_terms.append(
+                        clipped_ratio
+                        * selected_log_probability
+                        * secondary_signal
+                    )
+                    efficiency_policy_labels += 1
+
+                combined_policy_terms.append(
+                    -clipped_ratio
+                    * selected_log_probability
+                    * (primary_signal - secondary_signal)
+                )
+
+        task_value_loss = (
+            F.smooth_l1_loss(
+                torch.stack(task_predictions).float(),
+                torch.tensor(task_targets, device=self.device, dtype=torch.float32),
+            )
+            if task_predictions
+            else zero
+        )
+        revival_value_loss = (
+            F.smooth_l1_loss(
+                torch.stack(revival_predictions).float(),
+                torch.tensor(
+                    revival_targets,
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+            )
+            if revival_predictions
+            else zero
+        )
+        primary_policy_loss = (
+            torch.stack(primary_policy_terms).mean()
+            if primary_policy_terms
+            else zero
+        )
+        revival_policy_loss = (
+            torch.stack(revival_policy_terms).mean()
+            if revival_policy_terms
+            else zero
+        )
+        combined_policy_loss = (
+            torch.stack(combined_policy_terms).mean()
+            if combined_policy_terms
+            else zero
+        )
+        total_loss = (
+            combined_policy_loss
+            + self.episodic_config.task_value_weight * task_value_loss
+            + self.episodic_config.revival_value_weight * revival_value_loss
+        )
+        ratio_tensor = (
+            torch.stack(importance_ratios).float()
+            if importance_ratios
+            else empty_ratios
+        )
+        return _EpisodicLossBatch(
+            total_loss=total_loss,
+            primary_policy_loss=primary_policy_loss,
+            task_value_loss=task_value_loss,
+            revival_value_loss=revival_value_loss,
+            revival_policy_loss=revival_policy_loss,
+            burn_in_steps=total_burn_in_steps,
+            learn_steps=total_learn_steps,
+            policy_labels=len(primary_policy_terms),
+            task_value_labels=len(task_predictions),
+            revival_value_labels=len(revival_predictions),
+            efficiency_policy_labels=efficiency_policy_labels,
+            importance_ratios=ratio_tensor,
+            maximum_policy_lag=maximum_policy_lag,
         )
 
     def _transaction_losses(

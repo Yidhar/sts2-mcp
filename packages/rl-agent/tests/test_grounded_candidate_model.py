@@ -14,6 +14,15 @@ from sts2_rl.models import (
     WorldTokenBatch,
 )
 
+MULTISCALE_STATE_VALUE_FIELDS = (
+    "combat_task_value",
+    "act_task_value",
+    "run_task_value",
+    "combat_revival_cost_value",
+    "act_revival_cost_value",
+    "run_revival_cost_value",
+)
+
 
 @pytest.fixture
 def config() -> GroundedCandidateConfig:
@@ -128,6 +137,8 @@ def test_candidate_permutation_equivariance(config: GroundedCandidateConfig) -> 
     torch.testing.assert_close(permuted.state_embedding, output.state_embedding)
     torch.testing.assert_close(permuted.recurrent_state, output.recurrent_state)
     torch.testing.assert_close(permuted.value, output.value)
+    for field in MULTISCALE_STATE_VALUE_FIELDS:
+        torch.testing.assert_close(getattr(permuted, field), getattr(output, field))
     for actual, expected in (
         (permuted.candidate_embeddings, output.candidate_embeddings[:, permutation]),
         (permuted.policy_logits, output.policy_logits[:, permutation]),
@@ -191,6 +202,61 @@ def test_world_encoding_and_state_values_do_not_read_candidates(
     torch.testing.assert_close(output_a.state_embedding, output_b.state_embedding)
     torch.testing.assert_close(output_a.recurrent_state, output_b.recurrent_state)
     torch.testing.assert_close(output_a.value, output_b.value)
+    for field in MULTISCALE_STATE_VALUE_FIELDS:
+        torch.testing.assert_close(getattr(output_a, field), getattr(output_b, field))
+
+
+def test_multiscale_state_values_are_well_formed(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+
+    with torch.no_grad():
+        output = model(_make_batch(config))
+
+    assert output.validate(config) == (2, 5)
+    for field in MULTISCALE_STATE_VALUE_FIELDS:
+        value = getattr(output, field)
+        assert value.shape == (2,)
+        assert torch.isfinite(value).all()
+    for field in (
+        "combat_revival_cost_value",
+        "act_revival_cost_value",
+        "run_revival_cost_value",
+    ):
+        assert torch.all(getattr(output, field) >= 0.0)
+
+
+def test_output_validation_rejects_malformed_multiscale_value(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+    output = model(_make_batch(config))
+    malformed_finite = replace(
+        output,
+        run_revival_cost_value=torch.full_like(
+            output.run_revival_cost_value,
+            torch.nan,
+        ),
+    )
+    malformed_shape = replace(
+        output,
+        act_task_value=output.act_task_value[:1],
+    )
+    malformed_support = replace(
+        output,
+        combat_revival_cost_value=torch.full_like(
+            output.combat_revival_cost_value,
+            -1.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        malformed_finite.validate(config)
+    with pytest.raises(ValueError, match="must have shape"):
+        malformed_shape.validate(config)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        malformed_support.validate(config)
 
 
 def test_forward_backward_reaches_shared_world_and_candidate_parameters(
@@ -207,7 +273,8 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     probabilities = output.policy_probabilities()
     selected = torch.tensor([0, 2], dtype=torch.long)
     policy_loss = -torch.log(probabilities[torch.arange(2), selected].clamp_min(1e-8)).mean()
-    loss = policy_loss + output.value.square().mean()
+    multiscale_value_loss = sum(getattr(output, field).square().mean() for field in MULTISCALE_STATE_VALUE_FIELDS)
+    loss = policy_loss + output.value.square().mean() + multiscale_value_loss
     loss.backward()
 
     assert torch.isfinite(loss)
@@ -225,11 +292,21 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     assert target_relation_grad is not None and torch.isfinite(target_relation_grad).all()
     assert run_recurrent_grad is not None and torch.isfinite(run_recurrent_grad).all()
     assert combat_recurrent_grad is not None and torch.isfinite(combat_recurrent_grad).all()
+    for head_name in (
+        "combat_task_value_head",
+        "act_task_value_head",
+        "run_task_value_head",
+        "combat_revival_cost_value_head",
+        "act_revival_cost_value_head",
+        "run_revival_cost_value_head",
+    ):
+        head_grad = getattr(model, head_name)[-2 if "revival" in head_name else -1].weight.grad
+        assert head_grad is not None and torch.isfinite(head_grad).all()
 
 
 def test_default_model_stays_small() -> None:
     model = RecurrentCandidateModel()
-    assert model.parameter_count == 4_014_146
+    assert model.parameter_count == 4_413_512
 
 
 def test_batch_shape_contract_rejects_misaligned_candidate_local_axis(

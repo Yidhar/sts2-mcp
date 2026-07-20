@@ -27,8 +27,38 @@ historical RL artifacts.
   split intentionally reject earlier card/selection checkpoints rather than
   padding or migrating them.
 - Moved runtime artifacts outside the checkout through `STS2_ARTIFACT_ROOT`.
+- Advanced the recurrent checkpoint ABI to
+  `sts2-recurrent-vtrace-checkpoint-v4`. Exact resume now includes every
+  enabled replay sidecar and rejects v3. A v3 policy may be used only through
+  explicit model-parameter initialization into a fresh lineage; the complete
+  long-horizon head group starts fresh and optimizer/queue/RNG/counters/replay
+  are never imported.
 
 ### Added
+
+- Added bounded complete-episode credit assignment for native-revival full-run
+  preheat. The collector retains immutable CPU snapshots independently of
+  streamed short unrolls and backfills factual combat/Act/run success,
+  forward-return, future revival and HP-loss labels in one reverse pass.
+  Win/failure/censored replay is bounded by episode count, total bytes,
+  per-episode bytes and sampling quota. The learner reconstructs exact split-GRU
+  state under `no_grad` and keeps autograd to a short active-shape suffix, so a
+  10,000+ decision source episode cannot create a full-episode GPU graph. Both
+  prefix and suffix replay run with dropout disabled and restore the caller's
+  model mode, preserving exact sparse/full-history equivalence.
+- Added candidate-independent combat/Act/run task-value and non-negative
+  revival-cost heads. Completion/progress remains primary; revival policy/value
+  labels are success-conditional. Before success classification the secondary
+  signal is residual-capped; only inside an explicit narrow, learned-success
+  tie band may a bounded nominal-primary floor preserve the revival tie-break
+  after the primary advantage reaches zero. Forced singleton steps retain
+  value supervision but have no policy replay target.
+- Added held-out Act-boundary revival/HP counters, Act-1 and run completion at
+  zero or one revival, and success-conditional run efficiency summaries.
+- Added a bounded one-FIFO-batch learner lag when complete-episode replay is
+  enabled. The runtime commits an episode to replay before learning its final
+  pending online batch, so even a one-episode run receives long-horizon credit;
+  held-out evaluation seeds are rejected from every recorded collection path.
 
 - Added contract API `2.0.0` with JSON Schema 2020-12, OpenAPI, fixtures, and generated
   C#/TypeScript/Python version constants.

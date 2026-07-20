@@ -16,7 +16,9 @@ import torch
 
 from sts2_baseline import SequenceUnroll
 from sts2_rl.checkpoints import (
+    EXACT_RESUME_REQUIRED_FILES,
     AtomicCheckpointDirectory,
+    CheckpointIntegrityError,
     ValidatedResumeCheckpoint,
     build_checkpoint_provenance,
     contract_metadata,
@@ -26,13 +28,27 @@ from sts2_rl.checkpoints import (
 from sts2_rl.encoding import grounding_encoding_identity
 
 from .config import TrainingConfig
+from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
 from .seeding import SIGNED_INT32_MAX
 from .transaction import BoundedTransactionReplay
 
-_CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v3"
+_CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v4"
+_LEGACY_MODEL_INITIALIZATION_FORMATS = frozenset(
+    {"sts2-recurrent-vtrace-checkpoint-v3"}
+)
 _QUEUE_PAYLOAD_VERSION = "sts2-rollout-queue-pickle-v2"
 _ACTOR_SUPERVISOR_STATE_VERSION = "sts2-actor-supervisor-state-v1"
+_LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
+
+_LONG_HORIZON_HEAD_PREFIXES = (
+    "combat_task_value_head.",
+    "act_task_value_head.",
+    "run_task_value_head.",
+    "combat_revival_cost_value_head.",
+    "act_revival_cost_value_head.",
+    "run_revival_cost_value_head.",
+)
 
 # Exact resume always requires the complete active encoding identity.  Model
 # parameter initialization has one deliberately narrower exception: v9 added
@@ -291,9 +307,65 @@ def _validated_transaction_replay_payload(
     return payload
 
 
+def _new_episodic_replay(*, config: TrainingConfig) -> BoundedEpisodicReplay:
+    return BoundedEpisodicReplay(
+        capacity=config.episodic_learning.replay_capacity_episodes,
+        byte_capacity=config.episodic_learning.replay_capacity_bytes,
+        episode_byte_capacity=config.episodic_learning.per_episode_capacity_bytes,
+        max_segments_per_episode=config.episodic_learning.max_segments_per_episode,
+        seed=config.runtime.seed,
+    )
+
+
+def _validated_episodic_replay_payload(
+    payload: object,
+    *,
+    config: TrainingConfig,
+) -> dict[str, Any]:
+    """Validate a detached episodic replay in a fresh probe.
+
+    Exact resume must prove the complete byte-bounded corpus, accounting
+    counters, and sampler RNG are loadable before any live learner resource is
+    mutated.  The probe has the exact active capacities but is otherwise
+    independent of the runtime replay.
+    """
+
+    if not isinstance(payload, dict):
+        raise TypeError("episodic replay checkpoint must be an object")
+    probe = _new_episodic_replay(config=config)
+    probe.load_state_dict(payload)
+    expected_config = config.model.to_encoding_config()
+    expected_fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+    for episode in probe.snapshot():
+        for step in episode.steps:
+            step.snapshot.validate(
+                expected_config=expected_config,
+                expected_fingerprint=expected_fingerprint,
+            )
+    return payload
+
+
+def _episodic_replay_spec(
+    payload: dict[str, Any],
+    *,
+    config: TrainingConfig,
+) -> dict[str, int | str]:
+    probe = _new_episodic_replay(config=config)
+    probe.load_state_dict(payload)
+    return dict(probe.metrics())
+
+
 def _stochastic_state(resources: TrainingResources) -> dict[str, Any]:
+    collector_device = next(resources.collector_model.parameters()).device
+    cuda_rng_is_live = (
+        resources.device.type == "cuda"
+        or collector_device.type == "cuda"
+        or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+    )
     cuda_states = (
-        torch.cuda.get_rng_state_all() if resources.device.type == "cuda" and torch.cuda.is_available() else []
+        torch.cuda.get_rng_state_all()
+        if cuda_rng_is_live and torch.cuda.is_available()
+        else []
     )
     return {
         "version": "sts2-recurrent-stochastic-state-v2",
@@ -462,8 +534,19 @@ def _validate_metadata(
     model_only: bool,
 ) -> None:
     metadata = validated.metadata
-    if metadata.get("format") != _CHECKPOINT_FORMAT:
-        raise ValueError(f"unsupported v2 checkpoint format: {metadata.get('format')!r}")
+    checkpoint_format = metadata.get("format")
+    if model_only:
+        accepted_formats = {_CHECKPOINT_FORMAT, *_LEGACY_MODEL_INITIALIZATION_FORMATS}
+        if checkpoint_format not in accepted_formats:
+            raise ValueError(
+                "unsupported model-initialization checkpoint format: "
+                f"{checkpoint_format!r}"
+            )
+    elif checkpoint_format != _CHECKPOINT_FORMAT:
+        raise ValueError(
+            "unsupported exact-resume checkpoint format: "
+            f"{checkpoint_format!r}; expected {_CHECKPOINT_FORMAT!r}"
+        )
     if metadata.get("model_config") != asdict(config.model.to_model_config()):
         raise ValueError("checkpoint recurrent model config does not match")
     _validate_encoding_contract(
@@ -495,11 +578,29 @@ def _validate_metadata(
         raise ValueError("exact resume requires the same actor device")
     if not isinstance(metadata.get("queue_spec"), dict):
         raise ValueError("checkpoint has no rollout queue specification")
+    if metadata.get("long_horizon_value_head_abi") != _LONG_HORIZON_VALUE_HEAD_ABI:
+        raise ValueError("exact-resume checkpoint has no long-horizon value-head ABI marker")
     if config.transaction_learning.enabled:
         if metadata.get("transaction_heads_enabled") is not True:
             raise ValueError("transaction-enabled checkpoint has no head ABI marker")
         if not isinstance(metadata.get("transaction_replay_spec"), dict):
             raise ValueError("transaction-enabled checkpoint has no replay specification")
+    if config.episodic_learning.enabled:
+        if metadata.get("episodic_replay_enabled") is not True:
+            raise ValueError("episodic-learning checkpoint has no replay ABI marker")
+        if not isinstance(metadata.get("episodic_replay_spec"), dict):
+            raise ValueError("episodic-learning checkpoint has no replay specification")
+    elif metadata.get("episodic_replay_enabled") not in (False, None):
+        raise ValueError("episodic replay marker differs from the disabled configuration")
+
+
+def _exact_resume_required_files(config: TrainingConfig) -> frozenset[str]:
+    required = set(EXACT_RESUME_REQUIRED_FILES)
+    if config.transaction_learning.enabled:
+        required.add("transaction_replay.pkl")
+    if config.episodic_learning.enabled:
+        required.add("episodic_replay.pkl")
+    return frozenset(required)
 
 
 def preflight_training_checkpoint(
@@ -509,6 +610,12 @@ def preflight_training_checkpoint(
     resolved_device: str,
     resolved_collector_device: str,
 ) -> ValidatedResumeCheckpoint:
+    # Validate and hash the complete atomic directory using only the stable base
+    # payload set first.  This lets the metadata format gate reject a v3 source
+    # explicitly as model-initialization-only instead of misreporting the new
+    # v4 episodic sidecar as missing. ``validate_resume_checkpoint`` already
+    # hashes every manifest-listed file, including optional sidecars, so the
+    # second phase only needs to require their manifest entries.
     validated = validate_resume_checkpoint(checkpoint)
     _validate_metadata(
         validated,
@@ -517,6 +624,19 @@ def preflight_training_checkpoint(
         resolved_collector_device=resolved_collector_device,
         model_only=False,
     )
+    raw_entries = validated.manifest.get("files")
+    entries = raw_entries if isinstance(raw_entries, list) else []
+    listed = {
+        str(entry.get("path"))
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    missing = sorted(_exact_resume_required_files(config) - listed)
+    if missing:
+        raise CheckpointIntegrityError(
+            "exact resume checkpoint is missing required manifest entries: "
+            f"{missing}"
+        )
     return validated
 
 
@@ -578,6 +698,15 @@ def save_training_checkpoint(
                 transaction_replay_payload,
                 config=config,
             )
+        episodic_replay_payload = None
+        if config.episodic_learning.enabled:
+            if resources.episodic_replay is None:
+                raise RuntimeError("episodic-learning resources have no replay sidecar")
+            episodic_replay_payload = resources.episodic_replay.state_dict()
+            _validated_episodic_replay_payload(
+                episodic_replay_payload,
+                config=config,
+            )
         torch.save(network_state, staging / "network.pt")
         torch.save(actor_network_state, staging / "actor_network.pt")
         torch.save(optimizer_state, staging / "optimizer.pt")
@@ -596,6 +725,13 @@ def save_training_checkpoint(
                     handle,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
+        if episodic_replay_payload is not None:
+            with (staging / "episodic_replay.pkl").open("wb") as handle:
+                pickle.dump(
+                    episodic_replay_payload,
+                    handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
         metadata = {
             "format": _CHECKPOINT_FORMAT,
             "checkpoint_id": publisher.checkpoint_id,
@@ -611,9 +747,18 @@ def save_training_checkpoint(
             "actor_model_state_spec": _tensor_spec(actor_network_state),
             "optimizer_spec": _optimizer_spec(resources.optimizer, optimizer_state),
             "queue_spec": _queue_spec(queue_payload),
+            "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
             "transaction_heads_enabled": config.transaction_learning.enabled,
             "transaction_replay_spec": (
-                _transaction_replay_spec(transaction_replay_payload) if transaction_replay_payload is not None else None
+                _transaction_replay_spec(transaction_replay_payload)
+                if transaction_replay_payload is not None
+                else None
+            ),
+            "episodic_replay_enabled": config.episodic_learning.enabled,
+            "episodic_replay_spec": (
+                _episodic_replay_spec(episodic_replay_payload, config=config)
+                if episodic_replay_payload is not None
+                else None
             ),
             "resolved_device": str(resources.device),
             "resolved_collector_device": str(next(resources.collector_model.parameters()).device),
@@ -635,6 +780,20 @@ def load_training_checkpoint(
     config: TrainingConfig,
     resources: TrainingResources,
 ) -> TrainingState:
+    """Restore an exact continuation only after every payload probes cleanly.
+
+    In particular, optional replay corpora are deserialized and loaded into
+    fresh bounded replay instances before model, optimizer, queue, collector,
+    or process RNG state is touched.  A missing, corrupt, over-capacity, or
+    otherwise incompatible sidecar therefore cannot leave a partially restored
+    live learner.
+    """
+
+    if config.transaction_learning.enabled and resources.transaction_replay is None:
+        raise RuntimeError("transaction-enabled resources have no replay sidecar")
+    if config.episodic_learning.enabled and resources.episodic_replay is None:
+        raise RuntimeError("episodic-learning resources have no replay sidecar")
+
     validated = preflight_training_checkpoint(
         checkpoint,
         config=config,
@@ -660,11 +819,23 @@ def load_training_checkpoint(
         queue_payload = pickle.load(handle)
     with (validated.root / "stochastic_state.pkl").open("rb") as handle:
         stochastic = pickle.load(handle)
+
     transaction_replay_payload = None
     if config.transaction_learning.enabled:
         with (validated.root / "transaction_replay.pkl").open("rb") as handle:
             transaction_replay_payload = pickle.load(handle)
-    if not all(isinstance(item, dict) for item in (network_state, actor_network_state, optimizer_state, queue_payload)):
+    episodic_replay_payload = None
+    if config.episodic_learning.enabled:
+        with (validated.root / "episodic_replay.pkl").open("rb") as handle:
+            episodic_replay_payload = pickle.load(handle)
+
+    base_payloads = (
+        network_state,
+        actor_network_state,
+        optimizer_state,
+        queue_payload,
+    )
+    if not all(isinstance(item, dict) for item in base_payloads):
         raise ValueError("checkpoint payload types are invalid")
     if queue_payload.get("version") != _QUEUE_PAYLOAD_VERSION:
         raise ValueError("unsupported rollout queue checkpoint payload")
@@ -674,16 +845,31 @@ def load_training_checkpoint(
     _validate_unrolls(items, config=config)
     if validated.metadata.get("queue_spec") != _queue_spec(queue_payload):
         raise ValueError("checkpoint rollout queue metadata differs from payload")
+
     stochastic = _validate_stochastic_state(stochastic)
     if config.transaction_learning.enabled:
         transaction_replay_payload = _validated_transaction_replay_payload(
             transaction_replay_payload,
             config=config,
         )
-        if validated.metadata.get("transaction_replay_spec") != _transaction_replay_spec(transaction_replay_payload):
+        if validated.metadata.get("transaction_replay_spec") != _transaction_replay_spec(
+            transaction_replay_payload
+        ):
             raise ValueError("checkpoint transaction replay metadata differs from payload")
+    if config.episodic_learning.enabled:
+        episodic_replay_payload = _validated_episodic_replay_payload(
+            episodic_replay_payload,
+            config=config,
+        )
+        if validated.metadata.get("episodic_replay_spec") != _episodic_replay_spec(
+            episodic_replay_payload,
+            config=config,
+        ):
+            raise ValueError("checkpoint episodic replay metadata differs from payload")
     state = training_state_from_metadata(validated.metadata)
 
+    # Probe all mutable Torch payloads against independent objects.  Nothing
+    # below this block has touched the live TrainingResources instance.
     temporary_model = deepcopy(resources.model)
     temporary_model.load_state_dict(network_state, strict=True)
     temporary_actor = deepcopy(resources.collector_model)
@@ -698,17 +884,27 @@ def load_training_checkpoint(
         raise ValueError("checkpoint learner tensor specification differs")
     if validated.metadata.get("actor_model_state_spec") != _tensor_spec(actor_network_state):
         raise ValueError("checkpoint actor tensor specification differs")
-    if validated.metadata.get("optimizer_spec") != _optimizer_spec(temporary_optimizer, optimizer_state):
+    if validated.metadata.get("optimizer_spec") != _optimizer_spec(
+        temporary_optimizer,
+        optimizer_state,
+    ):
         raise ValueError("checkpoint optimizer specification differs")
+
+    # Queue restore has a live-target precondition independent of checkpoint
+    # payload validity.  Check it before model/optimizer/replay/RNG mutation so
+    # the public loader cannot fail halfway through an otherwise valid restore.
+    resources.rollout_queue.validate_restore_ready()
 
     resources.model.load_state_dict(network_state, strict=True)
     resources.collector_model.load_state_dict(actor_network_state, strict=True)
     resources.optimizer.load_state_dict(optimizer_state)
     resources.rollout_queue.restore(items)
     if transaction_replay_payload is not None:
-        if resources.transaction_replay is None:
-            raise RuntimeError("transaction-enabled resources have no replay sidecar")
+        assert resources.transaction_replay is not None  # precondition above
         resources.transaction_replay.load_state_dict(transaction_replay_payload)
+    if episodic_replay_payload is not None:
+        assert resources.episodic_replay is not None  # precondition above
+        resources.episodic_replay.load_state_dict(episodic_replay_payload)
     _restore_stochastic_state(stochastic, resources=resources)
     return state
 
@@ -722,9 +918,11 @@ def initialize_model_from_checkpoint(
     """Migrate only network parameters into a fresh training lineage.
 
     This is deliberately not exact resume: optimizer moments, queued unrolls,
-    collector/RNG state, environment counters, and policy-version counters are
-    left at their newly constructed values.  The source must still match the
-    exact learned-parameter and grounded feature ABI.
+    transaction/episodic replay, collector/RNG state, environment counters,
+    and policy-version counters are left at their newly constructed values.
+    Compatible learned tensors are inherited into a new lineage; the six v4
+    long-horizon heads may remain freshly initialized only for a validated
+    older-format source that predates their ABI.
     """
 
     validated = preflight_model_initialization(checkpoint, config=config)
@@ -742,6 +940,9 @@ def initialize_model_from_checkpoint(
         state,
         target_state=target_state,
         allow_missing_transaction_heads=config.transaction_learning.enabled,
+        allow_missing_long_horizon_heads=(
+            validated.metadata.get("format") in _LEGACY_MODEL_INITIALIZATION_FORMATS
+        ),
     )
     # Preserve the freshly constructed target-only parameters and RNG lineage;
     # the migration overlays compatible learned tensors onto that exact model
@@ -758,14 +959,16 @@ def _model_parameter_initialization_state(
     *,
     target_state: dict[str, Any],
     allow_missing_transaction_heads: bool,
+    allow_missing_long_horizon_heads: bool = False,
 ) -> dict[str, Any]:
     """Fail-closed overlay used only by explicit parameter initialization.
 
-    Exact resume never calls this path. The only permitted source/target model
-    ABI difference is the complete set of freshly initialized transaction
-    heads. Config/replay ABI changes (including the v4 factual completion-policy
-    objective) reuse compatible network tensors here and deliberately start with
-    a fresh optimizer, rollout queue, RNG lineage, and transaction replay.
+    Exact resume never calls this path. Optional transaction heads and the six
+    v4 long-horizon state heads are independent all-or-none migration groups.
+    Only a validated older-format checkpoint may omit the latter group. Every
+    shared tensor must still match by exact name, shape, and dtype. The caller
+    keeps the target model's fresh parameters for omitted groups and does not
+    import optimizer, queue, replay, RNG, or training counters.
     """
 
     if not isinstance(source_state, dict):
@@ -774,28 +977,59 @@ def _model_parameter_initialization_state(
         raise TypeError("model initialization source must contain named tensors")
     unexpected = sorted(set(source_state) - set(target_state))
     if unexpected:
-        raise ValueError("model initialization source contains unsupported tensors: " + ", ".join(unexpected))
-    allowed_prefixes = (
+        raise ValueError(
+            "model initialization source contains unsupported tensors: "
+            + ", ".join(unexpected)
+        )
+
+    transaction_prefixes = (
         "candidate_effect_head.",
         "selection_delta_head.",
         "transaction_q_head.",
     )
-    missing = set(target_state) - set(source_state)
     target_transaction_heads = {
-        key for key in target_state if key.startswith(allowed_prefixes)
+        key for key in target_state if key.startswith(transaction_prefixes)
     }
-    if missing:
-        if not allow_missing_transaction_heads or missing != target_transaction_heads:
-            shared_missing = sorted(missing - target_transaction_heads)
-            if shared_missing:
-                raise ValueError(
-                    "model initialization source is missing shared tensors: "
-                    + ", ".join(shared_missing)
-                )
+    target_long_horizon_heads = {
+        key for key in target_state if key.startswith(_LONG_HORIZON_HEAD_PREFIXES)
+    }
+    if not target_long_horizon_heads:
+        raise ValueError("model initialization target has no long-horizon head tensors")
+
+    missing = set(target_state) - set(source_state)
+    permitted_missing: set[str] = set()
+
+    missing_transaction = missing & target_transaction_heads
+    if missing_transaction:
+        if (
+            not allow_missing_transaction_heads
+            or missing_transaction != target_transaction_heads
+        ):
             raise ValueError(
                 "model initialization source must contain either all or none "
                 "of the transaction-head tensors"
             )
+        permitted_missing.update(target_transaction_heads)
+
+    missing_long_horizon = missing & target_long_horizon_heads
+    if missing_long_horizon:
+        if (
+            not allow_missing_long_horizon_heads
+            or missing_long_horizon != target_long_horizon_heads
+        ):
+            raise ValueError(
+                "model initialization source must contain either all or none "
+                "of the six long-horizon head prefixes"
+            )
+        permitted_missing.update(target_long_horizon_heads)
+
+    shared_missing = sorted(missing - permitted_missing)
+    if shared_missing:
+        raise ValueError(
+            "model initialization source is missing shared tensors: "
+            + ", ".join(shared_missing)
+        )
+
     migrated = dict(target_state)
     for key, value in source_state.items():
         if not isinstance(value, torch.Tensor):

@@ -1,9 +1,9 @@
-# Recurrent V-trace v2 checkpoint resume
+# Recurrent V-trace v4 checkpoint resume
 
-The v2 learner supports two explicit operations:
+The v4 learner supports two explicit operations:
 
 1. **Exact resume** of the same recurrent V-trace lineage.
-2. **Model initialization** from a complete, same-ABI v2 checkpoint.
+2. **Model initialization** from a complete, explicitly compatible checkpoint.
 
 The failed v1 replay baseline, MuZero, PPO, token-memory, planner, partial state
 dict, manifest-less weights and edited checkpoints are not inputs. In particular,
@@ -23,10 +23,14 @@ Before `torch.load` or queue deserialization, preflight verifies:
 - optimizer state/group specification;
 - pending `SequenceUnroll` types, versions, lengths, sparse snapshots, recurrent
   state width, behavior versions and queue capacity;
+- every enabled transaction/complete-episode replay payload, byte/capacity
+  contract, accounting counters and sampler RNG state;
 - training/evaluation/policy/unroll counters; and
 - Python, NumPy, Torch CPU/CUDA and collector RNG/seed state.
 
-Every v2 checkpoint contains:
+Every v4 checkpoint contains the base payloads below, plus
+`transaction_replay.pkl` and/or `episodic_replay.pkl` when those learners are
+enabled:
 
 ```text
 checkpoint.manifest.json
@@ -38,10 +42,12 @@ rollout_queue.pkl
 stochastic_state.pkl
 ```
 
-The internal format is `sts2-recurrent-vtrace-checkpoint-v3`; the queue payload
+The internal format is `sts2-recurrent-vtrace-checkpoint-v4`; the queue payload
 is `sts2-rollout-queue-pickle-v2`. Missing files, changed bytes, wrong versions
 or any semantic mismatch stop loading. There is no empty-queue, fresh-optimizer,
-partial-key or automatic tensor-remap fallback.
+partial-key or automatic tensor-remap fallback. Payloads are loaded into
+independent probe model/optimizer/replay objects before any live runtime object
+is mutated.
 
 Learner and actor networks are both stored because the bounded asynchronous
 pipeline permits a versioned actor snapshot to lag the learner. Checkpoints are
@@ -81,7 +87,7 @@ before any live resource is changed.
 
 ## Model initialization
 
-`--initialize-from` loads only a complete same-model v2 learner network and
+`--initialize-from` loads only compatible tensors from a complete learner network and
 starts a fresh optimizer, queue, counters, collector RNG and lineage:
 
 ```powershell
@@ -101,12 +107,17 @@ The learned-parameter configuration, grounded feature ABI, and strict state
 keys/shapes must match. Tensor-independent encoding capacities may change because
 they do not alter network parameter shapes. Initialization imports only
 `network.pt`, republishes it to the actor, and leaves optimizer, rollout queue,
-transaction replay, counters, collector/RNG state, and policy-version counters
+transaction replay, complete-episode replay, counters, collector/RNG state, and policy-version counters
 fresh. The first child checkpoint records a `model_parameter_initialization`
 parent relation plus the source contract, reward-fingerprint SHA-256, dependency
 locks, manifest hash, and metadata hash. Never edit an archived manifest to make
 it look current. A deliberate architecture or feature-encoding change starts
-randomly; v1 remains unsupported.
+randomly; v1 remains unsupported. The one explicit architecture migration is a
+recognized v3 source that predates the long-horizon heads: all shared tensors
+must still match exactly, and the complete six-prefix combat/Act/run task and
+revival-cost head group remains freshly initialized. A partial group is rejected.
+This operation always creates a fresh lineage and can never masquerade as exact
+resume.
 
 ## Operational verification
 

@@ -17,6 +17,7 @@ from sts2_rl.models import RecurrentCandidateModel
 
 from .collector import GroundedCollector
 from .config import TrainingConfig
+from .episode_replay import BoundedEpisodicReplay
 from .learner import VTraceLearner
 from .transaction import BoundedTransactionReplay
 
@@ -32,6 +33,7 @@ class TrainingResources:
     collector: GroundedCollector
     learner: VTraceLearner
     transaction_replay: BoundedTransactionReplay | None
+    episodic_replay: BoundedEpisodicReplay | None
     device: torch.device
 
     def publish_collector_policy(self) -> float:
@@ -160,6 +162,17 @@ def build_training_resources(
         if config.transaction_learning.enabled
         else None
     )
+    episodic_replay = (
+        BoundedEpisodicReplay(
+            capacity=config.episodic_learning.replay_capacity_episodes,
+            byte_capacity=config.episodic_learning.replay_capacity_bytes,
+            episode_byte_capacity=config.episodic_learning.per_episode_capacity_bytes,
+            max_segments_per_episode=config.episodic_learning.max_segments_per_episode,
+            seed=config.runtime.seed,
+        )
+        if config.episodic_learning.enabled
+        else None
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.optimization.learning_rate,
@@ -219,6 +232,7 @@ def build_training_resources(
                 if config.transaction_learning.enabled
                 else None
             ),
+            episodic_learning_enabled=config.episodic_learning.enabled,
         )
         learner = VTraceLearner(
             model=model,
@@ -228,6 +242,7 @@ def build_training_resources(
             maximum_unroll_length=config.rollout.unroll_length,
             maximum_policy_lag=config.rollout.max_policy_lag,
             transaction_config=config.transaction_learning,
+            episodic_config=config.episodic_learning,
         )
         return TrainingResources(
             model=model,
@@ -239,6 +254,7 @@ def build_training_resources(
             collector=collector,
             learner=learner,
             transaction_replay=transaction_replay,
+            episodic_replay=episodic_replay,
             device=device,
         )
     except BaseException:

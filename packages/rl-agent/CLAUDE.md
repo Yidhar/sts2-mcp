@@ -1,6 +1,6 @@
 # RL agent contributor guide
 
-This package contains the relational recurrent legal-candidate V-trace v3
+This package contains the relational recurrent legal-candidate V-trace v4
 baseline. The only maintained training entry point is:
 
 ```text
@@ -37,10 +37,10 @@ Torch/ROCm build or fall back to CPU.
 sts2_rl.train
   -> typed LiveBackend or HeadlessBackend
   -> factual relational GroundedObservationEncoder
-  -> RecurrentCandidateModel (exact relation grounding + run/combat GRU + masked policy + scalar value)
+  -> RecurrentCandidateModel (exact relation grounding + run/combat GRU + masked policy + online value + long-horizon values)
   -> fixed, profile-selected sts2_baseline reward contract
   -> bounded FIFO SequenceUnroll queue
-  -> VTraceLearner
+  -> VTraceLearner + bounded detached complete-episode replay
   -> atomic checkpoint
 ```
 
@@ -90,12 +90,35 @@ sts2_rl.train
   curriculum truncations. The short binary/schema/runtime-mechanics preflight
   validates transport facts only; it does not score a policy.
 - Forced singleton actions generate no policy target or policy-gradient term.
-- Main V-trace data is consumed once in FIFO order. The only maintained replay
-  is the bounded, training-partition transaction sidecar: it stores factual
-  select/deselect/confirm/cancel transitions, never held-out diagnostics or
-  fabricated counterfactual actions.
-- The recurrent model keeps one legal-candidate policy and scalar task-value
-  head. Optional transaction effect/delta/Q heads may train the shared factual
+- Main V-trace data is consumed once in FIFO order. Two bounded,
+  training-partition-only sidecars are maintained. Transaction replay stores
+  factual select/deselect/confirm/cancel transitions. Complete-episode replay
+  stores immutable CPU snapshots and authoritative combat/Act/run outcomes;
+  it never retains GPU tensors, hidden states, autograd graphs, held-out
+  diagnostics, or fabricated counterfactual actions.
+- With complete-episode replay enabled, runtime may retain exactly one fetched
+  FIFO batch so the episode is committed before its tail batch learns. The
+  batch must be flushed before maintenance/final checkpointing and may never be
+  consumed twice. Recorded collection must reject held-out evaluation seeds.
+- Complete-episode replay reconstructs the current split-GRU state from an
+  exact sparse prefix under `torch.no_grad()`. Both prefix and suffix forward
+  passes use deterministic evaluation-mode dropout semantics, while only the
+  configured short, contiguous suffix may enter autograd; the caller's model
+  mode must always be restored. Source episode length therefore cannot grow
+  accelerator activation memory. Replay is bounded by episode count, total
+  bytes, per-episode bytes and per-episode sampling quota.
+- Run completion/progress is the primary long-horizon objective. Revival cost
+  may train value/policy only on a factually successful horizon. Before the
+  task value classifies success and enters the explicit primary-tie tolerance,
+  its already-weighted policy signal is capped below the absolute primary
+  residual. Only inside that narrow learned-success stratum may a small
+  nominal-primary floor preserve the revival tie-break at zero task advantage;
+  failed/censored horizons still receive no cost label and early failure must
+  never become the cheap option. Forced singleton actions receive value labels
+  but no replay policy gradient.
+- The recurrent model keeps one legal-candidate policy, the legacy online
+  V-trace scalar value, and candidate-independent combat/Act/run task and
+  revival-cost value heads. Optional transaction effect/delta/Q heads train the shared factual
   representation. Transaction liveness must also optimize normalized policy
   logits directly: completed unique factual steps are preferred and exact
   repeated semantic node/action cycles are avoided. Deselect stays legal; no
@@ -112,11 +135,15 @@ never appear in logs.
 
 All mutable output lives below `STS2_ARTIFACT_ROOT`, outside the checkout.
 Checkpoint publication is atomic and hashes learner model, actor model, optimizer,
-the pending rollout queue, bounded transaction replay, and metadata. Exact resume
+the pending rollout queue, bounded transaction replay, bounded complete-episode
+replay (when enabled), and metadata. Exact resume
 rejects contract, reward projection, dependency lock, encoding, model/config or
 payload drift; optional static catalog provenance is not a gate. A declared
 `model_parameter_initialization` may inherit only shape-compatible network tensors
-into a new lineage; optimizer, queue, RNG, counters, and transaction replay reset.
+into a new lineage; optimizer, queue, RNG, counters, and both replay sidecars reset.
+Older compatible checkpoints may initialize all shared network tensors while
+the complete all-or-none long-horizon head group starts fresh; this is never
+reported as exact resume.
 
 ## Change discipline
 

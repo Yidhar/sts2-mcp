@@ -246,6 +246,20 @@ class BoundedRolloutQueue:
         with self._condition:
             return tuple(self._items)
 
+    def validate_restore_ready(self) -> None:
+        """Fail before a checkpoint restore can mutate any other live resource.
+
+        Exact-resume restoration replaces queue contents; it is never a merge.
+        Keep the empty/open precondition behind the queue lock so checkpointing
+        code does not need to inspect private synchronization state.
+        """
+
+        with self._condition:
+            if self._items:
+                raise RuntimeError("rollout queue must be empty before restore")
+            if self._closed:
+                raise RuntimeError("cannot restore a closed rollout queue")
+
     def restore(self, items: tuple[SequenceUnroll, ...]) -> None:
         if not isinstance(items, tuple) or not all(
             isinstance(item, SequenceUnroll) for item in items

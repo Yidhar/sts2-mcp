@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v4"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v5"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -317,6 +317,98 @@ class TransactionLearningConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodicLearningConfig:
+    """Complete-episode labels replayed through short recurrent graphs.
+
+    Completed training episodes remain detached CPU data. ``burn_in_steps``
+    reconstructs recurrent state under ``no_grad`` and only ``learn_steps``
+    participates in autograd, so episode length does not determine accelerator
+    activation memory. The two byte limits make the host-memory contract
+    explicit and prevent one pathological episode from evicting the corpus.
+
+    Revival policy supervision is a secondary objective. Its implementation
+    must gate cost advantages on factual horizon success. Before the task value
+    classifies the horizon as successful, ``secondary_advantage_fraction``
+    caps cost against the primary residual. Only after success classification
+    *and* inside ``primary_success_tie_tolerance`` may it cap against one
+    nominal primary unit, so equal-primary successful paths can still be
+    ordered by revival cost without overriding a material completion residual.
+    """
+
+    enabled: bool = False
+    replay_capacity_episodes: int = 64
+    replay_capacity_bytes: int = 2_147_483_648
+    per_episode_capacity_bytes: int = 536_870_912
+    max_segments_per_episode: int = 8
+    sample_sequences: int = 2
+    burn_in_steps: int = 32
+    learn_steps: int = 32
+    primary_policy_weight: float = 0.25
+    task_value_weight: float = 0.25
+    revival_value_weight: float = 0.10
+    revival_policy_weight: float = 0.05
+    secondary_advantage_fraction: float = 0.25
+    primary_success_tie_tolerance: float = 0.05
+    importance_ratio_clip: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("episodic_learning.enabled must be a boolean")
+        for name in (
+            "replay_capacity_episodes",
+            "replay_capacity_bytes",
+            "per_episode_capacity_bytes",
+            "max_segments_per_episode",
+            "sample_sequences",
+            "learn_steps",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"episodic_learning.{name}",
+                minimum=1,
+            )
+        _require_int(
+            self.burn_in_steps,
+            label="episodic_learning.burn_in_steps",
+            minimum=0,
+        )
+        if self.per_episode_capacity_bytes > self.replay_capacity_bytes:
+            raise ValueError(
+                "episodic_learning.per_episode_capacity_bytes cannot exceed "
+                "replay_capacity_bytes"
+            )
+        for name in (
+            "primary_policy_weight",
+            "task_value_weight",
+            "revival_value_weight",
+            "revival_policy_weight",
+        ):
+            _require_finite_number(
+                getattr(self, name),
+                label=f"episodic_learning.{name}",
+                minimum=0.0,
+            )
+        _require_finite_number(
+            self.secondary_advantage_fraction,
+            label="episodic_learning.secondary_advantage_fraction",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        _require_finite_number(
+            self.primary_success_tie_tolerance,
+            label="episodic_learning.primary_success_tie_tolerance",
+            minimum=0.0,
+            maximum=0.5,
+        )
+        importance_ratio_clip = _require_finite_number(
+            self.importance_ratio_clip,
+            label="episodic_learning.importance_ratio_clip",
+        )
+        if importance_ratio_clip <= 0.0:
+            raise ValueError("episodic_learning.importance_ratio_clip must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class EnvironmentConfig:
     backend: Literal["live", "headless"] = "headless"
     scenario: Literal["full-run", "combat"] = "full-run"
@@ -509,6 +601,9 @@ class TrainingConfig:
     transaction_learning: TransactionLearningConfig = field(
         default_factory=TransactionLearningConfig
     )
+    episodic_learning: EpisodicLearningConfig = field(
+        default_factory=EpisodicLearningConfig
+    )
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -526,6 +621,7 @@ class TrainingConfig:
             ("optimization", OptimizationConfig),
             ("rollout", RolloutConfig),
             ("transaction_learning", TransactionLearningConfig),
+            ("episodic_learning", EpisodicLearningConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
             ("runtime", RuntimeConfig),
@@ -539,6 +635,15 @@ class TrainingConfig:
             )
         if self.environment.scenario == "full-run" and self.curriculum.reward_objective == "combat":
             raise ValueError("full-run scenarios require objective='act1' or objective='run'")
+        if self.episodic_learning.enabled:
+            if self.environment.scenario != "full-run":
+                raise ValueError(
+                    "episodic learning requires environment.scenario='full-run'"
+                )
+            if self.curriculum.reward_objective != "run":
+                raise ValueError(
+                    "episodic learning requires curriculum.reward_objective='run'"
+                )
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("native revival preheat requires the headless backend")
@@ -652,6 +757,11 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
             _table(payload, "transaction_learning"),
             label="transaction_learning",
         ),
+        episodic_learning=_construct(
+            EpisodicLearningConfig,
+            _table(payload, "episodic_learning"),
+            label="episodic_learning",
+        ),
         environment=_construct(EnvironmentConfig, _table(payload, "environment"), label="environment"),
         curriculum=_construct(CurriculumConfig, _table(payload, "curriculum"), label="curriculum"),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
@@ -696,6 +806,7 @@ __all__ = [
     "CurriculumConfig",
     "DiagnosticsConfig",
     "EnvironmentConfig",
+    "EpisodicLearningConfig",
     "ModelConfig",
     "OptimizationConfig",
     "RolloutConfig",

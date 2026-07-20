@@ -1,10 +1,13 @@
-# Relational grounded-candidate V-trace baseline (v3)
+# Relational grounded-candidate V-trace baseline (v4)
 
 This document is the normative architecture for the restarted RL line. The v1
 grounded single-step replay learner and the relation-poor v2 recurrent learner
 did not establish a useful Act 1 baseline and are not migration sources. Their
-checkpoints and metrics may be retained as failure evidence, but v3 starts from
-fresh random parameters and rejects both older model/encoding ABIs.
+checkpoints and metrics may be retained as failure evidence. The original v3
+line started from fresh random parameters. The v4 long-horizon successor may
+inherit only explicitly validated, shape-compatible shared network tensors from
+the selected v3 policy into a new lineage; it never calls that operation exact
+resume.
 
 ## Scope
 
@@ -20,9 +23,12 @@ flowchart LR
     Actor --> Unroll["64-decision SequenceUnroll"]
     Unroll --> Queue["Bounded FIFO queue"]
     Queue --> Learner["V-trace actor/value learner"]
+    Actor --> Episode["Detached complete episode"]
+    Episode --> EpisodeReplay["Byte-bounded CPU episode replay"]
+    EpisodeReplay --> Learner
     Learner --> Publish["Versioned policy publication"]
     Publish --> Actor
-    Learner --> Checkpoint["Atomic v3 checkpoint"]
+    Learner --> Checkpoint["Atomic v4 checkpoint"]
     Learner --> Eval["Fixed odd-seed evaluation"]
     Eval --> Journal["Diagnostic trajectory JSONL"]
 ```
@@ -42,7 +48,9 @@ flowchart LR
    macro decisions, while combat memory updates in combat and is cleared on
    exit. Hundreds of card plays cannot overwrite route/build memory.
 5. The recurrent context conditions a masked legal-candidate policy.
-6. One scalar value predicts the configured task horizon.
+6. The legacy scalar value predicts the online V-trace target. Separate
+   candidate-independent task and revival-cost values predict combat, Act and
+   complete-run horizons without changing the online value ABI.
 
 The default contract is:
 
@@ -51,8 +59,10 @@ The default contract is:
 - world layers: 3;
 - latent slots: 12;
 - recurrent hidden width: 256;
-- parameters: 4,014,146;
-- output heads: masked policy and scalar value only.
+- parameters: reported by `--dry-run` for the selected optional-head profile;
+- output heads: one masked policy, the legacy online scalar value, and
+  combat/Act/run task plus non-negative revival-cost values. Optional factual
+  transaction effect/delta/Q heads remain profile-controlled.
 
 The model-facing observation uses the versioned
 `grounded-relational-runtime-encoding-v8` contract together with the factual
@@ -110,9 +120,20 @@ interface does not serialize inactive UI trees on every combat action.
 
 The final discount is zero exactly at task terminal/deadlock. A positive final
 discount requires a bootstrap snapshot. Unrolls are placed in a bounded FIFO and
-consumed once. There is no replay capacity measured in transitions, recent mix,
-coverage mix, priority, TD-error refresh, resampling, demonstration partition or
-backfill.
+consumed once. They are never inserted into a generic transition replay.
+
+Two purpose-specific, training-partition-only sidecars are maintained:
+
+1. transaction replay stores factual select/deselect/confirm/cancel sequences;
+2. complete-episode replay stores immutable CPU decision snapshots and the
+   authoritative result/cost labels backfilled at combat, Act and run boundaries.
+
+The episode sidecar is bounded independently by episode count, total logical
+bytes, per-episode bytes and sampled segments per episode. Oversized episodes
+are counted and rejected rather than evicting the entire corpus. Win, failure
+and censored episodes are sampled in rotating strata. Censored boundaries do
+not fabricate success or failure labels, and held-out evaluation never enters
+either training replay.
 
 The learner may publish a new policy while a long episode is running, but the
 actor adopts it only after emitting a complete recurrent unroll. At episode end
@@ -160,6 +181,37 @@ Standard-task defaults:
 The native-revival preheat profile uses discount `1.0`, not `0.997`, so its
 bounded cumulative survival scores telescope exactly over an episode.
 
+In the preheat profile, each learner update may additionally sample two complete-
+episode sequences. The current model reconstructs the exact split-GRU state from
+a sparse historical prefix under `torch.no_grad()`: every preceding non-combat
+decision needed by run memory, the current combat since its most recent reset,
+and at least the configured recent burn-in. Only the contiguous 32-decision
+learning suffix retains autograd. Therefore a 10,000- or 30,000-step source run
+increases bounded CPU storage and no-grad reconstruction work, but cannot make
+accelerator activation memory proportional to the full episode.
+
+Sparse and full replay consume different numbers of otherwise irrelevant model
+calls, so training-mode dropout would give them different RNG histories. The
+learner therefore evaluates the complete episodic replay forward pass with
+dropout disabled, including both prefix and suffix, and restores the model's
+previous train/eval mode in a `finally` block. Evaluation mode does not disable
+autograd: the short suffix still supplies the bounded learning graph.
+
+Every observed combat/Act/run boundary trains its task value. Revival-cost values
+and revival policy credit are success-conditional: a failed or censored horizon
+cannot look attractive merely because it used fewer revivals. Selected-action
+policy replay uses clipped factual behavior/current probability ratios. The
+already-weighted revival signal is capped to a configured fraction of the
+absolute primary completion/progress residual until the task value classifies
+that successful horizon on the positive side of the signed outcome target and
+its residual enters the configured `primary_success_tie_tolerance` band.
+Within that narrow learned-success tie stratum, the cap uses at least a small
+nominal primary unit. This keeps zero- versus high-revival successful paths
+distinguishable after the primary advantage converges to zero. Outside the tie
+band, the fractional cap cannot reverse a material primary residual; failed and
+censored horizons still receive no revival policy label. A forced singleton
+still trains value heads but has no episodic policy term.
+
 Forced singleton actions contribute value/recurrent training but no policy loss
 or policy entropy. All tensors, gradients and post-step parameters are checked
 for finiteness. The learner reports importance ratios, clipping fraction, policy
@@ -172,6 +224,15 @@ completed unrolls into the queue immediately, so learner updates overlap the res
 of the same environment episode. The learner never mutates the actor module.
 Policy snapshots are copied to the actor only at episode boundaries, and every
 unroll records the exact behavior-policy version.
+
+When complete-episode replay is enabled, the main thread holds at most one
+already-fetched FIFO batch behind the actor. A newer batch proves the retained
+batch is not the episode tail; otherwise the factual episode boundary commits
+the completed trajectory before that tail batch is learned. This bounded lag
+preserves steady-state overlap, never consumes an online unroll twice, and
+guarantees that a one-episode run samples its own long-horizon labels before the
+final checkpoint. Recorded collection with an odd held-out evaluation seed is
+rejected rather than mislabeled as training data.
 
 This replaces both v1 synchronous collection and the experimental one-episode
 overlap wrapper. There is one maintained execution mode: bounded FIFO asynchronous
@@ -197,7 +258,7 @@ rest, combat, and build decisions until the complete run terminates. The retaine
 `act1` objective and the `combat` profile are explicit software diagnostics, not
 gates or the main training route. Backend reward scalars are not targets.
 
-No human-data cold start is required for the first v3 baseline. Human trajectories
+No human-data cold start is required for this baseline. Human trajectories
 may be evaluated later as a separately versioned experiment; they must not be
 silently mixed into this baseline.
 
@@ -251,9 +312,12 @@ specific choices. Within the same outcome the weighted objective prefers:
 This is not an invincibility/no-consequence dataset and it does not supervise
 random actions as correct. Epsilon exploration uses revival as a safety net to
 reach later map, build, reward, event, shop, rest, elite, and boss decisions;
-V-trace trains policy and value from run outcome, forward distance, survival,
-and pace consequences. Evaluation reports run/Act-1 success, floor, decision
-count, exact HP lost, revivals used, and revival-free success rates.
+Online V-trace trains policy and value from the configured shaped return. The
+complete-episode sidecar separately gives decisions beyond one short unroll an
+authoritative combat/Act/run outcome and forward-progress target. Revival
+efficiency remains a subordinate success-conditional objective. Evaluation
+reports run/Act-1 success, floor, decision count, exact HP lost, revivals used,
+revival-free success, and successful completion with at most one revival.
 
 WSL/ROCm preheat starts the native-revival full game directly. There is no
 random-combat, Act-1, Act-2 or Act-3 behavior gate in the launch path. Act
@@ -324,7 +388,7 @@ construct a new decoded result for every state.
 
 ## Evaluation schedule
 
-Training seeds are even; held-out evaluation seeds are odd. The default v3 gates
+Training seeds are even; held-out evaluation seeds are odd. The default v4 gates
 are steps 0, 10,000, 25,000 and 50,000, with fixed seeds and deterministic policy.
 Reports include:
 
@@ -338,7 +402,9 @@ Reports include:
 - mean maximum act;
 - mean undiscounted reward.
 - for revival preheat, mean exact player HP lost, mean revivals used,
-  revival-free Act-1/run success rates, and full-run progress.
+  revival-free Act-1/run success rates, Act-1 boundary HP/revival means,
+  successful-run conditional HP/revival means, run wins with at most one
+  revival, and full-run progress.
 
 No Act 1 performance claim is valid without these held-out evaluations and their
 trajectory journals.
@@ -348,7 +414,7 @@ zero (including after model-parameter initialization) and at 30k/100k/250k.
 
 ## Checkpoint ABI
 
-The format is `sts2-recurrent-vtrace-checkpoint-v3` and contains:
+The format is `sts2-recurrent-vtrace-checkpoint-v4` and contains:
 
 ```text
 metadata.json
@@ -357,20 +423,28 @@ actor_network.pt
 optimizer.pt
 rollout_queue.pkl
 stochastic_state.pkl
+transaction_replay.pkl   # when transaction learning is enabled
+episodic_replay.pkl      # when complete-episode learning is enabled
 checkpoint.manifest.json
 ```
 
 Publication is atomic and SHA-256 covers every payload. Exact resume validates
 the contract/reward/dependency identities, model and encoding config, learner and
-actor tensor specifications, optimizer layout, pending unrolls, devices, RNGs and
-collector continuation state before mutating live resources. Old checkpoints
-containing `replay_buffer.pkl` are rejected; there is no v1 compatibility loader.
+actor tensor specifications, optimizer layout, pending unrolls, devices, RNGs,
+both enabled replay corpora (including sampler RNG/counters/capacities), and
+collector continuation state before mutating live resources. Every payload is
+probed against independent temporary objects before live resources are mutated.
+Old checkpoints containing `replay_buffer.pkl` are rejected; there is no v1
+compatibility loader and a v3 checkpoint is not an exact-resume source for v4.
 
 `--initialize-from` is a different, explicit operation. When the learned tensor
 shapes and grounded feature ABI are unchanged, capacity/config changes such as
 `max_candidates = 96` to `256` may import the learner network into a fresh
-lineage. Optimizer state, queued unrolls, RNGs, collector continuation, counters
-and policy-version numbers are not imported. Child checkpoint provenance uses
+lineage. For an explicitly recognized v3 source, all six long-horizon head
+prefixes must be absent as one complete group; those target heads remain freshly
+initialized while every inherited tensor must match exactly by name, shape and
+dtype. Optimizer state, queued unrolls, RNGs, collector continuation, counters,
+both replay corpora and policy-version numbers are not imported. Child checkpoint provenance uses
 the `model_parameter_initialization` relation, so this cannot be confused with
 exact resume.
 
