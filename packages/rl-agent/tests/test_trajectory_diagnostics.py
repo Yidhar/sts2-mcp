@@ -3,11 +3,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sts2_rl.training.trajectory import (
     SemanticDeadlockDetector,
     TrajectoryJournal,
+    _collection_count,
     semantic_decision_fingerprint,
 )
+
+
+def test_journal_collection_count_preserves_and_validates_multiplicity() -> None:
+    assert _collection_count([{"id": "CARD.WOUND", "quantity": 50_000}]) == 50_000
+    assert _collection_count({"cards": [{"id": "CARD.WOUND", "quantity": 7}]}) == 7
+    with pytest.raises(ValueError, match="quantity"):
+        _collection_count([{"id": "CARD.WOUND", "quantity": 0}])
 
 
 def test_semantic_fingerprint_ignores_transport_ids_and_candidate_order() -> None:

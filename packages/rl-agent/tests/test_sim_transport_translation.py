@@ -421,6 +421,71 @@ def test_runtime_instances_and_sparse_potion_slots_bind_state_to_actions() -> No
     assert actions[1]["potion"]["slot_index"] == 2
 
 
+
+def test_orderless_pile_quantity_survives_transport_without_expansion() -> None:
+    sim_state = {
+        "state_type": "combat",
+        "battle": {
+            "player": {
+                "current_hp": 1,
+                "max_hp": 80,
+                "hand": [],
+                "deck": [],
+                "draw_pile_count": 50_000,
+                "draw_pile": [
+                    {
+                        "id": "WOUND",
+                        "type": "Status",
+                        "cost": -2,
+                        "quantity": 50_000,
+                    }
+                ],
+                "discard_pile": [],
+                "exhaust_pile": [],
+            },
+            "enemies": [
+                {
+                    "entity_id": "TEST_SUBJECT",
+                    "combat_id": 46,
+                    "hp": 100,
+                    "max_hp": 100,
+                }
+            ],
+        },
+        "legal_actions": [{"action": "end_turn"}],
+    }
+
+    translated = translate_to_bridge_shape(sim_state, episode_id="ep-pollution")
+    pile = translated["player"]["draw_pile"]
+
+    assert len(pile) == 1
+    assert pile[0]["id"] == "CARD.WOUND"
+    assert pile[0]["quantity"] == 50_000
+    assert translated["player"]["draw_pile_count"] == 50_000
+
+
+@pytest.mark.parametrize("quantity", [0, -1, True, 1.5])
+def test_transport_rejects_invalid_card_multiplicity(quantity: object) -> None:
+    sim_state = {
+        "state_type": "combat",
+        "battle": {
+            "player": {
+                "current_hp": 1,
+                "max_hp": 80,
+                "hand": [],
+                "deck": [],
+                "draw_pile": [{"id": "WOUND", "quantity": quantity}],
+                "discard_pile": [],
+                "exhaust_pile": [],
+            },
+            "enemies": [],
+        },
+        "legal_actions": [{"action": "end_turn"}],
+    }
+
+    with pytest.raises(ValueError, match="quantity"):
+        translate_to_bridge_shape(sim_state, episode_id="ep-invalid-quantity")
+
 def test_opaque_handles_round_trip_sparse_shop_and_target_parameters_without_reindexing() -> None:
     shop_state = {
         "state_type": "shop",

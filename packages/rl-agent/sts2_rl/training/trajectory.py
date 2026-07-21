@@ -259,24 +259,49 @@ def _compact_entity(
     }
 
 
+def _collection_sequence_count(items: list[Any] | tuple[Any, ...]) -> int:
+    total = 0
+    for item in items:
+        if not isinstance(item, Mapping) or "quantity" not in item:
+            total += 1
+            continue
+        quantity = item["quantity"]
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise ValueError("journal card quantity must be a positive integer")
+        total += quantity
+    return total
+
+
 def _collection_count(value: Any) -> int | float | None:
     """Read a collection count from both canonical and live bridge shapes."""
 
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int | float):
         return value
     if isinstance(value, list | tuple):
-        return len(value)
+        return _collection_sequence_count(value)
     if not isinstance(value, Mapping):
         return None
     explicit = value.get("count")
-    if isinstance(explicit, int | float) and not isinstance(explicit, bool):
-        return explicit
+    if explicit is not None:
+        if (
+            isinstance(explicit, bool)
+            or not isinstance(explicit, int)
+            or explicit < 0
+        ):
+            raise ValueError(
+                "journal card collection count must be a non-negative integer"
+            )
+        return int(explicit)
     for key in ("cards", "items"):
         items = value.get(key)
         if isinstance(items, list | tuple):
-            return len(items)
+            return _collection_sequence_count(items)
     return None
 
 

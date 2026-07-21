@@ -19,6 +19,7 @@ from sts2_rl.encoding.grounded import (
     _DYNAMIC_VALUE_SLOT_BY_KEY,
     _NUMERIC_SLOT_BY_KEY,
     _ZONE_IDS,
+    _aggregate_orderless_card_multiset,
     _bounded_number,
     _canonical_card,
     _canonical_enemy,
@@ -27,6 +28,7 @@ from sts2_rl.encoding.grounded import (
     _canonical_power,
     _canonical_relic,
     _hash_id,
+    _pile_count,
     _strict_card_selection_projection,
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
@@ -610,6 +612,67 @@ def test_raw_event_options_and_run_modes_remain_distinguishable_without_effect_r
     ]
     mode_batch = encoder.encode(_observation(), mode_actions).batch.candidates
     assert not torch.equal(mode_batch.role_ids[:, 0], mode_batch.role_ids[:, 1])
+
+
+
+def test_compressed_orderless_card_multiplicity_matches_expanded_multiset() -> None:
+    card = {
+        "id": "CARD.WOUND",
+        "type": "Status",
+        "cost": -2,
+        "pile": "Discard",
+        "keywords": ["Unplayable"],
+    }
+    expanded = _aggregate_orderless_card_multiset([dict(card) for _ in range(7)])
+    compressed = _aggregate_orderless_card_multiset([{**card, "quantity": 7}])
+
+    assert compressed == expanded
+    assert compressed == [{**card, "quantity": 7}]
+    assert _pile_count(
+        [{**card, "quantity": 50_000}],
+        label="status pile",
+    ) == 50_000
+
+    with pytest.raises(ValueError, match="quantity"):
+        _aggregate_orderless_card_multiset([{**card, "quantity": 0}])
+
+def test_compressed_pile_multiplicity_is_end_to_end_tensor_equivalent() -> None:
+    card = {
+        "id": "CARD.WOUND",
+        "type": "Status",
+        "cost": -2,
+        "keywords": ["Unplayable"],
+    }
+    expanded = deepcopy(_observation())
+    expanded_combat = expanded["combat"]
+    assert isinstance(expanded_combat, dict)
+    expanded_combat["draw_pile"] = [
+        {**card, "instance_uuid": f"wound-{index}"}
+        for index in range(7)
+    ]
+
+    compressed = deepcopy(_observation())
+    compressed_combat = compressed["combat"]
+    assert isinstance(compressed_combat, dict)
+    compressed_combat["draw_pile"] = [{**card, "quantity": 7}]
+
+    encoder = _encoder()
+    expanded_world = encoder.encode(expanded, _actions()).batch.world
+    compressed_world = encoder.encode(compressed, _actions()).batch.world
+    for field in (
+        "features",
+        "mask",
+        "type_ids",
+        "role_ids",
+        "owner_ids",
+        "entity_ids",
+        "zone_ids",
+        "order_ids",
+    ):
+        assert torch.equal(
+            getattr(expanded_world, field),
+            getattr(compressed_world, field),
+        )
 
 
 def test_canonical_headless_and_live_route_coordinates_match_and_distinguish() -> None:

@@ -51,6 +51,11 @@ def _translate_card(
     if not isinstance(sim_card, Mapping):
         raise TypeError("simulator card must be a mapping")
     card = deepcopy(dict(sim_card))
+    if "quantity" in sim_card:
+        quantity = sim_card["quantity"]
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("simulator card quantity must be a positive integer")
+        card["quantity"] = quantity
     raw_id = sim_card.get("id", sim_card.get("card_id"))
     if raw_id is not None:
         card["id"] = _qualified_id("CARD", raw_id)

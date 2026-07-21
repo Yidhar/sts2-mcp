@@ -1772,6 +1772,13 @@ def _canonical_enemy(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _visible_card_quantity(value: Mapping[str, Any], *, label: str) -> int:
+    raw = value.get("quantity", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ValueError(f"{label}.quantity must be a positive integer")
+    return int(raw)
+
+
 def _pile_count(value: Any, *, label: str) -> int | float | None:
     if value is None:
         return None
@@ -1788,8 +1795,16 @@ def _pile_count(value: Any, *, label: str) -> int | float | None:
         cards = _first_present(value, "cards")
         if cards is None:
             return None
-        return len(_as_mapping_list(cards, label=f"{label}.cards"))
-    return len(_as_mapping_list(value, label=label))
+        values = _as_mapping_list(cards, label=f"{label}.cards")
+        return sum(
+            _visible_card_quantity(card, label=f"{label}.cards[{index}]")
+            for index, card in enumerate(values)
+        )
+    values = _as_mapping_list(value, label=label)
+    return sum(
+        _visible_card_quantity(card, label=f"{label}[{index}]")
+        for index, card in enumerate(values)
+    )
 
 
 def _pile_cards(value: Any, *, label: str) -> list[Mapping[str, Any]] | None:
@@ -1812,19 +1827,26 @@ def _canonical_card_sequence(
     pile: str | None = None,
     membership: str | None = None,
     sort_as_set: bool = False,
+    preserve_quantity: bool = False,
 ) -> list[dict[str, Any]] | None:
     cards = _pile_cards(value, label=label)
     if cards is None:
         return None
     result: list[dict[str, Any]] = []
-    for card in cards:
+    for index, card in enumerate(cards):
         enriched = dict(card)
         if pile is not None and _first_present(enriched, "source_pile", "pile", "zone") is None:
             enriched["pile"] = pile
         if membership is not None:
             enriched["selection_membership"] = membership
             enriched["is_selected"] = membership == "selected"
-        result.append(_canonical_card(enriched))
+        canonical = _canonical_card(enriched)
+        if preserve_quantity:
+            canonical["quantity"] = _visible_card_quantity(
+                enriched,
+                label=f"{label}[{index}]",
+            )
+        result.append(canonical)
     if sort_as_set:
         result.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     return result
@@ -1852,6 +1874,7 @@ def _aggregate_orderless_card_multiset(
     grouped: dict[str, tuple[dict[str, Any], dict[str, Any], int]] = {}
     for raw_card in cards:
         original = dict(raw_card)
+        quantity = _visible_card_quantity(original, label="orderless card")
         card = dict(original)
         card.pop("instance_id", None)
         card.pop("instance_uuid", None)
@@ -1859,9 +1882,13 @@ def _aggregate_orderless_card_multiset(
         identity = json.dumps(card, sort_keys=True, separators=(",", ":"))
         existing = grouped.get(identity)
         if existing is None:
-            grouped[identity] = (card, original, 1)
+            grouped[identity] = (card, original, quantity)
         else:
-            grouped[identity] = (existing[0], existing[1], existing[2] + 1)
+            grouped[identity] = (
+                existing[0],
+                existing[1],
+                existing[2] + quantity,
+            )
 
     result: list[dict[str, Any]] = []
     for identity in sorted(grouped):
@@ -2126,13 +2153,14 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         deck_count: int | float = deck_value
     else:
         deck_cards = _as_mapping_list(deck_value, label="player deck")
-        deck_count = len(deck_cards)
+        deck_count = _pile_count(deck_cards, label="player deck") or 0
 
     canonical_deck_sequence = _canonical_card_sequence(
         deck_cards,
         label="player.deck_cards",
         pile="Deck",
         sort_as_set=True,
+        preserve_quantity=True,
     ) or []
     canonical_deck_cards = _aggregate_orderless_card_multiset(
         canonical_deck_sequence
@@ -2292,6 +2320,7 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 label=f"combat {key}",
                 pile=pile,
                 sort_as_set=True,
+                preserve_quantity=True,
             )
             if cards is not None:
                 combat[key] = _aggregate_orderless_card_multiset(cards)
@@ -2385,11 +2414,9 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         selected_cards = _first_present(raw_selection, "selected_cards")
         selected_count = _first_present(raw_selection, "selected_count")
         if selected_count is None and selected_cards is not None:
-            selected_count = len(
-                _as_mapping_list(
-                    selected_cards,
-                    label="selection.selected_cards",
-                )
+            selected_count = _pile_count(
+                selected_cards,
+                label="selection.selected_cards",
             )
         requires_manual_confirmation = _first_present(
             raw_selection,
@@ -2445,12 +2472,14 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             label="selection.selectable_cards",
             membership="selectable",
             sort_as_set=True,
+            preserve_quantity=True,
         )
         selected = _canonical_card_sequence(
             selected_cards,
             label="selection.selected_cards",
             membership="selected",
             sort_as_set=True,
+            preserve_quantity=True,
         )
         raw_options = _first_present(raw_selection, "options")
         if raw_options is not None:

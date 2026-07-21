@@ -108,6 +108,11 @@ class EpisodeMetrics:
     revival_free_run_win: bool
     player_hp_lost: float
     stall_evidence: dict[str, object] | None
+    # A collector-observed combat liveness failure is a trustworthy policy
+    # outcome even though the simulator has not ended the native run. Keep it
+    # separate from run_defeat (environment outcome) and transport incidents
+    # (which never produce EpisodeMetrics).
+    combat_policy_failed: bool = False
     maximum_observed_semantic_candidates: int = 0
     maximum_equivalence_class_size: int = 0
     # Cumulative efficiency counters at successful, real Act boundaries.  The
@@ -788,6 +793,7 @@ def _episodic_combat_boundary(
     is_active: bool,
     transition_facts: Mapping[str, object],
     authoritative_run_result: str | None,
+    trusted_policy_failure: bool,
     episode_censored: bool,
 ) -> BoundaryOutcome:
     """Classify a factual combat horizon without treating revival as exit.
@@ -803,6 +809,8 @@ def _episodic_combat_boundary(
     if not was_active:
         return BoundaryOutcome.NONE
     if authoritative_run_result == "defeat":
+        return BoundaryOutcome.FAILED
+    if trusted_policy_failure:
         return BoundaryOutcome.FAILED
     if is_active:
         return BoundaryOutcome.CENSORED if episode_censored else BoundaryOutcome.NONE
@@ -825,6 +833,7 @@ def _episodic_act_boundary(
     before_act: int,
     after_act: int,
     authoritative_run_result: str | None,
+    trusted_policy_failure: bool,
     episode_censored: bool,
 ) -> BoundaryOutcome:
     """Classify the Act containing the pre-action decision."""
@@ -836,6 +845,8 @@ def _episodic_act_boundary(
     if authoritative_run_result == "victory":
         return BoundaryOutcome.SUCCEEDED
     if authoritative_run_result == "defeat":
+        return BoundaryOutcome.FAILED
+    if trusted_policy_failure:
         return BoundaryOutcome.FAILED
     if after_act < before_act:
         raise CollectionProtocolError(
@@ -1166,14 +1177,41 @@ def _durable_potion_signature(value: Mapping[str, object]) -> tuple[object, ...]
 def _durable_collection(
     value: object,
     projector: Callable[[Mapping[str, object]], tuple[object, ...]],
+    *,
+    counted_multiset: bool = False,
 ) -> tuple[tuple[object, ...], ...]:
     if isinstance(value, Mapping):
         nested = value.get("cards", value.get("items"))
         value = nested if isinstance(nested, list | tuple) else ()
     if not isinstance(value, list | tuple):
         return ()
-    projected = [projector(item) for item in value if isinstance(item, Mapping)]
-    return tuple(sorted(projected, key=repr))
+    if not counted_multiset:
+        projected = [
+            projector(item)
+            for item in value
+            if isinstance(item, Mapping)
+        ]
+        return tuple(sorted(projected, key=repr))
+
+    counts: dict[tuple[object, ...], int] = {}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        quantity = item.get("quantity", 1)
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise CollectionProtocolError(
+                "durable card quantity must be a positive integer"
+            )
+        signature = projector(item)
+        counts[signature] = counts.get(signature, 0) + quantity
+    return tuple(
+        (*signature, quantity)
+        for signature, quantity in sorted(counts.items(), key=lambda item: repr(item[0]))
+    )
 
 
 def _noncombat_durable_projections(
@@ -1239,6 +1277,7 @@ def _noncombat_durable_projections(
     player_projection["deck"] = _durable_collection(
         deck_value,
         _durable_card_signature,
+        counted_multiset=True,
     )
     player_projection["relics"] = _durable_collection(
         player.get("relics"),
@@ -1541,12 +1580,60 @@ class _NonCombatDurableProgressTracker:
         )
 
 
+def _diagnostic_nonnegative_count(value: object, *, label: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CollectionProtocolError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _diagnostic_card_quantity_total(value: object) -> int | None:
+    if isinstance(value, Mapping):
+        explicit = value.get("count")
+        if explicit is not None:
+            if (
+                isinstance(explicit, bool)
+                or not isinstance(explicit, int)
+                or explicit < 0
+            ):
+                raise CollectionProtocolError(
+                    "diagnostic card collection count must be a non-negative integer"
+                )
+            return int(explicit)
+        value = value.get("cards", value.get("items"))
+    if not isinstance(value, list | tuple):
+        return None
+    total = 0
+    for card in value:
+        if not isinstance(card, Mapping) or "quantity" not in card:
+            total += 1
+            continue
+        raw = card["quantity"]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise CollectionProtocolError(
+                "diagnostic card quantity must be a positive integer"
+            )
+        total += raw
+    return total
+
+
 def _zone_count(observation: Mapping[str, object], key: str) -> int:
     player = observation.get("player")
-    value = player.get(key) if isinstance(player, Mapping) else None
-    if isinstance(value, Mapping):
-        value = value.get("cards")
-    return len(value) if isinstance(value, list | tuple) else 0
+    combat = observation.get("combat")
+    for owner in (player, combat):
+        if not isinstance(owner, Mapping):
+            continue
+        explicit = _diagnostic_nonnegative_count(
+            owner.get(f"{key}_count"),
+            label=f"diagnostic {key}_count",
+        )
+        if explicit is not None:
+            return explicit
+        total = _diagnostic_card_quantity_total(owner.get(key))
+        if total is not None:
+            return total
+    return 0
 
 
 def _legal_action_kind_counts(
@@ -1590,19 +1677,22 @@ def _diagnostic_zone_count(
     combat = observation.get("combat")
     owners = tuple(owner for owner in (player, combat) if isinstance(owner, Mapping))
     for owner in owners:
+        count = _diagnostic_nonnegative_count(
+            owner.get(f"{key}_count"),
+            label=f"diagnostic {key}_count",
+        )
+        if count is not None:
+            return count
         value = owner.get(key)
-        if isinstance(value, Mapping):
-            explicit = value.get("count")
-            if isinstance(explicit, int | float) and not isinstance(explicit, bool):
-                return max(0, int(explicit))
-            value = value.get("cards", value.get("items"))
-        if isinstance(value, list | tuple):
-            return len(value)
-        if isinstance(value, int | float) and not isinstance(value, bool):
-            return max(0, int(value))
-        count = owner.get(f"{key}_count")
-        if isinstance(count, int | float) and not isinstance(count, bool):
-            return max(0, int(count))
+        total = _diagnostic_card_quantity_total(value)
+        if total is not None:
+            return total
+        scalar = _diagnostic_nonnegative_count(
+            value,
+            label=f"diagnostic {key}",
+        )
+        if scalar is not None:
+            return scalar
     return None
 
 
@@ -2243,6 +2333,7 @@ class GroundedCollector:
         deadlocked = False
         combat_progress_stalled = False
         noncombat_progress_stalled = False
+        trusted_policy_failure = False
         stall_evidence: dict[str, object] | None = None
         combat_progress = _CombatNetProgressTracker(
             window=self.combat_net_progress_window,
@@ -2461,7 +2552,16 @@ class GroundedCollector:
                 maximum_combat_no_net_progress_steps,
                 combat_progress_status.maximum_age_steps,
             )
-            combat_progress_stalled = bool(combat_progress_status.stalled and not result_terminal)
+            combat_progress_stalled = bool(
+                combat_progress_status.stalled
+                and not result_terminal
+                and not forced_horizon
+            )
+            # A bounded, mechanics-agnostic no-net-progress window is a task
+            # outcome: the policy failed to solve this combat. Native revival
+            # may keep the avatar alive, but it must not turn a strategically
+            # lost state into censored data or an infrastructure timeout.
+            trusted_policy_failure = combat_progress_stalled
             if combat_progress_stalled:
                 # Construct this bounded snapshot only for the terminating
                 # transition. Ordinary decisions retain no additional state.
@@ -2527,20 +2627,25 @@ class GroundedCollector:
                 else None
             )
             episode_censored = bool(
-                forced_horizon
-                or (breakdown.task_terminal and authoritative_run_result is None)
+                not trusted_policy_failure
+                and (
+                    forced_horizon
+                    or (breakdown.task_terminal and authoritative_run_result is None)
+                )
             )
             combat_boundary = _episodic_combat_boundary(
                 was_active=pre_action_combat,
                 is_active=next_combat_in_progress,
                 transition_facts=transition_facts,
                 authoritative_run_result=authoritative_run_result,
+                trusted_policy_failure=trusted_policy_failure,
                 episode_censored=episode_censored,
             )
             act_boundary = _episodic_act_boundary(
                 before_act=pre_action_act,
                 after_act=after_action_act,
                 authoritative_run_result=authoritative_run_result,
+                trusted_policy_failure=trusted_policy_failure,
                 episode_censored=episode_censored,
             )
             if act_boundary is BoundaryOutcome.SUCCEEDED:
@@ -2934,9 +3039,18 @@ class GroundedCollector:
             authoritative_run_outcome = bool(
                 state.terminated and typed_run_result in {"victory", "defeat"}
             )
+            observed_task_outcome = bool(
+                authoritative_run_outcome or trusted_policy_failure
+            )
             completion = EpisodeCompletion(
-                authoritative=authoritative_run_outcome,
-                won=(typed_run_result == "victory") if authoritative_run_outcome else None,
+                authoritative=observed_task_outcome,
+                won=(
+                    typed_run_result == "victory"
+                    if authoritative_run_outcome
+                    else False
+                    if trusted_policy_failure
+                    else None
+                ),
                 final_revivals=revivals_used,
                 final_hp_loss=player_hp_lost,
                 terminal_reason=str(resolved_terminal_reason or "censored_run"),
@@ -2982,6 +3096,7 @@ class GroundedCollector:
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
                 stall_evidence=stall_evidence,
+                combat_policy_failed=trusted_policy_failure,
                 maximum_observed_semantic_candidates=(
                     maximum_observed_semantic_candidates
                 ),

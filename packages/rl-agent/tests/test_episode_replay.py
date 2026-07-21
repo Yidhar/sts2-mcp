@@ -444,6 +444,21 @@ def test_act_zero_and_exact_policy_decision_flag_are_supported() -> None:
         replace(step, policy_decision=1)  # type: ignore[arg-type]
 
 
+def test_v2_replay_rejects_v1_exact_resume_sidecar() -> None:
+    replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=1024,
+        episode_byte_capacity=1024,
+        max_segments_per_episode=1,
+        seed=7,
+    )
+    payload = replay.state_dict()
+    payload["version"] = "sts2-episodic-replay-v1"
+
+    with pytest.raises(ValueError, match="unsupported episodic replay"):
+        replay.load_state_dict(payload)
+
+
 def test_sampling_round_robins_win_failure_and_censored_strata() -> None:
     snapshot = _snapshot()
     episodes = tuple(

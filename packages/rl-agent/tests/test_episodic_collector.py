@@ -23,6 +23,7 @@ from sts2_rl.training import (
     run_training,
     summarize_evaluation,
 )
+from sts2_rl.training.collector import _noncombat_durable_projections
 from sts2_rl.training.episode_replay import BoundaryOutcome
 from tests.test_v2_training_pipeline import _config
 
@@ -264,7 +265,12 @@ class _AuditableReward:
         )
 
 
-def _run_config(*, max_episode_steps: int = 32, durable_window: int = 32):
+def _run_config(
+    *,
+    max_episode_steps: int = 32,
+    durable_window: int = 32,
+    combat_window: int = 128,
+):
     base = _config(total_steps=max_episode_steps)
     return replace(
         base,
@@ -278,7 +284,7 @@ def _run_config(*, max_episode_steps: int = 32, durable_window: int = 32):
         diagnostics=DiagnosticsConfig(
             deadlock_window=128,
             deadlock_repeat_threshold=64,
-            combat_net_progress_window=128,
+            combat_net_progress_window=combat_window,
             noncombat_durable_progress_window=durable_window,
             combat_min_net_hp_fraction=0.05,
             journal_policy_topk=5,
@@ -444,6 +450,81 @@ def test_collection_budget_is_censored_and_does_not_fabricate_targets() -> None:
     assert not only.run.observed
     assert not only.act.observed
     assert not only.combat.observed
+
+
+
+def test_durable_deck_fingerprint_is_multiplicity_aware_and_bounded() -> None:
+    card = {"id": "CARD.STRIKE_IRONCLAD", "upgrade_level": 0}
+    expanded = {"player": {"deck_cards": [dict(card) for _ in range(7)]}}
+    compressed = {"player": {"deck_cards": [{**card, "quantity": 7}]}}
+    changed = {"player": {"deck_cards": [{**card, "quantity": 8}]}}
+
+    _, expanded_resources = _noncombat_durable_projections(expanded)
+    _, compressed_resources = _noncombat_durable_projections(compressed)
+    _, changed_resources = _noncombat_durable_projections(changed)
+
+    assert expanded_resources == compressed_resources
+    assert changed_resources != compressed_resources
+    deck = compressed_resources["player"]["deck"]
+    assert len(deck) == 1
+    assert deck[0][-1] == 7
+
+
+def test_combat_stall_is_observed_policy_failure_with_full_run_credit() -> None:
+    stable = _observation(act=1, floor=17, combat=True, revivals=12, hp_loss=40.0)
+    resources = build_training_resources(
+        _run_config(max_episode_steps=10, combat_window=2),
+        backend=_ScriptedRunBackend([stable, stable, stable], terminal_result=None),
+    )
+    resources.collector.reward_calculator = _AuditableReward()
+    try:
+        episode = resources.collector.collect_episode(
+            deterministic=True,
+            record=True,
+        )
+    finally:
+        resources.close()
+
+    completed = episode.completed_episode
+    assert completed is not None
+    assert episode.metrics.combat_progress_stalled
+    assert episode.metrics.combat_policy_failed
+    assert episode.metrics.terminal_reason == "combat_progress_stall"
+    assert completed.completion.authoritative
+    assert completed.won is False
+    assert completed.completion.terminal_reason == "combat_progress_stall"
+    assert completed.steps[-1].decision.combat_boundary is BoundaryOutcome.FAILED
+    assert completed.steps[-1].decision.act_boundary is BoundaryOutcome.FAILED
+    assert all(step.combat.observed and step.combat.success is False for step in completed.steps)
+    assert all(step.act.observed and step.act.success is False for step in completed.steps)
+    assert all(step.run.observed and step.run.success is False for step in completed.steps)
+    assert all(not step.run.efficiency_eligible for step in completed.steps)
+
+def test_collection_budget_censors_a_simultaneous_combat_stall() -> None:
+    stable = _observation(act=1, floor=17, combat=True, revivals=12, hp_loss=40.0)
+    resources = build_training_resources(
+        _run_config(max_episode_steps=2, combat_window=2),
+        backend=_ScriptedRunBackend([stable, stable, stable], terminal_result=None),
+    )
+    resources.collector.reward_calculator = _AuditableReward()
+    try:
+        episode = resources.collector.collect_episode(
+            deterministic=True,
+            record=True,
+        )
+    finally:
+        resources.close()
+
+    completed = episode.completed_episode
+    assert completed is not None
+    assert episode.metrics.truncated
+    assert not episode.metrics.combat_progress_stalled
+    assert not episode.metrics.combat_policy_failed
+    assert episode.metrics.terminal_reason == "collection_budget"
+    assert not completed.completion.authoritative
+    assert completed.won is None
+    assert completed.steps[-1].decision.combat_boundary is BoundaryOutcome.CENSORED
+    assert all(not step.run.observed for step in completed.steps)
 
 
 def test_noncombat_stall_is_censored_not_a_run_loss() -> None:

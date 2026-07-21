@@ -1,0 +1,84 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 76abc62..1013d9b 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -540,20 +540,35 @@ public static class FullRunApiStateBuilder
+ 	{
+ 		try
+ 		{
+-			var list = cards
+-				.Where(static card => card != null)
+-				.Select((card, index) => ToApiCardOption(card, index))
+-				.ToList();
+-			if (shuffle)
++			// These public piles are orderless surfaces. Project each card first,
++			// then quotient only DTOs whose complete visible facts are byte-for-byte
++			// equal. This keeps payload size proportional to semantic variety rather
++			// than status-card copy count while preserving exact multiplicity.
++			var grouped = new SortedDictionary<string, FullRunApiCardOption>(StringComparer.Ordinal);
++			foreach (CardModel card in cards.Where(static card => card != null))
+ 			{
+-				var rng = new System.Random();
+-				for (int i = list.Count - 1; i > 0; i--)
++				FullRunApiCardOption option = ToApiCardOption(card, index: 0);
++				option.quantity = 1;
++				string identity = JsonSerializer.Serialize(option);
++				if (grouped.TryGetValue(identity, out FullRunApiCardOption? existing))
++				{
++					existing.quantity = checked((existing.quantity ?? 1) + 1);
++				}
++				else
+ 				{
+-					int j = rng.Next(i + 1);
+-					(list[i], list[j]) = (list[j], list[i]);
++					grouped.Add(identity, option);
+ 				}
+ 			}
+-			return list;
++
++			// A deterministic identity order reveals no hidden draw order. Retain
++			// compact contiguous indexes for diagnostics and older consumers.
++			List<FullRunApiCardOption> result = grouped.Values.ToList();
++			for (int index = 0; index < result.Count; index++)
++			{
++				result[index].index = index;
++			}
++			_ = shuffle;
++			return result;
+ 		}
+ 		catch
+ 		{
+@@ -978,15 +993,13 @@ public static class FullRunApiStateBuilder
+ 	private static List<FullRunApiCardOption> SafeBuildDeck(Player player)
+ 	{
+ 		try
+ 		{
+-			return player.Deck?.Cards?
+-				.Where(static card => card != null)
+-				.Select((card, index) => ToApiCardOption(card, index))
+-				.ToList()
+-				?? new List<FullRunApiCardOption>();
++			return player.Deck?.Cards is { } cards
++				? SafeBuildPileCards(cards, shuffle: false)
++				: new List<FullRunApiCardOption>();
+ 		}
+ 		catch
+ 		{
+ 			return new List<FullRunApiCardOption>();
+ 		}
+ 	}
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+index 15bb206..357e8a5 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+@@ -109,6 +109,10 @@ public sealed class FullRunApiCardOption
+ {
+ 	public int index { get; set; }
+ 
++	// Exact multiplicity for orderless pile projections. Null is omitted for
++	// hand, selection, action, reward, and shop singleton DTOs.
++	public int? quantity { get; set; }
++
+ 	public string? id { get; set; }
+ 
+ 	public string? name { get; set; }

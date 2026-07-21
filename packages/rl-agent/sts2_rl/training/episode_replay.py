@@ -30,8 +30,13 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 
-EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v1"
-EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v1"
+# v2 broadens EpisodeCompletion.authoritative from native simulator
+# termination only to any reliably observed task outcome. In particular, a
+# bounded combat liveness failure can now label the full trajectory as a policy
+# failure. The version bump deliberately rejects exact resume of v1 replay
+# sidecars whose identical boolean carried narrower semantics.
+EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v2"
+EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v2"
 COMBAT_DOMAIN_ID: Final = 1
 
 # Canonical logical payload widths used by ``storage_nbytes``.  As with
@@ -264,7 +269,13 @@ class EpisodeDecisionStep:
 
 @dataclass(frozen=True, slots=True)
 class EpisodeCompletion:
-    """Authoritative or censored terminal facts for one collected episode."""
+    """Observed or censored task outcome for one collected episode.
+
+    The authoritative flag means that success or failure is known well enough
+    to train; it does not claim that the simulator itself emitted a native
+    terminal. The distinct terminal_reason retains provenance such as
+    run_defeat versus combat_progress_stall.
+    """
 
     authoritative: bool
     won: bool | None
@@ -521,7 +532,7 @@ def backfill_completed_episode(
     """Backfill exact long-horizon labels in one reverse ``O(T)`` pass.
 
     Censored run/combat/Act endings deliberately produce no target.  A failed
-    authoritative horizon still trains success/value prediction, but
+    observed horizon still trains success/value prediction, but
     ``HorizonTargets.efficiency_eligible`` remains false so a future learner
     cannot prefer an early failure merely because it used fewer revivals.
     """

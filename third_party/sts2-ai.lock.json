@@ -34,6 +34,10 @@
     {
       "path": "third_party/patches/sts2-ai/0005-authoritative-victory-and-reward-claims.patch",
       "sha256": "80f331708d1da6261ab9fb864ddcd01536539d4ae8522eb680089fc32fa63deb"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0006-bound-orderless-pile-multisets.patch",
+      "sha256": "32fd432255ac1902e15e1b55b20b88fcc1f8debbcb67bfd189d11bdfd7416c43"
     }
   ]
 }

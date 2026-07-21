@@ -403,6 +403,44 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     assert run_section.index("WinTime = Math.Max(1L, RunTime);") < run_section.index(
         "((TheArchitect)eventRoom.LocalMutableEvent).TriggerVictory();"
     )
+
+def test_orderless_pile_multiset_patch_is_locked_and_lossless() -> None:
+    root = repository_root()
+    lock = json.loads((root / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8"))
+    matching = [
+        record
+        for record in lock["patches"]
+        if record["path"].endswith("0006-bound-orderless-pile-multisets.patch")
+    ]
+    assert len(matching) == 1
+
+    patch_path = root / matching[0]["path"]
+    assert matching[0]["sha256"] == sha256_file(patch_path)
+    patch = patch_path.read_text(encoding="utf-8")
+    sections = {
+        section.splitlines()[0].split()[1][2:]: section
+        for section in patch.split("diff --git ")[1:]
+    }
+    assert set(sections) == {
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs",
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs",
+    }
+
+    builder = sections[
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs"
+    ]
+    dto = sections[
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs"
+    ]
+    assert "SortedDictionary<string, FullRunApiCardOption>" in builder
+    assert "JsonSerializer.Serialize(option)" in builder
+    assert "existing.quantity = checked((existing.quantity ?? 1) + 1);" in builder
+    assert "option.quantity = 1;" in builder
+    assert "result[index].index = index;" in builder
+    assert "Take(" not in builder
+    assert "public int? quantity { get; set; }" in dto
+    assert "SafeBuildPileCards(cards, shuffle: false)" in builder
+
 def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     executable, identity_path, lock_path, _ = _simulator(tmp_path)
 
