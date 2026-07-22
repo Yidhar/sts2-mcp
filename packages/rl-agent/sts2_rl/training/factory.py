@@ -210,6 +210,12 @@ def build_training_resources(
             combat_net_progress_window=(
                 config.diagnostics.combat_net_progress_window
             ),
+            combat_net_progress_room_windows=(
+                config.diagnostics.combat_net_progress_room_windows
+            ),
+            combat_net_progress_encounter_windows=(
+                config.diagnostics.combat_net_progress_encounter_windows
+            ),
             noncombat_durable_progress_window=(
                 config.diagnostics.noncombat_durable_progress_window
             ),

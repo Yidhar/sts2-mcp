@@ -23,7 +23,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v5"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v6"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -66,6 +66,12 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.runtime.evaluation_steps == (0, 30_000, 100_000, 250_000)
     assert preheat.runtime.evaluation_episodes == 12
     assert preheat.diagnostics.combat_net_progress_window == 256
+    assert preheat.diagnostics.combat_net_progress_room_windows == {
+        "TEST_SUBJECT_BOSS": 128,
+    }
+    assert preheat.diagnostics.combat_net_progress_encounter_windows == {}
+    assert default.diagnostics.combat_net_progress_room_windows == {}
+    assert combat.diagnostics.combat_net_progress_room_windows == {}
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
     assert preheat.runtime.log_dir.endswith("v16-episodic-long-credit")
@@ -107,6 +113,24 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
         DiagnosticsConfig(combat_net_progress_window=0)
     with pytest.raises(ValueError, match="noncombat_durable_progress_window"):
         DiagnosticsConfig(noncombat_durable_progress_window=0)
+    with pytest.raises(TypeError, match="room_windows must be a table"):
+        DiagnosticsConfig(combat_net_progress_room_windows=())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="identifiers must be non-empty"):
+        DiagnosticsConfig(combat_net_progress_room_windows={" ": 8})
+    with pytest.raises(TypeError, match="must be an integer"):
+        DiagnosticsConfig(combat_net_progress_encounter_windows={"BOSS": True})
+    with pytest.raises(ValueError, match="must be >= 1"):
+        DiagnosticsConfig(combat_net_progress_encounter_windows={"BOSS": 0})
+    with pytest.raises(ValueError, match="duplicate normalized identifier"):
+        DiagnosticsConfig(
+            combat_net_progress_room_windows={"boss": 4, "BOSS": 8},
+        )
+    normalized = DiagnosticsConfig(
+        combat_net_progress_room_windows={" test_subject_boss ": 128},
+    )
+    assert normalized.combat_net_progress_room_windows == {
+        "TEST_SUBJECT_BOSS": 128,
+    }
     with pytest.raises(ValueError, match="combat_min_net_hp_fraction"):
         DiagnosticsConfig(combat_min_net_hp_fraction=0.0)
     with pytest.raises(ValueError, match="strictly increasing"):
@@ -170,6 +194,21 @@ def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> Non
         rollout=replace(base.rollout, unroll_length=32),
     )
     assert changed_unroll.lineage_mapping() != base.lineage_mapping()
+    changed_combat_terminal_semantics = replace(
+        base,
+        diagnostics=replace(
+            base.diagnostics,
+            combat_net_progress_room_windows={"TEST_SUBJECT_BOSS": 128},
+        ),
+    )
+    # A room-scoped liveness window changes which factual prefix becomes a
+    # policy-failure label, so it must reject exact resume rather than masquerade
+    # as an output-only runtime change. Model-only initialization remains the
+    # explicit migration path.
+    assert (
+        changed_combat_terminal_semantics.lineage_mapping()
+        != base.lineage_mapping()
+    )
 
 
 def test_old_v1_config_is_rejected_instead_of_migrated() -> None:

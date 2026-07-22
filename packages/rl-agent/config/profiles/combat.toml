@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v5"
+version = "sts2-relational-curriculum-config-v6"
 profile = "combat"
 
 [model]
@@ -106,6 +106,8 @@ evaluation_episodes = 50
 deadlock_window = 128
 deadlock_repeat_threshold = 8
 combat_net_progress_window = 256
+combat_net_progress_room_windows = {}
+combat_net_progress_encounter_windows = {}
 noncombat_durable_progress_window = 256
 combat_min_net_hp_fraction = 0.05
 journal_policy_topk = 5

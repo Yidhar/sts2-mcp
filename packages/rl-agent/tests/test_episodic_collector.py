@@ -41,6 +41,8 @@ def _observation(
     combat: bool,
     revivals: int = 0,
     hp_loss: float = 0.0,
+    room_model_id: str | None = None,
+    encounter_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "phase": "combat" if combat else "map",
@@ -57,6 +59,7 @@ def _observation(
         },
         "combat": {
             "in_progress": combat,
+            "encounter_id": encounter_id,
             "enemies": (
                 [{"id": "enemy", "hp": 20, "max_hp": 20}]
                 if combat
@@ -68,6 +71,7 @@ def _observation(
             "act": act,
             "floor": floor,
             "room_type": "combat" if combat else "map",
+            "room_model_id": room_model_id,
         },
         "_training": {
             "revivals_used": revivals,
@@ -270,6 +274,8 @@ def _run_config(
     max_episode_steps: int = 32,
     durable_window: int = 32,
     combat_window: int = 128,
+    combat_room_windows: dict[str, int] | None = None,
+    combat_encounter_windows: dict[str, int] | None = None,
 ):
     base = _config(total_steps=max_episode_steps)
     return replace(
@@ -285,6 +291,10 @@ def _run_config(
             deadlock_window=128,
             deadlock_repeat_threshold=64,
             combat_net_progress_window=combat_window,
+            combat_net_progress_room_windows=combat_room_windows or {},
+            combat_net_progress_encounter_windows=(
+                combat_encounter_windows or {}
+            ),
             noncombat_durable_progress_window=durable_window,
             combat_min_net_hp_fraction=0.05,
             journal_policy_topk=5,
@@ -499,6 +509,96 @@ def test_combat_stall_is_observed_policy_failure_with_full_run_credit() -> None:
     assert all(step.act.observed and step.act.success is False for step in completed.steps)
     assert all(step.run.observed and step.run.success is False for step in completed.steps)
     assert all(not step.run.efficiency_eligible for step in completed.steps)
+
+@pytest.mark.parametrize(
+    (
+        "room_model_id",
+        "encounter_id",
+        "room_windows",
+        "encounter_windows",
+        "source",
+        "match_id",
+        "window",
+    ),
+    (
+        (
+            "test_subject_boss",
+            None,
+            {"TEST_SUBJECT_BOSS": 2},
+            {},
+            "room_model_id",
+            "TEST_SUBJECT_BOSS",
+            2,
+        ),
+        (
+            None,
+            "encounter.test_subject",
+            {},
+            {"ENCOUNTER.TEST_SUBJECT": 3},
+            "encounter_id",
+            "ENCOUNTER.TEST_SUBJECT",
+            3,
+        ),
+    ),
+)
+def test_combat_stall_uses_scoped_room_or_encounter_window_and_records_source(
+    room_model_id: str | None,
+    encounter_id: str | None,
+    room_windows: dict[str, int],
+    encounter_windows: dict[str, int],
+    source: str,
+    match_id: str,
+    window: int,
+) -> None:
+    stable = _observation(
+        act=3,
+        floor=46,
+        combat=True,
+        revivals=12,
+        hp_loss=40.0,
+        room_model_id=room_model_id,
+        encounter_id=encounter_id,
+    )
+    resources = build_training_resources(
+        _run_config(
+            max_episode_steps=10,
+            combat_window=8,
+            combat_room_windows=room_windows,
+            combat_encounter_windows=encounter_windows,
+        ),
+        backend=_ScriptedRunBackend([stable, stable], terminal_result=None),
+    )
+    resources.collector.reward_calculator = _AuditableReward()
+    progress = []
+    try:
+        episode = resources.collector.collect_episode(
+            deterministic=True,
+            record=True,
+            progress_sink=progress.append,
+        )
+    finally:
+        resources.close()
+
+    assert episode.metrics.combat_progress_stalled
+    assert episode.metrics.steps == window
+    evidence = episode.metrics.stall_evidence
+    assert evidence is not None
+    assert evidence["kind"] == "combat_no_net_progress"
+    assert evidence["window"] == window
+    assert evidence["default_window"] == 8
+    assert evidence["window_source"] == source
+    assert evidence["window_match_id"] == match_id
+    assert evidence["room_model_id"] == (
+        room_model_id.strip().upper() if room_model_id is not None else None
+    )
+    assert evidence["encounter_id"] == (
+        encounter_id.strip().upper() if encounter_id is not None else None
+    )
+    assert progress
+    assert progress[-1].combat_net_progress_window == window
+    assert progress[-1].combat_progress_window_source == source
+    assert progress[-1].combat_progress_window_match_id == match_id
+
 
 def test_collection_budget_censors_a_simultaneous_combat_stall() -> None:
     stable = _observation(act=1, floor=17, combat=True, revivals=12, hp_loss=40.0)

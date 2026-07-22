@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v5"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v6"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -556,6 +556,15 @@ class DiagnosticsConfig:
     deadlock_window: int = 128
     deadlock_repeat_threshold: int = 8
     combat_net_progress_window: int = 256
+    # A native-revival curriculum can keep a strategically lost combat alive
+    # long enough for encounter mechanics to make one simulator step
+    # pathologically expensive. These maps shorten the same generic net-HP
+    # liveness rule at a known room/encounter locus; they do not add a
+    # mechanics-specific reward or action rewrite. Because the effective
+    # window changes terminal labels, both maps remain immutable lineage
+    # semantics rather than an observation-only runtime knob.
+    combat_net_progress_room_windows: dict[str, int] = field(default_factory=dict)
+    combat_net_progress_encounter_windows: dict[str, int] = field(default_factory=dict)
     noncombat_durable_progress_window: int = 256
     combat_min_net_hp_fraction: float = 0.05
     journal_policy_topk: int = 5
@@ -573,6 +582,31 @@ class DiagnosticsConfig:
                 label=f"diagnostics.{name}",
                 minimum=1,
             )
+        for name in (
+            "combat_net_progress_room_windows",
+            "combat_net_progress_encounter_windows",
+        ):
+            raw = getattr(self, name)
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"diagnostics.{name} must be a table")
+            normalized: dict[str, int] = {}
+            for raw_identifier, raw_window in raw.items():
+                if not isinstance(raw_identifier, str) or not raw_identifier.strip():
+                    raise TypeError(
+                        f"diagnostics.{name} identifiers must be non-empty strings"
+                    )
+                identifier = raw_identifier.strip().upper()
+                if identifier in normalized:
+                    raise ValueError(
+                        f"diagnostics.{name} contains duplicate normalized identifier "
+                        f"{identifier!r}"
+                    )
+                normalized[identifier] = _require_int(
+                    raw_window,
+                    label=f"diagnostics.{name}[{identifier!r}]",
+                    minimum=1,
+                )
+            object.__setattr__(self, name, dict(sorted(normalized.items())))
         if self.deadlock_window < 2:
             raise ValueError("diagnostics.deadlock_window must be at least 2")
         if self.deadlock_repeat_threshold < 2:

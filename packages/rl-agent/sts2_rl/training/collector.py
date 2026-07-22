@@ -43,6 +43,7 @@ from .episode_replay import (
     EpisodeDecisionStep,
     backfill_completed_episode,
 )
+from .runaway_combat import RunawayCombatGuard
 from .seeding import (
     EVALUATION_SEED_PARITY,
     SIGNED_INT32_MAX,
@@ -168,6 +169,9 @@ class EpisodeProgress:
     behavior_policy_version: int
     maximum_observed_semantic_candidates: int = 0
     maximum_equivalence_class_size: int = 0
+    combat_net_progress_window: int = 0
+    combat_progress_window_source: str = "default"
+    combat_progress_window_match_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -932,6 +936,117 @@ def _combat_phase_signature(observation: Mapping[str, object]) -> tuple[str, ...
                 if isinstance(value, str | int | float) and not isinstance(value, bool):
                     markers.append(f"enemy[{index}].{key}={value}")
     return tuple(markers)
+
+
+@dataclass(frozen=True, slots=True)
+class _CombatProgressWindowSelection:
+    default_window: int
+    effective_window: int
+    source: Literal["default", "room_model_id", "encounter_id"]
+    match_id: str
+    room_model_id: str
+    encounter_id: str
+
+
+def _canonical_combat_locus_id(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().upper()
+
+
+def _combat_locus_id(
+    owners: tuple[Mapping[str, object], ...],
+    *keys: str,
+) -> str:
+    for owner in owners:
+        for key in keys:
+            identifier = _canonical_combat_locus_id(owner.get(key))
+            if identifier:
+                return identifier
+    return ""
+
+
+def _combat_progress_window_selection(
+    observation: Mapping[str, object],
+    *,
+    default_window: int,
+    room_windows: Mapping[str, int],
+    encounter_windows: Mapping[str, int],
+) -> _CombatProgressWindowSelection:
+    """Resolve one deterministic liveness window from public combat locus IDs.
+
+    A room match wins over an encounter match. The translated headless full-run
+    state always exposes ``run.room_model_id`` while some combat-only backends
+    expose only ``combat.encounter_id``; supporting both keeps the rule backend
+    neutral without reaching into ``_sim_raw``.
+    """
+
+    raw_run = observation.get("run")
+    run = raw_run if isinstance(raw_run, Mapping) else {}
+    raw_combat = observation.get("combat")
+    combat = raw_combat if isinstance(raw_combat, Mapping) else {}
+    room_model_id = _combat_locus_id(
+        (run, observation),
+        "room_model_id",
+        "room_model",
+    )
+    encounter_id = _combat_locus_id(
+        (combat, run, observation),
+        "encounter_id",
+        "canonical_encounter_id",
+    )
+    if room_model_id in room_windows:
+        return _CombatProgressWindowSelection(
+            default_window=default_window,
+            effective_window=room_windows[room_model_id],
+            source="room_model_id",
+            match_id=room_model_id,
+            room_model_id=room_model_id,
+            encounter_id=encounter_id,
+        )
+    if encounter_id in encounter_windows:
+        return _CombatProgressWindowSelection(
+            default_window=default_window,
+            effective_window=encounter_windows[encounter_id],
+            source="encounter_id",
+            match_id=encounter_id,
+            room_model_id=room_model_id,
+            encounter_id=encounter_id,
+        )
+    return _CombatProgressWindowSelection(
+        default_window=default_window,
+        effective_window=default_window,
+        source="default",
+        match_id="",
+        room_model_id=room_model_id,
+        encounter_id=encounter_id,
+    )
+
+
+def _normalize_combat_progress_windows(
+    value: Mapping[str, int] | None,
+    *,
+    label: str,
+) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping")
+    normalized: dict[str, int] = {}
+    for raw_identifier, raw_window in value.items():
+        if not isinstance(raw_identifier, str) or not raw_identifier.strip():
+            raise TypeError(f"{label} identifiers must be non-empty strings")
+        identifier = raw_identifier.strip().upper()
+        if identifier in normalized:
+            raise ValueError(
+                f"{label} contains duplicate normalized identifier {identifier!r}"
+            )
+        if isinstance(raw_window, bool) or not isinstance(raw_window, int):
+            raise TypeError(f"{label}[{identifier!r}] must be an integer")
+        if raw_window <= 0:
+            raise ValueError(f"{label}[{identifier!r}] must be positive")
+        normalized[identifier] = raw_window
+    return dict(sorted(normalized.items()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1749,7 +1864,7 @@ def _combat_stall_evidence(
     status: _CombatNetProgressStatus,
     observation: Mapping[str, object],
     legal_actions: tuple[dict[str, object], ...],
-    window: int,
+    window_selection: _CombatProgressWindowSelection,
     detected_step: int,
 ) -> dict[str, object]:
     """Build one bounded, mechanics-agnostic diagnostic at stall termination."""
@@ -1758,7 +1873,12 @@ def _combat_stall_evidence(
     hand_count = _diagnostic_zone_count(observation, "hand")
     return {
         "kind": "combat_no_net_progress",
-        "window": window,
+        "window": window_selection.effective_window,
+        "default_window": window_selection.default_window,
+        "window_source": window_selection.source,
+        "window_match_id": window_selection.match_id or None,
+        "room_model_id": window_selection.room_model_id or None,
+        "encounter_id": window_selection.encounter_id or None,
         "steps_without_net_progress": status.age_steps,
         "anchor_enemy_hp_total": status.anchor_hp,
         "current_enemy_hp_total": status.current_hp,
@@ -1799,6 +1919,8 @@ class GroundedCollector:
         deadlock_window: int = 128,
         deadlock_repeat_threshold: int = 8,
         combat_net_progress_window: int = 256,
+        combat_net_progress_room_windows: Mapping[str, int] | None = None,
+        combat_net_progress_encounter_windows: Mapping[str, int] | None = None,
         noncombat_durable_progress_window: int = 256,
         combat_min_net_hp_fraction: float = 0.05,
         journal_policy_topk: int = 5,
@@ -1880,6 +2002,16 @@ class GroundedCollector:
         self.unroll_length = unroll_length
         self.journal_policy_topk = journal_policy_topk
         self.combat_net_progress_window = combat_net_progress_window
+        self.combat_net_progress_room_windows = _normalize_combat_progress_windows(
+            combat_net_progress_room_windows,
+            label="combat_net_progress_room_windows",
+        )
+        self.combat_net_progress_encounter_windows = (
+            _normalize_combat_progress_windows(
+                combat_net_progress_encounter_windows,
+                label="combat_net_progress_encounter_windows",
+            )
+        )
         self.noncombat_durable_progress_window = noncombat_durable_progress_window
         self.combat_min_net_hp_fraction = float(combat_min_net_hp_fraction)
         self.additional_relics = tuple(str(item) for item in additional_relics)
@@ -2335,10 +2467,17 @@ class GroundedCollector:
         noncombat_progress_stalled = False
         trusted_policy_failure = False
         stall_evidence: dict[str, object] | None = None
+        combat_window_selection = _combat_progress_window_selection(
+            state.observation,
+            default_window=self.combat_net_progress_window,
+            room_windows=self.combat_net_progress_room_windows,
+            encounter_windows=self.combat_net_progress_encounter_windows,
+        )
         combat_progress = _CombatNetProgressTracker(
-            window=self.combat_net_progress_window,
+            window=combat_window_selection.effective_window,
             minimum_hp_fraction=self.combat_min_net_hp_fraction,
         )
+        runaway_combat_guard = RunawayCombatGuard()
         noncombat_progress = _NonCombatDurableProgressTracker(
             window=self.noncombat_durable_progress_window,
         )
@@ -2351,6 +2490,11 @@ class GroundedCollector:
         combat_progress_status = combat_progress.observe(
             step=0,
             observation=state.observation,
+        )
+        runaway_combat_guard.observe(
+            observation=state.observation,
+            legal_actions=state.legal_actions,
+            no_net_progress_steps=combat_progress_status.age_steps,
         )
         combat_in_progress = _combat_in_progress(state.observation)
         combat_no_net_progress_steps = combat_progress_status.age_steps
@@ -2543,6 +2687,13 @@ class GroundedCollector:
             if accepted_step_sink is not None:
                 accepted_step_sink(steps_taken, maximum_observed_candidates)
             next_combat_in_progress = _combat_in_progress(next_state.observation)
+            combat_window_selection = _combat_progress_window_selection(
+                next_state.observation,
+                default_window=self.combat_net_progress_window,
+                room_windows=self.combat_net_progress_room_windows,
+                encounter_windows=self.combat_net_progress_encounter_windows,
+            )
+            combat_progress.window = combat_window_selection.effective_window
             combat_progress_status = combat_progress.observe(
                 step=steps_taken,
                 observation=next_state.observation,
@@ -2552,8 +2703,18 @@ class GroundedCollector:
                 maximum_combat_no_net_progress_steps,
                 combat_progress_status.maximum_age_steps,
             )
+            runaway_combat_status = runaway_combat_guard.observe(
+                observation=next_state.observation,
+                legal_actions=next_state.legal_actions,
+                no_net_progress_steps=combat_progress_status.age_steps,
+            )
+            runaway_combat_stalled = bool(
+                runaway_combat_status.triggered
+                and not result_terminal
+                and not forced_horizon
+            )
             combat_progress_stalled = bool(
-                combat_progress_status.stalled
+                (combat_progress_status.stalled or runaway_combat_stalled)
                 and not result_terminal
                 and not forced_horizon
             )
@@ -2562,14 +2723,42 @@ class GroundedCollector:
             # may keep the avatar alive, but it must not turn a strategically
             # lost state into censored data or an infrastructure timeout.
             trusted_policy_failure = combat_progress_stalled
-            if combat_progress_stalled:
+            if runaway_combat_stalled:
+                # The accepted transition is the factual terminal learning
+                # prefix. Do not dispatch another forced end-turn into a
+                # simulator state whose Status-card work is already runaway.
+                stall_evidence = runaway_combat_status.evidence(
+                    detected_step=next_state.step_index,
+                )
+                stall_evidence.update(
+                    {
+                        "window": combat_window_selection.effective_window,
+                        "default_window": combat_window_selection.default_window,
+                        "window_source": combat_window_selection.source,
+                        "window_match_id": combat_window_selection.match_id or None,
+                        "room_model_id": combat_window_selection.room_model_id or None,
+                        "encounter_id": combat_window_selection.encounter_id or None,
+                        "anchor_enemy_hp_total": combat_progress_status.anchor_hp,
+                        "current_enemy_hp_total": combat_progress_status.current_hp,
+                        "current_enemy_max_hp_total": combat_progress_status.maximum_hp,
+                        "net_enemy_hp_progress": combat_progress_status.net_hp_progress,
+                        "required_net_enemy_hp_progress": (
+                            combat_progress_status.required_hp_progress
+                        ),
+                        "progress_kind": combat_progress_status.progress_kind,
+                        "legal_action_kinds": _legal_action_kind_counts(
+                            next_state.legal_actions
+                        ),
+                    }
+                )
+            elif combat_progress_stalled:
                 # Construct this bounded snapshot only for the terminating
                 # transition. Ordinary decisions retain no additional state.
                 stall_evidence = _combat_stall_evidence(
                     status=combat_progress_status,
                     observation=next_state.observation,
                     legal_actions=next_state.legal_actions,
-                    window=self.combat_net_progress_window,
+                    window_selection=combat_window_selection,
                     detected_step=next_state.step_index,
                 )
             combat_in_progress = bool(next_combat_in_progress and not result_terminal)
@@ -2975,6 +3164,15 @@ class GroundedCollector:
                             ),
                             maximum_equivalence_class_size=(
                                 maximum_equivalence_class_size
+                            ),
+                            combat_net_progress_window=(
+                                combat_window_selection.effective_window
+                            ),
+                            combat_progress_window_source=(
+                                combat_window_selection.source
+                            ),
+                            combat_progress_window_match_id=(
+                                combat_window_selection.match_id
                             ),
                         )
                     )
