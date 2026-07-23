@@ -1,0 +1,2268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>STS2 训练监控</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --background: #f5f7fa;
+      --surface: #ffffff;
+      --surface-alt: #f0f3f7;
+      --foreground: #17202b;
+      --muted-foreground: #5d6877;
+      --border: #d7dde5;
+      --border-strong: #b9c3cf;
+      --primary: #215f9b;
+      --primary-foreground: #ffffff;
+      --accent: #e7f0f9;
+      --accent-foreground: #164a7d;
+      --success: #19724a;
+      --success-soft: #e3f4eb;
+      --warning: #9a5d04;
+      --warning-soft: #fff2d8;
+      --danger: #ad3131;
+      --danger-soft: #fbe7e7;
+      --info: #5c4eb2;
+      --info-soft: #eeeafd;
+      --series-1: #2166ac;
+      --series-2: #238b62;
+      --series-3: #bb4b45;
+      --series-4: #7a52b3;
+      --series-5: #b26a00;
+      --chart-grid: #dce2e9;
+      --shadow: 0 1px 3px rgba(20, 32, 46, 0.08), 0 10px 30px rgba(20, 32, 46, 0.04);
+      --radius: 14px;
+      --font-size-base: 15px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --background: #101419;
+        --surface: #171d24;
+        --surface-alt: #202832;
+        --foreground: #edf1f5;
+        --muted-foreground: #abb6c3;
+        --border: #34404d;
+        --border-strong: #4a5867;
+        --primary: #8ac5fa;
+        --primary-foreground: #0d253a;
+        --accent: #21374b;
+        --accent-foreground: #b8dcfb;
+        --success: #71d19f;
+        --success-soft: #193a2b;
+        --warning: #f1bd65;
+        --warning-soft: #44331a;
+        --danger: #f39b9b;
+        --danger-soft: #472426;
+        --info: #c2b7fb;
+        --info-soft: #312d4f;
+        --series-1: #76b9ef;
+        --series-2: #65c69a;
+        --series-3: #ef8e89;
+        --series-4: #c0a3ee;
+        --series-5: #e3ad58;
+        --chart-grid: #313b46;
+        --shadow: 0 1px 3px rgba(0, 0, 0, 0.28), 0 12px 34px rgba(0, 0, 0, 0.18);
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--background);
+      color: var(--foreground);
+      font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+      font-size: var(--font-size-base);
+      line-height: 1.5;
+    }
+
+    button,
+    select {
+      font: inherit;
+    }
+
+    button:focus-visible,
+    select:focus-visible,
+    a:focus-visible {
+      outline: 3px solid color-mix(in srgb, var(--primary) 55%, transparent);
+      outline-offset: 2px;
+    }
+
+    .shell {
+      width: min(1480px, 100%);
+      margin: 0 auto;
+      padding: 22px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: clamp(1.45rem, 2.6vw, 2.15rem);
+      line-height: 1.2;
+      font-weight: 500;
+      letter-spacing: -0.02em;
+    }
+
+    .brand p {
+      margin: 5px 0 0;
+      color: var(--muted-foreground);
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: flex-end;
+      justify-content: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .field {
+      display: grid;
+      gap: 4px;
+    }
+
+    .field label {
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+    }
+
+    select,
+    button {
+      min-height: 40px;
+      border: 1px solid var(--border-strong);
+      border-radius: 9px;
+      background: var(--surface);
+      color: var(--foreground);
+      padding: 7px 11px;
+    }
+
+    select {
+      max-width: min(460px, 70vw);
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 500;
+    }
+
+    button:hover:not(:disabled) {
+      background: var(--accent);
+      color: var(--accent-foreground);
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 16px;
+      margin-bottom: 18px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .status-main,
+    .run-line,
+    .badge-row,
+    .metric-inline {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    .run-line {
+      margin-top: 5px;
+      color: var(--muted-foreground);
+      font-size: 0.9rem;
+    }
+
+    .run-line code {
+      color: var(--foreground);
+      overflow-wrap: anywhere;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      width: fit-content;
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: var(--surface-alt);
+      color: var(--foreground);
+      font-size: 0.86rem;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .pill::before {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+    }
+
+    .pill[data-state="running"] {
+      background: var(--success-soft);
+      color: var(--success);
+    }
+
+    .pill[data-state="complete"] {
+      background: var(--accent);
+      color: var(--accent-foreground);
+    }
+
+    .pill[data-state="continued"],
+    .pill[data-state="evaluating"],
+    .pill[data-state="checkpointing"] {
+      background: var(--info-soft);
+      color: var(--info);
+    }
+
+    .pill[data-state="interrupted"],
+    .pill[data-state="stale"],
+    .pill[data-state="waiting"] {
+      background: var(--warning-soft);
+      color: var(--warning);
+    }
+
+    .pill[data-state="failed"],
+    .pill[data-state="crashed"],
+    .pill[data-state="error"] {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .mode-badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 6px 11px;
+      background: var(--warning-soft);
+      color: var(--warning);
+      font-weight: 500;
+    }
+
+    .refresh-meta {
+      color: var(--muted-foreground);
+      font-size: 0.83rem;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .notice {
+      display: none;
+      margin: 0 0 18px;
+      padding: 12px 14px;
+      border-left: 4px solid var(--danger);
+      background: var(--danger-soft);
+      color: var(--foreground);
+    }
+
+    .notice.is-visible {
+      display: block;
+    }
+
+    .section {
+      margin: 28px 0;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 11px;
+    }
+
+    .section-header h2 {
+      margin: 0;
+      font-size: 1.2rem;
+      font-weight: 500;
+    }
+
+    .section-header p {
+      max-width: 780px;
+      margin: 3px 0 0;
+      color: var(--muted-foreground);
+      font-size: 0.9rem;
+    }
+
+    .overview-grid,
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .metric-grid.compact {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: 15px;
+    }
+
+    .metric-label {
+      margin-bottom: 7px;
+      color: var(--muted-foreground);
+      font-size: 0.83rem;
+    }
+
+    .metric-value {
+      font-size: clamp(1.28rem, 2.2vw, 1.85rem);
+      font-weight: 500;
+      line-height: 1.2;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+
+    .metric-context {
+      margin-top: 7px;
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+    }
+
+    progress {
+      display: block;
+      width: 100%;
+      height: 8px;
+      margin-top: 10px;
+      overflow: hidden;
+      border: 0;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      accent-color: var(--primary);
+    }
+
+    progress::-webkit-progress-bar {
+      background: var(--surface-alt);
+      border-radius: 999px;
+    }
+
+    progress::-webkit-progress-value {
+      background: var(--primary);
+      border-radius: 999px;
+    }
+
+    progress::-moz-progress-bar {
+      background: var(--primary);
+      border-radius: 999px;
+    }
+
+    .split-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.7fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .chart-panel {
+      min-width: 0;
+    }
+
+    .chart-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 7px;
+    }
+
+    .chart-heading h3,
+    .subsection h3 {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 500;
+    }
+
+    .chart-heading span {
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+    }
+
+    .chart {
+      width: 100%;
+      min-height: 230px;
+      color: var(--foreground);
+    }
+
+    .chart svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+
+    .chart .axis,
+    .chart .grid-line {
+      stroke: var(--chart-grid);
+      stroke-width: 1;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .chart .series-line {
+      fill: none;
+      stroke-width: 2.2;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .chart .point {
+      stroke: var(--surface);
+      stroke-width: 1.5;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .chart text {
+      fill: var(--muted-foreground);
+      font-family: inherit;
+      font-size: 11px;
+    }
+
+    .empty {
+      display: grid;
+      min-height: 150px;
+      place-items: center;
+      border: 1px dashed var(--border-strong);
+      border-radius: 10px;
+      color: var(--muted-foreground);
+      text-align: center;
+      padding: 18px;
+    }
+
+    .kv-list {
+      display: grid;
+      grid-template-columns: minmax(120px, 0.85fr) minmax(0, 1fr);
+      margin: 0;
+      font-size: 0.88rem;
+    }
+
+    .kv-list dt,
+    .kv-list dd {
+      margin: 0;
+      padding: 7px 0;
+      border-bottom: 1px solid var(--border);
+      overflow-wrap: anywhere;
+    }
+
+    .kv-list dt {
+      color: var(--muted-foreground);
+      padding-right: 12px;
+    }
+
+    .kv-list dd {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .kv-list dt:last-of-type,
+    .kv-list dd:last-of-type {
+      border-bottom: 0;
+    }
+
+    .heldout-zone {
+      padding: 18px;
+      border: 2px solid color-mix(in srgb, var(--info) 36%, var(--border));
+      border-radius: calc(var(--radius) + 3px);
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--info-soft) 55%, transparent), transparent 42%),
+        var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .heldout-zone .section-header {
+      margin-top: 0;
+    }
+
+    .scope-note {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-left: 4px solid var(--warning);
+      background: var(--warning-soft);
+      color: var(--foreground);
+      font-size: 0.9rem;
+    }
+
+    .metric-group {
+      margin: 18px 0;
+    }
+
+    .metric-group-title {
+      margin: 0 0 8px;
+      color: var(--muted-foreground);
+      font-size: 0.84rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.035em;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+    }
+
+    th,
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th {
+      color: var(--muted-foreground);
+      font-weight: 500;
+    }
+
+    tbody tr:hover {
+      background: color-mix(in srgb, var(--accent) 62%, transparent);
+    }
+
+    td.numeric,
+    th.numeric {
+      text-align: right;
+    }
+
+    td.wrap {
+      min-width: 180px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .subsection {
+      margin-top: 20px;
+    }
+
+    .subsection h3 {
+      margin-bottom: 8px;
+    }
+
+    .two-column {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+
+    .list {
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .list-item {
+      padding: 10px 11px;
+      border-left: 3px solid var(--border-strong);
+      background: var(--surface-alt);
+      overflow-wrap: anywhere;
+    }
+
+    .list-item.alert {
+      border-left-color: var(--warning);
+      background: var(--warning-soft);
+    }
+
+    .list-item.incident {
+      border-left-color: var(--danger);
+      background: var(--danger-soft);
+    }
+
+    .list-item .item-title {
+      font-weight: 500;
+    }
+
+    .list-item .item-meta {
+      margin-top: 3px;
+      color: var(--muted-foreground);
+      font-size: 0.8rem;
+    }
+
+    .footer {
+      margin: 30px 0 8px;
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+      text-align: center;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .skeleton {
+      color: transparent;
+      border-radius: 5px;
+      background:
+        linear-gradient(100deg, transparent 25%, color-mix(in srgb, var(--foreground) 7%, transparent) 50%, transparent 75%),
+        var(--surface-alt);
+      background-size: 200% 100%;
+      animation: skeleton 1.4s linear infinite;
+    }
+
+    @keyframes skeleton {
+      to {
+        background-position-x: -200%;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .skeleton {
+        animation: none;
+      }
+    }
+
+    @media (max-width: 1040px) {
+      .overview-grid,
+      .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .metric-grid.compact {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 780px) {
+      .shell {
+        padding: 15px;
+      }
+
+      .topbar,
+      .status-strip,
+      .section-header {
+        align-items: stretch;
+        grid-template-columns: 1fr;
+        flex-direction: column;
+      }
+
+      .toolbar {
+        justify-content: flex-start;
+      }
+
+      .field:first-child,
+      .field:first-child select {
+        width: 100%;
+        max-width: none;
+      }
+
+      .refresh-meta {
+        text-align: left;
+      }
+
+      .split-grid,
+      .two-column {
+        grid-template-columns: 1fr;
+      }
+
+      .heldout-zone {
+        padding: 14px;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .overview-grid,
+      .metric-grid,
+      .metric-grid.compact {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        width: 100%;
+      }
+
+      .toolbar .field:first-child {
+        grid-column: 1 / -1;
+      }
+
+      .status-main {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .kv-list {
+        grid-template-columns: 1fr;
+      }
+
+      .kv-list dt {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+
+      .kv-list dd {
+        text-align: left;
+        padding-top: 2px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <h1>STS2 训练监控</h1>
+        <p>只读遥测、held-out 评估与检查点状态</p>
+      </div>
+      <div class="toolbar" aria-label="监控刷新设置">
+        <div class="field">
+          <label for="run-select">训练运行</label>
+          <select id="run-select" aria-describedby="run-help">
+            <option value="">正在发现运行…</option>
+          </select>
+          <span id="run-help" class="sr-only">
+            默认自动跟随接口返回的最新运行；选择历史运行后锁定，重新选择最新运行可恢复自动跟随
+          </span>
+        </div>
+        <div class="field">
+          <label for="refresh-select">自动刷新</label>
+          <select id="refresh-select">
+            <option value="5000">每 5 秒</option>
+            <option value="15000" selected>每 15 秒</option>
+            <option value="30000">每 30 秒</option>
+            <option value="0">暂停</option>
+          </select>
+        </div>
+        <button id="refresh-button" type="button">立即刷新</button>
+      </div>
+    </header>
+
+    <div id="error-notice" class="notice" role="alert"></div>
+
+    <section class="status-strip" aria-labelledby="run-status-title">
+      <div>
+        <div class="status-main">
+          <span id="status-pill" class="pill" data-state="waiting">等待遥测</span>
+          <span id="mode-badge" class="mode-badge">正在识别训练模式</span>
+          <span id="run-status-title" class="sr-only">当前运行状态</span>
+        </div>
+        <div class="run-line">
+          <span id="run-title">尚未选择运行</span>
+          <span aria-hidden="true">·</span>
+          <code id="run-id">—</code>
+          <span id="run-device"></span>
+        </div>
+      </div>
+      <div class="refresh-meta" aria-live="polite">
+        <div id="data-age">遥测年龄：—</div>
+        <div id="last-refresh">尚未刷新</div>
+      </div>
+    </section>
+
+    <main id="main-content" aria-busy="true">
+      <section class="section" aria-labelledby="overview-title">
+        <div class="section-header">
+          <div>
+            <h2 id="overview-title">总览</h2>
+            <p id="status-evidence">等待运行证据。</p>
+          </div>
+        </div>
+        <div class="overview-grid">
+          <article class="card">
+            <div class="metric-label">环境进度</div>
+            <div id="progress-value" class="metric-value skeleton">000,000 / 000,000</div>
+            <div id="progress-context" class="metric-context">—</div>
+            <progress id="run-progress" max="100" value="0">0%</progress>
+          </article>
+          <article class="card">
+            <div class="metric-label">策略与更新</div>
+            <div id="policy-value" class="metric-value skeleton">策略 0000</div>
+            <div id="policy-context" class="metric-context">学习器更新 — · episode —</div>
+          </article>
+          <article class="card">
+            <div id="throughput-label" class="metric-label">近 15 分钟吞吐</div>
+            <div id="throughput-value" class="metric-value skeleton">00.0 步/秒</div>
+            <div id="throughput-context" class="metric-context">60 分钟 — · ETA —</div>
+          </article>
+          <article class="card">
+            <div class="metric-label">最新 held-out 门</div>
+            <div id="heldout-value" class="metric-value skeleton">Act 1 —</div>
+            <div id="heldout-context" class="metric-context">尚无评估</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="training-title">
+        <div class="section-header">
+          <div>
+            <h2 id="training-title">在线训练</h2>
+            <p>这些是采集与学习中的训练 episode；不与 held-out 评估混合。</p>
+          </div>
+          <div id="training-meta" class="metric-inline"></div>
+        </div>
+
+        <div class="split-grid">
+          <article class="card chart-panel">
+            <div class="chart-heading">
+              <h3>训练 episode 趋势</h3>
+              <span>最远楼层与复活次数</span>
+            </div>
+            <div id="episode-chart" class="chart" aria-live="polite"></div>
+          </article>
+          <article class="card">
+            <div class="chart-heading">
+              <h3>最新训练 episode</h3>
+              <span id="latest-episode-time">—</span>
+            </div>
+            <dl id="latest-episode-kv" class="kv-list"></dl>
+          </article>
+        </div>
+
+        <div class="subsection">
+          <h3>最近完成的训练 episode</h3>
+          <div class="table-wrap">
+            <table aria-label="最近训练 episode">
+              <thead>
+                <tr>
+                  <th>环境步</th>
+                  <th>Episode</th>
+                  <th class="numeric">最远楼层</th>
+                  <th class="numeric">复活</th>
+                  <th class="numeric">失血</th>
+                  <th class="numeric">动作步</th>
+                  <th>结果 / 原因</th>
+                </tr>
+              </thead>
+              <tbody id="episodes-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="section heldout-zone" aria-labelledby="heldout-title">
+        <div class="section-header">
+          <div>
+            <h2 id="heldout-title">Held-out 固定种子评估</h2>
+            <p>独立固定种子、确定性策略；评估轨迹不进入 replay，也不参与梯度更新。</p>
+          </div>
+          <span id="heldout-gate-badge" class="pill" data-state="waiting">尚无评估门</span>
+        </div>
+
+        <p id="heldout-scope-note" class="scope-note">
+          当前是无限原生复活预热。这里的 Act / 通关通过率不能当作标准零复活胜率。
+        </p>
+
+        <div class="metric-group">
+          <h3 class="metric-group-title">通过覆盖</h3>
+          <div class="metric-grid">
+            <article class="card">
+              <div class="metric-label">Act 1 通过</div>
+              <div id="eval-act1" class="metric-value">—</div>
+              <div id="eval-act1-context" class="metric-context">—</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">Act 3 通过</div>
+              <div id="eval-act3" class="metric-value">—</div>
+              <div id="eval-act3-context" class="metric-context">—</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">完整通关</div>
+              <div id="eval-win" class="metric-value">—</div>
+              <div id="eval-win-context" class="metric-context">—</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">最远楼层</div>
+              <div id="eval-floor" class="metric-value">—</div>
+              <div id="eval-floor-context" class="metric-context">平均 —</div>
+            </article>
+          </div>
+        </div>
+
+        <div class="metric-group">
+          <h3 class="metric-group-title">全体 held-out 原始效率（所有种子）</h3>
+          <div class="metric-grid compact">
+            <article class="card">
+              <div class="metric-label">平均复活次数</div>
+              <div id="eval-raw-revivals" class="metric-value">—</div>
+              <div class="metric-context">分母：全部 held-out episode</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">平均玩家失血</div>
+              <div id="eval-raw-hp-loss" class="metric-value">—</div>
+              <div class="metric-context">分母：全部 held-out episode</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">Deadlock</div>
+              <div id="eval-deadlocks" class="metric-value">—</div>
+              <div id="eval-deadlocks-context" class="metric-context">—</div>
+            </article>
+          </div>
+        </div>
+
+        <div class="metric-group">
+          <h3 class="metric-group-title">Act 1 边界条件效率（仅成功到达 Act 1 边界的子集）</h3>
+          <div class="metric-grid compact">
+            <article class="card">
+              <div class="metric-label">边界平均复活</div>
+              <div id="eval-boundary-revivals" class="metric-value">—</div>
+              <div id="eval-boundary-revivals-context" class="metric-context">条件样本 n=—</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">边界平均失血</div>
+              <div id="eval-boundary-hp-loss" class="metric-value">—</div>
+              <div id="eval-boundary-hp-loss-context" class="metric-context">条件样本 n=—</div>
+            </article>
+            <article class="card">
+              <div class="metric-label">低复活 Act 1 成功</div>
+              <div id="eval-low-revival" class="metric-value">—</div>
+              <div id="eval-low-revival-context" class="metric-context">零复活 — · ≤1 次 —</div>
+            </article>
+          </div>
+        </div>
+
+        <article class="chart-panel">
+          <div class="chart-heading">
+            <h3>评估门趋势</h3>
+            <span>成功数 / 固定种子总数</span>
+          </div>
+          <div id="evaluation-chart" class="chart" aria-live="polite"></div>
+        </article>
+
+        <div class="subsection">
+          <h3>各评估门明细</h3>
+          <div class="table-wrap">
+            <table aria-label="Held-out 各评估门结果">
+              <thead>
+                <tr>
+                  <th>门 / 环境步</th>
+                  <th class="numeric">样本</th>
+                  <th class="numeric">Act 1</th>
+                  <th class="numeric">Act 3</th>
+                  <th class="numeric">通关</th>
+                  <th class="numeric">平均 / 最远楼层</th>
+                  <th class="numeric">平均复活</th>
+                  <th class="numeric">平均失血</th>
+                  <th class="numeric">Deadlock / 停滞（各自独立）</th>
+                  <th class="numeric">基础设施重试</th>
+                </tr>
+              </thead>
+              <tbody id="evaluations-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="pipeline-title">
+        <div class="section-header">
+          <div>
+            <h2 id="pipeline-title">学习器与采集器</h2>
+            <p>用于判断 GPU 低负载来自采集、replay、更新还是检查点阶段。</p>
+          </div>
+        </div>
+        <div class="two-column">
+          <article class="card">
+            <div class="chart-heading">
+              <h3>最新学习器遥测</h3>
+              <span id="latest-learner-time">—</span>
+            </div>
+            <dl id="latest-learner-kv" class="kv-list"></dl>
+          </article>
+          <article class="card">
+            <div class="chart-heading">
+              <h3>最新 actor / collector 遥测</h3>
+              <span id="latest-actor-time">—</span>
+            </div>
+            <dl id="latest-actor-kv" class="kv-list"></dl>
+          </article>
+        </div>
+        <div class="subsection">
+          <article class="card chart-panel">
+            <div class="chart-heading">
+              <h3>学习器趋势</h3>
+              <span>更新损失（若有记录）</span>
+            </div>
+            <div id="learner-chart" class="chart" aria-live="polite"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="checkpoint-title">
+        <div class="section-header">
+          <div>
+            <h2 id="checkpoint-title">检查点与运行诊断</h2>
+            <p>
+              已发布条目是恢复候选；<code>valid</code> 只代表原子发布完成并通过
+              <code>size_verified</code> 轻量校验，不代表 restore 或 hash 已验证。
+              <code>.incomplete-*</code> 表示正在发布，不等于损坏。
+            </p>
+          </div>
+        </div>
+        <div class="two-column">
+          <article class="card">
+            <div class="chart-heading">
+              <h3>检查点</h3>
+              <span id="checkpoint-summary">—</span>
+            </div>
+            <div class="table-wrap">
+              <table aria-label="检查点列表">
+                <thead>
+                  <tr>
+                    <th>发布 / 轻量校验</th>
+                    <th>环境步</th>
+                    <th>名称 / 路径</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody id="checkpoints-body"></tbody>
+              </table>
+            </div>
+          </article>
+          <div>
+            <article class="card">
+              <div class="chart-heading">
+                <h3>告警</h3>
+                <span id="alerts-count">0</span>
+              </div>
+              <ul id="alerts-list" class="list"></ul>
+            </article>
+            <article class="card" style="margin-top: 14px">
+              <div class="chart-heading">
+                <h3>数据质量</h3>
+                <span id="incidents-count">事件 0</span>
+              </div>
+              <dl id="data-quality-kv" class="kv-list"></dl>
+              <ul id="incidents-list" class="list" style="margin-top: 10px"></ul>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      本页只读取训练产物，不发送动作、停止、恢复或删除命令。
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const API_RUNS = "/api/v1/runs";
+      const API_SNAPSHOT = "/api/v1/snapshot";
+      const SVG_NS = "http://www.w3.org/2000/svg";
+      const initialRunKey = new URLSearchParams(location.search).get("run") || "";
+      const state = {
+        runs: [],
+        selectedRun: initialRunKey,
+        latestRunKey: "",
+        followLatest: !initialRunKey,
+        snapshot: null,
+        timer: 0,
+        loading: false,
+        refreshMs: 15000,
+        lastFetchedAt: 0
+      };
+
+      const labels = {
+        environment_steps: "环境步",
+        target_environment_steps: "目标环境步",
+        training_episodes: "训练 episode",
+        episode: "Episode",
+        episode_index: "Episode",
+        learner_updates: "学习器更新",
+        update: "学习器更新",
+        update_step: "学习器更新",
+        policy_version: "策略版本",
+        reward: "奖励",
+        episode_return: "Episode 回报",
+        return: "回报",
+        max_floor: "最远楼层",
+        maximum_floor: "最远楼层",
+        floor: "最终楼层",
+        final_floor: "最终楼层",
+        act: "Act",
+        final_act: "最终 Act",
+        revivals: "复活次数",
+        revival_count: "复活次数",
+        max_revivals: "最大复活次数",
+        player_hp_lost: "玩家失血",
+        hp_lost: "玩家失血",
+        steps: "动作步",
+        episode_steps: "动作步",
+        decisions: "决策数",
+        outcome: "结果",
+        termination_reason: "终止原因",
+        reason: "原因",
+        deadlock: "Deadlock",
+        stall_failure: "净进展停滞",
+        loss: "总损失",
+        total_loss: "总损失",
+        learner_loss: "学习器损失",
+        td_loss: "TD 损失",
+        q_loss: "Q 损失",
+        policy_loss: "策略损失",
+        value_loss: "价值损失",
+        replay_size: "Replay 大小",
+        replay_buffer_size: "Replay 大小",
+        replay_ratio: "Replay ratio",
+        batch_size: "Batch 大小",
+        learning_rate: "学习率",
+        grad_norm: "梯度范数",
+        queue_depth: "队列深度",
+        actor_queue_depth: "Actor 队列深度",
+        collector_queue_depth: "Collector 队列深度",
+        actor_steps: "Actor 环境步",
+        collector_steps: "Collector 环境步",
+        env_steps_per_s: "环境步/秒",
+        learner_updates_per_s: "更新/秒",
+        maximum_observed_candidates: "Raw 候选峰值",
+        maximum_observed_semantic_candidates: "语义候选峰值",
+        maximum_equivalence_class_size: "最大等价类",
+        timestamp: "时间",
+        time: "时间",
+        created_at: "创建时间",
+        event: "事件",
+        phase: "阶段",
+        device: "设备"
+      };
+
+      const statusMap = {
+        running: "训练中",
+        complete: "已完成",
+        completed: "已完成",
+        continued: "已续跑",
+        interrupted: "已中断",
+        evaluating: "评估中",
+        checkpointing: "保存检查点",
+        publishing: "发布检查点",
+        stale: "遥测陈旧",
+        crashed: "运行崩溃",
+        failed: "运行失败",
+        error: "读取异常",
+        waiting: "等待遥测",
+        unknown: "状态未知"
+      };
+
+      const element = (id) => document.getElementById(id);
+
+      function setText(id, value) {
+        const node = element(id);
+        if (node) {
+          node.textContent = value == null || value === "" ? "—" : String(value);
+          node.classList.remove("skeleton");
+        }
+      }
+
+      function finite(value) {
+        if (
+          value === null ||
+          value === undefined ||
+          value === "" ||
+          typeof value === "boolean"
+        ) return null;
+        const number = typeof value === "number" ? value : Number(value);
+        return Number.isFinite(number) ? number : null;
+      }
+
+      function first(source, keys, fallback = null) {
+        if (!source || typeof source !== "object") return fallback;
+        for (const key of keys) {
+          if (source[key] !== undefined && source[key] !== null) return source[key];
+        }
+        return fallback;
+      }
+
+      function int(value) {
+        const number = finite(value);
+        return number == null ? "—" : Math.round(number).toLocaleString("zh-CN");
+      }
+
+      function decimal(value, digits = 2) {
+        const number = finite(value);
+        return number == null
+          ? "—"
+          : number.toLocaleString("zh-CN", { maximumFractionDigits: digits, minimumFractionDigits: 0 });
+      }
+
+      function normalizeRate(value) {
+        const number = finite(value);
+        if (number == null) return null;
+        return number > 1.000001 ? number / 100 : number;
+      }
+
+      function percent(value, digits = 1) {
+        const rate = normalizeRate(value);
+        return rate == null ? "—" : `${(rate * 100).toFixed(digits)}%`;
+      }
+
+      function rateText(successes, total, rate) {
+        const numerator = finite(successes);
+        const denominator = finite(total);
+        const resolvedRate = normalizeRate(rate);
+        if (numerator == null && resolvedRate == null) return "—";
+        const countPart = numerator != null && denominator != null
+          ? `${int(numerator)}/${int(denominator)}`
+          : "计数未知";
+        const ratePart = resolvedRate != null
+          ? percent(resolvedRate)
+          : denominator && numerator != null
+            ? percent(numerator / denominator)
+            : "—";
+        return `${countPart} · ${ratePart}`;
+      }
+
+      function duration(seconds) {
+        const value = finite(seconds);
+        if (value == null || value < 0) return "—";
+        if (value < 60) return `${Math.round(value)} 秒`;
+        if (value < 3600) return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
+        const hours = Math.floor(value / 3600);
+        const minutes = Math.floor((value % 3600) / 60);
+        if (hours < 48) return `${hours} 小时 ${minutes} 分`;
+        return `${Math.floor(hours / 24)} 天 ${hours % 24} 小时`;
+      }
+
+      function dateTime(value) {
+        if (value == null || value === "") return "—";
+        let date;
+        if (typeof value === "number") {
+          date = new Date(value < 1e12 ? value * 1000 : value);
+        } else {
+          date = new Date(String(value));
+        }
+        return Number.isNaN(date.getTime())
+          ? String(value)
+          : date.toLocaleString("zh-CN", { hour12: false });
+      }
+
+      function compactStep(value) {
+        const number = finite(value);
+        if (number == null) return "—";
+        const absolute = Math.abs(number);
+        if (absolute >= 1e6) return `${(number / 1e6).toFixed(1)}M`;
+        if (absolute >= 1e3) return `${(number / 1e3).toFixed(0)}k`;
+        return Math.round(number).toString();
+      }
+
+      function scalar(value) {
+        if (value == null) return "—";
+        if (typeof value === "boolean") return value ? "是" : "否";
+        if (typeof value === "number") {
+          return Number.isInteger(value) ? int(value) : decimal(value, 5);
+        }
+        if (typeof value === "string") return value || "—";
+        try {
+          const text = JSON.stringify(value);
+          return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+        } catch (_error) {
+          return String(value);
+        }
+      }
+
+      function humanKey(key) {
+        return labels[key] || String(key)
+          .replaceAll("_", " ")
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      }
+
+      function statusState(status) {
+        const raw = typeof status === "object" && status
+          ? first(status, ["state", "phase"], "unknown")
+          : status;
+        const normalized = String(raw || "unknown").toLowerCase();
+        if (normalized === "completed") return "complete";
+        if (normalized === "publishing") return "checkpointing";
+        return Object.prototype.hasOwnProperty.call(statusMap, normalized) ? normalized : "unknown";
+      }
+
+      function emptyNode(message, minimum = true) {
+        const div = document.createElement("div");
+        div.className = "empty";
+        if (!minimum) div.style.minHeight = "auto";
+        div.textContent = message;
+        return div;
+      }
+
+      function createCell(text, className = "") {
+        const td = document.createElement("td");
+        td.textContent = text == null ? "—" : String(text);
+        if (className) td.className = className;
+        return td;
+      }
+
+      function renderKeyValues(id, data, preferredKeys = []) {
+        const target = element(id);
+        target.replaceChildren();
+        if (!data || typeof data !== "object" || Array.isArray(data) || Object.keys(data).length === 0) {
+          const dt = document.createElement("dt");
+          const dd = document.createElement("dd");
+          dt.textContent = "状态";
+          dd.textContent = "尚无遥测";
+          target.append(dt, dd);
+          return;
+        }
+
+        const skipped = new Set(["event", "timestamp", "time", "created_at"]);
+        const sourceKeys = Object.keys(data).filter((key) => !skipped.has(key));
+        const ordered = [
+          ...preferredKeys.filter((key) => sourceKeys.includes(key)),
+          ...sourceKeys.filter((key) => !preferredKeys.includes(key))
+        ].slice(0, 14);
+
+        for (const key of ordered) {
+          const dt = document.createElement("dt");
+          const dd = document.createElement("dd");
+          dt.textContent = humanKey(key);
+          dd.textContent = scalar(data[key]);
+          target.append(dt, dd);
+        }
+      }
+
+      function renderStatus(snapshot) {
+        const status = snapshot.status || {};
+        const normalized = statusState(status);
+        const pill = element("status-pill");
+        const suppliedLabel = first(status, ["label"], null);
+        const phase = first(status, ["phase"], "");
+        pill.dataset.state = normalized;
+        pill.textContent = suppliedLabel || statusMap[normalized] || statusMap.unknown;
+        if (phase && String(phase).toLowerCase() !== normalized) {
+          pill.textContent += ` · ${humanKey(String(phase))}`;
+        }
+
+        const evidence = first(status, ["evidence"], null);
+        if (Array.isArray(evidence)) {
+          setText("status-evidence", evidence.length ? evidence.map(scalar).join("；") : "暂无附加状态证据。");
+        } else if (evidence && typeof evidence === "object") {
+          setText(
+            "status-evidence",
+            Object.entries(evidence).map(([key, value]) => `${humanKey(key)}：${scalar(value)}`).join("；")
+          );
+        } else {
+          setText("status-evidence", evidence || "状态由最新的持久化遥测与检查点证据判定。");
+        }
+
+        const telemetryAge = finite(first(status, ["telemetry_age_s"], null));
+        const agePrefix = normalized === "complete" ? "最终遥测年龄" : "遥测年龄";
+        setText("data-age", `${agePrefix}：${duration(telemetryAge)}`);
+      }
+
+      function renderContext(snapshot) {
+        const context = snapshot.context || {};
+        const budget = finite(context.revival_budget);
+        const standard = context.standard_game === true;
+        const badge = element("mode-badge");
+        const note = element("heldout-scope-note");
+
+        if (budget === -1) {
+          badge.textContent = "无限原生复活预热 · 非标准胜率";
+          note.textContent =
+            "当前是无限原生复活预热（revival_budget = -1）。通过覆盖用于验证完整流程与策略成长，不能当作标准零复活胜率。";
+        } else if (standard) {
+          badge.textContent = context.label || "标准游戏评估";
+          note.textContent = "当前上下文标记为标准游戏；成功率仍应结合固定种子样本数与复活统计解释。";
+        } else {
+          badge.textContent = context.label || context.mode || "训练上下文未完全标注";
+          note.textContent =
+            budget == null
+              ? "训练上下文未提供 revival_budget；请先确认复活策略，再解释成功率。"
+              : `当前 revival_budget = ${int(budget)}；成功率需结合复活次数一起解释。`;
+        }
+      }
+
+      function renderRun(snapshot) {
+        const run = snapshot.run || {};
+        const lineage = run.lineage || "未命名 lineage";
+        const chainCount = finite(run.chain_run_count);
+        setText("run-title", chainCount && chainCount > 1 ? `${lineage} · 链路 ${int(chainCount)} 段` : lineage);
+        setText("run-id", run.id || run.key || state.selectedRun || "—");
+        setText("run-device", run.configured_device ? `· ${run.configured_device}` : "");
+      }
+
+      function renderProgress(snapshot) {
+        const progress = snapshot.progress || {};
+        const current = finite(progress.environment_steps);
+        const target = finite(progress.target_environment_steps);
+        const suppliedPercent = finite(progress.percent);
+        const resolvedPercent = suppliedPercent != null
+          ? Math.max(0, Math.min(100, suppliedPercent))
+          : current != null && target && target > 0
+            ? Math.max(0, Math.min(100, current / target * 100))
+            : 0;
+
+        setText("progress-value", `${int(current)} / ${int(target)}`);
+        setText(
+          "progress-context",
+          `${resolvedPercent.toFixed(1)}% · raw 候选峰值 ${int(progress.maximum_observed_candidates)}` +
+            ` · 语义候选峰值 ${int(progress.maximum_observed_semantic_candidates)}` +
+            ` · 最大等价类 ${int(progress.maximum_equivalence_class_size)}`
+        );
+        const bar = element("run-progress");
+        bar.value = resolvedPercent;
+        bar.textContent = `${resolvedPercent.toFixed(1)}%`;
+
+        setText("policy-value", `策略 ${int(progress.policy_version)}`);
+        setText(
+          "policy-context",
+          `学习器更新 ${int(progress.learner_updates)} · 训练 episode ${int(progress.training_episodes)}`
+        );
+
+        const trainingMeta = element("training-meta");
+        trainingMeta.replaceChildren();
+        for (const text of [
+          `训练 episode ${int(progress.training_episodes)}`,
+          `评估 episode ${int(progress.evaluation_episodes)}`,
+          `raw 候选峰值 ${int(progress.maximum_observed_candidates)}`,
+          `语义候选峰值 ${int(progress.maximum_observed_semantic_candidates)}`,
+          `最大等价类 ${int(progress.maximum_equivalence_class_size)}`
+        ]) {
+          const badge = document.createElement("span");
+          badge.className = "pill";
+          badge.textContent = text;
+          trainingMeta.append(badge);
+        }
+      }
+
+      function renderThroughput(snapshot) {
+        const data = snapshot.throughput || {};
+        const rate15 = finite(data.env_steps_per_s_15m);
+        const rate60 = finite(data.env_steps_per_s_60m);
+        const preCompletion = data.scope === "pre_completion";
+        setText("throughput-label", preCompletion ? "结束前 15 分钟吞吐" : "近 15 分钟吞吐");
+        setText("throughput-value", rate15 == null ? "—" : `${decimal(rate15, 2)} 步/秒`);
+        const eta = duration(data.eta_s);
+        const confidence = data.confidence == null ? "" : ` · 置信 ${scalar(data.confidence)}`;
+        if (preCompletion) {
+          setText(
+            "throughput-context",
+            `结束前 60 分钟 ${rate60 == null ? "—" : `${decimal(rate60, 2)} 步/秒`}` +
+              ` · 运行已完成，非当前速度${confidence}`
+          );
+        } else {
+          setText(
+            "throughput-context",
+            `60 分钟 ${rate60 == null ? "—" : `${decimal(rate60, 2)} 步/秒`} · ETA ${eta}${confidence}`
+          );
+        }
+      }
+
+      function episodeX(episode, index) {
+        return finite(first(episode, ["environment_steps", "env_step", "step"], index));
+      }
+
+      function renderEpisodes(snapshot) {
+        const episodes = Array.isArray(snapshot.episodes) ? snapshot.episodes : [];
+        const latest = snapshot.latest_episode || (episodes.length ? episodes[episodes.length - 1] : null);
+        renderKeyValues("latest-episode-kv", latest, [
+          "episode", "environment_steps", "max_floor", "final_floor", "revivals",
+          "player_hp_lost", "steps", "reward", "outcome", "termination_reason"
+        ]);
+        setText("latest-episode-time", latest ? dateTime(first(latest, ["timestamp", "time", "created_at"], null)) : "—");
+
+        const floorPoints = [];
+        const revivalPoints = [];
+        episodes.forEach((episode, index) => {
+          const x = episodeX(episode, index);
+          const floor = finite(first(episode, ["max_floor", "maximum_floor", "final_floor", "floor"], null));
+          const revivals = finite(first(episode, ["revivals", "revival_count", "max_revivals"], null));
+          if (x != null && floor != null) floorPoints.push({ x, y: floor, meta: `环境步 ${int(x)}：楼层 ${decimal(floor)}` });
+          if (x != null && revivals != null) {
+            revivalPoints.push({ x, y: revivals, meta: `环境步 ${int(x)}：复活 ${decimal(revivals)}` });
+          }
+        });
+        renderLineChart("episode-chart", [
+          { label: "最远楼层", color: "--series-1", points: floorPoints },
+          {
+            label: "复活次数",
+            color: "--series-5",
+            points: revivalPoints,
+            dash: "6 4",
+            axis: "right"
+          }
+        ], {
+          xLabel: "环境步",
+          yLabel: "最远楼层",
+          rightYLabel: "复活次数",
+          empty: "完成训练 episode 后显示楼层与复活趋势"
+        });
+
+        const body = element("episodes-body");
+        body.replaceChildren();
+        const recent = episodes.slice(-20).reverse();
+        if (!recent.length) {
+          const row = document.createElement("tr");
+          const cell = createCell("尚无训练 episode 记录", "wrap");
+          cell.colSpan = 7;
+          row.append(cell);
+          body.append(row);
+          return;
+        }
+        recent.forEach((episode, reverseIndex) => {
+          const row = document.createElement("tr");
+          const originalIndex = episodes.length - reverseIndex;
+          const outcome = first(episode, ["outcome", "termination_reason", "reason", "status"], "—");
+          row.append(
+            createCell(int(first(episode, ["environment_steps", "env_step", "step"], null))),
+            createCell(int(first(episode, ["episode", "episode_index"], originalIndex))),
+            createCell(decimal(first(episode, ["max_floor", "maximum_floor", "final_floor", "floor"], null)), "numeric"),
+            createCell(decimal(first(episode, ["revivals", "revival_count", "max_revivals"], null)), "numeric"),
+            createCell(decimal(first(episode, ["player_hp_lost", "hp_lost"], null)), "numeric"),
+            createCell(int(first(episode, ["steps", "episode_steps", "decisions"], null)), "numeric"),
+            createCell(scalar(outcome), "wrap")
+          );
+          body.append(row);
+        });
+      }
+
+      function renderLatestEvaluation(snapshot) {
+        const evaluations = Array.isArray(snapshot.evaluations) ? snapshot.evaluations : [];
+        if (!evaluations.length) {
+          setText("heldout-value", "Act 1 —");
+          setText("heldout-context", "尚无 held-out 评估");
+          element("heldout-gate-badge").dataset.state = "waiting";
+          setText("heldout-gate-badge", "尚无评估门");
+          for (const id of [
+            "eval-act1", "eval-act3", "eval-win", "eval-floor", "eval-raw-revivals",
+            "eval-raw-hp-loss", "eval-deadlocks", "eval-boundary-revivals",
+            "eval-boundary-hp-loss", "eval-low-revival"
+          ]) setText(id, "—");
+          return;
+        }
+        const latest = evaluations[evaluations.length - 1];
+        const total = finite(latest.episodes);
+        const act1 = finite(latest.act_1_successes);
+        const act3 = finite(latest.act_3_successes);
+        const wins = finite(latest.run_wins);
+        const gate = first(latest, ["evaluation_gate", "environment_steps"], null);
+
+        setText("heldout-value", `Act 1 ${rateText(act1, total, latest.act_1_success_rate)}`);
+        setText("heldout-context", `门 ${int(gate)} · 固定种子 n=${int(total)}`);
+        const gateBadge = element("heldout-gate-badge");
+        gateBadge.dataset.state = "complete";
+        gateBadge.textContent = `门 ${int(gate)} · n=${int(total)}`;
+
+        setText("eval-act1", rateText(act1, total, latest.act_1_success_rate));
+        setText("eval-act1-context", `固定种子样本 n=${int(total)}`);
+        setText("eval-act3", rateText(act3, total, latest.act_3_success_rate));
+        setText("eval-act3-context", `固定种子样本 n=${int(total)}`);
+        setText("eval-win", rateText(wins, total, latest.run_win_rate));
+        setText("eval-win-context", `固定种子样本 n=${int(total)}`);
+        setText("eval-floor", decimal(latest.max_floor));
+        setText("eval-floor-context", `平均 ${decimal(latest.mean_max_floor, 2)}`);
+        setText("eval-raw-revivals", decimal(latest.mean_revivals, 2));
+        setText("eval-raw-hp-loss", decimal(latest.mean_player_hp_lost, 2));
+
+        const deadlocks = finite(latest.deadlock_count);
+        const combatStalls = finite(latest.combat_progress_stall_count);
+        const noncombatStalls = finite(latest.noncombat_progress_stall_count);
+        const policyFailures = finite(latest.combat_policy_failure_count);
+        setText(
+          "eval-deadlocks",
+          rateText(deadlocks, total, latest.deadlock_rate)
+        );
+        setText(
+          "eval-deadlocks-context",
+          `战斗停滞 ${int(combatStalls)} · 非战斗停滞 ${int(noncombatStalls)}` +
+            ` · 策略失败 ${int(policyFailures)}（各指标可能重叠）`
+        );
+
+        setText("eval-boundary-revivals", decimal(latest.act_1_boundary_mean_revivals, 2));
+        setText("eval-boundary-revivals-context", `条件样本 n=${int(act1)}`);
+        setText("eval-boundary-hp-loss", decimal(latest.act_1_boundary_mean_player_hp_lost, 2));
+        setText("eval-boundary-hp-loss-context", `条件样本 n=${int(act1)}`);
+
+        const zero = finite(latest.zero_revival_act1_successes);
+        const one = finite(latest.at_most_one_revival_act1_successes);
+        setText("eval-low-revival", rateText(one, total, total && one != null ? one / total : null));
+        setText(
+          "eval-low-revival-context",
+          `零复活 ${rateText(zero, total, total && zero != null ? zero / total : null)} · ≤1 次`
+        );
+      }
+
+      function renderEvaluations(snapshot) {
+        const evaluations = Array.isArray(snapshot.evaluations) ? snapshot.evaluations : [];
+        renderLatestEvaluation(snapshot);
+
+        const act1Points = [];
+        const act3Points = [];
+        const winPoints = [];
+        evaluations.forEach((evaluation, index) => {
+          const x = finite(first(evaluation, ["environment_steps", "evaluation_gate"], index));
+          const n = finite(evaluation.episodes);
+          const rate = (count, supplied) => {
+            const direct = normalizeRate(supplied);
+            if (direct != null) return direct;
+            const numerator = finite(count);
+            return n && numerator != null ? numerator / n : null;
+          };
+          const act1Rate = rate(evaluation.act_1_successes, evaluation.act_1_success_rate);
+          const act3Rate = rate(evaluation.act_3_successes, evaluation.act_3_success_rate);
+          const winRate = rate(evaluation.run_wins, evaluation.run_win_rate);
+          if (x != null && act1Rate != null) {
+            act1Points.push({ x, y: act1Rate, meta: `Act 1 ${rateText(evaluation.act_1_successes, n, act1Rate)}` });
+          }
+          if (x != null && act3Rate != null) {
+            act3Points.push({ x, y: act3Rate, meta: `Act 3 ${rateText(evaluation.act_3_successes, n, act3Rate)}` });
+          }
+          if (x != null && winRate != null) {
+            winPoints.push({ x, y: winRate, meta: `通关 ${rateText(evaluation.run_wins, n, winRate)}` });
+          }
+        });
+        renderLineChart("evaluation-chart", [
+          { label: "Act 1", color: "--series-1", points: act1Points },
+          { label: "Act 3", color: "--series-2", points: act3Points },
+          { label: "完整通关", color: "--series-3", points: winPoints, dash: "5 3" }
+        ], {
+          xLabel: "环境步",
+          yLabel: "成功率",
+          percent: true,
+          fixedY: [0, 1],
+          empty: "到达评估门后显示固定种子成功率趋势"
+        });
+
+        const body = element("evaluations-body");
+        body.replaceChildren();
+        if (!evaluations.length) {
+          const row = document.createElement("tr");
+          const cell = createCell("尚无 held-out 评估记录", "wrap");
+          cell.colSpan = 10;
+          row.append(cell);
+          body.append(row);
+          return;
+        }
+        evaluations.slice().reverse().forEach((evaluation) => {
+          const total = finite(evaluation.episodes);
+          const row = document.createElement("tr");
+          const gate = first(evaluation, ["evaluation_gate", "environment_steps"], null);
+          const deadlocks = finite(evaluation.deadlock_count);
+          const combatStalls = finite(evaluation.combat_progress_stall_count);
+          const noncombatStalls = finite(evaluation.noncombat_progress_stall_count);
+          const policyFailures = finite(evaluation.combat_policy_failure_count);
+          row.append(
+            createCell(int(gate)),
+            createCell(int(total), "numeric"),
+            createCell(rateText(evaluation.act_1_successes, total, evaluation.act_1_success_rate), "numeric"),
+            createCell(rateText(evaluation.act_3_successes, total, evaluation.act_3_success_rate), "numeric"),
+            createCell(rateText(evaluation.run_wins, total, evaluation.run_win_rate), "numeric"),
+            createCell(`${decimal(evaluation.mean_max_floor, 2)} / ${decimal(evaluation.max_floor)}`, "numeric"),
+            createCell(decimal(evaluation.mean_revivals, 2), "numeric"),
+            createCell(decimal(evaluation.mean_player_hp_lost, 2), "numeric"),
+            createCell(
+              `deadlock ${rateText(deadlocks, total, evaluation.deadlock_rate)}` +
+                ` · 战斗 ${int(combatStalls)} · 非战斗 ${int(noncombatStalls)}` +
+                ` · 策略失败 ${int(policyFailures)}（可重叠）`,
+              "numeric"
+            ),
+            createCell(int(evaluation.infrastructure_retries), "numeric")
+          );
+          body.append(row);
+        });
+      }
+
+      function renderLearner(snapshot) {
+        const latestLearner = snapshot.latest_learner || null;
+        const latestActor = snapshot.latest_actor || null;
+        renderKeyValues("latest-learner-kv", latestLearner, [
+          "learner_updates", "policy_version", "loss", "td_loss", "q_loss", "policy_loss",
+          "value_loss", "grad_norm", "replay_size", "batch_size", "learner_updates_per_s"
+        ]);
+        renderKeyValues("latest-actor-kv", latestActor, [
+          "environment_steps", "actor_steps", "collector_steps", "env_steps_per_s",
+          "queue_depth", "actor_queue_depth", "collector_queue_depth",
+          "maximum_observed_candidates", "maximum_observed_semantic_candidates",
+          "maximum_equivalence_class_size", "phase"
+        ]);
+        setText(
+          "latest-learner-time",
+          latestLearner ? dateTime(first(latestLearner, ["timestamp", "time", "created_at"], null)) : "—"
+        );
+        setText(
+          "latest-actor-time",
+          latestActor ? dateTime(first(latestActor, ["timestamp", "time", "created_at"], null)) : "—"
+        );
+
+        const learnerSeries = Array.isArray(snapshot.learner_series) ? snapshot.learner_series : [];
+        const lossPoints = [];
+        learnerSeries.forEach((item, index) => {
+          const x = finite(first(item, ["learner_updates", "update", "update_step", "environment_steps"], index));
+          const y = finite(first(item, ["loss", "total_loss", "learner_loss", "td_loss", "q_loss"], null));
+          if (x != null && y != null) {
+            lossPoints.push({ x, y, meta: `更新 ${int(x)}：损失 ${decimal(y, 5)}` });
+          }
+        });
+        renderLineChart("learner-chart", [
+          { label: "训练损失", color: "--series-4", points: lossPoints }
+        ], { xLabel: "学习器更新", yLabel: "损失", empty: "学习器记录损失后显示趋势" });
+      }
+
+      function checkpointValue(item, keys, fallback = null) {
+        return typeof item === "string" ? fallback : first(item, keys, fallback);
+      }
+
+      function checkpointName(item) {
+        if (typeof item === "string") return item;
+        return first(item, ["name", "path", "checkpoint", "id"], "未命名检查点");
+      }
+
+      function checkpointVerification(item, publishing) {
+        if (publishing) return "发布中 · 未完成校验";
+        if (!item || typeof item !== "object") return "已发布 · 校验未标注";
+
+        const verification = item.verification;
+        const verificationStatus = typeof verification === "string"
+          ? verification.toLowerCase()
+          : verification && typeof verification === "object"
+            ? String(first(verification, ["status", "level", "result"], "")).toLowerCase()
+            : "";
+        const explicitSizeVerified = verification && typeof verification === "object"
+          ? verification.size_verified === true
+          : verificationStatus.includes("size_verified") || verificationStatus.includes("size-verified");
+        const valid = item.valid === true;
+
+        if (valid || explicitSizeVerified) {
+          return "valid · 原子发布 + size_verified";
+        }
+        if (item.valid === false) {
+          return "已发布 · 轻量校验未通过";
+        }
+        return "已发布 · 校验未标注";
+      }
+
+      function renderCheckpoints(snapshot) {
+        const checkpoints = snapshot.checkpoints || {};
+        const published = Array.isArray(checkpoints.published) ? checkpoints.published : [];
+        const publishing = Array.isArray(checkpoints.publishing) ? checkpoints.publishing : [];
+        setText("checkpoint-summary", `已发布 ${int(published.length)} · 发布中 ${int(publishing.length)}`);
+        const body = element("checkpoints-body");
+        body.replaceChildren();
+        const entries = [
+          ...publishing.map((item) => ({ item, publishing: true })),
+          ...published.slice().reverse().slice(0, 12).map((item) => ({ item, publishing: false }))
+        ];
+        if (!entries.length) {
+          const row = document.createElement("tr");
+          const cell = createCell("尚未发现检查点", "wrap");
+          cell.colSpan = 4;
+          row.append(cell);
+          body.append(row);
+          return;
+        }
+        entries.forEach(({ item, publishing: isPublishing }) => {
+          const row = document.createElement("tr");
+          row.append(
+            createCell(checkpointVerification(item, isPublishing), "wrap"),
+            createCell(int(checkpointValue(item, ["environment_steps", "step", "env_step"], null))),
+            createCell(checkpointName(item), "wrap"),
+            createCell(dateTime(checkpointValue(item, ["created_at", "timestamp", "time", "modified_at"], null)))
+          );
+          body.append(row);
+        });
+      }
+
+      function describeListItem(item) {
+        if (typeof item === "string") return { title: item, meta: "" };
+        if (!item || typeof item !== "object") return { title: scalar(item), meta: "" };
+        const title = first(item, ["message", "label", "title", "type", "event"], "未命名事件");
+        const time = first(item, ["timestamp", "time", "created_at"], null);
+        const details = Object.entries(item)
+          .filter(([key]) => !["message", "label", "title", "timestamp", "time", "created_at"].includes(key))
+          .slice(0, 5)
+          .map(([key, value]) => `${humanKey(key)} ${scalar(value)}`)
+          .join(" · ");
+        const meta = [time ? dateTime(time) : "", details].filter(Boolean).join(" · ");
+        return { title: scalar(title), meta };
+      }
+
+      function renderList(id, items, kind, emptyMessage) {
+        const list = element(id);
+        list.replaceChildren();
+        if (!Array.isArray(items) || !items.length) {
+          const li = document.createElement("li");
+          li.className = "list-item";
+          li.textContent = emptyMessage;
+          list.append(li);
+          return;
+        }
+        items.slice(-12).reverse().forEach((item) => {
+          const description = describeListItem(item);
+          const li = document.createElement("li");
+          li.className = `list-item ${kind}`;
+          const title = document.createElement("div");
+          title.className = "item-title";
+          title.textContent = description.title;
+          li.append(title);
+          if (description.meta) {
+            const meta = document.createElement("div");
+            meta.className = "item-meta";
+            meta.textContent = description.meta;
+            li.append(meta);
+          }
+          list.append(li);
+        });
+      }
+
+      function renderDiagnostics(snapshot) {
+        const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
+        const incidents = Array.isArray(snapshot.incidents) ? snapshot.incidents : [];
+        setText("alerts-count", int(alerts.length));
+        setText("incidents-count", `事件 ${int(incidents.length)}`);
+        renderList("alerts-list", alerts, "alert", "当前没有告警");
+        renderList("incidents-list", incidents, "incident", "当前没有运行事件");
+        renderKeyValues("data-quality-kv", snapshot.data_quality || {}, [
+          "metrics_rows", "parsed_rows", "malformed_rows", "dropped_rows",
+          "journal_rows", "partial_line", "last_complete_offset"
+        ]);
+      }
+
+      function svgNode(name, attrs = {}, text = null) {
+        const node = document.createElementNS(SVG_NS, name);
+        Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        if (text != null) node.textContent = String(text);
+        return node;
+      }
+
+      function renderLineChart(id, series, options) {
+        const target = element(id);
+        target.replaceChildren();
+        const nonEmpty = series.filter((item) => Array.isArray(item.points) && item.points.length);
+        if (!nonEmpty.length) {
+          target.append(emptyNode(options.empty || "尚无可绘制的数据"));
+          return;
+        }
+
+        const width = 820;
+        const height = 270;
+        const rightSeries = nonEmpty.filter((item) => item.axis === "right");
+        const leftSeries = nonEmpty.filter((item) => item.axis !== "right");
+        const hasRightAxis = rightSeries.length > 0;
+        const margin = { top: 42, right: hasRightAxis ? 70 : 24, bottom: 43, left: 58 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const allPoints = nonEmpty.flatMap((item) => item.points);
+        let xMin = Math.min(...allPoints.map((point) => point.x));
+        let xMax = Math.max(...allPoints.map((point) => point.x));
+        if (xMin === xMax) {
+          xMin -= 1;
+          xMax += 1;
+        }
+
+        function axisDomain(axisSeries, fixedDomain) {
+          const points = axisSeries.flatMap((item) => item.points);
+          if (fixedDomain) return [fixedDomain[0], fixedDomain[1]];
+          if (!points.length) return [0, 1];
+          let minimum = Math.min(0, ...points.map((point) => point.y));
+          let maximum = Math.max(...points.map((point) => point.y));
+          if (minimum === maximum) {
+            const pad = Math.abs(minimum) * 0.1 || 1;
+            minimum -= minimum === 0 ? 0 : pad;
+            maximum += pad;
+          } else {
+            maximum += (maximum - minimum) * 0.08;
+          }
+          return [minimum, maximum];
+        }
+
+        const [yMin, yMax] = axisDomain(leftSeries.length ? leftSeries : nonEmpty, options.fixedY);
+        const [rightYMin, rightYMax] = axisDomain(rightSeries, options.fixedRightY);
+        const xScale = (value) => margin.left + (value - xMin) / (xMax - xMin) * plotWidth;
+        const leftYScale = (value) => margin.top + plotHeight - (value - yMin) / (yMax - yMin) * plotHeight;
+        const rightYScale = (value) =>
+          margin.top + plotHeight - (value - rightYMin) / (rightYMax - rightYMin) * plotHeight;
+        const svg = svgNode("svg", {
+          viewBox: `0 0 ${width} ${height}`,
+          role: "img",
+          "aria-labelledby": `${id}-title ${id}-desc`
+        });
+        svg.append(
+          svgNode("title", { id: `${id}-title` }, options.title || "趋势图"),
+          svgNode(
+            "desc",
+            { id: `${id}-desc` },
+            `${nonEmpty.map((item) => item.label).join("、")}，横轴 ${options.xLabel}，左轴 ${options.yLabel}` +
+              (hasRightAxis ? `，右轴 ${options.rightYLabel || "右轴数值"}` : "")
+          )
+        );
+
+        for (let tick = 0; tick <= 4; tick += 1) {
+          const ratio = tick / 4;
+          const y = margin.top + plotHeight * ratio;
+          const value = yMax - (yMax - yMin) * ratio;
+          svg.append(svgNode("line", {
+            x1: margin.left,
+            x2: width - margin.right,
+            y1: y,
+            y2: y,
+            class: "grid-line"
+          }));
+          svg.append(svgNode(
+            "text",
+            { x: margin.left - 9, y: y + 4, "text-anchor": "end" },
+            options.percent ? `${Math.round(value * 100)}%` : decimal(value, 2)
+          ));
+          if (hasRightAxis) {
+            const rightValue = rightYMax - (rightYMax - rightYMin) * ratio;
+            svg.append(svgNode(
+              "text",
+              {
+                x: width - margin.right + 9,
+                y: y + 4,
+                "text-anchor": "start"
+              },
+              options.rightPercent ? `${Math.round(rightValue * 100)}%` : compactStep(rightValue)
+            ));
+          }
+        }
+
+        for (let tick = 0; tick <= 4; tick += 1) {
+          const ratio = tick / 4;
+          const x = margin.left + plotWidth * ratio;
+          const value = xMin + (xMax - xMin) * ratio;
+          svg.append(svgNode("line", {
+            x1: x,
+            x2: x,
+            y1: margin.top + plotHeight,
+            y2: margin.top + plotHeight + 5,
+            class: "axis"
+          }));
+          svg.append(svgNode(
+            "text",
+            { x, y: height - 18, "text-anchor": "middle" },
+            compactStep(value)
+          ));
+        }
+
+        svg.append(
+          svgNode("line", {
+            x1: margin.left,
+            x2: margin.left,
+            y1: margin.top,
+            y2: margin.top + plotHeight,
+            class: "axis"
+          }),
+          svgNode("line", {
+            x1: margin.left,
+            x2: width - margin.right,
+            y1: margin.top + plotHeight,
+            y2: margin.top + plotHeight,
+            class: "axis"
+          }),
+          svgNode("text", {
+            x: margin.left + plotWidth / 2,
+            y: height - 2,
+            "text-anchor": "middle"
+          }, options.xLabel),
+          svgNode("text", {
+            x: 12,
+            y: margin.top + plotHeight / 2,
+            transform: `rotate(-90 12 ${margin.top + plotHeight / 2})`,
+            "text-anchor": "middle"
+          }, options.yLabel)
+        );
+        if (hasRightAxis) {
+          const rightAxisX = width - margin.right;
+          const rightLabelX = width - 9;
+          const rightLabelY = margin.top + plotHeight / 2;
+          svg.append(
+            svgNode("line", {
+              x1: rightAxisX,
+              x2: rightAxisX,
+              y1: margin.top,
+              y2: margin.top + plotHeight,
+              class: "axis"
+            }),
+            svgNode("text", {
+              x: rightLabelX,
+              y: rightLabelY,
+              transform: `rotate(90 ${rightLabelX} ${rightLabelY})`,
+              "text-anchor": "middle"
+            }, options.rightYLabel || "右轴数值")
+          );
+        }
+
+        let legendX = margin.left;
+        nonEmpty.forEach((item) => {
+          const color = `var(${item.color})`;
+          const yScale = item.axis === "right" ? rightYScale : leftYScale;
+          const pathData = item.points
+            .map((point, index) => `${index ? "L" : "M"} ${xScale(point.x).toFixed(2)} ${yScale(point.y).toFixed(2)}`)
+            .join(" ");
+          const pathAttrs = {
+            d: pathData,
+            class: "series-line",
+            stroke: color
+          };
+          if (item.dash) pathAttrs["stroke-dasharray"] = item.dash;
+          svg.append(svgNode("path", pathAttrs));
+          item.points.forEach((point) => {
+            const circle = svgNode("circle", {
+              cx: xScale(point.x),
+              cy: yScale(point.y),
+              r: 3.5,
+              fill: color,
+              class: "point"
+            });
+            circle.append(svgNode("title", {}, point.meta || `${item.label}：${decimal(point.y, 3)}`));
+            svg.append(circle);
+          });
+
+          svg.append(
+            svgNode("line", {
+              x1: legendX,
+              x2: legendX + 22,
+              y1: 18,
+              y2: 18,
+              stroke: color,
+              "stroke-width": 2.5,
+              "stroke-dasharray": item.dash || ""
+            }),
+            svgNode("circle", { cx: legendX + 11, cy: 18, r: 3, fill: color }),
+            svgNode(
+              "text",
+              { x: legendX + 29, y: 22 },
+              item.axis === "right" ? `${item.label}（右轴）` : item.label
+            )
+          );
+          const legendLabel = item.axis === "right" ? `${item.label}（右轴）` : item.label;
+          legendX += Math.max(105, legendLabel.length * 16 + 42);
+        });
+        target.append(svg);
+      }
+
+      function renderSnapshot(snapshot) {
+        state.snapshot = snapshot;
+        renderStatus(snapshot);
+        renderContext(snapshot);
+        renderRun(snapshot);
+        renderProgress(snapshot);
+        renderThroughput(snapshot);
+        renderEpisodes(snapshot);
+        renderEvaluations(snapshot);
+        renderLearner(snapshot);
+        renderCheckpoints(snapshot);
+        renderDiagnostics(snapshot);
+        element("main-content").setAttribute("aria-busy", "false");
+        setText("last-refresh", `页面刷新：${dateTime(Date.now())}`);
+        state.lastFetchedAt = Date.now();
+      }
+
+      function runOptionLabel(run) {
+        const lineage = run.lineage || "未命名 lineage";
+        const id = run.run_id || run.id || run.key || "未知运行";
+        const suppliedStatus = run.status && typeof run.status === "object"
+          ? run.status.label
+          : null;
+        const status = suppliedStatus || statusMap[statusState(run.status)] || scalar(run.status);
+        return `${lineage} · ${String(id).slice(0, 18)} · ${status}`;
+      }
+
+      function populateRuns(payload) {
+        const runs = Array.isArray(payload.runs) ? payload.runs : [];
+        state.runs = runs;
+        const select = element("run-select");
+        select.replaceChildren();
+
+        if (!runs.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "未发现训练运行";
+          select.append(option);
+          state.selectedRun = "";
+          state.latestRunKey = "";
+          return "";
+        }
+
+        const suppliedSelected = typeof payload.selected === "string"
+          ? payload.selected
+          : payload.selected && payload.selected.key
+            ? payload.selected.key
+            : "";
+        const latest = runs.some((run) => run.key === suppliedSelected)
+          ? suppliedSelected
+          : runs[0].key;
+        state.latestRunKey = latest;
+
+        let selected;
+        if (state.followLatest) {
+          selected = latest;
+        } else if (runs.some((run) => run.key === state.selectedRun)) {
+          selected = state.selectedRun;
+        } else {
+          // A pinned artifact can disappear after cleanup. Fall back to the
+          // current API-selected run instead of leaving the dashboard empty.
+          state.followLatest = true;
+          selected = latest;
+        }
+
+        runs.forEach((run) => {
+          const option = document.createElement("option");
+          option.value = run.key;
+          const latestSuffix = run.key === latest ? " · 最新" : "";
+          const lockSuffix = !state.followLatest && run.key === selected ? " · 已锁定" : "";
+          option.textContent = `${runOptionLabel(run)}${latestSuffix}${lockSuffix}`;
+          select.append(option);
+        });
+
+        state.selectedRun = selected;
+        select.value = selected;
+        element("run-help").textContent = state.followLatest
+          ? "当前自动跟随接口返回的最新运行；选择历史运行后会锁定该运行"
+          : "当前已锁定所选运行；重新选择标有“最新”的运行可恢复自动跟随";
+        return selected;
+      }
+
+      async function fetchJson(url) {
+        const response = await fetch(url, {
+          method: "GET",
+          headers: { "Accept": "application/json" },
+          cache: "no-store",
+          credentials: "same-origin"
+        });
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const payload = await response.json();
+            detail = payload.error || payload.message || "";
+          } catch (_error) {
+            detail = "";
+          }
+          throw new Error(`${response.status} ${response.statusText}${detail ? `：${detail}` : ""}`);
+        }
+        return response.json();
+      }
+
+      function showError(message) {
+        const notice = element("error-notice");
+        notice.textContent = message;
+        notice.classList.add("is-visible");
+      }
+
+      function clearError() {
+        const notice = element("error-notice");
+        notice.textContent = "";
+        notice.classList.remove("is-visible");
+      }
+
+      function updateUrl(runKey) {
+        const url = new URL(location.href);
+        if (runKey) url.searchParams.set("run", runKey);
+        else url.searchParams.delete("run");
+        history.replaceState(null, "", url);
+      }
+
+      function scheduleNext() {
+        window.clearTimeout(state.timer);
+        if (state.refreshMs > 0) {
+          state.timer = window.setTimeout(() => refresh(false), state.refreshMs);
+        }
+      }
+
+      async function refresh(manual) {
+        if (state.loading) return;
+        state.loading = true;
+        const button = element("refresh-button");
+        button.disabled = true;
+        button.textContent = "刷新中…";
+        if (manual) clearError();
+
+        try {
+          const runPayload = await fetchJson(API_RUNS);
+          const selected = populateRuns(runPayload);
+          if (!selected) {
+            showError("尚未发现可监控的训练运行。面板会继续轮询 artifact root。");
+            element("main-content").setAttribute("aria-busy", "false");
+            return;
+          }
+          updateUrl(state.followLatest ? "" : selected);
+          const snapshot = await fetchJson(`${API_SNAPSHOT}?run=${encodeURIComponent(selected)}`);
+          clearError();
+          renderSnapshot(snapshot);
+        } catch (error) {
+          showError(`读取监控数据失败：${error instanceof Error ? error.message : String(error)}。已保留最后一次成功快照。`);
+          element("main-content").setAttribute("aria-busy", "false");
+          setText("last-refresh", `刷新失败：${dateTime(Date.now())}`);
+        } finally {
+          state.loading = false;
+          button.disabled = false;
+          button.textContent = "立即刷新";
+          scheduleNext();
+        }
+      }
+
+      element("run-select").addEventListener("change", (event) => {
+        const next = event.target.value;
+        if (!next || next === state.selectedRun) return;
+        state.followLatest = next === state.latestRunKey;
+        state.selectedRun = next;
+        updateUrl(state.followLatest ? "" : next);
+        refresh(true);
+      });
+
+      element("refresh-select").addEventListener("change", (event) => {
+        state.refreshMs = Number(event.target.value) || 0;
+        scheduleNext();
+        setText(
+          "last-refresh",
+          state.refreshMs ? `自动刷新：每 ${state.refreshMs / 1000} 秒` : "自动刷新已暂停"
+        );
+      });
+
+      element("refresh-button").addEventListener("click", () => refresh(true));
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          if (!state.lastFetchedAt || Date.now() - state.lastFetchedAt > Math.max(state.refreshMs, 15000)) {
+            refresh(false);
+          } else {
+            scheduleNext();
+          }
+        } else {
+          window.clearTimeout(state.timer);
+        }
+      });
+
+      refresh(false);
+    })();
+  </script>
+</body>
+</html>

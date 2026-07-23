@@ -47,6 +47,7 @@ decisions from a launcher, compatibility wrapper, or build script.
 - [Development and verification](./runbooks/development.md)
 - [Artifact inventory and externalization](./runbooks/artifacts.md)
 - [WSL ROCm training](./runbooks/wsl-rocm-training.md)
+- [Local training dashboard](./runbooks/training-dashboard.md)
 - [HeadlessSim build identity](./headless-simulator-identity.md)
 - [Runtime card-facts ABI](./card-facts-abi.md)
 - [Runtime mechanics ABI](./runtime-mechanics-abi.md)

@@ -187,6 +187,17 @@ python -m sts2_rl.train --profile combat --sim-exe <PINNED_HEADLESS_SIM_RELEASE_
 python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
 ```
 
+Monitor persistent runs from a loopback-only, read-only local dashboard:
+
+```powershell
+.\scripts\start_training_dashboard.ps1
+```
+
+The page keeps online training samples separate from fixed-seed held-out
+evaluation and explicitly labels unlimited native-revival preheat as a
+non-standard win context. See the
+[training dashboard runbook](./docs/runbooks/training-dashboard.md).
+
 Formal headless runs require a `Release` simulator built from the locked
 `sts2-ai` commit and a matching binary-identity sidecar. Debug, stale, dirty-
 source, and hash-mismatched binaries are rejected before the simulator starts.

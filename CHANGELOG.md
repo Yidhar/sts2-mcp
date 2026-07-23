@@ -36,6 +36,11 @@ historical RL artifacts.
 
 ### Added
 
+- Added a loopback-only, read-only training dashboard with incremental JSONL
+  telemetry, exact-resume chain aggregation, held-out/training separation,
+  conservative lifecycle evidence, lightweight atomic-checkpoint validation,
+  bounded native SVG trends, and a Windows background launcher. The service
+  never deserializes checkpoint payloads or exposes training controls.
 - Added bounded complete-episode credit assignment for native-revival full-run
   preheat. The collector retains immutable CPU snapshots independently of
   streamed short unrolls and backfills factual combat/Act/run success,

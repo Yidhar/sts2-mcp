@@ -173,6 +173,16 @@ python -m sts2_rl.train --profile combat --sim-exe <PINNED_HEADLESS_SIM_RELEASE_
 python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE_EXE>
 ```
 
+使用仅绑定本机回环地址、只读的监控面板查看持久化训练：
+
+```powershell
+.\scripts\start_training_dashboard.ps1
+```
+
+面板严格分开展示在线训练样本和固定种子 held-out 评估，并把无限原生复活预热
+明确标为非标准胜率上下文。详见
+[训练监控面板 runbook](./docs/runbooks/training-dashboard.md)。
+
 正式无头训练必须使用从锁定 `sts2-ai` 提交构建的 `Release` 模拟器，并提供与
 二进制匹配的身份 sidecar。Debug、过期、脏源码构建或哈希不一致的二进制都会在
 模拟器启动前被拒绝。构建和验证流程见
