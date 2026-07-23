@@ -1,0 +1,11 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -800,6 +800,6 @@ public static class FullRunApiStateBuilder
+ 			target_type = potion.TargetType.ToString(),
+ 			can_use_in_combat = canUseInCombat && (potion.Usage == PotionUsage.CombatOnly || potion.Usage == PotionUsage.AnyTime) && !potion.IsQueued && potion.PassesCustomUsabilityCheck,
+-			can_throw_at_ally = potion.CanThrowAtAlly(),
++			can_throw_at_ally = canUseInCombat && potion.CanThrowAtAlly(),
+ 			is_queued = potion.IsQueued,
+ 			can_be_generated_in_combat = potion.CanBeGeneratedInCombat,
+ 			passes_custom_usability_check = potion.PassesCustomUsabilityCheck,

@@ -42,6 +42,10 @@
     {
       "path": "third_party/patches/sts2-ai/0007-grounded-macro-observation-contract.patch",
       "sha256": "aead1a9049799dcae5be9e5357db4a34918e5ee8c42c4466692133e5bb40ba69"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0008-guard-unowned-shop-potion-context.patch",
+      "sha256": "a7d8eedece05e91f38e0c841e43bd8ada4c8cbc327d4a580655e64331c6a4aa0"
     }
   ]
 }
