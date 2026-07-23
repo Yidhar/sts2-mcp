@@ -23,7 +23,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v7"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v8"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -43,6 +43,12 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert default.episodic_learning.macro_sample_fraction == 0.0
     assert combat.episodic_learning.macro_sample_fraction == 0.0
     assert preheat.episodic_learning.primary_success_tie_tolerance == 0.05
+    assert preheat.episodic_learning.policy_gradient_max_lag == 128
+    assert preheat.episodic_learning.revival_value_weight == 0.02
+    assert preheat.transaction_learning.pairwise_ranking_weight == 0.10
+    assert preheat.optimization.entropy_weight == 0.02
+    assert preheat.optimization.entropy_weight_end == 0.004
+    assert preheat.optimization.entropy_decay_updates == 2_000
     assert (
         preheat.episodic_learning.sample_sequences
         * preheat.episodic_learning.learn_steps
@@ -66,8 +72,21 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert combat.model.max_candidates == 256
     assert preheat.model.max_candidates == 256
     assert preheat.rollout.minimum_unrolls == 4
-    assert preheat.runtime.evaluation_steps == (0, 30_000, 100_000, 250_000)
+    assert preheat.rollout.queue_capacity == 64
+    assert preheat.rollout.max_policy_lag == 64
+    assert preheat.rollout.deterministic_probe_interval_episodes == 8
+    assert preheat.runtime.evaluation_steps == (0, 100_000)
     assert preheat.runtime.evaluation_episodes == 12
+    assert preheat.runtime.early_evaluation_steps == (
+        5_000,
+        10_000,
+        20_000,
+        30_000,
+    )
+    assert preheat.runtime.early_evaluation_episodes == 4
+    assert preheat.runtime.final_audit_steps == (250_000,)
+    assert preheat.runtime.final_audit_episodes == 20
+    assert preheat.runtime.evaluation_liveness_guard_enabled
     assert preheat.diagnostics.combat_net_progress_window == 256
     assert preheat.diagnostics.combat_net_progress_room_windows == {
         "TEST_SUBJECT_BOSS": 128,
@@ -77,9 +96,9 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert combat.diagnostics.combat_net_progress_room_windows == {}
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
-    assert preheat.runtime.log_dir.endswith("v19-observation-v2-macro-credit")
+    assert preheat.runtime.log_dir.endswith("v20-liveness-guard")
     assert preheat.runtime.checkpoint_dir.endswith(
-        "v19-observation-v2-macro-credit"
+        "v20-liveness-guard"
     )
     assert preheat.runtime.checkpoint_interval_steps == 10_000
     assert default.runtime.log_dir.endswith("v9-long-horizon-heads")
@@ -138,6 +157,16 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
         DiagnosticsConfig(combat_min_net_hp_fraction=0.0)
     with pytest.raises(ValueError, match="strictly increasing"):
         RuntimeConfig(evaluation_steps=(0, 10, 10))
+    with pytest.raises(ValueError, match="must be disjoint"):
+        RuntimeConfig(
+            evaluation_steps=(0, 10),
+            early_evaluation_steps=(10,),
+            early_evaluation_episodes=2,
+        )
+    with pytest.raises(ValueError, match="requires early evaluation"):
+        RuntimeConfig(evaluation_liveness_guard_enabled=True)
+    with pytest.raises(ValueError, match="entropy_weight_end"):
+        OptimizationConfig(entropy_weight=0.01, entropy_weight_end=0.02)
 
 
 def test_environment_and_task_horizons_must_match() -> None:
@@ -232,6 +261,7 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
     config = EpisodicLearningConfig(enabled=True)
     assert config.replay_capacity_episodes == 64
     assert config.sample_sequences * config.learn_steps == 64
+    assert config.policy_gradient_max_lag == 128
     with pytest.raises(TypeError, match="enabled must be a boolean"):
         EpisodicLearningConfig(enabled=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="per_episode_capacity_bytes"):

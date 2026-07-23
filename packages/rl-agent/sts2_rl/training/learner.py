@@ -51,6 +51,7 @@ class LearnerMetrics:
     policy_loss: float
     value_loss: float
     entropy: float
+    entropy_weight: float
     advantage_mean: float
     value_target_mean: float
     importance_ratio_mean: float
@@ -82,6 +83,7 @@ class LearnerMetrics:
     episodic_burn_in_steps: int
     episodic_learn_steps: int
     episodic_policy_labels: int
+    episodic_policy_lag_suppressed_labels: int
     episodic_task_value_labels: int
     episodic_revival_value_labels: int
     episodic_efficiency_policy_labels: int
@@ -112,6 +114,20 @@ def _require_finite(stage: str, values: tuple[tuple[str, Tensor], ...]) -> None:
         raise FloatingPointError(f"non-finite learner {stage}: {', '.join(invalid)}")
 
 
+def _annealed_entropy_weight(
+    config: OptimizationConfig,
+    *,
+    policy_version: int,
+) -> float:
+    """Return the explicit non-zero entropy schedule for this update."""
+
+    start = float(config.entropy_weight)
+    end = float(config.entropy_weight_end)
+    decay_updates = int(config.entropy_decay_updates)
+    progress = min(1.0, max(0.0, float(policy_version) / float(decay_updates)))
+    return start + progress * (end - start)
+
+
 @dataclass(frozen=True, slots=True)
 class _EpisodicLossBatch:
     total_loss: Tensor
@@ -122,6 +138,7 @@ class _EpisodicLossBatch:
     burn_in_steps: int
     learn_steps: int
     policy_labels: int
+    policy_lag_suppressed_labels: int
     task_value_labels: int
     revival_value_labels: int
     efficiency_policy_labels: int
@@ -264,15 +281,14 @@ class VTraceLearner:
                 validate=False,
             )
             hidden = hidden.index_copy(0, active_tensor, output.recurrent_state)
-            log_policy = F.log_softmax(output.policy_logits.float(), dim=-1)
-            policy = output.policy_probabilities()
+            log_policy = output.policy_log_probabilities()
             selected = torch.tensor(
                 [unrolls[index].steps[time_index].action_index for index in active],
                 device=self.device,
                 dtype=torch.long,
             )
             selected_log_prob = log_policy.gather(1, selected[:, None]).squeeze(1)
-            entropy = -(policy * log_policy).sum(dim=-1)
+            entropy = output.policy_entropy()
 
             floating_zero = output.value.new_zeros(batch_size)
             bool_zero = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
@@ -445,10 +461,14 @@ class VTraceLearner:
             * valid_float
         ).sum() / value_denominator
         entropy = (entropies * policy_float).sum() / policy_denominator
+        entropy_weight = _annealed_entropy_weight(
+            self.config,
+            policy_version=current_policy_version,
+        )
         total_loss = (
             self.config.policy_weight * policy_loss
             + self.config.value_weight * value_loss
-            - self.config.entropy_weight * entropy
+            - entropy_weight * entropy
         )
         (
             transaction_effect_loss,
@@ -579,6 +599,7 @@ class VTraceLearner:
             policy_loss=float(policy_loss.detach().item()),
             value_loss=float(value_loss.detach().item()),
             entropy=float(entropy.detach().item()),
+            entropy_weight=entropy_weight,
             advantage_mean=(
                 float(active_advantages.detach().mean().item())
                 if active_advantages.numel()
@@ -626,6 +647,9 @@ class VTraceLearner:
             episodic_burn_in_steps=episodic_losses.burn_in_steps,
             episodic_learn_steps=episodic_losses.learn_steps,
             episodic_policy_labels=episodic_losses.policy_labels,
+            episodic_policy_lag_suppressed_labels=(
+                episodic_losses.policy_lag_suppressed_labels
+            ),
             episodic_task_value_labels=episodic_losses.task_value_labels,
             episodic_revival_value_labels=(
                 episodic_losses.revival_value_labels
@@ -780,6 +804,7 @@ class VTraceLearner:
                 burn_in_steps=0,
                 learn_steps=0,
                 policy_labels=0,
+                policy_lag_suppressed_labels=0,
                 task_value_labels=0,
                 revival_value_labels=0,
                 efficiency_policy_labels=0,
@@ -835,6 +860,7 @@ class VTraceLearner:
         combined_policy_terms: list[Tensor] = []
         importance_ratios: list[Tensor] = []
         efficiency_policy_labels = 0
+        policy_lag_suppressed_labels = 0
 
         for time_index in range(maximum_time):
             active = [
@@ -859,7 +885,7 @@ class VTraceLearner:
                 validate=False,
             )
             hidden = hidden.index_copy(0, active_tensor, output.recurrent_state)
-            log_policy = F.log_softmax(output.policy_logits.float(), dim=-1)
+            log_policy = output.policy_log_probabilities()
 
             for row, step in enumerate(active_steps):
                 decision = step.decision
@@ -885,6 +911,15 @@ class VTraceLearner:
                         revival_targets.append(float(target.future_revivals))
 
                 if not decision.policy_decision:
+                    continue
+                policy_lag = current_policy_version - decision.policy_version
+                if policy_lag > self.episodic_config.policy_gradient_max_lag:
+                    # Complete episodes remain authoritative long-horizon value
+                    # supervision after their behavior policy becomes stale.
+                    # They must not, however, keep applying selected-action
+                    # likelihood gradients to a policy hundreds of updates
+                    # newer than the one that generated those decisions.
+                    policy_lag_suppressed_labels += 1
                     continue
                 primary = next(
                     (
@@ -1008,13 +1043,22 @@ class VTraceLearner:
             if task_predictions
             else zero
         )
+        # Revival counts have an extremely long tail under unlimited native
+        # revival.  Regressing raw counts makes this auxiliary value head
+        # numerically dominate the complete-episode objective even though its
+        # policy advantage is already secondary.  A log1p observation model
+        # keeps zero exact, remains monotone over factual counts, and prevents
+        # a 100-revival path from contributing roughly 100x the representation
+        # gradient of a one-revival path.
         revival_value_loss = (
             F.smooth_l1_loss(
-                torch.stack(revival_predictions).float(),
-                torch.tensor(
-                    revival_targets,
-                    device=self.device,
-                    dtype=torch.float32,
+                torch.log1p(torch.stack(revival_predictions).float()),
+                torch.log1p(
+                    torch.tensor(
+                        revival_targets,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
                 ),
             )
             if revival_predictions
@@ -1054,6 +1098,7 @@ class VTraceLearner:
             burn_in_steps=total_burn_in_steps,
             learn_steps=total_learn_steps,
             policy_labels=len(primary_policy_terms),
+            policy_lag_suppressed_labels=policy_lag_suppressed_labels,
             task_value_labels=len(task_predictions),
             revival_value_labels=len(revival_predictions),
             efficiency_policy_labels=efficiency_policy_labels,
@@ -1146,9 +1191,8 @@ class VTraceLearner:
                 # Both pairwise outcome ranking and factual liveness supervise
                 # normalized legal-candidate preference, never a free logit
                 # offset or a fabricated unexecuted action target.
-                policy_log_probabilities = F.log_softmax(
-                    output.policy_logits.float(),
-                    dim=-1,
+                policy_log_probabilities = (
+                    output.policy_log_probabilities()
                 )
                 selected_policy_log_probability = policy_log_probabilities[
                     0, action_index

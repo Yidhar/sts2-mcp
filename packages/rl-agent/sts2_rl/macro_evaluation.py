@@ -46,7 +46,14 @@ MACRO_SURFACES: Final[tuple[MacroSurface, ...]] = (
 MACRO_TELEMETRY_SCHEMA: Final = "sts2-macro-surface-telemetry-v1"
 MACRO_SENSITIVITY_SCHEMA: Final = "sts2-macro-policy-sensitivity-v1"
 FIXED_MACRO_PROBE_SUITE_VERSION: Final = "grounded-visible-facts-v1"
-_PREVIOUS_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v6"
+_V6_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v6"
+_V7_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v7"
+_REVIEWED_DIAGNOSTIC_CONFIG_VERSIONS: Final = frozenset(
+    {
+        _V6_CONFIG_VERSION,
+        _V7_CONFIG_VERSION,
+    }
+)
 
 _ACTION_KIND_TO_SURFACE: Final[dict[str, MacroSurface]] = {
     "card_reward": "card_reward",
@@ -817,6 +824,12 @@ def evaluate_macro_sensitivity(
                     raise ValueError(f"macro sensitivity case {case.name!r} changed the legality mask")
                 reference_probabilities = reference_output.policy_probabilities()[0][reference_mask].float()
                 comparison_probabilities = comparison_output.policy_probabilities()[0][comparison_mask].float()
+                reference_greedy = int(
+                    reference_output.greedy_action_indices()[0].item()
+                )
+                comparison_greedy = int(
+                    comparison_output.greedy_action_indices()[0].item()
+                )
                 probability_delta = (comparison_probabilities - reference_probabilities).abs()
                 logit_delta = (
                     _finite_candidate_logits(comparison_output) - _finite_candidate_logits(reference_output)
@@ -857,7 +870,7 @@ def evaluate_macro_sensitivity(
                         "policy_max_abs_probability_delta": float(probability_delta.max().cpu()),
                         "policy_max_abs_logit_delta": float(logit_delta.max().cpu()),
                         "top_candidate_changed": bool(
-                            reference_probabilities.argmax().item() != comparison_probabilities.argmax().item()
+                            reference_greedy != comparison_greedy
                         ),
                         "value_abs_deltas": value_deltas,
                         "reference_transaction_q_values": _optional_candidate_values(
@@ -902,13 +915,17 @@ def evaluate_macro_sensitivity(
 def _diagnostic_model_initialization_config(
     payload: Mapping[str, Any],
 ) -> TrainingConfig:
-    """Interpret only the reviewed v6 -> v7 config change for diagnostics.
+    """Interpret only reviewed config-default migrations for diagnostics.
 
     Frozen sensitivity loads network parameters through the same guarded
-    model-initialization path used by training.  A v18/v6 source predates only
-    the replay-sampling ``macro_sample_fraction`` field; that field does not
-    shape the model.  We migrate this one missing value to its disabled default
-    so the old policy can be measured before initializing the new lineage.
+    model-initialization path used by training. A v18/v6 source predates the
+    replay-sampling ``macro_sample_fraction`` field. A v19/v7 source predates
+    only v8 runtime schedules and scalar optimization/replay controls. None of
+    those missing fields shape model tensors, and ``training_config_from_mapping``
+    supplies their reviewed defaults after the version is advanced. The v6
+    field is filled explicitly because its disabled value is part of that
+    earlier reviewed migration.
+
     This is explicitly not exact resume and does not relax any checkpoint,
     tensor, or grounding-encoding validation.
     """
@@ -916,20 +933,27 @@ def _diagnostic_model_initialization_config(
     source_version = payload.get("version")
     if source_version == CONFIG_VERSION:
         return training_config_from_mapping(payload)
-    if source_version != _PREVIOUS_CONFIG_VERSION:
+    if source_version not in _REVIEWED_DIAGNOSTIC_CONFIG_VERSIONS:
         raise ValueError(
             "macro checkpoint evaluation has no reviewed config migration "
             f"from {source_version!r} to {CONFIG_VERSION!r}"
         )
     migrated = deepcopy(dict(payload))
-    raw_episodic = migrated.get("episodic_learning")
-    if not isinstance(raw_episodic, Mapping):
-        raise ValueError("reviewed macro checkpoint config migration requires an " "episodic_learning table")
-    episodic = dict(raw_episodic)
-    if "macro_sample_fraction" in episodic:
-        raise ValueError("v6 macro checkpoint config unexpectedly contains " "macro_sample_fraction")
-    episodic["macro_sample_fraction"] = 0.0
-    migrated["episodic_learning"] = episodic
+    if source_version == _V6_CONFIG_VERSION:
+        raw_episodic = migrated.get("episodic_learning")
+        if not isinstance(raw_episodic, Mapping):
+            raise ValueError(
+                "reviewed macro checkpoint config migration requires an "
+                "episodic_learning table"
+            )
+        episodic = dict(raw_episodic)
+        if "macro_sample_fraction" in episodic:
+            raise ValueError(
+                "v6 macro checkpoint config unexpectedly contains "
+                "macro_sample_fraction"
+            )
+        episodic["macro_sample_fraction"] = 0.0
+        migrated["episodic_learning"] = episodic
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 

@@ -1077,6 +1077,42 @@ def test_encoder_requires_registered_canonical_model_action_kind() -> None:
         )
 
 
+def test_encoder_fails_closed_on_cooccurring_policy_branch_hash_collision() -> None:
+    encoder = _encoder()
+    # These two reviewed labels currently collide in both the small test role
+    # vocabulary and the production-size vocabulary. They normally belong to
+    # disjoint decision surfaces, but a backend/schema regression must not make
+    # the hierarchical policy silently treat them as one action branch.
+    assert _hash_id(
+        "role",
+        "proceed",
+        encoder.config.role_vocab_size,
+    ) == _hash_id(
+        "role",
+        "card_selection:cancel_prompt",
+        encoder.config.role_vocab_size,
+    )
+    actions = [
+        {
+            "action_handle": "proceed",
+            "kind": "proceed",
+            "model_action_kind": "proceed",
+        },
+        {
+            "action_handle": "cancel",
+            "kind": "cancel_card_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "cancel_prompt",
+        },
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="co-occurring semantic action branches collide",
+    ):
+        encoder.encode(_observation(), actions)
+
+
 def test_unknown_engineered_subtrees_are_pruned_at_container_boundary() -> None:
     encoder = _encoder()
     clean = {

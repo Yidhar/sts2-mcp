@@ -71,7 +71,7 @@ The default contract is:
   transaction effect/delta/Q heads remain profile-controlled.
 
 The model-facing observation uses the versioned
-`grounded-relational-runtime-encoding-v10` contract together with the factual
+`grounded-relational-runtime-encoding-v11` contract together with the factual
 [`grounded-card-facts-encoding-v3`](./card-facts-abi.md) mechanics ABI. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
 description parsing or curated card rules. The default capacity is 2,048 world
@@ -79,14 +79,20 @@ tokens and 64 local tokens per candidate. Fact-identical copies in the permanent
 deck and public orderless combat piles share one exact counted variant, while
 hands, selections, candidates and distinct modified variants stay separate.
 Overflow is an error with exact structural diagnostics, never silent
-truncation. The v10 producer/encoder additions do not change model tensor
-shapes, but they do change encoded observations and replay meaning. Exact resume
-therefore rejects older encodings; only the separately reviewed v8/v9-to-v10
-model-parameter initialization path may reuse their compatible network tensors.
+truncation. V11 keeps the v10 tensor and parameter shapes but factorizes policy
+probability into a count-balanced semantic branch marginal and a conditional
+candidate distribution. Exact resume therefore rejects older behavior-policy
+semantics; only the separately reviewed v8/v9/v10-to-v11 model-parameter
+initialization path may reuse their compatible network tensors.
 
 Candidate permutation must permute policy outputs in the same way while leaving
 the world encoding, recurrent state and value unchanged. Opaque dispatch handles
 are not model inputs. Only the environment legality mask can suppress an action.
+Deterministic inference selects the semantic branch first and then its best
+candidate; stochastic collection samples the corresponding hierarchical joint
+distribution. This prevents one `end_turn`/`proceed` candidate from winning only
+because `play_card`/`reward` probability is divided among several concrete
+actions. The semantic preference remains learned and no branch is hard-masked.
 
 ### Factual relation coverage
 

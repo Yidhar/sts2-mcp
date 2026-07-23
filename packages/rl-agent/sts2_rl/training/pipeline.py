@@ -64,6 +64,8 @@ class ActorLearnerPipeline:
         starting_environment_steps: int,
         starting_policy_version: int,
         epsilon: Callable[[int], float],
+        starting_episode_count: int = 0,
+        deterministic_probe_interval_episodes: int = 0,
         supervisor_state: ActorSupervisorState | None = None,
     ) -> None:
         if total_environment_steps <= 0:
@@ -72,6 +74,20 @@ class ActorLearnerPipeline:
             raise ValueError("starting_environment_steps is outside the run horizon")
         if starting_policy_version < 0:
             raise ValueError("starting_policy_version must be non-negative")
+        if (
+            isinstance(starting_episode_count, bool)
+            or not isinstance(starting_episode_count, int)
+            or starting_episode_count < 0
+        ):
+            raise ValueError("starting_episode_count must be a non-negative integer")
+        if (
+            isinstance(deterministic_probe_interval_episodes, bool)
+            or not isinstance(deterministic_probe_interval_episodes, int)
+            or deterministic_probe_interval_episodes < 0
+        ):
+            raise ValueError(
+                "deterministic_probe_interval_episodes must be a non-negative integer"
+            )
         if supervisor_state is None:
             supervisor_state = ActorSupervisorState()
         elif not isinstance(supervisor_state, ActorSupervisorState):
@@ -81,6 +97,10 @@ class ActorLearnerPipeline:
         self._environment_steps = starting_environment_steps
         self._actor_policy_version = starting_policy_version
         self._epsilon = epsilon
+        self._completed_training_episodes = starting_episode_count
+        self._deterministic_probe_interval_episodes = (
+            deterministic_probe_interval_episodes
+        )
         self._episodes: queue.Queue[
             CollectedEpisode | RecoverableActorIncident | BaseException
         ] = queue.Queue()
@@ -427,6 +447,14 @@ class ActorLearnerPipeline:
                 with self._progress_lock:
                     self._actor_progress = None
                 try:
+                    liveness_probe = bool(
+                        self._deterministic_probe_interval_episodes > 0
+                        and (
+                            (self._completed_training_episodes + 1)
+                            % self._deterministic_probe_interval_episodes
+                            == 0
+                        )
+                    )
                     episode = self.resources.collector.collect_episode(
                         epsilon=self._epsilon(self._environment_steps),
                         deterministic=False,
@@ -436,6 +464,7 @@ class ActorLearnerPipeline:
                         unroll_sink=self._put_unroll,
                         progress_sink=self._record_progress,
                         accepted_step_sink=self._record_accepted_step,
+                        liveness_probe=liveness_probe,
                     )
                 except BaseException as exc:
                     if not self._is_recoverable_infrastructure_error(exc):
@@ -454,6 +483,7 @@ class ActorLearnerPipeline:
                     self._wait_if_paused()
                     continue
                 self._consecutive_incidents = 0
+                self._completed_training_episodes += 1
                 self._episode_boundary_release.clear()
                 self._episode_boundary_waiting.set()
                 self._episodes.put(episode)

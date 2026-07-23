@@ -37,7 +37,7 @@
     },
     {
       "path": "third_party/patches/sts2-ai/0006-bound-orderless-pile-multisets.patch",
-      "sha256": "32fd432255ac1902e15e1b55b20b88fcc1f8debbcb67bfd189d11bdfd7416c43"
+      "sha256": "20932db56131c96c4b51bfcc33f77ab93d5580b0055ea0bcbbfbf258ca5edb1e"
     },
     {
       "path": "third_party/patches/sts2-ai/0007-grounded-macro-observation-contract.patch",

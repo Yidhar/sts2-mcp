@@ -109,6 +109,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.sim_identity and config.environment.backend != "headless":
         raise SystemExit("--sim-identity is only valid for the headless backend")
+    runtime_provenance: dict[str, object] = {
+        "backend": config.environment.backend,
+    }
     if config.environment.backend == "headless":
         try:
             simulator = verify_headless_simulator(
@@ -143,6 +146,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        runtime_provenance = {
+            "backend": "headless",
+            "simulator_identity": simulator.to_mapping(),
+            "simulator_identity_audit_path": str(audit_path),
+            "runtime_mechanics": mechanics_summary,
+            "runtime_mechanics_audit_path": str(mechanics_audit_path),
+        }
         print(
             json.dumps(
                 {
@@ -165,6 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config,
         resume_from=resume,
         initialize_from=initialization,
+        runtime_provenance=runtime_provenance,
     )
     print(json.dumps({"status": "complete", **asdict(final_state)}, sort_keys=True))
     return 0

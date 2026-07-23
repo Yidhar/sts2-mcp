@@ -5,6 +5,10 @@ from __future__ import annotations
 SIGNED_INT32_MAX = 2_147_483_647
 TRAINING_SEED_PARITY = 0
 EVALUATION_SEED_PARITY = 1
+# Repeated validation uses the low odd prefix.  The high, disjoint odd range is
+# reserved for a final audit and must never be touched by training-time model
+# selection or liveness guards.
+FINAL_AUDIT_SEED_INDEX_OFFSET = 100_000_000
 
 
 def _base_seed(value: int) -> int:
@@ -25,7 +29,7 @@ def training_seed_start(base_seed: int) -> int:
 
 
 def held_out_evaluation_seeds(base_seed: int, count: int) -> tuple[int, ...]:
-    """Return the fixed odd seed prefix used at every evaluation boundary."""
+    """Return the fixed odd validation prefix used at repeated gates."""
 
     base = _base_seed(base_seed)
     if isinstance(count, bool) or not isinstance(count, int):
@@ -38,11 +42,30 @@ def held_out_evaluation_seeds(base_seed: int, count: int) -> tuple[int, ...]:
     return seeds
 
 
+def final_audit_evaluation_seeds(base_seed: int, count: int) -> tuple[int, ...]:
+    """Return never-reused odd seeds reserved for the final policy audit."""
+
+    base = _base_seed(base_seed)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("final audit seed count must be an integer")
+    if count < 0:
+        raise ValueError("final audit seed count must be non-negative")
+    start = base + FINAL_AUDIT_SEED_INDEX_OFFSET
+    seeds = tuple(
+        2 * (start + index) + EVALUATION_SEED_PARITY
+        for index in range(count)
+    )
+    if seeds and seeds[-1] > SIGNED_INT32_MAX:
+        raise ValueError("final audit seed set exceeds the signed 32-bit namespace")
+    return seeds
+
+
 def validate_seed_budget(
     base_seed: int,
     *,
     maximum_training_episodes: int,
     evaluation_episodes: int,
+    final_audit_episodes: int = 0,
 ) -> None:
     """Prove configured train/evaluation seeds remain valid and disjoint.
 
@@ -54,6 +77,7 @@ def validate_seed_budget(
     for label, value in (
         ("maximum_training_episodes", maximum_training_episodes),
         ("evaluation_episodes", evaluation_episodes),
+        ("final_audit_episodes", final_audit_episodes),
     ):
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(f"{label} must be an integer")
@@ -63,12 +87,15 @@ def validate_seed_budget(
     if last_training > SIGNED_INT32_MAX:
         raise ValueError("training seed budget exceeds signed 32-bit reset seeds")
     held_out_evaluation_seeds(base, evaluation_episodes)
+    final_audit_evaluation_seeds(base, final_audit_episodes)
 
 
 __all__ = [
     "EVALUATION_SEED_PARITY",
+    "FINAL_AUDIT_SEED_INDEX_OFFSET",
     "SIGNED_INT32_MAX",
     "TRAINING_SEED_PARITY",
+    "final_audit_evaluation_seeds",
     "held_out_evaluation_seeds",
     "training_seed_start",
     "validate_seed_budget",

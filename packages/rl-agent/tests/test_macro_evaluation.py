@@ -265,3 +265,46 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     unexpected_field["episodic_learning"] = unexpected_episodic
     with pytest.raises(ValueError, match="unexpectedly contains"):
         _diagnostic_model_initialization_config(unexpected_field)
+
+
+def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
+    active = load_training_config(profile="preheat")
+    source = active.to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v7"
+    optimization = source["optimization"]
+    rollout = source["rollout"]
+    episodic = source["episodic_learning"]
+    runtime = source["runtime"]
+    assert isinstance(optimization, dict)
+    assert isinstance(rollout, dict)
+    assert isinstance(episodic, dict)
+    assert isinstance(runtime, dict)
+    for key in ("entropy_weight_end", "entropy_decay_updates"):
+        del optimization[key]
+    del rollout["deterministic_probe_interval_episodes"]
+    del episodic["policy_gradient_max_lag"]
+    for key in (
+        "early_evaluation_steps",
+        "early_evaluation_episodes",
+        "final_audit_steps",
+        "final_audit_episodes",
+        "evaluation_liveness_guard_enabled",
+        "evaluation_guard_min_confirm_ready",
+        "evaluation_guard_min_multi_action_end_turn",
+        "evaluation_guard_max_confirm_failure_rate",
+        "evaluation_guard_max_multi_action_end_turn_rate",
+        "evaluation_guard_max_selection_cycle_episode_rate",
+    ):
+        del runtime[key]
+
+    migrated = _diagnostic_model_initialization_config(source)
+
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.model == active.model
+    assert migrated.optimization.entropy_weight_end == 0.01
+    assert migrated.optimization.entropy_decay_updates == 2_000
+    assert migrated.rollout.deterministic_probe_interval_episodes == 0
+    assert migrated.episodic_learning.policy_gradient_max_lag == 128
+    assert migrated.runtime.early_evaluation_steps == ()
+    assert migrated.runtime.final_audit_steps == ()
+    assert not migrated.runtime.evaluation_liveness_guard_enabled

@@ -55,9 +55,11 @@ _LONG_HORIZON_HEAD_PREFIXES = (
 # added strict equivalence grouping for card-selection candidates while
 # preserving every v8 input tensor dimension and learned parameter shape.  V10
 # adds only newly exposed factual macro entities and uses existing feature
-# slots; it likewise changes no tensor or parameter shape.  Queue/replay action
-# indexes, encoded snapshots, and behavior probabilities still belong to their
-# source ABI, so these exceptions are valid only for the model-only path.
+# slots. V11 preserves all v10 tensors but changes behavior-policy semantics to
+# the count-balanced hierarchical action-branch distribution. Queue/replay
+# action indexes, encoded snapshots, behavior probabilities, and optimizer
+# moments still belong to their source ABI, so these exceptions are valid only
+# for the model-only path.
 #
 # Keep both sides as complete, immutable identities rather than accepting a
 # version prefix or dimensions alone.  Any later encoder edit changes the
@@ -80,14 +82,24 @@ _V10_ENCODING_IDENTITY = {
     "feature_abi_end": 215,
     "fingerprint_sha256": "4caae6f3c6baafb31ce476615776e22cdea2e6073ee7b4893247a4ffef2e524f",
 }
+_V11_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v11",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": "5d150d5949c70e49203f7808e663abcfcbd897bcb9d18a55852b117292503bb7",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V8_ENCODING_IDENTITY,
-        _V10_ENCODING_IDENTITY,
+        _V11_ENCODING_IDENTITY,
     ),
     (
         _V9_ENCODING_IDENTITY,
+        _V11_ENCODING_IDENTITY,
+    ),
+    (
         _V10_ENCODING_IDENTITY,
+        _V11_ENCODING_IDENTITY,
     ),
 )
 
@@ -522,7 +534,7 @@ def _validate_encoding_contract(
     ``action_index`` values, behavior probabilities, transaction replay and
     recurrent state all belong to the source encoder.  Explicit model
     parameter initialization may cross only the explicitly reviewed legacy ->
-    v10 migrations whose existing feature slots and parameter tensors are
+    v11 migrations whose existing feature slots and parameter tensors are
     stable.
     Shape-compatible but otherwise unknown encoders remain rejected.
     """

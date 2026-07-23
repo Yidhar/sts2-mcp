@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v7"
+version = "sts2-relational-curriculum-config-v8"
 profile = "preheat"
 
 [model]
@@ -37,14 +37,17 @@ policy_rho_clip = 1.0
 policy_weight = 1.0
 value_weight = 0.5
 entropy_weight = 0.02
+entropy_weight_end = 0.004
+entropy_decay_updates = 2000
 
 [rollout]
 unroll_length = 16
-queue_capacity = 256
+queue_capacity = 64
 minimum_unrolls = 4
 collector_workers = 1
 policy_sync_interval_unrolls = 4
-max_policy_lag = 1024
+max_policy_lag = 64
+deterministic_probe_interval_episodes = 8
 
 [transaction_learning]
 # Full-run preheat learns generic selection liveness from factual training traces.
@@ -56,7 +59,7 @@ burn_in_steps = 24
 effect_weight = 0.10
 transaction_q_weight = 0.25
 completion_policy_weight = 0.25
-pairwise_ranking_weight = 0.0
+pairwise_ranking_weight = 0.10
 pairwise_margin = 0.10
 minimum_return_gap = 0.0
 maximum_pairs = 256
@@ -78,11 +81,12 @@ learn_steps = 32
 macro_sample_fraction = 0.5
 primary_policy_weight = 0.25
 task_value_weight = 0.25
-revival_value_weight = 0.10
+revival_value_weight = 0.02
 revival_policy_weight = 0.05
 secondary_advantage_fraction = 0.25
 primary_success_tie_tolerance = 0.05
 importance_ratio_clip = 1.0
+policy_gradient_max_lag = 128
 
 [environment]
 backend = "headless"
@@ -106,14 +110,24 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-v19-observation-v2-macro-credit"
-checkpoint_dir = "checkpoints/full-run-revival-v19-observation-v2-macro-credit"
+log_dir = "runs/full-run-revival-v20-liveness-guard"
+checkpoint_dir = "checkpoints/full-run-revival-v20-liveness-guard"
 checkpoint_interval_steps = 10000
 # A model-initialization lineage starts at step zero even when its network
 # parameters came from an older policy. Validate that inherited policy on a
 # fixed, statistically useful held-out seed prefix before collecting updates.
-evaluation_steps = [0, 30000, 100000, 250000]
+evaluation_steps = [0, 100000]
 evaluation_episodes = 12
+early_evaluation_steps = [5000, 10000, 20000, 30000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 20
+evaluation_liveness_guard_enabled = true
+evaluation_guard_min_confirm_ready = 8
+evaluation_guard_min_multi_action_end_turn = 32
+evaluation_guard_max_confirm_failure_rate = 0.95
+evaluation_guard_max_multi_action_end_turn_rate = 0.75
+evaluation_guard_max_selection_cycle_episode_rate = 0.75
 
 [diagnostics]
 deadlock_window = 128

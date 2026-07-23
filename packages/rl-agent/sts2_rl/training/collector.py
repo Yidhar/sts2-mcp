@@ -133,6 +133,7 @@ class CollectedEpisode:
     timings: CollectorTimings | None = None
     transaction_traces: tuple[TransactionTrace, ...] = ()
     completed_episode: CompletedEpisode | None = None
+    liveness_probe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,14 +292,16 @@ def _transaction_action_fingerprint(
     if equivalence_fingerprint is not None:
         normalized = str(equivalence_fingerprint).strip()
         if not normalized:
-            raise CollectionProtocolError(
-                "grouped candidate exposed an empty equivalence fingerprint"
-            )
+            raise CollectionProtocolError("grouped candidate exposed an empty equivalence fingerprint")
         return normalized
     return semantic_action_fingerprint(selected_action)
 
 
 _SEMANTIC_ACTION_SURFACE_KIND = "strict_action_group"
+# Transaction batches are replayed recurrently and sampled several traces at a
+# time. Keep enough tail decisions to expose short cycles without turning one
+# no-progress episode into hundreds of sequential learner forwards.
+_LIVENESS_LEARN_TAIL_STEPS = 32
 
 
 def _semantic_action_surface(
@@ -311,9 +314,7 @@ def _semantic_action_surface(
             "surface_kind": _SEMANTIC_ACTION_SURFACE_KIND,
             "prototype": group.prototype,
             "multiplicity": group.reference.multiplicity,
-            "equivalence_fingerprint": (
-                group.reference.equivalence_fingerprint
-            ),
+            "equivalence_fingerprint": (group.reference.equivalence_fingerprint),
             "enabled": group.reference.enabled,
         }
         for group in groups
@@ -376,6 +377,27 @@ _TRANSACTION_PHYSICAL_SOURCE_KEYS = (
     "physical_pile",
     "physical_zone",
 )
+_TRANSACTION_CARD_IDENTITY_IGNORED_KEYS = frozenset(
+    {
+        *_TRANSACTION_DEFINITION_KEYS,
+        *_TRANSACTION_INSTANCE_KEYS,
+        *_TRANSACTION_PHYSICAL_SOURCE_KEYS,
+        "index",
+        "idx",
+        "card_index",
+        "choice_index",
+        "option_index",
+        # These describe the prompt membership of the same card, not its
+        # gameplay semantics. The transaction node records membership
+        # separately through the selected multiset.
+        "selection_membership",
+        "is_selected",
+        # Some surfaces replace the physical pile with a Selected/Selectable
+        # pseudo-zone after a toggle. The stable physical source above is the
+        # only zone identity retained here.
+        "pile",
+    }
+)
 
 
 def _first_nonempty(value: Mapping[str, object], keys: tuple[str, ...]) -> object | None:
@@ -393,12 +415,13 @@ def _transaction_option_identity(
 ) -> object:
     """Return a stable selectable-card identity.
 
-    Card DTOs contain resolved cost, previews, UI ordinals and membership
-    pseudo-zones.  None of those identifies the selectable *object*, and all of
-    them may change after a toggle.  This positive allowlist retains definition
-    and physical source; callers may additionally retain concrete identity for
-    selected-membership tracking.  Option universes instead use counted strict
-    groups and deliberately omit arbitrary physical instance IDs.
+    Physical instance IDs, UI ordinals and selection membership may change
+    after a toggle and therefore cannot define the semantic node. All other
+    visible card facts are retained fail-closed. Consequently two cards with
+    the same definition but different upgrades, enchantments, modifiers,
+    costs, lifecycle flags or future schema fields never collapse merely
+    because their base ID matches. This mirrors the encoder invariant that
+    duplicate-action merging is allowed only for strictly equal cards.
     """
 
     if not isinstance(value, Mapping):
@@ -421,6 +444,15 @@ def _transaction_option_identity(
         identity["instance"] = str(instance).strip()
     if physical_source is not None:
         identity["physical_source"] = str(physical_source).strip()
+    projected = semantic_projection(card)
+    if isinstance(projected, Mapping):
+        facts = {
+            str(key): child
+            for key, child in projected.items()
+            if str(key).lower() not in _TRANSACTION_CARD_IDENTITY_IGNORED_KEYS
+        }
+        if facts:
+            identity["facts"] = facts
     return identity
 
 
@@ -430,13 +462,7 @@ def _selection_actions(
     return tuple(
         prototype
         for action in legal_actions
-        if str(
-            (prototype := _semantic_action_prototype(action)).get(
-                "model_action_kind"
-            )
-            or ""
-        )
-        == "card_selection"
+        if str((prototype := _semantic_action_prototype(action)).get("model_action_kind") or "") == "card_selection"
     )
 
 
@@ -444,12 +470,17 @@ def _transaction_selection_context(
     observation: Mapping[str, object],
     legal_actions: tuple[Mapping[str, object], ...],
 ) -> Mapping[str, object] | None:
+    actions = _selection_actions(legal_actions)
+    # The v2 observation contract exposes ``card_selection: {}`` on ordinary
+    # combat, map, reward, event, shop and rest decisions.  A mapping's mere
+    # presence is therefore not an active transaction.  Requiring a grounded
+    # card-selection candidate prevents the replay from incorrectly wrapping
+    # whole runs as completed selection transactions.
+    if not actions:
+        return None
     raw_selection = observation.get("card_selection")
     if isinstance(raw_selection, Mapping):
         return raw_selection
-    actions = _selection_actions(legal_actions)
-    if not actions:
-        return None
     # Legacy/live surfaces may expose selection semantics only on candidates.
     # Merge the stable prompt contract without depending on candidate order.
     synthesized: dict[str, object] = {"mode": "action-derived"}
@@ -490,10 +521,7 @@ def _transaction_option_universe(
         if str(action.get("model_action_kind") or "") != "card_selection":
             continue
         variant = str(
-            action.get("selection_operation")
-            or action.get("model_action_variant")
-            or action.get("kind")
-            or ""
+            action.get("selection_operation") or action.get("model_action_variant") or action.get("kind") or ""
         ).lower()
         if "select" not in variant:
             continue
@@ -513,11 +541,7 @@ def _transaction_option_universe(
             # Simulator translation marks ``cards`` as the *currently
             # selectable* membership. A toggle moves a card between that
             # collection and ``selected_cards``, so their union is stable.
-            selectable_field = (
-                "selectable_cards"
-                if "selectable_cards" in selection
-                else "cards"
-            )
+            selectable_field = "selectable_cards" if "selectable_cards" in selection else "cards"
             for field in (selectable_field, "selected_cards"):
                 items = selection.get(field)
                 if isinstance(items, list | tuple):
@@ -553,19 +577,21 @@ def _transaction_surface_key(
 ) -> str | None:
     """Return a stable card-selection transaction kind, without membership.
 
-    Selection counts, selected cards and transport handles are intentionally
-    excluded.  Those values identify nodes *inside* one transaction and belong
-    in ``_transaction_node_key`` instead.
+    Selection counts, selected cards, the currently exposed option subset and
+    transport handles are intentionally excluded. Those values identify nodes
+    *inside* one transaction and belong in ``_transaction_node_key`` instead.
+
+    In particular, a max-one grid commonly exposes all selectable cards before
+    a choice but only ``deselect/confirm/cancel`` afterwards. Hashing that
+    membership-dependent option universe split one real transaction into two
+    independently "completed" traces and taught both select and deselect as
+    preferred actions.
     """
 
     raw_selection = _transaction_selection_context(observation, legal_actions)
     if raw_selection is None:
         return None
-    selection = {
-        key: raw_selection[key]
-        for key in _TRANSACTION_SURFACE_FIELDS
-        if raw_selection.get(key) is not None
-    }
+    selection = {key: raw_selection[key] for key in _TRANSACTION_SURFACE_FIELDS if raw_selection.get(key) is not None}
     raw_run = observation.get("run")
     run = raw_run if isinstance(raw_run, Mapping) else {}
     return semantic_fingerprint(
@@ -578,10 +604,6 @@ def _transaction_surface_key(
                 "room_model_id": run.get("room_model_id"),
             },
             "selection": selection,
-            "option_universe": _transaction_option_universe(
-                raw_selection,
-                legal_actions,
-            ),
         }
     )
 
@@ -596,7 +618,7 @@ def _transaction_selected_identities(
         options = raw_selection.get("options")
         if isinstance(options, list | tuple):
             identities.extend(
-                _transaction_option_identity(option)
+                _transaction_option_identity(option, include_instance=False)
                 for option in options
                 if isinstance(option, Mapping)
                 and (
@@ -608,7 +630,7 @@ def _transaction_selected_identities(
         if not identities:
             selected = raw_selection.get("selected_cards")
             if isinstance(selected, list | tuple):
-                identities.extend(_transaction_option_identity(item) for item in selected)
+                identities.extend(_transaction_option_identity(item, include_instance=False) for item in selected)
     if not identities:
         for action in _selection_actions(legal_actions):
             variant = str(action.get("model_action_variant") or action.get("kind") or "").lower()
@@ -618,7 +640,7 @@ def _transaction_selected_identities(
                 or card.get("is_selected") is True
                 or str(card.get("selection_membership") or "").lower() == "selected"
             ):
-                identities.append(_transaction_option_identity(card))
+                identities.append(_transaction_option_identity(card, include_instance=False))
     return tuple(sorted(canonical_json(identity) for identity in identities))
 
 
@@ -637,10 +659,7 @@ def _transaction_selected_count(
         return len(selected)
     options = raw_selection.get("options")
     if isinstance(options, list | tuple):
-        return sum(
-            int(isinstance(option, Mapping) and option.get("is_selected") is True)
-            for option in options
-        )
+        return sum(int(isinstance(option, Mapping) and option.get("is_selected") is True) for option in options)
     return len(_transaction_selected_identities(observation, legal_actions))
 
 
@@ -657,11 +676,7 @@ def _deadlock_semantic_observation(
     surface.  Scalar prompt state and every non-selection world fact remain.
     """
 
-    result = {
-        key: value
-        for key, value in observation.items()
-        if key not in {"available_actions", "legal_actions"}
-    }
+    result = {key: value for key, value in observation.items() if key not in {"available_actions", "legal_actions"}}
     raw_selection = observation.get("card_selection")
     if not isinstance(raw_selection, Mapping):
         return result
@@ -680,9 +695,7 @@ def _deadlock_semantic_observation(
         raw_selection,
         semantic_actions,
     )
-    selection["semantic_selected_identities"] = (
-        _transaction_selected_identities(observation, semantic_actions)
-    )
+    selection["semantic_selected_identities"] = _transaction_selected_identities(observation, semantic_actions)
     result["card_selection"] = selection
     return result
 
@@ -721,7 +734,17 @@ def _transaction_node_key(
     world_context = {
         key: value
         for key, value in observation.items()
-        if key not in {"card_selection", "available_actions", "legal_actions"}
+        if key
+        not in {
+            "card_selection",
+            "available_actions",
+            "legal_actions",
+            # These bridge hashes already include UI membership and transport
+            # projection details represented explicitly below. Retaining them
+            # makes a semantic select/deselect return look like a novel node.
+            "semantic_state_hash",
+            "state_hash",
+        }
         and not str(key).startswith("_")
     }
     training_reward_state = observation.get("_training")
@@ -736,9 +759,7 @@ def _transaction_node_key(
             "selected_count": _transaction_selected_count(observation, legal_actions),
             "remaining": remaining,
             "can_confirm": bool(can_confirm),
-            "legal_action_fingerprints": tuple(
-                sorted(semantic_action_fingerprint(action) for action in legal_actions)
-            ),
+            "legal_action_fingerprints": tuple(sorted(semantic_action_fingerprint(action) for action in legal_actions)),
         }
     )
 
@@ -818,9 +839,7 @@ def _episodic_decision_surface(
     ):
         if value is None:
             continue
-        normalized = "_".join(
-            str(value).strip().lower().replace("-", " ").split()
-        )
+        normalized = "_".join(str(value).strip().lower().replace("-", " ").split())
         if normalized:
             return normalized
     return "noncombat"
@@ -858,9 +877,7 @@ def _episodic_combat_boundary(
     if combat_result in {"defeat", "escaped"}:
         return BoundaryOutcome.FAILED
     if combat_result not in {None, "none", "victory"}:
-        raise CollectionProtocolError(
-            f"unsupported typed combat_result for episodic replay: {combat_result!r}"
-        )
+        raise CollectionProtocolError(f"unsupported typed combat_result for episodic replay: {combat_result!r}")
     # A mid-run active -> inactive transition is a factual completed combat,
     # even when an older bridge omitted its explicit result.  A terminal run
     # victory is the same final-combat success fallback.
@@ -888,9 +905,7 @@ def _episodic_act_boundary(
     if trusted_policy_failure:
         return BoundaryOutcome.FAILED
     if after_act < before_act:
-        raise CollectionProtocolError(
-            "non-terminal full-run transition regressed its Act index"
-        )
+        raise CollectionProtocolError("non-terminal full-run transition regressed its Act index")
     return BoundaryOutcome.CENSORED if episode_censored else BoundaryOutcome.NONE
 
 
@@ -1073,9 +1088,7 @@ def _normalize_combat_progress_windows(
             raise TypeError(f"{label} identifiers must be non-empty strings")
         identifier = raw_identifier.strip().upper()
         if identifier in normalized:
-            raise ValueError(
-                f"{label} contains duplicate normalized identifier {identifier!r}"
-            )
+            raise ValueError(f"{label} contains duplicate normalized identifier {identifier!r}")
         if isinstance(raw_window, bool) or not isinstance(raw_window, int):
             raise TypeError(f"{label}[{identifier!r}] must be an integer")
         if raw_window <= 0:
@@ -1336,11 +1349,7 @@ def _durable_collection(
     if not isinstance(value, list | tuple):
         return ()
     if not counted_multiset:
-        projected = [
-            projector(item)
-            for item in value
-            if isinstance(item, Mapping)
-        ]
+        projected = [projector(item) for item in value if isinstance(item, Mapping)]
         return tuple(sorted(projected, key=repr))
 
     counts: dict[tuple[object, ...], int] = {}
@@ -1348,19 +1357,12 @@ def _durable_collection(
         if not isinstance(item, Mapping):
             continue
         quantity = item.get("quantity", 1)
-        if (
-            isinstance(quantity, bool)
-            or not isinstance(quantity, int)
-            or quantity <= 0
-        ):
-            raise CollectionProtocolError(
-                "durable card quantity must be a positive integer"
-            )
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise CollectionProtocolError("durable card quantity must be a positive integer")
         signature = projector(item)
         counts[signature] = counts.get(signature, 0) + quantity
     return tuple(
-        (*signature, quantity)
-        for signature, quantity in sorted(counts.items(), key=lambda item: repr(item[0]))
+        (*signature, quantity) for signature, quantity in sorted(counts.items(), key=lambda item: repr(item[0]))
     )
 
 
@@ -1742,14 +1744,8 @@ def _diagnostic_card_quantity_total(value: object) -> int | None:
     if isinstance(value, Mapping):
         explicit = value.get("count")
         if explicit is not None:
-            if (
-                isinstance(explicit, bool)
-                or not isinstance(explicit, int)
-                or explicit < 0
-            ):
-                raise CollectionProtocolError(
-                    "diagnostic card collection count must be a non-negative integer"
-                )
+            if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 0:
+                raise CollectionProtocolError("diagnostic card collection count must be a non-negative integer")
             return int(explicit)
         value = value.get("cards", value.get("items"))
     if not isinstance(value, list | tuple):
@@ -1761,9 +1757,7 @@ def _diagnostic_card_quantity_total(value: object) -> int | None:
             continue
         raw = card["quantity"]
         if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-            raise CollectionProtocolError(
-                "diagnostic card quantity must be a positive integer"
-            )
+            raise CollectionProtocolError("diagnostic card quantity must be a positive integer")
         total += raw
     return total
 
@@ -1928,9 +1922,7 @@ def _combat_stall_evidence(
         "exhaust_cards": _diagnostic_zone_count(observation, "exhaust_pile"),
         "legal_action_kinds": _legal_action_kind_counts(legal_actions),
         "hand_card_preview": hand_preview,
-        "hand_card_preview_truncated": bool(
-            hand_count is not None and hand_count > len(hand_preview)
-        ),
+        "hand_card_preview_truncated": bool(hand_count is not None and hand_count > len(hand_preview)),
     }
 
 
@@ -1998,12 +1990,8 @@ class GroundedCollector:
             raise ValueError("transaction_burn_in_steps must be non-negative or null")
         if not isinstance(episodic_learning_enabled, bool):
             raise TypeError("episodic_learning_enabled must be a boolean")
-        if episodic_learning_enabled and (
-            scenario != "full-run" or objective != "run"
-        ):
-            raise ValueError(
-                "episodic learning requires the full-run scenario and run objective"
-            )
+        if episodic_learning_enabled and (scenario != "full-run" or objective != "run"):
+            raise ValueError("episodic learning requires the full-run scenario and run objective")
         if isinstance(journal_policy_topk, bool) or not isinstance(journal_policy_topk, int):
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
@@ -2041,11 +2029,9 @@ class GroundedCollector:
             combat_net_progress_room_windows,
             label="combat_net_progress_room_windows",
         )
-        self.combat_net_progress_encounter_windows = (
-            _normalize_combat_progress_windows(
-                combat_net_progress_encounter_windows,
-                label="combat_net_progress_encounter_windows",
-            )
+        self.combat_net_progress_encounter_windows = _normalize_combat_progress_windows(
+            combat_net_progress_encounter_windows,
+            label="combat_net_progress_encounter_windows",
         )
         self.noncombat_durable_progress_window = noncombat_durable_progress_window
         self.combat_min_net_hp_fraction = float(combat_min_net_hp_fraction)
@@ -2214,19 +2200,14 @@ class GroundedCollector:
             fact_name = "combat_result" if self.objective == "combat" else "run_result"
             terminal_result = transition.facts.get(fact_name)
             supported_results = (
-                {"victory", "defeat", "escaped"}
-                if self.objective == "combat"
-                else {"victory", "defeat"}
+                {"victory", "defeat", "escaped"} if self.objective == "combat" else {"victory", "defeat"}
             )
             if terminal_result not in supported_results:
                 raise CollectionProtocolError(
                     f"terminated {self.objective} step has no authoritative typed {fact_name}"
                 )
             expected_reason = f"{'combat' if self.objective == 'combat' else 'run'}_{terminal_result}"
-            if (
-                after.terminal_reason != expected_reason
-                or transition.facts.get("terminal_reason") != expected_reason
-            ):
+            if after.terminal_reason != expected_reason or transition.facts.get("terminal_reason") != expected_reason:
                 raise CollectionProtocolError(
                     "terminated step facts/result reason disagrees with its objective-scoped result"
                 )
@@ -2340,6 +2321,7 @@ class GroundedCollector:
                     validate=False,
                 )
                 policy = output.policy_probabilities()[0].float().cpu().numpy()
+                greedy_selected = int(output.greedy_action_indices()[0].item())
                 valid = output.action_mask[0].cpu().numpy().astype(bool)
                 next_recurrent_state = output.recurrent_state.detach()
                 value = float(output.value[0].item())
@@ -2359,7 +2341,9 @@ class GroundedCollector:
         if not math.isfinite(policy_mass) or policy_mass <= 0.0:
             raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
         if deterministic:
-            selected = int(valid_indices[int(np.argmax(valid_policy))])
+            selected = greedy_selected
+            if selected < 0 or selected >= len(valid) or not bool(valid[selected]):
+                raise CollectionProtocolError("model produced an invalid hierarchical greedy action")
             reference = encoded.action(selected)
             return _ActionChoice(
                 candidate_index=selected,
@@ -2368,10 +2352,13 @@ class GroundedCollector:
                 equivalence_fingerprint=reference.equivalence_fingerprint,
                 multiplicity=reference.multiplicity,
                 action_references=encoded.actions,
-                semantic_actions=_semantic_action_surface(
-                    encoded.semantic_groups
-                ),
-                behavior_log_probability=float(math.log(max(float(valid_policy.max() / policy_mass), 1e-30))),
+                semantic_actions=_semantic_action_surface(encoded.semantic_groups),
+                # Deterministic collection samples from a delta behavior
+                # policy.  This is irrelevant to held-out evaluation, but a
+                # recorded training liveness probe must expose log(1)=0 to
+                # V-trace/episodic importance weighting instead of pretending
+                # that it sampled from the model distribution.
+                behavior_log_probability=0.0,
                 valid_count=valid_count,
                 snapshot=encoded.snapshot,
                 recurrent_state=next_recurrent_state,
@@ -2425,9 +2412,7 @@ class GroundedCollector:
         raw_handle = str(handle_value) if handle_value is not None and str(handle_value) else ""
         encoded_handle = str(dispatch_handle) if dispatch_handle is not None else ""
         if encoded_handle and raw_handle and encoded_handle != raw_handle:
-            raise CollectionProtocolError(
-                "encoder dispatch handle disagrees with the representative raw action"
-            )
+            raise CollectionProtocolError("encoder dispatch handle disagrees with the representative raw action")
         handle = encoded_handle or raw_handle
         request = StepRequest(
             request_id=str(uuid4()),
@@ -2455,6 +2440,7 @@ class GroundedCollector:
         progress_sink: Callable[[EpisodeProgress], None] | None = None,
         accepted_step_sink: Callable[[int, int], None] | None = None,
         journal_episode_id_prefix: str = "",
+        liveness_probe: bool = False,
     ) -> CollectedEpisode:
         if isinstance(policy_version, bool) or not isinstance(policy_version, int):
             raise TypeError("policy_version must be an integer")
@@ -2462,10 +2448,21 @@ class GroundedCollector:
             raise ValueError("policy_version must be non-negative")
         if not isinstance(journal_episode_id_prefix, str):
             raise TypeError("journal_episode_id_prefix must be a string")
+        if not isinstance(liveness_probe, bool):
+            raise TypeError("liveness_probe must be a boolean")
+        if liveness_probe:
+            if not record:
+                raise ValueError("liveness probes must be recorded training data")
+            if evaluation_seed is not None:
+                raise ValueError("liveness probes cannot use a held-out evaluation seed")
+            # A probe executes the current greedy policy on the normal even
+            # training-seed partition.  Unlike held-out evaluation it remains
+            # recorded, so factual deadlock prefixes can enter transaction
+            # replay and teach the policy to escape its own argmax failures.
+            epsilon = 0.0
+            deterministic = True
         if record and evaluation_seed is not None:
-            raise ValueError(
-                "recorded training collection cannot use a held-out evaluation seed"
-            )
+            raise ValueError("recorded training collection cannot use a held-out evaluation seed")
         episode_limit = self.max_episode_steps
         if maximum_steps is not None:
             if isinstance(maximum_steps, bool) or not isinstance(maximum_steps, int):
@@ -2545,8 +2542,17 @@ class GroundedCollector:
         last_selected_action_kind = ""
         transaction_enabled = bool(record and self.transaction_burn_in_steps is not None)
         transaction_context: deque[tuple[int, TransactionStep]] = deque(
-            maxlen=self.transaction_burn_in_steps or 0
+            maxlen=(self.transaction_burn_in_steps or 0) + _LIVENESS_LEARN_TAIL_STEPS
         )
+        # A liveness window can end with a long forced-action suffix. Keep a
+        # tiny factual prefix around the most recent actual policy decision so
+        # a trusted deadlock still yields an actionable AVOID target instead
+        # of a trace containing only singleton choices.
+        last_liveness_policy_prefix: tuple[
+            int,
+            tuple[TransactionStep, ...],
+            int,
+        ] | None = None
         transaction_traces_pending: list[TransactionTrace] = []
         active_transaction_surface: str | None = None
         active_transaction_steps: list[TransactionStep] = []
@@ -2560,11 +2566,7 @@ class GroundedCollector:
         # Complete-run replay is collected independently of fixed unroll
         # streaming.  These are immutable CPU snapshots, never recurrent
         # hidden tensors or autograd graphs.
-        episodic_enabled = bool(
-            record
-            and self.episodic_learning_enabled
-            and self.objective == "run"
-        )
+        episodic_enabled = bool(record and self.episodic_learning_enabled and self.objective == "run")
         episodic_steps: list[EpisodeDecisionStep] = []
         next_combat_identity = 0
         active_combat_id: str | None = None
@@ -2643,19 +2645,16 @@ class GroundedCollector:
             )
             if current_transaction_surface is not None:
                 if active_transaction_surface is None:
-                    context = tuple(transaction_context)
+                    burn_in_context = self.transaction_burn_in_steps or 0
+                    context = tuple(transaction_context)[-burn_in_context:] if burn_in_context else ()
                     active_transaction_surface = current_transaction_surface
                     active_transaction_steps = [item[1] for item in context]
-                    active_transaction_start_step = (
-                        context[0][0] if context else step_offset
-                    )
+                    active_transaction_start_step = context[0][0] if context else step_offset
                     active_transaction_burn_in = len(context)
                     active_transaction_policy_version = segment_policy_version
                     active_transaction_seen_nodes = {current_transaction_node}
                 elif active_transaction_surface != current_transaction_surface:
-                    raise RuntimeError(
-                        "transaction surface changed without an observed exit transition"
-                    )
+                    raise RuntimeError("transaction surface changed without an observed exit transition")
             deadlock_evidence = self.deadlock_detector.observe(
                 step_index=state.step_index,
                 observation=_deadlock_semantic_observation(
@@ -2669,9 +2668,7 @@ class GroundedCollector:
                 # reorder equal card instances after every toggle; hashing the
                 # raw representative would reintroduce card_index/instance
                 # churn and hide an otherwise exact select/deselect cycle.
-                selected_action=choice.semantic_actions[
-                    choice.candidate_index
-                ],
+                selected_action=choice.semantic_actions[choice.candidate_index],
             )
             sim_step_started_ns = time.perf_counter_ns()
             next_state, _ = self._step(
@@ -2683,9 +2680,7 @@ class GroundedCollector:
             steps_taken += 1
             if next_state.truncated:
                 raise CollectionProtocolError("transport/outcome-unknown truncation discarded before rollout")
-            next_action_groups = self.encoder.semantic_action_groups(
-                next_state.legal_actions
-            )
+            next_action_groups = self.encoder.semantic_action_groups(next_state.legal_actions)
             next_semantic_actions = _semantic_action_surface(next_action_groups)
             result_terminal = next_state.terminated or next_state.truncated
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
@@ -2744,9 +2739,7 @@ class GroundedCollector:
                 no_net_progress_steps=combat_progress_status.age_steps,
             )
             runaway_combat_stalled = bool(
-                runaway_combat_status.triggered
-                and not result_terminal
-                and not forced_horizon
+                runaway_combat_status.triggered and not result_terminal and not forced_horizon
             )
             combat_progress_stalled = bool(
                 (combat_progress_status.stalled or runaway_combat_stalled)
@@ -2777,13 +2770,9 @@ class GroundedCollector:
                         "current_enemy_hp_total": combat_progress_status.current_hp,
                         "current_enemy_max_hp_total": combat_progress_status.maximum_hp,
                         "net_enemy_hp_progress": combat_progress_status.net_hp_progress,
-                        "required_net_enemy_hp_progress": (
-                            combat_progress_status.required_hp_progress
-                        ),
+                        "required_net_enemy_hp_progress": (combat_progress_status.required_hp_progress),
                         "progress_kind": combat_progress_status.progress_kind,
-                        "legal_action_kinds": _legal_action_kind_counts(
-                            next_state.legal_actions
-                        ),
+                        "legal_action_kinds": _legal_action_kind_counts(next_state.legal_actions),
                     }
                 )
             elif combat_progress_stalled:
@@ -2843,19 +2832,12 @@ class GroundedCollector:
             typed_run_result = transition_facts.get("run_result")
             authoritative_run_result = (
                 str(typed_run_result)
-                if (
-                    self.scenario == "full-run"
-                    and next_state.terminated
-                    and typed_run_result in {"victory", "defeat"}
-                )
+                if (self.scenario == "full-run" and next_state.terminated and typed_run_result in {"victory", "defeat"})
                 else None
             )
             episode_censored = bool(
                 not trusted_policy_failure
-                and (
-                    forced_horizon
-                    or (breakdown.task_terminal and authoritative_run_result is None)
-                )
+                and (forced_horizon or (breakdown.task_terminal and authoritative_run_result is None))
             )
             combat_boundary = _episodic_combat_boundary(
                 was_active=pre_action_combat,
@@ -2899,9 +2881,7 @@ class GroundedCollector:
                         combat_id=step_combat_id,
                         # Long-horizon primary credit excludes every
                         # efficiency/pace shaping term by construction.
-                        task_reward=float(
-                            breakdown.terminal_reward + breakdown.progress_reward
-                        ),
+                        task_reward=float(breakdown.terminal_reward + breakdown.progress_reward),
                         discount=breakdown.discount,
                         revivals_before=revivals_before_step,
                         revivals_after=revivals_used,
@@ -2969,8 +2949,32 @@ class GroundedCollector:
                     transaction_return=None,
                     return_steps=None,
                 )
+                if choice.valid_count > 1:
+                    prefix_burn_in = self.transaction_burn_in_steps or 0
+                    prefix_context = (
+                        tuple(transaction_context)[-prefix_burn_in:]
+                        if prefix_burn_in
+                        else ()
+                    )
+                    last_liveness_policy_prefix = (
+                        prefix_context[0][0] if prefix_context else step_offset,
+                        (
+                            *(item[1] for item in prefix_context),
+                            factual_transaction_step,
+                        ),
+                        len(prefix_context),
+                    )
                 if current_transaction_surface is not None:
                     active_transaction_steps.append(factual_transaction_step)
+                    maximum_transaction_steps = (self.transaction_burn_in_steps or 0) + _LIVENESS_LEARN_TAIL_STEPS
+                    if len(active_transaction_steps) > maximum_transaction_steps:
+                        overflow = len(active_transaction_steps) - maximum_transaction_steps
+                        del active_transaction_steps[:overflow]
+                        active_transaction_start_step += overflow
+                        active_transaction_burn_in = min(
+                            self.transaction_burn_in_steps or 0,
+                            max(0, len(active_transaction_steps) - 1),
+                        )
                     active_transaction_seen_nodes.add(next_transaction_node)
                     transaction_ended = bool(
                         next_transaction_surface != current_transaction_surface
@@ -3000,8 +3004,7 @@ class GroundedCollector:
                                 burn_in_steps=active_transaction_burn_in,
                                 outcome=(
                                     TransactionOutcome.COMPLETED
-                                    if next_transaction_surface
-                                    != current_transaction_surface
+                                    if next_transaction_surface != current_transaction_surface
                                     else TransactionOutcome.DEADLOCK
                                     if breakdown.outcome == "deadlock"
                                     else TransactionOutcome.CENSORED
@@ -3011,6 +3014,80 @@ class GroundedCollector:
                         active_transaction_surface = None
                         active_transaction_steps = []
                         active_transaction_seen_nodes = set()
+                elif breakdown.outcome == "deadlock":
+                    # Selection cycles are emitted by the active transaction
+                    # above. Other trusted liveness failures (semantic action
+                    # cycles and bounded combat/non-combat no-progress
+                    # windows) still need a factual replay trace. Retain a
+                    # bounded pre-failure prefix: the configured recurrent
+                    # burn-in is detached by the learner and the remaining
+                    # tail supplies liveness/Q labels.
+                    maximum_liveness_steps = (
+                        (self.transaction_burn_in_steps or 0)
+                        + _LIVENESS_LEARN_TAIL_STEPS
+                    )
+                    context = (
+                        *tuple(transaction_context),
+                        (step_offset, factual_transaction_step),
+                    )[-maximum_liveness_steps:]
+                    liveness_steps = tuple(item[1] for item in context)
+                    liveness_burn_in = min(
+                        self.transaction_burn_in_steps or 0,
+                        max(0, len(liveness_steps) - 1),
+                    )
+                    liveness_start_step = context[0][0]
+                    if not any(
+                        np.count_nonzero(step.snapshot.action_mask) > 1
+                        for step in liveness_steps[liveness_burn_in:]
+                    ):
+                        # The bounded tail may be entirely forced even though
+                        # an earlier policy choice caused the failure. Prefer
+                        # the most recent bounded decision prefix so factual
+                        # liveness supervision can update a policy parameter.
+                        if last_liveness_policy_prefix is not None:
+                            (
+                                liveness_start_step,
+                                liveness_steps,
+                                liveness_burn_in,
+                            ) = last_liveness_policy_prefix
+                    failure_kind = (
+                        "combat_no_net_progress"
+                        if combat_progress_stalled
+                        else "noncombat_no_durable_progress"
+                        if noncombat_progress_stalled
+                        else "semantic_action_cycle"
+                    )
+                    failure_surface = semantic_fingerprint(
+                        {
+                            "kind": "training_liveness_failure",
+                            "failure_kind": failure_kind,
+                            "locus": {
+                                "act": pre_action_act,
+                                "floor": _run_position(state.observation)[1],
+                                "decision_domain": state.observation.get("decision_domain"),
+                            },
+                        }
+                    )
+                    transaction_traces_pending.append(
+                        TransactionTrace(
+                            trace_id=(
+                                f"seed-{reset_seed}:{state.episode_id}:"
+                                f"{liveness_start_step}:"
+                                f"{step_offset}:{failure_surface}"
+                            ),
+                            episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                            surface_key=failure_surface,
+                            start_step=liveness_start_step,
+                            policy_version=segment_policy_version,
+                            initial_recurrent_state=np.zeros(
+                                self.model.config.recurrent_hidden_dim,
+                                dtype=np.float32,
+                            ),
+                            steps=liveness_steps,
+                            burn_in_steps=liveness_burn_in,
+                            outcome=TransactionOutcome.DEADLOCK,
+                        )
+                    )
                 transaction_context.append((step_offset, factual_transaction_step))
             if trajectory_journal is not None:
                 journal_deadlock: Mapping[str, object] | None = None
@@ -3060,14 +3137,11 @@ class GroundedCollector:
                     "selected_candidate_index": choice.candidate_index,
                     "selected_dispatch_index": choice.dispatch_position,
                     "selected_action_multiplicity": choice.multiplicity,
-                    "selected_action_equivalence_fingerprint": (
-                        choice.equivalence_fingerprint
-                    ),
+                    "selected_action_equivalence_fingerprint": (choice.equivalence_fingerprint),
                     "semantic_candidate_count": choice.snapshot.candidate_count,
                     "raw_legal_action_count": len(state.legal_actions),
                     "maximum_candidate_multiplicity": max(
-                        reference.multiplicity
-                        for reference in choice.action_references
+                        reference.multiplicity for reference in choice.action_references
                     ),
                     "selected_action": selected_action,
                     "policy_topk": [
@@ -3075,12 +3149,8 @@ class GroundedCollector:
                             "index": index,
                             "candidate_index": index,
                             "dispatch_index": choice.action_references[index].position,
-                            "multiplicity": choice.action_references[
-                                index
-                            ].multiplicity,
-                            "equivalence_fingerprint": choice.action_references[
-                                index
-                            ].equivalence_fingerprint,
+                            "multiplicity": choice.action_references[index].multiplicity,
+                            "equivalence_fingerprint": choice.action_references[index].equivalence_fingerprint,
                             "probability": float(choice.policy[index]),
                         }
                         for index in ranked
@@ -3198,21 +3268,11 @@ class GroundedCollector:
                             selected_action_kinds=dict(sorted(selected_action_kind_counts.items())),
                             last_selected_action_kind=last_selected_action_kind,
                             behavior_policy_version=completed_unroll.policy_version,
-                            maximum_observed_semantic_candidates=(
-                                maximum_observed_semantic_candidates
-                            ),
-                            maximum_equivalence_class_size=(
-                                maximum_equivalence_class_size
-                            ),
-                            combat_net_progress_window=(
-                                combat_window_selection.effective_window
-                            ),
-                            combat_progress_window_source=(
-                                combat_window_selection.source
-                            ),
-                            combat_progress_window_match_id=(
-                                combat_window_selection.match_id
-                            ),
+                            maximum_observed_semantic_candidates=(maximum_observed_semantic_candidates),
+                            maximum_equivalence_class_size=(maximum_equivalence_class_size),
+                            combat_net_progress_window=(combat_window_selection.effective_window),
+                            combat_progress_window_source=(combat_window_selection.source),
+                            combat_progress_window_match_id=(combat_window_selection.match_id),
                         )
                     )
                 segment_steps = []
@@ -3239,22 +3299,14 @@ class GroundedCollector:
                 for trace in transaction_traces_pending
             )
         terminal_facts = state.transition.facts if state.transition is not None else {}
-        run_won = bool(
-            self.objective == "run"
-            and state.terminated
-            and terminal_facts.get("run_result") == "victory"
-        )
+        run_won = bool(self.objective == "run" and state.terminated and terminal_facts.get("run_result") == "victory")
         combat_won = bool(
-            self.objective == "combat"
-            and state.terminated
-            and terminal_facts.get("combat_result") == "victory"
+            self.objective == "combat" and state.terminated and terminal_facts.get("combat_result") == "victory"
         )
         if state.terminated and self.objective in {"run", "combat"}:
             typed_success = run_won if self.objective == "run" else combat_won
             if typed_success != (final_outcome == "success"):
-                raise CollectionProtocolError(
-                    "typed terminal result disagrees with the reward outcome"
-                )
+                raise CollectionProtocolError("typed terminal result disagrees with the reward outcome")
         resolved_terminal_reason = (
             "combat_progress_stall"
             if combat_progress_stalled
@@ -3273,12 +3325,8 @@ class GroundedCollector:
             if not episodic_steps:  # reset validation and a positive horizon make this unreachable
                 raise RuntimeError("run episode ended without an accepted episodic decision")
             typed_run_result = terminal_facts.get("run_result")
-            authoritative_run_outcome = bool(
-                state.terminated and typed_run_result in {"victory", "defeat"}
-            )
-            observed_task_outcome = bool(
-                authoritative_run_outcome or trusted_policy_failure
-            )
+            authoritative_run_outcome = bool(state.terminated and typed_run_result in {"victory", "defeat"})
+            observed_task_outcome = bool(authoritative_run_outcome or trusted_policy_failure)
             completion = EpisodeCompletion(
                 authoritative=observed_task_outcome,
                 won=(
@@ -3298,10 +3346,7 @@ class GroundedCollector:
                 completion=completion,
                 data_partition="training",
             )
-        ordered_act_efficiency = tuple(
-            act_boundary_efficiency[act]
-            for act in sorted(act_boundary_efficiency)
-        )
+        ordered_act_efficiency = tuple(act_boundary_efficiency[act] for act in sorted(act_boundary_efficiency))
         return CollectedEpisode(
             unrolls=tuple(unrolls),
             metrics=EpisodeMetrics(
@@ -3326,20 +3371,13 @@ class GroundedCollector:
                 maximum_noncombat_no_durable_progress_steps=(maximum_noncombat_no_durable_progress_steps),
                 revivals_used=revivals_used,
                 revival_free_combat_win=bool(combat_won and revivals_used == 0),
-                revival_free_act1_clear=bool(
-                    1 in act_boundary_efficiency
-                    and act_boundary_efficiency[1][0] == 0
-                ),
+                revival_free_act1_clear=bool(1 in act_boundary_efficiency and act_boundary_efficiency[1][0] == 0),
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
                 stall_evidence=stall_evidence,
                 combat_policy_failed=trusted_policy_failure,
-                maximum_observed_semantic_candidates=(
-                    maximum_observed_semantic_candidates
-                ),
-                maximum_equivalence_class_size=(
-                    maximum_equivalence_class_size
-                ),
+                maximum_observed_semantic_candidates=(maximum_observed_semantic_candidates),
+                maximum_equivalence_class_size=(maximum_equivalence_class_size),
                 act_revival_counts=tuple(item[0] for item in ordered_act_efficiency),
                 act_hp_loss_counts=tuple(item[1] for item in ordered_act_efficiency),
             ),
@@ -3348,6 +3386,7 @@ class GroundedCollector:
             timings=timings.snapshot(),
             transaction_traces=transaction_traces,
             completed_episode=completed_episode,
+            liveness_probe=liveness_probe,
         )
 
 

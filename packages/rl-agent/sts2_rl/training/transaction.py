@@ -162,11 +162,7 @@ class TransactionStep:
                 raise ValueError("censored transaction return cannot declare return_steps")
         else:
             _finite(self.transaction_return, label="transaction_return")
-            if (
-                isinstance(self.return_steps, bool)
-                or not isinstance(self.return_steps, int)
-                or self.return_steps <= 0
-            ):
+            if isinstance(self.return_steps, bool) or not isinstance(self.return_steps, int) or self.return_steps <= 0:
                 raise ValueError("observed transaction return requires positive return_steps")
 
     @property
@@ -241,9 +237,7 @@ class TransactionTrace:
             raise ValueError("transaction burn-in must leave at least one learn step")
         object.__setattr__(self, "initial_recurrent_state", _owned_state(self.initial_recurrent_state))
         if bool(np.count_nonzero(self.initial_recurrent_state)):
-            raise ValueError(
-                "transaction replay requires zero initial state and current-network burn-in"
-            )
+            raise ValueError("transaction replay requires zero initial state and current-network burn-in")
 
     @property
     def learn_steps(self) -> tuple[TransactionStep, ...]:
@@ -266,14 +260,17 @@ def factual_transaction_policy_targets(
     """Build policy-coupled liveness labels from factual transaction paths.
 
     A completed trace is traversed backwards from its factual exit. For each
-    semantic node, only its last factual action whose successor is already
-    known to reach the exit is preferred. This erases an early wrong branch
-    after the trace later revisits and corrects the same node, without globally
-    penalizing the corrective deselect that returned there. Exact repeated
-    ``(node, action)`` pairs are factual cycles and receive an avoid target
-    instead, even if random exploration eventually escaped. A deadlocked trace
-    contributes only those repeated pairs. Censored traces contribute no
-    policy target.
+    semantic node, its last factual action whose successor is already known to
+    reach the exit is preferred. Other *observed* actions from that same node
+    are avoided. This labels an explored wrong branch without penalizing the
+    corrective deselect that factually returned to the successful route.
+
+    A deadlocked trace has no successful suffix. Its factual cycle-closing
+    ``STAY``/``REVISIT`` transitions are avoided. Some liveness failures (for
+    example a bounded combat no-progress window) can contain a long sequence
+    of unique semantic nodes rather than an exact cycle; in that case the last
+    non-forced factual action is avoided. Censored traces contribute no policy
+    target.
 
     The key includes the full semantic transaction node, so a deselect used
     once to correct a choice on a subsequently completed route is preferred;
@@ -287,18 +284,10 @@ def factual_transaction_policy_targets(
         return ()
 
     learn_steps = trace.learn_steps
-    pair_counts: dict[tuple[str, str], int] = {}
-    for step in learn_steps:
-        pair = (step.node_key, step.action_fingerprint)
-        pair_counts[pair] = pair_counts.get(pair, 0) + 1
-
     preferred_indices: set[int] = set()
+    preferred_actions: dict[str, str] = {}
     if trace.outcome is TransactionOutcome.COMPLETED:
-        exit_nodes = {
-            step.next_node_key
-            for step in learn_steps
-            if step.effect is TransactionEffect.EXIT
-        }
+        exit_nodes = {step.next_node_key for step in learn_steps if step.effect is TransactionEffect.EXIT}
         reachable_nodes = set(exit_nodes)
         handled_nodes: set[str] = set()
         for local_index in range(len(learn_steps) - 1, -1, -1):
@@ -306,12 +295,40 @@ def factual_transaction_policy_targets(
             if step.node_key in handled_nodes:
                 continue
             handled_nodes.add(step.node_key)
-            pair = (step.node_key, step.action_fingerprint)
-            if pair_counts[pair] > 1 or step.next_node_key not in reachable_nodes:
+            if step.next_node_key not in reachable_nodes:
                 continue
             reachable_nodes.add(step.node_key)
             if step.effect is not TransactionEffect.STAY:
                 preferred_indices.add(trace.burn_in_steps + local_index)
+                preferred_actions[step.node_key] = step.action_fingerprint
+
+    avoided_indices: set[int] = set()
+    if trace.outcome is TransactionOutcome.COMPLETED:
+        for local_index, step in enumerate(learn_steps):
+            preferred = preferred_actions.get(step.node_key)
+            if preferred is not None and step.action_fingerprint != preferred:
+                avoided_indices.add(trace.burn_in_steps + local_index)
+    elif trace.outcome is TransactionOutcome.DEADLOCK:
+        pair_counts: dict[tuple[str, str], int] = {}
+        for step in learn_steps:
+            pair = (step.node_key, step.action_fingerprint)
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+        for local_index, step in enumerate(learn_steps):
+            if (
+                step.effect in {TransactionEffect.STAY, TransactionEffect.REVISIT}
+                or pair_counts[(step.node_key, step.action_fingerprint)] > 1
+            ):
+                avoided_indices.add(trace.burn_in_steps + local_index)
+        if not avoided_indices:
+            # Net-progress failures need not revisit an exact decision node.
+            # The final non-forced action is nevertheless a factual member of
+            # the terminal failed prefix and supplies a conservative liveness
+            # target without inventing an unexecuted alternative.
+            for local_index in range(len(learn_steps) - 1, -1, -1):
+                step = learn_steps[local_index]
+                if int(np.count_nonzero(step.snapshot.action_mask)) > 1:
+                    avoided_indices.add(trace.burn_in_steps + local_index)
+                    break
 
     labels: list[FactualTransactionPolicyTarget] = []
     for step_index, step in enumerate(
@@ -320,8 +337,7 @@ def factual_transaction_policy_targets(
     ):
         if int(np.count_nonzero(step.snapshot.action_mask)) <= 1:
             continue
-        repeated = pair_counts[(step.node_key, step.action_fingerprint)] > 1
-        if repeated:
+        if step_index in avoided_indices:
             labels.append(
                 FactualTransactionPolicyTarget(
                     step_index=step_index,
@@ -336,6 +352,7 @@ def factual_transaction_policy_targets(
                 )
             )
     return tuple(labels)
+
 
 @dataclass(frozen=True, slots=True)
 class ObservedTransactionPair:
@@ -362,9 +379,7 @@ def observed_outcome_pairs(
         for step_index, step in enumerate(trace.steps):
             if step_index < trace.burn_in_steps or not step.q_observed:
                 continue
-            grouped.setdefault((trace.surface_key, step.node_key), []).append(
-                (trace_index, step_index, step)
-            )
+            grouped.setdefault((trace.surface_key, step.node_key), []).append((trace_index, step_index, step))
     pairs: list[ObservedTransactionPair] = []
     for observations in grouped.values():
         for left_index, left_step_index, left in observations:
@@ -380,13 +395,9 @@ def observed_outcome_pairs(
                 if abs(left_return - right_return) <= gap:
                     continue
                 if left_return > right_return:
-                    pairs.append(
-                        ObservedTransactionPair(left_index, left_step_index, right_index, right_step_index)
-                    )
+                    pairs.append(ObservedTransactionPair(left_index, left_step_index, right_index, right_step_index))
                 else:
-                    pairs.append(
-                        ObservedTransactionPair(right_index, right_step_index, left_index, left_step_index)
-                    )
+                    pairs.append(ObservedTransactionPair(right_index, right_step_index, left_index, left_step_index))
     return tuple(pairs)
 
 
@@ -426,10 +437,7 @@ def backfill_factual_monte_carlo_returns(
     if not authoritative_outcome:
         return replace(
             trace,
-            steps=tuple(
-                replace(step, transaction_return=None, return_steps=None)
-                for step in trace.steps
-            ),
+            steps=tuple(replace(step, transaction_return=None, return_steps=None) for step in trace.steps),
         )
 
     returns = [0.0] * len(rewards)
@@ -494,10 +502,23 @@ class BoundedTransactionReplay:
                 self._duplicate_count += 1
                 return False
             while self._items and (
-                len(self._items) >= self.capacity
-                or self._storage_nbytes + size > self.byte_capacity
+                len(self._items) >= self.capacity or self._storage_nbytes + size > self.byte_capacity
             ):
-                evicted = self._items.popleft()
+                # Liveness failures are sparse and carry the only guaranteed
+                # AVOID targets. Prefer evicting the oldest non-deadlock trace
+                # instead of letting routine completed transactions erase
+                # them from the replay. If every retained item is a deadlock,
+                # normal FIFO bounding still applies.
+                eviction_index = next(
+                    (
+                        index
+                        for index, item in enumerate(self._items)
+                        if item.outcome is not TransactionOutcome.DEADLOCK
+                    ),
+                    0,
+                )
+                evicted = self._items[eviction_index]
+                del self._items[eviction_index]
                 self._trace_ids.remove(evicted.trace_id)
                 self._storage_nbytes -= evicted.storage_nbytes()
                 self._eviction_count += 1
@@ -513,9 +534,60 @@ class BoundedTransactionReplay:
         with self._lock:
             if not self._items:
                 return ()
-            count = min(maximum, len(self._items))
-            indices = self._rng.choice(len(self._items), size=count, replace=False)
             items = tuple(self._items)
+            count = min(maximum, len(items))
+            deadlock_indices = np.asarray(
+                [index for index, item in enumerate(items) if item.outcome is TransactionOutcome.DEADLOCK],
+                dtype=np.int64,
+            )
+            ordinary_indices = np.asarray(
+                [index for index, item in enumerate(items) if item.outcome is not TransactionOutcome.DEADLOCK],
+                dtype=np.int64,
+            )
+            # Reserve half of a normal batch for sparse liveness failures, but
+            # always admit at least one when both strata exist. Fill any unused
+            # reservation from the other stratum.
+            if deadlock_indices.size and ordinary_indices.size:
+                deadlock_count = min(
+                    int(deadlock_indices.size),
+                    max(1, count // 2),
+                )
+            else:
+                deadlock_count = min(int(deadlock_indices.size), count)
+            ordinary_count = min(int(ordinary_indices.size), count - deadlock_count)
+            remaining = count - deadlock_count - ordinary_count
+            if remaining:
+                deadlock_count += min(
+                    remaining,
+                    int(deadlock_indices.size) - deadlock_count,
+                )
+                remaining = count - deadlock_count - ordinary_count
+            if remaining:
+                ordinary_count += min(
+                    remaining,
+                    int(ordinary_indices.size) - ordinary_count,
+                )
+            selected: list[int] = []
+            if deadlock_count:
+                selected.extend(
+                    int(index)
+                    for index in self._rng.choice(
+                        deadlock_indices,
+                        size=deadlock_count,
+                        replace=False,
+                    )
+                )
+            if ordinary_count:
+                selected.extend(
+                    int(index)
+                    for index in self._rng.choice(
+                        ordinary_indices,
+                        size=ordinary_count,
+                        replace=False,
+                    )
+                )
+            indices = np.asarray(selected, dtype=np.int64)
+            self._rng.shuffle(indices)
             self._sample_count += count
             return tuple(items[int(index)] for index in indices)
 
@@ -535,6 +607,7 @@ class BoundedTransactionReplay:
                 "sample_count": self._sample_count,
                 "eviction_count": self._eviction_count,
                 "duplicate_count": self._duplicate_count,
+                "deadlock_size": sum(item.outcome is TransactionOutcome.DEADLOCK for item in self._items),
             }
 
     def state_dict(self) -> dict[str, Any]:

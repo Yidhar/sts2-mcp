@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from sts2_rl.training.config import RuntimeConfig
+from sts2_rl.training.evaluation_liveness import (
+    evaluate_liveness_guard,
+    summarize_greedy_liveness_journal,
+)
+from sts2_rl.training.seeding import (
+    final_audit_evaluation_seeds,
+    held_out_evaluation_seeds,
+)
+
+
+def _decision(
+    episode: int,
+    step: int,
+    *,
+    selected: str,
+    confirm_ready: bool = False,
+    end_turn_choice: bool = False,
+    reward_hub: bool = False,
+    terminal_cycle: bool = False,
+) -> dict[str, object]:
+    if end_turn_choice:
+        legal_kinds = {"end_turn": 1, "play_card": 5}
+        topk = [
+            {"action": {"action": "end_turn"}, "probability": 0.19},
+            {"action": {"action": "play_card"}, "probability": 0.17},
+        ]
+    elif reward_hub:
+        legal_kinds = {"proceed": 1, "reward": 2}
+        topk = [
+            {"action": {"action": "proceed"}, "probability": 0.50},
+            {"action": {"action": "claim_reward"}, "probability": 0.26},
+            {"action": {"action": "claim_reward"}, "probability": 0.24},
+        ]
+    else:
+        legal_kinds = {"card_selection": 3}
+        topk = [
+            {"action": {"action": "deselect_card"}, "probability": 0.34},
+            {"action": {"action": "cancel_selection"}, "probability": 0.33},
+            {"action": {"action": "confirm_selection"}, "probability": 0.33},
+        ]
+    return {
+        "event": "decision",
+        "record_kind": "summary",
+        "episode_id": f"validation-{episode}",
+        "step_index": step,
+        "observation_summary": {
+            "card_selection": {"can_confirm": confirm_ready},
+        },
+        "legal_action_kinds": legal_kinds,
+        "selected_action": {"action": selected},
+        "policy_topk": topk,
+        "deadlock": (
+            {"cycle_span": 2, "occurrences": 8}
+            if terminal_cycle
+            else None
+        ),
+    }
+
+
+def test_liveness_summary_and_guard_detect_only_obvious_greedy_failures(
+    tmp_path: Path,
+) -> None:
+    records: list[dict[str, object]] = []
+    for episode in range(4):
+        for step in range(8):
+            records.append(
+                _decision(
+                    episode,
+                    step,
+                    selected="select_card" if step % 2 == 0 else "deselect_card",
+                    confirm_ready=True,
+                    terminal_cycle=step == 7,
+                )
+            )
+        for step in range(8, 18):
+            records.append(
+                _decision(
+                    episode,
+                    step,
+                    selected="end_turn",
+                    end_turn_choice=True,
+                )
+            )
+        records.append(
+            _decision(
+                episode,
+                18,
+                selected="proceed",
+                reward_hub=True,
+            )
+        )
+        records.append(
+            _decision(
+                episode,
+                19,
+                selected="deselect_card",
+                confirm_ready=True,
+                terminal_cycle=True,
+            )
+        )
+    journal = tmp_path / "evaluation.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    assert summary["episode_count"] == 4
+    assert summary["confirm_ready_decisions"] == 36
+    assert summary["confirm_ready_greedy_rate"] == 0.0
+    assert summary["multi_action_end_turn_decisions"] == 40
+    assert summary["multi_action_end_turn_greedy_rate"] == 1.0
+    assert summary["selection_cycle_episode_rate"] == 1.0
+    assert summary["reward_hub_decisions"] == 4
+    assert summary["reward_proceed_minus_best_claim_mean_margin"] == 0.24
+
+    config = RuntimeConfig(
+        early_evaluation_steps=(5_000,),
+        early_evaluation_episodes=4,
+        evaluation_liveness_guard_enabled=True,
+    )
+    guard = evaluate_liveness_guard(summary, config)
+    assert guard["stop_requested"] is True
+    assert {
+        item["kind"] for item in guard["violations"]
+    } == {
+        "confirm_ready_greedy_failure",
+        "avoidable_end_turn_collapse",
+        "selection_cycle_collapse",
+    }
+    assert guard["outcome_metrics_used_for_stop"] is False
+
+
+def test_final_audit_seed_range_is_odd_and_disjoint_from_repeated_validation() -> None:
+    validation = held_out_evaluation_seeds(6, 32)
+    final_audit = final_audit_evaluation_seeds(6, 32)
+    assert set(validation).isdisjoint(final_audit)
+    assert all(seed % 2 == 1 for seed in validation)
+    assert all(seed % 2 == 1 for seed in final_audit)
+
+
+def test_combat_selection_operation_names_use_the_same_liveness_semantics(
+    tmp_path: Path,
+) -> None:
+    records = [
+        {
+            **_decision(
+                0,
+                step,
+                selected=(
+                    "combat_select_card"
+                    if step % 2 == 0
+                    else "combat_deselect_card"
+                ),
+                terminal_cycle=step == 7,
+            ),
+            "policy_topk": [
+                {
+                    "action": {"action": "combat_confirm_selection"},
+                    "probability": 0.6,
+                },
+                {
+                    "action": {"action": "combat_deselect_card"},
+                    "probability": 0.4,
+                },
+            ],
+        }
+        for step in range(8)
+    ]
+    records.append(
+        {
+            **_decision(
+                1,
+                0,
+                selected="combat_confirm_selection",
+                confirm_ready=True,
+            ),
+            "policy_topk": [
+                {
+                    "action": {"action": "combat_confirm_selection"},
+                    "probability": 1.0,
+                }
+            ],
+        }
+    )
+    journal = tmp_path / "combat-selection.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    assert summary["selection_cycle_episode_count"] == 1
+    assert summary["confirm_ready_decisions"] == 9
+    assert summary["confirm_selected_decisions"] == 1

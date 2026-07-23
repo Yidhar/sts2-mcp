@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -36,6 +37,10 @@ from .checkpointing import (
 )
 from .collector import EpisodeMetrics
 from .config import TrainingConfig
+from .evaluation_liveness import (
+    evaluate_liveness_guard,
+    summarize_greedy_liveness_journal,
+)
 from .factory import (
     TrainingResources,
     build_backend,
@@ -43,7 +48,10 @@ from .factory import (
     resolve_device,
 )
 from .pipeline import ActorLearnerPipeline, RecoverableActorIncident
-from .seeding import held_out_evaluation_seeds
+from .seeding import (
+    final_audit_evaluation_seeds,
+    held_out_evaluation_seeds,
+)
 from .trajectory import TrajectoryJournal
 
 
@@ -79,6 +87,19 @@ class JsonlMetrics:
 
 class EvaluationInfrastructureError(RuntimeError):
     """A held-out gate could not produce a policy-valid episode."""
+
+
+def _model_state_sha256(model: torch.nn.Module) -> str:
+    """Hash one exact in-memory policy snapshot without serializing an artifact."""
+
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(value.numpy().tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | int]:
@@ -220,15 +241,39 @@ def evaluate_policy(
     journal_path: str | Path | None = None,
     backend_factory: Callable[[], EnvironmentBackend] | None = None,
     infrastructure_retries_per_seed: int = 1,
-) -> tuple[list[EpisodeMetrics], dict[str, float | int]]:
-    """Evaluate on fixed odd seeds with compact journals and sparse snapshots."""
+    data_partition: str = "validation",
+    evaluation_context: Mapping[str, Any] | None = None,
+) -> tuple[list[EpisodeMetrics], dict[str, Any]]:
+    """Evaluate on disjoint odd seeds with compact diagnostic journals."""
 
     resources.publish_collector_policy()
-    evaluation_seeds = held_out_evaluation_seeds(base_seed, int(episodes))
+    if data_partition == "validation":
+        evaluation_seeds = held_out_evaluation_seeds(base_seed, int(episodes))
+        namespace = "heldout"
+    elif data_partition == "final_audit":
+        evaluation_seeds = final_audit_evaluation_seeds(
+            base_seed,
+            int(episodes),
+        )
+        namespace = "final-audit"
+    else:
+        raise ValueError(
+            "evaluation data_partition must be validation or final_audit"
+        )
     collector_state = deepcopy(resources.collector.state_dict())
     journal = TrajectoryJournal(journal_path) if journal_path is not None else None
     if journal is not None:
         journal.__enter__()
+        journal.write_episode_boundary(
+            {
+                "event": "evaluation_started",
+                "data_partition": data_partition,
+                "evaluation_seeds": list(evaluation_seeds),
+                "epsilon": 0.0,
+                "deterministic": True,
+                **dict(evaluation_context or {}),
+            }
+        )
     try:
         results: list[EpisodeMetrics] = []
         infrastructure_retries = 0
@@ -243,8 +288,9 @@ def evaluate_policy(
                             "evaluation_seed": evaluation_seed,
                             "attempt": attempt_number,
                             "journal_episode_namespace": (
-                                f"heldout-seed-{evaluation_seed}-attempt-{attempt_number}:"
+                                f"{namespace}-seed-{evaluation_seed}-attempt-{attempt_number}:"
                             ),
+                            "data_partition": data_partition,
                         }
                     )
                 try:
@@ -255,7 +301,7 @@ def evaluate_policy(
                         evaluation_seed=evaluation_seed,
                         trajectory_journal=journal,
                         journal_episode_id_prefix=(
-                            f"heldout-seed-{evaluation_seed}-attempt-{attempt_number}:"
+                            f"{namespace}-seed-{evaluation_seed}-attempt-{attempt_number}:"
                         ),
                     )
                     if journal is not None:
@@ -265,7 +311,7 @@ def evaluate_policy(
                                 "evaluation_seed": evaluation_seed,
                                 "attempt": attempt_number,
                                 "episode_id": (
-                                    f"heldout-seed-{evaluation_seed}-attempt-"
+                                    f"{namespace}-seed-{evaluation_seed}-attempt-"
                                     f"{attempt_number}:{episode.metrics.episode_id}"
                                 ),
                                 "steps": episode.metrics.steps,
@@ -313,8 +359,13 @@ def evaluate_policy(
                         replacement.close()
                         raise
             results.append(episode.metrics)
-        summary = summarize_evaluation(results)
+        summary: dict[str, Any] = dict(summarize_evaluation(results))
         summary["infrastructure_retries"] = infrastructure_retries
+        summary["data_partition"] = data_partition
+        summary["evaluation_seed_count"] = len(evaluation_seeds)
+        summary["evaluation_seeds"] = list(evaluation_seeds)
+        summary["epsilon"] = 0.0
+        summary["deterministic"] = True
         return results, summary
     finally:
         if journal is not None:
@@ -329,6 +380,8 @@ def _evaluate_training_gate(
     base_seed: int,
     journal_path: str | Path,
     backend_factory: Callable[[], EnvironmentBackend] | None,
+    data_partition: str = "validation",
+    evaluation_context: Mapping[str, Any] | None = None,
 ) -> tuple[list[EpisodeMetrics], dict[str, Any]]:
     """Evaluate one training gate and attach read-only macro diagnostics.
 
@@ -347,6 +400,8 @@ def _evaluate_training_gate(
         base_seed=base_seed,
         journal_path=journal_path,
         backend_factory=backend_factory,
+        data_partition=data_partition,
+        evaluation_context=evaluation_context,
     )
 
     # Keep macro evaluation out of the training module import graph. The
@@ -363,6 +418,10 @@ def _evaluate_training_gate(
         resources.collector_model,
         resources.encoder,
     )
+    summary["greedy_liveness"] = summarize_greedy_liveness_journal(
+        journal_path
+    )
+    summary["evaluation_context"] = dict(evaluation_context or {})
     return evaluation_results, summary
 
 
@@ -408,6 +467,10 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
         "unroll_length": config.rollout.unroll_length,
         "rollout_queue_capacity": config.rollout.queue_capacity,
+        "rollout_max_policy_lag": config.rollout.max_policy_lag,
+        "deterministic_probe_interval_episodes": (
+            config.rollout.deterministic_probe_interval_episodes
+        ),
         "transaction_learning": {
             "enabled": config.transaction_learning.enabled,
             "replay_capacity": config.transaction_learning.replay_capacity,
@@ -454,6 +517,9 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "primary_success_tie_tolerance": (
                 config.episodic_learning.primary_success_tie_tolerance
             ),
+            "policy_gradient_max_lag": (
+                config.episodic_learning.policy_gradient_max_lag
+            ),
         },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
@@ -490,6 +556,79 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
 
 def _checkpoint_path(root: Path, state: TrainingState, *, prefix: str) -> Path:
     return root / f"{prefix}-step-{state.environment_steps:09d}"
+
+
+def _checkpoint_reference(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    manifest_path = path / "checkpoint.manifest.json"
+    checkpoint_id: str | None = None
+    manifest_sha256: str | None = None
+    if manifest_path.is_file():
+        raw = manifest_path.read_bytes()
+        manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        value = json.loads(raw)
+        if isinstance(value, Mapping):
+            raw_id = value.get("checkpoint_id")
+            if isinstance(raw_id, str) and raw_id:
+                checkpoint_id = raw_id
+    return {
+        "path": str(path),
+        "checkpoint_id": checkpoint_id,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _evaluation_context(
+    resources: TrainingResources,
+    *,
+    config: TrainingConfig,
+    state: TrainingState,
+    evaluation_gate: int,
+    gate_kind: str,
+    parent_checkpoint: Path | None,
+    load_mode: str,
+    runtime_provenance: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Describe the exact in-memory policy and runtime evaluated at one gate."""
+
+    if (
+        load_mode == "model_initialization"
+        and state.environment_steps == 0
+        and state.policy_version == 0
+    ):
+        checkpoint_relation = "model_parameter_initialization"
+    elif parent_checkpoint is not None:
+        checkpoint_relation = "in_memory_successor"
+    else:
+        checkpoint_relation = "fresh_uncheckpointed_policy"
+    return {
+        "schema_version": "sts2-training-evaluation-context-v1",
+        "evaluation_gate": evaluation_gate,
+        "gate_kind": gate_kind,
+        "actual_environment_steps": state.environment_steps,
+        "policy_version": state.policy_version,
+        "actor_policy_version": state.actor_policy_version,
+        "policy_model_state_sha256": _model_state_sha256(
+            resources.collector_model
+        ),
+        "checkpoint_association": {
+            "relation": checkpoint_relation,
+            "load_mode": load_mode,
+            "last_committed_checkpoint": _checkpoint_reference(
+                parent_checkpoint
+            ),
+        },
+        "config": {
+            "version": config.version,
+            "profile": config.profile,
+            "fingerprint_sha256": config.fingerprint_sha256(),
+        },
+        "encoding": grounding_encoding_identity(),
+        "simulator": dict(runtime_provenance or {}),
+        "epsilon": 0.0,
+        "deterministic": True,
+    }
 
 
 def _save(
@@ -531,9 +670,15 @@ def run_training(
     backend: EnvironmentBackend | None = None,
     resume_from: str | Path | None = None,
     initialize_from: str | Path | None = None,
+    runtime_provenance: Mapping[str, Any] | None = None,
 ) -> TrainingState:
     if resume_from is not None and initialize_from is not None:
         raise ValueError("resume_from and initialize_from are mutually exclusive")
+    if runtime_provenance is not None and not isinstance(
+        runtime_provenance,
+        Mapping,
+    ):
+        raise TypeError("runtime_provenance must be a mapping or None")
 
     # Fail before backend launch or artifact creation when checkpoint ABI/device
     # identity is incompatible.
@@ -595,6 +740,8 @@ def run_training(
                 "state": asdict(state),
                 "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
+                "config_fingerprint_sha256": config.fingerprint_sha256(),
+                "runtime_provenance": dict(runtime_provenance or {}),
                 "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
                 "checkpoint_load": {
                     "mode": load_mode,
@@ -628,39 +775,212 @@ def run_training(
             # them later under a false gate identity.
             if step <= state.environment_steps
         }
+        completed_early_evaluations = {
+            step
+            for step in config.runtime.early_evaluation_steps
+            if step <= state.environment_steps
+        }
+        completed_final_audits = {
+            step
+            for step in config.runtime.final_audit_steps
+            if step <= state.environment_steps
+        }
+        evaluation_guard_stop: dict[str, Any] | None = None
+
+        def run_one_evaluation(
+            *,
+            evaluation_step: int,
+            episodes: int,
+            data_partition: str,
+            gate_kind: str,
+            journal_name: str,
+        ) -> dict[str, Any] | None:
+            """Run one frozen gate; evaluation data never enters replay."""
+
+            nonlocal state
+            resources.publish_collector_policy()
+            context = _evaluation_context(
+                resources,
+                config=config,
+                state=state,
+                evaluation_gate=evaluation_step,
+                gate_kind=gate_kind,
+                parent_checkpoint=parent_checkpoint,
+                load_mode=load_mode,
+                runtime_provenance=runtime_provenance,
+            )
+            evaluation_results, summary = _evaluate_training_gate(
+                resources,
+                episodes=episodes,
+                base_seed=config.runtime.seed,
+                journal_path=run_log_root / journal_name,
+                backend_factory=recovery_backend_factory,
+                data_partition=data_partition,
+                evaluation_context=context,
+            )
+            state = replace(
+                state,
+                evaluation_episodes=state.evaluation_episodes + episodes,
+                maximum_observed_candidates=max(
+                    state.maximum_observed_candidates,
+                    *(
+                        item.maximum_observed_candidates
+                        for item in evaluation_results
+                    ),
+                ),
+            )
+            guard = (
+                evaluate_liveness_guard(
+                    summary["greedy_liveness"],
+                    config.runtime,
+                )
+                if gate_kind == "early_validation"
+                else {
+                    "schema_version": "sts2-greedy-liveness-guard-v1",
+                    "enabled": False,
+                    "passed": True,
+                    "stop_requested": False,
+                    "violations": [],
+                    "reason": "guard_applies_only_to_early_validation",
+                }
+            )
+            metrics.write(
+                "evaluation",
+                {
+                    "environment_steps": state.environment_steps,
+                    "evaluation_gate": evaluation_step,
+                    "gate_kind": gate_kind,
+                    "data_partition": data_partition,
+                    "run_maximum_observed_candidates": (
+                        state.maximum_observed_candidates
+                    ),
+                    "liveness_guard": guard,
+                    **summary,
+                },
+            )
+            if guard.get("stop_requested") is True:
+                stop = {
+                    "evaluation_gate": evaluation_step,
+                    "actual_environment_steps": state.environment_steps,
+                    "gate_kind": gate_kind,
+                    "data_partition": data_partition,
+                    "liveness_guard": guard,
+                    "policy_version": state.policy_version,
+                    "policy_model_state_sha256": context[
+                        "policy_model_state_sha256"
+                    ],
+                }
+                metrics.write("evaluation_guard_stop_requested", stop)
+                return stop
+            return None
+
         if (
             0 in config.runtime.evaluation_steps
             and state.environment_steps == 0
             and config.runtime.evaluation_episodes > 0
         ):
-            evaluation_results, summary = _evaluate_training_gate(
-                resources,
+            run_one_evaluation(
+                evaluation_step=0,
                 episodes=config.runtime.evaluation_episodes,
-                base_seed=config.runtime.seed,
-                journal_path=run_log_root / "evaluation-step-000000000.jsonl",
-                backend_factory=recovery_backend_factory,
-            )
-            state = replace(
-                state,
-                evaluation_episodes=(
-                    state.evaluation_episodes + config.runtime.evaluation_episodes
-                ),
-                maximum_observed_candidates=max(
-                    state.maximum_observed_candidates,
-                    *(item.maximum_observed_candidates for item in evaluation_results),
-                ),
+                data_partition="validation",
+                gate_kind="validation",
+                journal_name="evaluation-step-000000000.jsonl",
             )
             completed_evaluations.add(0)
-            metrics.write(
-                "evaluation",
-                {
-                    "environment_steps": 0,
-                    "run_maximum_observed_candidates": (
-                        state.maximum_observed_candidates
-                    ),
-                    **summary,
-                },
+
+        def has_due_evaluation() -> bool:
+            return (
+                any(
+                    step <= state.environment_steps
+                    and step not in completed_evaluations
+                    for step in config.runtime.evaluation_steps
+                )
+                or any(
+                    step <= state.environment_steps
+                    and step not in completed_early_evaluations
+                    for step in config.runtime.early_evaluation_steps
+                )
+                or any(
+                    step <= state.environment_steps
+                    and step not in completed_final_audits
+                    for step in config.runtime.final_audit_steps
+                )
             )
+
+        def run_due_evaluations() -> dict[str, Any] | None:
+            """Run crossed gates in gate order and stop after first guard failure."""
+
+            pending: list[
+                tuple[int, str, str, int, set[int], str]
+            ] = []
+            for step in config.runtime.evaluation_steps:
+                if (
+                    step <= state.environment_steps
+                    and step not in completed_evaluations
+                ):
+                    pending.append(
+                        (
+                            step,
+                            "validation",
+                            "validation",
+                            config.runtime.evaluation_episodes,
+                            completed_evaluations,
+                            f"evaluation-step-{step:09d}.jsonl",
+                        )
+                    )
+            for step in config.runtime.early_evaluation_steps:
+                if (
+                    step <= state.environment_steps
+                    and step not in completed_early_evaluations
+                ):
+                    pending.append(
+                        (
+                            step,
+                            "validation",
+                            "early_validation",
+                            config.runtime.early_evaluation_episodes,
+                            completed_early_evaluations,
+                            f"early-validation-step-{step:09d}.jsonl",
+                        )
+                    )
+            for step in config.runtime.final_audit_steps:
+                if (
+                    step <= state.environment_steps
+                    and step not in completed_final_audits
+                ):
+                    pending.append(
+                        (
+                            step,
+                            "final_audit",
+                            "final_audit",
+                            config.runtime.final_audit_episodes,
+                            completed_final_audits,
+                            f"final-audit-step-{step:09d}.jsonl",
+                        )
+                    )
+            for (
+                step,
+                partition,
+                kind,
+                episodes,
+                completed,
+                journal_name,
+            ) in sorted(pending, key=lambda item: item[0]):
+                stop = (
+                    run_one_evaluation(
+                        evaluation_step=step,
+                        episodes=episodes,
+                        data_partition=partition,
+                        gate_kind=kind,
+                        journal_name=journal_name,
+                    )
+                    if episodes > 0
+                    else None
+                )
+                completed.add(step)
+                if stop is not None:
+                    return stop
+            return None
 
         pipeline = ActorLearnerPipeline(
             resources,
@@ -668,6 +988,10 @@ def run_training(
             starting_environment_steps=state.environment_steps,
             starting_policy_version=state.actor_policy_version,
             epsilon=lambda steps: exploration_epsilon(config, steps),
+            starting_episode_count=state.episodes,
+            deterministic_probe_interval_episodes=(
+                config.rollout.deterministic_probe_interval_episodes
+            ),
             supervisor_state=actor_supervisor_state,
         )
         next_checkpoint = (
@@ -761,11 +1085,7 @@ def run_training(
                     "fresh_backend": True,
                 },
             )
-            crossed_evaluation = any(
-                step <= state.environment_steps
-                and step not in completed_evaluations
-                for step in config.runtime.evaluation_steps
-            )
+            crossed_evaluation = has_due_evaluation()
             crossed_checkpoint = state.environment_steps >= next_checkpoint
             if crossed_evaluation or crossed_checkpoint:
                 maintenance_requested = True
@@ -961,6 +1281,17 @@ def run_training(
                         "policy_version": state.policy_version,
                         "actor_policy_version": state.actor_policy_version,
                         "behavior_policy_version": episode.behavior_policy_version,
+                        "liveness_probe": episode.liveness_probe,
+                        "data_partition": "training",
+                        "deterministic": episode.liveness_probe,
+                        "collection_epsilon": (
+                            0.0
+                            if episode.liveness_probe
+                            else exploration_epsilon(
+                                config,
+                                state.environment_steps,
+                            )
+                        ),
                         "run_maximum_observed_candidates": (
                             state.maximum_observed_candidates
                         ),
@@ -1007,11 +1338,7 @@ def run_training(
                         ),
                     },
                 )
-                crossed_evaluation = any(
-                    step <= state.environment_steps
-                    and step not in completed_evaluations
-                    for step in config.runtime.evaluation_steps
-                )
+                crossed_evaluation = has_due_evaluation()
                 crossed_checkpoint = state.environment_steps >= next_checkpoint
                 if crossed_evaluation or crossed_checkpoint:
                     maintenance_requested = True
@@ -1039,48 +1366,33 @@ def run_training(
                 resources.publish_collector_policy()
                 pipeline.set_paused_policy_version(state.policy_version)
                 state = replace(state, actor_policy_version=state.policy_version)
-                for evaluation_step in config.runtime.evaluation_steps:
-                    if (
-                        evaluation_step <= state.environment_steps
-                        and evaluation_step not in completed_evaluations
-                    ):
-                        if config.runtime.evaluation_episodes > 0:
-                            evaluation_results, summary = _evaluate_training_gate(
-                                resources,
-                                episodes=config.runtime.evaluation_episodes,
-                                base_seed=config.runtime.seed,
-                                journal_path=(
-                                    run_log_root
-                                    / f"evaluation-step-{evaluation_step:09d}.jsonl"
-                                ),
-                                backend_factory=recovery_backend_factory,
-                            )
-                            state = replace(
-                                state,
-                                evaluation_episodes=(
-                                    state.evaluation_episodes
-                                    + config.runtime.evaluation_episodes
-                                ),
-                                maximum_observed_candidates=max(
-                                    state.maximum_observed_candidates,
-                                    *(
-                                        item.maximum_observed_candidates
-                                        for item in evaluation_results
-                                    ),
-                                ),
-                            )
-                            metrics.write(
-                                "evaluation",
-                                {
-                                    "environment_steps": state.environment_steps,
-                                    "evaluation_gate": evaluation_step,
-                                    "run_maximum_observed_candidates": (
-                                        state.maximum_observed_candidates
-                                    ),
-                                    **summary,
-                                },
-                            )
-                        completed_evaluations.add(evaluation_step)
+                evaluation_guard_stop = run_due_evaluations()
+                if evaluation_guard_stop is not None:
+                    checkpoint = _save(
+                        resources,
+                        config=config,
+                        state=state,
+                        checkpoint_root=checkpoint_root / f"run-{run_id}",
+                        prefix="guard-stop",
+                        parent_checkpoint=parent_checkpoint,
+                        run_id=run_id,
+                        load_mode=load_mode,
+                        actor_supervisor_state=pipeline.supervisor_state,
+                    )
+                    parent_checkpoint = checkpoint
+                    load_mode = "in_process_successor"
+                    metrics.write(
+                        "evaluation_guard_stopped",
+                        {
+                            **evaluation_guard_stop,
+                            "checkpoint": str(checkpoint),
+                            "state": asdict(state),
+                        },
+                    )
+                    maintenance_requested = False
+                    pipeline.stop()
+                    pending_batch = ()
+                    break
                 if state.environment_steps >= next_checkpoint:
                     checkpoint = _save(
                         resources,
@@ -1139,48 +1451,8 @@ def run_training(
             )
             pipeline.release_episode_boundary()
         resources.publish_collector_policy()
-        for evaluation_step in config.runtime.evaluation_steps:
-            if (
-                evaluation_step <= state.environment_steps
-                and evaluation_step not in completed_evaluations
-            ):
-                if config.runtime.evaluation_episodes > 0:
-                    evaluation_results, summary = _evaluate_training_gate(
-                        resources,
-                        episodes=config.runtime.evaluation_episodes,
-                        base_seed=config.runtime.seed,
-                        journal_path=(
-                            run_log_root
-                            / f"evaluation-step-{evaluation_step:09d}.jsonl"
-                        ),
-                        backend_factory=recovery_backend_factory,
-                    )
-                    state = replace(
-                        state,
-                        evaluation_episodes=(
-                            state.evaluation_episodes
-                            + config.runtime.evaluation_episodes
-                        ),
-                        maximum_observed_candidates=max(
-                            state.maximum_observed_candidates,
-                            *(
-                                item.maximum_observed_candidates
-                                for item in evaluation_results
-                            ),
-                        ),
-                    )
-                    metrics.write(
-                        "evaluation",
-                        {
-                            "environment_steps": state.environment_steps,
-                            "evaluation_gate": evaluation_step,
-                            "run_maximum_observed_candidates": (
-                                state.maximum_observed_candidates
-                            ),
-                            **summary,
-                        },
-                    )
-                completed_evaluations.add(evaluation_step)
+        if evaluation_guard_stop is None:
+            evaluation_guard_stop = run_due_evaluations()
         state = replace(state, actor_policy_version=state.policy_version)
         final_checkpoint = _save(
             resources,
@@ -1195,7 +1467,16 @@ def run_training(
         )
         metrics.write(
             "run_complete",
-            {"checkpoint": str(final_checkpoint), **asdict(state)},
+            {
+                "checkpoint": str(final_checkpoint),
+                "completion_status": (
+                    "evaluation_guard_stopped"
+                    if evaluation_guard_stop is not None
+                    else "horizon_complete"
+                ),
+                "evaluation_guard_stop": evaluation_guard_stop,
+                **asdict(state),
+            },
         )
         return state
     except KeyboardInterrupt:

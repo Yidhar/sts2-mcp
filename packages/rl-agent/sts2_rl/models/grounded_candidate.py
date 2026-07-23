@@ -491,6 +491,16 @@ class RecurrentCandidateOutput:
     recurrent_state: Tensor  # [B, H]
     candidate_embeddings: Tensor  # [B, A, D]
     policy_logits: Tensor  # [B, A], invalid candidates use dtype minimum
+    # Stable semantic action-branch identity for the two-stage policy.  The
+    # grounded encoder's candidate role is ``model_action_kind`` optionally
+    # refined by ``model_action_variant``.  Examples are ``play_card``,
+    # ``end_turn``, ``reward``, ``proceed``, and the distinct
+    # ``card_selection:{select,deselect,confirm,cancel_prompt}`` branches.
+    #
+    # This tensor is an output/runtime ABI only; it adds no learned parameter
+    # and therefore preserves the complete state_dict tensor ABI.
+    policy_branch_ids: Tensor  # [B, A] integer
+    policy_branch_count: int
     value: Tensor  # [B]
     # Candidate-independent state values at the three learning boundaries.
     # ``value`` above remains the legacy online-V-trace ABI; these heads are
@@ -547,8 +557,24 @@ class RecurrentCandidateOutput:
             )
         candidate_shape = (batch_size, action_count)
         _require_shape("output.policy_logits", self.policy_logits, candidate_shape)
+        _require_shape(
+            "output.policy_branch_ids",
+            self.policy_branch_ids,
+            candidate_shape,
+        )
         _require_shape("output.action_mask", self.action_mask, candidate_shape)
         _require_bool("output.action_mask", self.action_mask)
+        if (
+            isinstance(self.policy_branch_count, bool)
+            or not isinstance(self.policy_branch_count, int)
+            or self.policy_branch_count <= 0
+        ):
+            raise ValueError("output.policy_branch_count must be a positive integer")
+        _require_ids(
+            "output.policy_branch_ids",
+            self.policy_branch_ids,
+            self.policy_branch_count,
+        )
 
         floating_outputs = (
             ("world_latents", self.world_latents),
@@ -561,6 +587,11 @@ class RecurrentCandidateOutput:
             _require_finite_floating(f"output.{name}", value)
             _require_same_device(f"output.{name}", self.state_embedding, value)
         _require_same_device("output.action_mask", self.state_embedding, self.action_mask)
+        _require_same_device(
+            "output.policy_branch_ids",
+            self.state_embedding,
+            self.policy_branch_ids,
+        )
 
         for name, value in (
             ("value", self.value),
@@ -612,24 +643,227 @@ class RecurrentCandidateOutput:
 
         return batch_size, action_count
 
-    def policy_probabilities(self) -> Tensor:
-        """Return float32 masked probabilities; all-invalid rows are all zero.
+    def _policy_components(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Return hierarchical policy terms without candidate-count bias.
 
-        Keeping the public probability surface in float32 prevents valid but
-        small probabilities from underflowing when logits originate from an
-        fp16/bfloat16 inference path.
+        A flat candidate softmax makes one singleton branch compete with every
+        concrete member of a many-candidate branch.  In deterministic mode this
+        can select ``end_turn`` over a collectively preferred set of playable
+        cards simply because the play probability is divided among cards.  The
+        same pathology exists for ``proceed`` versus multiple reward claims.
+
+        The policy is instead factorized as::
+
+            p(action) = p(semantic_branch) * p(action | semantic_branch)
+
+        A branch logit is the log-mean-exp of its legal candidate logits.  The
+        mean, rather than sum, prevents the number of equivalent/near-equivalent
+        candidates from automatically increasing branch probability.  Candidate
+        choice inside a branch remains a normal softmax over learned logits.
+
+        Returns ``(joint_log_p, branch_log_p, within_log_p, branch_counts)``.
+        Invalid candidate entries use ``-inf`` and all-invalid rows remain safe.
+        Everything is float32 so low-precision inference cannot underflow a
+        small but valid branch before the collector mixes epsilon exploration.
         """
 
         mask = self.action_mask.bool()
-        work_logits = self.policy_logits.float()
-        masked_logits = torch.where(mask, work_logits, torch.full_like(work_logits, -torch.inf))
-        row_max = masked_logits.amax(dim=-1, keepdim=True)
-        safe_max = torch.where(torch.isfinite(row_max), row_max, torch.zeros_like(row_max))
-        exp_logits = torch.where(mask, torch.exp(work_logits - safe_max), torch.zeros_like(work_logits))
-        denominator = exp_logits.sum(dim=-1, keepdim=True)
-        probabilities = exp_logits / denominator.clamp_min(torch.finfo(exp_logits.dtype).tiny)
-        probabilities = torch.where(denominator > 0.0, probabilities, torch.zeros_like(probabilities))
-        return probabilities
+        logits = self.policy_logits.float()
+        branch_ids = self.policy_branch_ids.long()
+        batch_size = int(logits.shape[0])
+        branch_shape = (batch_size, self.policy_branch_count)
+
+        counts = torch.zeros(
+            branch_shape,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        counts.scatter_add_(1, branch_ids, mask.to(dtype=logits.dtype))
+        branch_mask = counts > 0.0
+
+        masked_logits = torch.where(
+            mask,
+            logits,
+            torch.full_like(logits, -torch.inf),
+        )
+        branch_max = torch.full(
+            branch_shape,
+            -torch.inf,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        branch_max.scatter_reduce_(
+            1,
+            branch_ids,
+            masked_logits,
+            reduce="amax",
+            include_self=True,
+        )
+        safe_branch_max = torch.where(
+            branch_mask,
+            branch_max,
+            torch.zeros_like(branch_max),
+        )
+        candidate_branch_max = safe_branch_max.gather(1, branch_ids)
+        centered_exp = torch.where(
+            mask,
+            torch.exp(logits - candidate_branch_max),
+            torch.zeros_like(logits),
+        )
+        branch_exp_sum = torch.zeros_like(counts)
+        branch_exp_sum.scatter_add_(1, branch_ids, centered_exp)
+        branch_logsumexp = safe_branch_max + torch.log(
+            branch_exp_sum.clamp_min(torch.finfo(logits.dtype).tiny)
+        )
+        branch_logits = branch_logsumexp - torch.log(counts.clamp_min(1.0))
+        branch_logits = torch.where(
+            branch_mask,
+            branch_logits,
+            torch.full_like(branch_logits, -torch.inf),
+        )
+
+        branch_normalizer = torch.logsumexp(branch_logits, dim=-1, keepdim=True)
+        safe_branch_normalizer = torch.where(
+            torch.isfinite(branch_normalizer),
+            branch_normalizer,
+            torch.zeros_like(branch_normalizer),
+        )
+        branch_log_probabilities = torch.where(
+            branch_mask,
+            branch_logits - safe_branch_normalizer,
+            torch.full_like(branch_logits, -torch.inf),
+        )
+
+        candidate_branch_logsumexp = branch_logsumexp.gather(1, branch_ids)
+        within_log_probabilities = torch.where(
+            mask,
+            logits - candidate_branch_logsumexp,
+            torch.full_like(logits, -torch.inf),
+        )
+        joint_log_probabilities = torch.where(
+            mask,
+            branch_log_probabilities.gather(1, branch_ids)
+            + within_log_probabilities,
+            torch.full_like(logits, -torch.inf),
+        )
+        return (
+            joint_log_probabilities,
+            branch_log_probabilities,
+            within_log_probabilities,
+            counts,
+        )
+
+    def policy_log_probabilities(self) -> Tensor:
+        """Return the masked two-stage candidate log distribution."""
+
+        return self._policy_components()[0]
+
+    def policy_probabilities(self) -> Tensor:
+        """Return float32 hierarchical probabilities.
+
+        Valid rows sum to one. All-invalid rows contain only zeros.
+        """
+
+        log_probabilities = self.policy_log_probabilities()
+        return torch.where(
+            self.action_mask.bool(),
+            torch.exp(log_probabilities),
+            torch.zeros_like(log_probabilities),
+        )
+
+    def policy_branch_probabilities(self) -> Tensor:
+        """Return branch marginals, independent of within-branch cardinality."""
+
+        branch_log_probabilities = self._policy_components()[1]
+        return torch.where(
+            torch.isfinite(branch_log_probabilities),
+            torch.exp(branch_log_probabilities),
+            torch.zeros_like(branch_log_probabilities),
+        )
+
+    def greedy_action_indices(self) -> Tensor:
+        """Choose branch first, then the best candidate inside that branch.
+
+        Returning ``-1`` for an all-invalid row keeps the primitive total; the
+        collector already rejects such an environment state before dispatch.
+        This differs intentionally from ``argmax(policy_probabilities())``:
+        joint probability is divided among candidates inside a branch, whereas
+        deterministic hierarchical choice must honor the branch marginal.
+        """
+
+        _, branch_log_probabilities, _, _ = self._policy_components()
+        branch_valid = torch.isfinite(branch_log_probabilities)
+        selected_branch = branch_log_probabilities.argmax(dim=-1)
+        in_selected_branch = (
+            self.policy_branch_ids.long()
+            == selected_branch.unsqueeze(-1)
+        ) & self.action_mask.bool()
+        candidate_logits = torch.where(
+            in_selected_branch,
+            self.policy_logits.float(),
+            torch.full_like(self.policy_logits.float(), -torch.inf),
+        )
+        selected = candidate_logits.argmax(dim=-1)
+        return torch.where(
+            branch_valid.any(dim=-1),
+            selected,
+            torch.full_like(selected, -1),
+        )
+
+    def policy_entropy(self) -> Tensor:
+        """Return count-balanced hierarchical entropy for each batch row.
+
+        The branch entropy is conventional.  Conditional entropy is normalized
+        by ``log(candidate_count)`` before being averaged under branch
+        probability, so merely exposing more candidates in one semantic branch
+        cannot make that branch more attractive to the entropy objective.
+        """
+
+        (
+            _,
+            branch_log_probabilities,
+            within_log_probabilities,
+            counts,
+        ) = self._policy_components()
+        branch_probabilities = torch.where(
+            torch.isfinite(branch_log_probabilities),
+            torch.exp(branch_log_probabilities),
+            torch.zeros_like(branch_log_probabilities),
+        )
+        safe_branch_logs = torch.where(
+            torch.isfinite(branch_log_probabilities),
+            branch_log_probabilities,
+            torch.zeros_like(branch_log_probabilities),
+        )
+        branch_entropy = -(
+            branch_probabilities * safe_branch_logs
+        ).sum(dim=-1)
+
+        within_probabilities = torch.where(
+            self.action_mask.bool(),
+            torch.exp(within_log_probabilities),
+            torch.zeros_like(within_log_probabilities),
+        )
+        safe_within_logs = torch.where(
+            self.action_mask.bool(),
+            within_log_probabilities,
+            torch.zeros_like(within_log_probabilities),
+        )
+        candidate_entropy_terms = -within_probabilities * safe_within_logs
+        conditional_entropy = torch.zeros_like(counts)
+        conditional_entropy.scatter_add_(
+            1,
+            self.policy_branch_ids.long(),
+            candidate_entropy_terms,
+        )
+        conditional_entropy = torch.where(
+            counts > 1.0,
+            conditional_entropy / torch.log(counts.clamp_min(2.0)),
+            torch.zeros_like(conditional_entropy),
+        )
+        return branch_entropy + (
+            branch_probabilities * conditional_entropy
+        ).sum(dim=-1)
 
 
 def _make_transformer_stack(
@@ -1263,6 +1497,8 @@ class RecurrentCandidateModel(nn.Module):
             recurrent_state=next_recurrent_state,
             candidate_embeddings=policy_features,
             policy_logits=policy_logits,
+            policy_branch_ids=batch.candidates.role_ids,
+            policy_branch_count=self.config.role_vocab_size,
             value=self.value_head(next_recurrent_state).squeeze(-1),
             combat_task_value=self.combat_task_value_head(next_recurrent_state).squeeze(-1),
             act_task_value=self.act_task_value_head(next_recurrent_state).squeeze(-1),

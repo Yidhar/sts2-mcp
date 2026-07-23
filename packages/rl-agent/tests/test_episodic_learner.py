@@ -30,9 +30,36 @@ from sts2_rl.training.episode_replay import (
     ReplaySequence,
     backfill_completed_episode,
 )
-from sts2_rl.training.learner import VTraceLearner
+from sts2_rl.training.learner import (
+    VTraceLearner,
+    _annealed_entropy_weight,
+)
 
 CPU = torch.device("cpu")
+
+
+def test_entropy_weight_anneals_to_explicit_nonzero_floor() -> None:
+    config = OptimizationConfig(
+        entropy_weight=0.02,
+        entropy_weight_end=0.004,
+        entropy_decay_updates=2_000,
+    )
+
+    assert _annealed_entropy_weight(config, policy_version=0) == pytest.approx(
+        0.02
+    )
+    assert _annealed_entropy_weight(
+        config,
+        policy_version=1_000,
+    ) == pytest.approx(0.012)
+    assert _annealed_entropy_weight(
+        config,
+        policy_version=2_000,
+    ) == pytest.approx(0.004)
+    assert _annealed_entropy_weight(
+        config,
+        policy_version=20_000,
+    ) == pytest.approx(0.004)
 
 
 def _model_config(*, dropout: float = 0.0) -> GroundedCandidateConfig:
@@ -295,6 +322,25 @@ def test_failed_horizon_has_primary_value_but_no_revival_labels() -> None:
     assert losses.revival_policy_loss.detach().item() == 0.0
 
 
+def test_stale_episode_keeps_value_labels_but_suppresses_policy_gradient() -> None:
+    learner, encoding = _learner(learn_steps=1)
+    snapshot = _snapshot(encoding, domain_id=0)
+    episode = _episode((snapshot,), episode_id="stale-success", won=True)
+
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=(
+            learner.episodic_config.policy_gradient_max_lag + 1
+        ),
+    )
+
+    assert losses.policy_labels == 0
+    assert losses.policy_lag_suppressed_labels == 1
+    assert losses.task_value_labels == 2
+    assert losses.revival_value_labels == 2
+    assert losses.task_value_loss.detach().item() > 0.0
+
+
 def test_forced_singleton_trains_values_without_any_policy_label() -> None:
     learner, encoding = _learner(learn_steps=1)
     singleton = _snapshot(encoding, domain_id=0, singleton=True)
@@ -325,6 +371,39 @@ def test_forced_singleton_trains_values_without_any_policy_label() -> None:
         for name, parameter in learner.model.named_parameters()
         if name.startswith("run_task_value_head.")
     )
+
+
+def test_revival_value_log_observation_bounds_unlimited_revival_tail() -> None:
+    learner, encoding = _learner(learn_steps=1)
+    snapshot = _snapshot(encoding, domain_id=0, singleton=True)
+    episode = _episode(
+        (snapshot,),
+        episode_id="thousand-revival-success",
+        won=True,
+        final_revivals=1_000,
+        policy_decisions=(False,),
+    )
+
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=0,
+    )
+
+    assert losses.revival_value_labels == 2
+    assert torch.isfinite(losses.revival_value_loss)
+    # Raw-count smooth-L1 would be approximately one thousand here and dominate
+    # every shared representation gradient. The monotone log1p observation
+    # model keeps this auxiliary target on a single-digit scale.
+    assert 0.0 < float(losses.revival_value_loss.detach().item()) < 10.0
+    learner.model.zero_grad(set_to_none=True)
+    losses.total_loss.backward()
+    finite_gradients = [
+        parameter.grad
+        for parameter in learner.model.parameters()
+        if parameter.grad is not None
+    ]
+    assert finite_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in finite_gradients)
 
 
 def test_sparse_exact_burn_in_matches_full_split_recurrent_history() -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -15,7 +17,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v7"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v8"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -170,6 +172,11 @@ class OptimizationConfig:
     policy_weight: float = 1.0
     value_weight: float = 0.5
     entropy_weight: float = 0.01
+    # Entropy is annealed by learner update rather than dropped abruptly.
+    # A non-zero floor preserves exploration while allowing deterministic
+    # policy margins to emerge as factual liveness supervision accumulates.
+    entropy_weight_end: float = 0.01
+    entropy_decay_updates: int = 2_000
 
     def __post_init__(self) -> None:
         learning_rate = _require_finite_number(
@@ -183,6 +190,11 @@ class OptimizationConfig:
         _require_int(
             self.batch_unrolls,
             label="optimization.batch_unrolls",
+            minimum=1,
+        )
+        _require_int(
+            self.entropy_decay_updates,
+            label="optimization.entropy_decay_updates",
             minimum=1,
         )
         discount = _require_finite_number(
@@ -210,6 +222,7 @@ class OptimizationConfig:
             "policy_weight",
             "value_weight",
             "entropy_weight",
+            "entropy_weight_end",
         ):
             value = _require_finite_number(
                 getattr(self, name),
@@ -217,6 +230,10 @@ class OptimizationConfig:
             )
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative")
+        if self.entropy_weight_end > self.entropy_weight:
+            raise ValueError(
+                "entropy_weight_end cannot exceed entropy_weight"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +241,15 @@ class RolloutConfig:
     """Short-lived FIFO data plane; every unroll is consumed at most once."""
 
     unroll_length: int = 64
-    queue_capacity: int = 256
+    queue_capacity: int = 64
     minimum_unrolls: int = 8
     collector_workers: int = 1
     policy_sync_interval_unrolls: int = 8
-    max_policy_lag: int = 1_024
+    max_policy_lag: int = 64
+    # Every Nth training episode is collected greedily on the ordinary even
+    # training seed stream.  It remains training data and is never allowed to
+    # consume the odd validation or final-audit seed namespaces.
+    deterministic_probe_interval_episodes: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -244,6 +265,11 @@ class RolloutConfig:
                 label=f"rollout.{name}",
                 minimum=1,
             )
+        _require_int(
+            self.deterministic_probe_interval_episodes,
+            label="rollout.deterministic_probe_interval_episodes",
+            minimum=0,
+        )
         if self.minimum_unrolls > self.queue_capacity:
             raise ValueError("rollout minimum_unrolls cannot exceed queue_capacity")
         if self.collector_workers != 1:
@@ -356,6 +382,11 @@ class EpisodicLearningConfig:
     secondary_advantage_fraction: float = 0.25
     primary_success_tie_tolerance: float = 0.05
     importance_ratio_clip: float = 1.0
+    # Old complete episodes remain useful factual value targets, but their
+    # selected-action likelihood must not continue moving a much newer policy.
+    # The learner therefore keeps value supervision and suppresses only policy
+    # gradients whose behavior version exceeds this strict lag.
+    policy_gradient_max_lag: int = 128
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -367,6 +398,7 @@ class EpisodicLearningConfig:
             "max_segments_per_episode",
             "sample_sequences",
             "learn_steps",
+            "policy_gradient_max_lag",
         ):
             _require_int(
                 getattr(self, name),
@@ -516,6 +548,18 @@ class RuntimeConfig:
     checkpoint_interval_steps: int = 25_000
     evaluation_steps: tuple[int, ...] = (0, 10_000, 25_000, 50_000)
     evaluation_episodes: int = 20
+    # Lightweight repeated validation gates are explicitly separate from the
+    # larger evaluation schedule and from the never-reused final-audit seeds.
+    early_evaluation_steps: tuple[int, ...] = ()
+    early_evaluation_episodes: int = 0
+    final_audit_steps: tuple[int, ...] = ()
+    final_audit_episodes: int = 0
+    evaluation_liveness_guard_enabled: bool = False
+    evaluation_guard_min_confirm_ready: int = 8
+    evaluation_guard_min_multi_action_end_turn: int = 32
+    evaluation_guard_max_confirm_failure_rate: float = 0.95
+    evaluation_guard_max_multi_action_end_turn_rate: float = 0.75
+    evaluation_guard_max_selection_cycle_episode_rate: float = 0.75
 
     def __post_init__(self) -> None:
         for name in (
@@ -537,14 +581,78 @@ class RuntimeConfig:
             label="runtime.evaluation_episodes",
             minimum=0,
         )
-        if not isinstance(self.evaluation_steps, tuple):
-            object.__setattr__(self, "evaluation_steps", tuple(self.evaluation_steps))
-        previous = -1
-        for index, step in enumerate(self.evaluation_steps):
-            _require_int(step, label=f"runtime.evaluation_steps[{index}]", minimum=0)
-            if step <= previous:
-                raise ValueError("runtime.evaluation_steps must be strictly increasing")
-            previous = step
+        for name in (
+            "early_evaluation_episodes",
+            "final_audit_episodes",
+            "evaluation_guard_min_confirm_ready",
+            "evaluation_guard_min_multi_action_end_turn",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"runtime.{name}",
+                minimum=0,
+            )
+        if not isinstance(self.evaluation_liveness_guard_enabled, bool):
+            raise TypeError(
+                "runtime.evaluation_liveness_guard_enabled must be a boolean"
+            )
+        for name in (
+            "evaluation_steps",
+            "early_evaluation_steps",
+            "final_audit_steps",
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, tuple):
+                values = tuple(values)
+                object.__setattr__(self, name, values)
+            previous = -1
+            for index, step in enumerate(values):
+                _require_int(
+                    step,
+                    label=f"runtime.{name}[{index}]",
+                    minimum=0,
+                )
+                if step <= previous:
+                    raise ValueError(
+                        f"runtime.{name} must be strictly increasing"
+                    )
+                previous = step
+        if set(self.early_evaluation_steps) & set(self.evaluation_steps):
+            raise ValueError(
+                "runtime early_evaluation_steps and evaluation_steps must be disjoint"
+            )
+        if set(self.final_audit_steps) & (
+            set(self.early_evaluation_steps) | set(self.evaluation_steps)
+        ):
+            raise ValueError(
+                "runtime final_audit_steps must be disjoint from repeated validation"
+            )
+        if self.early_evaluation_steps and self.early_evaluation_episodes <= 0:
+            raise ValueError(
+                "runtime early_evaluation_steps require early_evaluation_episodes"
+            )
+        if self.final_audit_steps and self.final_audit_episodes <= 0:
+            raise ValueError(
+                "runtime final_audit_steps require final_audit_episodes"
+            )
+        if (
+            self.evaluation_liveness_guard_enabled
+            and not self.early_evaluation_steps
+        ):
+            raise ValueError(
+                "runtime evaluation liveness guard requires early evaluation gates"
+            )
+        for name in (
+            "evaluation_guard_max_confirm_failure_rate",
+            "evaluation_guard_max_multi_action_end_turn_rate",
+            "evaluation_guard_max_selection_cycle_episode_rate",
+        ):
+            _require_finite_number(
+                getattr(self, name),
+                label=f"runtime.{name}",
+                minimum=0.0,
+                maximum=1.0,
+            )
         if not isinstance(self.device, str) or not self.device.strip():
             raise TypeError("runtime.device must be a non-empty string")
         if not isinstance(self.collector_device, str) or not self.collector_device.strip():
@@ -559,7 +667,11 @@ class RuntimeConfig:
         validate_seed_budget(
             self.seed,
             maximum_training_episodes=self.total_environment_steps,
-            evaluation_episodes=self.evaluation_episodes,
+            evaluation_episodes=max(
+                self.evaluation_episodes,
+                self.early_evaluation_episodes,
+            ),
+            final_audit_episodes=self.final_audit_episodes,
         )
 
 
@@ -690,6 +802,13 @@ class TrainingConfig:
                 raise ValueError(
                     "episodic learning requires curriculum.reward_objective='run'"
                 )
+        if (
+            self.rollout.deterministic_probe_interval_episodes > 0
+            and not self.transaction_learning.enabled
+        ):
+            raise ValueError(
+                "deterministic liveness probes require transaction learning"
+            )
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("native revival preheat requires the headless backend")
@@ -702,6 +821,23 @@ class TrainingConfig:
 
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)
+
+    def fingerprint_sha256(self) -> str:
+        """Return a canonical identity for the complete effective config.
+
+        Unlike ``lineage_mapping()``, this includes observation-only schedules
+        and output paths.  Evaluation records use it to prove that two gates
+        were produced by the same fully resolved runtime configuration.
+        """
+
+        serialized = json.dumps(
+            self.to_mapping(),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def lineage_mapping(self) -> dict[str, Any]:
         """Return only immutable training semantics for exact-resume identity.
@@ -722,6 +858,16 @@ class TrainingConfig:
             "checkpoint_interval_steps",
             "evaluation_steps",
             "evaluation_episodes",
+            "early_evaluation_steps",
+            "early_evaluation_episodes",
+            "final_audit_steps",
+            "final_audit_episodes",
+            "evaluation_liveness_guard_enabled",
+            "evaluation_guard_min_confirm_ready",
+            "evaluation_guard_min_multi_action_end_turn",
+            "evaluation_guard_max_confirm_failure_rate",
+            "evaluation_guard_max_multi_action_end_turn_rate",
+            "evaluation_guard_max_selection_cycle_episode_rate",
         ):
             runtime.pop(key)
         return payload

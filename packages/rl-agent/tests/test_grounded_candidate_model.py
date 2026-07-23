@@ -142,6 +142,10 @@ def test_candidate_permutation_equivariance(config: GroundedCandidateConfig) -> 
     for actual, expected in (
         (permuted.candidate_embeddings, output.candidate_embeddings[:, permutation]),
         (permuted.policy_logits, output.policy_logits[:, permutation]),
+        (
+            permuted.policy_branch_ids,
+            output.policy_branch_ids[:, permutation],
+        ),
     ):
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
@@ -175,6 +179,129 @@ def test_all_masked_policy_is_safe(config: GroundedCandidateConfig) -> None:
     output = model(all_masked)
     assert torch.isfinite(output.policy_probabilities()).all()
     assert torch.count_nonzero(output.policy_probabilities()) == 0
+
+
+@pytest.mark.parametrize(
+    ("many_branch_label", "singleton_branch_label"),
+    [
+        ("play_card", "end_turn"),
+        ("claim_reward", "proceed"),
+    ],
+)
+def test_hierarchical_policy_does_not_turn_branch_cardinality_into_preference(
+    config: GroundedCandidateConfig,
+    many_branch_label: str,
+    singleton_branch_label: str,
+) -> None:
+    """Cloning an equal-score branch cannot change its branch marginal.
+
+    The labels document the two production failures this synthetic policy
+    surface covers.  Learned branch IDs are opaque integers at model runtime;
+    their semantic origin is validated by the grounded encoder tests.
+    """
+
+    del many_branch_label, singleton_branch_label
+    model = RecurrentCandidateModel(config).eval()
+    template = model(_make_batch(config))
+    many_branch = 2
+    singleton_branch = 5
+
+    two_candidates = replace(
+        template,
+        policy_logits=torch.tensor([[0.2, 0.2, 0.0]]),
+        policy_branch_ids=torch.tensor(
+            [[many_branch, many_branch, singleton_branch]],
+            dtype=torch.long,
+        ),
+        action_mask=torch.ones((1, 3), dtype=torch.bool),
+    )
+    four_candidates = replace(
+        template,
+        policy_logits=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.0]]),
+        policy_branch_ids=torch.tensor(
+            [
+                [
+                    many_branch,
+                    many_branch,
+                    many_branch,
+                    many_branch,
+                    singleton_branch,
+                ]
+            ],
+            dtype=torch.long,
+        ),
+        action_mask=torch.ones((1, 5), dtype=torch.bool),
+    )
+
+    two_marginal = two_candidates.policy_branch_probabilities()[0]
+    four_marginal = four_candidates.policy_branch_probabilities()[0]
+    torch.testing.assert_close(
+        two_marginal[[many_branch, singleton_branch]],
+        four_marginal[[many_branch, singleton_branch]],
+    )
+    assert two_marginal[many_branch] > two_marginal[singleton_branch]
+
+    # A joint candidate argmax still favors the singleton because the preferred
+    # branch's mass is divided among concrete actions. Deterministic dispatch
+    # must therefore use the explicit branch-first primitive.
+    assert int(two_candidates.policy_probabilities()[0].argmax().item()) == 2
+    assert int(four_candidates.policy_probabilities()[0].argmax().item()) == 4
+    assert int(two_candidates.greedy_action_indices()[0].item()) in {0, 1}
+    assert int(four_candidates.greedy_action_indices()[0].item()) in {
+        0,
+        1,
+        2,
+        3,
+    }
+    torch.testing.assert_close(
+        two_candidates.policy_entropy(),
+        four_candidates.policy_entropy(),
+    )
+
+
+def test_confirm_and_deselect_are_learned_distinct_branches_without_hard_coding(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+    template = model(_make_batch(config))
+    deselect_branch = 3
+    confirm_branch = 7
+    surface = replace(
+        template,
+        policy_logits=torch.tensor([[0.1, 0.4]]),
+        policy_branch_ids=torch.tensor(
+            [[deselect_branch, confirm_branch]],
+            dtype=torch.long,
+        ),
+        action_mask=torch.ones((1, 2), dtype=torch.bool),
+    )
+
+    assert int(surface.greedy_action_indices()[0].item()) == 1
+    reversed_surface = replace(
+        surface,
+        policy_logits=torch.tensor([[0.5, -0.2]]),
+    )
+    assert int(reversed_surface.greedy_action_indices()[0].item()) == 0
+
+
+def test_hierarchical_policy_adds_no_checkpoint_parameters(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+    before = {
+        key: value.detach().clone()
+        for key, value in model.state_dict().items()
+    }
+
+    output = model(_make_batch(config))
+    output.policy_probabilities()
+    output.policy_branch_probabilities()
+    output.greedy_action_indices()
+    output.policy_entropy()
+
+    assert set(model.state_dict()) == set(before)
+    for key, expected in before.items():
+        torch.testing.assert_close(model.state_dict()[key], expected)
 
 
 def test_world_encoding_and_state_values_do_not_read_candidates(
@@ -224,7 +351,11 @@ def test_multiscale_state_values_are_well_formed(
         "act_revival_cost_value",
         "run_revival_cost_value",
     ):
-        assert torch.all(getattr(output, field) >= 0.0)
+        value = getattr(output, field)
+        assert torch.all(value >= 0.0)
+        # Episodic learning uses a log1p observation model for the long-tailed
+        # factual count. The Softplus head support makes that transform total.
+        assert torch.isfinite(torch.log1p(value)).all()
 
 
 def test_output_validation_rejects_malformed_multiscale_value(

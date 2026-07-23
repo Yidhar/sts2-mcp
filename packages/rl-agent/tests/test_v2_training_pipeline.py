@@ -1522,7 +1522,45 @@ def test_async_pipeline_streams_fifo_data_and_finishes_exact_horizon() -> None:
         assert sum(item.metrics.steps for item in episodes) == 4
         assert [item.behavior_policy_version for item in episodes] == [0, 1]
         assert [item.actor_policy_version for item in episodes] == [0, 1]
+        assert [item.liveness_probe for item in episodes] == [False, False]
     finally:
+        resources.close()
+
+
+def test_async_pipeline_schedules_training_only_greedy_probe_every_n_episodes() -> None:
+    resources = build_training_resources(
+        _config(total_steps=4),
+        backend=FakeCombatBackend(),
+    )
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=4,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        starting_episode_count=0,
+        deterministic_probe_interval_episodes=2,
+        epsilon=lambda _: 0.75,
+    )
+    try:
+        pipeline.start()
+        episodes = []
+        while sum(item.metrics.steps for item in episodes) < 4:
+            episode = pipeline.next_episode(timeout=5.0)
+            assert episode is not None
+            episodes.append(episode)
+            pipeline.release_episode_boundary()
+        pipeline.join(timeout=10.0)
+
+        assert [item.liveness_probe for item in episodes] == [False, True]
+        assert resources.rollout_queue.put_count == 2
+        # Both episodes use the normal even training-seed partition.  The
+        # second is a deterministic epsilon-zero probe, not held-out
+        # validation data.
+        assert all(int(item.metrics.reset_seed) % 2 == 0 for item in episodes)
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
         resources.close()
 
 
@@ -1879,6 +1917,21 @@ def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
     finally:
         source.close()
 
+    checkpoint_reference = runtime_module._checkpoint_reference(
+        source_checkpoint
+    )
+    assert checkpoint_reference is not None
+    source_metadata = json.loads(
+        (source_checkpoint / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert (
+        checkpoint_reference["checkpoint_id"]
+        == source_metadata["checkpoint_id"]
+    )
+    assert checkpoint_reference["manifest_sha256"] == hashlib.sha256(
+        (source_checkpoint / "checkpoint.manifest.json").read_bytes()
+    ).hexdigest()
+
     state = run_training(
         config,
         backend=FakeCombatBackend(),
@@ -1955,12 +2008,19 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
 ) -> None:
     backend = FakeCombatBackend()
     resources = build_training_resources(_config(), backend=backend)
+    journal_path = tmp_path / "trajectory.jsonl"
+    context = {
+        "schema_version": "sts2-training-evaluation-context-v1",
+        "policy_version": 7,
+        "policy_model_state_sha256": "test-policy-digest",
+    }
     try:
         episodes, summary = evaluate_policy(
             resources,
             episodes=2,
             base_seed=6,
-            journal_path=tmp_path / "trajectory.jsonl",
+            journal_path=journal_path,
+            evaluation_context=context,
         )
         assert len(episodes) == 2
         assert summary["combat_win_rate"] == 1.0
@@ -1970,7 +2030,112 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         assert summary["maximum_observed_candidates"] == 2
         assert all(item.maximum_observed_candidates == 2 for item in episodes)
         assert all(int(seed) % 2 == 1 for seed in backend.reset_seeds)
-        assert (tmp_path / "trajectory.jsonl").read_text(encoding="utf-8")
+        assert summary["data_partition"] == "validation"
+        assert summary["evaluation_seeds"] == backend.reset_seeds
+        assert summary["epsilon"] == 0.0
+        assert summary["deterministic"] is True
+        assert len(resources.rollout_queue) == 0
+        journal_events = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+        start = journal_events[0]
+        assert start["event"] == "evaluation_started"
+        assert start["data_partition"] == "validation"
+        assert start["evaluation_seeds"] == backend.reset_seeds
+        assert start["epsilon"] == 0.0
+        assert start["deterministic"] is True
+        assert start["policy_version"] == 7
+        assert (
+            start["policy_model_state_sha256"]
+            == "test-policy-digest"
+        )
+    finally:
+        resources.close()
+
+
+def test_evaluation_context_distinguishes_initialization_from_updated_successor() -> None:
+    config = _config()
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        initial = runtime_module._evaluation_context(
+            resources,
+            config=config,
+            state=TrainingState(),
+            evaluation_gate=0,
+            gate_kind="validation",
+            parent_checkpoint=Path("source-checkpoint"),
+            load_mode="model_initialization",
+            runtime_provenance={"backend": "fake"},
+        )
+        assert (
+            initial["checkpoint_association"]["relation"]
+            == "model_parameter_initialization"
+        )
+
+        updated = runtime_module._evaluation_context(
+            resources,
+            config=config,
+            state=TrainingState(
+                environment_steps=5_000,
+                episodes=2,
+                policy_version=17,
+                actor_policy_version=17,
+            ),
+            evaluation_gate=5_000,
+            gate_kind="early_validation",
+            parent_checkpoint=Path("source-checkpoint"),
+            load_mode="model_initialization",
+            runtime_provenance={"backend": "fake"},
+        )
+        assert (
+            updated["checkpoint_association"]["relation"]
+            == "in_memory_successor"
+        )
+        assert updated["checkpoint_association"]["load_mode"] == "model_initialization"
+        assert updated["actual_environment_steps"] == 5_000
+        assert updated["policy_version"] == 17
+    finally:
+        resources.close()
+
+
+def test_final_audit_uses_never_reused_odd_namespace_and_no_replay(
+    tmp_path: Path,
+) -> None:
+    backend = FakeCombatBackend()
+    resources = build_training_resources(_config(), backend=backend)
+    journal_path = tmp_path / "final-audit.jsonl"
+    try:
+        episodes, summary = evaluate_policy(
+            resources,
+            episodes=1,
+            base_seed=6,
+            journal_path=journal_path,
+            data_partition="final_audit",
+        )
+
+        assert len(episodes) == 1
+        assert summary["data_partition"] == "final_audit"
+        assert summary["evaluation_seeds"] == backend.reset_seeds
+        assert backend.reset_seeds[0] % 2 == 1
+        assert backend.reset_seeds[0] > 100_000_000
+        assert len(resources.rollout_queue) == 0
+        records = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert records[0]["event"] == "evaluation_started"
+        assert records[0]["data_partition"] == "final_audit"
+        decision_episode_ids = {
+            str(item["episode_id"])
+            for item in records
+            if item.get("event") in {"decision", "decision_snapshot"}
+        }
+        assert decision_episode_ids
+        assert all(
+            episode_id.startswith("final-audit-seed-")
+            for episode_id in decision_episode_ids
+        )
     finally:
         resources.close()
 

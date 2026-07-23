@@ -721,7 +721,13 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v10"
+# V11 preserves every emitted tensor and feature slot from v10.  The version
+# bump records the policy-facing semantic ABI: candidate ``role_ids`` now drive
+# a count-balanced hierarchical branch distribution rather than a flat
+# candidate softmax.  Exact resume must not silently continue optimizer/replay
+# state across that behavior-policy change, while explicitly reviewed
+# model-parameter initialization remains shape compatible.
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v11"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -3080,7 +3086,32 @@ class GroundedObservationEncoder:
         target_lookup = _target_fact_lookup(observation)
         candidates: list[_Candidate] = []
         references: list[ActionReference] = []
+        # ``role_id`` is also the parameter-free policy branch ID. Hashing is
+        # still appropriate for embeddings, but two distinct co-occurring
+        # branch labels must never be silently merged into one probability
+        # marginal. Fail closed at the untrusted action boundary if the finite
+        # role vocabulary collides for this decision.
+        branch_labels_by_id: dict[int, str] = {}
         for group in action_groups:
+            branch_label = self._candidate_role_label(group.prototype)
+            branch_id = _hash_id(
+                "role",
+                branch_label,
+                self.config.role_vocab_size,
+            )
+            previous_branch_label = branch_labels_by_id.setdefault(
+                branch_id,
+                branch_label,
+            )
+            if previous_branch_label != branch_label:
+                raise ValueError(
+                    "co-occurring semantic action branches collide in the "
+                    "configured role vocabulary; refusing to merge policy "
+                    "marginals: "
+                    f"role_id={branch_id} "
+                    f"first={previous_branch_label!r} "
+                    f"second={branch_label!r}"
+                )
             candidate = self._candidate_token(
                 group.prototype,
                 target_lookup=target_lookup,
@@ -3273,28 +3304,8 @@ class GroundedObservationEncoder:
         target_lookup: Mapping[str, dict[str, Any]],
         multiplicity: int = 1,
     ) -> _Candidate:
-        raw_model_kind = action.get("model_action_kind")
-        if not isinstance(raw_model_kind, str) or not raw_model_kind.strip():
-            raise ValueError("legal action is missing non-empty model_action_kind")
-        kind = raw_model_kind.strip()
-        if kind not in MODEL_ACTION_KIND_VOCABULARY:
-            raise ValueError(f"unregistered model_action_kind: {kind!r}")
-        root_variant = _string_field(
-            action,
-            (
-                "model_action_variant",
-                "selection",
-                "character_id",
-                "option_id",
-                "room_model_id",
-                "run_mode_action",
-                "menu_action",
-                "shop_action",
-                "source",
-                "mode",
-            ),
-        )
-        role_label = f"{kind}:{root_variant}" if root_variant else kind
+        role_label = self._candidate_role_label(action)
+        kind = str(action["model_action_kind"]).strip()
         owner = _owner_label(action, ("candidate",), "neutral")
         roots = _candidate_local_roots(
             action,
@@ -3427,6 +3438,33 @@ class GroundedObservationEncoder:
             locals=tuple(locals_),
             enabled=enabled,
         )
+
+    @staticmethod
+    def _candidate_role_label(action: Mapping[str, Any]) -> str:
+        """Return the exact semantic branch label encoded into ``role_id``."""
+
+        raw_model_kind = action.get("model_action_kind")
+        if not isinstance(raw_model_kind, str) or not raw_model_kind.strip():
+            raise ValueError("legal action is missing non-empty model_action_kind")
+        kind = raw_model_kind.strip()
+        if kind not in MODEL_ACTION_KIND_VOCABULARY:
+            raise ValueError(f"unregistered model_action_kind: {kind!r}")
+        root_variant = _string_field(
+            action,
+            (
+                "model_action_variant",
+                "selection",
+                "character_id",
+                "option_id",
+                "room_model_id",
+                "run_mode_action",
+                "menu_action",
+                "shop_action",
+                "source",
+                "mode",
+            ),
+        )
+        return f"{kind}:{root_variant}" if root_variant else kind
 
     @staticmethod
     def _excluded(key: str, excluded: frozenset[str]) -> bool:
