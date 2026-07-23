@@ -24,7 +24,8 @@ Before `torch.load` or queue deserialization, preflight verifies:
 - pending `SequenceUnroll` types, versions, lengths, sparse snapshots, recurrent
   state width, behavior versions and queue capacity;
 - every enabled transaction/complete-episode replay payload, byte/capacity
-  contract, accounting counters and sampler RNG state;
+  contract, accounting counters, factual decision-surface labels and sampler
+  RNG state;
 - training/evaluation/policy/unroll counters; and
 - Python, NumPy, Torch CPU/CUDA and collector RNG/seed state.
 
@@ -103,21 +104,47 @@ be structurally valid and identical between its manifest and metadata. Their
 values may predate the active runtime because this operation starts a new task
 lineage; exact resume still requires them to equal the current runtime exactly.
 
-The learned-parameter configuration, grounded feature ABI, and strict state
-keys/shapes must match. Tensor-independent encoding capacities may change because
-they do not alter network parameter shapes. Initialization imports only
-`network.pt`, republishes it to the actor, and leaves optimizer, rollout queue,
-transaction replay, complete-episode replay, counters, collector/RNG state, and policy-version counters
-fresh. The first child checkpoint records a `model_parameter_initialization`
-parent relation plus the source contract, reward-fingerprint SHA-256, dependency
-locks, manifest hash, and metadata hash. Never edit an archived manifest to make
-it look current. A deliberate architecture or feature-encoding change starts
+The learned-parameter configuration and strict state keys/shapes must match.
+Tensor-independent encoding capacities may change because they do not alter
+network parameter shapes. A changed encoding identity is rejected unless its
+complete source and target identities match one reviewed model-only migration.
+The current reviewed list is v8-to-v10 and v9-to-v10; version prefixes,
+dimensions, or shape compatibility alone are not sufficient. These migrations
+reuse only network tensors because encoded observations, candidate indexes,
+behavior probabilities and replay payloads still belong to the source ABI.
+Exact resume never uses this exception.
+
+Initialization imports only `network.pt`, republishes it to the actor, and
+leaves optimizer, rollout queue, transaction replay, complete-episode replay,
+counters, collector/RNG state, and policy-version counters fresh. The first
+child checkpoint records a `model_parameter_initialization` parent relation
+plus the source contract, reward-fingerprint SHA-256, dependency locks,
+manifest hash, and metadata hash. Never edit an archived manifest to make it
+look current. An unreviewed architecture or feature-encoding change starts
 randomly; v1 remains unsupported. The one explicit architecture migration is a
 recognized v3 source that predates the long-horizon heads: all shared tensors
 must still match exactly, and the complete six-prefix combat/Act/run task and
-revival-cost head group remains freshly initialized. A partial group is rejected.
-This operation always creates a fresh lineage and can never masquerade as exact
-resume.
+revival-cost head group remains freshly initialized. A partial group is
+rejected. This operation always creates a fresh lineage and can never
+masquerade as exact resume.
+
+## Observation-v2/macro-credit v19 initialization
+
+The v19 preheat lineage uses config v7, grounded encoding v10 and
+complete-episode replay v3. Its reviewed source is the immutable v18 checkpoint
+whose metadata records policy version 3,936:
+
+```bash
+bash scripts/train_preheat_wsl_rocm.sh \
+  --initialize-from "<V18_POLICY_3936_CHECKPOINT>"
+```
+
+This is a model-only initialization. The v18 network parameters are checked
+before import, while v19 starts from environment step zero with a fresh
+optimizer, FIFO queue, transaction replay, macro-stratified complete-episode
+replay, RNG stream, actor/learner counters and policy-version counter. Do not
+substitute `--resume`; config, encoding and replay semantics changed, so an
+exact continuation would be false provenance.
 
 ## Operational verification
 

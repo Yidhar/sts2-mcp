@@ -1,0 +1,228 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index a1047cd..a2bcbf6 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -60,7 +60,12 @@ public static class FullRunApiStateBuilder
+ 				act = snapshot.CurrentActIndex + 1,
+ 				floor = snapshot.TotalFloor,
+ 				room_type = snapshot.RoomType,
+-				room_model_id = snapshot.RoomModelId
++				room_model_id = snapshot.RoomModelId,
++				next_boss_id = runState == null
++					? null
++					: SafeValue<string?>(
++						() => runState.Act.PullNextEncounter(RoomType.Boss).Id.Entry,
++						null)
+ 			},
+ 			legal_actions = snapshot.LegalActions.Select(ToApiAction).ToList()
+ 		};
+@@ -77,6 +82,24 @@ public static class FullRunApiStateBuilder
+ 				state.map = new FullRunApiMapState
+ 				{
+ 					player = GetPlayerState(),
++					current_coord = runState?.CurrentMapCoord is { } currentCoord
++						? new FullRunApiMapCoord
++						{
++							col = currentCoord.col,
++							row = currentCoord.row
++						}
++						: null,
++					nodes = snapshot.MapNodes.Select(static node => new FullRunApiMapNode
++					{
++						col = node.Col,
++						row = node.Row,
++						point_type = node.PointType,
++						children = node.Children.Select(static child => new FullRunApiMapCoord
++						{
++							col = child.Col,
++							row = child.Row
++						}).ToList()
++					}).ToList(),
+ 					next_options = snapshot.MapOptions.Select(static option => new FullRunApiMapOption
+ 					{
+ 						index = option.Index,
+@@ -90,7 +113,7 @@ public static class FullRunApiStateBuilder
+ 				state.@event = BuildEventState(runState?.CurrentRoom as EventRoom, GetPlayerState());
+ 				break;
+ 			case "rest_site":
+-				state.rest_site = BuildRestSiteState(GetPlayerState());
++				state.rest_site = BuildRestSiteState(player, GetPlayerState());
+ 				break;
+ 			case "shop":
+ 				state.shop = BuildShopState(runState?.CurrentRoom as MerchantRoom, GetPlayerState());
+@@ -305,20 +328,27 @@ public static class FullRunApiStateBuilder
+ 		return state;
+ 	}
+ 
+-	private static FullRunApiRestSiteState BuildRestSiteState(FullRunApiPlayerState playerState)
++	private static FullRunApiRestSiteState BuildRestSiteState(
++		Player? player,
++		FullRunApiPlayerState playerState)
+ 	{
+ 		IReadOnlyList<RestSiteOption> options = RunManager.Instance.RestSiteSynchronizer.GetLocalOptions();
+ 		return new FullRunApiRestSiteState
+ 		{
+ 			player = playerState,
+ 			can_proceed = options.Count == 0,
+-			options = options.Select(static (option, index) => new FullRunApiRestSiteOption
++			options = options.Select((option, index) => new FullRunApiRestSiteOption
+ 			{
+ 				index = index,
+ 				id = option.OptionId.ToString(),
+ 				name = SafeGetText(() => option.Title),
+ 				description = SafeGetText(() => option.Description),
+-				is_enabled = option.IsEnabled
++				is_enabled = option.IsEnabled,
++				heal_amount = player != null && option is HealRestSiteOption
++					? SafeValue<decimal?>(
++						() => HealRestSiteOption.GetHealAmount(player),
++						null)
++					: null
+ 			}).ToList()
+ 		};
+ 	}
+@@ -342,7 +372,9 @@ public static class FullRunApiStateBuilder
+ 			{
+ 				index = index++,
+ 				cost = entry.Cost,
++				price = entry.Cost,
+ 				can_afford = entry.EnoughGold,
++				is_affordable = entry.EnoughGold,
+ 				is_stocked = entry.IsStocked,
+ 				description = GetMerchantEntryDescription(entry)
+ 			};
+@@ -357,7 +389,11 @@ public static class FullRunApiStateBuilder
+ 					item.card_rarity = cardEntry.CreationResult?.Card.Rarity.ToString();
+ 					item.card_description = cardEntry.CreationResult == null ? null : GetCardDescription(cardEntry.CreationResult.Card);
+ 					item.on_sale = cardEntry.IsOnSale;
++					item.is_on_sale = cardEntry.IsOnSale;
+ 					item.keywords = cardEntry.CreationResult?.Card.Keywords.Select(static keyword => keyword.ToString()).ToList() ?? new List<string>();
++					item.card = cardEntry.CreationResult == null
++						? null
++						: ToApiCardOption(cardEntry.CreationResult.Card, item.index);
+ 					break;
+ 				case MerchantRelicEntry relicEntry:
+ 					item.category = "relic";
+@@ -365,6 +401,9 @@ public static class FullRunApiStateBuilder
+ 					item.relic_id = relicEntry.Model?.Id.Entry;
+ 					item.relic_name = SafeGetText(() => relicEntry.Model?.Title);
+ 					item.relic_description = SafeGetText(() => relicEntry.Model?.DynamicDescription);
++					item.relic = relicEntry.Model == null
++						? null
++						: ToApiRelicOption(relicEntry.Model, item.index);
+ 					break;
+ 				case MerchantPotionEntry potionEntry:
+ 					item.category = "potion";
+@@ -372,6 +411,9 @@ public static class FullRunApiStateBuilder
+ 					item.potion_id = potionEntry.Model?.Id.Entry;
+ 					item.potion_name = SafeGetText(() => potionEntry.Model?.Title);
+ 					item.potion_description = SafeGetText(() => potionEntry.Model?.DynamicDescription);
++					item.potion = potionEntry.Model == null
++						? null
++						: ToApiPotionState(potionEntry.Model, item.index, canUseInCombat: false);
+ 					break;
+ 				case MerchantCardRemovalEntry:
+ 					item.category = "card_removal";
+@@ -382,6 +424,7 @@ public static class FullRunApiStateBuilder
+ 					item.name = GetMerchantEntryName(entry);
+ 					break;
+ 			}
++			item.type = item.category;
+ 			state.items.Add(item);
+ 		}
+ 		return state;
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+index cb76361..c1bbd95 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+@@ -68,6 +68,10 @@ public sealed class FullRunApiRun
+ 	public string? room_type { get; set; }
+ 
+ 	public string? room_model_id { get; set; }
++
++	// The next boss encounter currently shown by the game's map/top-bar UI.
++	// This is authoritative visible information, not a prediction.
++	public string? next_boss_id { get; set; }
+ }
+ 
+ public sealed class FullRunApiPower
+@@ -575,10 +579,32 @@ public sealed class FullRunApiMapOption
+ 	public string? point_type { get; set; }
+ }
+ 
++public sealed class FullRunApiMapCoord
++{
++	public int col { get; set; }
++
++	public int row { get; set; }
++}
++
++public sealed class FullRunApiMapNode
++{
++	public int col { get; set; }
++
++	public int row { get; set; }
++
++	public string? point_type { get; set; }
++
++	public List<FullRunApiMapCoord> children { get; set; } = new List<FullRunApiMapCoord>();
++}
++
+ public sealed class FullRunApiMapState
+ {
+ 	public FullRunApiPlayerState player { get; set; } = new FullRunApiPlayerState();
+ 
++	public FullRunApiMapCoord? current_coord { get; set; }
++
++	public List<FullRunApiMapNode> nodes { get; set; } = new List<FullRunApiMapNode>();
++
+ 	public List<FullRunApiMapOption> next_options { get; set; } = new List<FullRunApiMapOption>();
+ }
+ 
+@@ -679,6 +705,10 @@ public sealed class FullRunApiRestSiteOption
+ 	public string? description { get; set; }
+ 
+ 	public bool is_enabled { get; set; }
++
++	// Authoritative hook-adjusted heal preview. Null for non-heal options or
++	// when the runtime cannot safely obtain the value.
++	public decimal? heal_amount { get; set; }
+ }
+ 
+ public sealed class FullRunApiRestSiteState
+@@ -696,14 +726,22 @@ public sealed class FullRunApiShopItem
+ 
+ 	public string? category { get; set; }
+ 
++	public string? type { get; set; }
++
+ 	public int cost { get; set; }
+ 
++	public int price { get; set; }
++
+ 	public bool can_afford { get; set; }
+ 
++	public bool is_affordable { get; set; }
++
+ 	public bool is_stocked { get; set; }
+ 
+ 	public bool on_sale { get; set; }
+ 
++	public bool is_on_sale { get; set; }
++
+ 	public string? name { get; set; }
+ 
+ 	public string? description { get; set; }
+@@ -731,6 +769,12 @@ public sealed class FullRunApiShopItem
+ 	public string? potion_description { get; set; }
+ 
+ 	public List<string> keywords { get; set; } = new List<string>();
++
++	public FullRunApiCardOption? card { get; set; }
++
++	public FullRunApiRelicOption? relic { get; set; }
++
++	public FullRunApiPotionState? potion { get; set; }
+ }
+ 
+ public sealed class FullRunApiShopState

@@ -51,29 +51,44 @@ _LONG_HORIZON_HEAD_PREFIXES = (
 )
 
 # Exact resume always requires the complete active encoding identity.  Model
-# parameter initialization has one deliberately narrower exception: v9 added
-# strict equivalence grouping for card-selection candidates while preserving
-# every v8 feature slot, every model input tensor dimension, and every learned
-# parameter shape.  The sole new input lives in the formerly unused feature
-# slot 214.  Queue/replay action indexes and behavior probabilities do change
-# meaning, so this exception is valid only for the model-only path.
+# parameter initialization has deliberately narrow legacy exceptions.  V9
+# added strict equivalence grouping for card-selection candidates while
+# preserving every v8 input tensor dimension and learned parameter shape.  V10
+# adds only newly exposed factual macro entities and uses existing feature
+# slots; it likewise changes no tensor or parameter shape.  Queue/replay action
+# indexes, encoded snapshots, and behavior probabilities still belong to their
+# source ABI, so these exceptions are valid only for the model-only path.
 #
 # Keep both sides as complete, immutable identities rather than accepting a
 # version prefix or dimensions alone.  Any later encoder edit changes the
 # fingerprint and fails closed until it receives a separately reviewed entry.
-_STRICT_CARD_SELECTION_GROUPING_ENCODING_MIGRATION = (
-    {
-        "version": "grounded-relational-runtime-encoding-v8",
-        "min_token_feature_dim": 224,
-        "feature_abi_end": 214,
-        "fingerprint_sha256": "8bc0204fe3201871cf3bdb3be39deaac9cc1b02f830ac2ba72d3e29bef0ddf58",
-    },
-    {
-        "version": "grounded-relational-runtime-encoding-v9",
-        "min_token_feature_dim": 224,
-        "feature_abi_end": 215,
-        "fingerprint_sha256": "a953c6a01cd0ae85e77f0916ee6f072f7a97a59cbfdae6967003f9e8894dba1b",
-    },
+_V8_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v8",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 214,
+    "fingerprint_sha256": "8bc0204fe3201871cf3bdb3be39deaac9cc1b02f830ac2ba72d3e29bef0ddf58",
+}
+_V9_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v9",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": "a953c6a01cd0ae85e77f0916ee6f072f7a97a59cbfdae6967003f9e8894dba1b",
+}
+_V10_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v10",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": "4caae6f3c6baafb31ce476615776e22cdea2e6073ee7b4893247a4ffef2e524f",
+}
+_REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
+    (
+        _V8_ENCODING_IDENTITY,
+        _V10_ENCODING_IDENTITY,
+    ),
+    (
+        _V9_ENCODING_IDENTITY,
+        _V10_ENCODING_IDENTITY,
+    ),
 )
 
 
@@ -506,8 +521,9 @@ def _validate_encoding_contract(
     Exact continuation may never cross a changed decision space: queued
     ``action_index`` values, behavior probabilities, transaction replay and
     recurrent state all belong to the source encoder.  Explicit model
-    parameter initialization may cross only the one reviewed v8 -> v9
-    migration whose existing feature slots and parameter tensors are stable.
+    parameter initialization may cross only the explicitly reviewed legacy ->
+    v10 migrations whose existing feature slots and parameter tensors are
+    stable.
     Shape-compatible but otherwise unknown encoders remain rejected.
     """
 
@@ -515,7 +531,10 @@ def _validate_encoding_contract(
     if source == target:
         return
     migration = (source, target)
-    if model_only and migration == _STRICT_CARD_SELECTION_GROUPING_ENCODING_MIGRATION:
+    if model_only and any(
+        migration == reviewed
+        for reviewed in _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS
+    ):
         return
     if model_only:
         raise ValueError(

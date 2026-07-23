@@ -23,7 +23,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v6"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v7"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -39,6 +39,9 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.episodic_learning.sample_sequences == 2
     assert preheat.episodic_learning.burn_in_steps == 32
     assert preheat.episodic_learning.learn_steps == 32
+    assert preheat.episodic_learning.macro_sample_fraction == 0.5
+    assert default.episodic_learning.macro_sample_fraction == 0.0
+    assert combat.episodic_learning.macro_sample_fraction == 0.0
     assert preheat.episodic_learning.primary_success_tie_tolerance == 0.05
     assert (
         preheat.episodic_learning.sample_sequences
@@ -74,11 +77,11 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert combat.diagnostics.combat_net_progress_room_windows == {}
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
-    assert preheat.runtime.log_dir.endswith("v16-episodic-long-credit")
-    assert preheat.runtime.checkpoint_dir.endswith("v16-episodic-long-credit")
+    assert preheat.runtime.log_dir.endswith("v19-observation-v2-macro-credit")
+    assert preheat.runtime.checkpoint_dir.endswith(
+        "v19-observation-v2-macro-credit"
+    )
     assert preheat.runtime.checkpoint_interval_steps == 10_000
-    assert "episodic-long-credit" in preheat.runtime.log_dir
-    assert "episodic-long-credit" in preheat.runtime.checkpoint_dir
     assert default.runtime.log_dir.endswith("v9-long-horizon-heads")
     assert default.runtime.checkpoint_dir.endswith("v9-long-horizon-heads")
     assert combat.runtime.log_dir.endswith("v7-long-horizon-heads")
@@ -244,6 +247,14 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
         EpisodicLearningConfig(importance_ratio_clip=0.0)
     with pytest.raises(ValueError, match="task_value_weight"):
         EpisodicLearningConfig(task_value_weight=float("nan"))
+    with pytest.raises(TypeError, match="macro_sample_fraction"):
+        EpisodicLearningConfig(macro_sample_fraction=True)
+    with pytest.raises(ValueError, match="macro_sample_fraction"):
+        EpisodicLearningConfig(macro_sample_fraction=-0.01)
+    with pytest.raises(ValueError, match="macro_sample_fraction"):
+        EpisodicLearningConfig(macro_sample_fraction=1.01)
+    with pytest.raises(ValueError, match="macro_sample_fraction"):
+        EpisodicLearningConfig(macro_sample_fraction=float("nan"))
 
 
 def test_missing_episodic_section_uses_disabled_compatibility_defaults() -> None:
@@ -261,3 +272,14 @@ def test_episodic_learning_contract_is_part_of_lineage_identity() -> None:
         episodic_learning=replace(base.episodic_learning, enabled=True),
     )
     assert enabled.lineage_mapping() != base.lineage_mapping()
+    changed_sampling = replace(
+        base,
+        episodic_learning=replace(
+            base.episodic_learning,
+            macro_sample_fraction=0.5,
+        ),
+    )
+    assert changed_sampling.lineage_mapping() != base.lineage_mapping()
+    round_tripped = training_config_from_mapping(changed_sampling.to_mapping())
+    assert round_tripped.episodic_learning.macro_sample_fraction == 0.5
+    assert round_tripped == changed_sampling

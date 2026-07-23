@@ -15,7 +15,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v6"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v7"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -343,6 +343,12 @@ class EpisodicLearningConfig:
     sample_sequences: int = 2
     burn_in_steps: int = 32
     learn_steps: int = 32
+    # Complete runs contain far more combat actions than build/route/resource
+    # decisions.  This fraction reserves replay sequences for factual
+    # non-combat policy decisions, stratified by their observed decision
+    # surface.  It changes replay sampling only: no action is fabricated, no
+    # reward is rewritten, and the one-pass FIFO V-trace plane is untouched.
+    macro_sample_fraction: float = 0.0
     primary_policy_weight: float = 0.25
     task_value_weight: float = 0.25
     revival_value_weight: float = 0.10
@@ -371,6 +377,12 @@ class EpisodicLearningConfig:
             self.burn_in_steps,
             label="episodic_learning.burn_in_steps",
             minimum=0,
+        )
+        _require_finite_number(
+            self.macro_sample_fraction,
+            label="episodic_learning.macro_sample_fraction",
+            minimum=0.0,
+            maximum=1.0,
         )
         if self.per_episode_capacity_bytes > self.replay_capacity_bytes:
             raise ValueError(

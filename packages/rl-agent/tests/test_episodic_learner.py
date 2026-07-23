@@ -138,6 +138,9 @@ def _episode(
             revivals_after=final_revivals if index == len(snapshots) - 1 else 0,
             hp_loss_before=0.0,
             hp_loss_after=0.0,
+            decision_surface=(
+                "combat" if snapshot.domain_id == 1 else "other"
+            ),
             act_boundary=(
                 BoundaryOutcome.SUCCEEDED if won else BoundaryOutcome.FAILED
             )

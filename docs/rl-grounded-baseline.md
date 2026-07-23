@@ -7,7 +7,11 @@ checkpoints and metrics may be retained as failure evidence. The original v3
 line started from fresh random parameters. The v4 long-horizon successor may
 inherit only explicitly validated, shape-compatible shared network tensors from
 the selected v3 policy into a new lineage; it never calls that operation exact
-resume.
+resume. The current observation-v2/macro-credit campaign follows the same rule:
+the v19 lineage is initialized explicitly from the validated v18 checkpoint
+whose recorded policy version is 3,936. It inherits compatible network tensors
+only; it does not inherit the v18 optimizer, replay, RNG, counters, rollout
+queue, or claimed results.
 
 ## Scope
 
@@ -24,13 +28,15 @@ flowchart LR
     Unroll --> Queue["Bounded FIFO queue"]
     Queue --> Learner["V-trace actor/value learner"]
     Actor --> Episode["Detached complete episode"]
-    Episode --> EpisodeReplay["Byte-bounded CPU episode replay"]
+    Episode --> EpisodeReplay["Outcome + factual macro-stratified CPU replay"]
     EpisodeReplay --> Learner
     Learner --> Publish["Versioned policy publication"]
     Publish --> Actor
     Learner --> Checkpoint["Atomic v4 checkpoint"]
     Learner --> Eval["Fixed odd-seed evaluation"]
     Eval --> Journal["Diagnostic trajectory JSONL"]
+    Journal --> MacroTelemetry["Diagnostic macro exposure/entropy"]
+    Checkpoint -. read-only .-> MacroProbe["Label-free fixed sensitivity probes"]
 ```
 
 ## Model
@@ -65,7 +71,7 @@ The default contract is:
   transaction effect/delta/Q heads remain profile-controlled.
 
 The model-facing observation uses the versioned
-`grounded-relational-runtime-encoding-v8` contract together with the factual
+`grounded-relational-runtime-encoding-v10` contract together with the factual
 [`grounded-card-facts-encoding-v3`](./card-facts-abi.md) mechanics ABI. Card effects
 come from exact runtime `DynamicVar`, keyword, tag and lifecycle facts, not from
 description parsing or curated card rules. The default capacity is 2,048 world
@@ -73,7 +79,10 @@ tokens and 64 local tokens per candidate. Fact-identical copies in the permanent
 deck and public orderless combat piles share one exact counted variant, while
 hands, selections, candidates and distinct modified variants stay separate.
 Overflow is an error with exact structural diagnostics, never silent
-truncation. This encoder change invalidates every earlier checkpoint.
+truncation. The v10 producer/encoder additions do not change model tensor
+shapes, but they do change encoded observations and replay meaning. Exact resume
+therefore rejects older encodings; only the separately reviewed v8/v9-to-v10
+model-parameter initialization path may reuse their compatible network tensors.
 
 Candidate permutation must permute policy outputs in the same way while leaving
 the world encoding, recurrent state and value unchanged. Opaque dispatch handles
@@ -94,16 +103,21 @@ from unstable list positions:
 | potion to inventory slot | factual `slot_index` and potion zone |
 | card selection/multi-select | source/destination zone, membership, operation, counts and confirmation facts |
 | deck upgrade | original instance bound to its factual upgrade preview |
-| shop choice | exact shelf slot, nested item, price, stock and affordability facts |
-| rest choice | native option type/enabled state and exact heal amount when supplied by the game |
+| shop choice | authoritative sparse shelf slot; nested card/relic/potion runtime facts; price, stock, affordability and sale state |
+| rest choice | native option type/enabled state and nullable hook-adjusted heal amount supplied by the game |
 | reward choice | reward card/relic/potion identity and explicit add/skip mutation family |
-| map route | coordinate identities, point/room types and explicit directed edge tokens |
+| map route | current coordinate, every visible node and directed edge, point/room types and visible next-boss identity |
 | action consequence | only guaranteed immediate protocol mutation/resource facts; never predicted damage, draws, event results or future RNG |
 
 Draw-pile composition is player-inspectable and is encoded as a canonical
-unordered counted multiset; hidden draw order is never exposed. Active map/shop/rest,
-reward and selection surfaces are included only where decision-relevant so the
-interface does not serialize inactive UI trees on every combat action.
+unordered counted multiset; hidden draw order is never exposed. Active
+map/shop/rest, reward and selection surfaces are included only where
+decision-relevant so the interface does not serialize inactive UI trees on
+every combat action. Observation v2 exports current authoritative visible facts
+only. It has no hand-written deck-strength label, route score, expected future
+card pool, future shop, future outcome, or RNG lookahead; learning the
+relationship between current resources and legal choices remains the policy's
+job.
 
 ## Training data contract
 
@@ -134,6 +148,21 @@ are counted and rejected rather than evicting the entire corpus. Win, failure
 and censored episodes are sampled in rotating strata. Censored boundaries do
 not fabricate success or failure labels, and held-out evaluation never enters
 either training replay.
+
+Every complete-episode decision also records one factual decision-surface label
+derived from the runtime state/domain. `combat` is canonical for combat; other
+labels describe observed non-combat surfaces such as card reward, map, rest and
+shop. The label is replay-sampling metadata only: it is not a model feature,
+reward, preferred-action target, or fabricated counterfactual.
+
+The preheat profile sets `macro_sample_fraction = 0.5`. Of its two requested
+complete-episode sequences, up to one is therefore reserved for an exact
+observed non-combat policy decision. The reservation keeps the existing
+outcome-stratified episode order, admits at most one reserved segment per
+episode before later visits, and rotates toward the least-used available
+surface with randomized ties. The unreserved sequence retains the ordinary
+outcome-stratified coverage. A surface with no factual policy decision produces
+no synthetic sample, and the one-pass FIFO V-trace plane is unchanged.
 
 The learner may publish a new policy while a long episode is running, but the
 actor adopts it only after emitting a complete recurrent unroll. At episode end
@@ -412,6 +441,22 @@ trajectory journals.
 The native-revival preheat profile evaluates 12 fixed held-out seeds at step
 zero (including after model-parameter initialization) and at 30k/100k/250k.
 
+Macro diagnostics are deliberately label-free and read-only:
+
+- held-out journal aggregation reports card-reward/map/rest/shop exposure,
+  candidate-count histograms, selected/top action kinds and exact or bounded
+  normalized policy entropy; forced singleton transitions are excluded from
+  policy-concentration metrics;
+- a fixed paired probe suite keeps each legal-candidate tensor identical while
+  changing only visible world facts such as deck/floor, HP/topology, HP at rest,
+  or gold/deck at shop, then reports policy-distribution, logit, value and
+  embedding deltas without naming a preferred action.
+
+These reports emit zero training samples and never enter FIFO, transaction
+replay, complete-episode replay, rewards, or model targets. They measure whether
+macro information is exposed and whether a frozen policy responds to it; they
+do not by themselves establish that a response is strategically correct.
+
 ## Checkpoint ABI
 
 The format is `sts2-recurrent-vtrace-checkpoint-v4` and contains:
@@ -437,16 +482,24 @@ probed against independent temporary objects before live resources are mutated.
 Old checkpoints containing `replay_buffer.pkl` are rejected; there is no v1
 compatibility loader and a v3 checkpoint is not an exact-resume source for v4.
 
-`--initialize-from` is a different, explicit operation. When the learned tensor
-shapes and grounded feature ABI are unchanged, capacity/config changes such as
-`max_candidates = 96` to `256` may import the learner network into a fresh
-lineage. For an explicitly recognized v3 source, all six long-horizon head
-prefixes must be absent as one complete group; those target heads remain freshly
-initialized while every inherited tensor must match exactly by name, shape and
-dtype. Optimizer state, queued unrolls, RNGs, collector continuation, counters,
-both replay corpora and policy-version numbers are not imported. Child checkpoint provenance uses
-the `model_parameter_initialization` relation, so this cannot be confused with
-exact resume.
+`--initialize-from` is a different, explicit operation. When learned tensor
+shapes are unchanged, capacity/config changes such as `max_candidates = 96` to
+`256` may import the learner network into a fresh lineage. The only
+encoding-contract exceptions are complete, fingerprinted v8-to-v10 and
+v9-to-v10 identities; shape compatibility alone is insufficient. For an
+explicitly recognized v3 source, all six long-horizon head prefixes must be
+absent as one complete group; those target heads remain freshly initialized
+while every inherited tensor must match exactly by name, shape and dtype.
+Optimizer state, queued unrolls, RNGs, collector continuation, counters, both
+replay corpora and policy-version numbers are not imported. Child checkpoint
+provenance uses the `model_parameter_initialization` relation, so this cannot be
+confused with exact resume.
+
+Operationally, v19 observation-v2/macro-credit starts with
+`--initialize-from <V18_POLICY_3936_CHECKPOINT>`. The source remains an immutable
+v18 artifact and the child starts at step zero under config v7, encoding v10
+and complete-episode replay v3. Using `--resume` for that transition is
+incorrect and must fail closed.
 
 Checkpoint provenance describes the operation that actually produced each
 checkpoint. The first checkpoint of a process retains `fresh`, `exact_resume`,
@@ -481,6 +534,12 @@ python -m sts2_rl.train --profile preheat --sim-exe <PINNED_RELEASE_EXE>
 
 # Native-revival knowledge preheat (WSL/ROCm; refuses CPU fallback)
 wsl.exe -- bash -lc 'export STS2_ARTIFACT_ROOT=<WSL_ARTIFACT_ROOT>; cd <WSL_REPOSITORY_ROOT>/packages/rl-agent; bash scripts/train_preheat_wsl_rocm.sh'
+
+# Observation-v2/macro-credit successor from the validated v18 policy 3936
+wsl.exe -- bash -lc 'export STS2_ARTIFACT_ROOT=<WSL_ARTIFACT_ROOT>; cd <WSL_REPOSITORY_ROOT>/packages/rl-agent; bash scripts/train_preheat_wsl_rocm.sh --initialize-from "<V18_POLICY_3936_CHECKPOINT>"'
+
+# Read-only macro diagnostics (held-out journal, frozen checkpoint, or both)
+python -m sts2_rl.macro_evaluation --journal <HELD_OUT_JSONL> --checkpoint <ATOMIC_CHECKPOINT> --output <REPORT_JSON>
 
 # Main Act 1 baseline
 python -m sts2_rl.train --profile default --sim-exe <PINNED_RELEASE_EXE>

@@ -322,6 +322,50 @@ def evaluate_policy(
         resources.collector.load_state_dict(collector_state)
 
 
+def _evaluate_training_gate(
+    resources: TrainingResources,
+    *,
+    episodes: int,
+    base_seed: int,
+    journal_path: str | Path,
+    backend_factory: Callable[[], EnvironmentBackend] | None,
+) -> tuple[list[EpisodeMetrics], dict[str, Any]]:
+    """Evaluate one training gate and attach read-only macro diagnostics.
+
+    ``evaluate_policy`` remains the stable policy-evaluation API and publishes
+    the learner snapshot to the collector replica before collecting held-out
+    episodes. Once that call has closed its journal, this wrapper only reads
+    the journal and performs fixed, label-free paired forwards on the same
+    published collector replica. Neither diagnostic creates rollout/replay
+    records or mutates the learner, optimizer, recurrent collector state, or
+    model topology.
+    """
+
+    evaluation_results, scalar_summary = evaluate_policy(
+        resources,
+        episodes=episodes,
+        base_seed=base_seed,
+        journal_path=journal_path,
+        backend_factory=backend_factory,
+    )
+
+    # Keep macro evaluation out of the training module import graph. The
+    # diagnostic module also supports standalone checkpoint audits and imports
+    # checkpoint/config helpers from this package.
+    from sts2_rl.macro_evaluation import (
+        evaluate_macro_sensitivity,
+        read_macro_journal,
+    )
+
+    summary: dict[str, Any] = dict(scalar_summary)
+    summary["macro_surface_telemetry"] = read_macro_journal(journal_path)
+    summary["macro_policy_sensitivity"] = evaluate_macro_sensitivity(
+        resources.collector_model,
+        resources.encoder,
+    )
+    return evaluation_results, summary
+
+
 def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     """Validate the v2 config/model/encoder without launching a simulator."""
 
@@ -391,6 +435,9 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "sample_sequences": config.episodic_learning.sample_sequences,
             "burn_in_steps": config.episodic_learning.burn_in_steps,
             "learn_steps": config.episodic_learning.learn_steps,
+            "macro_sample_fraction": (
+                config.episodic_learning.macro_sample_fraction
+            ),
             "primary_policy_weight": (
                 config.episodic_learning.primary_policy_weight
             ),
@@ -586,7 +633,7 @@ def run_training(
             and state.environment_steps == 0
             and config.runtime.evaluation_episodes > 0
         ):
-            evaluation_results, summary = evaluate_policy(
+            evaluation_results, summary = _evaluate_training_gate(
                 resources,
                 episodes=config.runtime.evaluation_episodes,
                 base_seed=config.runtime.seed,
@@ -745,6 +792,9 @@ def run_training(
                     config.episodic_learning.sample_sequences,
                     learn_steps=config.episodic_learning.learn_steps,
                     burn_in_steps=config.episodic_learning.burn_in_steps,
+                    macro_sample_fraction=(
+                        config.episodic_learning.macro_sample_fraction
+                    ),
                 )
                 if resources.episodic_replay is not None
                 else ()
@@ -995,7 +1045,7 @@ def run_training(
                         and evaluation_step not in completed_evaluations
                     ):
                         if config.runtime.evaluation_episodes > 0:
-                            evaluation_results, summary = evaluate_policy(
+                            evaluation_results, summary = _evaluate_training_gate(
                                 resources,
                                 episodes=config.runtime.evaluation_episodes,
                                 base_seed=config.runtime.seed,
@@ -1095,7 +1145,7 @@ def run_training(
                 and evaluation_step not in completed_evaluations
             ):
                 if config.runtime.evaluation_episodes > 0:
-                    evaluation_results, summary = evaluate_policy(
+                    evaluation_results, summary = _evaluate_training_gate(
                         resources,
                         episodes=config.runtime.evaluation_episodes,
                         base_seed=config.runtime.seed,

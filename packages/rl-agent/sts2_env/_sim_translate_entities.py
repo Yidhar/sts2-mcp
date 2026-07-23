@@ -223,6 +223,23 @@ def _translate_combat_block(
 def _translate_map_block(map_state: Mapping[str, Any]) -> dict[str, Any]:
     translated = deepcopy(dict(map_state))
     translated.pop("player", None)
+    if "current_coord" in map_state:
+        raw_current = map_state.get("current_coord")
+        if raw_current is not None:
+            if not isinstance(raw_current, Mapping):
+                raise TypeError("simulator map current_coord must be a mapping")
+            x = raw_current.get("x", raw_current.get("col", raw_current.get("column")))
+            y = raw_current.get("y", raw_current.get("row"))
+            if (
+                isinstance(x, bool)
+                or not isinstance(x, int)
+                or isinstance(y, bool)
+                or not isinstance(y, int)
+            ):
+                raise TypeError(
+                    "simulator map current_coord must contain integer x/y or col/row"
+                )
+            translated["current_coord"] = {"x": x, "y": y}
     for field in ("next_options", "nodes", "points"):
         if field not in map_state:
             continue

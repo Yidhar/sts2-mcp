@@ -23,7 +23,10 @@ from sts2_rl.training import (
     run_training,
     summarize_evaluation,
 )
-from sts2_rl.training.collector import _noncombat_durable_projections
+from sts2_rl.training.collector import (
+    _episodic_decision_surface,
+    _noncombat_durable_projections,
+)
 from sts2_rl.training.episode_replay import BoundaryOutcome
 from tests.test_v2_training_pipeline import _config
 
@@ -302,6 +305,45 @@ def _run_config(
     )
 
 
+def test_decision_surface_uses_factual_state_identity_and_canonical_combat() -> None:
+    assert (
+        _episodic_decision_surface(
+            {
+                "state_type": " Card-Select ",
+                "screen": "SELECTION",
+                "decision_domain": "build",
+            },
+            combat_in_progress=False,
+        )
+        == "card_select"
+    )
+    assert (
+        _episodic_decision_surface(
+            {"screen": " SHOP SCREEN ", "decision_domain": "build"},
+            combat_in_progress=False,
+        )
+        == "shop_screen"
+    )
+    assert (
+        _episodic_decision_surface(
+            {"run": {"room_type": " Treasure-Room "}},
+            combat_in_progress=False,
+        )
+        == "treasure_room"
+    )
+    assert (
+        _episodic_decision_surface(
+            {"state_type": "map", "screen": "MAP"},
+            combat_in_progress=True,
+        )
+        == "combat"
+    )
+    assert (
+        _episodic_decision_surface({}, combat_in_progress=False)
+        == "noncombat"
+    )
+
+
 def test_streamed_full_run_backfills_boundaries_exact_costs_and_primary_reward() -> None:
     states = [
         _observation(act=0, floor=0, combat=False),
@@ -344,6 +386,15 @@ def test_streamed_full_run_backfills_boundaries_exact_costs_and_primary_reward()
     decisions = [step.decision for step in completed.steps]
     assert [step.policy_version for step in decisions] == [5, 5, 6, 6, 7, 7, 8]
     assert all(not step.policy_decision for step in decisions)
+    assert [step.decision_surface for step in decisions] == [
+        "map",
+        "map",
+        "combat",
+        "combat",
+        "map",
+        "map",
+        "combat",
+    ]
     assert episode.metrics.forced_decisions == 7
 
     assert decisions[0].act == 0

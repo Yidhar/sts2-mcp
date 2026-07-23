@@ -26,13 +26,14 @@ import torch
 
 from sts2_rl.checkpoints import validate_resume_checkpoint
 from sts2_rl.contracts import EnvironmentBackend
+from sts2_rl.macro_evaluation import read_macro_journal
 
 from .checkpointing import initialize_model_from_checkpoint, preflight_model_initialization
 from .config import TrainingConfig, training_config_from_mapping
 from .factory import build_backend, build_training_resources
 from .runtime import evaluate_policy
 
-_AUDIT_SCHEMA = "sts2-frozen-checkpoint-evaluation-v1"
+_AUDIT_SCHEMA = "sts2-frozen-checkpoint-evaluation-v2"
 
 
 def _device_request_uses_cuda(device: str) -> bool:
@@ -243,6 +244,7 @@ def _evaluate_checkpoint_policy_unprotected(
                 journal_path=staging_journal_path,
                 backend_factory=(None if backend is not None else lambda: build_backend(config)),
             )
+            macro_surface_telemetry = read_macro_journal(staging_journal_path)
             if len(resources.rollout_queue) != 0:
                 raise RuntimeError("evaluation unexpectedly populated the rollout queue")
         finally:
@@ -282,6 +284,7 @@ def _evaluate_checkpoint_policy_unprotected(
                 "journal": str(journal_path),
                 "episode_metrics": [asdict(item) for item in results],
                 "summary": summary,
+                "macro_surface_telemetry": macro_surface_telemetry,
             },
         }
         (staging_root / "evaluation.json").write_text(

@@ -17,7 +17,7 @@ current network from the sampled burn-in prefix.
 from __future__ import annotations
 
 import math
-from collections import deque
+from collections import Counter, deque
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import IntEnum
@@ -30,14 +30,16 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 
-# v2 broadens EpisodeCompletion.authoritative from native simulator
-# termination only to any reliably observed task outcome. In particular, a
-# bounded combat liveness failure can now label the full trajectory as a policy
-# failure. The version bump deliberately rejects exact resume of v1 replay
-# sidecars whose identical boolean carried narrower semantics.
-EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v2"
-EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v2"
+# v3 retains the v2 authoritative-outcome semantics and adds the factual
+# decision-surface label required to keep sparse build/route/resource decisions
+# visible in complete-episode replay sampling.  The label is diagnostics and
+# sampling metadata only; it is never a model feature or reward.  Exact resume
+# deliberately rejects v1/v2 replay sidecars because their decisions cannot be
+# surface-stratified without reconstructing discarded raw observations.
+EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v3"
+EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v3"
 COMBAT_DOMAIN_ID: Final = 1
+COMBAT_DECISION_SURFACE: Final = "combat"
 
 # Canonical logical payload widths used by ``storage_nbytes``.  As with
 # EncodedDecisionSnapshot.storage_nbytes(), Python/dataclass headers are not
@@ -218,6 +220,7 @@ class EpisodeDecisionStep:
     hp_loss_after: float
     combat_boundary: BoundaryOutcome = BoundaryOutcome.NONE
     act_boundary: BoundaryOutcome = BoundaryOutcome.NONE
+    decision_surface: str = "other"
 
     def __post_init__(self) -> None:
         _validate_snapshot_is_cpu_detached(self.snapshot)
@@ -251,6 +254,16 @@ class EpisodeDecisionStep:
             raise TypeError("act_boundary must be BoundaryOutcome")
         if self.combat_boundary is not BoundaryOutcome.NONE and self.combat_id is None:
             raise ValueError("a combat boundary requires a combat_id")
+        _key(self.decision_surface, label="episode decision_surface")
+        if self.snapshot.domain_id == COMBAT_DOMAIN_ID:
+            if self.decision_surface != COMBAT_DECISION_SURFACE:
+                raise ValueError(
+                    "combat episode decisions must use the canonical combat surface"
+                )
+        elif self.decision_surface == COMBAT_DECISION_SURFACE:
+            raise ValueError(
+                "non-combat episode decisions cannot claim the combat surface"
+            )
 
     @property
     def exact_revivals_delta(self) -> int:
@@ -264,7 +277,12 @@ class EpisodeDecisionStep:
         """Exact canonical payload bytes retained by this decision."""
 
         combat_key_bytes = 0 if self.combat_id is None else len(self.combat_id.encode("utf-8"))
-        return self.snapshot.storage_nbytes() + _DECISION_SCALAR_BYTES + combat_key_bytes
+        return (
+            self.snapshot.storage_nbytes()
+            + _DECISION_SCALAR_BYTES
+            + combat_key_bytes
+            + len(self.decision_surface.encode("utf-8"))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +790,95 @@ def _exact_recurrent_prefix(
     return tuple(episode.steps[index] for index in sorted(selected))
 
 
+def _replay_sequence(
+    episode: CompletedEpisode,
+    *,
+    learn_start: int,
+    learn_steps: int,
+    burn_in_steps: int,
+) -> ReplaySequence:
+    """Build one bounded learning suffix with exact split-memory burn-in."""
+
+    learn_end = min(len(episode.steps), learn_start + learn_steps)
+    prefix = _exact_recurrent_prefix(
+        episode,
+        learn_start=learn_start,
+        configured_burn_in_steps=burn_in_steps,
+    )
+    learning = episode.steps[learn_start:learn_end]
+    sequence_steps = prefix + learning
+    return ReplaySequence(
+        episode_id=episode.episode_id,
+        start_step=sequence_steps[0].step_index,
+        learn_start_step=learn_start,
+        steps=sequence_steps,
+        burn_in_steps=len(prefix),
+        configured_burn_in_steps=burn_in_steps,
+        source_episode_won=episode.won,
+        source_episode_authoritative=episode.completion.authoritative,
+    )
+
+
+def _macro_surface_candidates(
+    episodes: tuple[CompletedEpisode, ...],
+    *,
+    episode_order: tuple[int, ...],
+    rng: np.random.Generator,
+) -> tuple[tuple[int, int], ...]:
+    """Round-robin factual non-combat policy decisions by runtime surface.
+
+    One representative decision is first drawn for each episode/surface pair;
+    the least-used available surface then contributes at most one returned
+    candidate per episode.  That limit
+    preserves the replay-wide invariant that no episode receives a second
+    segment before other eligible episodes receive their first; the ordinary
+    outcome-stratified sampler may fill later quotas after the reserved macro
+    pass.  Surface order and in-surface decision indexes are shuffled, but the
+    source data remain exact observed training trajectories.
+    """
+
+    per_episode_candidates: dict[int, dict[str, int]] = {}
+    for episode_index in episode_order:
+        episode = episodes[episode_index]
+        per_surface: dict[str, list[int]] = {}
+        for step in episode.steps:
+            decision = step.decision
+            if (
+                not decision.policy_decision
+                or decision.snapshot.domain_id == COMBAT_DOMAIN_ID
+            ):
+                continue
+            per_surface.setdefault(decision.decision_surface, []).append(
+                step.step_index
+            )
+        if per_surface:
+            per_episode_candidates[episode_index] = {
+                surface: indexes[int(rng.integers(0, len(indexes)))]
+                for surface, indexes in per_surface.items()
+            }
+
+    # Preserve the already outcome-stratified episode order exactly.  Within
+    # that order, choose the least-used available surface (randomizing ties)
+    # so the reservation does not collapse onto whichever macro surface first
+    # appeared in an episode.
+    surface_counts: Counter[str] = Counter()
+    result: list[tuple[int, int]] = []
+    for episode_index in episode_order:
+        candidates = per_episode_candidates.get(episode_index)
+        if not candidates:
+            continue
+        minimum_count = min(surface_counts[surface] for surface in candidates)
+        least_used = tuple(
+            surface
+            for surface in candidates
+            if surface_counts[surface] == minimum_count
+        )
+        surface = least_used[int(rng.integers(0, len(least_used)))]
+        result.append((episode_index, candidates[surface]))
+        surface_counts[surface] += 1
+    return tuple(result)
+
+
 def _stratified_episode_order(
     episodes: tuple[CompletedEpisode, ...],
     *,
@@ -855,6 +962,7 @@ class BoundedEpisodicReplay:
         self._storage_nbytes = 0
         self._put_count = 0
         self._sample_count = 0
+        self._macro_sample_count = 0
         self._eviction_count = 0
         self._duplicate_count = 0
         self._oversize_count = 0
@@ -902,10 +1010,20 @@ class BoundedEpisodicReplay:
         *,
         learn_steps: int,
         burn_in_steps: int,
+        macro_sample_fraction: float = 0.0,
     ) -> tuple[ReplaySequence, ...]:
         _integer(maximum, label="episodic replay sample maximum", minimum=1)
         _integer(learn_steps, label="episodic replay learn_steps", minimum=1)
         _integer(burn_in_steps, label="episodic replay burn_in_steps")
+        macro_fraction = _finite(
+            macro_sample_fraction,
+            label="episodic replay macro_sample_fraction",
+            minimum=0.0,
+        )
+        if macro_fraction > 1.0:
+            raise ValueError(
+                "episodic replay macro_sample_fraction must be in [0, 1]"
+            )
         with self._lock:
             if not self._items:
                 return ()
@@ -920,38 +1038,79 @@ class BoundedEpisodicReplay:
                 choices[episode_index] = tuple(int(value) for value in selected)
 
             sequences: list[ReplaySequence] = []
-            for quota_index in range(self.max_segments_per_episode):
-                for episode_index in order:
-                    episode_choices = choices[episode_index]
-                    if quota_index >= len(episode_choices):
+            selected_starts: set[tuple[int, int]] = set()
+            per_episode_count = {index: 0 for index in order}
+            macro_limit = min(
+                maximum,
+                int(math.ceil(maximum * macro_fraction)),
+            )
+            macro_added = 0
+            if macro_limit:
+                for episode_index, decision_index in _macro_surface_candidates(
+                    episodes,
+                    episode_order=order,
+                    rng=self._rng,
+                ):
+                    if per_episode_count[episode_index] >= self.max_segments_per_episode:
                         continue
-                    episode = episodes[episode_index]
-                    learn_start = episode_choices[quota_index] * learn_steps
-                    learn_end = min(len(episode.steps), learn_start + learn_steps)
-                    prefix = _exact_recurrent_prefix(
-                        episode,
-                        learn_start=learn_start,
-                        configured_burn_in_steps=burn_in_steps,
-                    )
-                    learning = episode.steps[learn_start:learn_end]
-                    sequence_steps = prefix + learning
-                    start_step = sequence_steps[0].step_index
+                    key = (episode_index, decision_index)
+                    if key in selected_starts:
+                        continue
                     sequences.append(
-                        ReplaySequence(
-                            episode_id=episode.episode_id,
-                            start_step=start_step,
-                            learn_start_step=learn_start,
-                            steps=sequence_steps,
-                            burn_in_steps=len(prefix),
-                            configured_burn_in_steps=burn_in_steps,
-                            source_episode_won=episode.won,
-                            source_episode_authoritative=episode.completion.authoritative,
+                        _replay_sequence(
+                            episodes[episode_index],
+                            learn_start=decision_index,
+                            learn_steps=learn_steps,
+                            burn_in_steps=burn_in_steps,
                         )
                     )
+                    selected_starts.add(key)
+                    per_episode_count[episode_index] += 1
+                    macro_added += 1
+                    if macro_added >= macro_limit:
+                        break
+                if len(sequences) >= maximum:
+                    self._sample_count += len(sequences)
+                    self._macro_sample_count += macro_added
+                    return tuple(sequences)
+
+            for quota_index in range(self.max_segments_per_episode):
+                for episode_index in order:
+                    # Preserve the original every-episode-before-second-visit
+                    # fairness even after a macro sequence was preselected.
+                    if per_episode_count[episode_index] > quota_index:
+                        continue
+                    episode_choices = choices[episode_index]
+                    available = tuple(
+                        choice
+                        for choice in episode_choices
+                        if (
+                            episode_index,
+                            choice * learn_steps,
+                        )
+                        not in selected_starts
+                    )
+                    if not available:
+                        continue
+                    episode = episodes[episode_index]
+                    learn_start = available[0] * learn_steps
+                    sequences.append(
+                        _replay_sequence(
+                            episode,
+                            learn_start=learn_start,
+                            learn_steps=learn_steps,
+                            burn_in_steps=burn_in_steps,
+                        )
+                    )
+                    selected_starts.add((episode_index, learn_start))
+                    per_episode_count[episode_index] += 1
                     if len(sequences) >= maximum:
                         self._sample_count += len(sequences)
+                        self._macro_sample_count += macro_added
                         return tuple(sequences)
+
             self._sample_count += len(sequences)
+            self._macro_sample_count += macro_added
             return tuple(sequences)
 
     def snapshot(self) -> tuple[CompletedEpisode, ...]:
@@ -970,6 +1129,7 @@ class BoundedEpisodicReplay:
                 "max_segments_per_episode": self.max_segments_per_episode,
                 "put_count": self._put_count,
                 "sample_count": self._sample_count,
+                "macro_sample_count": self._macro_sample_count,
                 "eviction_count": self._eviction_count,
                 "duplicate_count": self._duplicate_count,
                 "oversize_count": self._oversize_count,
@@ -990,6 +1150,7 @@ class BoundedEpisodicReplay:
                 "rng_state": deepcopy(self._rng.bit_generator.state),
                 "put_count": self._put_count,
                 "sample_count": self._sample_count,
+                "macro_sample_count": self._macro_sample_count,
                 "eviction_count": self._eviction_count,
                 "duplicate_count": self._duplicate_count,
                 "oversize_count": self._oversize_count,
@@ -1011,6 +1172,7 @@ class BoundedEpisodicReplay:
             "rng_state",
             "put_count",
             "sample_count",
+            "macro_sample_count",
             "eviction_count",
             "duplicate_count",
             "oversize_count",
@@ -1052,6 +1214,7 @@ class BoundedEpisodicReplay:
         for name in (
             "put_count",
             "sample_count",
+            "macro_sample_count",
             "eviction_count",
             "duplicate_count",
             "oversize_count",
@@ -1061,6 +1224,10 @@ class BoundedEpisodicReplay:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"episodic replay {name} must be a non-negative integer")
             counters[name] = value
+        if counters["macro_sample_count"] > counters["sample_count"]:
+            raise ValueError(
+                "episodic replay macro_sample_count cannot exceed sample_count"
+            )
         largest_episode = max((len(item.steps) for item in items), default=0)
         if counters["maximum_observed_episode_steps"] < largest_episode:
             raise ValueError("episodic replay maximum observed length is inconsistent")
@@ -1086,6 +1253,7 @@ class BoundedEpisodicReplay:
             self._rng.bit_generator.state = deepcopy(validated_rng_state)
             self._put_count = counters["put_count"]
             self._sample_count = counters["sample_count"]
+            self._macro_sample_count = counters["macro_sample_count"]
             self._eviction_count = counters["eviction_count"]
             self._duplicate_count = counters["duplicate_count"]
             self._oversize_count = counters["oversize_count"]

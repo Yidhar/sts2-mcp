@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v6"
+version = "sts2-relational-curriculum-config-v7"
 profile = "preheat"
 
 [model]
@@ -72,6 +72,10 @@ max_segments_per_episode = 8
 sample_sequences = 2
 burn_in_steps = 32
 learn_steps = 32
+# Reserve half of detached complete-episode replay suffixes for factual
+# non-combat policy decisions. The remaining suffixes retain outcome-stratified
+# whole-run coverage; FIFO V-trace collection remains unchanged.
+macro_sample_fraction = 0.5
 primary_policy_weight = 0.25
 task_value_weight = 0.25
 revival_value_weight = 0.10
@@ -102,8 +106,8 @@ device = "auto"
 collector_device = "cpu"
 total_environment_steps = 250000
 seed = 0
-log_dir = "runs/full-run-revival-v16-episodic-long-credit"
-checkpoint_dir = "checkpoints/full-run-revival-v16-episodic-long-credit"
+log_dir = "runs/full-run-revival-v19-observation-v2-macro-credit"
+checkpoint_dir = "checkpoints/full-run-revival-v19-observation-v2-macro-credit"
 checkpoint_interval_steps = 10000
 # A model-initialization lineage starts at step zero even when its network
 # parameters came from an older policy. Validate that inherited policy on a

@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import time
+from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -899,6 +900,7 @@ def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() 
     assert report["active_shape_batching"] is True
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
+    assert report["episodic_learning"]["macro_sample_fraction"] == 0.0
 
 
 def test_cpu_resource_build_does_not_seed_or_initialize_unused_cuda(
@@ -1973,6 +1975,74 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         resources.close()
 
 
+def test_training_gate_adds_diagnostic_only_macro_metrics_without_learning(
+    tmp_path: Path,
+) -> None:
+    base = _config()
+    config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+    )
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    learner_before = {
+        key: value.detach().clone()
+        for key, value in resources.model.state_dict().items()
+    }
+    collector_before = {
+        key: value.detach().clone()
+        for key, value in resources.collector_model.state_dict().items()
+    }
+    collector_state_before = deepcopy(resources.collector.state_dict())
+    learner_mode_before = resources.model.training
+    collector_mode_before = resources.collector_model.training
+    try:
+        episodes, summary = runtime_module._evaluate_training_gate(
+            resources,
+            episodes=1,
+            base_seed=6,
+            journal_path=tmp_path / "training-gate.jsonl",
+            backend_factory=None,
+        )
+
+        assert len(episodes) == 1
+        assert summary["combat_win_rate"] == 1.0
+        telemetry = summary["macro_surface_telemetry"]
+        assert telemetry["diagnostic_only"] is True
+        assert telemetry["training_samples_emitted"] == 0
+        assert telemetry["total_macro_decisions"] == 0
+        sensitivity = summary["macro_policy_sensitivity"]
+        assert sensitivity["diagnostic_only"] is True
+        assert sensitivity["training_samples_emitted"] == 0
+        assert sensitivity["expected_action_labels"] is False
+        assert sensitivity["case_count"] == 7
+        assert (
+            sensitivity["recurrent_state_contract"]
+            == "fresh_zero_state_per_pair"
+        )
+
+        assert len(resources.rollout_queue) == 0
+        assert resources.collector.state_dict() == collector_state_before
+        assert resources.model.training is learner_mode_before
+        assert resources.collector_model.training is collector_mode_before
+        assert set(resources.model.state_dict()) == set(learner_before)
+        assert set(resources.collector_model.state_dict()) == set(collector_before)
+        assert all(
+            torch.equal(resources.model.state_dict()[key], value)
+            for key, value in learner_before.items()
+        )
+        assert all(
+            torch.equal(resources.collector_model.state_dict()[key], value)
+            for key, value in collector_before.items()
+        )
+    finally:
+        resources.close()
+
+
 def test_evaluation_retries_same_seed_once_on_fresh_backend(tmp_path: Path) -> None:
     first = RecoverableIncidentBackend(fail_step=2)
     replacement = FakeCombatBackend(terminal_step=2)
@@ -2110,6 +2180,11 @@ def test_frozen_checkpoint_evaluation_never_loads_or_consumes_pending_queue(
     assert audit["training_rng_loaded"] is False
     assert audit["training_checkpoint_published"] is False
     assert audit["evaluation_of"]["training_state"]["policy_version"] == 7
+    assert audit["evaluation"]["macro_surface_telemetry"]["diagnostic_only"] is True
+    assert (
+        audit["evaluation"]["macro_surface_telemetry"]["training_samples_emitted"]
+        == 0
+    )
     assert random.getstate() == python_rng_before
     numpy_rng_after = np.random.get_state()
     assert numpy_rng_after[0] == numpy_rng_before[0]

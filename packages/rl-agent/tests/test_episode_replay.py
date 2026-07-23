@@ -74,13 +74,15 @@ def _step(
     after_hp: float,
     combat_boundary: BoundaryOutcome = BoundaryOutcome.NONE,
     act_boundary: BoundaryOutcome = BoundaryOutcome.NONE,
+    policy_decision: bool = True,
+    decision_surface: str | None = None,
 ) -> EpisodeDecisionStep:
     return EpisodeDecisionStep(
         snapshot=snapshot,
         step_index=index,
         action_index=index % 2,
         behavior_log_probability=-0.5,
-        policy_decision=True,
+        policy_decision=policy_decision,
         policy_version=7,
         act=act,
         combat_id=combat_id,
@@ -92,6 +94,13 @@ def _step(
         hp_loss_after=after_hp,
         combat_boundary=combat_boundary,
         act_boundary=act_boundary,
+        decision_surface=(
+            "combat"
+            if snapshot.domain_id == 1
+            else "other"
+            if decision_surface is None
+            else decision_surface
+        ),
     )
 
 
@@ -300,6 +309,66 @@ def _linear_episode(
     )
 
 
+def _surface_episode(
+    *,
+    episode_id: str,
+    surfaces: tuple[str, ...],
+    policy_decisions: tuple[bool, ...] | None = None,
+    won: bool | None = True,
+) -> CompletedEpisode:
+    """Build one factual non-combat episode with explicit replay surfaces."""
+
+    snapshot = _snapshot(domain_id=0)
+    decisions = (
+        (True,) * len(surfaces)
+        if policy_decisions is None
+        else policy_decisions
+    )
+    assert len(decisions) == len(surfaces)
+    steps = tuple(
+        _step(
+            snapshot,
+            index,
+            act=1,
+            combat_id=None,
+            reward=0.0,
+            before_revivals=0,
+            after_revivals=0,
+            before_hp=0.0,
+            after_hp=0.0,
+            act_boundary=(
+                BoundaryOutcome.CENSORED
+                if won is None and index == len(surfaces) - 1
+                else BoundaryOutcome.SUCCEEDED
+                if won is True and index == len(surfaces) - 1
+                else BoundaryOutcome.FAILED
+                if won is False and index == len(surfaces) - 1
+                else BoundaryOutcome.NONE
+            ),
+            policy_decision=decisions[index],
+            decision_surface=surface,
+        )
+        for index, surface in enumerate(surfaces)
+    )
+    return backfill_completed_episode(
+        episode_id=episode_id,
+        steps=steps,
+        completion=EpisodeCompletion(
+            authoritative=won is not None,
+            won=won,
+            final_revivals=0,
+            final_hp_loss=0.0,
+            terminal_reason=(
+                "transport_abort"
+                if won is None
+                else "run_victory"
+                if won
+                else "run_defeat"
+            ),
+        ),
+    )
+
+
 def test_replay_is_byte_bounded_episode_balanced_and_samples_no_grad_burn_in() -> None:
     snapshot = _snapshot()
     first = _linear_episode(snapshot, episode_id="first", length=8, won=False)
@@ -380,6 +449,10 @@ def test_storage_accounting_includes_exact_snapshot_and_utf8_payload_once() -> N
     )
     utf8_step = replace(ascii_step, combat_id="战")
     assert utf8_step.storage_nbytes() - ascii_step.storage_nbytes() == len("战".encode()) - 1
+    utf8_surface = replace(ascii_step, decision_surface="牌")
+    assert utf8_surface.storage_nbytes() - ascii_step.storage_nbytes() == (
+        len("牌".encode()) - len(ascii_step.decision_surface.encode())
+    )
     assert ascii_step.storage_nbytes() > snapshot.storage_nbytes()
 
     episode = backfill_completed_episode(
@@ -444,7 +517,48 @@ def test_act_zero_and_exact_policy_decision_flag_are_supported() -> None:
         replace(step, policy_decision=1)  # type: ignore[arg-type]
 
 
-def test_v2_replay_rejects_v1_exact_resume_sidecar() -> None:
+def test_decision_surfaces_fail_closed_and_combat_is_canonical() -> None:
+    noncombat = _step(
+        _snapshot(domain_id=0),
+        0,
+        act=1,
+        combat_id=None,
+        reward=0.0,
+        before_revivals=0,
+        after_revivals=0,
+        before_hp=0.0,
+        after_hp=0.0,
+        decision_surface="card_reward",
+    )
+    combat = _step(
+        _snapshot(domain_id=1),
+        0,
+        act=1,
+        combat_id="combat-one",
+        reward=0.0,
+        before_revivals=0,
+        after_revivals=0,
+        before_hp=0.0,
+        after_hp=0.0,
+    )
+
+    assert noncombat.decision_surface == "card_reward"
+    assert combat.decision_surface == "combat"
+    with pytest.raises(ValueError, match="cannot claim the combat surface"):
+        replace(noncombat, decision_surface="combat")
+    with pytest.raises(ValueError, match="canonical combat surface"):
+        replace(combat, decision_surface="map")
+    with pytest.raises(ValueError, match="non-empty"):
+        replace(noncombat, decision_surface=" ")
+
+
+@pytest.mark.parametrize(
+    "prior_version",
+    ("sts2-episodic-replay-v1", "sts2-episodic-replay-v2"),
+)
+def test_v3_replay_rejects_prior_exact_resume_sidecars(
+    prior_version: str,
+) -> None:
     replay = BoundedEpisodicReplay(
         capacity=1,
         byte_capacity=1024,
@@ -453,7 +567,7 @@ def test_v2_replay_rejects_v1_exact_resume_sidecar() -> None:
         seed=7,
     )
     payload = replay.state_dict()
-    payload["version"] = "sts2-episodic-replay-v1"
+    payload["version"] = prior_version
 
     with pytest.raises(ValueError, match="unsupported episodic replay"):
         replay.load_state_dict(payload)
@@ -491,6 +605,339 @@ def test_sampling_round_robins_win_failure_and_censored_strata() -> None:
     }
     assert strata == {"win", "failure", "censored"}
     assert len({sequence.episode_id for sequence in first_round}) == 3
+
+
+def test_macro_fraction_reserves_exact_noncombat_policy_decisions_by_surface() -> None:
+    episodes = (
+        _surface_episode(
+            episode_id="macro-map",
+            surfaces=(
+                "forced_event",
+                "map",
+                "forced_event",
+                "forced_event",
+                "forced_event",
+                "forced_event",
+            ),
+            policy_decisions=(False, True, False, False, False, False),
+        ),
+        _surface_episode(
+            episode_id="macro-card-reward",
+            surfaces=(
+                "forced_event",
+                "card_reward",
+                "forced_event",
+                "forced_event",
+                "forced_event",
+                "forced_event",
+            ),
+            policy_decisions=(False, True, False, False, False, False),
+        ),
+    )
+    total_bytes = sum(episode.storage_nbytes() for episode in episodes)
+    replay = BoundedEpisodicReplay(
+        capacity=2,
+        byte_capacity=total_bytes,
+        episode_byte_capacity=max(
+            episode.storage_nbytes() for episode in episodes
+        ),
+        max_segments_per_episode=2,
+        seed=101,
+    )
+    assert all(replay.put(episode) for episode in episodes)
+
+    sequences = replay.sample(
+        4,
+        learn_steps=2,
+        burn_in_steps=1,
+        macro_sample_fraction=0.5,
+    )
+
+    assert len(sequences) == 4
+    reserved = tuple(
+        sequence
+        for sequence in sequences
+        if sequence.learn_steps[0].decision.policy_decision
+    )
+    assert len(reserved) == 2
+    reserved_decisions = tuple(
+        sequence.learn_steps[0].decision for sequence in reserved
+    )
+    assert {decision.decision_surface for decision in reserved_decisions} == {
+        "map",
+        "card_reward",
+    }
+    assert all(decision.policy_decision for decision in reserved_decisions)
+    assert all(decision.snapshot.domain_id != 1 for decision in reserved_decisions)
+    for sequence, decision in zip(reserved, reserved_decisions, strict=True):
+        source = next(
+            episode
+            for episode in episodes
+            if episode.episode_id == sequence.episode_id
+        )
+        assert decision is source.steps[sequence.learn_start_step].decision
+    assert replay.metrics()["macro_sample_count"] == 2
+    assert replay.metrics()["sample_count"] == 4
+
+
+def test_macro_reservation_excludes_combat_and_forced_decisions() -> None:
+    combat_snapshot = _snapshot(domain_id=1)
+    combat_steps = tuple(
+        _step(
+            combat_snapshot,
+            index,
+            act=1,
+            combat_id="combat-one",
+            reward=0.0,
+            before_revivals=0,
+            after_revivals=0,
+            before_hp=0.0,
+            after_hp=0.0,
+            combat_boundary=(
+                BoundaryOutcome.SUCCEEDED
+                if index == 1
+                else BoundaryOutcome.NONE
+            ),
+            act_boundary=(
+                BoundaryOutcome.SUCCEEDED
+                if index == 1
+                else BoundaryOutcome.NONE
+            ),
+        )
+        for index in range(2)
+    )
+    combat = backfill_completed_episode(
+        episode_id="combat-only",
+        steps=combat_steps,
+        completion=EpisodeCompletion(
+            authoritative=True,
+            won=True,
+            final_revivals=0,
+            final_hp_loss=0.0,
+            terminal_reason="run_victory",
+        ),
+    )
+    forced = _surface_episode(
+        episode_id="forced-noncombat",
+        surfaces=("map", "card_reward"),
+        policy_decisions=(False, False),
+    )
+    episodes = (combat, forced)
+    total_bytes = sum(episode.storage_nbytes() for episode in episodes)
+    replay = BoundedEpisodicReplay(
+        capacity=2,
+        byte_capacity=total_bytes,
+        episode_byte_capacity=max(
+            episode.storage_nbytes() for episode in episodes
+        ),
+        max_segments_per_episode=1,
+        seed=37,
+    )
+    assert all(replay.put(episode) for episode in episodes)
+
+    sequences = replay.sample(
+        2,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=1.0,
+    )
+
+    assert len(sequences) == 2
+    assert replay.metrics()["macro_sample_count"] == 0
+
+
+def test_zero_macro_fraction_preserves_default_sampling_and_rng_contract() -> None:
+    episodes = (
+        _surface_episode(
+            episode_id="zero-win",
+            surfaces=("map", "card_reward", "shop", "rest"),
+            won=True,
+        ),
+        _surface_episode(
+            episode_id="zero-loss",
+            surfaces=("event", "map", "event", "map"),
+            won=False,
+        ),
+    )
+    total_bytes = sum(episode.storage_nbytes() for episode in episodes)
+
+    def build() -> BoundedEpisodicReplay:
+        replay = BoundedEpisodicReplay(
+            capacity=2,
+            byte_capacity=total_bytes,
+            episode_byte_capacity=max(
+                episode.storage_nbytes() for episode in episodes
+            ),
+            max_segments_per_episode=2,
+            seed=59,
+        )
+        assert all(replay.put(episode) for episode in episodes)
+        return replay
+
+    implicit = build()
+    explicit = build()
+    implicit_sequences = implicit.sample(4, learn_steps=1, burn_in_steps=1)
+    explicit_sequences = explicit.sample(
+        4,
+        learn_steps=1,
+        burn_in_steps=1,
+        macro_sample_fraction=0.0,
+    )
+
+    def projection(sequence: ReplaySequence) -> tuple[object, ...]:
+        return (
+            sequence.episode_id,
+            sequence.learn_start_step,
+            tuple(step.step_index for step in sequence.burn_in),
+            tuple(step.step_index for step in sequence.learn_steps),
+        )
+
+    assert [projection(sequence) for sequence in explicit_sequences] == [
+        projection(sequence) for sequence in implicit_sequences
+    ]
+    assert explicit.state_dict()["rng_state"] == implicit.state_dict()["rng_state"]
+    assert explicit.metrics()["macro_sample_count"] == 0
+    assert implicit.metrics()["macro_sample_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    (
+        (-0.01, ValueError),
+        (1.01, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+        (True, TypeError),
+        ("0.5", TypeError),
+    ),
+)
+def test_macro_sample_fraction_is_strictly_validated(
+    value: object,
+    error: type[Exception],
+) -> None:
+    replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=1024,
+        episode_byte_capacity=1024,
+        max_segments_per_episode=1,
+        seed=0,
+    )
+    with pytest.raises(error, match="macro_sample_fraction"):
+        replay.sample(
+            1,
+            learn_steps=1,
+            burn_in_steps=0,
+            macro_sample_fraction=value,  # type: ignore[arg-type]
+        )
+
+
+def test_macro_sampling_keeps_every_episode_ahead_of_any_second_segment() -> None:
+    macro_rich = _surface_episode(
+        episode_id="macro-rich",
+        surfaces=("map", "card_reward", "shop", "rest"),
+    )
+    forced_only = _surface_episode(
+        episode_id="forced-only",
+        surfaces=("event", "event", "event", "event"),
+        policy_decisions=(False, False, False, False),
+    )
+    episodes = (macro_rich, forced_only)
+    total_bytes = sum(episode.storage_nbytes() for episode in episodes)
+    replay = BoundedEpisodicReplay(
+        capacity=2,
+        byte_capacity=total_bytes,
+        episode_byte_capacity=max(
+            episode.storage_nbytes() for episode in episodes
+        ),
+        max_segments_per_episode=2,
+        seed=3,
+    )
+    assert all(replay.put(episode) for episode in episodes)
+
+    sequences = replay.sample(
+        4,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=0.5,
+    )
+    first_positions = {
+        episode.episode_id: next(
+            index
+            for index, sequence in enumerate(sequences)
+            if sequence.episode_id == episode.episode_id
+        )
+        for episode in episodes
+    }
+    second_positions = [
+        index
+        for episode in episodes
+        for index, sequence in enumerate(sequences)
+        if sequence.episode_id == episode.episode_id
+        and sum(
+            prior.episode_id == episode.episode_id
+            for prior in sequences[:index]
+        )
+        == 1
+    ]
+
+    assert len(sequences) == 4
+    assert second_positions
+    assert min(second_positions) > max(first_positions.values())
+
+
+def test_macro_sampling_preserves_outcome_strata_round_robin() -> None:
+    episodes = (
+        _surface_episode(
+            episode_id="macro-win-a",
+            surfaces=("map",),
+            won=True,
+        ),
+        _surface_episode(
+            episode_id="macro-win-b",
+            surfaces=("card_reward",),
+            won=True,
+        ),
+        _surface_episode(
+            episode_id="macro-failure",
+            surfaces=("shop",),
+            won=False,
+        ),
+        _surface_episode(
+            episode_id="macro-censored",
+            surfaces=("event",),
+            won=None,
+        ),
+    )
+    total_bytes = sum(episode.storage_nbytes() for episode in episodes)
+    replay = BoundedEpisodicReplay(
+        capacity=len(episodes),
+        byte_capacity=total_bytes,
+        episode_byte_capacity=max(
+            episode.storage_nbytes() for episode in episodes
+        ),
+        max_segments_per_episode=1,
+        seed=17,
+    )
+    assert all(replay.put(episode) for episode in episodes)
+
+    sequences = replay.sample(
+        3,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=1.0,
+    )
+    strata = {
+        "censored"
+        if not sequence.source_episode_authoritative
+        else "win"
+        if sequence.source_episode_won
+        else "failure"
+        for sequence in sequences
+    }
+
+    assert len(sequences) == 3
+    assert strata == {"win", "failure", "censored"}
+    assert replay.metrics()["macro_sample_count"] == 3
 
 
 def test_split_gru_prefix_is_sparse_but_exact_and_learning_suffix_is_contiguous() -> None:
@@ -599,8 +1046,16 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
 
     original = replay()
     assert all(original.put(episode) for episode in episodes)
-    original.sample(2, learn_steps=2, burn_in_steps=1)
+    original.sample(
+        2,
+        learn_steps=2,
+        burn_in_steps=1,
+        macro_sample_fraction=0.5,
+    )
     payload = original.state_dict()
+    assert payload["version"] == "sts2-episodic-replay-v3"
+    assert payload["sample_count"] == 2
+    assert payload["macro_sample_count"] == 1
     assert set(payload) == {
         "version",
         "capacity",
@@ -611,6 +1066,7 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
         "rng_state",
         "put_count",
         "sample_count",
+        "macro_sample_count",
         "eviction_count",
         "duplicate_count",
         "oversize_count",
@@ -626,6 +1082,7 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
 
     expected = original.sample(5, learn_steps=2, burn_in_steps=1)
     actual = restored.sample(5, learn_steps=2, burn_in_steps=1)
+
     def projection(sequence: ReplaySequence) -> object:
         return (
             sequence.episode_id,
@@ -648,6 +1105,14 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
     extra_key["unexpected"] = 1
     with pytest.raises(ValueError, match="schema"):
         restored.load_state_dict(extra_key)
+
+    impossible_counter = dict(payload)
+    sample_count = payload["sample_count"]
+    assert isinstance(sample_count, int)
+    impossible_counter["macro_sample_count"] = sample_count + 1
+    with pytest.raises(ValueError, match="macro_sample_count"):
+        restored.load_state_dict(impossible_counter)
+    assert restored.metrics() == before
 
 
 def test_replay_protocol4_payload_is_copied_and_refrozen_without_repairing_shapes() -> None:
@@ -708,7 +1173,9 @@ def test_replay_rejects_hash_consistent_accounting_edits_atomically() -> None:
     assert replay.put(episode)
     before = replay.state_dict()
     edited = dict(before)
-    edited["put_count"] = int(edited["put_count"]) + 1
+    put_count = edited["put_count"]
+    assert isinstance(put_count, int)
+    edited["put_count"] = put_count + 1
 
     with pytest.raises(ValueError, match="put/eviction accounting"):
         replay.load_state_dict(edited)

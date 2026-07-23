@@ -122,7 +122,17 @@ def _translate_shop_block(shop: Mapping[str, Any]) -> dict[str, Any]:
 
 def _translate_shop_item(item: Mapping[str, Any], *, index: int) -> dict[str, Any]:
     translated = deepcopy(dict(item))
-    translated.setdefault("slot_index", index)
+    raw_slot = item.get("slot_index", item.get("index"))
+    if raw_slot is None:
+        slot_index = index
+    elif isinstance(raw_slot, bool) or not isinstance(raw_slot, int):
+        raise TypeError("simulator shop item index must be an integer")
+    else:
+        slot_index = raw_slot
+    # Preserve the simulator's authoritative inventory slot.  Enumerating the
+    # list here broke the exact world-item/candidate relation for sparse shop
+    # indices, even though dispatch still used the correct native index.
+    translated["slot_index"] = slot_index
     raw_card = item.get("card")
     if raw_card is not None:
         translated["card"] = _translate_card(raw_card, pile="Shop")

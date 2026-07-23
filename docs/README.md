@@ -46,6 +46,7 @@ decisions from a launcher, compatibility wrapper, or build script.
 
 - [Development and verification](./runbooks/development.md)
 - [Artifact inventory and externalization](./runbooks/artifacts.md)
+- [Checkpoint exact resume and model initialization](./runbooks/checkpoint-resume.md)
 - [WSL ROCm training](./runbooks/wsl-rocm-training.md)
 - [Local training dashboard](./runbooks/training-dashboard.md)
 - [HeadlessSim build identity](./headless-simulator-identity.md)

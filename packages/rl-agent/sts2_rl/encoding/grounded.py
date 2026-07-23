@@ -597,6 +597,7 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "map_node",
         "modifiers",
         "move_history",
+        "next_boss",
         "next_options",
         "nodes",
         "option",
@@ -720,7 +721,7 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v9"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v10"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -2251,6 +2252,13 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 canonical_coord[key] = item
         if canonical_coord:
             run["coord"] = canonical_coord
+    next_boss_id = _first_present(raw_run, "next_boss_id")
+    if next_boss_id is not None and str(next_boss_id).strip():
+        # Keep the visible encounter as its own entity instead of folding it
+        # into the run token's categorical hash.  The current room already
+        # owns the run token's definition identity; a child preserves both
+        # identities without adding a boss rule, score, or future outcome.
+        run["next_boss"] = {"id": str(next_boss_id).strip()}
 
     canonical: dict[str, Any] = {
         "phase": phase,
@@ -3506,7 +3514,13 @@ class GroundedObservationEncoder:
         identity = (
             str(container.get("card_id") or container.get("id") or container.get("model_id") or "").strip().upper()
         )
-        if identity.startswith("CARD.") or normalized_path & _CARD_PATH_PARTS:
+        leaf = _normalize_key(path[-1]) if path else ""
+        # Shop-item wrappers inherit their nested card's stable definition ID
+        # so purchase candidates bind to the exact world slot.  The wrapper is
+        # still an item: price/affordability/sale flags must use the generic
+        # factual contract rather than the narrower card-instance contract.
+        identity_is_card = identity.startswith("CARD.") and leaf != "item"
+        if identity_is_card or normalized_path & _CARD_PATH_PARTS:
             if isinstance(value, bool):
                 return lowered in _CARD_FACT_BOOLEAN_KEYS
             return lowered in _CARD_FACT_NUMERIC_KEYS

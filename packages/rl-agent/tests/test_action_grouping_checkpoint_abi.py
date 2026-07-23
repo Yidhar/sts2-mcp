@@ -50,6 +50,12 @@ _V9_ENCODING = {
     "feature_abi_end": 215,
     "fingerprint_sha256": ("a953c6a01cd0ae85e77f0916ee6f072f7a97a59cbfdae6967003f9e8894dba1b"),
 }
+_V10_ENCODING = {
+    "version": "grounded-relational-runtime-encoding-v10",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": ("4caae6f3c6baafb31ce476615776e22cdea2e6073ee7b4893247a4ffef2e524f"),
+}
 
 
 class _CombatBackend:
@@ -278,12 +284,18 @@ def _rewrite_checkpoint_encoding_contract(
     )
 
 
-def test_only_reviewed_v8_to_v9_model_initialization_crosses_decision_abi(
+@pytest.mark.parametrize("archived_encoding", [_V8_ENCODING, _V9_ENCODING])
+def test_only_reviewed_legacy_to_v10_model_initialization_crosses_decision_abi(
     tmp_path: Path,
+    archived_encoding: dict[str, Any],
 ) -> None:
     config = _config()
-    assert grounding_encoding_identity() == _V9_ENCODING
-    archived = _validated_metadata(tmp_path, config=config, encoding=_V8_ENCODING)
+    assert grounding_encoding_identity() == _V10_ENCODING
+    archived = _validated_metadata(
+        tmp_path,
+        config=config,
+        encoding=archived_encoding,
+    )
 
     with pytest.raises(ValueError, match="encoding contract does not match"):
         checkpointing_module._validate_metadata(
@@ -316,7 +328,7 @@ def test_only_reviewed_v8_to_v9_model_initialization_crosses_decision_abi(
         )
 
 
-def test_v8_action_grouping_initialization_inherits_only_model_parameters(
+def test_v9_observation_v2_initialization_inherits_only_model_parameters(
     tmp_path: Path,
 ) -> None:
     config = _config()
@@ -362,7 +374,7 @@ def test_v8_action_grouping_initialization_inherits_only_model_parameters(
 
     _rewrite_checkpoint_encoding_contract(
         checkpoint,
-        encoding_contract=_V8_ENCODING,
+        encoding_contract=_V9_ENCODING,
     )
     with pytest.raises(ValueError, match="encoding contract does not match"):
         preflight_training_checkpoint(
@@ -425,7 +437,7 @@ def test_v8_action_grouping_initialization_inherits_only_model_parameters(
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["encoding_contract"] == _V9_ENCODING
+        assert metadata["encoding_contract"] == _V10_ENCODING
         assert metadata["training_state"] == asdict(TrainingState())
         provenance = metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"

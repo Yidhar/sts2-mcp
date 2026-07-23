@@ -791,6 +791,41 @@ def _combat_in_progress(observation: Mapping[str, object]) -> bool:
     return bool(isinstance(combat, Mapping) and combat.get("in_progress") is True)
 
 
+def _episodic_decision_surface(
+    observation: Mapping[str, object],
+    *,
+    combat_in_progress: bool,
+) -> str:
+    """Return a factual, strategy-free surface label for replay sampling.
+
+    The label never enters the model.  It preserves the authoritative runtime
+    screen/state identity long enough for detached complete-episode replay to
+    keep sparse build, route and resource decisions visible beside the much
+    larger combat stream.  Combat is deliberately collapsed to one surface so
+    monster/boss identities cannot become replay priorities.
+    """
+
+    if combat_in_progress:
+        return "combat"
+    raw_run = observation.get("run")
+    run = raw_run if isinstance(raw_run, Mapping) else {}
+    for value in (
+        observation.get("state_type"),
+        observation.get("screen"),
+        observation.get("phase"),
+        observation.get("decision_domain"),
+        run.get("room_type"),
+    ):
+        if value is None:
+            continue
+        normalized = "_".join(
+            str(value).strip().lower().replace("-", " ").split()
+        )
+        if normalized:
+            return normalized
+    return "noncombat"
+
+
 def _episodic_combat_boundary(
     *,
     was_active: bool,
@@ -2874,6 +2909,10 @@ class GroundedCollector:
                         hp_loss_after=player_hp_lost,
                         combat_boundary=combat_boundary,
                         act_boundary=act_boundary,
+                        decision_surface=_episodic_decision_surface(
+                            state.observation,
+                            combat_in_progress=pre_action_combat,
+                        ),
                     )
                 )
                 if pre_action_combat and not next_combat_in_progress:

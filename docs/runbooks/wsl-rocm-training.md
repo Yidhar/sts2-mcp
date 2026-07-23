@@ -78,7 +78,7 @@ This installs:
 - this project in editable mode without build isolation, using the already locked
   `setuptools`/`wheel`, followed by `pip check` and a real GPU visibility check
 
-## Launch recurrent v2 training from WSL
+## Launch recurrent V-trace v4 training from WSL
 
 ```bash
 export REPO_ROOT='/mnt/<drive>/path/to/sts2_mcp'
@@ -98,6 +98,42 @@ The launcher will:
 
 The deleted MuZero/token-memory compatibility wrappers are not supported.
 Checkpoints and logs resolve below `STS2_ARTIFACT_ROOT` through the typed config.
+
+## Launch the observation-v2/macro-credit preheat lineage
+
+The `preheat` profile uses the patched, identity-pinned headless simulator rather
+than the Windows live bridge. Before launch, build the locked dependency from
+the repository root so the simulator exports the complete visible map graph,
+visible next boss, nullable native rest-heal preview and canonical shop item
+facts:
+
+```powershell
+python .\packages\rl-agent\scripts\build_pinned_headless_sim.py
+```
+
+The current v19 campaign is a fresh lineage initialized from the validated v18
+checkpoint whose metadata records policy version 3,936:
+
+```bash
+export REPO_ROOT='/mnt/<drive>/path/to/sts2_mcp'
+export STS2_ARTIFACT_ROOT='/mnt/<drive>/sts2-artifacts'
+cd "$REPO_ROOT/packages/rl-agent"
+bash scripts/train_preheat_wsl_rocm.sh \
+  --initialize-from "<V18_POLICY_3936_CHECKPOINT>"
+```
+
+The launcher refuses CPU fallback and runs the complete native-revival game
+flow. `--initialize-from` imports only compatible network parameters. The v19
+optimizer, FIFO queue, transaction/complete-episode replay, RNGs, counters and
+policy versions start fresh at step zero. Do not replace it with `--resume`:
+observation v2, config v7 and replay v3 deliberately form a new lineage.
+
+The producer exposes factual visible state only. It does not calculate deck
+strength, route desirability, future rewards or future card/shop predictions.
+The preheat replay merely reserves part of complete-episode sampling for exact
+observed non-combat policy decisions; it never fabricates a target action.
+Odd-seed held-out journals and macro sensitivity reports are diagnostic-only
+and never train the model.
 
 ## Custom bridge session path
 

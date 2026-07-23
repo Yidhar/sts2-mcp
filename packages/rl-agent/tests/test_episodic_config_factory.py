@@ -73,6 +73,7 @@ def _small_config() -> TrainingConfig:
             sample_sequences=2,
             burn_in_steps=4,
             learn_steps=8,
+            macro_sample_fraction=0.5,
         ),
     )
 
@@ -87,7 +88,7 @@ def test_factory_wires_bounded_episodic_replay_and_learner_config(monkeypatch: A
         assert resources.learner.episodic_config is config.episodic_learning  # type: ignore[attr-defined]
         assert resources.collector.episodic_learning_enabled
         assert resources.episodic_replay.metrics() == {
-            "version": "sts2-episodic-replay-v2",
+            "version": "sts2-episodic-replay-v3",
             "size": 0,
             "capacity": 3,
             "storage_nbytes": 0,
@@ -96,6 +97,7 @@ def test_factory_wires_bounded_episodic_replay_and_learner_config(monkeypatch: A
             "max_segments_per_episode": 2,
             "put_count": 0,
             "sample_count": 0,
+            "macro_sample_count": 0,
             "eviction_count": 0,
             "duplicate_count": 0,
             "oversize_count": 0,
