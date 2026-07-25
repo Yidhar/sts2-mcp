@@ -265,12 +265,12 @@ def factual_transaction_policy_targets(
     are avoided. This labels an explored wrong branch without penalizing the
     corrective deselect that factually returned to the successful route.
 
-    A deadlocked trace has no successful suffix. Its factual cycle-closing
-    ``STAY``/``REVISIT`` transitions are avoided. Some liveness failures (for
-    example a bounded combat no-progress window) can contain a long sequence
-    of unique semantic nodes rather than an exact cycle; in that case the last
-    non-forced factual action is avoided. Censored traces contribute no policy
-    target.
+    A deadlocked trace has no successful suffix. Only its factual
+    cycle-closing ``STAY``/``REVISIT`` transitions or repeated exact
+    node/action pairs are avoided. A delayed no-progress window containing only
+    unique moving transitions is authoritative value evidence but cannot name
+    one causal action, so it contributes no policy target. Censored traces also
+    contribute no policy target.
 
     The key includes the full semantic transaction node, so a deselect used
     once to correct a choice on a subsequently completed route is preferred;
@@ -319,16 +319,6 @@ def factual_transaction_policy_targets(
                 or pair_counts[(step.node_key, step.action_fingerprint)] > 1
             ):
                 avoided_indices.add(trace.burn_in_steps + local_index)
-        if not avoided_indices:
-            # Net-progress failures need not revisit an exact decision node.
-            # The final non-forced action is nevertheless a factual member of
-            # the terminal failed prefix and supplies a conservative liveness
-            # target without inventing an unexecuted alternative.
-            for local_index in range(len(learn_steps) - 1, -1, -1):
-                step = learn_steps[local_index]
-                if int(np.count_nonzero(step.snapshot.action_mask)) > 1:
-                    avoided_indices.add(trace.burn_in_steps + local_index)
-                    break
 
     labels: list[FactualTransactionPolicyTarget] = []
     for step_index, step in enumerate(

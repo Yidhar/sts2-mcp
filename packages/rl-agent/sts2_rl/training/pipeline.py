@@ -66,6 +66,7 @@ class ActorLearnerPipeline:
         epsilon: Callable[[int], float],
         starting_episode_count: int = 0,
         deterministic_probe_interval_episodes: int = 0,
+        deterministic_probe_environment_steps: tuple[int, ...] = (),
         supervisor_state: ActorSupervisorState | None = None,
     ) -> None:
         if total_environment_steps <= 0:
@@ -88,6 +89,23 @@ class ActorLearnerPipeline:
             raise ValueError(
                 "deterministic_probe_interval_episodes must be a non-negative integer"
             )
+        if not isinstance(deterministic_probe_environment_steps, tuple):
+            deterministic_probe_environment_steps = tuple(
+                deterministic_probe_environment_steps
+            )
+        previous_probe_step = 0
+        for index, probe_step in enumerate(deterministic_probe_environment_steps):
+            if (
+                isinstance(probe_step, bool)
+                or not isinstance(probe_step, int)
+                or probe_step <= previous_probe_step
+            ):
+                raise ValueError(
+                    "deterministic_probe_environment_steps must contain "
+                    "strictly increasing positive integers; invalid item at "
+                    f"index {index}"
+                )
+            previous_probe_step = probe_step
         if supervisor_state is None:
             supervisor_state = ActorSupervisorState()
         elif not isinstance(supervisor_state, ActorSupervisorState):
@@ -101,6 +119,23 @@ class ActorLearnerPipeline:
         self._deterministic_probe_interval_episodes = (
             deterministic_probe_interval_episodes
         )
+        self._deterministic_probe_environment_steps = (
+            deterministic_probe_environment_steps
+        )
+        # Exact resume must not replay early probes that belong to the already
+        # committed prefix. A milestone exactly at the restored step is part of
+        # that prefix; later milestones become due only after collection crosses
+        # them. This needs no mutable checkpoint sidecar.
+        self._next_deterministic_probe_step = 0
+        while (
+            self._next_deterministic_probe_step
+            < len(self._deterministic_probe_environment_steps)
+            and self._deterministic_probe_environment_steps[
+                self._next_deterministic_probe_step
+            ]
+            <= starting_environment_steps
+        ):
+            self._next_deterministic_probe_step += 1
         self._episodes: queue.Queue[
             CollectedEpisode | RecoverableActorIncident | BaseException
         ] = queue.Queue()
@@ -447,7 +482,7 @@ class ActorLearnerPipeline:
                 with self._progress_lock:
                     self._actor_progress = None
                 try:
-                    liveness_probe = bool(
+                    episode_probe_due = bool(
                         self._deterministic_probe_interval_episodes > 0
                         and (
                             (self._completed_training_episodes + 1)
@@ -455,6 +490,26 @@ class ActorLearnerPipeline:
                             == 0
                         )
                     )
+                    # Collection can cross multiple early milestones before an
+                    # episode boundary. Coalesce every currently overdue
+                    # milestone into this one probe rather than running a burst
+                    # of duplicate greedy episodes. Commit the cursor only after
+                    # successful collection so a recoverable backend incident
+                    # retries the probe on the replacement session.
+                    next_probe_step = self._next_deterministic_probe_step
+                    while (
+                        next_probe_step
+                        < len(self._deterministic_probe_environment_steps)
+                        and self._deterministic_probe_environment_steps[
+                            next_probe_step
+                        ]
+                        <= self._environment_steps
+                    ):
+                        next_probe_step += 1
+                    step_probe_due = (
+                        next_probe_step > self._next_deterministic_probe_step
+                    )
+                    liveness_probe = episode_probe_due or step_probe_due
                     episode = self.resources.collector.collect_episode(
                         epsilon=self._epsilon(self._environment_steps),
                         deterministic=False,
@@ -483,6 +538,8 @@ class ActorLearnerPipeline:
                     self._wait_if_paused()
                     continue
                 self._consecutive_incidents = 0
+                if step_probe_due:
+                    self._next_deterministic_probe_step = next_probe_step
                 self._completed_training_episodes += 1
                 self._episode_boundary_release.clear()
                 self._episode_boundary_waiting.set()

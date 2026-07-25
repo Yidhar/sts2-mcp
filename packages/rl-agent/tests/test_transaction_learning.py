@@ -1095,7 +1095,7 @@ def test_exact_transaction_cycle_is_avoided_but_corrective_deselect_is_preferred
     }
 
 
-def test_unique_node_deadlock_avoids_last_factual_policy_decision() -> None:
+def test_unique_moving_deadlock_has_no_invented_last_action_policy_blame() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(
         config,
@@ -1114,10 +1114,10 @@ def test_unique_node_deadlock_avoids_last_factual_policy_decision() -> None:
         ),
     )
 
-    target = factual_transaction_policy_targets(trace)
-    assert len(target) == 1
-    assert target[0].step_index == 2
-    assert target[0].target is TransactionPolicyTarget.AVOID
+    # The window proves that the trajectory failed, but all transitions are
+    # unique moves. The final action merely crossed a delayed threshold and is
+    # not factual evidence that this particular action caused the failure.
+    assert factual_transaction_policy_targets(trace) == ()
 
 
 def test_transaction_liveness_targets_directly_update_policy_head() -> None:
@@ -1721,12 +1721,22 @@ def test_training_only_greedy_liveness_probe_records_delta_behavior_and_deadlock
         assert trace.outcome is TransactionOutcome.DEADLOCK
         assert len(trace.learn_steps) <= 32
         assert len(trace.steps) <= 36
-        assert all(
-            step.behavior_log_probability == pytest.approx(0.0) for unroll in episode.unrolls for step in unroll.steps
+        rollout_steps = tuple(
+            step for unroll in episode.unrolls for step in unroll.steps
         )
-        labels = factual_transaction_policy_targets(trace)
-        assert labels
-        assert any(label.target is TransactionPolicyTarget.AVOID for label in labels)
+        assert all(
+            step.behavior_log_probability == pytest.approx(0.0)
+            for step in rollout_steps
+        )
+        assert any(step.policy_decision for step in rollout_steps[:-1])
+        assert rollout_steps[-1].discount == 0.0
+        assert rollout_steps[-1].policy_decision is False
+        # A training probe still records the failed trace for value/Q learning,
+        # but a unique MOVE-only window supplies no factual action-level blame.
+        assert all(
+            step.effect is TransactionEffect.MOVE for step in trace.learn_steps
+        )
+        assert factual_transaction_policy_targets(trace) == ()
 
         with pytest.raises(ValueError, match="recorded training"):
             resources.collector.collect_episode(
@@ -1743,7 +1753,7 @@ def test_training_only_greedy_liveness_probe_records_delta_behavior_and_deadlock
         resources.close()
 
 
-def test_liveness_trace_keeps_last_policy_choice_before_long_forced_suffix() -> None:
+def test_unique_liveness_trace_keeps_value_prefix_without_invented_policy_blame() -> None:
     from tests.test_v2_training_pipeline import (
         DynamicPreviewLoopBackend,
         _event_loop_config,
@@ -1794,9 +1804,10 @@ def test_liveness_trace_keeps_last_policy_choice_before_long_forced_suffix() -> 
         assert trace.burn_in_steps == 0
         assert len(trace.steps) == 1
         assert np.count_nonzero(trace.steps[0].snapshot.action_mask) == 2
-        labels = factual_transaction_policy_targets(trace)
-        assert len(labels) == 1
-        assert labels[0].target is TransactionPolicyTarget.AVOID
+        # This preserves the last learnable prefix for value/Q reconstruction,
+        # but MOVE-only delayed-window evidence cannot identify that action as
+        # the cause of the later stall.
+        assert factual_transaction_policy_targets(trace) == ()
     finally:
         resources.close()
 
@@ -1850,7 +1861,9 @@ def test_long_selection_failure_trace_is_bounded_to_burn_in_plus_learning_tail()
         assert trace.burn_in_steps <= 4
         assert len(trace.learn_steps) <= 32
         assert len(trace.steps) <= 36
-        assert factual_transaction_policy_targets(trace)
+        # The bounded trace is still retained, but this preview sequence has no
+        # exact repeated node/action evidence and therefore no AVOID label.
+        assert factual_transaction_policy_targets(trace) == ()
     finally:
         resources.close()
 

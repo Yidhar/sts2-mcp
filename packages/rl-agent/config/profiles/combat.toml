@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v8"
+version = "sts2-relational-curriculum-config-v9"
 profile = "combat"
 
 [model]
@@ -48,6 +48,7 @@ collector_workers = 1
 policy_sync_interval_unrolls = 8
 max_policy_lag = 64
 deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
 
 [transaction_learning]
 enabled = false

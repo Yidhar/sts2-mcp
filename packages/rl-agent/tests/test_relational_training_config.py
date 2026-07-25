@@ -23,7 +23,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v8"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v9"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -74,7 +74,13 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.rollout.minimum_unrolls == 4
     assert preheat.rollout.queue_capacity == 64
     assert preheat.rollout.max_policy_lag == 64
-    assert preheat.rollout.deterministic_probe_interval_episodes == 8
+    assert preheat.rollout.deterministic_probe_interval_episodes == 0
+    assert preheat.rollout.deterministic_probe_environment_steps == (
+        512,
+        1_024,
+        2_048,
+        4_096,
+    )
     assert preheat.runtime.evaluation_steps == (0, 100_000)
     assert preheat.runtime.evaluation_episodes == 12
     assert preheat.runtime.early_evaluation_steps == (
@@ -124,6 +130,14 @@ def test_model_and_rollout_configs_fail_closed() -> None:
         RolloutConfig(collector_workers=2)
     with pytest.raises(TypeError, match="integer"):
         RolloutConfig(unroll_length=True)  # type: ignore[arg-type]
+    normalized = RolloutConfig(
+        deterministic_probe_environment_steps=[512, 1_024],  # type: ignore[arg-type]
+    )
+    assert normalized.deterministic_probe_environment_steps == (512, 1_024)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        RolloutConfig(deterministic_probe_environment_steps=(512, 512))
+    with pytest.raises(ValueError, match="must be >= 1"):
+        RolloutConfig(deterministic_probe_environment_steps=(0,))
 
 
 def test_vtrace_and_diagnostics_bounds_are_strict() -> None:

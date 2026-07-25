@@ -83,6 +83,7 @@ class LearnerMetrics:
     episodic_burn_in_steps: int
     episodic_learn_steps: int
     episodic_policy_labels: int
+    episodic_failure_policy_suppressed_labels: int
     episodic_policy_lag_suppressed_labels: int
     episodic_task_value_labels: int
     episodic_revival_value_labels: int
@@ -138,6 +139,7 @@ class _EpisodicLossBatch:
     burn_in_steps: int
     learn_steps: int
     policy_labels: int
+    failure_policy_suppressed_labels: int
     policy_lag_suppressed_labels: int
     task_value_labels: int
     revival_value_labels: int
@@ -647,6 +649,9 @@ class VTraceLearner:
             episodic_burn_in_steps=episodic_losses.burn_in_steps,
             episodic_learn_steps=episodic_losses.learn_steps,
             episodic_policy_labels=episodic_losses.policy_labels,
+            episodic_failure_policy_suppressed_labels=(
+                episodic_losses.failure_policy_suppressed_labels
+            ),
             episodic_policy_lag_suppressed_labels=(
                 episodic_losses.policy_lag_suppressed_labels
             ),
@@ -781,9 +786,11 @@ class VTraceLearner:
         cannot increase activation memory beyond
         ``len(sequences) * episodic_config.learn_steps``.
 
-        The selected-action replay gradient is clipped by the factual behavior
-        probability.  Revival cost can affect policy only for a successfully
-        completed horizon.  Outside a configured, success-classified primary
+        Successful-horizon selected-action replay is clipped by the factual
+        behavior probability. Failed horizons remain authoritative value
+        targets but never become blanket anti-imitation policy labels. Revival
+        cost can affect policy only for a successfully completed horizon.
+        Outside a configured, success-classified primary
         tie band, the already-weighted cost signal is capped below the absolute
         primary residual.  Inside that narrow band, a small nominal-primary
         floor keeps the cost tie-break alive even when the task advantage is
@@ -804,6 +811,7 @@ class VTraceLearner:
                 burn_in_steps=0,
                 learn_steps=0,
                 policy_labels=0,
+                failure_policy_suppressed_labels=0,
                 policy_lag_suppressed_labels=0,
                 task_value_labels=0,
                 revival_value_labels=0,
@@ -860,6 +868,7 @@ class VTraceLearner:
         combined_policy_terms: list[Tensor] = []
         importance_ratios: list[Tensor] = []
         efficiency_policy_labels = 0
+        failure_policy_suppressed_labels = 0
         policy_lag_suppressed_labels = 0
 
         for time_index in range(maximum_time):
@@ -932,6 +941,21 @@ class VTraceLearner:
                 if primary is None:
                     continue
                 _, primary_target, primary_prediction, _ = primary
+                if primary_target.success is not True:
+                    # A failed long horizon is authoritative evidence for the
+                    # task-value heads, but it is not a counterfactual action
+                    # label. Applying a negative selected-action likelihood
+                    # update to every decision in a long failed run performs
+                    # anti-imitation of the entire factual trajectory. With a
+                    # hierarchical policy this systematically suppresses the
+                    # frequently sampled, many-candidate branches and leaks
+                    # probability into unsampled singleton branches (for
+                    # example END_TURN). FIFO V-trace and bounded factual
+                    # transaction failures still provide local policy
+                    # gradients; complete-episode replay reinforces policy
+                    # only after an observed successful horizon.
+                    failure_policy_suppressed_labels += 1
+                    continue
                 raw_ratio = torch.exp(
                     (
                         selected_log_probability
@@ -1098,6 +1122,7 @@ class VTraceLearner:
             burn_in_steps=total_burn_in_steps,
             learn_steps=total_learn_steps,
             policy_labels=len(primary_policy_terms),
+            failure_policy_suppressed_labels=failure_policy_suppressed_labels,
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
             task_value_labels=len(task_predictions),
             revival_value_labels=len(revival_predictions),

@@ -268,6 +268,83 @@ class _CollectorTimingAccumulator:
         )
 
 
+def _branch_balanced_epsilon_behavior(
+    *,
+    policy: NDArray[np.float32],
+    valid: NDArray[np.bool_],
+    policy_branch_ids: NDArray[np.int64],
+    epsilon: float,
+) -> NDArray[np.float64]:
+    """Mix the target policy with a count-balanced hierarchical explorer.
+
+    The learned policy first chooses one semantic action branch and then one
+    concrete action inside that branch. Epsilon exploration must use the same
+    factorization. A flat ``epsilon / valid_candidate_count`` explorer would
+    make a five-card ``play_card`` branch receive five times the exploratory
+    mass of singleton ``end_turn`` and would reintroduce the exact candidate
+    cardinality bias that the hierarchical target policy removes.
+
+    Strictly grouped duplicate backend actions are already represented by one
+    candidate here. Their raw multiplicity therefore cannot silently increase
+    exploratory probability.
+    """
+
+    if policy.ndim != 1 or valid.ndim != 1 or policy_branch_ids.ndim != 1:
+        raise CollectionProtocolError(
+            "policy, valid mask, and policy branch IDs must be one-dimensional"
+        )
+    if policy.shape != valid.shape or policy.shape != policy_branch_ids.shape:
+        raise CollectionProtocolError(
+            "policy, valid mask, and policy branch IDs have different shapes"
+        )
+    normalized_epsilon = float(epsilon)
+    if not math.isfinite(normalized_epsilon) or not 0.0 <= normalized_epsilon <= 1.0:
+        raise ValueError("exploration epsilon must be finite and in [0, 1]")
+
+    valid_indices = np.flatnonzero(valid)
+    if valid_indices.size == 0:
+        raise CollectionProtocolError("cannot build behavior policy without a legal action")
+    valid_policy = policy[valid_indices].astype(np.float64, copy=False)
+    if not np.all(np.isfinite(valid_policy)) or np.any(valid_policy < 0.0):
+        raise CollectionProtocolError("model produced a non-finite policy distribution")
+    policy_mass = float(valid_policy.sum())
+    if not math.isfinite(policy_mass) or policy_mass <= 0.0:
+        raise CollectionProtocolError("model produced zero/non-finite legal policy mass")
+
+    valid_branch_ids = policy_branch_ids[valid_indices]
+    if np.any(valid_branch_ids < 0):
+        raise CollectionProtocolError("model produced a negative legal policy branch ID")
+    _, inverse, branch_candidate_counts = np.unique(
+        valid_branch_ids,
+        return_inverse=True,
+        return_counts=True,
+    )
+    branch_count = int(branch_candidate_counts.size)
+    if branch_count <= 0:  # pragma: no cover - valid_indices makes this impossible
+        raise CollectionProtocolError("model produced no legal policy branch")
+
+    exploration = np.zeros(policy.shape, dtype=np.float64)
+    exploration[valid_indices] = 1.0 / (
+        float(branch_count) * branch_candidate_counts[inverse].astype(np.float64)
+    )
+    behavior = np.zeros(policy.shape, dtype=np.float64)
+    behavior[valid_indices] = (
+        (1.0 - normalized_epsilon) * valid_policy / policy_mass
+        + normalized_epsilon * exploration[valid_indices]
+    )
+    behavior_mass = float(behavior.sum())
+    if not math.isfinite(behavior_mass) or behavior_mass <= 0.0:
+        raise CollectionProtocolError("collector produced zero/non-finite behavior policy mass")
+    behavior /= behavior_mass
+    if (
+        not np.all(np.isfinite(behavior))
+        or np.any(behavior < 0.0)
+        or np.any(behavior[~valid] != 0.0)
+    ):
+        raise CollectionProtocolError("collector produced an invalid behavior policy")
+    return behavior
+
+
 def _number(value: object, default: float = 0.0) -> float:
     if not isinstance(value, str | int | float):
         return float(default)
@@ -2321,6 +2398,7 @@ class GroundedCollector:
                     validate=False,
                 )
                 policy = output.policy_probabilities()[0].float().cpu().numpy()
+                policy_branch_ids = output.policy_branch_ids[0].long().cpu().numpy()
                 greedy_selected = int(output.greedy_action_indices()[0].item())
                 valid = output.action_mask[0].cpu().numpy().astype(bool)
                 next_recurrent_state = output.recurrent_state.detach()
@@ -2368,13 +2446,12 @@ class GroundedCollector:
                 policy_forward_ms=policy_forward_ms,
             )
 
-        behavior = np.zeros_like(policy, dtype=np.float64)
-        behavior[valid_indices] = (
-            1.0 - normalized_epsilon
-        ) * valid_policy / policy_mass + normalized_epsilon / valid_count
-        behavior /= behavior.sum()
-        if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0):
-            raise CollectionProtocolError("collector produced an invalid behavior policy")
+        behavior = _branch_balanced_epsilon_behavior(
+            policy=policy,
+            valid=valid,
+            policy_branch_ids=policy_branch_ids,
+            epsilon=normalized_epsilon,
+        )
         selected = int(self._rng.choice(len(behavior), p=behavior))
         reference = encoded.action(selected)
         return _ActionChoice(
@@ -2868,6 +2945,14 @@ class GroundedCollector:
                             completed_act,
                             (revivals_used, player_hp_lost),
                         )
+            # Synthetic liveness terminals summarize a delayed window, not a
+            # one-step causal consequence of the action that happened to cross
+            # its threshold. Keep the terminal reward/value target and the
+            # bounded transaction trace, but do not assign that -1 directly to
+            # the final selected action through FIFO or episodic policy loss.
+            one_step_policy_decision = bool(
+                choice.valid_count > 1 and breakdown.outcome != "deadlock"
+            )
             if episodic_enabled:
                 episodic_steps.append(
                     EpisodeDecisionStep(
@@ -2875,7 +2960,7 @@ class GroundedCollector:
                         step_index=len(episodic_steps),
                         action_index=choice.candidate_index,
                         behavior_log_probability=choice.behavior_log_probability,
-                        policy_decision=choice.valid_count > 1,
+                        policy_decision=one_step_policy_decision,
                         policy_version=segment_policy_version,
                         act=pre_action_act,
                         combat_id=step_combat_id,
@@ -2908,7 +2993,7 @@ class GroundedCollector:
                         behavior_log_probability=choice.behavior_log_probability,
                         reward=breakdown.reward,
                         discount=breakdown.discount,
-                        policy_decision=choice.valid_count > 1,
+                        policy_decision=one_step_policy_decision,
                     )
                 )
             if transaction_enabled:

@@ -48,10 +48,12 @@ MACRO_SENSITIVITY_SCHEMA: Final = "sts2-macro-policy-sensitivity-v1"
 FIXED_MACRO_PROBE_SUITE_VERSION: Final = "grounded-visible-facts-v1"
 _V6_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v6"
 _V7_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v7"
+_V8_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v8"
 _REVIEWED_DIAGNOSTIC_CONFIG_VERSIONS: Final = frozenset(
     {
         _V6_CONFIG_VERSION,
         _V7_CONFIG_VERSION,
+        _V8_CONFIG_VERSION,
     }
 )
 
@@ -920,11 +922,10 @@ def _diagnostic_model_initialization_config(
     Frozen sensitivity loads network parameters through the same guarded
     model-initialization path used by training. A v18/v6 source predates the
     replay-sampling ``macro_sample_fraction`` field. A v19/v7 source predates
-    only v8 runtime schedules and scalar optimization/replay controls. None of
-    those missing fields shape model tensors, and ``training_config_from_mapping``
-    supplies their reviewed defaults after the version is advanced. The v6
-    field is filled explicitly because its disabled value is part of that
-    earlier reviewed migration.
+    v8 runtime schedules and scalar optimization/replay controls. V6--v8 all
+    predate v9 environment-step liveness-probe milestones. None of those
+    missing fields shape model tensors. Reviewed disabled defaults are filled
+    explicitly before the version is advanced.
 
     This is explicitly not exact resume and does not relax any checkpoint,
     tensor, or grounding-encoding validation.
@@ -939,6 +940,19 @@ def _diagnostic_model_initialization_config(
             f"from {source_version!r} to {CONFIG_VERSION!r}"
         )
     migrated = deepcopy(dict(payload))
+    raw_rollout = migrated.get("rollout")
+    if not isinstance(raw_rollout, Mapping):
+        raise ValueError(
+            "reviewed macro checkpoint config migration requires a rollout table"
+        )
+    rollout = dict(raw_rollout)
+    if "deterministic_probe_environment_steps" in rollout:
+        raise ValueError(
+            f"{source_version} macro checkpoint config unexpectedly contains "
+            "deterministic_probe_environment_steps"
+        )
+    rollout["deterministic_probe_environment_steps"] = []
+    migrated["rollout"] = rollout
     if source_version == _V6_CONFIG_VERSION:
         raw_episodic = migrated.get("episodic_learning")
         if not isinstance(raw_episodic, Mapping):

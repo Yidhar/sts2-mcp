@@ -304,7 +304,7 @@ def test_early_action_beyond_online_unroll_gets_run_policy_gradient() -> None:
     assert torch.count_nonzero(gradient) > 0
 
 
-def test_failed_horizon_has_primary_value_but_no_revival_labels() -> None:
+def test_failed_horizon_is_value_only_without_anti_imitation_policy_label() -> None:
     learner, encoding = _learner(learn_steps=1)
     snapshot = _snapshot(encoding, domain_id=0)
     episode = _episode((snapshot,) * 12, episode_id="long-run-failure", won=False)
@@ -315,11 +315,21 @@ def test_failed_horizon_has_primary_value_but_no_revival_labels() -> None:
     )
 
     assert losses.task_value_labels == 2
-    assert losses.policy_labels == 1
+    assert losses.policy_labels == 0
+    assert losses.failure_policy_suppressed_labels == 1
     assert losses.revival_value_labels == 0
     assert losses.efficiency_policy_labels == 0
+    assert losses.primary_policy_loss.detach().item() == 0.0
     assert losses.revival_value_loss.detach().item() == 0.0
     assert losses.revival_policy_loss.detach().item() == 0.0
+
+    learner.model.zero_grad(set_to_none=True)
+    losses.total_loss.backward()
+    assert all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        for name, parameter in learner.model.named_parameters()
+        if name.startswith("policy_head.")
+    )
 
 
 def test_stale_episode_keeps_value_labels_but_suppresses_policy_gradient() -> None:

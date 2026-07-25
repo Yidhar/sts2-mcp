@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import time
 from copy import deepcopy
@@ -894,10 +895,112 @@ def test_collector_learns_group_index_but_dispatches_raw_representative(
         resources.close()
 
 
+def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnequalGroupedSelectionBackend(StrictGroupedSelectionBackend):
+        @staticmethod
+        def _actions() -> tuple[dict[str, Any], ...]:
+            actions: list[dict[str, Any]] = []
+            for card_id, copies in (("CARD.WOUND", 1), ("CARD.BURN", 3)):
+                for copy_index in range(copies):
+                    actions.append(
+                        {
+                            "action_handle": f"select-{card_id}-{copy_index}",
+                            "action": "combat_select_card",
+                            "kind": "combat_select_card",
+                            "model_action_kind": "card_selection",
+                            "model_action_variant": "select",
+                            "selection_operation": "select",
+                            "enabled": True,
+                            "card_index": len(actions),
+                            "card": {
+                                "id": card_id,
+                                "pile": "Discard",
+                                "cost": -2,
+                                "is_selected": False,
+                            },
+                        }
+                    )
+            return tuple(actions)
+
+        def _observation(self, *, terminal: bool) -> dict[str, Any]:
+            observation = super()._observation(terminal=terminal)
+            selection = observation["card_selection"]
+            assert isinstance(selection, dict)
+            selection["cards"] = [
+                {
+                    "card_instance_id": f"instance-{index}",
+                    "id": "CARD.WOUND" if index == 0 else "CARD.BURN",
+                    "pile": "Discard",
+                    "cost": -2,
+                    "is_selected": False,
+                }
+                for index in range(4)
+            ]
+            return observation
+
+    class FixedCandidateRng:
+        def __init__(self) -> None:
+            self.probabilities: np.ndarray[Any, np.dtype[np.float64]] | None = None
+
+        def choice(
+            self,
+            candidate_count: int,
+            *,
+            p: np.ndarray[Any, np.dtype[np.float64]],
+        ) -> int:
+            assert candidate_count == 2
+            self.probabilities = np.asarray(p, dtype=np.float64)
+            return 0
+
+    backend = UnequalGroupedSelectionBackend()
+    resources = build_training_resources(_config(total_steps=1), backend=backend)
+    fixed_rng = FixedCandidateRng()
+    monkeypatch.setattr(resources.collector, "_rng", fixed_rng)
+    try:
+        encoded = resources.encoder.encode(
+            backend._observation(terminal=False),
+            backend._actions(),
+            device="cpu",
+        )
+        assert encoded.snapshot.candidate_count == 2
+        assert [reference.multiplicity for reference in encoded.actions] == [1, 3]
+
+        episode = resources.collector.collect_episode(
+            epsilon=1.0,
+            deterministic=False,
+            record=True,
+            policy_version=0,
+        )
+
+        # The raw 1:3 multiplicity is collapsed before exploration. Both
+        # semantic candidates are in one branch, so each receives half of that
+        # branch rather than probabilities 1/4 and 3/4. The exact selected
+        # behavior probability is what enters V-trace.
+        assert fixed_rng.probabilities is not None
+        np.testing.assert_allclose(
+            fixed_rng.probabilities,
+            np.asarray([0.5, 0.5]),
+            rtol=0.0,
+            atol=1e-15,
+        )
+        step = episode.unrolls[0].steps[0]
+        assert step.action_index == 0
+        assert step.behavior_log_probability == pytest.approx(math.log(0.5))
+        assert episode.metrics.maximum_observed_candidates == 4
+        assert episode.metrics.maximum_observed_semantic_candidates == 2
+        assert episode.metrics.maximum_equivalence_class_size == 3
+    finally:
+        resources.close()
+
+
+
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
     config = _config()
     report = inspect_baseline(config)
     assert report["active_shape_batching"] is True
+    assert report["deterministic_probe_environment_steps"] == []
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
     assert report["episodic_learning"]["macro_sample_fraction"] == 0.0
@@ -1557,6 +1660,74 @@ def test_async_pipeline_schedules_training_only_greedy_probe_every_n_episodes() 
         # second is a deterministic epsilon-zero probe, not held-out
         # validation data.
         assert all(int(item.metrics.reset_seed) % 2 == 0 for item in episodes)
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
+def test_async_pipeline_schedules_one_probe_for_crossed_step_milestones() -> None:
+    resources = build_training_resources(
+        _config(total_steps=6),
+        backend=FakeCombatBackend(),
+    )
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=6,
+        starting_environment_steps=0,
+        starting_policy_version=0,
+        deterministic_probe_environment_steps=(1, 2),
+        epsilon=lambda _: 0.75,
+    )
+    try:
+        pipeline.start()
+        episodes = []
+        while sum(item.metrics.steps for item in episodes) < 6:
+            episode = pipeline.next_episode(timeout=5.0)
+            assert episode is not None
+            episodes.append(episode)
+            pipeline.release_episode_boundary()
+        pipeline.join(timeout=10.0)
+
+        # The first two-step episode crosses both overdue milestones. They are
+        # coalesced into the next single greedy training episode rather than a
+        # burst of duplicate probes.
+        assert [item.liveness_probe for item in episodes] == [False, True, False]
+        assert all(int(item.metrics.reset_seed) % 2 == 0 for item in episodes)
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
+def test_async_pipeline_does_not_replay_step_probes_before_resume_position() -> None:
+    resources = build_training_resources(
+        _config(total_steps=6),
+        backend=FakeCombatBackend(),
+    )
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=6,
+        starting_environment_steps=2,
+        starting_policy_version=0,
+        deterministic_probe_environment_steps=(1, 2, 3),
+        epsilon=lambda _: 0.75,
+    )
+    try:
+        pipeline.start()
+        episodes = []
+        while pipeline.environment_steps < 6:
+            episode = pipeline.next_episode(timeout=5.0)
+            assert episode is not None
+            episodes.append(episode)
+            pipeline.release_episode_boundary()
+        pipeline.join(timeout=10.0)
+
+        # Milestones in the checkpointed prefix (1 and 2) are not replayed.
+        # The first new episode crosses 3, so only its successor is a probe.
+        assert [item.liveness_probe for item in episodes] == [False, True]
     finally:
         pipeline.stop()
         if pipeline.alive:
@@ -2563,7 +2734,7 @@ def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(
         source_config,
         model=replace(source_config.model, max_candidates=256),
     )
-    with pytest.raises(ValueError, match="identical immutable.*lineage"):
+    with pytest.raises(ValueError, match=r"identical immutable.*lineage"):
         preflight_training_checkpoint(
             checkpoint,
             config=target_config,

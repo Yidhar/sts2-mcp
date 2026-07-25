@@ -17,7 +17,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v8"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v9"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
 
@@ -250,6 +250,14 @@ class RolloutConfig:
     # training seed stream.  It remains training data and is never allowed to
     # consume the odd validation or final-audit seed namespaces.
     deterministic_probe_interval_episodes: int = 0
+    # Full-run episodes can span thousands of decisions, so an episode-count
+    # interval alone may never expose a collapsing greedy policy before the
+    # first held-out gate. Each positive environment-step milestone schedules
+    # one training-only greedy episode at the first subsequent episode
+    # boundary. Milestones crossed by the same long episode are coalesced into
+    # one probe; exact resume treats milestones at or below the restored
+    # environment step as already observed instead of replaying stale probes.
+    deterministic_probe_environment_steps: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -270,6 +278,27 @@ class RolloutConfig:
             label="rollout.deterministic_probe_interval_episodes",
             minimum=0,
         )
+        milestones = self.deterministic_probe_environment_steps
+        if not isinstance(milestones, tuple):
+            milestones = tuple(milestones)
+            object.__setattr__(
+                self,
+                "deterministic_probe_environment_steps",
+                milestones,
+            )
+        previous = 0
+        for index, step in enumerate(milestones):
+            _require_int(
+                step,
+                label=f"rollout.deterministic_probe_environment_steps[{index}]",
+                minimum=1,
+            )
+            if step <= previous:
+                raise ValueError(
+                    "rollout.deterministic_probe_environment_steps must be "
+                    "strictly increasing"
+                )
+            previous = step
         if self.minimum_unrolls > self.queue_capacity:
             raise ValueError("rollout minimum_unrolls cannot exceed queue_capacity")
         if self.collector_workers != 1:
@@ -803,7 +832,10 @@ class TrainingConfig:
                     "episodic learning requires curriculum.reward_objective='run'"
                 )
         if (
-            self.rollout.deterministic_probe_interval_episodes > 0
+            (
+                self.rollout.deterministic_probe_interval_episodes > 0
+                or bool(self.rollout.deterministic_probe_environment_steps)
+            )
             and not self.transaction_learning.enabled
         ):
             raise ValueError(
@@ -848,6 +880,15 @@ class TrainingConfig:
         """
 
         payload = self.to_mapping()
+        rollout = payload["rollout"]
+        if not isinstance(rollout, dict):  # pragma: no cover - asdict invariant
+            raise TypeError("serialized rollout config must be an object")
+        # Metadata JSON represents immutable tuples as arrays. Canonicalize the
+        # new lineage schedule before comparison so a checkpoint written from
+        # this exact config can resume without a tuple/list false mismatch.
+        rollout["deterministic_probe_environment_steps"] = list(
+            self.rollout.deterministic_probe_environment_steps
+        )
         runtime = payload["runtime"]
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")

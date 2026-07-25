@@ -471,6 +471,9 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "deterministic_probe_interval_episodes": (
             config.rollout.deterministic_probe_interval_episodes
         ),
+        "deterministic_probe_environment_steps": list(
+            config.rollout.deterministic_probe_environment_steps
+        ),
         "transaction_learning": {
             "enabled": config.transaction_learning.enabled,
             "replay_capacity": config.transaction_learning.replay_capacity,
@@ -991,6 +994,9 @@ def run_training(
             starting_episode_count=state.episodes,
             deterministic_probe_interval_episodes=(
                 config.rollout.deterministic_probe_interval_episodes
+            ),
+            deterministic_probe_environment_steps=(
+                config.rollout.deterministic_probe_environment_steps
             ),
             supervisor_state=actor_supervisor_state,
         )

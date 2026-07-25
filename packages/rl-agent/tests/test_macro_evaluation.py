@@ -245,8 +245,11 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
     episodic = source["episodic_learning"]
+    rollout = source["rollout"]
     assert isinstance(episodic, dict)
+    assert isinstance(rollout, dict)
     del episodic["macro_sample_fraction"]
+    del rollout["deterministic_probe_environment_steps"]
 
     migrated = _diagnostic_model_initialization_config(source)
 
@@ -282,6 +285,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     for key in ("entropy_weight_end", "entropy_decay_updates"):
         del optimization[key]
     del rollout["deterministic_probe_interval_episodes"]
+    del rollout["deterministic_probe_environment_steps"]
     del episodic["policy_gradient_max_lag"]
     for key in (
         "early_evaluation_steps",
@@ -308,3 +312,24 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     assert migrated.runtime.early_evaluation_steps == ()
     assert migrated.runtime.final_audit_steps == ()
     assert not migrated.runtime.evaluation_liveness_guard_enabled
+
+
+def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
+    active = load_training_config(profile="preheat")
+    source = active.to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v8"
+    rollout = source["rollout"]
+    assert isinstance(rollout, dict)
+    del rollout["deterministic_probe_environment_steps"]
+
+    migrated = _diagnostic_model_initialization_config(source)
+
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.model == active.model
+    assert migrated.rollout.deterministic_probe_environment_steps == ()
+    assert migrated.rollout.deterministic_probe_interval_episodes == 0
+
+    unexpected = active.to_mapping()
+    unexpected["version"] = "sts2-relational-curriculum-config-v8"
+    with pytest.raises(ValueError, match="unexpectedly contains"):
+        _diagnostic_model_initialization_config(unexpected)
