@@ -14,6 +14,7 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
+from itertools import islice, pairwise
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +23,25 @@ from sts2_rl.artifacts import validate_artifact_component
 JsonDict = dict[str, Any]
 
 _RUN_DIRECTORY_RE = re.compile(
-    r"^run-(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+    r"^run-(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
 _PARENT_RUN_RE = re.compile(
-    r"(?:^|[/\\])run-(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:[/\\]|$)"
+    r"(?:^|[/\\])run-(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:[/\\]|$)"
 )
 _CHECKPOINT_RE = re.compile(r"^(?P<kind>periodic|final)-step-(?P<step>[0-9]+)$")
-_EVALUATION_RE = re.compile(r"^evaluation-step-(?P<step>[0-9]+)\.jsonl$")
+_EVALUATION_RE = re.compile(
+    r"^(?P<journal_kind>evaluation|early-validation|final-audit)-" r"step-(?P<step>[0-9]{1,18})\.jsonl$"
+)
+_EVALUATION_GATE_KIND_BY_JOURNAL = {
+    "evaluation": "validation",
+    "early-validation": "early_validation",
+    "final-audit": "final_audit",
+}
+_EVALUATION_GATE_KIND_ORDER = {
+    "validation": 0,
+    "early_validation": 1,
+    "final_audit": 2,
+}
 _MAX_METRICS_LINE_BYTES = 8 * 1024 * 1024
 _MAX_START_LINE_BYTES = 8 * 1024 * 1024
 _MAX_EPISODES = 500
@@ -41,6 +52,7 @@ _MAX_INCIDENTS = 200
 _MAX_CHECKPOINT_EVENTS = 200
 _MAX_CHECKPOINT_JSON_BYTES = 2 * 1024 * 1024
 _MAX_CHECKPOINT_FILES = 512
+_MAX_EVALUATION_JOURNAL_SCAN_ENTRIES = 1024
 _MAX_PARSER_CACHE = 8
 _DISCOVERY_TTL_SECONDS = 3.0
 _CHECKPOINT_TTL_SECONDS = 4.0
@@ -142,11 +154,7 @@ def _read_first_object(path: Path) -> JsonDict | None:
 def _read_bounded_json_object(path: Path, *, parent: Path, limit: int) -> JsonDict | None:
     """Read a small JSON object without following artifact-tree links."""
 
-    if (
-        not path.is_file()
-        or _is_link_or_reparse(path)
-        or not _safe_resolved_child(path, parent)
-    ):
+    if not path.is_file() or _is_link_or_reparse(path) or not _safe_resolved_child(path, parent):
         return None
     try:
         size = path.stat().st_size
@@ -456,10 +464,8 @@ class IncrementalMetrics:
             if (
                 not self.candidate_peaks
                 or raw_peak > _integer(previous.get("maximum_observed_candidates"))
-                or semantic_peak
-                > _integer(previous.get("maximum_observed_semantic_candidates"))
-                or equivalence_peak
-                > _integer(previous.get("maximum_equivalence_class_size"))
+                or semantic_peak > _integer(previous.get("maximum_observed_semantic_candidates"))
+                or equivalence_peak > _integer(previous.get("maximum_equivalence_class_size"))
             ):
                 _bounded_append(
                     self.candidate_peaks,
@@ -526,6 +532,38 @@ def _terminal_projection(event: JsonDict | None) -> JsonDict:
     return event if event is not None else {}
 
 
+def _pending_evaluation_status(
+    pending_evaluation: JsonDict,
+    *,
+    telemetry_age: float | None = None,
+) -> JsonDict:
+    evaluation_kind = _string(pending_evaluation.get("kind"), "validation")
+    evaluation_gate = _integer(pending_evaluation.get("gate"))
+    if evaluation_kind == "final_audit":
+        label = f"最终审计中 · 门 {evaluation_gate}"
+        evidence = [
+            "最终审计 journal 活跃且尚无对应 evaluation 汇总",
+            "run_complete 尚未持久化; 整个运行尚未完成",
+        ]
+    elif evaluation_kind == "early_validation":
+        label = f"早期评估中 · 门 {evaluation_gate}"
+        evidence = ["早期评估 journal 活跃且尚无对应 evaluation 汇总"]
+    else:
+        label = f"评估中 · 门 {evaluation_gate}"
+        evidence = ["评估 journal 活跃且尚无对应 evaluation 汇总"]
+    projected = {
+        "state": "evaluating",
+        "phase": "evaluating",
+        "label": label,
+        "evaluation_kind": evaluation_kind,
+        "evaluation_gate": evaluation_gate,
+        "evidence": evidence,
+    }
+    if telemetry_age is not None:
+        projected["telemetry_age_s"] = telemetry_age
+    return projected
+
+
 def _latest_counter(
     aggregate: IncrementalMetrics,
     *,
@@ -557,11 +595,7 @@ def _rate(
     if len(points) < 3:
         return None, "low"
     end_time = points[-1][0] if reference_time is None else reference_time
-    selected = [
-        point
-        for point in points
-        if end_time - seconds <= point[0] <= end_time + 5.0
-    ]
+    selected = [point for point in points if end_time - seconds <= point[0] <= end_time + 5.0]
     distinct: list[tuple[float, int]] = []
     for timestamp, step in selected:
         if distinct and step == distinct[-1][1]:
@@ -623,10 +657,23 @@ def _downsample_extrema(points: list[JsonDict], limit: int, key: str) -> list[Js
     return [item for _, item in selected[:limit]]
 
 
+def _evaluation_gate_kind(event: JsonDict) -> str:
+    supplied = _string(event.get("gate_kind")).replace("-", "_")
+    if supplied in {"validation", "early_validation", "final_audit"}:
+        return supplied
+    if _string(event.get("data_partition")).replace("-", "_") == "final_audit":
+        return "final_audit"
+    # Legacy evaluation summaries predate gate_kind. Those journals used the
+    # ordinary evaluation-step-* namespace, so validation is the safe fallback.
+    return "validation"
+
+
 def _normalise_evaluation(event: JsonDict) -> JsonDict:
     episodes = _integer(event.get("episodes"))
     gate_value = event.get("evaluation_gate")
     gate = _integer(gate_value if _finite_number(gate_value) is not None else event.get("environment_steps"))
+    gate_kind = _evaluation_gate_kind(event)
+
     def fraction(name: str) -> float:
         value = _finite_number(event.get(name))
         return min(1.0, max(0.0, value)) if value is not None else 0.0
@@ -640,10 +687,23 @@ def _normalise_evaluation(event: JsonDict) -> JsonDict:
     combat_stall_rate = fraction("combat_progress_stall_rate")
     noncombat_stall_rate = fraction("noncombat_progress_stall_rate")
     policy_failures = _integer(event.get("combat_policy_failure_count"))
+    evaluation_context = _mapping(event.get("evaluation_context"))
+    policy_number = _finite_number(evaluation_context.get("policy_version"))
+    if policy_number is None:
+        policy_number = _finite_number(event.get("policy_version"))
+    actor_policy_number = _finite_number(evaluation_context.get("actor_policy_version"))
+    if actor_policy_number is None:
+        actor_policy_number = _finite_number(event.get("actor_policy_version"))
     return {
         "timestamp": _finite_number(event.get("unix_s")),
         "evaluation_gate": gate,
+        "gate_kind": gate_kind,
+        "data_partition": _string(event.get("data_partition"))
+        or ("final_audit" if gate_kind == "final_audit" else "validation"),
         "environment_steps": _integer(event.get("environment_steps")),
+        "policy_version": int(policy_number) if policy_number is not None else None,
+        "actor_policy_version": (int(actor_policy_number) if actor_policy_number is not None else None),
+        "policy_model_state_sha256": _string(evaluation_context.get("policy_model_state_sha256")),
         "episodes": episodes,
         "act_1_successes": _integer(event.get("act1_clear_count"), round(act1_rate * episodes)),
         "act_1_success_rate": act1_rate,
@@ -703,31 +763,21 @@ def _bounded_episodes(aggregate: IncrementalMetrics, boundary: JsonDict | None) 
     if boundary is None:
         return list(aggregate.episodes)
     maximum_episode = _integer(boundary.get("episodes"))
-    return [
-        episode
-        for episode in aggregate.episodes
-        if _integer(episode.get("episode")) <= maximum_episode
-    ]
+    return [episode for episode in aggregate.episodes if _integer(episode.get("episode")) <= maximum_episode]
 
 
 def _bounded_learner_series(aggregate: IncrementalMetrics, boundary: JsonDict | None) -> list[JsonDict]:
     if boundary is None:
         return list(aggregate.learner_series)
     maximum_policy = _integer(boundary.get("policy_version"))
-    return [
-        point
-        for point in aggregate.learner_series
-        if _integer(point.get("policy_version")) <= maximum_policy
-    ]
+    return [point for point in aggregate.learner_series if _integer(point.get("policy_version")) <= maximum_policy]
 
 
 def _bounded_evaluations(aggregate: IncrementalMetrics, boundary: JsonDict | None) -> list[JsonDict]:
     if boundary is None:
         return list(aggregate.evaluations)
     start_count = _integer(
-        _mapping(aggregate.start_event.get("state") if aggregate.start_event else {}).get(
-            "evaluation_episodes"
-        )
+        _mapping(aggregate.start_event.get("state") if aggregate.start_event else {}).get("evaluation_episodes")
     )
     maximum_count = _integer(boundary.get("evaluation_episodes"))
     result: list[JsonDict] = []
@@ -761,11 +811,7 @@ def _bounded_candidate_peaks(
     if boundary is None:
         return list(aggregate.candidate_peaks)
     maximum_episode = _integer(boundary.get("episodes"))
-    return [
-        point
-        for point in aggregate.candidate_peaks
-        if _integer(point.get("episode")) <= maximum_episode
-    ]
+    return [point for point in aggregate.candidate_peaks if _integer(point.get("episode")) <= maximum_episode]
 
 
 class DashboardStore:
@@ -900,16 +946,24 @@ class DashboardStore:
         parser = self._parsers.get(run.metrics_path)
         if parser is not None and parser.parsed_rows:
             parser.refresh()
-            state = self._status(run, parser, {"published": [], "publishing": []}, None)
+            evaluation_activity, pending_evaluation = self._evaluation_activity(run, parser)
+            state = self._status(
+                run,
+                parser,
+                {
+                    "published": [],
+                    "publishing": [],
+                    "latest_activity": evaluation_activity,
+                },
+                pending_evaluation,
+            )
             return {"state": state["state"], "phase": state["phase"], "label": state["label"]}
         try:
             modified = run.metrics_path.stat().st_mtime
         except OSError:
             return {"state": "unknown", "label": "不可读取"}
-        recent_events = {
-            _string(event.get("event"))
-            for event in _read_recent_objects(run.metrics_path)
-        }
+        recent_objects = _read_recent_objects(run.metrics_path)
+        recent_events = {_string(event.get("event")) for event in recent_objects}
         if "run_complete" in recent_events:
             return {"state": "completed", "phase": "complete", "label": "已完成"}
         successor = self._successor_for(run)
@@ -923,7 +977,31 @@ class DashboardStore:
             return {"state": "interrupted", "phase": "interrupted", "label": "已中断"}
         if "run_failed" in recent_events or "circuit_breaker_open" in recent_events:
             return {"state": "failed", "phase": "failed", "label": "运行失败"}
-        age = max(0.0, self._now() - modified)
+        completed_gates = {
+            (
+                _evaluation_gate_kind(event),
+                _integer(
+                    event.get("evaluation_gate")
+                    if _finite_number(event.get("evaluation_gate")) is not None
+                    else event.get("environment_steps")
+                ),
+            )
+            for event in recent_objects
+            if event.get("event") == "evaluation"
+        }
+        evaluation_activity, pending_evaluation = self._evaluation_journal_activity(
+            run,
+            completed_gates=completed_gates,
+            metrics_mtime=modified,
+        )
+        latest_activity = max(
+            modified,
+            evaluation_activity if evaluation_activity is not None else modified,
+        )
+        age = max(0.0, self._now() - latest_activity)
+        if pending_evaluation is not None and age <= self.stale_seconds:
+            state = _pending_evaluation_status(pending_evaluation)
+            return {"state": state["state"], "phase": state["phase"], "label": state["label"]}
         return {
             "state": "stale" if age > self.stale_seconds else "running",
             "label": "遥测陈旧" if age > self.stale_seconds else "可用",
@@ -997,9 +1075,7 @@ class DashboardStore:
                 publishing.append(
                     {
                         "name": target_name,
-                        "environment_steps": (
-                            int(target_match.group("step")) if target_match is not None else None
-                        ),
+                        "environment_steps": (int(target_match.group("step")) if target_match is not None else None),
                         "modified_at": child_mtime,
                         "status": "publishing",
                     }
@@ -1074,11 +1150,7 @@ class DashboardStore:
                         issues.append("invalid_manifest_path")
                         continue
                     relative_file = Path(file_name)
-                    if (
-                        relative_file.is_absolute()
-                        or len(relative_file.parts) != 1
-                        or relative_file.name != file_name
-                    ):
+                    if relative_file.is_absolute() or len(relative_file.parts) != 1 or relative_file.name != file_name:
                         issues.append("unsafe_manifest_path")
                         continue
                     if file_name in declared_files:
@@ -1141,59 +1213,82 @@ class DashboardStore:
         self._checkpoint_cache[directory] = (monotonic_now, result)
         return result
 
+    def _evaluation_journal_activity(
+        self,
+        run: DiscoveredRun,
+        *,
+        completed_gates: set[tuple[str, int]],
+        metrics_mtime: float | None,
+    ) -> tuple[float | None, JsonDict | None]:
+        latest_mtime: float | None = None
+        pending_evaluation: JsonDict | None = None
+        pending_mtime: float | None = None
+        try:
+            entries = run.run_directory.iterdir()
+        except OSError:
+            return None, None
+        try:
+            for entry in islice(entries, _MAX_EVALUATION_JOURNAL_SCAN_ENTRIES):
+                match = _EVALUATION_RE.fullmatch(entry.name)
+                if (
+                    match is None
+                    or not entry.is_file()
+                    or _is_link_or_reparse(entry)
+                    or not _safe_resolved_child(entry, run.run_directory)
+                ):
+                    continue
+                try:
+                    modified = entry.stat().st_mtime
+                    gate = int(match.group("step"))
+                except (OSError, OverflowError, ValueError):
+                    continue
+                gate_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[match.group("journal_kind")]
+                if latest_mtime is None or modified > latest_mtime:
+                    latest_mtime = modified
+                if (gate_kind, gate) not in completed_gates and (pending_mtime is None or modified >= pending_mtime):
+                    pending_evaluation = {
+                        "kind": gate_kind,
+                        "gate": gate,
+                        "journal_name": entry.name,
+                        "modified_at": modified,
+                    }
+                    pending_mtime = modified
+        except OSError:
+            # A concurrent artifact cleanup can invalidate the directory
+            # iterator. Preserve any safe activity observed before that point.
+            pass
+        if pending_mtime is not None and metrics_mtime is not None and pending_mtime < metrics_mtime:
+            pending_evaluation = None
+        return latest_mtime, pending_evaluation
+
     def _evaluation_activity(
         self,
         run: DiscoveredRun,
         parser: IncrementalMetrics,
-    ) -> tuple[float | None, int | None]:
+    ) -> tuple[float | None, JsonDict | None]:
         completed_gates = {
-            _integer(
-                event.get("evaluation_gate")
-                if _finite_number(event.get("evaluation_gate")) is not None
-                else event.get("environment_steps")
+            (
+                _evaluation_gate_kind(event),
+                _integer(
+                    event.get("evaluation_gate")
+                    if _finite_number(event.get("evaluation_gate")) is not None
+                    else event.get("environment_steps")
+                ),
             )
             for event in parser.evaluations
         }
-        latest_mtime: float | None = None
-        pending_gate: int | None = None
-        pending_mtime: float | None = None
-        try:
-            entries = list(run.run_directory.iterdir())
-        except OSError:
-            return None, None
-        for entry in entries:
-            match = _EVALUATION_RE.fullmatch(entry.name)
-            if (
-                match is None
-                or not entry.is_file()
-                or _is_link_or_reparse(entry)
-                or not _safe_resolved_child(entry, run.run_directory)
-            ):
-                continue
-            try:
-                modified = entry.stat().st_mtime
-            except OSError:
-                continue
-            gate = int(match.group("step"))
-            if latest_mtime is None or modified > latest_mtime:
-                latest_mtime = modified
-            if gate not in completed_gates and (pending_mtime is None or modified >= pending_mtime):
-                pending_gate = gate
-                pending_mtime = modified
-        if (
-            pending_mtime is not None
-            and parser.last_mtime is not None
-            and pending_mtime < parser.last_mtime
-        ):
-            pending_gate = None
-        return latest_mtime, pending_gate
+        return self._evaluation_journal_activity(
+            run,
+            completed_gates=completed_gates,
+            metrics_mtime=parser.last_mtime,
+        )
 
     def _status(
         self,
         run: DiscoveredRun,
         parser: IncrementalMetrics,
         checkpoints: JsonDict,
-        pending_evaluation_gate: int | None,
+        pending_evaluation: JsonDict | None,
     ) -> JsonDict:
         now = self._now()
         checkpoint_activity = _finite_number(checkpoints.get("latest_activity"))
@@ -1212,9 +1307,7 @@ class DashboardStore:
         if "run_complete" in parser.latest_by_event:
             published = checkpoints.get("published")
             has_final_checkpoint = isinstance(published, list) and any(
-                isinstance(item, dict)
-                and item.get("kind") == "final"
-                and item.get("valid") is True
+                isinstance(item, dict) and item.get("kind") == "final" and item.get("valid") is True
                 for item in published
             )
             return {
@@ -1272,6 +1365,7 @@ class DashboardStore:
                 "telemetry_age_s": telemetry_age,
                 "evidence": [
                     f"超过 {int(self.stale_seconds)} 秒无结构化活动",
+                    "run_complete 尚未持久化",
                     "没有通用失败事件, 不能据此断言进程崩溃",
                 ],
             }
@@ -1283,14 +1377,11 @@ class DashboardStore:
                 "telemetry_age_s": telemetry_age,
                 "evidence": ["发现原子检查点 staging; 尚不可恢复"],
             }
-        if pending_evaluation_gate is not None:
-            return {
-                "state": "evaluating",
-                "phase": "evaluating",
-                "label": f"评估中 · 门 {pending_evaluation_gate}",
-                "telemetry_age_s": telemetry_age,
-                "evidence": ["评估 journal 活跃且尚无对应 evaluation 汇总"],
-            }
+        if pending_evaluation is not None:
+            return _pending_evaluation_status(
+                pending_evaluation,
+                telemetry_age=telemetry_age,
+            )
         latest_progress = parser.latest_by_event.get("learner_progress")
         stage = _string(latest_progress.get("stage")) if latest_progress is not None else "collecting"
         return {
@@ -1317,6 +1408,11 @@ class DashboardStore:
                 "revival_budget": None,
                 "standard_game": False,
                 "label": "尚未选择训练运行",
+            },
+            "lifecycle": {
+                "run_complete_persisted": False,
+                "training_horizon_reached": False,
+                "pending_evaluation": None,
             },
             "progress": {},
             "throughput": {},
@@ -1356,12 +1452,12 @@ class DashboardStore:
             ]
             selected_parser = aggregates[-1][1]
             checkpoints = self._checkpoint_snapshot(selected)
-            evaluation_activity, pending_gate = self._evaluation_activity(selected, selected_parser)
+            evaluation_activity, pending_evaluation = self._evaluation_activity(selected, selected_parser)
             if evaluation_activity is not None:
                 current_activity = _finite_number(checkpoints.get("latest_activity"))
                 if current_activity is None or evaluation_activity > current_activity:
                     checkpoints["latest_activity"] = evaluation_activity
-            status = self._status(selected, selected_parser, checkpoints, pending_gate)
+            status = self._status(selected, selected_parser, checkpoints, pending_evaluation)
 
             config = _mapping(selected.start_event.get("config"))
             runtime = _mapping(config.get("runtime"))
@@ -1373,9 +1469,7 @@ class DashboardStore:
             learner_updates = max(
                 _latest_counter(selected_parser, field="learner_updates"),
                 _integer(state.get("learner_updates")),
-                _integer(
-                    selected_parser.latest_by_event.get("learner_update", {}).get("policy_version")
-                ),
+                _integer(selected_parser.latest_by_event.get("learner_update", {}).get("policy_version")),
             )
             policy_version = max(
                 _integer(completed.get("policy_version")),
@@ -1435,18 +1529,12 @@ class DashboardStore:
 
             all_environment_points: list[tuple[float, int]] = []
             for _, aggregate, boundary in segments:
-                maximum_step = (
-                    _integer(boundary.get("environment_steps")) if boundary is not None else None
-                )
+                maximum_step = _integer(boundary.get("environment_steps")) if boundary is not None else None
                 all_environment_points.extend(
-                    point
-                    for point in aggregate.environment_points
-                    if maximum_step is None or point[1] <= maximum_step
+                    point for point in aggregate.environment_points if maximum_step is None or point[1] <= maximum_step
                 )
             all_environment_points.sort(key=lambda item: item[0])
-            rate_reference = (
-                None if status["state"] == "completed" else self._now()
-            )
+            rate_reference = None if status["state"] == "completed" else self._now()
             rate_15m, confidence_15m = _rate(
                 all_environment_points,
                 15.0 * 60.0,
@@ -1459,39 +1547,62 @@ class DashboardStore:
             )
             update_rate = _recent_update_rate(selected_parser.learner_points)
             eta: float | None
-            if (
-                status["state"] == "running"
-                and rate_60m is not None
-                and rate_60m > 0
-                and target > environment_steps
-            ):
+            if status["state"] == "running" and rate_60m is not None and rate_60m > 0 and target > environment_steps:
                 eta = (target - environment_steps) / rate_60m
             else:
                 eta = None
             confidence = confidence_15m if rate_15m is not None else confidence_60m
 
-            evaluations_by_gate: dict[int, JsonDict] = {}
+            evaluations_by_gate: dict[tuple[str, int], tuple[int, JsonDict]] = {}
+            evaluation_sequence = 0
             for _, aggregate, boundary in segments:
                 for event in _bounded_evaluations(aggregate, boundary):
                     normalised = _normalise_evaluation(event)
-                    evaluations_by_gate[_integer(normalised.get("evaluation_gate"))] = normalised
-            evaluations = [evaluations_by_gate[gate] for gate in sorted(evaluations_by_gate)]
+                    key = (
+                        _string(normalised.get("gate_kind"), "validation"),
+                        _integer(normalised.get("evaluation_gate")),
+                    )
+                    evaluations_by_gate[key] = (evaluation_sequence, normalised)
+                    evaluation_sequence += 1
+            projected_evaluations = sorted(
+                evaluations_by_gate.values(),
+                key=lambda item: item[0],
+            )
+            evaluation_timestamps = [
+                _finite_number(evaluation.get("timestamp")) for _, evaluation in projected_evaluations
+            ]
+            finite_evaluation_timestamps = [timestamp for timestamp in evaluation_timestamps if timestamp is not None]
+            timestamps_are_reliable = (
+                bool(evaluation_timestamps)
+                and len(finite_evaluation_timestamps) == len(evaluation_timestamps)
+                and all(previous <= following for previous, following in pairwise(finite_evaluation_timestamps))
+            )
+            if timestamps_are_reliable:
+                projected_evaluations.sort(
+                    key=lambda item: (
+                        _finite_number(item[1].get("timestamp")) or 0.0,
+                        _EVALUATION_GATE_KIND_ORDER.get(
+                            _string(item[1].get("gate_kind"), "validation"),
+                            -1,
+                        ),
+                        item[0],
+                    )
+                )
+            else:
+                # Mixed/legacy clocks are not safe to compare. The chained
+                # metrics parse order is the authoritative fallback.
+                projected_evaluations.sort(key=lambda item: item[0])
+            evaluations = [evaluation for _, evaluation in projected_evaluations]
 
             episodes = [
-                episode
-                for _, aggregate, boundary in segments
-                for episode in _bounded_episodes(aggregate, boundary)
+                episode for _, aggregate, boundary in segments for episode in _bounded_episodes(aggregate, boundary)
             ][-_MAX_EPISODES:]
             learner_series = [
-                point
-                for _, aggregate, boundary in segments
-                for point in _bounded_learner_series(aggregate, boundary)
+                point for _, aggregate, boundary in segments for point in _bounded_learner_series(aggregate, boundary)
             ]
             learner_series = _downsample_extrema(learner_series, 800, "loss")
             incidents = [
-                incident
-                for _, aggregate, boundary in segments
-                for incident in _bounded_incidents(aggregate, boundary)
+                incident for _, aggregate, boundary in segments for incident in _bounded_incidents(aggregate, boundary)
             ][-_MAX_INCIDENTS:]
 
             alerts: list[JsonDict] = []
@@ -1518,6 +1629,26 @@ class DashboardStore:
                         {
                             "type": "heldout_deadlock",
                             "message": "最新 held-out 评估全部 deadlock; 这是模型质量告警, 不是基础设施重试",
+                        }
+                    )
+                latest_completion = _mapping(selected_parser.latest_by_event.get("run_complete"))
+                audited_policy = _finite_number(latest_evaluation.get("policy_version"))
+                terminal_policy = _finite_number(latest_completion.get("policy_version"))
+                if (
+                    latest_evaluation.get("gate_kind") == "final_audit"
+                    and _string(latest_evaluation.get("policy_model_state_sha256"))
+                    and audited_policy is not None
+                    and terminal_policy is not None
+                    and int(audited_policy) != int(terminal_policy)
+                ):
+                    alerts.append(
+                        {
+                            "type": "final_audit_policy_mismatch",
+                            "message": (
+                                "最终审计策略版本 "
+                                f"{int(audited_policy)} 与 run_complete 策略版本 "
+                                f"{int(terminal_policy)} 不一致; 不能把该审计结果冒充为最终 checkpoint 结果"
+                            ),
                         }
                     )
             max_candidates = _integer(model.get("max_candidates"))
@@ -1550,9 +1681,7 @@ class DashboardStore:
             mode = _string(curriculum.get("mode"))
             unlimited_revival = revival_budget == -1
             standard_game = (
-                revival_budget is not None
-                and not unlimited_revival
-                and mode not in {"native-revival-preheat"}
+                revival_budget is not None and not unlimited_revival and mode not in {"native-revival-preheat"}
             )
             parsed_rows = sum(aggregate.parsed_rows for _, aggregate in aggregates)
             checkpoint_load = _mapping(selected.start_event.get("checkpoint_load"))
@@ -1571,9 +1700,7 @@ class DashboardStore:
                             "key": run.key,
                             "run_id": run.run_id,
                             "start_time": run.start_time,
-                            "checkpoint_load_mode": _mapping(
-                                run.start_event.get("checkpoint_load")
-                            ).get("mode"),
+                            "checkpoint_load_mode": _mapping(run.start_event.get("checkpoint_load")).get("mode"),
                         }
                         for run in chain
                     ],
@@ -1592,8 +1719,15 @@ class DashboardStore:
                     "label": (
                         "无限原生复活预热 · 非标准胜率"
                         if unlimited_revival
-                        else "标准游戏评估" if standard_game else mode or "训练上下文未标注"
+                        else "标准游戏评估"
+                        if standard_game
+                        else mode or "训练上下文未标注"
                     ),
+                },
+                "lifecycle": {
+                    "run_complete_persisted": "run_complete" in selected_parser.latest_by_event,
+                    "training_horizon_reached": target > 0 and environment_steps >= target,
+                    "pending_evaluation": pending_evaluation,
                 },
                 "progress": {
                     "environment_steps": environment_steps,
@@ -1614,9 +1748,7 @@ class DashboardStore:
                     "eta_s": eta,
                     "confidence": confidence,
                     "scope": "pre_completion" if status["state"] == "completed" else "live",
-                    "paused_for_phase": status["phase"]
-                    if status["phase"] in {"evaluating", "checkpointing"}
-                    else None,
+                    "paused_for_phase": status["phase"] if status["phase"] in {"evaluating", "checkpointing"} else None,
                 },
                 "latest_episode": episodes[-1] if episodes else None,
                 "latest_learner": selected_parser.latest_learner,
@@ -1638,9 +1770,7 @@ class DashboardStore:
                     "partial_line": any(aggregate.partial_line for _, aggregate in aggregates),
                     "last_complete_offset": selected_parser.offset,
                     "chain_files": len(chain),
-                    "unknown_events": sum(
-                        aggregate.event_counts.get("unknown", 0) for _, aggregate in aggregates
-                    ),
+                    "unknown_events": sum(aggregate.event_counts.get("unknown", 0) for _, aggregate in aggregates),
                 },
                 "alerts": alerts,
             }

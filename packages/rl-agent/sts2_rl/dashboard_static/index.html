@@ -809,7 +809,7 @@
         </div>
         <div class="overview-grid">
           <article class="card">
-            <div class="metric-label">环境进度</div>
+            <div class="metric-label">环境采集进度</div>
             <div id="progress-value" class="metric-value skeleton">000,000 / 000,000</div>
             <div id="progress-context" class="metric-context">—</div>
             <progress id="run-progress" max="100" value="0">0%</progress>
@@ -1158,6 +1158,9 @@
         maximum_observed_candidates: "Raw 候选峰值",
         maximum_observed_semantic_candidates: "语义候选峰值",
         maximum_equivalence_class_size: "最大等价类",
+        validation: "常规评估",
+        early_validation: "早期评估",
+        final_audit: "最终审计",
         timestamp: "时间",
         time: "时间",
         created_at: "创建时间",
@@ -1421,6 +1424,7 @@
 
       function renderProgress(snapshot) {
         const progress = snapshot.progress || {};
+        const lifecycle = snapshot.lifecycle || {};
         const current = finite(progress.environment_steps);
         const target = finite(progress.target_environment_steps);
         const suppliedPercent = finite(progress.percent);
@@ -1429,13 +1433,23 @@
           : current != null && target && target > 0
             ? Math.max(0, Math.min(100, current / target * 100))
             : 0;
+        const horizonReached = lifecycle.training_horizon_reached === true ||
+          (current != null && target != null && target > 0 && current >= target);
+        const runComplete = lifecycle.run_complete_persisted === true ||
+          statusState(snapshot.status || {}) === "complete";
+        const completionContext = horizonReached
+          ? runComplete
+            ? " · run_complete 已确认"
+            : " · 采集目标已达；整个运行尚未完成"
+          : "";
 
         setText("progress-value", `${int(current)} / ${int(target)}`);
         setText(
           "progress-context",
           `${resolvedPercent.toFixed(1)}% · raw 候选峰值 ${int(progress.maximum_observed_candidates)}` +
             ` · 语义候选峰值 ${int(progress.maximum_observed_semantic_candidates)}` +
-            ` · 最大等价类 ${int(progress.maximum_equivalence_class_size)}`
+            ` · 最大等价类 ${int(progress.maximum_equivalence_class_size)}` +
+            completionContext
         );
         const bar = element("run-progress");
         bar.value = resolvedPercent;
@@ -1574,12 +1588,21 @@
         const act3 = finite(latest.act_3_successes);
         const wins = finite(latest.run_wins);
         const gate = first(latest, ["evaluation_gate", "environment_steps"], null);
+        const gateKind = first(latest, ["gate_kind"], "validation");
+        const gateKindLabel = labels[gateKind] || humanKey(gateKind);
+        const evaluatedPolicy = finite(latest.policy_version);
+        const policyContext = evaluatedPolicy != null
+          ? ` · policy ${int(evaluatedPolicy)}`
+          : "";
 
         setText("heldout-value", `Act 1 ${rateText(act1, total, latest.act_1_success_rate)}`);
-        setText("heldout-context", `门 ${int(gate)} · 固定种子 n=${int(total)}`);
+        setText(
+          "heldout-context",
+          `${gateKindLabel} · 门 ${int(gate)} · 固定种子 n=${int(total)}${policyContext}`
+        );
         const gateBadge = element("heldout-gate-badge");
         gateBadge.dataset.state = "complete";
-        gateBadge.textContent = `门 ${int(gate)} · n=${int(total)}`;
+        gateBadge.textContent = `${gateKindLabel} · 门 ${int(gate)} · n=${int(total)}`;
 
         setText("eval-act1", rateText(act1, total, latest.act_1_success_rate));
         setText("eval-act1-context", `固定种子样本 n=${int(total)}`);

@@ -2,9 +2,11 @@
 
 from .checkpointing import (
     ActorSupervisorState,
+    EvaluationGateState,
     TrainingState,
     actor_supervisor_state_from_metadata,
     checkpoint_summary,
+    evaluation_gate_state_from_metadata,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
     preflight_model_initialization,
@@ -89,6 +91,7 @@ __all__ = [
     "EpisodeDecisionStep",
     "EpisodeMetrics",
     "EpisodicLearningConfig",
+    "EvaluationGateState",
     "FactualTransactionPolicyTarget",
     "GroundedCollector",
     "HorizonTargets",
@@ -116,6 +119,7 @@ __all__ = [
     "build_training_resources",
     "checkpoint_summary",
     "evaluate_policy",
+    "evaluation_gate_state_from_metadata",
     "exploration_epsilon",
     "factual_transaction_policy_targets",
     "initialize_model_from_checkpoint",

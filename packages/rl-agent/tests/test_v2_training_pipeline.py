@@ -28,6 +28,7 @@ from sts2_rl.training import (
     CurriculumConfig,
     DiagnosticsConfig,
     EnvironmentConfig,
+    EvaluationGateState,
     ModelConfig,
     OptimizationConfig,
     RolloutConfig,
@@ -734,6 +735,80 @@ def _config(*, total_steps: int = 4) -> TrainingConfig:
     )
 
 
+def test_evaluation_gate_state_mapping_is_versioned_and_fail_closed() -> None:
+    state = EvaluationGateState(
+        completed_validation_steps=(0, 100),
+        completed_early_validation_steps=(5,),
+        completed_final_audit_steps=(250,),
+    )
+    assert EvaluationGateState.from_mapping(state.to_mapping()) == state
+
+    malformed = state.to_mapping()
+    malformed["version"] = "unknown-evaluation-state"
+    with pytest.raises(ValueError, match="unsupported checkpoint evaluation_state"):
+        EvaluationGateState.from_mapping(malformed)
+
+    malformed = state.to_mapping()
+    malformed["completed_final_audit_steps"] = [250, 250]
+    with pytest.raises(ValueError, match="strictly increasing"):
+        EvaluationGateState.from_mapping(malformed)
+
+    malformed = state.to_mapping()
+    malformed["completed_validation_steps"] = (0, 100)
+    with pytest.raises(TypeError, match="must be an array"):
+        EvaluationGateState.from_mapping(malformed)
+
+
+def test_checkpoint_rejects_completed_evaluation_gate_beyond_training_horizon(
+    tmp_path: Path,
+) -> None:
+    config = _config(total_steps=4)
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    target = tmp_path / "future-evaluation-gate"
+    try:
+        with pytest.raises(
+            ValueError,
+            match="cannot complete gates beyond training_state.environment_steps",
+        ):
+            save_training_checkpoint(
+                target,
+                config=config,
+                resources=resources,
+                state=TrainingState(environment_steps=2),
+                evaluation_state=EvaluationGateState(
+                    completed_final_audit_steps=(4,),
+                ),
+            )
+    finally:
+        resources.close()
+    assert not target.exists()
+
+
+def test_checkpoint_rejects_completed_gate_absent_from_its_schedule(
+    tmp_path: Path,
+) -> None:
+    config = _config(total_steps=4)
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    target = tmp_path / "unconfigured-evaluation-gate"
+    try:
+        with pytest.raises(
+            ValueError,
+            match="contains gates absent from its training_config schedule",
+        ):
+            save_training_checkpoint(
+                target,
+                config=config,
+                resources=resources,
+                state=TrainingState(environment_steps=2),
+                evaluation_state=EvaluationGateState(
+                    completed_final_audit_steps=(2,),
+                ),
+            )
+    finally:
+        resources.close()
+    assert not target.exists()
+
+
 def _rewrite_checkpoint_runtime_identity(
     checkpoint: Path,
     *,
@@ -751,9 +826,7 @@ def _rewrite_checkpoint_runtime_identity(
     elif mismatch == "reward":
         reward = dict(provenance["reward_spec"])
         reward["fingerprint"] = reward["fingerprint"] + "|archived-reward"
-        reward["fingerprint_sha256"] = hashlib.sha256(
-            reward["fingerprint"].encode("utf-8")
-        ).hexdigest()
+        reward["fingerprint_sha256"] = hashlib.sha256(reward["fingerprint"].encode("utf-8")).hexdigest()
         provenance["reward_spec"] = reward
     elif mismatch == "dependency":
         locks = [dict(item) for item in provenance["dependency_locks"]]
@@ -993,7 +1066,6 @@ def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
         assert episode.metrics.maximum_equivalence_class_size == 3
     finally:
         resources.close()
-
 
 
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
@@ -1243,10 +1315,7 @@ def test_combat_stall_records_one_bounded_exhausted_hand_evidence(
         assert evidence["hand_card_preview_truncated"] is True
         assert len(json.dumps(evidence, sort_keys=True)) < 4_096
 
-        records = [
-            json.loads(line)
-            for line in journal_path.read_text(encoding="utf-8").splitlines()
-        ]
+        records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
         terminal_stalls = [
             record
             for record in records
@@ -1257,9 +1326,7 @@ def test_combat_stall_records_one_bounded_exhausted_hand_evidence(
         assert len(terminal_stalls) == 1
         assert terminal_stalls[0]["deadlock"]["draw_cards"] == 0
         assert terminal_stalls[0]["deadlock"]["discard_cards"] == 0
-        assert terminal_stalls[0]["deadlock"]["legal_action_kinds"] == {
-            "end_turn": 1
-        }
+        assert terminal_stalls[0]["deadlock"]["legal_action_kinds"] == {"end_turn": 1}
     finally:
         resources.close()
 
@@ -1935,6 +2002,257 @@ def test_runtime_checkpoints_each_crossed_episode_boundary(
     assert '"run_maximum_observed_candidates": 2' in metrics_text
 
 
+def test_runtime_final_audit_matches_final_policy_after_all_learning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/final-audit-policy",
+            checkpoint_dir="checkpoints/final-audit-policy",
+            checkpoint_interval_steps=100,
+            # Final-audit steps are eligibility thresholds, but the audit is
+            # terminal: it must cover the fully drained policy saved below.
+            final_audit_steps=(2,),
+            final_audit_episodes=1,
+        ),
+    )
+
+    state = run_training(config, backend=FakeCombatBackend())
+    assert state.learner_updates == state.consumed_unrolls == 2
+    assert state.evaluation_episodes == 1
+
+    metrics_path = next((tmp_path / "runs" / "final-audit-policy").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    final_audits = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.get("event") == "evaluation" and event.get("gate_kind") == "final_audit"
+    ]
+    assert len(final_audits) == 1
+    final_audit_index, final_audit = final_audits[0]
+    run_complete_index = next(index for index, event in enumerate(events) if event.get("event") == "run_complete")
+    assert final_audit_index < run_complete_index
+    assert not [
+        event
+        for event in events[final_audit_index + 1 :]
+        if event.get("event") in {"learner_update_start", "learner_update"}
+    ]
+
+    final_checkpoint = next((tmp_path / "checkpoints" / "final-audit-policy").glob("run-*/final-*"))
+    final_metadata = json.loads((final_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    final_state = final_metadata["training_state"]
+    evaluation_context = final_audit["evaluation_context"]
+    assert evaluation_context["actual_environment_steps"] == state.environment_steps
+    assert evaluation_context["policy_version"] == state.policy_version
+    assert evaluation_context["actor_policy_version"] == state.policy_version
+    assert final_state["policy_version"] == state.policy_version
+    assert final_state["actor_policy_version"] == state.policy_version
+    assert final_state["evaluation_episodes"] == state.evaluation_episodes == 1
+    assert final_metadata["evaluation_state"]["completed_final_audit_steps"] == [2]
+
+    def checkpoint_model_sha256(filename: str) -> str:
+        payload = torch.load(
+            final_checkpoint / filename,
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert isinstance(payload, dict)
+        digest = hashlib.sha256()
+        for name, tensor in sorted(payload.items()):
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(
+                json.dumps(
+                    list(value.shape),
+                    separators=(",", ":"),
+                ).encode("ascii")
+            )
+            digest.update(value.numpy().tobytes(order="C"))
+        return digest.hexdigest()
+
+    audited_digest = evaluation_context["policy_model_state_sha256"]
+    assert checkpoint_model_sha256("network.pt") == audited_digest
+    assert checkpoint_model_sha256("actor_network.pt") == audited_digest
+
+
+def test_crash_before_final_audit_resumes_before_gate_and_does_not_skip_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/final-audit-resume",
+            checkpoint_dir="checkpoints/final-audit-resume",
+            checkpoint_interval_steps=2,
+            final_audit_steps=(4,),
+            final_audit_episodes=1,
+        ),
+    )
+    real_evaluate_training_gate = runtime_module._evaluate_training_gate
+
+    def crash_before_audit(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("injected final-audit crash")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_evaluate_training_gate",
+        crash_before_audit,
+    )
+    with pytest.raises(RuntimeError, match="injected final-audit crash"):
+        run_training(config, backend=FakeCombatBackend())
+
+    checkpoint_root = tmp_path / "checkpoints" / "final-audit-resume"
+    first_run_root = next(checkpoint_root.glob("run-*"))
+    periodic = sorted(first_run_root.glob("periodic-*"))
+    assert len(periodic) == 2
+    resume_checkpoint = periodic[-1]
+    periodic_metadata = json.loads((resume_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert periodic_metadata["training_state"]["environment_steps"] == 4
+    assert periodic_metadata["evaluation_state"] == {
+        "version": "sts2-evaluation-gate-state-v1",
+        "completed_validation_steps": [],
+        "completed_early_validation_steps": [],
+        "completed_final_audit_steps": [],
+    }
+    first_metrics_path = next((tmp_path / "runs" / "final-audit-resume").glob("run-*/metrics.jsonl"))
+    first_events = [json.loads(line) for line in first_metrics_path.read_text(encoding="utf-8").splitlines()]
+    assert not [event for event in first_events if event.get("event") == "evaluation"]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_evaluate_training_gate",
+        real_evaluate_training_gate,
+    )
+    resumed = run_training(
+        config,
+        backend=FakeCombatBackend(),
+        resume_from=resume_checkpoint,
+    )
+    assert resumed.environment_steps == 4
+    assert resumed.evaluation_episodes == 1
+    resumed_metrics_path = next(
+        path
+        for path in (tmp_path / "runs" / "final-audit-resume").glob("run-*/metrics.jsonl")
+        if path != first_metrics_path
+    )
+    resumed_events = [json.loads(line) for line in resumed_metrics_path.read_text(encoding="utf-8").splitlines()]
+    resumed_audits = [
+        event
+        for event in resumed_events
+        if event.get("event") == "evaluation" and event.get("gate_kind") == "final_audit"
+    ]
+    assert len(resumed_audits) == 1
+    assert resumed_audits[0]["evaluation_context"]["policy_version"] == resumed.policy_version
+    resumed_final = next((tmp_path / "checkpoints" / "final-audit-resume").glob("run-*/final-*"))
+    resumed_final_metadata = json.loads((resumed_final / "metadata.json").read_text(encoding="utf-8"))
+    assert resumed_final_metadata["evaluation_state"]["completed_final_audit_steps"] == [4]
+
+    prior_metrics_paths = {first_metrics_path, resumed_metrics_path}
+    resumed_again = run_training(
+        config,
+        backend=FakeCombatBackend(),
+        resume_from=resumed_final,
+    )
+    assert resumed_again.environment_steps == 4
+    assert resumed_again.evaluation_episodes == 1
+    final_resume_metrics_path = next(
+        path
+        for path in (tmp_path / "runs" / "final-audit-resume").glob("run-*/metrics.jsonl")
+        if path not in prior_metrics_paths
+    )
+    final_resume_events = [
+        json.loads(line) for line in final_resume_metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not [event for event in final_resume_events if event.get("event") == "evaluation"]
+
+
+def test_extended_exact_resume_reaudits_the_new_terminal_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=2)
+    first_config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="r/fae1",
+            checkpoint_dir="c/fae1",
+            final_audit_steps=(2,),
+            final_audit_episodes=1,
+        ),
+    )
+    first_state = run_training(first_config, backend=FakeCombatBackend())
+    assert first_state.environment_steps == 2
+    assert first_state.evaluation_episodes == 1
+    first_final = next((tmp_path / "c" / "fae1").glob("run-*/final-*"))
+
+    extended_config = replace(
+        first_config,
+        runtime=replace(
+            first_config.runtime,
+            total_environment_steps=4,
+            log_dir="r/fae2",
+            checkpoint_dir="c/fae2",
+        ),
+    )
+    extended_state = run_training(
+        extended_config,
+        backend=FakeCombatBackend(),
+        resume_from=first_final,
+    )
+
+    assert extended_state.environment_steps == 4
+    assert extended_state.evaluation_episodes == 2
+    second_metrics = next((tmp_path / "r" / "fae2").glob("run-*/metrics.jsonl"))
+    second_events = [json.loads(line) for line in second_metrics.read_text(encoding="utf-8").splitlines()]
+    audits = [
+        event
+        for event in second_events
+        if event.get("event") == "evaluation" and event.get("gate_kind") == "final_audit"
+    ]
+    assert len(audits) == 1
+    assert audits[0]["evaluation_context"]["policy_version"] == (extended_state.policy_version)
+    audit_index = second_events.index(audits[0])
+    assert not [
+        event
+        for event in second_events[audit_index + 1 :]
+        if event.get("event") in {"learner_update_start", "learner_update"}
+    ]
+    second_final = next((tmp_path / "c" / "fae2").glob("run-*/final-*"))
+    second_metadata = json.loads((second_final / "metadata.json").read_text(encoding="utf-8"))
+    assert second_metadata["training_state"]["policy_version"] == (extended_state.policy_version)
+    assert second_metadata["evaluation_state"]["completed_final_audit_steps"] == [2]
+
+
 def test_runtime_recovers_one_infrastructure_abort_without_fabricating_episode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1964,9 +2282,7 @@ def test_runtime_recovers_one_infrastructure_abort_without_fabricating_episode(
     assert state.environment_steps == 4
     assert state.episodes == 1
     assert first.closed
-    metrics_path = next(
-        (tmp_path / "runs" / "recoverable-incident").glob("run-*/metrics.jsonl")
-    )
+    metrics_path = next((tmp_path / "runs" / "recoverable-incident").glob("run-*/metrics.jsonl"))
     events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     assert sum(item["event"] == "backend_protocol_incident" for item in events) == 1
     assert sum(item["event"] == "episode_aborted" for item in events) == 1
@@ -2008,13 +2324,9 @@ def test_exact_resume_restores_actor_incident_circuit_breaker(
     assert first_state.environment_steps == 2
     assert first_state.episodes == 1
 
-    checkpoint = next(
-        (tmp_path / "checkpoints" / "supervisor-source").glob("run-*/final-*")
-    )
+    checkpoint = next((tmp_path / "checkpoints" / "supervisor-source").glob("run-*/final-*"))
     metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
-    restored_supervisor = checkpointing_module.actor_supervisor_state_from_metadata(
-        metadata
-    )
+    restored_supervisor = checkpointing_module.actor_supervisor_state_from_metadata(metadata)
     assert restored_supervisor == ActorSupervisorState(
         episode_attempts=2,
         consecutive_incidents=0,
@@ -2041,13 +2353,8 @@ def test_exact_resume_restores_actor_incident_circuit_breaker(
     with pytest.raises(RuntimeError, match="circuit breaker opened"):
         run_training(second_config, resume_from=checkpoint)
 
-    metrics_path = next(
-        (tmp_path / "runs" / "supervisor-resume").glob("run-*/metrics.jsonl")
-    )
-    events = [
-        json.loads(line)
-        for line in metrics_path.read_text(encoding="utf-8").splitlines()
-    ]
+    metrics_path = next((tmp_path / "runs" / "supervisor-resume").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     breaker = next(item for item in events if item["event"] == "circuit_breaker_open")
     assert breaker["fingerprint"] == RecoverableTestProtocolError.fingerprint
     assert breaker["fingerprint_occurrences"] == 2
@@ -2088,20 +2395,14 @@ def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
     finally:
         source.close()
 
-    checkpoint_reference = runtime_module._checkpoint_reference(
-        source_checkpoint
-    )
+    checkpoint_reference = runtime_module._checkpoint_reference(source_checkpoint)
     assert checkpoint_reference is not None
-    source_metadata = json.loads(
-        (source_checkpoint / "metadata.json").read_text(encoding="utf-8")
-    )
+    source_metadata = json.loads((source_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert checkpoint_reference["checkpoint_id"] == source_metadata["checkpoint_id"]
     assert (
-        checkpoint_reference["checkpoint_id"]
-        == source_metadata["checkpoint_id"]
+        checkpoint_reference["manifest_sha256"]
+        == hashlib.sha256((source_checkpoint / "checkpoint.manifest.json").read_bytes()).hexdigest()
     )
-    assert checkpoint_reference["manifest_sha256"] == hashlib.sha256(
-        (source_checkpoint / "checkpoint.manifest.json").read_bytes()
-    ).hexdigest()
 
     state = run_training(
         config,
@@ -2164,14 +2465,129 @@ def test_exact_resume_does_not_repeat_evaluation_gate_at_checkpoint_step(
 
     assert state.environment_steps == 4
     assert state.evaluation_episodes == 1
-    metrics_path = next(
-        (tmp_path / "runs" / "evaluation-resume").glob("run-*/metrics.jsonl")
-    )
-    events = [
-        json.loads(line)
-        for line in metrics_path.read_text(encoding="utf-8").splitlines()
-    ]
+    metrics_path = next((tmp_path / "runs" / "evaluation-resume").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     assert not [event for event in events if event["event"] == "evaluation"]
+
+
+def test_explicit_gate_state_treats_new_past_validation_as_historical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    source_config = _config(total_steps=4)
+    resume_config = replace(
+        source_config,
+        runtime=replace(
+            source_config.runtime,
+            log_dir="runs/new-past-evaluation",
+            checkpoint_dir="checkpoints/new-past-evaluation",
+            evaluation_steps=(2,),
+            evaluation_episodes=1,
+        ),
+    )
+    source = build_training_resources(
+        source_config,
+        backend=FakeCombatBackend(),
+    )
+    try:
+        source_checkpoint = save_training_checkpoint(
+            tmp_path / "new-past-evaluation-source",
+            config=source_config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                maximum_observed_candidates=2,
+            ),
+            run_id="new-past-evaluation-source-run",
+            checkpoint_load_mode="fresh",
+            evaluation_state=EvaluationGateState(),
+        )
+    finally:
+        source.close()
+
+    state = run_training(
+        resume_config,
+        backend=FakeCombatBackend(),
+        resume_from=source_checkpoint,
+    )
+
+    assert state.environment_steps == 4
+    assert state.evaluation_episodes == 0
+    metrics_path = next((tmp_path / "runs" / "new-past-evaluation").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    assert not [event for event in events if event["event"] == "evaluation"]
+    final_checkpoint = next((tmp_path / "checkpoints" / "new-past-evaluation").glob("run-*/final-*"))
+    final_metadata = json.loads((final_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert final_metadata["evaluation_state"]["completed_validation_steps"] == [2]
+
+
+def test_legacy_exact_resume_conservatively_repeats_final_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=2)
+    config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/legacy-final-audit-resume",
+            checkpoint_dir="checkpoints/legacy-final-audit-resume",
+            checkpoint_interval_steps=100,
+            final_audit_steps=(2,),
+            final_audit_episodes=1,
+        ),
+    )
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        legacy_checkpoint = save_training_checkpoint(
+            tmp_path / "legacy-final-audit-source",
+            config=config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                evaluation_episodes=1,
+                maximum_observed_candidates=2,
+            ),
+            run_id="legacy-final-audit-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    legacy_metadata = json.loads((legacy_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert "evaluation_state" not in legacy_metadata
+
+    resumed = run_training(
+        config,
+        backend=FakeCombatBackend(),
+        resume_from=legacy_checkpoint,
+    )
+
+    assert resumed.environment_steps == 2
+    # Legacy evaluation_episodes already includes the possibly stale audit;
+    # the conservative terminal-policy re-audit is deliberately additive.
+    assert resumed.evaluation_episodes == 2
+    metrics_path = next((tmp_path / "runs" / "legacy-final-audit-resume").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    audits = [
+        event for event in events if event.get("event") == "evaluation" and event.get("gate_kind") == "final_audit"
+    ]
+    assert len(audits) == 1
+    assert audits[0]["evaluation_context"]["policy_version"] == resumed.policy_version
+
+    final_checkpoint = next((tmp_path / "checkpoints" / "legacy-final-audit-resume").glob("run-*/final-*"))
+    final_metadata = json.loads((final_checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert final_metadata["evaluation_state"]["completed_final_audit_steps"] == [2]
 
 
 def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
@@ -2206,10 +2622,7 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         assert summary["epsilon"] == 0.0
         assert summary["deterministic"] is True
         assert len(resources.rollout_queue) == 0
-        journal_events = [
-            json.loads(line)
-            for line in journal_path.read_text(encoding="utf-8").splitlines()
-        ]
+        journal_events = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
         start = journal_events[0]
         assert start["event"] == "evaluation_started"
         assert start["data_partition"] == "validation"
@@ -2217,10 +2630,7 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
         assert start["epsilon"] == 0.0
         assert start["deterministic"] is True
         assert start["policy_version"] == 7
-        assert (
-            start["policy_model_state_sha256"]
-            == "test-policy-digest"
-        )
+        assert start["policy_model_state_sha256"] == "test-policy-digest"
     finally:
         resources.close()
 
@@ -2239,10 +2649,7 @@ def test_evaluation_context_distinguishes_initialization_from_updated_successor(
             load_mode="model_initialization",
             runtime_provenance={"backend": "fake"},
         )
-        assert (
-            initial["checkpoint_association"]["relation"]
-            == "model_parameter_initialization"
-        )
+        assert initial["checkpoint_association"]["relation"] == "model_parameter_initialization"
 
         updated = runtime_module._evaluation_context(
             resources,
@@ -2259,10 +2666,7 @@ def test_evaluation_context_distinguishes_initialization_from_updated_successor(
             load_mode="model_initialization",
             runtime_provenance={"backend": "fake"},
         )
-        assert (
-            updated["checkpoint_association"]["relation"]
-            == "in_memory_successor"
-        )
+        assert updated["checkpoint_association"]["relation"] == "in_memory_successor"
         assert updated["checkpoint_association"]["load_mode"] == "model_initialization"
         assert updated["actual_environment_steps"] == 5_000
         assert updated["policy_version"] == 17
@@ -2291,22 +2695,14 @@ def test_final_audit_uses_never_reused_odd_namespace_and_no_replay(
         assert backend.reset_seeds[0] % 2 == 1
         assert backend.reset_seeds[0] > 100_000_000
         assert len(resources.rollout_queue) == 0
-        records = [
-            json.loads(line)
-            for line in journal_path.read_text(encoding="utf-8").splitlines()
-        ]
+        records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
         assert records[0]["event"] == "evaluation_started"
         assert records[0]["data_partition"] == "final_audit"
         decision_episode_ids = {
-            str(item["episode_id"])
-            for item in records
-            if item.get("event") in {"decision", "decision_snapshot"}
+            str(item["episode_id"]) for item in records if item.get("event") in {"decision", "decision_snapshot"}
         }
         assert decision_episode_ids
-        assert all(
-            episode_id.startswith("final-audit-seed-")
-            for episode_id in decision_episode_ids
-        )
+        assert all(episode_id.startswith("final-audit-seed-") for episode_id in decision_episode_ids)
     finally:
         resources.close()
 
@@ -2325,14 +2721,8 @@ def test_training_gate_adds_diagnostic_only_macro_metrics_without_learning(
         ),
     )
     resources = build_training_resources(config, backend=FakeCombatBackend())
-    learner_before = {
-        key: value.detach().clone()
-        for key, value in resources.model.state_dict().items()
-    }
-    collector_before = {
-        key: value.detach().clone()
-        for key, value in resources.collector_model.state_dict().items()
-    }
+    learner_before = {key: value.detach().clone() for key, value in resources.model.state_dict().items()}
+    collector_before = {key: value.detach().clone() for key, value in resources.collector_model.state_dict().items()}
     collector_state_before = deepcopy(resources.collector.state_dict())
     learner_mode_before = resources.model.training
     collector_mode_before = resources.collector_model.training
@@ -2356,10 +2746,7 @@ def test_training_gate_adds_diagnostic_only_macro_metrics_without_learning(
         assert sensitivity["training_samples_emitted"] == 0
         assert sensitivity["expected_action_labels"] is False
         assert sensitivity["case_count"] == 7
-        assert (
-            sensitivity["recurrent_state_contract"]
-            == "fresh_zero_state_per_pair"
-        )
+        assert sensitivity["recurrent_state_contract"] == "fresh_zero_state_per_pair"
 
         assert len(resources.rollout_queue) == 0
         assert resources.collector.state_dict() == collector_state_before
@@ -2367,13 +2754,9 @@ def test_training_gate_adds_diagnostic_only_macro_metrics_without_learning(
         assert resources.collector_model.training is collector_mode_before
         assert set(resources.model.state_dict()) == set(learner_before)
         assert set(resources.collector_model.state_dict()) == set(collector_before)
+        assert all(torch.equal(resources.model.state_dict()[key], value) for key, value in learner_before.items())
         assert all(
-            torch.equal(resources.model.state_dict()[key], value)
-            for key, value in learner_before.items()
-        )
-        assert all(
-            torch.equal(resources.collector_model.state_dict()[key], value)
-            for key, value in collector_before.items()
+            torch.equal(resources.collector_model.state_dict()[key], value) for key, value in collector_before.items()
         )
     finally:
         resources.close()
@@ -2397,8 +2780,7 @@ def test_evaluation_retries_same_seed_once_on_fresh_backend(tmp_path: Path) -> N
         assert replacement.reset_seeds[0] == first.reset_seeds[0]
         assert replacement.reset_seeds == [13, 15]
         journal_events = [
-            json.loads(line)
-            for line in (tmp_path / "retry-trajectory.jsonl").read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in (tmp_path / "retry-trajectory.jsonl").read_text(encoding="utf-8").splitlines()
         ]
         boundaries = [item for item in journal_events if item.get("event", "").startswith("evaluation_attempt_")]
         assert [item["event"] for item in boundaries[:4]] == [
@@ -2410,8 +2792,7 @@ def test_evaluation_retries_same_seed_once_on_fresh_backend(tmp_path: Path) -> N
         first_seed_episode_ids = {
             str(item["episode_id"])
             for item in journal_events
-            if item.get("event") in {"decision", "decision_snapshot"}
-            and item.get("reset_seed") == 13
+            if item.get("event") in {"decision", "decision_snapshot"} and item.get("reset_seed") == 13
         }
         assert any("attempt-1:" in item for item in first_seed_episode_ids)
         assert any("attempt-2:" in item for item in first_seed_episode_ids)
@@ -2419,8 +2800,7 @@ def test_evaluation_retries_same_seed_once_on_fresh_backend(tmp_path: Path) -> N
         first_abort_index = next(
             index
             for index, item in enumerate(journal_events)
-            if item.get("event") == "evaluation_attempt_aborted"
-            and item.get("evaluation_seed") == 13
+            if item.get("event") == "evaluation_attempt_aborted" and item.get("evaluation_seed") == 13
         )
         second_start_index = next(
             index
@@ -2489,11 +2869,7 @@ def test_frozen_checkpoint_evaluation_never_loads_or_consumes_pending_queue(
     python_rng_before = random.getstate()
     numpy_rng_before = np.random.get_state()
     torch_rng_before = torch.get_rng_state().clone()
-    cuda_rng_before = (
-        [state.clone() for state in torch.cuda.get_rng_state_all()]
-        if torch.cuda.is_available()
-        else None
-    )
+    cuda_rng_before = [state.clone() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else None
     result = evaluate_checkpoint_policy(
         checkpoint,
         output_directory=tmp_path / "frozen-evaluation",
@@ -2517,10 +2893,7 @@ def test_frozen_checkpoint_evaluation_never_loads_or_consumes_pending_queue(
     assert audit["training_checkpoint_published"] is False
     assert audit["evaluation_of"]["training_state"]["policy_version"] == 7
     assert audit["evaluation"]["macro_surface_telemetry"]["diagnostic_only"] is True
-    assert (
-        audit["evaluation"]["macro_surface_telemetry"]["training_samples_emitted"]
-        == 0
-    )
+    assert audit["evaluation"]["macro_surface_telemetry"]["training_samples_emitted"] == 0
     assert random.getstate() == python_rng_before
     numpy_rng_after = np.random.get_state()
     assert numpy_rng_after[0] == numpy_rng_before[0]
@@ -2562,11 +2935,7 @@ def test_failed_frozen_evaluation_cleans_staging_and_allows_same_output_retry(
     python_rng_before = random.getstate()
     numpy_rng_before = np.random.get_state()
     torch_rng_before = torch.get_rng_state().clone()
-    cuda_rng_before = (
-        [state.clone() for state in torch.cuda.get_rng_state_all()]
-        if torch.cuda.is_available()
-        else None
-    )
+    cuda_rng_before = [state.clone() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else None
     with pytest.raises(EvaluationInfrastructureError, match="infrastructure-invalid"):
         evaluate_checkpoint_policy(
             checkpoint,
@@ -2672,9 +3041,7 @@ def test_exact_resume_accepts_legacy_checkpoint_without_candidate_diagnostic() -
 def test_actor_supervisor_metadata_has_strict_legacy_compatibility() -> None:
     # Absence is the sole legacy migration: old exact-resume checkpoints start
     # with a clean supervisor rather than being rejected.
-    assert checkpointing_module.actor_supervisor_state_from_metadata({}) == (
-        ActorSupervisorState()
-    )
+    assert checkpointing_module.actor_supervisor_state_from_metadata({}) == (ActorSupervisorState())
 
     valid = ActorSupervisorState(
         episode_attempts=3,
@@ -2682,20 +3049,17 @@ def test_actor_supervisor_metadata_has_strict_legacy_compatibility() -> None:
         incident_fingerprints=(("test:fingerprint", 2),),
         recent_incident_attempts=(1, 3),
     )
-    assert checkpointing_module.actor_supervisor_state_from_metadata(
-        {"actor_supervisor_state": valid.to_mapping()}
-    ) == valid
+    assert (
+        checkpointing_module.actor_supervisor_state_from_metadata({"actor_supervisor_state": valid.to_mapping()})
+        == valid
+    )
 
     malformed = valid.to_mapping()
     malformed["unexpected"] = True
     with pytest.raises(ValueError, match="keys mismatch"):
-        checkpointing_module.actor_supervisor_state_from_metadata(
-            {"actor_supervisor_state": malformed}
-        )
+        checkpointing_module.actor_supervisor_state_from_metadata({"actor_supervisor_state": malformed})
     with pytest.raises(TypeError, match="must be an object"):
-        checkpointing_module.actor_supervisor_state_from_metadata(
-            {"actor_supervisor_state": None}
-        )
+        checkpointing_module.actor_supervisor_state_from_metadata({"actor_supervisor_state": None})
 
 
 def test_capacity_change_uses_explicit_model_parameter_initialization_lineage(
@@ -2795,9 +3159,7 @@ def test_model_initialization_migrates_only_parameters_across_runtime_identities
         objective = sum(parameter.square().mean() for parameter in source.model.parameters())
         objective.backward()
         source.optimizer.step()
-        source_state = {
-            key: value.detach().clone() for key, value in source.model.state_dict().items()
-        }
+        source_state = {key: value.detach().clone() for key, value in source.model.state_dict().items()}
         checkpoint = save_training_checkpoint(
             tmp_path / f"archived-{mismatch}",
             config=config,
@@ -2844,9 +3206,7 @@ def test_model_initialization_migrates_only_parameters_across_runtime_identities
             checkpoint_load_mode="model_initialization",
             parent_relation="model_parameter_initialization",
         )
-        migrated_metadata = json.loads(
-            (migrated / "metadata.json").read_text(encoding="utf-8")
-        )
+        migrated_metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
         assert migrated_metadata["training_state"] == asdict(TrainingState())
         provenance = migrated_metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"
@@ -2854,12 +3214,11 @@ def test_model_initialization_migrates_only_parameters_across_runtime_identities
         assert parent_metadata["relation"] == "model_parameter_initialization"
         source_identity = parent_metadata["source_runtime_identity"]
         assert source_identity["contract"] == archived["contract"]
-        assert source_identity["reward_spec_fingerprint_sha256"] == (
-            archived["provenance"]["reward_spec"]["fingerprint_sha256"]
+        assert (
+            source_identity["reward_spec_fingerprint_sha256"]
+            == (archived["provenance"]["reward_spec"]["fingerprint_sha256"])
         )
-        assert source_identity["dependency_locks"] == (
-            archived["provenance"]["dependency_locks"]
-        )
+        assert source_identity["dependency_locks"] == (archived["provenance"]["dependency_locks"])
     finally:
         target.close()
 

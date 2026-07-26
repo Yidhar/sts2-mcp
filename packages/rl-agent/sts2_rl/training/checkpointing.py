@@ -27,18 +27,17 @@ from sts2_rl.checkpoints import (
 )
 from sts2_rl.encoding import grounding_encoding_identity
 
-from .config import TrainingConfig
+from .config import TrainingConfig, training_config_from_mapping
 from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
 from .seeding import SIGNED_INT32_MAX
 from .transaction import BoundedTransactionReplay
 
 _CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v4"
-_LEGACY_MODEL_INITIALIZATION_FORMATS = frozenset(
-    {"sts2-recurrent-vtrace-checkpoint-v3"}
-)
+_LEGACY_MODEL_INITIALIZATION_FORMATS = frozenset({"sts2-recurrent-vtrace-checkpoint-v3"})
 _QUEUE_PAYLOAD_VERSION = "sts2-rollout-queue-pickle-v2"
 _ACTOR_SUPERVISOR_STATE_VERSION = "sts2-actor-supervisor-state-v1"
+_EVALUATION_GATE_STATE_VERSION = "sts2-evaluation-gate-state-v1"
 _LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
 
 _LONG_HORIZON_HEAD_PREFIXES = (
@@ -125,6 +124,65 @@ class TrainingState:
 
 
 @dataclass(frozen=True, slots=True)
+class EvaluationGateState:
+    """Exact-resume identities for completed evaluation gates."""
+
+    completed_validation_steps: tuple[int, ...] = ()
+    completed_early_validation_steps: tuple[int, ...] = ()
+    completed_final_audit_steps: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            values = getattr(self, name)
+            if not isinstance(values, tuple):
+                raise TypeError(f"{name} must be an immutable tuple")
+            previous = -1
+            for step in values:
+                if isinstance(step, bool) or not isinstance(step, int) or step < 0 or step <= previous:
+                    raise ValueError(f"{name} must contain strictly increasing non-negative integers")
+                previous = step
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "version": _EVALUATION_GATE_STATE_VERSION,
+            "completed_validation_steps": list(self.completed_validation_steps),
+            "completed_early_validation_steps": list(self.completed_early_validation_steps),
+            "completed_final_audit_steps": list(self.completed_final_audit_steps),
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: object) -> EvaluationGateState:
+        if not isinstance(payload, Mapping):
+            raise TypeError("checkpoint evaluation_state must be an object")
+        expected = {
+            "version",
+            "completed_validation_steps",
+            "completed_early_validation_steps",
+            "completed_final_audit_steps",
+        }
+        if set(payload) != expected:
+            raise ValueError("checkpoint evaluation_state keys mismatch")
+        if payload.get("version") != _EVALUATION_GATE_STATE_VERSION:
+            raise ValueError("unsupported checkpoint evaluation_state version")
+
+        values: dict[str, tuple[int, ...]] = {}
+        for name in (
+            "completed_validation_steps",
+            "completed_early_validation_steps",
+            "completed_final_audit_steps",
+        ):
+            raw = payload.get(name)
+            if not isinstance(raw, list):
+                raise TypeError(f"checkpoint evaluation_state.{name} must be an array")
+            values[name] = tuple(raw)
+        return cls(
+            completed_validation_steps=values["completed_validation_steps"],
+            completed_early_validation_steps=values["completed_early_validation_steps"],
+            completed_final_audit_steps=values["completed_final_audit_steps"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ActorSupervisorState:
     """Exact-resume state for actor incident accounting and circuit breaking.
 
@@ -151,11 +209,7 @@ class ActorSupervisorState:
             if not isinstance(item, tuple) or len(item) != 2:
                 raise TypeError("incident_fingerprints entries must be (fingerprint, count) tuples")
             fingerprint, count = item
-            if (
-                not isinstance(fingerprint, str)
-                or not fingerprint
-                or fingerprint.strip() != fingerprint
-            ):
+            if not isinstance(fingerprint, str) or not fingerprint or fingerprint.strip() != fingerprint:
                 raise ValueError("actor incident fingerprints must be non-empty canonical strings")
             if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
                 raise ValueError("actor incident fingerprint counts must be positive integers")
@@ -178,9 +232,7 @@ class ActorSupervisorState:
                 or attempt <= previous
                 or attempt > self.episode_attempts
             ):
-                raise ValueError(
-                    "recent actor incident attempts must be strictly increasing valid attempts"
-                )
+                raise ValueError("recent actor incident attempts must be strictly increasing valid attempts")
             previous = attempt
         if len(self.recent_incident_attempts) > 100:
             raise ValueError("actor supervisor may retain at most 100 recent incidents")
@@ -385,15 +437,9 @@ def _episodic_replay_spec(
 def _stochastic_state(resources: TrainingResources) -> dict[str, Any]:
     collector_device = next(resources.collector_model.parameters()).device
     cuda_rng_is_live = (
-        resources.device.type == "cuda"
-        or collector_device.type == "cuda"
-        or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+        resources.device.type == "cuda" or collector_device.type == "cuda" or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
     )
-    cuda_states = (
-        torch.cuda.get_rng_state_all()
-        if cuda_rng_is_live and torch.cuda.is_available()
-        else []
-    )
+    cuda_states = torch.cuda.get_rng_state_all() if cuda_rng_is_live and torch.cuda.is_available() else []
     return {
         "version": "sts2-recurrent-stochastic-state-v2",
         "python_random": random.getstate(),
@@ -523,6 +569,60 @@ def actor_supervisor_state_from_metadata(
     return ActorSupervisorState.from_mapping(metadata["actor_supervisor_state"])
 
 
+def evaluation_gate_state_from_metadata(
+    metadata: Mapping[str, Any],
+) -> EvaluationGateState | None:
+    """Load explicit completed-gate identities when the checkpoint has them.
+
+    Absence identifies a legacy checkpoint.  A present payload is validated
+    strictly; malformed or partially specified state never falls back to a
+    legacy inference.
+    """
+
+    if "evaluation_state" not in metadata:
+        return None
+    return EvaluationGateState.from_mapping(metadata["evaluation_state"])
+
+
+def _validate_evaluation_gate_state_horizon(
+    evaluation_state: EvaluationGateState | None,
+    training_state: TrainingState,
+) -> None:
+    if evaluation_state is None:
+        return
+    for name in (
+        "completed_validation_steps",
+        "completed_early_validation_steps",
+        "completed_final_audit_steps",
+    ):
+        future_steps = [step for step in getattr(evaluation_state, name) if step > training_state.environment_steps]
+        if future_steps:
+            raise ValueError(
+                "checkpoint evaluation_state cannot complete gates beyond "
+                f"training_state.environment_steps: {name}={future_steps}"
+            )
+
+
+def _validate_evaluation_gate_state_schedule(
+    evaluation_state: EvaluationGateState | None,
+    config: TrainingConfig,
+) -> None:
+    if evaluation_state is None:
+        return
+    schedules = {
+        "completed_validation_steps": set(config.runtime.evaluation_steps),
+        "completed_early_validation_steps": set(config.runtime.early_evaluation_steps),
+        "completed_final_audit_steps": set(config.runtime.final_audit_steps),
+    }
+    for name, configured in schedules.items():
+        unknown = sorted(set(getattr(evaluation_state, name)) - configured)
+        if unknown:
+            raise ValueError(
+                "checkpoint evaluation_state contains gates absent from its "
+                f"training_config schedule: {name}={unknown}"
+            )
+
+
 def _validate_encoding_contract(
     source: object,
     *,
@@ -543,15 +643,11 @@ def _validate_encoding_contract(
     if source == target:
         return
     migration = (source, target)
-    if model_only and any(
-        migration == reviewed
-        for reviewed in _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS
-    ):
+    if model_only and any(migration == reviewed for reviewed in _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS):
         return
     if model_only:
         raise ValueError(
-            "checkpoint encoding contract does not match; no reviewed "
-            "model-parameter initialization migration"
+            "checkpoint encoding contract does not match; no reviewed " "model-parameter initialization migration"
         )
     raise ValueError("checkpoint encoding contract does not match")
 
@@ -569,14 +665,10 @@ def _validate_metadata(
     if model_only:
         accepted_formats = {_CHECKPOINT_FORMAT, *_LEGACY_MODEL_INITIALIZATION_FORMATS}
         if checkpoint_format not in accepted_formats:
-            raise ValueError(
-                "unsupported model-initialization checkpoint format: "
-                f"{checkpoint_format!r}"
-            )
+            raise ValueError("unsupported model-initialization checkpoint format: " f"{checkpoint_format!r}")
     elif checkpoint_format != _CHECKPOINT_FORMAT:
         raise ValueError(
-            "unsupported exact-resume checkpoint format: "
-            f"{checkpoint_format!r}; expected {_CHECKPOINT_FORMAT!r}"
+            "unsupported exact-resume checkpoint format: " f"{checkpoint_format!r}; expected {_CHECKPOINT_FORMAT!r}"
         )
     if metadata.get("model_config") != asdict(config.model.to_model_config()):
         raise ValueError("checkpoint recurrent model config does not match")
@@ -588,8 +680,18 @@ def _validate_metadata(
         raise ValueError("checkpoint has no model tensor specification")
     if model_only:
         return
-    training_state_from_metadata(metadata)
+    training_state = training_state_from_metadata(metadata)
     actor_supervisor_state_from_metadata(metadata)
+    evaluation_state = evaluation_gate_state_from_metadata(metadata)
+    _validate_evaluation_gate_state_horizon(evaluation_state, training_state)
+    if evaluation_state is not None:
+        source_training_config = metadata.get("training_config")
+        if not isinstance(source_training_config, Mapping):
+            raise ValueError("checkpoint has no training_config object")
+        _validate_evaluation_gate_state_schedule(
+            evaluation_state,
+            training_config_from_mapping(source_training_config),
+        )
     checkpoint_lineage = metadata.get("lineage_config")
     active_lineage = config.lineage_mapping()
     if isinstance(checkpoint_lineage, dict) and "transaction_learning" not in checkpoint_lineage:
@@ -658,16 +760,11 @@ def preflight_training_checkpoint(
     raw_entries = validated.manifest.get("files")
     entries = raw_entries if isinstance(raw_entries, list) else []
     listed = {
-        str(entry.get("path"))
-        for entry in entries
-        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        str(entry.get("path")) for entry in entries if isinstance(entry, dict) and isinstance(entry.get("path"), str)
     }
     missing = sorted(_exact_resume_required_files(config) - listed)
     if missing:
-        raise CheckpointIntegrityError(
-            "exact resume checkpoint is missing required manifest entries: "
-            f"{missing}"
-        )
+        raise CheckpointIntegrityError("exact resume checkpoint is missing required manifest entries: " f"{missing}")
     return validated
 
 
@@ -698,6 +795,7 @@ def save_training_checkpoint(
     checkpoint_load_mode: str | None = None,
     parent_relation: str | None = None,
     actor_supervisor_state: ActorSupervisorState | None = None,
+    evaluation_state: EvaluationGateState | None = None,
 ) -> Path:
     """Publish a checkpoint while the actor is quiescent between episodes."""
 
@@ -705,6 +803,13 @@ def save_training_checkpoint(
         actor_supervisor_state = ActorSupervisorState()
     elif not isinstance(actor_supervisor_state, ActorSupervisorState):
         raise TypeError("actor_supervisor_state must be ActorSupervisorState")
+    if evaluation_state is not None and not isinstance(
+        evaluation_state,
+        EvaluationGateState,
+    ):
+        raise TypeError("evaluation_state must be EvaluationGateState or None")
+    _validate_evaluation_gate_state_horizon(evaluation_state, state)
+    _validate_evaluation_gate_state_schedule(evaluation_state, config)
     provenance = build_checkpoint_provenance(
         parent_checkpoint=parent_checkpoint,
         experiment_run_id=run_id,
@@ -781,9 +886,7 @@ def save_training_checkpoint(
             "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
             "transaction_heads_enabled": config.transaction_learning.enabled,
             "transaction_replay_spec": (
-                _transaction_replay_spec(transaction_replay_payload)
-                if transaction_replay_payload is not None
-                else None
+                _transaction_replay_spec(transaction_replay_payload) if transaction_replay_payload is not None else None
             ),
             "episodic_replay_enabled": config.episodic_learning.enabled,
             "episodic_replay_spec": (
@@ -795,6 +898,8 @@ def save_training_checkpoint(
             "resolved_collector_device": str(next(resources.collector_model.parameters()).device),
             "total_steps": state.environment_steps,
         }
+        if evaluation_state is not None:
+            metadata["evaluation_state"] = evaluation_state.to_mapping()
         (staging / "metadata.json").write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -883,9 +988,7 @@ def load_training_checkpoint(
             transaction_replay_payload,
             config=config,
         )
-        if validated.metadata.get("transaction_replay_spec") != _transaction_replay_spec(
-            transaction_replay_payload
-        ):
+        if validated.metadata.get("transaction_replay_spec") != _transaction_replay_spec(transaction_replay_payload):
             raise ValueError("checkpoint transaction replay metadata differs from payload")
     if config.episodic_learning.enabled:
         episodic_replay_payload = _validated_episodic_replay_payload(
@@ -971,9 +1074,7 @@ def initialize_model_from_checkpoint(
         state,
         target_state=target_state,
         allow_missing_transaction_heads=config.transaction_learning.enabled,
-        allow_missing_long_horizon_heads=(
-            validated.metadata.get("format") in _LEGACY_MODEL_INITIALIZATION_FORMATS
-        ),
+        allow_missing_long_horizon_heads=(validated.metadata.get("format") in _LEGACY_MODEL_INITIALIZATION_FORMATS),
     )
     # Preserve the freshly constructed target-only parameters and RNG lineage;
     # the migration overlays compatible learned tensors onto that exact model
@@ -1008,22 +1109,15 @@ def _model_parameter_initialization_state(
         raise TypeError("model initialization source must contain named tensors")
     unexpected = sorted(set(source_state) - set(target_state))
     if unexpected:
-        raise ValueError(
-            "model initialization source contains unsupported tensors: "
-            + ", ".join(unexpected)
-        )
+        raise ValueError("model initialization source contains unsupported tensors: " + ", ".join(unexpected))
 
     transaction_prefixes = (
         "candidate_effect_head.",
         "selection_delta_head.",
         "transaction_q_head.",
     )
-    target_transaction_heads = {
-        key for key in target_state if key.startswith(transaction_prefixes)
-    }
-    target_long_horizon_heads = {
-        key for key in target_state if key.startswith(_LONG_HORIZON_HEAD_PREFIXES)
-    }
+    target_transaction_heads = {key for key in target_state if key.startswith(transaction_prefixes)}
+    target_long_horizon_heads = {key for key in target_state if key.startswith(_LONG_HORIZON_HEAD_PREFIXES)}
     if not target_long_horizon_heads:
         raise ValueError("model initialization target has no long-horizon head tensors")
 
@@ -1032,34 +1126,23 @@ def _model_parameter_initialization_state(
 
     missing_transaction = missing & target_transaction_heads
     if missing_transaction:
-        if (
-            not allow_missing_transaction_heads
-            or missing_transaction != target_transaction_heads
-        ):
+        if not allow_missing_transaction_heads or missing_transaction != target_transaction_heads:
             raise ValueError(
-                "model initialization source must contain either all or none "
-                "of the transaction-head tensors"
+                "model initialization source must contain either all or none " "of the transaction-head tensors"
             )
         permitted_missing.update(target_transaction_heads)
 
     missing_long_horizon = missing & target_long_horizon_heads
     if missing_long_horizon:
-        if (
-            not allow_missing_long_horizon_heads
-            or missing_long_horizon != target_long_horizon_heads
-        ):
+        if not allow_missing_long_horizon_heads or missing_long_horizon != target_long_horizon_heads:
             raise ValueError(
-                "model initialization source must contain either all or none "
-                "of the six long-horizon head prefixes"
+                "model initialization source must contain either all or none " "of the six long-horizon head prefixes"
             )
         permitted_missing.update(target_long_horizon_heads)
 
     shared_missing = sorted(missing - permitted_missing)
     if shared_missing:
-        raise ValueError(
-            "model initialization source is missing shared tensors: "
-            + ", ".join(shared_missing)
-        )
+        raise ValueError("model initialization source is missing shared tensors: " + ", ".join(shared_missing))
 
     migrated = dict(target_state)
     for key, value in source_state.items():
@@ -1076,13 +1159,13 @@ def _model_parameter_initialization_state(
 
 def checkpoint_summary(checkpoint: str | Path) -> dict[str, Any]:
     validated = validate_resume_checkpoint(checkpoint)
+    evaluation_state = evaluation_gate_state_from_metadata(validated.metadata)
     return {
         "root": str(validated.root),
         "checkpoint_id": validated.manifest.get("checkpoint_id"),
         "training_state": validated.metadata.get("training_state"),
-        "actor_supervisor_state": actor_supervisor_state_from_metadata(
-            validated.metadata
-        ).to_mapping(),
+        "actor_supervisor_state": actor_supervisor_state_from_metadata(validated.metadata).to_mapping(),
+        "evaluation_state": (evaluation_state.to_mapping() if evaluation_state is not None else None),
         "format": validated.metadata.get("format"),
         "queue_spec": validated.metadata.get("queue_spec"),
     }
@@ -1090,9 +1173,11 @@ def checkpoint_summary(checkpoint: str | Path) -> dict[str, Any]:
 
 __all__ = [
     "ActorSupervisorState",
+    "EvaluationGateState",
     "TrainingState",
     "actor_supervisor_state_from_metadata",
     "checkpoint_summary",
+    "evaluation_gate_state_from_metadata",
     "initialize_model_from_checkpoint",
     "load_training_checkpoint",
     "preflight_model_initialization",

@@ -9,7 +9,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
 
-from sts2_rl.monitor_dashboard import DashboardHTTPServer
+import pytest
+
+import sts2_rl.monitoring as monitoring_module
+from sts2_rl.monitor_dashboard import DashboardHTTPServer, _dashboard_html
 from sts2_rl.monitoring import DashboardStore, IncrementalMetrics
 
 RUN_A = "11111111-1111-4111-8111-111111111111"
@@ -225,9 +228,7 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
         },
         checkpoint_load={
             "mode": "exact_resume",
-            "parent_checkpoint": (
-                f"/runtime/checkpoints/lineage/run-{RUN_A}/periodic-step-000000010"
-            ),
+            "parent_checkpoint": (f"/runtime/checkpoints/lineage/run-{RUN_A}/periodic-step-000000010"),
         },
     )
     _append_jsonl(
@@ -304,6 +305,265 @@ def test_status_completed_overrides_stale_fresh_is_running_and_old_unknown_is_st
     assert stale["status"]["phase"] == "stale_unknown"
 
 
+def test_active_final_audit_is_fresh_evaluating_not_complete_at_training_horizon(
+    tmp_path: Path,
+) -> None:
+    now = 10_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "learner_update",
+            "unix_s": 200.0,
+            "environment_steps": 100,
+            "policy_version": 1,
+        },
+    )
+    os.utime(metrics, (200.0, 200.0))
+    final_audit = run_directory / "final-audit-step-000000100.jsonl"
+    _append_jsonl(final_audit, {"event": "decision", "reset_seed": 200_000_001})
+    os.utime(final_audit, (now - 5.0, now - 5.0))
+
+    store = DashboardStore(root, stale_seconds=100.0, now=lambda: now)
+    quick_status = store.list_runs()["runs"][0]["status"]
+    snapshot = store.snapshot()
+
+    assert quick_status == {
+        "state": "evaluating",
+        "phase": "evaluating",
+        "label": "最终审计中 · 门 100",
+    }
+    assert snapshot["status"]["state"] == "evaluating"
+    assert snapshot["status"]["label"] == "最终审计中 · 门 100"
+    assert "run_complete 尚未持久化" in snapshot["status"]["evidence"][1]
+    assert snapshot["progress"]["percent"] == 100.0
+    assert snapshot["lifecycle"] == {
+        "run_complete_persisted": False,
+        "training_horizon_reached": True,
+        "pending_evaluation": {
+            "kind": "final_audit",
+            "gate": 100,
+            "journal_name": "final-audit-step-000000100.jsonl",
+            "modified_at": now - 5.0,
+        },
+    }
+
+
+def test_validation_and_early_validation_journals_are_recognized(tmp_path: Path) -> None:
+    cases = (
+        ("evaluation-step-000000010.jsonl", "validation", "评估中 · 门 10"),
+        ("early-validation-step-000000020.jsonl", "early_validation", "早期评估中 · 门 20"),
+    )
+    for index, (journal_name, expected_kind, expected_label) in enumerate(cases):
+        now = 2_000.0 + index
+        root = tmp_path / f"artifacts-{index}"
+        run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+        os.utime(metrics, (100.0, 100.0))
+        journal = run_directory / journal_name
+        _append_jsonl(journal, {"event": "decision"})
+        os.utime(journal, (now - 1.0, now - 1.0))
+
+        snapshot = DashboardStore(root, stale_seconds=100.0, now=lambda now=now: now).snapshot()
+
+        assert snapshot["status"]["label"] == expected_label
+        assert snapshot["lifecycle"]["pending_evaluation"]["kind"] == expected_kind
+
+
+def test_evaluation_completion_and_projection_are_keyed_by_kind_and_gate(
+    tmp_path: Path,
+) -> None:
+    now = 1_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 900.0,
+            "evaluation_gate": 100,
+            "environment_steps": 100,
+            "episodes": 1,
+        },
+    )
+    os.utime(metrics, (900.0, 900.0))
+    validation = run_directory / "evaluation-step-000000100.jsonl"
+    final_audit = run_directory / "final-audit-step-000000100.jsonl"
+    _append_jsonl(validation, {"event": "decision"})
+    _append_jsonl(final_audit, {"event": "decision"})
+    os.utime(validation, (899.0, 899.0))
+    os.utime(final_audit, (995.0, 995.0))
+
+    store = DashboardStore(root, stale_seconds=100.0, now=lambda: now)
+    pending = store.snapshot()
+
+    assert pending["lifecycle"]["pending_evaluation"]["kind"] == "final_audit"
+    assert pending["lifecycle"]["pending_evaluation"]["gate"] == 100
+    assert pending["status"]["label"] == "最终审计中 · 门 100"
+
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 999.0,
+            "evaluation_gate": 100,
+            "gate_kind": "final_audit",
+            "data_partition": "final_audit",
+            "environment_steps": 100,
+            "episodes": 1,
+            "deadlock_rate": 1.0,
+        },
+    )
+    os.utime(metrics, (999.0, 999.0))
+    completed = store.snapshot()
+
+    assert completed["lifecycle"]["pending_evaluation"] is None
+    assert [(evaluation["gate_kind"], evaluation["evaluation_gate"]) for evaluation in completed["evaluations"]] == [
+        ("validation", 100),
+        ("final_audit", 100),
+    ]
+    assert completed["evaluations"][-1]["gate_kind"] == "final_audit"
+    assert any(alert["type"] == "heldout_deadlock" for alert in completed["alerts"])
+
+
+def test_final_audit_policy_mismatch_is_visible_and_not_certified(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 200.0,
+            "evaluation_gate": 250,
+            "gate_kind": "final_audit",
+            "data_partition": "final_audit",
+            "environment_steps": 250,
+            "episodes": 2,
+            "evaluation_context": {
+                "policy_version": 7,
+                "actor_policy_version": 7,
+                "policy_model_state_sha256": "a" * 64,
+            },
+        },
+        {
+            "event": "run_complete",
+            "unix_s": 201.0,
+            "environment_steps": 250,
+            "policy_version": 8,
+            "actor_policy_version": 8,
+        },
+    )
+
+    snapshot = DashboardStore(root, now=lambda: 202.0).snapshot()
+
+    latest = snapshot["evaluations"][-1]
+    assert latest["gate_kind"] == "final_audit"
+    assert latest["policy_version"] == 7
+    assert latest["actor_policy_version"] == 7
+    assert latest["policy_model_state_sha256"] == "a" * 64
+    mismatch = [alert for alert in snapshot["alerts"] if alert["type"] == "final_audit_policy_mismatch"]
+    assert len(mismatch) == 1
+    assert "策略版本 7" in mismatch[0]["message"]
+    assert "run_complete 策略版本 8" in mismatch[0]["message"]
+
+
+def test_evaluation_projection_prefers_reliable_event_time_over_gate_number(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 200.0,
+            "evaluation_gate": 200,
+            "gate_kind": "validation",
+            "environment_steps": 200,
+            "episodes": 1,
+        },
+        {
+            "event": "evaluation",
+            "unix_s": 300.0,
+            "evaluation_gate": 100,
+            "gate_kind": "validation",
+            "environment_steps": 300,
+            "episodes": 1,
+        },
+    )
+
+    evaluations = DashboardStore(root, now=lambda: 301.0).snapshot()["evaluations"]
+
+    assert [evaluation["evaluation_gate"] for evaluation in evaluations] == [200, 100]
+
+
+def test_stale_final_audit_journal_does_not_override_stale_status(tmp_path: Path) -> None:
+    now = 1_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    os.utime(metrics, (100.0, 100.0))
+    final_audit = run_directory / "final-audit-step-000000100.jsonl"
+    _append_jsonl(final_audit, {"event": "decision"})
+    os.utime(final_audit, (200.0, 200.0))
+
+    store = DashboardStore(root, stale_seconds=100.0, now=lambda: now)
+    quick_status = store.list_runs()["runs"][0]["status"]
+    snapshot = store.snapshot()
+
+    assert quick_status["state"] == "stale"
+    assert snapshot["status"]["state"] == "stale"
+    assert snapshot["lifecycle"]["pending_evaluation"]["kind"] == "final_audit"
+
+
+def test_evaluation_journal_scan_is_bounded_and_skips_overlong_gate_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    os.utime(metrics, (100.0, 100.0))
+    overlong_gate = run_directory / f"evaluation-step-{'9' * 40}.jsonl"
+    final_audit = run_directory / "final-audit-step-000000100.jsonl"
+    _append_jsonl(overlong_gate, {"event": "decision"})
+    _append_jsonl(final_audit, {"event": "decision"})
+    os.utime(final_audit, (now - 1.0, now - 1.0))
+
+    original_iterdir = Path.iterdir
+    scan_limit = monitoring_module._MAX_EVALUATION_JOURNAL_SCAN_ENTRIES
+
+    def guarded_iterdir(path: Path) -> Iterator[Path]:
+        if path != run_directory:
+            return original_iterdir(path)
+
+        def entries() -> Iterator[Path]:
+            yield overlong_gate
+            yield final_audit
+            for index in range(scan_limit - 2):
+                yield run_directory / f"unrelated-{index:06d}.tmp"
+            raise AssertionError("evaluation journal scan exceeded its entry bound")
+
+        return entries()
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+
+    snapshot = DashboardStore(root, stale_seconds=100.0, now=lambda: now).snapshot()
+
+    assert snapshot["status"]["label"] == "最终审计中 · 门 100"
+    assert snapshot["lifecycle"]["pending_evaluation"]["journal_name"] == final_audit.name
+
+
+def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion() -> None:
+    html = _dashboard_html().decode("utf-8")
+
+    assert '<div class="metric-label">环境采集进度</div>' in html
+    assert "采集目标已达" in html
+    assert "整个运行尚未完成" in html
+    assert "const latest = evaluations[evaluations.length - 1]" in html
+
+
 def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     _, parent_metrics = _create_run(root, RUN_A, unix_s=100.0)
@@ -314,17 +574,12 @@ def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:
         unix_s=200.0,
         checkpoint_load={
             "mode": "exact_resume",
-            "parent_checkpoint": (
-                f"/runtime/checkpoints/lineage/run-{RUN_A}/periodic-step-000000010"
-            ),
+            "parent_checkpoint": (f"/runtime/checkpoints/lineage/run-{RUN_A}/periodic-step-000000010"),
         },
     )
 
     store = DashboardStore(root, stale_seconds=10.0, now=lambda: 1_000.0)
-    statuses = {
-        item["run_id"]: item["status"]
-        for item in store.list_runs()["runs"]
-    }
+    statuses = {item["run_id"]: item["status"] for item in store.list_runs()["runs"]}
 
     assert statuses[RUN_A] == {
         "state": "continued",
@@ -407,13 +662,7 @@ def test_checkpoint_publication_requires_public_directory_manifest_and_matching_
 def test_empty_checkpoint_objects_are_not_valid_restore_candidates(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     _create_run(root, RUN_A, checkpoint_dir="checkpoints/lineage")
-    checkpoint = (
-        root
-        / "checkpoints"
-        / "lineage"
-        / f"run-{RUN_A}"
-        / "periodic-step-000000010"
-    )
+    checkpoint = root / "checkpoints" / "lineage" / f"run-{RUN_A}" / "periodic-step-000000010"
     checkpoint.mkdir(parents=True)
     (checkpoint / "checkpoint.manifest.json").write_text("{}", encoding="utf-8")
     (checkpoint / "metadata.json").write_text("{}", encoding="utf-8")
@@ -567,7 +816,7 @@ def test_http_dashboard_routes_are_read_only_loopback_scoped_and_hardened(tmp_pa
     server = DashboardHTTPServer(("127.0.0.1", 0), store, b"<!doctype html><title>monitor</title>")
 
     with _running_server(server):
-        index_status, index_headers, index_body = _request(server, "GET", "/")
+        index_status, _index_headers, index_body = _request(server, "GET", "/")
         assert index_status == 200
         assert b"<title>monitor</title>" in index_body
 

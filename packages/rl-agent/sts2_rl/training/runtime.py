@@ -27,8 +27,10 @@ from sts2_rl.models import RecurrentCandidateModel
 
 from .checkpointing import (
     ActorSupervisorState,
+    EvaluationGateState,
     TrainingState,
     actor_supervisor_state_from_metadata,
+    evaluation_gate_state_from_metadata,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
     preflight_model_initialization,
@@ -62,10 +64,7 @@ def exploration_epsilon(config: TrainingConfig, environment_steps: int) -> float
     if environment_steps >= curriculum.epsilon_decay_steps:
         return float(curriculum.epsilon_end)
     progress = min(1.0, max(0.0, environment_steps / curriculum.epsilon_decay_steps))
-    return float(
-        curriculum.epsilon_start
-        + progress * (curriculum.epsilon_end - curriculum.epsilon_start)
-    )
+    return float(curriculum.epsilon_start + progress * (curriculum.epsilon_end - curriculum.epsilon_start))
 
 
 class JsonlMetrics:
@@ -154,81 +153,43 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "run_win_rate": sum(item.run_won for item in episodes) / count,
         "combat_win_rate": sum(item.combat_won for item in episodes) / count,
         "deadlock_rate": sum(item.deadlocked for item in episodes) / count,
-        "combat_progress_stall_rate": (
-            sum(item.combat_progress_stalled for item in episodes) / count
-        ),
-        "combat_policy_failure_count": sum(
-            item.combat_policy_failed for item in episodes
-        ),
-        "combat_policy_failure_rate": (
-            sum(item.combat_policy_failed for item in episodes) / count
-        ),
-        "noncombat_progress_stall_rate": (
-            sum(item.noncombat_progress_stalled for item in episodes) / count
-        ),
+        "combat_progress_stall_rate": (sum(item.combat_progress_stalled for item in episodes) / count),
+        "combat_policy_failure_count": sum(item.combat_policy_failed for item in episodes),
+        "combat_policy_failure_rate": (sum(item.combat_policy_failed for item in episodes) / count),
+        "noncombat_progress_stall_rate": (sum(item.noncombat_progress_stalled for item in episodes) / count),
         "mean_max_floor": statistics.fmean(item.max_floor for item in episodes),
         "maximum_floor": max(item.max_floor for item in episodes),
         "mean_max_act": statistics.fmean(item.max_act for item in episodes),
-        "mean_undiscounted_reward_total": statistics.fmean(
-            item.reward_total for item in episodes
-        ),
+        "mean_undiscounted_reward_total": statistics.fmean(item.reward_total for item in episodes),
         "mean_environment_steps": statistics.fmean(item.steps for item in episodes),
-        "mean_revivals_used": statistics.fmean(
-            item.revivals_used for item in episodes
-        ),
-        "mean_player_hp_lost": statistics.fmean(
-            item.player_hp_lost for item in episodes
-        ),
-        "maximum_observed_candidates": max(
-            item.maximum_observed_candidates for item in episodes
-        ),
-        "revival_free_combat_win_rate": (
-            sum(item.revival_free_combat_win for item in episodes) / count
-        ),
-        "revival_free_act1_clear_rate": (
-            sum(item.revival_free_act1_clear for item in episodes) / count
-        ),
-        "revival_free_run_win_rate": (
-            sum(item.revival_free_run_win for item in episodes) / count
-        ),
+        "mean_revivals_used": statistics.fmean(item.revivals_used for item in episodes),
+        "mean_player_hp_lost": statistics.fmean(item.player_hp_lost for item in episodes),
+        "maximum_observed_candidates": max(item.maximum_observed_candidates for item in episodes),
+        "revival_free_combat_win_rate": (sum(item.revival_free_combat_win for item in episodes) / count),
+        "revival_free_act1_clear_rate": (sum(item.revival_free_act1_clear for item in episodes) / count),
+        "revival_free_run_win_rate": (sum(item.revival_free_run_win for item in episodes) / count),
         # Completion remains the primary denominator.  Efficiency metrics do
         # not award an early loss merely because it spent fewer revivals.
         "act1_clear_at_most_one_revival_rate": (
-            sum(
-                bool(item.act_revival_counts)
-                and item.act_revival_counts[0] <= 1
-                for item in episodes
-            )
-            / count
+            sum(bool(item.act_revival_counts) and item.act_revival_counts[0] <= 1 for item in episodes) / count
         ),
-        "run_win_at_most_one_revival_count": sum(
-            item.run_won and item.revivals_used <= 1 for item in episodes
-        ),
+        "run_win_at_most_one_revival_count": sum(item.run_won and item.revivals_used <= 1 for item in episodes),
         "run_win_at_most_one_revival_rate": (
-            sum(item.run_won and item.revivals_used <= 1 for item in episodes)
-            / count
+            sum(item.run_won and item.revivals_used <= 1 for item in episodes) / count
         ),
         "successful_run_count": len(successful_runs),
         "successful_run_mean_revivals": (
-            statistics.fmean(item.revivals_used for item in successful_runs)
-            if successful_runs
-            else 0.0
+            statistics.fmean(item.revivals_used for item in successful_runs) if successful_runs else 0.0
         ),
         "successful_run_mean_hp_lost": (
-            statistics.fmean(item.player_hp_lost for item in successful_runs)
-            if successful_runs
-            else 0.0
+            statistics.fmean(item.player_hp_lost for item in successful_runs) if successful_runs else 0.0
         ),
         "act1_boundary_count": len(act1_boundaries),
         "act1_boundary_mean_revivals": (
-            statistics.fmean(item[0] for item in act1_boundaries)
-            if act1_boundaries
-            else 0.0
+            statistics.fmean(item[0] for item in act1_boundaries) if act1_boundaries else 0.0
         ),
         "act1_boundary_mean_hp_lost": (
-            statistics.fmean(item[1] for item in act1_boundaries)
-            if act1_boundaries
-            else 0.0
+            statistics.fmean(item[1] for item in act1_boundaries) if act1_boundaries else 0.0
         ),
     }
 
@@ -257,9 +218,7 @@ def evaluate_policy(
         )
         namespace = "final-audit"
     else:
-        raise ValueError(
-            "evaluation data_partition must be validation or final_audit"
-        )
+        raise ValueError("evaluation data_partition must be validation or final_audit")
     collector_state = deepcopy(resources.collector.state_dict())
     journal = TrajectoryJournal(journal_path) if journal_path is not None else None
     if journal is not None:
@@ -300,9 +259,7 @@ def evaluate_policy(
                         record=False,
                         evaluation_seed=evaluation_seed,
                         trajectory_journal=journal,
-                        journal_episode_id_prefix=(
-                            f"{namespace}-seed-{evaluation_seed}-attempt-{attempt_number}:"
-                        ),
+                        journal_episode_id_prefix=(f"{namespace}-seed-{evaluation_seed}-attempt-{attempt_number}:"),
                     )
                     if journal is not None:
                         journal.write_episode_boundary(
@@ -325,9 +282,7 @@ def evaluate_policy(
                                 "event": "evaluation_attempt_aborted",
                                 "evaluation_seed": evaluation_seed,
                                 "attempt": attempt_number,
-                                "exception_type": (
-                                    f"{type(exc).__module__}.{type(exc).__qualname__}"
-                                ),
+                                "exception_type": (f"{type(exc).__module__}.{type(exc).__qualname__}"),
                                 "fingerprint": str(
                                     getattr(exc, "incident_fingerprint", None)
                                     or getattr(exc, "fingerprint", None)
@@ -339,13 +294,9 @@ def evaluate_policy(
                         )
                     if getattr(exc, "recoverable", False) is not True:
                         raise
-                    if (
-                        backend_factory is None
-                        or attempts >= infrastructure_retries_per_seed
-                    ):
+                    if backend_factory is None or attempts >= infrastructure_retries_per_seed:
                         raise EvaluationInfrastructureError(
-                            "held-out evaluation is infrastructure-invalid for "
-                            f"seed={evaluation_seed}: {exc}"
+                            "held-out evaluation is infrastructure-invalid for " f"seed={evaluation_seed}: {exc}"
                         ) from exc
                     attempts += 1
                     infrastructure_retries += 1
@@ -418,9 +369,7 @@ def _evaluate_training_gate(
         resources.collector_model,
         resources.encoder,
     )
-    summary["greedy_liveness"] = summarize_greedy_liveness_journal(
-        journal_path
-    )
+    summary["greedy_liveness"] = summarize_greedy_liveness_journal(journal_path)
     summary["evaluation_context"] = dict(evaluation_context or {})
     return evaluation_results, summary
 
@@ -468,12 +417,8 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "unroll_length": config.rollout.unroll_length,
         "rollout_queue_capacity": config.rollout.queue_capacity,
         "rollout_max_policy_lag": config.rollout.max_policy_lag,
-        "deterministic_probe_interval_episodes": (
-            config.rollout.deterministic_probe_interval_episodes
-        ),
-        "deterministic_probe_environment_steps": list(
-            config.rollout.deterministic_probe_environment_steps
-        ),
+        "deterministic_probe_interval_episodes": (config.rollout.deterministic_probe_interval_episodes),
+        "deterministic_probe_environment_steps": list(config.rollout.deterministic_probe_environment_steps),
         "transaction_learning": {
             "enabled": config.transaction_learning.enabled,
             "replay_capacity": config.transaction_learning.replay_capacity,
@@ -482,47 +427,25 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "burn_in_steps": config.transaction_learning.burn_in_steps,
             "effect_weight": config.transaction_learning.effect_weight,
             "transaction_q_weight": config.transaction_learning.transaction_q_weight,
-            "completion_policy_weight": (
-                config.transaction_learning.completion_policy_weight
-            ),
-            "pairwise_ranking_weight": (
-                config.transaction_learning.pairwise_ranking_weight
-            ),
+            "completion_policy_weight": (config.transaction_learning.completion_policy_weight),
+            "pairwise_ranking_weight": (config.transaction_learning.pairwise_ranking_weight),
         },
         "episodic_learning": {
             "enabled": config.episodic_learning.enabled,
-            "replay_capacity_episodes": (
-                config.episodic_learning.replay_capacity_episodes
-            ),
+            "replay_capacity_episodes": (config.episodic_learning.replay_capacity_episodes),
             "replay_capacity_bytes": config.episodic_learning.replay_capacity_bytes,
-            "per_episode_capacity_bytes": (
-                config.episodic_learning.per_episode_capacity_bytes
-            ),
+            "per_episode_capacity_bytes": (config.episodic_learning.per_episode_capacity_bytes),
             "sample_sequences": config.episodic_learning.sample_sequences,
             "burn_in_steps": config.episodic_learning.burn_in_steps,
             "learn_steps": config.episodic_learning.learn_steps,
-            "macro_sample_fraction": (
-                config.episodic_learning.macro_sample_fraction
-            ),
-            "primary_policy_weight": (
-                config.episodic_learning.primary_policy_weight
-            ),
+            "macro_sample_fraction": (config.episodic_learning.macro_sample_fraction),
+            "primary_policy_weight": (config.episodic_learning.primary_policy_weight),
             "task_value_weight": config.episodic_learning.task_value_weight,
-            "revival_value_weight": (
-                config.episodic_learning.revival_value_weight
-            ),
-            "revival_policy_weight": (
-                config.episodic_learning.revival_policy_weight
-            ),
-            "secondary_advantage_fraction": (
-                config.episodic_learning.secondary_advantage_fraction
-            ),
-            "primary_success_tie_tolerance": (
-                config.episodic_learning.primary_success_tie_tolerance
-            ),
-            "policy_gradient_max_lag": (
-                config.episodic_learning.policy_gradient_max_lag
-            ),
+            "revival_value_weight": (config.episodic_learning.revival_value_weight),
+            "revival_policy_weight": (config.episodic_learning.revival_policy_weight),
+            "secondary_advantage_fraction": (config.episodic_learning.secondary_advantage_fraction),
+            "primary_success_tie_tolerance": (config.episodic_learning.primary_success_tie_tolerance),
+            "policy_gradient_max_lag": (config.episodic_learning.policy_gradient_max_lag),
         },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
@@ -536,9 +459,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "combat_task_value_shape": list(output.combat_task_value.shape),
         "act_task_value_shape": list(output.act_task_value.shape),
         "run_task_value_shape": list(output.run_task_value.shape),
-        "combat_revival_cost_value_shape": list(
-            output.combat_revival_cost_value.shape
-        ),
+        "combat_revival_cost_value_shape": list(output.combat_revival_cost_value.shape),
         "act_revival_cost_value_shape": list(output.act_revival_cost_value.shape),
         "run_revival_cost_value_shape": list(output.run_revival_cost_value.shape),
         "recurrent_state_shape": list(output.recurrent_state.shape),
@@ -595,11 +516,7 @@ def _evaluation_context(
 ) -> dict[str, Any]:
     """Describe the exact in-memory policy and runtime evaluated at one gate."""
 
-    if (
-        load_mode == "model_initialization"
-        and state.environment_steps == 0
-        and state.policy_version == 0
-    ):
+    if load_mode == "model_initialization" and state.environment_steps == 0 and state.policy_version == 0:
         checkpoint_relation = "model_parameter_initialization"
     elif parent_checkpoint is not None:
         checkpoint_relation = "in_memory_successor"
@@ -612,15 +529,11 @@ def _evaluation_context(
         "actual_environment_steps": state.environment_steps,
         "policy_version": state.policy_version,
         "actor_policy_version": state.actor_policy_version,
-        "policy_model_state_sha256": _model_state_sha256(
-            resources.collector_model
-        ),
+        "policy_model_state_sha256": _model_state_sha256(resources.collector_model),
         "checkpoint_association": {
             "relation": checkpoint_relation,
             "load_mode": load_mode,
-            "last_committed_checkpoint": _checkpoint_reference(
-                parent_checkpoint
-            ),
+            "last_committed_checkpoint": _checkpoint_reference(parent_checkpoint),
         },
         "config": {
             "version": config.version,
@@ -645,6 +558,7 @@ def _save(
     run_id: str,
     load_mode: str,
     actor_supervisor_state: ActorSupervisorState,
+    evaluation_state: EvaluationGateState,
 ) -> Path:
     return save_training_checkpoint(
         _checkpoint_path(checkpoint_root, state, prefix=prefix),
@@ -655,6 +569,7 @@ def _save(
         run_id=run_id,
         checkpoint_load_mode=load_mode,
         actor_supervisor_state=actor_supervisor_state,
+        evaluation_state=evaluation_state,
         parent_relation=(
             "model_parameter_initialization"
             if parent_checkpoint is not None and load_mode == "model_initialization"
@@ -725,9 +640,7 @@ def run_training(
                 config=config,
                 resources=resources,
             )
-            actor_supervisor_state = actor_supervisor_state_from_metadata(
-                prevalidated_resume.metadata
-            )
+            actor_supervisor_state = actor_supervisor_state_from_metadata(prevalidated_resume.metadata)
         elif prevalidated_initialization is not None:
             parent_checkpoint = initialize_model_from_checkpoint(
                 prevalidated_initialization.root,
@@ -748,47 +661,83 @@ def run_training(
                 "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
                 "checkpoint_load": {
                     "mode": load_mode,
-                    "parent_checkpoint": (
-                        str(parent_checkpoint)
-                        if parent_checkpoint is not None
-                        else None
-                    ),
+                    "parent_checkpoint": (str(parent_checkpoint) if parent_checkpoint is not None else None),
                     "source_training_state": (
                         prevalidated_initialization.metadata.get("training_state")
                         if prevalidated_initialization is not None
                         else None
                     ),
-                    "network_parameters_initialized": (
-                        load_mode == "model_initialization"
-                    ),
-                    "optimizer_rollouts_rng_and_counters_reset": (
-                        load_mode == "model_initialization"
-                    ),
+                    "network_parameters_initialized": (load_mode == "model_initialization"),
+                    "optimizer_rollouts_rng_and_counters_reset": (load_mode == "model_initialization"),
                 },
             },
         )
 
-        completed_evaluations = {
-            step
-            for step in config.runtime.evaluation_steps
-            # A checkpoint is published only after all crossed evaluation
-            # gates have completed.  On exact resume, the gate at the exact
-            # checkpoint step is therefore already complete as well.  Treat
-            # newly configured past gates as historical rather than executing
-            # them later under a false gate identity.
-            if step <= state.environment_steps
-        }
-        completed_early_evaluations = {
-            step
-            for step in config.runtime.early_evaluation_steps
-            if step <= state.environment_steps
-        }
-        completed_final_audits = {
-            step
-            for step in config.runtime.final_audit_steps
-            if step <= state.environment_steps
-        }
+        restored_evaluation_state = (
+            evaluation_gate_state_from_metadata(prevalidated_resume.metadata)
+            if prevalidated_resume is not None
+            else None
+        )
+        if restored_evaluation_state is not None:
+            completed_evaluations = set(restored_evaluation_state.completed_validation_steps)
+            # Validation schedules are observation-only and may change across
+            # an exact continuation.  A newly configured gate at or behind an
+            # already published checkpoint is historical; running it now
+            # would label the current policy as though it were the old gate's
+            # policy.  Runtime checkpoints are only published after every
+            # crossed normal/early gate has completed, so this inference is
+            # safe for those two live-maintenance schedules.  Final audits are
+            # deliberately excluded: they are terminal-policy certificates
+            # and a newly configured eligible audit must still run below.
+            completed_evaluations.update(
+                step for step in config.runtime.evaluation_steps if step <= state.environment_steps
+            )
+            completed_early_evaluations = set(restored_evaluation_state.completed_early_validation_steps)
+            completed_early_evaluations.update(
+                step for step in config.runtime.early_evaluation_steps if step <= state.environment_steps
+            )
+            completed_final_audits = set(restored_evaluation_state.completed_final_audit_steps)
+            if config.runtime.total_environment_steps > state.environment_steps:
+                # A final audit certifies the terminal policy, not merely that
+                # its numeric eligibility threshold was crossed once.  When
+                # an exact continuation extends the collection horizon, any
+                # restored certificate becomes stale as soon as new learner
+                # work is allowed.  Clear it now so the extended run audits
+                # the newly drained terminal policy.
+                completed_final_audits.clear()
+        elif prevalidated_resume is not None:
+            # Legacy runtimes published normal/early checkpoints only after
+            # those crossed gates completed, so retain their historical
+            # inference.  A legacy final audit, however, may have run before
+            # queued learner work was drained; its checkpoint therefore cannot
+            # certify the terminal policy under the new contract.  Re-audit it
+            # conservatively rather than treating a potentially stale audit as
+            # complete.  New checkpoints persist all three sets explicitly.
+            completed_evaluations = {
+                step for step in config.runtime.evaluation_steps if step <= state.environment_steps
+            }
+            completed_early_evaluations = {
+                step for step in config.runtime.early_evaluation_steps if step <= state.environment_steps
+            }
+            completed_final_audits = set()
+        else:
+            completed_evaluations = set()
+            completed_early_evaluations = set()
+            completed_final_audits = set()
         evaluation_guard_stop: dict[str, Any] | None = None
+
+        def current_evaluation_state() -> EvaluationGateState:
+            return EvaluationGateState(
+                completed_validation_steps=tuple(
+                    sorted(completed_evaluations.intersection(config.runtime.evaluation_steps))
+                ),
+                completed_early_validation_steps=tuple(
+                    sorted(completed_early_evaluations.intersection(config.runtime.early_evaluation_steps))
+                ),
+                completed_final_audit_steps=tuple(
+                    sorted(completed_final_audits.intersection(config.runtime.final_audit_steps))
+                ),
+            )
 
         def run_one_evaluation(
             *,
@@ -826,10 +775,7 @@ def run_training(
                 evaluation_episodes=state.evaluation_episodes + episodes,
                 maximum_observed_candidates=max(
                     state.maximum_observed_candidates,
-                    *(
-                        item.maximum_observed_candidates
-                        for item in evaluation_results
-                    ),
+                    *(item.maximum_observed_candidates for item in evaluation_results),
                 ),
             )
             guard = (
@@ -854,9 +800,7 @@ def run_training(
                     "evaluation_gate": evaluation_step,
                     "gate_kind": gate_kind,
                     "data_partition": data_partition,
-                    "run_maximum_observed_candidates": (
-                        state.maximum_observed_candidates
-                    ),
+                    "run_maximum_observed_candidates": (state.maximum_observed_candidates),
                     "liveness_guard": guard,
                     **summary,
                 },
@@ -869,9 +813,7 @@ def run_training(
                     "data_partition": data_partition,
                     "liveness_guard": guard,
                     "policy_version": state.policy_version,
-                    "policy_model_state_sha256": context[
-                        "policy_model_state_sha256"
-                    ],
+                    "policy_model_state_sha256": context["policy_model_state_sha256"],
                 }
                 metrics.write("evaluation_guard_stop_requested", stop)
                 return stop
@@ -891,36 +833,34 @@ def run_training(
             )
             completed_evaluations.add(0)
 
-        def has_due_evaluation() -> bool:
+        def has_due_final_audit() -> bool:
+            return any(
+                step <= state.environment_steps and step not in completed_final_audits
+                for step in config.runtime.final_audit_steps
+            )
+
+        def has_due_evaluation(*, include_final_audits: bool = False) -> bool:
             return (
                 any(
-                    step <= state.environment_steps
-                    and step not in completed_evaluations
+                    step <= state.environment_steps and step not in completed_evaluations
                     for step in config.runtime.evaluation_steps
                 )
                 or any(
-                    step <= state.environment_steps
-                    and step not in completed_early_evaluations
+                    step <= state.environment_steps and step not in completed_early_evaluations
                     for step in config.runtime.early_evaluation_steps
                 )
-                or any(
-                    step <= state.environment_steps
-                    and step not in completed_final_audits
-                    for step in config.runtime.final_audit_steps
-                )
+                or (include_final_audits and has_due_final_audit())
             )
 
-        def run_due_evaluations() -> dict[str, Any] | None:
+        def run_due_evaluations(
+            *,
+            include_final_audits: bool = False,
+        ) -> dict[str, Any] | None:
             """Run crossed gates in gate order and stop after first guard failure."""
 
-            pending: list[
-                tuple[int, str, str, int, set[int], str]
-            ] = []
+            pending: list[tuple[int, str, str, int, set[int], str]] = []
             for step in config.runtime.evaluation_steps:
-                if (
-                    step <= state.environment_steps
-                    and step not in completed_evaluations
-                ):
+                if step <= state.environment_steps and step not in completed_evaluations:
                     pending.append(
                         (
                             step,
@@ -932,10 +872,7 @@ def run_training(
                         )
                     )
             for step in config.runtime.early_evaluation_steps:
-                if (
-                    step <= state.environment_steps
-                    and step not in completed_early_evaluations
-                ):
+                if step <= state.environment_steps and step not in completed_early_evaluations:
                     pending.append(
                         (
                             step,
@@ -946,21 +883,19 @@ def run_training(
                             f"early-validation-step-{step:09d}.jsonl",
                         )
                     )
-            for step in config.runtime.final_audit_steps:
-                if (
-                    step <= state.environment_steps
-                    and step not in completed_final_audits
-                ):
-                    pending.append(
-                        (
-                            step,
-                            "final_audit",
-                            "final_audit",
-                            config.runtime.final_audit_episodes,
-                            completed_final_audits,
-                            f"final-audit-step-{step:09d}.jsonl",
+            if include_final_audits:
+                for step in config.runtime.final_audit_steps:
+                    if step <= state.environment_steps and step not in completed_final_audits:
+                        pending.append(
+                            (
+                                step,
+                                "final_audit",
+                                "final_audit",
+                                config.runtime.final_audit_episodes,
+                                completed_final_audits,
+                                f"final-audit-step-{step:09d}.jsonl",
+                            )
                         )
-                    )
             for (
                 step,
                 partition,
@@ -992,12 +927,8 @@ def run_training(
             starting_policy_version=state.actor_policy_version,
             epsilon=lambda steps: exploration_epsilon(config, steps),
             starting_episode_count=state.episodes,
-            deterministic_probe_interval_episodes=(
-                config.rollout.deterministic_probe_interval_episodes
-            ),
-            deterministic_probe_environment_steps=(
-                config.rollout.deterministic_probe_environment_steps
-            ),
+            deterministic_probe_interval_episodes=(config.rollout.deterministic_probe_interval_episodes),
+            deterministic_probe_environment_steps=(config.rollout.deterministic_probe_environment_steps),
             supervisor_state=actor_supervisor_state,
         )
         next_checkpoint = (
@@ -1013,9 +944,7 @@ def run_training(
             nonlocal state, maintenance_requested
             state = replace(
                 state,
-                environment_steps=(
-                    state.environment_steps + incident.emitted_environment_steps
-                ),
+                environment_steps=(state.environment_steps + incident.emitted_environment_steps),
                 actor_policy_version=incident.actor_policy_version,
                 maximum_observed_candidates=max(
                     state.maximum_observed_candidates,
@@ -1037,9 +966,7 @@ def run_training(
                     "incident_id": incident.incident_id,
                     "reason": "infrastructure_protocol_fault",
                     "environment_steps": state.environment_steps,
-                    "emitted_environment_steps": (
-                        incident.emitted_environment_steps
-                    ),
+                    "emitted_environment_steps": (incident.emitted_environment_steps),
                     "lost_valid_prefix_steps": incident.lost_valid_prefix_steps,
                     "task_terminal_or_reward_fabricated": False,
                 },
@@ -1057,19 +984,12 @@ def run_training(
                         "incident_id": incident.incident_id,
                         "fingerprint": incident.fingerprint,
                         "environment_steps": state.environment_steps,
-                        "fingerprint_occurrences": (
-                            incident.fingerprint_occurrences
-                        ),
+                        "fingerprint_occurrences": (incident.fingerprint_occurrences),
                         "consecutive_incidents": incident.consecutive_incidents,
-                        "incidents_last_100_attempts": (
-                            incident.incidents_last_100_attempts
-                        ),
+                        "incidents_last_100_attempts": (incident.incidents_last_100_attempts),
                     },
                 )
-                raise RuntimeError(
-                    "actor infrastructure circuit breaker opened for "
-                    f"{incident.fingerprint}"
-                )
+                raise RuntimeError("actor infrastructure circuit breaker opened for " f"{incident.fingerprint}")
             if recovery_backend_factory is None:
                 raise RuntimeError(
                     "recoverable actor incident requires an explicit backend "
@@ -1107,9 +1027,7 @@ def run_training(
             update_number = state.learner_updates + 1
             batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
             transaction_traces = (
-                resources.transaction_replay.sample(
-                    config.transaction_learning.sample_traces
-                )
+                resources.transaction_replay.sample(config.transaction_learning.sample_traces)
                 if resources.transaction_replay is not None
                 else ()
             )
@@ -1118,9 +1036,7 @@ def run_training(
                     config.episodic_learning.sample_sequences,
                     learn_steps=config.episodic_learning.learn_steps,
                     burn_in_steps=config.episodic_learning.burn_in_steps,
-                    macro_sample_fraction=(
-                        config.episodic_learning.macro_sample_fraction
-                    ),
+                    macro_sample_fraction=(config.episodic_learning.macro_sample_fraction),
                 )
                 if resources.episodic_replay is not None
                 else ()
@@ -1135,19 +1051,12 @@ def run_training(
                     "batch_environment_steps": batch_environment_steps,
                     "transaction_traces": len(transaction_traces),
                     "transaction_replay": (
-                        resources.transaction_replay.metrics()
-                        if resources.transaction_replay is not None
-                        else None
+                        resources.transaction_replay.metrics() if resources.transaction_replay is not None else None
                     ),
                     "episodic_sequences": len(episodic_sequences),
-                    "episodic_learn_steps": sum(
-                        len(sequence.learn_steps)
-                        for sequence in episodic_sequences
-                    ),
+                    "episodic_learn_steps": sum(len(sequence.learn_steps) for sequence in episodic_sequences),
                     "episodic_replay": (
-                        resources.episodic_replay.metrics()
-                        if resources.episodic_replay is not None
-                        else None
+                        resources.episodic_replay.metrics() if resources.episodic_replay is not None else None
                     ),
                 },
             )
@@ -1190,19 +1099,13 @@ def run_training(
                     "environment_steps": pipeline.environment_steps,
                     "policy_version": state.policy_version,
                     "actor_progress": (
-                        asdict(pipeline.actor_progress)
-                        if pipeline.actor_progress is not None
-                        else None
+                        asdict(pipeline.actor_progress) if pipeline.actor_progress is not None else None
                     ),
                     "rollout_queue": resources.rollout_queue.metrics(),
                     **learner_metrics.to_mapping(),
                 },
             )
-            if (
-                unrolls_since_publication
-                >= config.rollout.policy_sync_interval_unrolls
-                and pipeline.alive
-            ):
+            if unrolls_since_publication >= config.rollout.policy_sync_interval_unrolls and pipeline.alive:
                 pipeline.request_policy_publication(state.policy_version)
                 unrolls_since_publication = 0
 
@@ -1214,11 +1117,7 @@ def run_training(
         # online batch samples that replay.  The local batch is always flushed
         # before maintenance/final checkpointing and is never consumed twice.
         pending_batch: tuple[SequenceUnroll, ...] = ()
-        while (
-            pipeline.alive
-            or len(resources.rollout_queue) > 0
-            or bool(pending_batch)
-        ):
+        while pipeline.alive or len(resources.rollout_queue) > 0 or bool(pending_batch):
             try:
                 fetched_batch = resources.rollout_queue.get_batch(
                     config.optimization.batch_unrolls,
@@ -1251,23 +1150,17 @@ def run_training(
                 transaction_traces_stored = 0
                 if resources.transaction_replay is not None:
                     transaction_traces_stored = sum(
-                        int(resources.transaction_replay.put(trace))
-                        for trace in episode.transaction_traces
+                        int(resources.transaction_replay.put(trace)) for trace in episode.transaction_traces
                     )
                 elif episode.transaction_traces:
-                    raise RuntimeError(
-                        "collector emitted transaction traces while replay is disabled"
-                    )
+                    raise RuntimeError("collector emitted transaction traces while replay is disabled")
                 episodic_episode_stored = False
                 if resources.episodic_replay is not None:
                     if episode.completed_episode is None:
                         raise RuntimeError(
-                            "episodic learning is enabled but the collector emitted no "
-                            "completed episode"
+                            "episodic learning is enabled but the collector emitted no " "completed episode"
                         )
-                    episodic_episode_stored = resources.episodic_replay.put(
-                        episode.completed_episode
-                    )
+                    episodic_episode_stored = resources.episodic_replay.put(episode.completed_episode)
                 state = replace(
                     state,
                     environment_steps=state.environment_steps + episode.metrics.steps,
@@ -1298,49 +1191,26 @@ def run_training(
                                 state.environment_steps,
                             )
                         ),
-                        "run_maximum_observed_candidates": (
-                            state.maximum_observed_candidates
-                        ),
-                        "epsilon": exploration_epsilon(
-                            config, state.environment_steps
-                        ),
-                        "collector_timings": (
-                            episode.timings.to_mapping()
-                            if episode.timings is not None
-                            else None
-                        ),
+                        "run_maximum_observed_candidates": (state.maximum_observed_candidates),
+                        "epsilon": exploration_epsilon(config, state.environment_steps),
+                        "collector_timings": (episode.timings.to_mapping() if episode.timings is not None else None),
                         "rollout_queue": resources.rollout_queue.metrics(),
-                        "transaction_traces_emitted": len(
-                            episode.transaction_traces
-                        ),
+                        "transaction_traces_emitted": len(episode.transaction_traces),
                         "transaction_traces_stored": transaction_traces_stored,
-                        "transaction_learn_steps": sum(
-                            len(trace.learn_steps)
-                            for trace in episode.transaction_traces
-                        ),
+                        "transaction_learn_steps": sum(len(trace.learn_steps) for trace in episode.transaction_traces),
                         "transaction_q_labels": sum(
-                            int(step.q_observed)
-                            for trace in episode.transaction_traces
-                            for step in trace.learn_steps
+                            int(step.q_observed) for trace in episode.transaction_traces for step in trace.learn_steps
                         ),
                         "transaction_replay": (
-                            resources.transaction_replay.metrics()
-                            if resources.transaction_replay is not None
-                            else None
+                            resources.transaction_replay.metrics() if resources.transaction_replay is not None else None
                         ),
-                        "episodic_episode_emitted": (
-                            episode.completed_episode is not None
-                        ),
+                        "episodic_episode_emitted": (episode.completed_episode is not None),
                         "episodic_episode_stored": episodic_episode_stored,
                         "episodic_episode_storage_nbytes": (
-                            episode.completed_episode.storage_nbytes()
-                            if episode.completed_episode is not None
-                            else 0
+                            episode.completed_episode.storage_nbytes() if episode.completed_episode is not None else 0
                         ),
                         "episodic_replay": (
-                            resources.episodic_replay.metrics()
-                            if resources.episodic_replay is not None
-                            else None
+                            resources.episodic_replay.metrics() if resources.episodic_replay is not None else None
                         ),
                     },
                 )
@@ -1359,9 +1229,7 @@ def run_training(
                 learn_rollout_batch(batch_to_learn)
             if resources.episodic_replay is not None and pending_batch:
                 terminal_drain = bool(
-                    not pipeline.alive
-                    and resources.rollout_queue.closed
-                    and len(resources.rollout_queue) == 0
+                    not pipeline.alive and resources.rollout_queue.closed and len(resources.rollout_queue) == 0
                 )
                 if boundary_committed or terminal_drain:
                     learn_rollout_batch(pending_batch)
@@ -1384,6 +1252,7 @@ def run_training(
                         run_id=run_id,
                         load_mode=load_mode,
                         actor_supervisor_state=pipeline.supervisor_state,
+                        evaluation_state=current_evaluation_state(),
                     )
                     parent_checkpoint = checkpoint
                     load_mode = "in_process_successor"
@@ -1410,6 +1279,7 @@ def run_training(
                         run_id=run_id,
                         load_mode=load_mode,
                         actor_supervisor_state=pipeline.supervisor_state,
+                        evaluation_state=current_evaluation_state(),
                     )
                     parent_checkpoint = checkpoint
                     load_mode = "in_process_successor"
@@ -1428,22 +1298,18 @@ def run_training(
                 break
             if isinstance(actor_result, RecoverableActorIncident):
                 raise RuntimeError(
-                    "actor exited with an unhandled recoverable incident: "
-                    f"{actor_result.incident_id}"
+                    "actor exited with an unhandled recoverable incident: " f"{actor_result.incident_id}"
                 )
             episode = actor_result
             if resources.transaction_replay is not None:
                 for trace in episode.transaction_traces:
                     resources.transaction_replay.put(trace)
             elif episode.transaction_traces:
-                raise RuntimeError(
-                    "collector emitted transaction traces while replay is disabled"
-                )
+                raise RuntimeError("collector emitted transaction traces while replay is disabled")
             if resources.episodic_replay is not None:
                 if episode.completed_episode is None:
                     raise RuntimeError(
-                        "episodic learning is enabled but the collector emitted no "
-                        "completed episode during drain"
+                        "episodic learning is enabled but the collector emitted no " "completed episode during drain"
                     )
                 resources.episodic_replay.put(episode.completed_episode)
             state = replace(
@@ -1456,10 +1322,13 @@ def run_training(
                 ),
             )
             pipeline.release_episode_boundary()
+        # Final audits describe the policy persisted below, not an intermediate
+        # policy at the collection horizon.  The actor is joined and every
+        # queued/pending rollout has been learned before this publication.
         resources.publish_collector_policy()
-        if evaluation_guard_stop is None:
-            evaluation_guard_stop = run_due_evaluations()
         state = replace(state, actor_policy_version=state.policy_version)
+        if evaluation_guard_stop is None:
+            evaluation_guard_stop = run_due_evaluations(include_final_audits=True)
         final_checkpoint = _save(
             resources,
             config=config,
@@ -1470,15 +1339,14 @@ def run_training(
             run_id=run_id,
             load_mode=load_mode,
             actor_supervisor_state=pipeline.supervisor_state,
+            evaluation_state=current_evaluation_state(),
         )
         metrics.write(
             "run_complete",
             {
                 "checkpoint": str(final_checkpoint),
                 "completion_status": (
-                    "evaluation_guard_stopped"
-                    if evaluation_guard_stop is not None
-                    else "horizon_complete"
+                    "evaluation_guard_stopped" if evaluation_guard_stop is not None else "horizon_complete"
                 ),
                 "evaluation_guard_stop": evaluation_guard_stop,
                 **asdict(state),
