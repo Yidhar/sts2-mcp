@@ -305,6 +305,55 @@ def test_status_completed_overrides_stale_fresh_is_running_and_old_unknown_is_st
     assert stale["status"]["phase"] == "stale_unknown"
 
 
+@pytest.mark.parametrize(
+    ("completion_status", "expected_status"),
+    (
+        (
+            "horizon_complete",
+            {
+                "state": "completed",
+                "phase": "complete",
+                "label": "已完成",
+            },
+        ),
+        (
+            "evaluation_guard_stopped",
+            {
+                "state": "guard_stopped",
+                "phase": "evaluation_guard_stopped",
+                "label": "评估门禁提前停止",
+            },
+        ),
+    ),
+)
+def test_run_completion_status_is_consistent_across_quick_and_full_paths(
+    tmp_path: Path,
+    completion_status: str,
+    expected_status: dict[str, str],
+) -> None:
+    root = tmp_path / completion_status
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "run_complete",
+            "unix_s": 101.0,
+            "environment_steps": (25 if completion_status == "evaluation_guard_stopped" else 100),
+            "completion_status": completion_status,
+        },
+    )
+
+    store = DashboardStore(root, now=lambda: 102.0)
+    cold_quick = store.list_runs()["runs"][0]["status"]
+    full = store.snapshot()
+    cached_quick = store.list_runs()["runs"][0]["status"]
+
+    assert cold_quick == expected_status
+    assert {key: full["status"][key] for key in ("state", "phase", "label")} == expected_status
+    assert cached_quick == expected_status
+    assert full["lifecycle"]["completion_status"] == completion_status
+
+
 def test_active_final_audit_is_fresh_evaluating_not_complete_at_training_horizon(
     tmp_path: Path,
 ) -> None:
@@ -341,6 +390,7 @@ def test_active_final_audit_is_fresh_evaluating_not_complete_at_training_horizon
     assert snapshot["lifecycle"] == {
         "run_complete_persisted": False,
         "training_horizon_reached": True,
+        "completion_status": None,
         "pending_evaluation": {
             "kind": "final_audit",
             "gate": 100,
@@ -561,6 +611,8 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert '<div class="metric-label">环境采集进度</div>' in html
     assert "采集目标已达" in html
     assert "整个运行尚未完成" in html
+    assert "评估门禁提前停止" in html
+    assert "采集目标未完成" in html
     assert "const latest = evaluations[evaluations.length - 1]" in html
 
 

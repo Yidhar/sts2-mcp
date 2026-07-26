@@ -244,6 +244,7 @@
       color: var(--info);
     }
 
+    .pill[data-state="guard_stopped"],
     .pill[data-state="interrupted"],
     .pill[data-state="stale"],
     .pill[data-state="waiting"] {
@@ -1173,6 +1174,7 @@
         running: "训练中",
         complete: "已完成",
         completed: "已完成",
+        guard_stopped: "评估门禁提前停止",
         continued: "已续跑",
         interrupted: "已中断",
         evaluating: "评估中",
@@ -1437,7 +1439,10 @@
           (current != null && target != null && target > 0 && current >= target);
         const runComplete = lifecycle.run_complete_persisted === true ||
           statusState(snapshot.status || {}) === "complete";
-        const completionContext = horizonReached
+        const completionStatus = first(lifecycle, ["completion_status"], null);
+        const completionContext = completionStatus === "evaluation_guard_stopped"
+          ? " · 评估门禁提前停止，采集目标未完成"
+          : horizonReached
           ? runComplete
             ? " · run_complete 已确认"
             : " · 采集目标已达；整个运行尚未完成"

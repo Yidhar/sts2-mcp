@@ -532,6 +532,36 @@ def _terminal_projection(event: JsonDict | None) -> JsonDict:
     return event if event is not None else {}
 
 
+def _run_completion_status(event: JsonDict) -> JsonDict:
+    """Project a persisted run terminus without conflating its outcome.
+
+    ``run_complete`` means the runtime finished its shutdown/checkpoint
+    protocol.  It does not necessarily mean that collection reached the
+    configured horizon: an evaluation liveness guard deliberately emits the
+    same terminal event after stopping a lineage early.  Keep legacy events
+    without ``completion_status`` classified as completed, but surface the
+    explicit guard outcome distinctly wherever a run status is rendered.
+    """
+
+    completion_status = _string(event.get("completion_status"))
+    if completion_status == "evaluation_guard_stopped":
+        return {
+            "state": "guard_stopped",
+            "phase": "evaluation_guard_stopped",
+            "label": "评估门禁提前停止",
+            "evidence": [
+                "run_complete 已持久化; completion_status=evaluation_guard_stopped",
+                "评估门禁请求提前停止, 这不代表训练采集目标已经完成",
+            ],
+        }
+    return {
+        "state": "completed",
+        "phase": "complete",
+        "label": "已完成",
+        "evidence": ["run_complete 已持久化"],
+    }
+
+
 def _pending_evaluation_status(
     pending_evaluation: JsonDict,
     *,
@@ -964,8 +994,17 @@ class DashboardStore:
             return {"state": "unknown", "label": "不可读取"}
         recent_objects = _read_recent_objects(run.metrics_path)
         recent_events = {_string(event.get("event")) for event in recent_objects}
-        if "run_complete" in recent_events:
-            return {"state": "completed", "phase": "complete", "label": "已完成"}
+        recent_completion = next(
+            (event for event in reversed(recent_objects) if event.get("event") == "run_complete"),
+            None,
+        )
+        if recent_completion is not None:
+            status = _run_completion_status(recent_completion)
+            return {
+                "state": status["state"],
+                "phase": status["phase"],
+                "label": status["label"],
+            }
         successor = self._successor_for(run)
         if successor is not None:
             return {
@@ -1310,13 +1349,14 @@ class DashboardStore:
                 isinstance(item, dict) and item.get("kind") == "final" and item.get("valid") is True
                 for item in published
             )
+            completion = _run_completion_status(parser.latest_by_event["run_complete"])
             return {
-                "state": "completed",
-                "phase": "complete",
-                "label": "已完成",
+                "state": completion["state"],
+                "phase": completion["phase"],
+                "label": completion["label"],
                 "telemetry_age_s": telemetry_age,
                 "evidence": [
-                    "run_complete 已持久化",
+                    *completion["evidence"],
                     (
                         "最终检查点已原子发布并通过大小校验"
                         if has_final_checkpoint
@@ -1727,6 +1767,7 @@ class DashboardStore:
                 "lifecycle": {
                     "run_complete_persisted": "run_complete" in selected_parser.latest_by_event,
                     "training_horizon_reached": target > 0 and environment_steps >= target,
+                    "completion_status": (_string(completed.get("completion_status")) or None),
                     "pending_evaluation": pending_evaluation,
                 },
                 "progress": {

@@ -101,6 +101,8 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
     by_episode: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     confirm_ready = 0
     confirm_selected = 0
+    selection_exit_ready = 0
+    selection_exit_selected = 0
     multi_action_end_turn = 0
     avoidable_end_turn_selected = 0
     reward_hubs = 0
@@ -130,6 +132,10 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
             selection_value if isinstance(selection_value, Mapping) else {}
         )
         can_confirm = selection.get("can_confirm") is True
+        optional_cancel_exit = (
+            selection.get("can_cancel") is True
+            and _integer(selection.get("min_select")) == 0
+        )
 
         topk_value = record.get("policy_topk")
         topk = (
@@ -142,6 +148,14 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         if can_confirm or "confirm_selection" in topk_kinds:
             confirm_ready += 1
             confirm_selected += int(selected_kind == "confirm_selection")
+            selection_exit_ready += 1
+            selection_exit_selected += int(
+                selected_kind == "confirm_selection"
+                or (
+                    optional_cancel_exit
+                    and selected_kind == "cancel_selection"
+                )
+            )
 
         end_count = _integer(kinds.get("end_turn")) or 0
         total_legal = sum(
@@ -212,6 +226,11 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
     confirm_rate = (
         confirm_selected / confirm_ready if confirm_ready else None
     )
+    selection_exit_rate = (
+        selection_exit_selected / selection_exit_ready
+        if selection_exit_ready
+        else None
+    )
     avoidable_end_rate = (
         avoidable_end_turn_selected / multi_action_end_turn
         if multi_action_end_turn
@@ -228,6 +247,18 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         "confirm_ready_greedy_rate": confirm_rate,
         "confirm_ready_failure_rate": (
             1.0 - confirm_rate if confirm_rate is not None else None
+        ),
+        # Preserve the historical confirm-only fields above for report
+        # compatibility.  The hard guard uses exit semantics: Cancel is a
+        # valid exit when the simulator explicitly declares the window
+        # optional (min_select=0, can_cancel=true).
+        "selection_exit_ready_decisions": selection_exit_ready,
+        "selection_exit_selected_decisions": selection_exit_selected,
+        "selection_exit_greedy_rate": selection_exit_rate,
+        "selection_exit_failure_rate": (
+            1.0 - selection_exit_rate
+            if selection_exit_rate is not None
+            else None
         ),
         "multi_action_end_turn_decisions": multi_action_end_turn,
         "avoidable_end_turn_selected_decisions": avoidable_end_turn_selected,
@@ -258,8 +289,19 @@ def evaluate_liveness_guard(
     """
 
     violations: list[dict[str, Any]] = []
-    confirm_exposures = _integer(telemetry.get("confirm_ready_decisions")) or 0
-    confirm_failure = telemetry.get("confirm_ready_failure_rate")
+    # Persisted pre-exit-semantics summaries contain only confirm_* fields.
+    # Falling back keeps those old reports readable and preserves their guard
+    # result while new summaries distinguish a legal optional Cancel.
+    confirm_exposures = _integer(
+        telemetry.get(
+            "selection_exit_ready_decisions",
+            telemetry.get("confirm_ready_decisions"),
+        )
+    ) or 0
+    confirm_failure = telemetry.get(
+        "selection_exit_failure_rate",
+        telemetry.get("confirm_ready_failure_rate"),
+    )
     if (
         confirm_exposures >= config.evaluation_guard_min_confirm_ready
         and isinstance(confirm_failure, int | float)

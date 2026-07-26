@@ -199,3 +199,125 @@ def test_combat_selection_operation_names_use_the_same_liveness_semantics(
     assert summary["selection_cycle_episode_count"] == 1
     assert summary["confirm_ready_decisions"] == 9
     assert summary["confirm_selected_decisions"] == 1
+
+
+def test_optional_cancel_is_a_successful_selection_exit(
+    tmp_path: Path,
+) -> None:
+    records = []
+    for step in range(8):
+        record = _decision(
+            0,
+            step,
+            selected="combat_cancel_selection",
+            confirm_ready=True,
+        )
+        record["observation_summary"] = {
+            "card_selection": {
+                "can_confirm": True,
+                "can_cancel": True,
+                "min_select": 0,
+                "max_select": 1,
+            }
+        }
+        records.append(record)
+
+    journal = tmp_path / "optional-cancel.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    # The legacy metric remains confirm-only for report compatibility.
+    assert summary["confirm_ready_decisions"] == 8
+    assert summary["confirm_selected_decisions"] == 0
+    assert summary["confirm_ready_failure_rate"] == 1.0
+    # The guard asks whether the policy legally exited the window.
+    assert summary["selection_exit_ready_decisions"] == 8
+    assert summary["selection_exit_selected_decisions"] == 8
+    assert summary["selection_exit_greedy_rate"] == 1.0
+    assert summary["selection_exit_failure_rate"] == 0.0
+
+    config = RuntimeConfig(
+        early_evaluation_steps=(5_000,),
+        early_evaluation_episodes=4,
+        evaluation_liveness_guard_enabled=True,
+    )
+    guard = evaluate_liveness_guard(summary, config)
+    assert guard["stop_requested"] is False
+    assert guard["violations"] == []
+
+
+def test_required_selection_without_exit_still_triggers_guard(
+    tmp_path: Path,
+) -> None:
+    records = []
+    for step in range(8):
+        record = _decision(
+            0,
+            step,
+            selected=(
+                "combat_select_card"
+                if step % 2 == 0
+                else "combat_deselect_card"
+            ),
+            confirm_ready=True,
+        )
+        record["observation_summary"] = {
+            "card_selection": {
+                "can_confirm": True,
+                "can_cancel": False,
+                "min_select": 1,
+                "max_select": 2,
+            }
+        }
+        records.append(record)
+
+    journal = tmp_path / "required-selection-no-exit.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    assert summary["selection_exit_ready_decisions"] == 8
+    assert summary["selection_exit_selected_decisions"] == 0
+    assert summary["selection_exit_failure_rate"] == 1.0
+
+    config = RuntimeConfig(
+        early_evaluation_steps=(5_000,),
+        early_evaluation_episodes=4,
+        evaluation_liveness_guard_enabled=True,
+    )
+    guard = evaluate_liveness_guard(summary, config)
+    assert guard["stop_requested"] is True
+    assert {
+        item["kind"] for item in guard["violations"]
+    } == {"confirm_ready_greedy_failure"}
+
+
+def test_guard_accepts_legacy_confirm_only_telemetry() -> None:
+    config = RuntimeConfig(
+        early_evaluation_steps=(5_000,),
+        early_evaluation_episodes=4,
+        evaluation_liveness_guard_enabled=True,
+    )
+    guard = evaluate_liveness_guard(
+        {
+            "confirm_ready_decisions": 8,
+            "confirm_ready_failure_rate": 1.0,
+            "multi_action_end_turn_decisions": 0,
+            "selection_cycle_episode_rate": 0.0,
+        },
+        config,
+    )
+    assert guard["stop_requested"] is True
+    assert guard["violations"] == [
+        {
+            "kind": "confirm_ready_greedy_failure",
+            "observed": 1.0,
+            "threshold": 0.95,
+            "exposures": 8,
+        }
+    ]

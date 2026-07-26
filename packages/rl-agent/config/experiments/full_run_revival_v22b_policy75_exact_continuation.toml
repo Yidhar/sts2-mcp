@@ -1,0 +1,38 @@
+# Exact continuation of the v22 policy-75 guard-stop checkpoint.
+#
+# This overlay intentionally changes only mutable execution controls relative
+# to the v22 warm-start lineage: output locations and the observation-only
+# liveness guard.  Model, rollout, optimizer, exploration, reward, replay, and
+# environment semantics remain identical so the complete optimizer/replay/RNG
+# state can be restored with ``--resume`` rather than model initialization.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[runtime]
+total_environment_steps = 250000
+seed = 1000000
+log_dir = "runs/full-run-revival-v22b-policy75-exact-continuation"
+checkpoint_dir = "checkpoints/full-run-revival-v22b-policy75-exact-continuation"
+checkpoint_interval_steps = 10000
+
+evaluation_steps = [0, 50000, 100000, 150000, 200000, 240000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000, 30000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 20
+
+# The v22 stop was a false positive: every alleged confirm failure was a
+# min_select=0 window exited through a legal cancel action.  Preserve all
+# diagnostic journals, but do not allow that observation-only guard to stop
+# this exact continuation.
+evaluation_liveness_guard_enabled = false

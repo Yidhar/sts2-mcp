@@ -51,14 +51,11 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.optimization.entropy_weight_end == 0.004
     assert preheat.optimization.entropy_decay_updates == 2_000
     assert (
-        preheat.episodic_learning.sample_sequences
-        * preheat.episodic_learning.learn_steps
+        preheat.episodic_learning.sample_sequences * preheat.episodic_learning.learn_steps
         == preheat.rollout.unroll_length * preheat.optimization.batch_unrolls
         == 64
     )
-    assert preheat.episodic_learning.per_episode_capacity_bytes <= (
-        preheat.episodic_learning.replay_capacity_bytes
-    )
+    assert preheat.episodic_learning.per_episode_capacity_bytes <= (preheat.episodic_learning.replay_capacity_bytes)
     assert preheat.environment.scenario == "full-run"
     assert preheat.curriculum.reward_objective == "run"
     assert preheat.environment.encounter_id is None
@@ -104,9 +101,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.diagnostics.noncombat_durable_progress_window == 256
     assert preheat.diagnostics.combat_min_net_hp_fraction == 0.05
     assert preheat.runtime.log_dir.endswith("v20-liveness-guard")
-    assert preheat.runtime.checkpoint_dir.endswith(
-        "v20-liveness-guard"
-    )
+    assert preheat.runtime.checkpoint_dir.endswith("v20-liveness-guard")
     assert preheat.runtime.checkpoint_interval_steps == 10_000
     assert default.runtime.log_dir.endswith("v9-long-horizon-heads")
     assert default.runtime.checkpoint_dir.endswith("v9-long-horizon-heads")
@@ -123,12 +118,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
 
 
 def test_v22_policy3918_warmstart_overlay_is_conservative_and_fully_audited() -> None:
-    overlay = (
-        Path(__file__).parents[1]
-        / "config"
-        / "experiments"
-        / "full_run_revival_v22_policy3918_warmstart.toml"
-    )
+    overlay = Path(__file__).parents[1] / "config" / "experiments" / "full_run_revival_v22_policy3918_warmstart.toml"
     config = load_training_config(profile="preheat", config_path=overlay)
 
     # Model-only initialization must preserve the frozen model/data contracts.
@@ -161,6 +151,42 @@ def test_v22_policy3918_warmstart_overlay_is_conservative_and_fully_audited() ->
     assert config.runtime.evaluation_episodes == 8
     assert config.runtime.final_audit_steps == (250_000,)
     assert config.runtime.final_audit_episodes == 20
+
+
+def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
+    experiment_root = Path(__file__).parents[1] / "config" / "experiments"
+    warmstart = load_training_config(
+        profile="preheat",
+        config_path=(experiment_root / "full_run_revival_v22_policy3918_warmstart.toml"),
+    )
+    continuation = load_training_config(
+        profile="preheat",
+        config_path=(experiment_root / "full_run_revival_v22b_policy75_exact_continuation.toml"),
+    )
+
+    # Exact resume restores optimizer, queued unrolls, replay, recurrent state,
+    # and RNG.  Only runtime controls excluded from lineage identity may move.
+    assert continuation.lineage_mapping() == warmstart.lineage_mapping()
+    assert continuation.model == warmstart.model
+    assert continuation.rollout == warmstart.rollout
+    assert continuation.optimization == warmstart.optimization
+    assert continuation.curriculum == warmstart.curriculum
+    assert continuation.transaction_learning == warmstart.transaction_learning
+    assert continuation.episodic_learning == warmstart.episodic_learning
+    assert continuation.environment == warmstart.environment
+    assert continuation.diagnostics == warmstart.diagnostics
+
+    assert continuation.runtime.total_environment_steps == 250_000
+    assert continuation.runtime.seed == 1_000_000
+    assert continuation.runtime.log_dir.endswith("full-run-revival-v22b-policy75-exact-continuation")
+    assert continuation.runtime.checkpoint_dir.endswith("full-run-revival-v22b-policy75-exact-continuation")
+    assert not continuation.runtime.evaluation_liveness_guard_enabled
+    assert continuation.runtime.evaluation_steps == warmstart.runtime.evaluation_steps
+    assert continuation.runtime.evaluation_episodes == warmstart.runtime.evaluation_episodes
+    assert continuation.runtime.early_evaluation_steps == warmstart.runtime.early_evaluation_steps
+    assert continuation.runtime.early_evaluation_episodes == warmstart.runtime.early_evaluation_episodes
+    assert continuation.runtime.final_audit_steps == warmstart.runtime.final_audit_steps
+    assert continuation.runtime.final_audit_episodes == warmstart.runtime.final_audit_episodes
 
 
 def test_model_and_rollout_configs_fail_closed() -> None:
@@ -293,10 +319,7 @@ def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> Non
     # policy-failure label, so it must reject exact resume rather than masquerade
     # as an output-only runtime change. Model-only initialization remains the
     # explicit migration path.
-    assert (
-        changed_combat_terminal_semantics.lineage_mapping()
-        != base.lineage_mapping()
-    )
+    assert changed_combat_terminal_semantics.lineage_mapping() != base.lineage_mapping()
 
 
 def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
