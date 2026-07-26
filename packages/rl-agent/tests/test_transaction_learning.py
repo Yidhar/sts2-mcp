@@ -1363,6 +1363,79 @@ def test_replay_retains_and_samples_sparse_deadlock_traces_first() -> None:
         assert "deadlock" in sampled_ids
 
 
+def test_replay_retains_and_always_samples_sparse_factual_avoid_trace() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    actionable_cycle = _sequence_trace(
+        snapshot,
+        trace_id="actionable-cycle",
+        outcome=TransactionOutcome.DEADLOCK,
+        steps=(
+            ("empty", "selected", "select:a", 0, TransactionEffect.MOVE),
+            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+            ("empty", "selected", "select:a", 0, TransactionEffect.REVISIT),
+            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+        ),
+    )
+    label_free_deadlocks = tuple(
+        _sequence_trace(
+            snapshot,
+            trace_id=f"unique-moving-deadlock-{index}",
+            outcome=TransactionOutcome.DEADLOCK,
+            steps=(
+                (
+                    f"unique-{index}-before",
+                    f"unique-{index}-after",
+                    f"move:{index}",
+                    index % 2,
+                    TransactionEffect.MOVE,
+                ),
+            ),
+        )
+        for index in range(8)
+    )
+    assert any(
+        label.target is TransactionPolicyTarget.AVOID for label in factual_transaction_policy_targets(actionable_cycle)
+    )
+    assert all(factual_transaction_policy_targets(trace) == () for trace in label_free_deadlocks)
+
+    replay = BoundedTransactionReplay(
+        capacity=4,
+        byte_capacity=10_000_000,
+        seed=23,
+    )
+    assert replay.put(actionable_cycle)
+    assert all(replay.put(trace) for trace in label_free_deadlocks)
+
+    # Once every retained item is a deadlock, ordinary deadlock stratification
+    # alone would evict and then almost never sample the one trace that can
+    # actually update the policy.  The derived factual-AVOID stratum preserves
+    # it without inspecting select/deselect action names.
+    assert "actionable-cycle" in {trace.trace_id for trace in replay.snapshot()}
+    assert replay.sample(1)[0].trace_id == "actionable-cycle"
+    for _ in range(16):
+        sampled = replay.sample(2)
+        assert any(
+            label.target is TransactionPolicyTarget.AVOID
+            for trace in sampled
+            for label in factual_transaction_policy_targets(trace)
+        )
+
+    restored = BoundedTransactionReplay(
+        capacity=replay.capacity,
+        byte_capacity=replay.byte_capacity,
+        seed=999,
+    )
+    restored.load_state_dict(replay.state_dict())
+    assert restored.sample(1)[0].trace_id == "actionable-cycle"
+
+
 def test_pairwise_labels_require_same_node_distinct_factual_actions() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(

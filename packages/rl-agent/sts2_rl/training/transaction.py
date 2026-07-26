@@ -452,6 +452,20 @@ def backfill_factual_monte_carlo_returns(
     )
 
 
+def _has_factual_avoid_target(trace: TransactionTrace) -> bool:
+    """Return whether a trace owns at least one grounded policy AVOID label.
+
+    Most delayed liveness failures deliberately have no policy label because
+    their bounded window contains only unique moving transitions.  They remain
+    useful value/Q evidence, but they must not crowd the much rarer exact
+    recurrent cycles out of replay.  This predicate depends only on the same
+    factual target construction consumed by the learner; it does not inspect
+    action names or invent a counterfactual action.
+    """
+
+    return any(item.target is TransactionPolicyTarget.AVOID for item in factual_transaction_policy_targets(trace))
+
+
 class BoundedTransactionReplay:
     """Thread-safe, byte-bounded replay sidecar with exact checkpoint state."""
 
@@ -470,6 +484,9 @@ class BoundedTransactionReplay:
         self._rng = np.random.default_rng(seed)
         self._items: deque[TransactionTrace] = deque()
         self._trace_ids: set[str] = set()
+        # Derived entirely from immutable traces; checkpoint state need not
+        # duplicate it and load reconstructs it fail-closed.
+        self._actionable_avoid_trace_ids: set[str] = set()
         self._storage_nbytes = 0
         self._put_count = 0
         self._sample_count = 0
@@ -487,6 +504,7 @@ class BoundedTransactionReplay:
         size = trace.storage_nbytes()
         if size > self.byte_capacity:
             raise ValueError("one transaction trace exceeds replay byte capacity")
+        has_factual_avoid = _has_factual_avoid_target(trace)
         with self._lock:
             if trace.trace_id in self._trace_ids:
                 self._duplicate_count += 1
@@ -494,26 +512,40 @@ class BoundedTransactionReplay:
             while self._items and (
                 len(self._items) >= self.capacity or self._storage_nbytes + size > self.byte_capacity
             ):
-                # Liveness failures are sparse and carry the only guaranteed
-                # AVOID targets. Prefer evicting the oldest non-deadlock trace
-                # instead of letting routine completed transactions erase
-                # them from the replay. If every retained item is a deadlock,
-                # normal FIFO bounding still applies.
+                # Exact recurrent cycles and explored wrong branches are the
+                # only traces that carry grounded AVOID targets.  Preserve
+                # those sparse actionable traces ahead of both routine
+                # completions and delayed deadlocks whose unique-moving
+                # windows cannot name a causal action.  Within equal strata,
+                # eviction remains deterministic FIFO.
                 eviction_index = next(
                     (
                         index
                         for index, item in enumerate(self._items)
-                        if item.outcome is not TransactionOutcome.DEADLOCK
+                        if (
+                            item.outcome is not TransactionOutcome.DEADLOCK
+                            and item.trace_id not in self._actionable_avoid_trace_ids
+                        )
                     ),
-                    0,
+                    next(
+                        (
+                            index
+                            for index, item in enumerate(self._items)
+                            if item.trace_id not in self._actionable_avoid_trace_ids
+                        ),
+                        0,
+                    ),
                 )
                 evicted = self._items[eviction_index]
                 del self._items[eviction_index]
                 self._trace_ids.remove(evicted.trace_id)
+                self._actionable_avoid_trace_ids.discard(evicted.trace_id)
                 self._storage_nbytes -= evicted.storage_nbytes()
                 self._eviction_count += 1
             self._items.append(trace)
             self._trace_ids.add(trace.trace_id)
+            if has_factual_avoid:
+                self._actionable_avoid_trace_ids.add(trace.trace_id)
             self._storage_nbytes += size
             self._put_count += 1
             return True
@@ -526,38 +558,66 @@ class BoundedTransactionReplay:
                 return ()
             items = tuple(self._items)
             count = min(maximum, len(items))
+            actionable_indices = np.asarray(
+                [index for index, item in enumerate(items) if item.trace_id in self._actionable_avoid_trace_ids],
+                dtype=np.int64,
+            )
+            selected: list[int] = []
+            # One factual AVOID-bearing trace is mandatory whenever replay has
+            # one.  Without this separate stratum, hundreds of delayed
+            # deadlocks with intentionally label-free unique transitions can
+            # make exact select/deselect-cycle supervision disappear for many
+            # consecutive learner updates even though it remains in memory.
+            if actionable_indices.size:
+                selected.append(int(self._rng.choice(actionable_indices, size=1, replace=False)[0]))
+
+            selected_set = set(selected)
             deadlock_indices = np.asarray(
-                [index for index, item in enumerate(items) if item.outcome is TransactionOutcome.DEADLOCK],
+                [
+                    index
+                    for index, item in enumerate(items)
+                    if (index not in selected_set and item.outcome is TransactionOutcome.DEADLOCK)
+                ],
                 dtype=np.int64,
             )
             ordinary_indices = np.asarray(
-                [index for index, item in enumerate(items) if item.outcome is not TransactionOutcome.DEADLOCK],
+                [
+                    index
+                    for index, item in enumerate(items)
+                    if (index not in selected_set and item.outcome is not TransactionOutcome.DEADLOCK)
+                ],
                 dtype=np.int64,
             )
+            remaining_count = count - len(selected)
             # Reserve half of a normal batch for sparse liveness failures, but
             # always admit at least one when both strata exist. Fill any unused
             # reservation from the other stratum.
-            if deadlock_indices.size and ordinary_indices.size:
+            if remaining_count <= 0:
+                deadlock_count = 0
+                ordinary_count = 0
+            elif deadlock_indices.size and ordinary_indices.size:
                 deadlock_count = min(
                     int(deadlock_indices.size),
-                    max(1, count // 2),
+                    max(1, remaining_count // 2),
                 )
             else:
-                deadlock_count = min(int(deadlock_indices.size), count)
-            ordinary_count = min(int(ordinary_indices.size), count - deadlock_count)
-            remaining = count - deadlock_count - ordinary_count
+                deadlock_count = min(int(deadlock_indices.size), remaining_count)
+            ordinary_count = min(
+                int(ordinary_indices.size),
+                remaining_count - deadlock_count,
+            )
+            remaining = remaining_count - deadlock_count - ordinary_count
             if remaining:
                 deadlock_count += min(
                     remaining,
                     int(deadlock_indices.size) - deadlock_count,
                 )
-                remaining = count - deadlock_count - ordinary_count
+                remaining = remaining_count - deadlock_count - ordinary_count
             if remaining:
                 ordinary_count += min(
                     remaining,
                     int(ordinary_indices.size) - ordinary_count,
                 )
-            selected: list[int] = []
             if deadlock_count:
                 selected.extend(
                     int(index)
@@ -654,9 +714,11 @@ class BoundedTransactionReplay:
             probe.bit_generator.state = dict(payload["rng_state"])
         except (TypeError, ValueError) as exc:
             raise ValueError("transaction replay RNG checkpoint is invalid") from exc
+        actionable_avoid_trace_ids = {item.trace_id for item in items if _has_factual_avoid_target(item)}
         with self._lock:
             self._items = deque(items)
             self._trace_ids = set(ids)
+            self._actionable_avoid_trace_ids = actionable_avoid_trace_ids
             self._storage_nbytes = storage_nbytes
             self._rng.bit_generator.state = dict(payload["rng_state"])
             self._put_count = counters["put_count"]

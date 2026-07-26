@@ -1,0 +1,34 @@
+# Model-only warm start from the independently audited v21 policy 3918.
+#
+# This is deliberately a partial overlay on top of the `preheat` profile:
+# the relational model, 256-candidate fail-closed contract, active-shape
+# batching, replay losses, native unlimited revival, and full-run environment
+# remain unchanged.  A fresh optimizer must not treat a mature policy like a
+# random initialization, so learning/exploration start conservatively.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[runtime]
+total_environment_steps = 250000
+seed = 1000000
+log_dir = "runs/full-run-revival-v22-policy3918-warmstart"
+checkpoint_dir = "checkpoints/full-run-revival-v22-policy3918-warmstart"
+checkpoint_interval_steps = 10000
+
+# Keep small early liveness probes, then observe the inherited policy throughout
+# the entire 250k lineage rather than leaving 100k--250k unevaluated.
+evaluation_steps = [0, 50000, 100000, 150000, 200000, 240000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000, 30000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 20

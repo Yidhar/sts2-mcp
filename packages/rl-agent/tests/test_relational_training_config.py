@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -119,6 +120,47 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert "q_weight" not in mapping["optimization"]
     assert "reward_weight" not in mapping["optimization"]
     assert "terminal_weight" not in mapping["optimization"]
+
+
+def test_v22_policy3918_warmstart_overlay_is_conservative_and_fully_audited() -> None:
+    overlay = (
+        Path(__file__).parents[1]
+        / "config"
+        / "experiments"
+        / "full_run_revival_v22_policy3918_warmstart.toml"
+    )
+    config = load_training_config(profile="preheat", config_path=overlay)
+
+    # Model-only initialization must preserve the frozen model/data contracts.
+    base = load_training_config(profile="preheat")
+    assert config.model == base.model
+    assert config.rollout == base.rollout
+    assert config.transaction_learning == base.transaction_learning
+    assert config.episodic_learning == base.episodic_learning
+    assert config.environment == base.environment
+    assert config.curriculum.revival_budget == -1
+
+    # A fresh Adam state and a mature inherited policy use conservative updates
+    # and exploration rather than replaying the random-policy preheat schedule.
+    assert config.optimization.learning_rate == pytest.approx(1.0e-4)
+    assert config.optimization.entropy_weight == pytest.approx(0.006)
+    assert config.optimization.entropy_weight_end == pytest.approx(0.002)
+    assert config.curriculum.epsilon_start == pytest.approx(0.15)
+    assert config.curriculum.epsilon_end == pytest.approx(0.05)
+
+    assert config.runtime.total_environment_steps == 250_000
+    assert config.runtime.seed == 1_000_000
+    assert config.runtime.evaluation_steps == (
+        0,
+        50_000,
+        100_000,
+        150_000,
+        200_000,
+        240_000,
+    )
+    assert config.runtime.evaluation_episodes == 8
+    assert config.runtime.final_audit_steps == (250_000,)
+    assert config.runtime.final_audit_episodes == 20
 
 
 def test_model_and_rollout_configs_fail_closed() -> None:
