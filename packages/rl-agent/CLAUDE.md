@@ -27,7 +27,7 @@ python -m sts2_rl.train --dry-run
 
 WSL/ROCm uses the externally pinned artifacts installed by
 `scripts/bootstrap_wsl_rocm.sh`. Launch the live baseline with
-`scripts/train_grounded_wsl_rocm.sh` and the headless native-revival preheat
+`scripts/train_grounded_wsl_rocm.sh` and the headless engine-bailout preheat
 with `scripts/train_preheat_wsl_rocm.sh`. Never silently substitute a
 Torch/ROCm build or fall back to CPU.
 
@@ -75,17 +75,19 @@ sts2_rl.train
 - Each profile selects exactly one immutable reward identity. Backend scalars
   are never accepted as targets (the headless adapter strips them and may
   retain a diagnostic); objective vectors and settlement bonuses are rejected.
-- Native-revival preheat may inject only the configured native revival relic.
-  The simulator re-arms only that training copy after the game's native death
-  hook/flash/50%-heal path. Revival and actual HP removed come from exact
-  monotonic simulator counters under `observation._training`, never from HP
-  increase inference or a hand-written combat policy. Those underscore facts
-  are not model inputs.
+- Revival preheat uses the versioned, engine-owned `engine-bailout-v1`
+  facility. It must not inject a relic, power, card, buff, action candidate or
+  any other model-visible game entity. Native death prevention resolves first;
+  the training bailout applies only to an otherwise ordinary player death and
+  never intercepts forced kills or non-positive max HP. Revival and actual HP
+  removed come from exact monotonic simulator counters under
+  `observation._training`, never from HP increase inference or a hand-written
+  combat policy. Those underscore facts are not model inputs.
 - Reward never pays for damage dealt, enemy-HP change or cards played. The
   maintained preheat runs the complete headless game flow and ranks final run
   outcome plus forward run distance first, then bounded exact run-scoped
   HP-loss/revival costs and a small decision cost.
-- `scripts/train_preheat_wsl_rocm.sh` launches the native-revival full game
+- `scripts/train_preheat_wsl_rocm.sh` launches the engine-bailout full game
   directly. Act boundaries are episode metrics, never behavior gates or
   curriculum truncations. The short binary/schema/runtime-mechanics preflight
   validates transport facts only; it does not score a policy.

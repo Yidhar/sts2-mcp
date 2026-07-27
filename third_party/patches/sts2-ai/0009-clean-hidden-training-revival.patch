@@ -1,0 +1,629 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+index 8d802e4ab6a8c3076011779a5e326b542e15cc4d..0c360f2aff52ba6d193243c111f7b7a4c4ae836a 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
+@@ -79,6 +79,12 @@ internal static class Program
+ 		}
+ 		using IDisposable standaloneScope = FullRunTrainingEnvService.EnterStandaloneMode();
+ 		FullRunTrainingEnvService service = FullRunTrainingEnvService.Instance;
++		if (options.RunTrainingRevivalSelfTest)
++		{
++			await TrainingRevivalSelfTests.RunAsync(service);
++			Console.WriteLine("HeadlessSim training revival self-test: PASS");
++			return;
++		}
+ 		if (options.RunSettlementRuntimeSelfTest)
+ 		{
+ 			await service.RunSettlementRuntimeSelfTestsAsync();
+@@ -2644,6 +2650,8 @@ internal static class Program
+ 
+ 		public bool RunPlayerResourceLifecycleSelfTest { get; private set; }
+ 
++		public bool RunTrainingRevivalSelfTest { get; private set; }
++
+ 		public string PipeName => BinaryProtocol.PipeName(Port, Protocol);
+ 
+ 		public static HostOptions Parse(IEnumerable<string> args)
+@@ -2663,6 +2671,9 @@ internal static class Program
+ 					case "--player-resource-lifecycle-self-test":
+ 						options.RunPlayerResourceLifecycleSelfTest = true;
+ 						break;
++					case "--training-revival-self-test":
++						options.RunTrainingRevivalSelfTest = true;
++						break;
+ 					case "--stdio":
+ 						options.UseStdio = true;
+ 						break;
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 03bef843ada9a7e4b09bbb2b5c0620d517f26b81..3cbc1859319c5c98e93f2c8cd6a6fec05f42e3d1 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -28,6 +28,7 @@ public static class FullRunApiStateBuilder
+ 	internal static FullRunApiState Build(RunState? runState, FullRunSimulationStateSnapshot snapshot, FullRunSimulationChoiceBridge bridge, bool forceMapView)
+ 	{
+ 		Player? player = runState == null ? null : ResolveLocalPlayer(runState);
++		TrainingRevivalSnapshot trainingRevival = TrainingRevivalController.Capture(runState);
+ 		FullRunChoiceBridgeSnapshotCache bridgeSnapshots = snapshot.CachedBridgeSnapshots ?? bridge.CaptureSnapshots();
+ 		FullRunApiPlayerState? cachedPlayerState = null;
+ 		FullRunApiPlayerState GetPlayerState()
+@@ -49,9 +50,9 @@ public static class FullRunApiStateBuilder
+ 			backend_kind = snapshot.BackendKind,
+ 			coverage_tier = snapshot.CoverageTier,
+ 			run_outcome = snapshot.RunOutcome,
+-			training_revival_budget = TrainingRevivalController.RevivalBudget,
+-			training_revivals_used = TrainingRevivalController.RevivalsUsed,
+-			training_player_hp_lost = TrainingRevivalController.PlayerHpLost,
++			training_revival_budget = trainingRevival.RevivalBudget,
++			training_revivals_used = trainingRevival.RevivalsUsed,
++			training_player_hp_lost = trainingRevival.PlayerHpLost,
+ 			run = new FullRunApiRun
+ 			{
+ 				character_id = snapshot.CharacterId,
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunExportedRunSnapshot.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunExportedRunSnapshot.cs
+index 59989cb6921f8769f7767ce27a63aae7feea47c5..05482a7cf760735ce7e11d458e6000a4b9946817 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunExportedRunSnapshot.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunExportedRunSnapshot.cs
+@@ -14,6 +14,8 @@ public sealed class FullRunExportedRunSnapshot
+ 
+ 	public string StateType { get; set; } = string.Empty;
+ 
++	public TrainingRevivalSnapshot? TrainingRevival { get; set; }
++
+ 	public FullRunPendingSelectionRestoreSnapshot? PendingSelection { get; set; }
+ 
+ 	public FullRunSimulatorRuntimeFacade.SavedCombatSnapshot? CombatSnapshot { get; set; }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationSerializerContext.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationSerializerContext.cs
+index a25f828f68938bf0074f07860c370b8050688977..f1bc9230712b6264e73101fd258c60e5893a9dd2 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationSerializerContext.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationSerializerContext.cs
+@@ -8,6 +8,7 @@ namespace MegaCrit.Sts2.Core.Simulation;
+ 	UseStringEnumConverter = true,
+ 	PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+ [JsonSerializable(typeof(FullRunExportedRunSnapshot))]
++[JsonSerializable(typeof(TrainingRevivalSnapshot))]
+ [JsonSerializable(typeof(FullRunPendingSelectionRestoreSnapshot))]
+ [JsonSerializable(typeof(FullRunPendingRewardSelectionRestoreSnapshot))]
+ [JsonSerializable(typeof(FullRunPendingCardRewardRestoreSnapshot))]
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index d51be31286c7389fc0f744e12f430f11c4218731..6e0ad98fc80004dbfe023347f1ec9d041c4430c0 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -111,6 +111,8 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 
+ 		public string StateType { get; set; } = string.Empty;
+ 
++		public TrainingRevivalSnapshot? TrainingRevival { get; set; }
++
+ 		public FullRunPendingSelectionRestoreSnapshot? PendingSelection { get; set; }
+ 
+ 		public SavedCombatSnapshot? CombatSnapshot { get; set; }
+@@ -1944,6 +1946,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			RunSnapshot = CreateFullRunSnapshot(runState, state),
+ 			ExactSignature = BuildExactSnapshotSignature(runState, state),
+ 			StateType = state.StateType,
++			TrainingRevival = TrainingRevivalController.Capture(runState),
+ 			PendingSelection = FullRunSimulationChoiceBridge.Instance.CapturePendingSelection(),
+ 			CombatSnapshot = CaptureCombatSnapshot(runState, state),
+ 			ShopSnapshot = CaptureShopSnapshot(runState, state),
+@@ -2063,6 +2066,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			RunSnapshot = savedSnapshot.RunSnapshot,
+ 			ExactSignature = savedSnapshot.ExactSignature,
+ 			StateType = savedSnapshot.StateType,
++			TrainingRevival = savedSnapshot.TrainingRevival,
+ 			PendingSelection = savedSnapshot.PendingSelection,
+ 			CombatSnapshot = savedSnapshot.CombatSnapshot,
+ 			ShopSnapshot = savedSnapshot.ShopSnapshot,
+@@ -2120,6 +2124,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 
+ 		RunState restored = RunState.FromSerializable(snapshot);
+ 		RunManager.Instance.SetUpSavedSinglePlayer(restored, snapshot);
++		TrainingRevivalController.Restore(restored, savedSnapshot.TrainingRevival);
+ 
+ 		await PreloadManager.LoadRunAssets(restored.Players.Select(static p => p.Character));
+ 		if (restored.CurrentActIndex < restored.Acts.Count)
+@@ -2251,6 +2256,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				return await LoadFullSnapshotAsync(stateId, savedSnapshot);
+ 			}
+ 
++			TrainingRevivalController.Restore(runState, savedSnapshot.TrainingRevival);
+ 			RestoreCombatRandomState(runState, savedSnapshot.CombatRandomState);
+ 			ApplyCombatSnapshot(restoredCombatRoom, savedSnapshot.CombatSnapshot);
+ 			_forceMapView = false;
+@@ -2298,6 +2304,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 			RunSnapshot = exported.RunSnapshot,
+ 			ExactSignature = exported.ExactSignature ?? string.Empty,
+ 			StateType = exported.StateType ?? string.Empty,
++			TrainingRevival = exported.TrainingRevival,
+ 			PendingSelection = exported.PendingSelection,
+ 			CombatSnapshot = exported.CombatSnapshot,
+ 			ShopSnapshot = exported.ShopSnapshot,
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
+index 3ed8f3054dc216460fa51b4c5e963c91192f8daa..27625f562f439ce614e6564273f67e69e18fd836 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
+@@ -73,7 +73,7 @@ internal static class SimulationBuildSupport
+ 
+ 	public static void ApplyToPlayerIfRequested(Player player, SimulationBuildSpec? build)
+ 	{
+-		TrainingRevivalController.Configure(build?.TrainingRevivalBudget);
++		TrainingRevivalController.Configure(player.RunState, build?.TrainingRevivalBudget);
+ 		if (!HasOverrides(build))
+ 		{
+ 			return;
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
+index 6dacd8ae1becdd57f7cc76a1bb4ebdcd0f9f1a99..19c54840cdefcc86e3a9579887ba09d807ddf02c 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
+@@ -1,62 +1,172 @@
+ using System;
++using System.Runtime.CompilerServices;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
++using MegaCrit.Sts2.Core.Runs;
+ 
+ namespace MegaCrit.Sts2.Core.Simulation;
+ 
+ /// <summary>
+-/// Simulator-only accounting and budget control for native-revival preheat.
+-/// A null budget disables the training override, -1 is unlimited, and any
+-/// non-negative value is the total number of native Lizard Tail revivals that
+-/// may fire in the current reset episode, including an entire full run.
++/// Run-scoped, simulator-only accounting and budget control for the hidden
++/// training bailout. A null budget disables it, -1 is unlimited, and any
++/// non-negative value is the total number of ordinary player deaths that may
++/// be recovered in the current run. No relic, power, card, or other model-facing
++/// entity is created by this controller.
+ /// </summary>
+ public static class TrainingRevivalController
+ {
+-	private static int? _revivalBudget;
++	private sealed class RunTrainingRevivalState
++	{
++		public int? RevivalBudget { get; set; }
+ 
+-	public static bool IsEnabled => _revivalBudget.HasValue;
++		public int RevivalsUsed { get; set; }
+ 
+-	public static int? RevivalBudget => _revivalBudget;
++		public int PlayerHpLost { get; set; }
++	}
+ 
+-	public static int RevivalsUsed { get; private set; }
++	private static readonly ConditionalWeakTable<IRunState, RunTrainingRevivalState> States = new();
+ 
+-	public static int PlayerHpLost { get; private set; }
++	public static void Configure(IRunState runState, int? revivalBudget)
++	{
++		ArgumentNullException.ThrowIfNull(runState);
++		ValidateBudget(revivalBudget);
+ 
+-	public static bool CanRevive => IsEnabled
+-		&& (_revivalBudget == -1 || RevivalsUsed < _revivalBudget);
++		States.Remove(runState);
++		if (revivalBudget.HasValue)
++		{
++			States.Add(runState, new RunTrainingRevivalState
++			{
++				RevivalBudget = revivalBudget
++			});
++		}
++	}
+ 
+-	public static void Configure(int? revivalBudget)
++	public static TrainingRevivalSnapshot Capture(IRunState? runState)
+ 	{
+-		if (revivalBudget.HasValue && revivalBudget.Value < -1)
++		if (runState == null || !States.TryGetValue(runState, out RunTrainingRevivalState? state))
+ 		{
+-			throw new InvalidOperationException(
+-				"training_revival_budget must be null, -1, or a non-negative integer."
+-			);
++			return new TrainingRevivalSnapshot();
+ 		}
+ 
+-		_revivalBudget = revivalBudget;
+-		RevivalsUsed = 0;
+-		PlayerHpLost = 0;
++		lock (state)
++		{
++			return new TrainingRevivalSnapshot
++			{
++				RevivalBudget = state.RevivalBudget,
++				RevivalsUsed = state.RevivalsUsed,
++				PlayerHpLost = state.PlayerHpLost
++			};
++		}
+ 	}
+ 
+-	public static void RecordRevival()
++	public static void Restore(IRunState runState, TrainingRevivalSnapshot? snapshot)
+ 	{
+-		if (!CanRevive)
++		ArgumentNullException.ThrowIfNull(runState);
++		snapshot ??= new TrainingRevivalSnapshot();
++		ValidateSnapshot(snapshot);
++
++		Configure(runState, snapshot.RevivalBudget);
++		if (!snapshot.RevivalBudget.HasValue)
+ 		{
+-			throw new InvalidOperationException(
+-				"A training revival fired after its configured budget was exhausted."
+-			);
++			return;
+ 		}
+ 
+-		RevivalsUsed = checked(RevivalsUsed + 1);
++		RunTrainingRevivalState state = States.GetValue(
++			runState,
++			static _ => throw new InvalidOperationException("Training revival state was not configured."));
++		lock (state)
++		{
++			state.RevivalsUsed = snapshot.RevivalsUsed;
++			state.PlayerHpLost = snapshot.PlayerHpLost;
++		}
++	}
++
++	/// <summary>
++	/// Atomically consumes one hidden bailout for an ordinary player death.
++	/// The caller must first allow all native ShouldDie preventers to run and
++	/// must never call this for force-kill or non-positive-MaxHp deaths.
++	/// </summary>
++	public static bool TryConsumeRevival(IRunState runState, Creature creature)
++	{
++		ArgumentNullException.ThrowIfNull(runState);
++		ArgumentNullException.ThrowIfNull(creature);
++		if (!creature.IsPlayer
++			|| !ReferenceEquals(creature.Player.RunState, runState)
++			|| !States.TryGetValue(runState, out RunTrainingRevivalState? state))
++		{
++			return false;
++		}
++
++		lock (state)
++		{
++			if (!CanRevive(state))
++			{
++				return false;
++			}
++
++			state.RevivalsUsed = checked(state.RevivalsUsed + 1);
++			return true;
++		}
+ 	}
+ 
+ 	public static void RecordHpLoss(Creature creature, int amount)
+ 	{
+-		if (!IsEnabled || !creature.IsPlayer || amount <= 0)
++		if (!creature.IsPlayer || amount <= 0)
+ 		{
+ 			return;
+ 		}
+ 
+-		PlayerHpLost = checked(PlayerHpLost + amount);
++		IRunState runState = creature.Player.RunState;
++		if (!States.TryGetValue(runState, out RunTrainingRevivalState? state))
++		{
++			return;
++		}
++
++		lock (state)
++		{
++			state.PlayerHpLost = checked(state.PlayerHpLost + amount);
++		}
++	}
++
++	private static bool CanRevive(RunTrainingRevivalState state)
++	{
++		return state.RevivalBudget.HasValue
++			&& (state.RevivalBudget == -1 || state.RevivalsUsed < state.RevivalBudget);
++	}
++
++	private static void ValidateBudget(int? revivalBudget)
++	{
++		if (revivalBudget.HasValue && revivalBudget.Value < -1)
++		{
++			throw new InvalidOperationException(
++				"training_revival_budget must be null, -1, or a non-negative integer."
++			);
++		}
+ 	}
++
++	private static void ValidateSnapshot(TrainingRevivalSnapshot snapshot)
++	{
++		ValidateBudget(snapshot.RevivalBudget);
++		if (snapshot.RevivalsUsed < 0 || snapshot.PlayerHpLost < 0)
++		{
++			throw new InvalidOperationException("Training revival snapshot counters must be non-negative.");
++		}
++		if (!snapshot.RevivalBudget.HasValue
++			&& (snapshot.RevivalsUsed != 0 || snapshot.PlayerHpLost != 0))
++		{
++			throw new InvalidOperationException("A disabled training revival snapshot cannot contain counters.");
++		}
++		if (snapshot.RevivalBudget >= 0 && snapshot.RevivalsUsed > snapshot.RevivalBudget)
++		{
++			throw new InvalidOperationException("Training revival snapshot exceeds its configured budget.");
++		}
++	}
++}
++
++public sealed class TrainingRevivalSnapshot
++{
++	public int? RevivalBudget { get; set; }
++
++	public int RevivalsUsed { get; set; }
++
++	public int PlayerHpLost { get; set; }
+ }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalSelfTests.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalSelfTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..89f581b501d1aea1d899bb881d4d998d2f7460dc
+--- /dev/null
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalSelfTests.cs
+@@ -0,0 +1,185 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text.Json;
++using System.Threading.Tasks;
++using MegaCrit.Sts2.Core.Combat;
++using MegaCrit.Sts2.Core.Commands;
++using MegaCrit.Sts2.Core.Entities.Players;
++using MegaCrit.Sts2.Core.Models.Relics;
++using MegaCrit.Sts2.Core.Runs;
++
++namespace MegaCrit.Sts2.Core.Simulation;
++
++internal static class TrainingRevivalSelfTests
++{
++	private const string CharacterId = "IRONCLAD";
++
++	public static async Task RunAsync(FullRunTrainingEnvService service)
++	{
++		await OrdinaryLethalUsesHiddenBailoutAsync(service);
++		await ForceKillBypassesHiddenBailoutAsync(service);
++		await NonPositiveMaxHpBypassesHiddenBailoutAsync(service);
++		await NativeLizardTailPrecedesHiddenBailoutAsync(service);
++		await ResetAndSnapshotLifecycleIsRunScopedAsync(service);
++	}
++
++	private static async Task OrdinaryLethalUsesHiddenBailoutAsync(FullRunTrainingEnvService service)
++	{
++		FullRunSimulationStateSnapshot state = await ResetAsync(service, "CLEAN_REVIVAL_ORDINARY", budget: 1);
++		RunState runState = CurrentRun();
++		Player player = LocalPlayer(runState);
++		AssertNoInjectedRevivalEntity(runState, state);
++
++		int expectedHp = Math.Max(1, player.Creature.MaxHp / 2);
++		await CreatureCmd.Kill(player.Creature);
++		TrainingRevivalSnapshot training = TrainingRevivalController.Capture(runState);
++		Assert(!player.Creature.IsDead, "ordinary lethal damage must be recovered by the hidden bailout");
++		Assert(player.Creature.CurrentHp == expectedHp,
++			$"hidden bailout must heal 50% MaxHp (expected={expectedHp}, actual={player.Creature.CurrentHp})");
++		Assert(training.RevivalsUsed == 1, "ordinary lethal damage must consume exactly one hidden bailout");
++		Assert(training.PlayerHpLost > 0, "ordinary lethal damage must remain visible to HP-loss accounting");
++
++	}
++
++	private static async Task ForceKillBypassesHiddenBailoutAsync(FullRunTrainingEnvService service)
++	{
++		await ResetAsync(service, "CLEAN_REVIVAL_FORCE", budget: -1);
++		RunState runState = CurrentRun();
++		Player player = LocalPlayer(runState);
++		AttachMinimalCombat(runState, player);
++		await CreatureCmd.Kill(player.Creature, force: true);
++		Assert(player.Creature.IsDead, "force:true must remain an authoritative death");
++		Assert(TrainingRevivalController.Capture(runState).RevivalsUsed == 0,
++			"force:true must not consume or trigger the hidden bailout");
++	}
++
++	private static async Task NonPositiveMaxHpBypassesHiddenBailoutAsync(FullRunTrainingEnvService service)
++	{
++		await ResetAsync(service, "CLEAN_REVIVAL_MAX_HP", budget: -1);
++		RunState runState = CurrentRun();
++		Player player = LocalPlayer(runState);
++		AttachMinimalCombat(runState, player);
++		await CreatureCmd.SetMaxHp(player.Creature, 0m);
++		Assert(player.Creature.MaxHp == 0 && player.Creature.IsDead,
++			"MaxHp <= 0 must remain an authoritative death");
++		Assert(TrainingRevivalController.Capture(runState).RevivalsUsed == 0,
++			"MaxHp <= 0 must not consume or trigger the hidden bailout");
++	}
++
++	private static async Task NativeLizardTailPrecedesHiddenBailoutAsync(FullRunTrainingEnvService service)
++	{
++		await ResetAsync(
++			service,
++			"CLEAN_REVIVAL_NATIVE_FIRST",
++			budget: 1,
++			additionalRelics: new List<SimulationBuildRelicSpec>
++			{
++				new SimulationBuildRelicSpec { Id = "LIZARD_TAIL" }
++			});
++		RunState runState = CurrentRun();
++		Player player = LocalPlayer(runState);
++		LizardTail lizardTail = player.Relics.OfType<LizardTail>().Single();
++
++		await CreatureCmd.Kill(player.Creature);
++		Assert(!player.Creature.IsDead && lizardTail.IsUsedUp,
++			"the natural Lizard Tail must remain a one-shot native death preventer");
++		Assert(TrainingRevivalController.Capture(runState).RevivalsUsed == 0,
++			"the hidden bailout must not run before a native ShouldDie preventer");
++
++		await CreatureCmd.Kill(player.Creature);
++		Assert(!player.Creature.IsDead, "hidden bailout must recover the next ordinary death");
++		Assert(lizardTail.IsUsedUp, "hidden bailout must not rearm the natural Lizard Tail");
++		Assert(TrainingRevivalController.Capture(runState).RevivalsUsed == 1,
++			"hidden bailout must run only after the one-shot native preventer is exhausted");
++	}
++
++	private static async Task ResetAndSnapshotLifecycleIsRunScopedAsync(FullRunTrainingEnvService service)
++	{
++		await ResetAsync(service, "CLEAN_REVIVAL_SNAPSHOT", budget: 2);
++		RunState originalRun = CurrentRun();
++		Player originalPlayer = LocalPlayer(originalRun);
++		await CreatureCmd.Kill(originalPlayer.Creature);
++		Assert(TrainingRevivalController.Capture(originalRun).RevivalsUsed == 1,
++			"snapshot test setup must consume one bailout");
++		await CreatureCmd.Heal(originalPlayer.Creature, originalPlayer.Creature.MaxHp, playAnim: false);
++
++		string stateId = service.SaveState();
++		await CreatureCmd.Kill(originalPlayer.Creature);
++		Assert(TrainingRevivalController.Capture(originalRun).RevivalsUsed == 2,
++			"live run must advance independently after snapshot capture");
++
++		await service.LoadState(stateId);
++		RunState restoredRun = CurrentRun();
++		Assert(!ReferenceEquals(originalRun, restoredRun), "full snapshot restore must create a distinct RunState");
++		TrainingRevivalSnapshot restored = TrainingRevivalController.Capture(restoredRun);
++		Assert(restored.RevivalBudget == 2 && restored.RevivalsUsed == 1,
++			"full snapshot restore must recover the captured hidden bailout budget and counter");
++
++		await ResetAsync(service, "CLEAN_REVIVAL_RESET", budget: 2);
++		RunState resetRun = CurrentRun();
++		Assert(!ReferenceEquals(restoredRun, resetRun), "episode reset must create a distinct RunState");
++		TrainingRevivalSnapshot reset = TrainingRevivalController.Capture(resetRun);
++		Assert(reset.RevivalBudget == 2 && reset.RevivalsUsed == 0 && reset.PlayerHpLost == 0,
++			"episode reset must start isolated hidden bailout counters");
++	}
++
++	private static async Task<FullRunSimulationStateSnapshot> ResetAsync(
++		FullRunTrainingEnvService service,
++		string seed,
++		int budget,
++		List<SimulationBuildRelicSpec>? additionalRelics = null)
++	{
++		return await service.ResetAsync(new FullRunSimulationResetRequest
++		{
++			CharacterId = CharacterId,
++			Seed = seed,
++			Build = new SimulationBuildSpec
++			{
++				TrainingRevivalBudget = budget,
++				AdditionalRelics = additionalRelics
++			}
++		});
++	}
++
++	private static RunState CurrentRun()
++	{
++		return RunManager.Instance.DebugOnlyGetState()
++			?? throw new InvalidOperationException("Training revival self-test has no active RunState.");
++	}
++
++	private static Player LocalPlayer(RunState runState)
++	{
++		return runState.Players.Single();
++	}
++
++	private static void AttachMinimalCombat(RunState runState, Player player)
++	{
++		CombatState combatState = new(
++			runState: runState,
++			modifiers: runState.Modifiers,
++			multiplayerScalingModel: runState.MultiplayerScalingModel);
++		combatState.AddPlayer(player);
++	}
++
++	private static void AssertNoInjectedRevivalEntity(
++		RunState runState,
++		FullRunSimulationStateSnapshot state)
++	{
++		Player player = LocalPlayer(runState);
++		Assert(player.Relics.All(static relic => relic is not LizardTail),
++			"enabling hidden revival must not inject Lizard Tail into the player's relic inventory");
++		FullRunApiState apiState = FullRunApiStateBuilder.Build(runState, state);
++		string json = JsonSerializer.Serialize(apiState);
++		Assert(!json.Contains("LIZARD_TAIL", StringComparison.OrdinalIgnoreCase),
++			"enabling hidden revival must not expose an injected Lizard Tail in the API observation");
++	}
++
++	private static void Assert(bool condition, string message)
++	{
++		if (!condition)
++		{
++			throw new InvalidOperationException($"Training revival self-test failed: {message}");
++		}
++	}
++}
+diff --git a/src/Core/Commands/CreatureCmd.cs b/src/Core/Commands/CreatureCmd.cs
+index f407ddaf0965bbc2ab4f3d60c4135ad585bdb6ef..513c7ea6202bd8bb39f0f88e69180acbc13289cb 100644
+--- a/src/Core/Commands/CreatureCmd.cs
++++ b/src/Core/Commands/CreatureCmd.cs
+@@ -28,6 +28,7 @@ using MegaCrit.Sts2.Core.Rooms;
+ using MegaCrit.Sts2.Core.Runs;
+ using MegaCrit.Sts2.Core.Runs.History;
+ using MegaCrit.Sts2.Core.Saves;
++using MegaCrit.Sts2.Core.Simulation;
+ using MegaCrit.Sts2.Core.TestSupport;
+ using MegaCrit.Sts2.Core.ValueProps;
+ 
+@@ -354,7 +355,25 @@ public static class CreatureCmd
+ 		}
+ 		await Hook.BeforeDeath(runState, combatState, creature);
+ 		AbstractModel preventer = null;
+-		if (force || creature.MaxHp <= 0 || Hook.ShouldDie(runState, combatState, creature, out preventer))
++		bool bypassDeathPrevention = force || creature.MaxHp <= 0;
++		bool shouldDie = bypassDeathPrevention
++			|| Hook.ShouldDie(runState, combatState, creature, out preventer);
++		if (shouldDie
++			&& !bypassDeathPrevention
++			&& TrainingRevivalController.TryConsumeRevival(runState, creature))
++		{
++			// All native ShouldDie listeners already declined to prevent this death.
++			// The simulator-only bailout is deliberately last and has no model-facing
++			// relic, power, card, status, or candidate-action representation.
++			await Hook.AfterDeath(runState, combatState, creature, wasRemovalPrevented: true, 0f);
++			decimal healAmount = Math.Max(1m, (decimal)creature.MaxHp * 0.5m);
++			await Heal(creature, healAmount, playAnim: false);
++			if (creature.IsDead)
++			{
++				throw new InvalidOperationException("Training revival bailout did not restore positive HP.");
++			}
++		}
++		else if (shouldDie)
+ 		{
+ 			creature.InvokeDiedEvent();
+ 			bool shouldRemoveFromCombat = combatState != null && Hook.ShouldCreatureBeRemovedFromCombatAfterDeath(combatState, creature);
+diff --git a/src/Core/Models/Relics/LizardTail.cs b/src/Core/Models/Relics/LizardTail.cs
+index e4bdc175b4b40e61b6cb6efea555fad552ac9f36..dffe5c6af54ea0a15a2bed9f2ce139a583ce4214 100644
+--- a/src/Core/Models/Relics/LizardTail.cs
++++ b/src/Core/Models/Relics/LizardTail.cs
+@@ -6,7 +6,6 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Entities.Relics;
+ using MegaCrit.Sts2.Core.Localization.DynamicVars;
+ using MegaCrit.Sts2.Core.Saves.Runs;
+-using MegaCrit.Sts2.Core.Simulation;
+ 
+ namespace MegaCrit.Sts2.Core.Models.Relics;
+ 
+@@ -44,10 +43,6 @@ public sealed class LizardTail : RelicModel
+ 		{
+ 			return true;
+ 		}
+-		if (TrainingRevivalController.IsEnabled)
+-		{
+-			return !TrainingRevivalController.CanRevive;
+-		}
+ 		if (WasUsed)
+ 		{
+ 			return true;
+@@ -58,19 +53,8 @@ public sealed class LizardTail : RelicModel
+ 	public override async Task AfterPreventingDeath(Creature creature)
+ 	{
+ 		Flash();
+-		if (TrainingRevivalController.IsEnabled)
+-		{
+-			TrainingRevivalController.RecordRevival();
+-		}
+ 		WasUsed = true;
+ 		decimal amount = Math.Max(1m, (decimal)creature.MaxHp * (base.DynamicVars.Heal.BaseValue / 100m));
+ 		await CreatureCmd.Heal(creature, amount);
+-		if (TrainingRevivalController.CanRevive)
+-		{
+-			// Rearm only the simulator training copy. The death prevention,
+-			// relic flash and 50% native heal above remain the game's own path.
+-			WasUsed = false;
+-			base.Status = RelicStatus.Normal;
+-		}
+ 	}
+ }

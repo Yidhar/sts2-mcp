@@ -38,7 +38,7 @@ from .checkpointing import (
     save_training_checkpoint,
 )
 from .collector import EpisodeMetrics
-from .config import TrainingConfig
+from .config import TrainingConfig, engine_revival_identity
 from .evaluation_liveness import (
     evaluate_liveness_guard,
     summarize_greedy_liveness_journal,
@@ -485,7 +485,12 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         },
         "reward_objective": config.curriculum.reward_objective,
         "curriculum_mode": config.curriculum.mode,
-        "revival_relic_id": config.curriculum.revival_relic_id,
+        "revival_mechanism": config.curriculum.revival_mechanism,
+        "revival_contract": (
+            engine_revival_identity()
+            if config.curriculum.revival_mechanism is not None
+            else None
+        ),
         "revival_budget": config.curriculum.revival_budget,
     }
 

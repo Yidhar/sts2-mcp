@@ -890,7 +890,7 @@
         </div>
 
         <p id="heldout-scope-note" class="scope-note">
-          当前是无限原生复活预热。这里的 Act / 通关通过率不能当作标准零复活胜率。
+          当前是无限隐藏引擎续命预热。这里的 Act / 通关通过率不能当作标准零复活胜率。
         </p>
 
         <div class="metric-group">
@@ -1400,9 +1400,9 @@
         const note = element("heldout-scope-note");
 
         if (budget === -1) {
-          badge.textContent = "无限原生复活预热 · 非标准胜率";
+          badge.textContent = "无限隐藏引擎续命预热 · 非标准胜率";
           note.textContent =
-            "当前是无限原生复活预热（revival_budget = -1）。通过覆盖用于验证完整流程与策略成长，不能当作标准零复活胜率。";
+            "当前是无限隐藏引擎续命预热（revival_budget = -1）。通过覆盖用于验证完整流程与策略成长，不能当作标准零复活胜率。";
         } else if (standard) {
           badge.textContent = context.label || "标准游戏评估";
           note.textContent = "当前上下文标记为标准游戏；成功率仍应结合固定种子样本数与复活统计解释。";

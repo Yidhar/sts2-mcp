@@ -273,7 +273,7 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
         "mode": "native-revival-preheat",
         "revival_budget": -1,
         "standard_game": False,
-        "label": "无限原生复活预热 · 非标准胜率",
+        "label": "无限隐藏引擎续命预热 · 非标准胜率",
     }
 
 

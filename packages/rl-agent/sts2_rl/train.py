@@ -20,7 +20,11 @@ from sts2_rl.simulator_identity import (
     verify_headless_simulator,
     write_preflight_audit,
 )
-from sts2_rl.training.config import TrainingConfig, load_training_config
+from sts2_rl.training.config import (
+    TrainingConfig,
+    engine_revival_identity,
+    load_training_config,
+)
 from sts2_rl.training.runtime import inspect_baseline, run_training
 
 
@@ -111,6 +115,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--sim-identity is only valid for the headless backend")
     runtime_provenance: dict[str, object] = {
         "backend": config.environment.backend,
+        "training_revival": (
+            engine_revival_identity()
+            if config.curriculum.revival_mechanism is not None
+            else None
+        ),
     }
     if config.environment.backend == "headless":
         try:
@@ -148,6 +157,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         runtime_provenance = {
             "backend": "headless",
+            "training_revival": (
+                engine_revival_identity()
+                if config.curriculum.revival_mechanism is not None
+                else None
+            ),
             "simulator_identity": simulator.to_mapping(),
             "simulator_identity_audit_path": str(audit_path),
             "runtime_mechanics": mechanics_summary,

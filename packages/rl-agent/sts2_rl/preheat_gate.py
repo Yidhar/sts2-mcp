@@ -1,15 +1,15 @@
-"""Fail-closed random-policy gate for native-revival full-run preheat.
+"""Fail-closed random-policy gate for engine-bailout full-run preheat.
 
 The gate proves two independent properties before the learner is allowed to
 start:
 
-* one combat can consume the game's native Lizard Tail path more than once
-  without resetting the enemy state; and
+* one combat can consume the private engine bailout more than once without
+  injecting a game entity or resetting the enemy state; and
 * a random legal policy can actually reach typed combat victories in a
   configured smoke encounter under unlimited revival; and
 * an unlimited-revival full-run probe can traverse combat, route, and build
   decisions past Act 1 while the exact counters remain monotonic; and
-* a separate bounded-revival full-run probe exhausts the native budget and
+* a separate bounded-revival full-run probe exhausts the engine budget and
   reaches a typed game-over boundary.
 
 This is an environment/protocol acceptance gate, not a learning benchmark.
@@ -39,7 +39,7 @@ from sts2_rl.contracts import (
     StepRequest,
 )
 
-GATE_VERSION = "sts2-native-revival-full-run-gate-v5-selection-semantics"
+GATE_VERSION = "sts2-engine-bailout-full-run-gate-v6-selection-semantics"
 DEFAULT_ENCOUNTER = "FUZZY_WURM_CRAWLER_WEAK"
 DEFAULT_STRESS_ENCOUNTER = "TUNNELER_WEAK"
 
@@ -173,7 +173,7 @@ def validate_counter_transition(
     before_hp_lost = _training_counter(before, "player_hp_lost")
     after_hp_lost = _training_counter(after, "player_hp_lost")
     if after_revivals < before_revivals or after_hp_lost < before_hp_lost:
-        raise RuntimeError("native-revival training counters are not monotonic")
+        raise RuntimeError("engine-bailout training counters are not monotonic")
 
     revival_delta = int(after_revivals - before_revivals)
     hp_lost_delta = after_hp_lost - before_hp_lost
@@ -210,13 +210,12 @@ def _reset(
             encounter_id=encounter_id,
             seed=seed,
             current_hp=current_hp,
-            additional_relics=("RELIC.LIZARD_TAIL",),
             training_revival_budget=-1,
         )
     )
     training = result.observation.get("_training")
     if not isinstance(training, dict) or training.get("revival_budget") != -1:
-        raise RuntimeError("combat reset did not activate unlimited native revival")
+        raise RuntimeError("combat reset did not activate unlimited engine bailout")
     if _training_counter(result, "revivals_used") != 0.0:
         raise RuntimeError("revival counter did not reset at episode start")
     if _training_counter(result, "player_hp_lost") != 0.0:
@@ -269,28 +268,18 @@ def _reset_full_run(
             character="IRONCLAD",
             seed=seed,
             force_fresh=True,
-            additional_relics=("RELIC.LIZARD_TAIL",),
             training_revival_budget=revival_budget,
         )
     )
     training = result.observation.get("_training")
     if not isinstance(training, dict) or training.get("revival_budget") != revival_budget:
         raise RuntimeError(
-            "full-run reset did not activate the requested native revival budget"
+            "full-run reset did not activate the requested engine bailout budget"
         )
     if _training_counter(result, "revivals_used") != 0.0:
         raise RuntimeError("full-run revival counter did not reset at episode start")
     if _training_counter(result, "player_hp_lost") != 0.0:
         raise RuntimeError("full-run HP-loss counter did not reset at episode start")
-    player = result.observation.get("player")
-    relics = player.get("relics") if isinstance(player, dict) else None
-    relic_ids = {
-        str(relic.get("id") or "").upper()
-        for relic in relics or []
-        if isinstance(relic, dict)
-    }
-    if "RELIC.LIZARD_TAIL" not in relic_ids:
-        raise RuntimeError("full-run reset did not inject the native Lizard Tail")
     return result
 
 
@@ -379,7 +368,7 @@ def _prove_repeated_native_revival(
         if result.terminated:
             break
     raise RuntimeError(
-        "failed to observe more than one native revival in a single combat"
+        "failed to observe more than one engine bailout in a single combat"
     )
 
 
@@ -489,7 +478,7 @@ def run_gate(
             )
         if episode.revivals_used <= 0:
             raise RuntimeError(
-                f"full-run seed={episode.seed} did not exercise native revival"
+                f"full-run seed={episode.seed} did not exercise engine bailout"
             )
     for episode in terminal_runs:
         if not episode.terminated:

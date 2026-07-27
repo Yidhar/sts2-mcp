@@ -143,7 +143,7 @@ class TransactionStep:
     return_steps: int | None
     # ``node_key`` remains the exact reward/Q identity.  Liveness policy
     # credit sometimes needs a deliberately coarser identity: for example an
-    # event page can repeat while HP, max HP and native-revival telemetry keep
+    # event page can repeat while HP, max HP and training-revival telemetry keep
     # changing.  Keeping the two keys separate prevents policy-cycle matching
     # from accidentally merging reward-distinct Q states.  ``None`` preserves
     # the exact key for ordinary and card-selection transactions.

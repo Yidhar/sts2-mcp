@@ -71,7 +71,7 @@ A training `run_won` is a sampled experience, not a generalization result.
 Held-out rates always show their numerator and denominator.
 
 When `curriculum.mode=native-revival-preheat` and `revival_budget=-1`, the page
-shows an **unlimited native-revival preheat** badge. Its Act/run coverage is not
+shows an **unlimited hidden-engine-bailout preheat** badge. Its Act/run coverage is not
 a standard zero-revival win rate. The panel therefore reports all-episode
 revival/HP cost separately from the conditional Act 1 boundary cost and the
 zero/at-most-one-revival metrics.

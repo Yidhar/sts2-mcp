@@ -211,7 +211,6 @@ def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
     assert identity["version"] == "sts2-run-survival-efficiency-v4"
     calculator = RevivalEfficiencyRewardCalculator(
-        revival_relic_id="RELIC.LIZARD_TAIL",
         maximum_episode_steps=512,
     )
     before = _result(step=0)
@@ -238,7 +237,6 @@ def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
 
 def test_healing_does_not_erase_exact_hp_loss_cost() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
-        revival_relic_id="RELIC.LIZARD_TAIL",
         maximum_episode_steps=512,
     )
     reward = calculator.evaluate(
@@ -256,7 +254,6 @@ def test_healing_does_not_erase_exact_hp_loss_cost() -> None:
 
 def test_full_run_preheat_combines_forward_progress_with_run_scoped_costs() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
-        revival_relic_id="RELIC.LIZARD_TAIL",
         objective="run",
         maximum_episode_steps=10_000,
     )
@@ -286,7 +283,6 @@ def test_full_run_preheat_combines_forward_progress_with_run_scoped_costs() -> N
 
 def test_full_run_preheat_progresses_past_act1_instead_of_terminating() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
-        revival_relic_id="RELIC.LIZARD_TAIL",
         objective="run",
         maximum_episode_steps=10_000,
     )
@@ -301,7 +297,6 @@ def test_full_run_preheat_progresses_past_act1_instead_of_terminating() -> None:
 
 def test_survival_preheat_still_makes_every_win_better_than_every_loss() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
-        revival_relic_id="RELIC.LIZARD_TAIL",
         maximum_episode_steps=512,
     )
     costly_victory = calculator.evaluate(
@@ -327,7 +322,6 @@ def test_survival_preheat_still_makes_every_win_better_than_every_loss() -> None
 def test_preheat_requires_undiscounted_efficiency_telescoping() -> None:
     with pytest.raises(ValueError, match="undiscounted"):
         RevivalEfficiencyRewardCalculator(
-            revival_relic_id="RELIC.LIZARD_TAIL",
             maximum_episode_steps=512,
             discount=0.997,
         )

@@ -194,7 +194,7 @@ Monitor persistent runs from a loopback-only, read-only local dashboard:
 ```
 
 The page keeps online training samples separate from fixed-seed held-out
-evaluation and explicitly labels unlimited native-revival preheat as a
+evaluation and explicitly labels unlimited hidden-engine-bailout preheat as a
 non-standard win context. See the
 [training dashboard runbook](./docs/runbooks/training-dashboard.md).
 

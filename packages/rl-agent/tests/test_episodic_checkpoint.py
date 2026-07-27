@@ -479,6 +479,8 @@ def test_transaction_replay_restore_reowns_and_freezes_legacy_snapshot_arrays(
     (
         ("trace_version", "unsupported transaction trace version"),
         ("step_return", "observed transaction return requires positive return_steps"),
+        ("policy_node_only", "must be both present or both absent"),
+        ("policy_action_only", "must be both present or both absent"),
         ("fingerprint", "fingerprint differs"),
         ("config", "config differs"),
         ("candidate_shape", "action mask length"),
@@ -516,6 +518,14 @@ def test_hash_consistent_transaction_replay_corruption_fails_before_live_mutatio
         object.__setattr__(trace, "version", "corrupt-transaction-trace")
     elif corruption == "step_return":
         object.__setattr__(step, "return_steps", None)
+    elif corruption == "policy_node_only":
+        object.__setattr__(step, "policy_node_key", "coarse-policy-node")
+    elif corruption == "policy_action_only":
+        object.__setattr__(
+            step,
+            "policy_action_fingerprint",
+            "coarse-policy-action",
+        )
     elif corruption == "fingerprint":
         object.__setattr__(snapshot, "encoding_fingerprint", "0" * 64)
     elif corruption == "config":

@@ -25,6 +25,7 @@ from sts2_rl.contracts import (
 )
 from sts2_rl.encoding import grounding_encoding_identity
 from sts2_rl.training import (
+    ENGINE_REVIVAL_MECHANISM,
     CurriculumConfig,
     DiagnosticsConfig,
     EnvironmentConfig,
@@ -1321,7 +1322,7 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         curriculum=CurriculumConfig(
             mode="native-revival-preheat",
             reward_objective="combat",
-            revival_relic_id="RELIC.LIZARD_TAIL",
+            revival_mechanism=ENGINE_REVIVAL_MECHANISM,
             revival_budget=-1,
             epsilon_start=0.2,
             epsilon_end=0.1,
@@ -1333,6 +1334,8 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         backend=FakeCombatBackend(terminal_step=10),
     )
     try:
+        assert resources.collector.additional_relics == ()
+        assert resources.collector.training_revival_budget == -1
         episode = resources.collector.collect_episode(
             record=True,
             maximum_steps=1,
@@ -1345,6 +1348,10 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         assert episode.unrolls[0].bootstrap_snapshot is not None
     finally:
         resources.close()
+
+    report = inspect_baseline(config)
+    assert report["revival_mechanism"] == ENGINE_REVIVAL_MECHANISM
+    assert report["revival_contract"]["model_visible_game_entity"] is None
 
 
 @pytest.mark.parametrize(

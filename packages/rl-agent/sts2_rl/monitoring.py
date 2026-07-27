@@ -1760,7 +1760,7 @@ class DashboardStore:
                     "revival_budget": revival_budget,
                     "standard_game": standard_game,
                     "label": (
-                        "无限原生复活预热 · 非标准胜率"
+                        "无限隐藏引擎续命预热 · 非标准胜率"
                         if unlimited_revival
                         else "标准游戏评估"
                         if standard_game

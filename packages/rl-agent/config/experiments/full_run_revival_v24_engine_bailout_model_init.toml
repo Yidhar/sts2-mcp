@@ -1,0 +1,39 @@
+# Fresh v24 lineage initialized from the last complete v23 network checkpoint.
+#
+# This is intentionally *not* an exact resume.  The former curriculum exposed
+# its continuation through an injected Lizard Tail.  v24 replaces that visible
+# game entity with a run-scoped, simulator-owned engine bailout.  The model
+# parameters are imported with ``--initialize-from``; optimizer, replay, RNGs,
+# counters, policy version and evaluation state all restart under config v10.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[rollout]
+# Preserve recurring training-only deterministic probes so factual event and
+# selection failures continue to enter replay without using held-out episodes.
+deterministic_probe_interval_episodes = 16
+
+[runtime]
+total_environment_steps = 250000
+seed = 1000000
+log_dir = "runs/full-run-revival-v24-engine-bailout-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v24-engine-bailout-model-init"
+checkpoint_interval_steps = 10000
+
+evaluation_steps = [0, 50000, 100000, 150000, 200000, 240000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000, 30000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 20
+
+evaluation_liveness_guard_enabled = true

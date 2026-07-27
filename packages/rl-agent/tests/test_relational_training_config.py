@@ -7,6 +7,7 @@ import pytest
 
 from sts2_rl.training import (
     CONFIG_VERSION,
+    ENGINE_REVIVAL_MECHANISM,
     CurriculumConfig,
     DiagnosticsConfig,
     ModelConfig,
@@ -14,6 +15,7 @@ from sts2_rl.training import (
     RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
+    engine_revival_identity,
     load_training_config,
     training_config_from_mapping,
 )
@@ -24,12 +26,12 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v9"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v10"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
     assert preheat.curriculum.mode == "native-revival-preheat"
-    assert preheat.curriculum.revival_relic_id == "RELIC.LIZARD_TAIL"
+    assert preheat.curriculum.revival_mechanism == ENGINE_REVIVAL_MECHANISM
     assert preheat.curriculum.revival_budget == -1
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
@@ -258,12 +260,12 @@ def test_environment_and_task_horizons_must_match() -> None:
 
 
 def test_native_revival_preheat_supports_a_headless_full_run_curriculum() -> None:
-    with pytest.raises(ValueError, match="requires revival_relic_id"):
+    with pytest.raises(ValueError, match="requires revival_mechanism"):
         CurriculumConfig(mode="native-revival-preheat", reward_objective="combat")
     curriculum = CurriculumConfig(
         mode="native-revival-preheat",
         reward_objective="combat",
-        revival_relic_id="RELIC.LIZARD_TAIL",
+        revival_mechanism=ENGINE_REVIVAL_MECHANISM,
         revival_budget=-1,
     )
     combat = TrainingConfig(
@@ -274,6 +276,27 @@ def test_native_revival_preheat_supports_a_headless_full_run_curriculum() -> Non
     assert combat.environment.scenario == "combat"
     full_run = load_training_config(profile="preheat")
     assert full_run.environment.scenario == "full-run"
+
+
+def test_engine_revival_identity_is_explicit_and_fail_closed() -> None:
+    identity = engine_revival_identity()
+    assert identity["version"] == ENGINE_REVIVAL_MECHANISM
+    assert identity["model_visible_game_entity"] is None
+    assert identity["forced_kill_policy"] == "not intercepted"
+    assert identity["native_death_prevention_order"] == (
+        "native hooks before training bailout"
+    )
+    assert len(identity["fingerprint_sha256"]) == 64
+
+    with pytest.raises(ValueError, match="engine revival mechanism"):
+        CurriculumConfig(revival_mechanism=ENGINE_REVIVAL_MECHANISM)
+    with pytest.raises(ValueError, match="engine-bailout-v1"):
+        CurriculumConfig(
+            mode="native-revival-preheat",
+            reward_objective="combat",
+            revival_mechanism="visible-relic-v0",  # type: ignore[arg-type]
+            revival_budget=-1,
+        )
 
 
 def test_preheat_and_standard_discount_contracts_fail_closed() -> None:

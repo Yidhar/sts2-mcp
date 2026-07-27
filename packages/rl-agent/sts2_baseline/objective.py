@@ -1,9 +1,9 @@
 """Auditable outcome, survival-efficiency, and run-distance rewards.
 
 The v3 objective deliberately contains no reward for damage dealt, enemy HP
-change, cards played, or any hand-written action preference.  Native-revival
+change, cards played, or any hand-written action preference.  Engine-bailout
 preheat runs on either a combat or full-run horizon and learns from the task
-outcome, monotonic run progress, exact player-HP loss, and exact native-revival
+outcome, monotonic run progress, exact player-HP loss, and exact training-revival
 counters. Simulator-only counters remain underscore-prefixed observation facts
 and are never model features.
 """
@@ -43,13 +43,13 @@ TASK_REWARD_SPEC: Final = TaskRewardSpec()
 
 @dataclass(frozen=True, slots=True)
 class RevivalEfficiencyRewardSpec:
-    """Bounded, undiscounted native-revival preference.
+    """Bounded, undiscounted training-revival preference.
 
     Each efficiency term is a delta of a monotonic bounded score.  Across a
     complete episode their combined magnitude is strictly below 1.0, so
     every victory remains better than every failure.  Within the same outcome,
     the weighted survival objective jointly prefers less cumulative HP loss,
-    fewer native revivals, and fewer decisions; it does not reward damage.
+    fewer training revivals, and fewer decisions; it does not reward damage.
     """
 
     version: str = field(default="sts2-run-survival-efficiency-v4", init=False)
@@ -265,20 +265,16 @@ class RevivalEfficiencyRewardCalculator:
     def __init__(
         self,
         *,
-        revival_relic_id: str,
         maximum_episode_steps: int,
         objective: TaskObjective = "combat",
         discount: float = 1.0,
     ) -> None:
-        if not isinstance(revival_relic_id, str) or not revival_relic_id.strip():
-            raise TypeError("revival_relic_id must be non-empty text")
         if objective not in {"combat", "act1", "run"}:
             raise ValueError("objective must be combat, act1, or run")
         if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
             raise ValueError("maximum_episode_steps must be a positive integer")
         if float(discount) != REVIVAL_EFFICIENCY_REWARD_SPEC.required_discount:
             raise ValueError("survival preheat requires an undiscounted return (discount=1)")
-        self.revival_relic_id = revival_relic_id.strip().upper()
         self.maximum_episode_steps = int(maximum_episode_steps)
         self.base = TaskRewardCalculator(objective, discount=discount)
 

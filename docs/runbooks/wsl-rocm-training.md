@@ -122,7 +122,7 @@ bash scripts/train_preheat_wsl_rocm.sh \
   --initialize-from "<V18_POLICY_3936_CHECKPOINT>"
 ```
 
-The launcher refuses CPU fallback and runs the complete native-revival game
+The launcher refuses CPU fallback and runs the complete hidden-engine-bailout game
 flow. `--initialize-from` imports only compatible network parameters. The v19
 optimizer, FIFO queue, transaction/complete-episode replay, RNGs, counters and
 policy versions start fresh at step zero. Do not replace it with `--resume`:

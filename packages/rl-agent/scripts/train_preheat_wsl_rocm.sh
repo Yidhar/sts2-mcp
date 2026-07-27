@@ -65,7 +65,7 @@ echo "[preheat-rocm] STS2_ARTIFACT_ROOT=$STS2_ARTIFACT_ROOT"
 echo "[preheat-rocm] STS2_HEADLESS_SIM_EXE=$SIM_EXE"
 
 cd "$REPO_ROOT"
-echo "[preheat-rocm] starting direct native-revival full run (no combat/Act gate)"
+echo "[preheat-rocm] starting direct hidden-engine-bailout full run (no combat/Act gate)"
 exec python -m sts2_rl.train \
   --profile preheat \
   --device cuda \

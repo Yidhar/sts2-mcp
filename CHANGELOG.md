@@ -37,8 +37,19 @@ historical RL artifacts.
   liveness-only policy node/action identities are now separate; v2 transaction
   replay is intentionally rejected and may only seed a new lineage through
   model-parameter initialization.
+- Advanced the curriculum config to v10 and replaced the model-visible,
+  re-armed Lizard Tail preheat implementation with `engine-bailout-v1`.
+  Existing v9 runs are not exact-resume compatible; learned network parameters
+  may be imported only through an explicit fresh-lineage model initialization.
 
 ### Added
+
+- Added a run-scoped, snapshot-preserved HeadlessSim training bailout that runs
+  only after native death preventers decline, restores 50% maximum HP, and
+  never creates a relic, power, card, status or action candidate. Forced kills
+  and non-positive-MaxHP deaths remain authoritative. A dedicated
+  `--training-revival-self-test` covers visibility, budgets, native Lizard Tail
+  ordering, force/MaxHP bypass, reset isolation and save/load restoration.
 
 - Added a loopback-only, read-only training dashboard with incremental JSONL
   telemetry, exact-resume chain aggregation, held-out/training separation,

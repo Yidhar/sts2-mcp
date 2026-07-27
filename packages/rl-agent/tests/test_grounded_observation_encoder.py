@@ -124,13 +124,18 @@ def test_encoder_contract_runs_through_grounded_model() -> None:
     assert encoded.action(0).handle == "opaque:one"
 
 
-def test_candidate_containers_and_retired_features_cannot_pollute_world() -> None:
+def test_candidate_containers_retired_and_private_training_features_cannot_pollute_world() -> None:
     encoder = _encoder()
     before = _observation()
     after = _observation()
     after["available_actions"] = [{"kind": "different", "quality": -12345}]
     after["boss_mechanics"] = {"forced_line": -999.0}
     after["_sim_raw"] = {"secret": "different"}
+    after["_training"] = {
+        "revival_budget": -1,
+        "revivals_used": 999_999,
+        "player_hp_lost": 999_999,
+    }
     after["action_quality"] = 999999.0
     after["state_version"] = 888
     after["card_effect_profile"] = {"damage_score": 1234.0}

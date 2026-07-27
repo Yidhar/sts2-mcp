@@ -46,6 +46,10 @@
     {
       "path": "third_party/patches/sts2-ai/0008-guard-unowned-shop-potion-context.patch",
       "sha256": "a7d8eedece05e91f38e0c841e43bd8ada4c8cbc327d4a580655e64331c6a4aa0"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0009-clean-hidden-training-revival.patch",
+      "sha256": "722c11906b9996b52af7f6ee94e7f840578eff47f40164d3a5f01f7ae1ceeab9"
     }
   ]
 }

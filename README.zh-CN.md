@@ -179,7 +179,7 @@ python -m sts2_rl.train --profile default --sim-exe <PINNED_HEADLESS_SIM_RELEASE
 .\scripts\start_training_dashboard.ps1
 ```
 
-面板严格分开展示在线训练样本和固定种子 held-out 评估，并把无限原生复活预热
+面板严格分开展示在线训练样本和固定种子 held-out 评估，并把无限隐藏引擎续命预热
 明确标为非标准胜率上下文。详见
 [训练监控面板 runbook](./docs/runbooks/training-dashboard.md)。
 

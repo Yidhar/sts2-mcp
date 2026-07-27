@@ -17,9 +17,34 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v9"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v10"
+ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
+
+
+def engine_revival_identity() -> dict[str, Any]:
+    """Return the immutable contract for privileged engine revival."""
+
+    payload: dict[str, Any] = {
+        "version": ENGINE_REVIVAL_MECHANISM,
+        "activation": "reset.training_revival_budget",
+        "scope": "engine-owned run state",
+        "model_visible_game_entity": None,
+        "native_death_prevention_order": "native hooks before training bailout",
+        "forced_kill_policy": "not intercepted",
+        "nonpositive_max_hp_policy": "not intercepted",
+        "telemetry": (
+            "observation._training.revival_budget+revivals_used+player_hp_lost"
+        ),
+        "model_input_policy": "underscore training telemetry excluded",
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["fingerprint"] = serialized
+    payload["fingerprint_sha256"] = hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _require_int(value: object, *, label: str, minimum: int | None = None) -> int:
@@ -520,7 +545,7 @@ class CurriculumConfig:
 
     mode: Literal["standard", "native-revival-preheat"] = "standard"
     reward_objective: Literal["combat", "act1", "run"] = "run"
-    revival_relic_id: str | None = None
+    revival_mechanism: Literal["engine-bailout-v1"] | None = None
     revival_budget: int | None = None
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
@@ -532,17 +557,24 @@ class CurriculumConfig:
         if self.reward_objective not in {"combat", "act1", "run"}:
             raise ValueError("reward_objective must be combat, act1, or run")
         _require_optional_text(
-            self.revival_relic_id,
-            label="curriculum.revival_relic_id",
+            self.revival_mechanism,
+            label="curriculum.revival_mechanism",
         )
-        if self.mode == "standard" and self.revival_relic_id is not None:
-            raise ValueError("standard curriculum cannot inject a revival relic")
+        if self.revival_mechanism not in {None, ENGINE_REVIVAL_MECHANISM}:
+            raise ValueError(
+                "curriculum.revival_mechanism must be "
+                f"{ENGINE_REVIVAL_MECHANISM!r} or null"
+            )
+        if self.mode == "standard" and self.revival_mechanism is not None:
+            raise ValueError(
+                "standard curriculum cannot enable an engine revival mechanism"
+            )
         if self.mode == "standard" and self.revival_budget is not None:
             raise ValueError("standard curriculum cannot set a revival budget")
-        if self.mode == "native-revival-preheat" and self.revival_relic_id is None:
-            raise ValueError("native revival preheat requires revival_relic_id")
+        if self.mode == "native-revival-preheat" and self.revival_mechanism is None:
+            raise ValueError("engine-bailout preheat requires revival_mechanism")
         if self.mode == "native-revival-preheat" and self.revival_budget is None:
-            raise ValueError("native revival preheat requires revival_budget")
+            raise ValueError("engine-bailout preheat requires revival_budget")
         if self.revival_budget is not None:
             _require_int(
                 self.revival_budget,
@@ -709,7 +741,7 @@ class DiagnosticsConfig:
     deadlock_window: int = 128
     deadlock_repeat_threshold: int = 8
     combat_net_progress_window: int = 256
-    # A native-revival curriculum can keep a strategically lost combat alive
+    # An engine-bailout curriculum can keep a strategically lost combat alive
     # long enough for encounter mechanics to make one simulator step
     # pathologically expensive. These maps shorten the same generic net-HP
     # liveness rule at a known room/encounter locus; they do not add a
@@ -843,7 +875,7 @@ class TrainingConfig:
             )
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
-                raise ValueError("native revival preheat requires the headless backend")
+                raise ValueError("engine-bailout preheat requires the headless backend")
         expected_discount = 1.0 if self.curriculum.mode == "native-revival-preheat" else TASK_REWARD_SPEC.discount
         if self.optimization.discount != expected_discount:
             raise ValueError(
@@ -1035,6 +1067,7 @@ def replace_runtime(config: TrainingConfig, **changes: Any) -> TrainingConfig:
 
 __all__ = [
     "CONFIG_VERSION",
+    "ENGINE_REVIVAL_MECHANISM",
     "PROFILE_DIR",
     "CurriculumConfig",
     "DiagnosticsConfig",
@@ -1046,6 +1079,7 @@ __all__ = [
     "RuntimeConfig",
     "TrainingConfig",
     "TransactionLearningConfig",
+    "engine_revival_identity",
     "load_training_config",
     "replace_runtime",
     "training_config_from_mapping",

@@ -178,16 +178,13 @@ def build_training_resources(
         lr=config.optimization.learning_rate,
         weight_decay=config.optimization.weight_decay,
     )
-    revival_relic_id = config.curriculum.revival_relic_id
     reward_calculator = (
         RevivalEfficiencyRewardCalculator(
-            revival_relic_id=revival_relic_id,
             objective=config.curriculum.reward_objective,
             discount=config.optimization.discount,
             maximum_episode_steps=config.environment.max_episode_steps,
         )
         if config.curriculum.mode == "native-revival-preheat"
-        and revival_relic_id is not None
         else None
     )
     owns_backend = backend is None
@@ -224,13 +221,10 @@ def build_training_resources(
             ),
             journal_policy_topk=config.diagnostics.journal_policy_topk,
             reward_calculator=reward_calculator,
-            additional_relics=(
-                (revival_relic_id,)
-                if config.curriculum.mode == "native-revival-preheat"
-                and revival_relic_id is not None
-                else ()
-            ),
-            revival_relic_id=revival_relic_id,
+            # The maintained preheat uses private engine state and injects no
+            # model-visible relic. GroundedCollector retains generic
+            # ``additional_relics`` support for explicit scenario fixtures.
+            additional_relics=(),
             training_revival_budget=config.curriculum.revival_budget,
             horizon_as_failure=config.curriculum.mode == "native-revival-preheat",
             transaction_burn_in_steps=(

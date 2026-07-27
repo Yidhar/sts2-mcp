@@ -117,7 +117,7 @@ class EpisodeMetrics:
     combat_policy_failed: bool = False
     # Generic confirmed policy-liveness failures include exact semantic cycles
     # and recurrent non-combat event-page actions.  They are authoritative task
-    # losses even when native revival keeps the simulator run alive.
+    # losses even when the engine bailout keeps the simulator run alive.
     trusted_policy_failure: bool = False
     noncombat_event_cycle: bool = False
     selection_action_cycle: bool = False
@@ -964,7 +964,7 @@ def _episodic_combat_boundary(
 ) -> BoundaryOutcome:
     """Classify a factual combat horizon without treating revival as exit.
 
-    Native revival keeps ``combat.in_progress`` true.  That observable state
+    Engine bailout keeps ``combat.in_progress`` true.  That observable state
     has priority over any incidental result string and therefore never closes
     a combat horizon.  In a full run the bridge normally emits
     ``combat_result=victory`` on a true -> false transition.  The explicit
@@ -1480,7 +1480,7 @@ def _noncombat_durable_projections(
     """Split forward run locus from same-locus persistent resources.
 
     This deliberately excludes event/card/relic ``dynamic_vars``, descriptions,
-    pages, screens, selection membership, HP/max-HP vitality, native-revival
+    pages, screens, selection membership, HP/max-HP vitality, training-revival
     telemetry, damage/heal previews, counters and legal-option text.  Those
     values are costs or reversible state and may change forever without moving
     the run.  The positive allowlist keeps the detector generic across events
@@ -1661,7 +1661,7 @@ def _noncombat_event_page_projection(
     Event pages are *not* durable progress: a finite page cycle must not reset
     the room-level clock.  They are nevertheless useful factual cycle nodes.
     This projection intentionally excludes HP, max HP, previews, dynamic vars,
-    option text, damage counters and native-revival telemetry.
+    option text, damage counters and training-revival telemetry.
     """
 
     raw_event = observation.get("event")
@@ -2346,7 +2346,6 @@ class GroundedCollector:
         journal_policy_topk: int = 5,
         reward_calculator: RewardCalculator | None = None,
         additional_relics: tuple[str, ...] = (),
-        revival_relic_id: str | None = None,
         training_revival_budget: int | None = None,
         horizon_as_failure: bool = False,
         transaction_burn_in_steps: int | None = None,
@@ -2431,20 +2430,16 @@ class GroundedCollector:
         self.deadlock_repeat_threshold = deadlock_repeat_threshold
         self.combat_min_net_hp_fraction = float(combat_min_net_hp_fraction)
         self.additional_relics = tuple(str(item) for item in additional_relics)
-        self.revival_relic_id = (
-            revival_relic_id.strip().upper() if isinstance(revival_relic_id, str) and revival_relic_id.strip() else None
-        )
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
         self.transaction_burn_in_steps = transaction_burn_in_steps
         self.episodic_learning_enabled = episodic_learning_enabled
-        if self.revival_relic_id is not None and self.revival_relic_id not in {
-            item.upper() for item in self.additional_relics
-        }:
-            raise ValueError("revival_relic_id must be one of the injected additional relics")
         if self.training_revival_budget is not None:
-            if self.revival_relic_id is None:
-                raise ValueError("training_revival_budget requires an injected revival relic")
+            if (
+                isinstance(self.training_revival_budget, bool)
+                or not isinstance(self.training_revival_budget, int)
+            ):
+                raise TypeError("training_revival_budget must be an integer or null")
             if self.training_revival_budget < -1:
                 raise ValueError("training_revival_budget must be -1 or non-negative")
         self._rng = np.random.default_rng(int(seed))

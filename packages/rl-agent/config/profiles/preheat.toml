@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v9"
+version = "sts2-relational-curriculum-config-v10"
 profile = "preheat"
 
 [model]
@@ -100,7 +100,7 @@ max_episode_steps = 30000
 [curriculum]
 mode = "native-revival-preheat"
 reward_objective = "run"
-revival_relic_id = "RELIC.LIZARD_TAIL"
+revival_mechanism = "engine-bailout-v1"
 revival_budget = -1
 epsilon_start = 0.70
 epsilon_end = 0.10

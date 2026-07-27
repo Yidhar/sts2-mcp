@@ -21,6 +21,7 @@ from .collector import (
 )
 from .config import (
     CONFIG_VERSION,
+    ENGINE_REVIVAL_MECHANISM,
     CurriculumConfig,
     DiagnosticsConfig,
     EnvironmentConfig,
@@ -31,6 +32,7 @@ from .config import (
     RuntimeConfig,
     TrainingConfig,
     TransactionLearningConfig,
+    engine_revival_identity,
     load_training_config,
     training_config_from_mapping,
 )
@@ -76,6 +78,7 @@ from .transaction import (
 
 __all__ = [
     "CONFIG_VERSION",
+    "ENGINE_REVIVAL_MECHANISM",
     "ActorLearnerPipeline",
     "ActorSupervisorState",
     "BoundaryOutcome",
@@ -118,6 +121,7 @@ __all__ = [
     "build_backend",
     "build_training_resources",
     "checkpoint_summary",
+    "engine_revival_identity",
     "evaluate_policy",
     "evaluation_gate_state_from_metadata",
     "exploration_epsilon",

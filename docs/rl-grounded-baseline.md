@@ -298,12 +298,14 @@ may be evaluated later as a separately versioned experiment; they must not be
 silently mixed into this baseline.
 
 The optional `preheat` profile is a separate, versioned full-run curriculum. It
-adds the game's native `RELIC.LIZARD_TAIL` to the normal starter relic set at a
-fresh full-run reset. The simulator-only training controller budgets that same
-native death-prevention path across the entire run; `-1` means unlimited and
-normal profiles leave it disabled. The relic still performs the game's own
-death hook, flash and 50% maximum-HP heal. Only the training copy is re-armed
-after it fires.
+enables a run-scoped, simulator-owned bailout at a fresh full-run reset; `-1`
+means unlimited and normal profiles leave it disabled. The bailout is evaluated
+only after all native `ShouldDie` preventers decline, heals 50% maximum HP, and
+never creates a relic, power, card, status or candidate action. Forced kills and
+non-positive-MaxHP deaths bypass it, so authoritative mechanics such as The
+Insatiable's Sandpit execution remain terminal. A naturally acquired
+`RELIC.LIZARD_TAIL` remains visible and one-shot, and runs before the hidden
+fallback; the training controller never re-arms it.
 
 The simulator exports exact monotonic `training_revivals_used` and
 `training_player_hp_lost` counters. HP loss is recorded at `Creature.LoseHp`
@@ -356,7 +358,7 @@ efficiency remains a subordinate success-conditional objective. Evaluation
 reports run/Act-1 success, floor, decision count, exact HP lost, revivals used,
 revival-free success, and successful completion with at most one revival.
 
-WSL/ROCm preheat starts the native-revival full game directly. There is no
+WSL/ROCm preheat starts the hidden-engine-bailout full game directly. There is no
 random-combat, Act-1, Act-2 or Act-3 behavior gate in the launch path. Act
 crossings and the real terminal outcome are metrics from the same uninterrupted
 episode, not prerequisites that repeatedly rerun parts of the game. The short
@@ -469,7 +471,7 @@ Reports include:
 No Act 1 performance claim is valid without these held-out evaluations and their
 trajectory journals.
 
-The native-revival preheat profile evaluates 12 fixed held-out seeds at step
+The hidden-engine-bailout preheat profile evaluates fixed held-out seeds at step
 zero (including after model-parameter initialization) and at 30k/100k/250k.
 
 Macro diagnostics are deliberately label-free and read-only:
