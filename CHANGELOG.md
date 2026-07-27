@@ -33,6 +33,10 @@ historical RL artifacts.
   explicit model-parameter initialization into a fresh lineage; the complete
   long-horizon head group starts fresh and optimizer/queue/RNG/counters/replay
   are never imported.
+- Advanced transaction trace/replay to v3. Exact reward/Q nodes and coarse
+  liveness-only policy node/action identities are now separate; v2 transaction
+  replay is intentionally rejected and may only seed a new lineage through
+  model-parameter initialization.
 
 ### Added
 
@@ -113,6 +117,18 @@ historical RL artifacts.
 
 ### Fixed
 
+- Corrected non-combat durable progress so HP, max HP, native deaths/revivals and
+  cumulative loss cannot masquerade as forward room progress. Added a generic
+  factual event-page transition cycle detector, authoritative event/selection
+  policy-failure completion, and bounded transaction `AVOID` credit for the
+  repeatedly executed option on the same factual legal-action surface, without
+  hard-coding an exit or blaming forced/locked actions. Recurrence is bounded by
+  environment steps and distinguishes strict-group multiplicity. Prior local
+  prompt-completion credit for that globally failed option is censored rather
+  than left as a contradictory `PREFER` target. Selection replay now
+  preserves/samples exact +/- cycles, monotonic auto-submit completions and
+  completed corrective deselections separately, while preheat runs continue
+  training-partition greedy liveness probes every 16 episodes.
 - Closed two HeadlessSim legal-action/executor gaps exposed by long full-run
   native-revival training. Merchant potion actions are now published only when
   the item is stocked and affordable, the player has an open potion slot, and

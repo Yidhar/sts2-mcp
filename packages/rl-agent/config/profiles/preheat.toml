@@ -47,7 +47,7 @@ minimum_unrolls = 4
 collector_workers = 1
 policy_sync_interval_unrolls = 4
 max_policy_lag = 64
-deterministic_probe_interval_episodes = 0
+deterministic_probe_interval_episodes = 16
 deterministic_probe_environment_steps = [512, 1024, 2048, 4096]
 
 [transaction_learning]

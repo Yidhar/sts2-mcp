@@ -997,6 +997,37 @@ def _sequence_trace(
 
 
 @pytest.mark.parametrize(
+    ("policy_node_key", "policy_action_fingerprint"),
+    (("coarse-node", None), (None, "coarse-action")),
+)
+def test_transaction_liveness_policy_identity_is_an_atomic_pair(
+    policy_node_key: str | None,
+    policy_action_fingerprint: str | None,
+) -> None:
+    encoding = GroundedEncodingConfig.from_model_config(
+        _model_config(),
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    step = _trace(
+        _snapshot(encoding),
+        trace_id="policy-pair",
+        action_index=0,
+        action_fingerprint="exact-action",
+        effect=TransactionEffect.MOVE,
+        transaction_return=None,
+    ).steps[0]
+
+    with pytest.raises(ValueError, match="both present or both absent"):
+        replace(
+            step,
+            policy_node_key=policy_node_key,
+            policy_action_fingerprint=policy_action_fingerprint,
+        )
+
+
+@pytest.mark.parametrize(
     ("surface", "steps"),
     (
         (
@@ -1118,6 +1149,40 @@ def test_unique_moving_deadlock_has_no_invented_last_action_policy_blame() -> No
     # unique moves. The final action merely crossed a delayed threshold and is
     # not factual evidence that this particular action caused the failure.
     assert factual_transaction_policy_targets(trace) == ()
+
+
+def test_forced_recurrent_deadlock_keeps_value_credit_without_policy_blame() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    forced_snapshot = replace(
+        _snapshot(encoding),
+        action_mask=np.asarray([True, False], dtype=np.bool_),
+    )
+    trace = _sequence_trace(
+        forced_snapshot,
+        trace_id="forced-event-cycle",
+        outcome=TransactionOutcome.DEADLOCK,
+        steps=(
+            ("forced-page", "forced-page", "forced:proceed", 0, TransactionEffect.STAY),
+            ("forced-page", "forced-page", "forced:proceed", 0, TransactionEffect.STAY),
+        ),
+    )
+
+    credited = backfill_factual_monte_carlo_returns(
+        trace,
+        episode_rewards=(-0.1, -1.0),
+        episode_discounts=(1.0, 0.0),
+        authoritative_outcome=True,
+    )
+    # The failure remains a factual return/Q target, but an AVOID label would
+    # be undefined because the actor had no alternative legal candidate.
+    assert all(step.q_observed for step in credited.steps)
+    assert factual_transaction_policy_targets(credited) == ()
 
 
 def test_transaction_liveness_targets_directly_update_policy_head() -> None:
@@ -1314,6 +1379,13 @@ def test_replay_is_bounded_checkpointable_and_rejects_heldout() -> None:
     with pytest.raises(ValueError, match="unsupported transaction replay"):
         restored.load_state_dict(legacy_payload)
 
+    inconsistent_payload = dict(payload)
+    inconsistent_payload["put_count"] += 1
+    restored_before = restored.state_dict()
+    with pytest.raises(ValueError, match="accounting is inconsistent"):
+        restored.load_state_dict(inconsistent_payload)
+    assert restored.state_dict() == restored_before
+
 
 def test_replay_retains_and_samples_sparse_deadlock_traces_first() -> None:
     config = _model_config()
@@ -1434,6 +1506,244 @@ def test_replay_retains_and_always_samples_sparse_factual_avoid_trace() -> None:
     )
     restored.load_state_dict(replay.state_dict())
     assert restored.sample(1)[0].trace_id == "actionable-cycle"
+
+
+def test_coarse_policy_keys_credit_repeated_event_action_without_merging_q_nodes() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    trace = TransactionTrace(
+        trace_id="vitality-event-cycle",
+        episode_id="episode-vitality-event-cycle",
+        surface_key="event-liveness",
+        start_step=0,
+        policy_version=0,
+        initial_recurrent_state=np.zeros(32, dtype=np.float32),
+        steps=tuple(
+            TransactionStep(
+                snapshot=snapshot,
+                action_index=0,
+                node_key=f"exact-q-node-{index}",
+                next_node_key=f"exact-q-node-{index + 1}",
+                action_fingerprint=f"exact-action-with-preview-{index}",
+                effect=TransactionEffect.MOVE,
+                selected_count_delta=0,
+                transaction_return=-1.0,
+                return_steps=4 - index,
+                policy_node_key=f"page-{index % 2}",
+                policy_action_fingerprint="event-option-zero",
+            )
+            for index in range(4)
+        ),
+        outcome=TransactionOutcome.DEADLOCK,
+    )
+
+    assert len({step.node_key for step in trace.steps}) == 4
+    labels = factual_transaction_policy_targets(trace)
+    assert len(labels) == 4
+    assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
+    assert all(trace.steps[label.step_index].action_index == 0 for label in labels)
+
+
+def test_event_deadlock_avoids_only_repeated_pair_not_one_off_corrective_revisit() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    corrective = TransactionStep(
+        snapshot=snapshot,
+        action_index=1,
+        node_key="selection-wrong-card",
+        next_node_key="selection-empty",
+        action_fingerprint="deselect:wrong-card",
+        effect=TransactionEffect.REVISIT,
+        selected_count_delta=-1,
+        transaction_return=-1.0,
+        return_steps=4,
+    )
+    repeated = tuple(
+        TransactionStep(
+            snapshot=snapshot,
+            action_index=0,
+            node_key=f"exact-event-q-node-{index}",
+            next_node_key=f"exact-event-q-node-{index + 1}",
+            action_fingerprint=f"exact-event-option-{index}",
+            effect=TransactionEffect.MOVE,
+            selected_count_delta=0,
+            transaction_return=-1.0,
+            return_steps=3 - index,
+            policy_node_key="event-page-linger",
+            policy_action_fingerprint="event-option:linger",
+        )
+        for index in range(3)
+    )
+    trace = TransactionTrace(
+        trace_id="corrective-before-event-cycle",
+        episode_id="episode-corrective-before-event-cycle",
+        surface_key="global-event-liveness",
+        start_step=0,
+        policy_version=0,
+        initial_recurrent_state=np.zeros(32, dtype=np.float32),
+        steps=(corrective, *repeated),
+        outcome=TransactionOutcome.DEADLOCK,
+    )
+
+    labels = factual_transaction_policy_targets(trace)
+    assert {label.step_index for label in labels} == {1, 2, 3}
+    assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
+    assert all(
+        trace.steps[label.step_index].effective_policy_action_fingerprint == "event-option:linger" for label in labels
+    )
+
+
+def test_replay_samples_all_available_selection_structure_strata_after_restore() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+
+    def with_deltas(
+        trace: TransactionTrace,
+        deltas: tuple[int, ...],
+    ) -> TransactionTrace:
+        assert len(trace.steps) == len(deltas)
+        return replace(
+            trace,
+            steps=tuple(
+                replace(step, selected_count_delta=delta) for step, delta in zip(trace.steps, deltas, strict=True)
+            ),
+        )
+
+    cycle = with_deltas(
+        _sequence_trace(
+            snapshot,
+            trace_id="selection-cycle",
+            outcome=TransactionOutcome.DEADLOCK,
+            steps=(
+                ("empty", "one", "select:a", 0, TransactionEffect.MOVE),
+                ("one", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+                ("empty", "one", "select:a", 0, TransactionEffect.REVISIT),
+                ("one", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
+            ),
+        ),
+        (1, -1, 1, -1),
+    )
+    monotonic = with_deltas(
+        _sequence_trace(
+            snapshot,
+            trace_id="selection-monotonic",
+            outcome=TransactionOutcome.COMPLETED,
+            steps=(
+                ("empty-m", "one-m", "select:m1", 0, TransactionEffect.MOVE),
+                ("one-m", "exit-m", "select:m2", 1, TransactionEffect.EXIT),
+            ),
+        ),
+        (1, 1),
+    )
+    corrective = with_deltas(
+        _sequence_trace(
+            snapshot,
+            trace_id="selection-corrective",
+            outcome=TransactionOutcome.COMPLETED,
+            steps=(
+                ("empty-c", "wrong-c", "select:wrong", 0, TransactionEffect.MOVE),
+                ("wrong-c", "empty-c", "deselect:wrong", 1, TransactionEffect.REVISIT),
+                ("empty-c", "right-c", "select:right1", 0, TransactionEffect.MOVE),
+                ("right-c", "exit-c", "select:right2", 1, TransactionEffect.EXIT),
+            ),
+        ),
+        (1, -1, 1, 1),
+    )
+    ordinary = tuple(
+        _trace(
+            snapshot,
+            trace_id=f"ordinary-{index}",
+            action_index=index % 2,
+            action_fingerprint=f"ordinary:{index}",
+            effect=TransactionEffect.EXIT,
+            transaction_return=1.0,
+            outcome=TransactionOutcome.COMPLETED,
+        )
+        for index in range(12)
+    )
+    replay = BoundedTransactionReplay(
+        capacity=32,
+        byte_capacity=50_000_000,
+        seed=29,
+    )
+    for trace in (*ordinary, cycle, monotonic, corrective):
+        assert replay.put(trace)
+
+    metrics = replay.metrics()
+    assert metrics["selection_cycle_size"] == 1
+    assert metrics["selection_monotonic_completion_size"] == 1
+    assert metrics["selection_corrective_completion_size"] == 1
+    for _ in range(8):
+        sampled_ids = {trace.trace_id for trace in replay.sample(6)}
+        assert {
+            "selection-cycle",
+            "selection-monotonic",
+            "selection-corrective",
+        } <= sampled_ids
+
+    restored = BoundedTransactionReplay(
+        capacity=replay.capacity,
+        byte_capacity=replay.byte_capacity,
+        seed=999,
+    )
+    restored.load_state_dict(replay.state_dict())
+    assert restored.metrics() == replay.metrics()
+    restored_ids = {trace.trace_id for trace in restored.sample(6)}
+    assert {
+        "selection-cycle",
+        "selection-monotonic",
+        "selection-corrective",
+    } <= restored_ids
+
+    # Reconstructing derived stratum sets after eviction must not change the
+    # mapping from checkpointed RNG indices to replay items.  Iterating a set
+    # here would make exact resume diverge because the live set has deletion/
+    # resize history while the restored set is freshly allocated.
+    churned = BoundedTransactionReplay(
+        capacity=16,
+        byte_capacity=50_000_000,
+        seed=31,
+    )
+    templates = (cycle, monotonic, corrective)
+    for index in range(100):
+        template = templates[index % len(templates)]
+        assert churned.put(
+            replace(
+                template,
+                trace_id=f"churn-{index}",
+                episode_id=f"episode-churn-{index}",
+                surface_key=f"surface-churn-{index}",
+            )
+        )
+    assert churned.metrics()["eviction_count"] == 84
+    churned_restored = BoundedTransactionReplay(
+        capacity=churned.capacity,
+        byte_capacity=churned.byte_capacity,
+        seed=999,
+    )
+    churned_restored.load_state_dict(churned.state_dict())
+    for _ in range(12):
+        expected_ids = tuple(trace.trace_id for trace in churned.sample(8))
+        restored_ids = tuple(trace.trace_id for trace in churned_restored.sample(8))
+        assert restored_ids == expected_ids
 
 
 def test_pairwise_labels_require_same_node_distinct_factual_actions() -> None:
@@ -1718,13 +2028,15 @@ def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> Non
     try:
         training_episode = resources.collector.collect_episode(record=True)
         assert training_episode.metrics.noncombat_progress_stalled
+        assert not training_episode.metrics.trusted_policy_failure
         assert len(training_episode.transaction_traces) == 1
         trace = training_episode.transaction_traces[0]
         assert trace.data_partition == "training"
         assert trace.start_step == 0
         assert trace.burn_in_steps == 0
-        assert trace.outcome is TransactionOutcome.DEADLOCK
-        assert all(step.transaction_return is not None for step in trace.learn_steps)
+        assert trace.outcome is TransactionOutcome.CENSORED
+        assert all(not step.q_observed for step in trace.learn_steps)
+        assert factual_transaction_policy_targets(trace) == ()
 
         evaluation_episode = resources.collector.collect_episode(
             record=False,
@@ -1736,7 +2048,7 @@ def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> Non
         resources.close()
 
 
-def test_training_only_greedy_liveness_probe_records_delta_behavior_and_deadlock() -> None:
+def test_training_only_greedy_liveness_probe_records_delta_behavior_without_false_action_credit() -> None:
     from tests.test_v2_training_pipeline import (
         DynamicPreviewLoopBackend,
         _event_loop_config,
@@ -1789,26 +2101,22 @@ def test_training_only_greedy_liveness_probe_records_delta_behavior_and_deadlock
         )
         assert episode.metrics.reset_seed % 2 == 0
         assert episode.metrics.deadlocked
+        assert not episode.metrics.trusted_policy_failure
         assert episode.transaction_traces
         trace = episode.transaction_traces[-1]
-        assert trace.outcome is TransactionOutcome.DEADLOCK
+        assert trace.outcome is TransactionOutcome.CENSORED
         assert len(trace.learn_steps) <= 32
         assert len(trace.steps) <= 36
-        rollout_steps = tuple(
-            step for unroll in episode.unrolls for step in unroll.steps
-        )
-        assert all(
-            step.behavior_log_probability == pytest.approx(0.0)
-            for step in rollout_steps
-        )
+        rollout_steps = tuple(step for unroll in episode.unrolls for step in unroll.steps)
+        assert all(step.behavior_log_probability == pytest.approx(0.0) for step in rollout_steps)
         assert any(step.policy_decision for step in rollout_steps[:-1])
         assert rollout_steps[-1].discount == 0.0
         assert rollout_steps[-1].policy_decision is False
-        # A training probe still records the failed trace for value/Q learning,
-        # but a unique MOVE-only window supplies no factual action-level blame.
-        assert all(
-            step.effect is TransactionEffect.MOVE for step in trace.learn_steps
-        )
+        # A training probe still records the bounded diagnostic trace, but a
+        # unique MOVE-only window supplies neither factual Q authority nor
+        # action-level blame.
+        assert all(step.effect is TransactionEffect.MOVE for step in trace.learn_steps)
+        assert all(not step.q_observed for step in trace.learn_steps)
         assert factual_transaction_policy_targets(trace) == ()
 
         with pytest.raises(ValueError, match="recorded training"):
@@ -1871,8 +2179,9 @@ def test_unique_liveness_trace_keeps_value_prefix_without_invented_policy_blame(
             deterministic=True,
         )
         assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.trusted_policy_failure
         trace = episode.transaction_traces[-1]
-        assert trace.outcome is TransactionOutcome.DEADLOCK
+        assert trace.outcome is TransactionOutcome.CENSORED
         assert trace.start_step == 0
         assert trace.burn_in_steps == 0
         assert len(trace.steps) == 1
@@ -1880,6 +2189,7 @@ def test_unique_liveness_trace_keeps_value_prefix_without_invented_policy_blame(
         # This preserves the last learnable prefix for value/Q reconstruction,
         # but MOVE-only delayed-window evidence cannot identify that action as
         # the cause of the later stall.
+        assert all(not step.q_observed for step in trace.learn_steps)
         assert factual_transaction_policy_targets(trace) == ()
     finally:
         resources.close()
@@ -1928,15 +2238,280 @@ def test_long_selection_failure_trace_is_bounded_to_burn_in_plus_learning_tail()
             deterministic=True,
         )
         assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.trusted_policy_failure
         assert len(episode.transaction_traces) == 1
         trace = episode.transaction_traces[0]
-        assert trace.outcome is TransactionOutcome.DEADLOCK
+        assert trace.outcome is TransactionOutcome.CENSORED
         assert trace.burn_in_steps <= 4
         assert len(trace.learn_steps) <= 32
         assert len(trace.steps) <= 36
         # The bounded trace is still retained, but this preview sequence has no
         # exact repeated node/action evidence and therefore no AVOID label.
+        assert all(not step.q_observed for step in trace.learn_steps)
         assert factual_transaction_policy_targets(trace) == ()
+    finally:
+        resources.close()
+
+
+def test_external_policy_burn_in_does_not_make_forced_selection_cycle_authoritative() -> None:
+    from tests.test_v2_training_pipeline import (  # local import avoids fixture coupling
+        DynamicPreviewLoopBackend,
+        _event_loop_config,
+    )
+
+    class ExternalChoiceThenForcedSelectionLoopBackend(DynamicPreviewLoopBackend):
+        """One real choice precedes an unrelated, entirely forced selection loop."""
+
+        def _actions(self) -> tuple[dict[str, object], ...]:
+            if self._step == 0:
+                return (
+                    {
+                        "action_handle": "enter-selection:0",
+                        "action": "choose_event_option",
+                        "kind": "choose_event_option",
+                        "model_action_kind": "event_option",
+                        "transport_kind": "event_option",
+                        "index": 0,
+                    },
+                    {
+                        "action_handle": "alternate:0",
+                        "action": "choose_event_option",
+                        "kind": "choose_event_option",
+                        "model_action_kind": "event_option",
+                        "transport_kind": "event_option",
+                        "index": 1,
+                    },
+                )
+            selected = bool((self._step - 1) % 2)
+            return (
+                {
+                    "action_handle": f"forced-toggle:{self._step}",
+                    "action": "deselect_card" if selected else "select_card",
+                    "kind": "deselect_card" if selected else "select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "deselect" if selected else "select",
+                    "selection_operation": "deselect" if selected else "select",
+                    "card": {
+                        "id": "CARD.STRIKE",
+                        "instance_id": "forced-strike",
+                        "source_pile": "Discard",
+                        "selection_membership": "selected" if selected else "selectable",
+                        "is_selected": selected,
+                    },
+                },
+            )
+
+        def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+            observation = super()._observation(terminal=terminal)
+            observation["phase"] = "event" if self._step == 0 else "selection"
+            observation["state_type"] = "event" if self._step == 0 else "card_select"
+            observation["screen"] = "EVENT" if self._step == 0 else "SELECTION"
+            event = observation["event"]
+            assert isinstance(event, dict)
+            event["description_key"] = "EVENT.FORCED_SELECTION.pages.LOOP"
+            event["dynamic_vars"] = []
+            if self._step == 0:
+                observation.pop("card_selection", None)
+                return observation
+
+            selected = bool((self._step - 1) % 2)
+            card = {
+                "id": "CARD.STRIKE",
+                "instance_id": "forced-strike",
+                "source_pile": "Discard",
+            }
+            observation["card_selection"] = {
+                "mode": "SimpleGrid",
+                "prompt_id": "event.FORCED_SELECTION.selection",
+                "operation_type": "select",
+                "source_zone": "Discard",
+                "min_select": 0,
+                "max_select": 1,
+                "cards": [card],
+                "selected_cards": [card] if selected else [],
+                "selected_count": int(selected),
+                "remaining_picks": 1 - int(selected),
+                "requires_manual_confirmation": False,
+                "can_confirm": False,
+            }
+            return observation
+
+    base = _event_loop_config(durable_window=40)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=40),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=40,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=8,
+            replay_byte_capacity=10_000_000,
+            sample_traces=2,
+            burn_in_steps=4,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=ExternalChoiceThenForcedSelectionLoopBackend(),
+    )
+    try:
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.deadlocked
+        assert episode.metrics.terminal_reason == "semantic_deadlock"
+        assert not episode.metrics.selection_action_cycle
+        assert not episode.metrics.trusted_policy_failure
+        completed = episode.completed_episode
+        assert completed is not None
+        assert not completed.completion.authoritative
+        assert completed.completion.won is None
+
+        assert len(episode.transaction_traces) == 1
+        trace = episode.transaction_traces[0]
+        assert trace.burn_in_steps == 1
+        assert np.count_nonzero(trace.steps[0].snapshot.action_mask) == 2
+        assert all(np.count_nonzero(step.snapshot.action_mask) == 1 for step in trace.learn_steps)
+        assert trace.outcome is TransactionOutcome.CENSORED
+        assert all(not step.q_observed for step in trace.steps)
+        assert factual_transaction_policy_targets(trace) == ()
+    finally:
+        resources.close()
+
+
+def test_event_reopen_cycle_censors_local_completion_and_avoids_bad_confirm() -> None:
+    from tests.test_v2_training_pipeline import (  # local import avoids fixture coupling
+        DynamicPreviewLoopBackend,
+        _event_loop_config,
+    )
+
+    class ConfirmThenForcedReopenBackend(DynamicPreviewLoopBackend):
+        """A bad confirm locally exits, then a forced page reopens the prompt."""
+
+        @staticmethod
+        def _card() -> dict[str, object]:
+            return {
+                "id": "CARD.STRIKE",
+                "instance_id": "selected-strike",
+                "source_pile": "Discard",
+            }
+
+        def _actions(self) -> tuple[dict[str, object], ...]:
+            if self._step % 2:
+                return (
+                    {
+                        "action_handle": f"forced-reopen:{self._step}",
+                        "action": "choose_event_option",
+                        "kind": "choose_event_option",
+                        "model_action_kind": "event_option",
+                        "transport_kind": "event_option",
+                        "index": 0,
+                    },
+                )
+            return (
+                {
+                    "action_handle": f"bad-confirm:{self._step}",
+                    "action": "confirm_selection",
+                    "kind": "confirm_selection",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "confirm",
+                    "selection_operation": "confirm",
+                },
+                {
+                    "action_handle": f"cancel:{self._step}",
+                    "action": "cancel_selection",
+                    "kind": "cancel_selection",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "cancel_prompt",
+                    "selection_operation": "cancel_prompt",
+                },
+            )
+
+        def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+            observation = super()._observation(terminal=terminal)
+            observation["phase"] = "selection" if self._step % 2 == 0 else "event"
+            observation["state_type"] = "card_select" if self._step % 2 == 0 else "event"
+            observation["screen"] = "SELECTION" if self._step % 2 == 0 else "EVENT"
+            event = observation["event"]
+            assert isinstance(event, dict)
+            event["event_id"] = "EVENT.REOPEN_SELECTION"
+            event["description_key"] = "EVENT.REOPEN_SELECTION.pages.LOOP"
+            event["dynamic_vars"] = []
+            if self._step % 2:
+                observation.pop("card_selection", None)
+                return observation
+            card = self._card()
+            observation["card_selection"] = {
+                "mode": "SimpleGrid",
+                "prompt_id": "event.REOPEN_SELECTION.confirm",
+                "operation_type": "select",
+                "source_zone": "Discard",
+                "min_select": 1,
+                "max_select": 1,
+                "cards": [],
+                "selected_cards": [card],
+                "selected_count": 1,
+                "remaining_picks": 0,
+                "requires_manual_confirmation": True,
+                "can_confirm": True,
+            }
+            return observation
+
+    base = _event_loop_config(durable_window=40)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=40),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=40,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=2,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=ConfirmThenForcedReopenBackend(),
+    )
+    try:
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.terminal_reason == "noncombat_event_action_cycle"
+        assert episode.metrics.noncombat_event_cycle
+        assert episode.metrics.trusted_policy_failure
+        assert episode.completed_episode is not None
+        assert episode.completed_episode.completion.authoritative
+        assert episode.completed_episode.won is False
+
+        traces = episode.transaction_traces
+        assert any(trace.outcome is TransactionOutcome.CENSORED for trace in traces)
+        assert any(trace.outcome is TransactionOutcome.DEADLOCK for trace in traces)
+        labels = tuple((trace, label) for trace in traces for label in factual_transaction_policy_targets(trace))
+        assert labels
+        assert all(label.target is not TransactionPolicyTarget.PREFER for _, label in labels)
+        avoided = tuple(
+            trace.steps[label.step_index] for trace, label in labels if label.target is TransactionPolicyTarget.AVOID
+        )
+        assert avoided
+        assert all(step.policy_node_key is not None for step in avoided)
+        assert len({step.policy_action_fingerprint for step in avoided}) == 1
     finally:
         resources.close()
 
@@ -1980,6 +2555,19 @@ def test_post_step_deadlock_agrees_with_transaction_exit_outcome(novel_exit: boo
                         "source_pile": "Discard",
                         "selection_membership": "selected" if selected else "selectable",
                         "is_selected": selected,
+                    },
+                },
+                {
+                    "action": "select_card",
+                    "kind": "select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "select",
+                    "card": {
+                        "id": "CARD.DEFEND",
+                        "instance_id": "defend-1",
+                        "source_pile": "Discard",
+                        "selection_membership": "selectable",
+                        "is_selected": False,
                     },
                 },
             )
@@ -2037,19 +2625,24 @@ def test_post_step_deadlock_agrees_with_transaction_exit_outcome(novel_exit: boo
                 "instance_id": "strike-1",
                 "source_pile": "Discard",
             }
+            alternative = {
+                "id": "CARD.DEFEND",
+                "instance_id": "defend-1",
+                "source_pile": "Discard",
+            }
             observation["card_selection"] = {
                 "mode": "SimpleGrid",
                 "prompt_id": "card.TRANSACTION_TEST.selection",
                 "operation_type": "select",
                 "source_zone": "Discard",
-                "min_select": 0,
-                "max_select": 1,
-                "cards": [] if selected else [card],
+                "min_select": 2,
+                "max_select": 2,
+                "cards": [alternative] if selected else [card, alternative],
                 "selected_cards": [card] if selected else [],
                 "selected_count": int(selected),
-                "remaining_picks": int(not selected),
+                "remaining_picks": 2 - int(selected),
                 "requires_manual_confirmation": False,
-                "can_confirm": selected,
+                "can_confirm": False,
             }
             return observation
 
@@ -2075,7 +2668,10 @@ def test_post_step_deadlock_agrees_with_transaction_exit_outcome(novel_exit: boo
         backend=SelectionCycleThenExitBackend(exit_at_threshold=novel_exit),
     )
     try:
-        episode = resources.collector.collect_episode(record=True)
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
         assert len(episode.transaction_traces) == 1
         trace = episode.transaction_traces[0]
         if novel_exit:
@@ -2089,7 +2685,9 @@ def test_post_step_deadlock_agrees_with_transaction_exit_outcome(novel_exit: boo
             assert episode.metrics.steps == 5
             assert not episode.metrics.run_won
             assert episode.metrics.deadlocked
-            assert episode.metrics.terminal_reason == "semantic_deadlock"
+            assert episode.metrics.terminal_reason == "selection_action_cycle"
+            assert episode.metrics.selection_action_cycle
+            assert episode.metrics.trusted_policy_failure
             assert trace.outcome is TransactionOutcome.DEADLOCK
             assert trace.steps[-1].effect is TransactionEffect.REVISIT
     finally:

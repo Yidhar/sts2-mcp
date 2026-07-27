@@ -34,8 +34,12 @@ from sts2_rl.training import (
     RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
+    TransactionLearningConfig,
+    TransactionOutcome,
+    TransactionPolicyTarget,
     build_training_resources,
     evaluate_policy,
+    factual_transaction_policy_targets,
     initialize_model_from_checkpoint,
     inspect_baseline,
     load_training_checkpoint,
@@ -49,7 +53,11 @@ from sts2_rl.training import factory as factory_module
 from sts2_rl.training import runtime as runtime_module
 from sts2_rl.training.checkpoint_evaluation import evaluate_checkpoint_policy
 from sts2_rl.training.checkpointing import ActorSupervisorState, TrainingState
-from sts2_rl.training.collector import CollectionProtocolError, _CombatNetProgressTracker
+from sts2_rl.training.collector import (
+    CollectionProtocolError,
+    _CombatNetProgressTracker,
+    _NonCombatEventCycleTracker,
+)
 from sts2_rl.training.pipeline import ActorLearnerPipeline, RecoverableActorIncident
 from sts2_rl.training.runtime import EvaluationInfrastructureError
 from sts2_rl.training.trajectory import TrajectoryJournal
@@ -550,6 +558,127 @@ class DynamicPreviewLoopBackend(FakeCombatBackend):
             ),
             info={"reward_authority": "external-rl"},
         )
+
+
+class VitalityEventCycleBackend(DynamicPreviewLoopBackend):
+    """Two-option event cycle with unbounded HP/max-HP/revival churn."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                "action_handle": f"event-option:{index}:{self._step}",
+                "action": "choose_event_option",
+                "kind": "choose_event_option",
+                "model_action_kind": "event_option",
+                "transport_kind": "event_option",
+                "index": index,
+                "option": {
+                    "index": index,
+                    "text_key": f"EVENT.VITALITY.options.{index}",
+                    "is_locked": False,
+                    "is_chosen": False,
+                    "is_proceed": bool(index),
+                },
+            }
+            for index in range(2)
+        )
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, Any]:
+        observation = super()._observation(terminal=terminal)
+        player = observation["player"]
+        assert isinstance(player, dict)
+        player["hp"] = 1 if self._step % 2 == 0 else 40 + self._step
+        player["max_hp"] = 80 + 2 * self._step
+        observation["phase"] = "event"
+        observation["screen"] = "EVENT"
+        observation["_training"] = {
+            "revivals_used": self._step // 2,
+            "player_hp_lost": self._step * (self._step + 1),
+        }
+        event = observation["event"]
+        assert isinstance(event, dict)
+        event["event_id"] = "EVENT.VITALITY"
+        event["description_key"] = (
+            "EVENT.VITALITY.pages.LINGER9" if self._step % 2 == 0 else "EVENT.VITALITY.pages.DEATH_WARNING"
+        )
+        event["dynamic_vars"] = [
+            {
+                "name": "Damage",
+                "family": "value",
+                "int_value": self._step * self._step,
+            }
+        ]
+        return observation
+
+
+class ChangingAlternativeEventBackend(VitalityEventCycleBackend):
+    """Reuses option indexes but changes the alternative's stable semantics."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        selected, alternative = super()._actions()
+        alternative = {
+            **alternative,
+            "action_handle": f"changing-alternative:{self._step}",
+            "option": {
+                **alternative["option"],
+                "text_key": f"EVENT.VITALITY.options.ALTERNATIVE_{self._step}",
+                "is_proceed": bool(self._step % 2),
+            },
+        }
+        return selected, alternative
+
+
+class SparseRepeatEventBackend(VitalityEventCycleBackend):
+    """Repeats an old decision only after it has left the learnable tail."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        selected, alternative = super()._actions()
+        # The original action surface occurs three times globally, but never
+        # three times inside the 32-step actor-learnable liveness tail.
+        if self._step not in {0, 17, 35}:
+            alternative = {
+                **alternative,
+                "option": {
+                    **alternative["option"],
+                    "text_key": f"EVENT.VITALITY.options.NOVEL_{self._step}",
+                },
+            }
+        return selected, alternative
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, Any]:
+        observation = super()._observation(terminal=terminal)
+        event = observation["event"]
+        assert isinstance(event, dict)
+        event["description_key"] = "EVENT.VITALITY.pages.CONSTANT"
+        return observation
+
+
+class ChangingMultiplicityEventBackend(VitalityEventCycleBackend):
+    """Changes only the number of strictly equal copies of the chosen option."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        selected, alternative = super()._actions()
+        copies = tuple(
+            {
+                **selected,
+                "action_handle": f"event-option:0:{self._step}:{copy_index}",
+            }
+            for copy_index in range(self._step + 1)
+        )
+        return (*copies, alternative)
+
+
+class LockedAlternativeEventBackend(VitalityEventCycleBackend):
+    """Publishes a locked option beside the only enabled event action."""
+
+    def _actions(self) -> tuple[dict[str, Any], ...]:
+        selected, alternative = super()._actions()
+        return selected, {
+            **alternative,
+            "enabled": False,
+            "is_enabled": False,
+            "option": {**alternative["option"], "is_locked": True},
+        }
 
 
 class TerminalWithoutObservationFlagsBackend(DynamicPreviewLoopBackend):
@@ -1218,6 +1347,54 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
         resources.close()
 
 
+@pytest.mark.parametrize(
+    ("backend", "budget", "durable_window", "repeat_threshold"),
+    (
+        (DynamicPreviewLoopBackend(), 2, 2, 8),
+        (StaticEventLoopBackend(), 4, 100, 4),
+    ),
+    ids=("durable-window-at-budget", "exact-cycle-at-budget"),
+)
+def test_collection_budget_precedes_noncombat_liveness_boundaries(
+    backend: DynamicPreviewLoopBackend,
+    budget: int,
+    durable_window: int,
+    repeat_threshold: int,
+) -> None:
+    base = _event_loop_config(durable_window=durable_window)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=10),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=repeat_threshold,
+            noncombat_durable_progress_window=durable_window,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(config, backend=backend)
+    try:
+        episode = resources.collector.collect_episode(
+            record=True,
+            maximum_steps=budget,
+        )
+
+        assert episode.metrics.steps == budget
+        assert episode.metrics.terminal_reason == "collection_budget"
+        assert episode.metrics.truncated
+        assert not episode.metrics.deadlocked
+        assert not episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.trusted_policy_failure
+        assert episode.unrolls[-1].steps[-1].discount > 0.0
+        assert episode.unrolls[-1].bootstrap_snapshot is not None
+        assert episode.completed_episode is not None
+        assert not episode.completed_episode.completion.authoritative
+        assert episode.completed_episode.completion.won is None
+    finally:
+        resources.close()
+
+
 @pytest.mark.parametrize("marker_key", ["wave_index", "stage_id"])
 def test_combat_progress_tracker_preserves_phase_and_wave_resets(
     marker_key: str,
@@ -1463,6 +1640,310 @@ def test_noncombat_dynamic_preview_and_changing_labels_cannot_evade_stall(
         resources.close()
 
 
+def test_event_page_cycle_ignores_vitality_revival_churn_and_credits_action() -> None:
+    base = _event_loop_config(durable_window=20)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=40),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=20,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=0,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=VitalityEventCycleBackend(),
+    )
+    try:
+        # Uniform logits make deterministic argmax choose option zero while a
+        # second legal option remains available throughout the factual cycle.
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            record=True,
+            deterministic=True,
+        )
+
+        assert episode.metrics.steps == 5
+        assert episode.metrics.deadlocked
+        assert episode.metrics.noncombat_progress_stalled
+        assert episode.metrics.noncombat_event_cycle
+        assert episode.metrics.trusted_policy_failure
+        assert not episode.metrics.combat_policy_failed
+        assert episode.metrics.terminal_reason == "noncombat_event_action_cycle"
+        assert episode.completed_episode is not None
+        assert episode.completed_episode.completion.authoritative
+        assert episode.completed_episode.won is False
+        evidence = episode.metrics.stall_evidence
+        assert evidence is not None
+        assert evidence["kind"] == "noncombat_event_action_cycle"
+        assert evidence["repeat_threshold"] == 3
+        assert evidence["cycle_span"] == 2
+
+        assert len(episode.transaction_traces) == 1
+        trace = episode.transaction_traces[0]
+        assert all(step.policy_node_key is not None for step in trace.steps)
+        assert all(step.policy_action_fingerprint is not None for step in trace.steps)
+        labels = factual_transaction_policy_targets(trace)
+        assert labels
+        assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
+        assert {trace.steps[label.step_index].action_index for label in labels} == {trace.steps[0].action_index}
+        assert all(np.count_nonzero(step.snapshot.action_mask) == 2 for step in trace.steps)
+    finally:
+        resources.close()
+
+
+def test_event_cycle_requires_the_same_factual_legal_action_surface() -> None:
+    base = _event_loop_config(durable_window=8)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=20),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=8,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=0,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=ChangingAlternativeEventBackend(),
+    )
+    try:
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.steps == 8
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.noncombat_event_cycle
+        assert not episode.metrics.trusted_policy_failure
+        assert episode.completed_episode is not None
+        assert not episode.completed_episode.completion.authoritative
+        assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
+        assert all(not step.q_observed for trace in episode.transaction_traces for step in trace.steps)
+    finally:
+        resources.close()
+
+
+def test_event_cycle_policy_node_preserves_strict_group_multiplicity() -> None:
+    base = _event_loop_config(durable_window=4)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=12),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=4,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=0,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=ChangingMultiplicityEventBackend(),
+    )
+    try:
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.steps == 4
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.noncombat_event_cycle
+        assert not episode.metrics.trusted_policy_failure
+        assert episode.completed_episode is not None
+        assert not episode.completed_episode.completion.authoritative
+        assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
+        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
+    finally:
+        resources.close()
+
+
+def test_event_cycle_does_not_blame_one_enabled_choice_beside_locked_option() -> None:
+    base = _event_loop_config(durable_window=4)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=12),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=8,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=4,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=0,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(
+        config,
+        backend=LockedAlternativeEventBackend(),
+    )
+    try:
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.steps == 4
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.noncombat_event_cycle
+        assert not episode.metrics.trusted_policy_failure
+        assert episode.completed_episode is not None
+        assert not episode.completed_episode.completion.authoritative
+        assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
+        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
+    finally:
+        resources.close()
+
+
+def test_event_cycle_recurrence_window_uses_environment_steps_across_forced_gap() -> None:
+    tracker = _NonCombatEventCycleTracker(window=32, repeat_threshold=2)
+
+    def event_observation(page: str) -> dict[str, Any]:
+        return {
+            "phase": "event",
+            "decision_domain": "event",
+            "state_type": "event",
+            "run": {
+                "act": 1,
+                "floor": 9,
+                "room_type": "event",
+                "room_model_id": "EVENT.FORCED_GAP",
+            },
+            "player": {"gold": 0, "deck_cards": [], "relics": [], "potions": []},
+            "event": {
+                "event_id": "EVENT.FORCED_GAP",
+                "description_key": page,
+                "is_finished": False,
+            },
+        }
+
+    before = event_observation("EVENT.FORCED_GAP.pages.CHOICE")
+    after = event_observation("EVENT.FORCED_GAP.pages.FORCED_START")
+    assert (
+        tracker.observe(
+            step=1,
+            before_observation=before,
+            after_observation=after,
+            action_fingerprint="choose:linger",
+            policy_node_key="choice-node",
+            durable_progress_kind="recurring_durable_resource_state",
+        )
+        is None
+    )
+    # The collector calls observe on forced pages too, but they carry no policy
+    # node and must not preserve an actionable event choice beyond the 32-step
+    # learner tail.
+    for step in range(2, 35):
+        assert (
+            tracker.observe(
+                step=step,
+                before_observation=event_observation(f"EVENT.FORCED_GAP.pages.FORCED_{step}"),
+                after_observation=event_observation(f"EVENT.FORCED_GAP.pages.FORCED_{step + 1}"),
+                action_fingerprint=f"forced:{step}",
+                policy_node_key=None,
+                durable_progress_kind="recurring_durable_resource_state",
+            )
+            is None
+        )
+    assert (
+        tracker.observe(
+            step=35,
+            before_observation=before,
+            after_observation=after,
+            action_fingerprint="choose:linger",
+            policy_node_key="choice-node",
+            durable_progress_kind="recurring_durable_resource_state",
+        )
+        is None
+    )
+    # A new recurrence wholly inside the tail is actionable again.
+    evidence = tracker.observe(
+        step=36,
+        before_observation=before,
+        after_observation=after,
+        action_fingerprint="choose:linger",
+        policy_node_key="choice-node",
+        durable_progress_kind="recurring_durable_resource_state",
+    )
+    assert evidence is not None
+    assert evidence.occurrences == 2
+    assert evidence.cycle_span == 1
+
+
+def test_sparse_event_repeat_outside_learnable_tail_is_not_authoritative() -> None:
+    base = _event_loop_config(durable_window=40)
+    config = replace(
+        base,
+        environment=replace(base.environment, max_episode_steps=50),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=128,
+            deadlock_repeat_threshold=3,
+            noncombat_durable_progress_window=40,
+        ),
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=16,
+            replay_byte_capacity=20_000_000,
+            sample_traces=4,
+            burn_in_steps=2,
+        ),
+        episodic_learning=replace(base.episodic_learning, enabled=True),
+    )
+    resources = build_training_resources(config, backend=SparseRepeatEventBackend())
+    try:
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(record=True, deterministic=True)
+
+        assert episode.metrics.steps == 40
+        assert episode.metrics.terminal_reason == "noncombat_progress_stall"
+        assert not episode.metrics.noncombat_event_cycle
+        assert not episode.metrics.trusted_policy_failure
+        assert episode.completed_episode is not None
+        assert not episode.completed_episode.completion.authoritative
+        assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
+        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
+    finally:
+        resources.close()
+
+
 def test_alternating_select_cancel_and_ui_state_do_not_reset_durable_window() -> None:
     resources = build_training_resources(
         _event_loop_config(),
@@ -1599,7 +2080,7 @@ def test_collector_rejects_run_terminal_without_typed_run_result() -> None:
         resources.close()
 
 
-def test_noncombat_stall_evidence_precedes_simultaneous_semantic_evidence(
+def test_generic_stall_evidence_precedes_a_forced_semantic_event_cycle(
     tmp_path: Path,
 ) -> None:
     base = _event_loop_config(durable_window=4)
@@ -1620,12 +2101,14 @@ def test_noncombat_stall_evidence_precedes_simultaneous_semantic_evidence(
                 trajectory_journal=journal,
             )
         assert episode.metrics.noncombat_progress_stalled
+        assert not episode.metrics.noncombat_event_cycle
+        assert not episode.metrics.trusted_policy_failure
         assert episode.metrics.terminal_reason == "noncombat_progress_stall"
         records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
         terminal_summary = next(
             item for item in records if item.get("record_kind") == "summary" and item.get("outcome") == "deadlock"
         )
-        assert terminal_summary["deadlock"]["kind"] == ("noncombat_no_durable_progress")
+        assert terminal_summary["deadlock"]["kind"] == "noncombat_no_durable_progress"
     finally:
         resources.close()
 

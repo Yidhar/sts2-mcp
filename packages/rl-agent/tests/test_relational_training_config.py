@@ -72,7 +72,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.rollout.minimum_unrolls == 4
     assert preheat.rollout.queue_capacity == 64
     assert preheat.rollout.max_policy_lag == 64
-    assert preheat.rollout.deterministic_probe_interval_episodes == 0
+    assert preheat.rollout.deterministic_probe_interval_episodes == 16
     assert preheat.rollout.deterministic_probe_environment_steps == (
         512,
         1_024,

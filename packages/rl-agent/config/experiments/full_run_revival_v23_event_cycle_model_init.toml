@@ -1,0 +1,43 @@
+# Fresh v23 lineage initialized from the final validated v22b network.
+#
+# This is intentionally *not* an exact resume.  Transaction traces/replay move
+# from v2 to v3, non-combat liveness semantics change, and recurring
+# training-partition greedy probes are enabled.  ``--initialize-from`` imports
+# compatible model parameters only; optimizer, replay, RNGs, counters and
+# policy versions start at zero under the new ABI.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[rollout]
+# Milestone-only probes were already behind the v22b resume point.  A recurring
+# training-only deterministic probe makes current greedy event and selection
+# cycles factual replay data without ever training on held-out evaluation.
+deterministic_probe_interval_episodes = 16
+
+[runtime]
+total_environment_steps = 250000
+seed = 1000000
+log_dir = "runs/full-run-revival-v23-event-cycle-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v23-event-cycle-model-init"
+checkpoint_interval_steps = 10000
+
+evaluation_steps = [0, 50000, 100000, 150000, 200000, 240000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000, 30000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 20
+
+# Specific event/selection cycles are now separately observable and terminate
+# well before the outer transport horizon, so the fixed held-out liveness guard
+# is authoritative again.
+evaluation_liveness_guard_enabled = true

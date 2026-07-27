@@ -353,7 +353,10 @@ def test_v9_observation_v2_initialization_inherits_only_model_parameters(
         source_replay = source.transaction_replay.state_dict()
         source_replay.update(
             {
-                "put_count": 19,
+                # Keep replay accounting internally valid while making every
+                # mutable counter non-zero; model initialization must still
+                # ignore the entire source replay sidecar.
+                "put_count": 7,
                 "sample_count": 11,
                 "eviction_count": 7,
                 "duplicate_count": 3,
@@ -430,6 +433,10 @@ def test_v9_observation_v2_initialization_inherits_only_model_parameters(
             "eviction_count": 0,
             "duplicate_count": 0,
             "deadlock_size": 0,
+            "actionable_avoid_size": 0,
+            "selection_cycle_size": 0,
+            "selection_monotonic_completion_size": 0,
+            "selection_corrective_completion_size": 0,
         }
         assert target.transaction_replay.state_dict()["rng_state"] == (initial_replay["rng_state"])
         for key, expected in source_state.items():

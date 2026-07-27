@@ -320,6 +320,9 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     source["version"] = "sts2-relational-curriculum-config-v8"
     rollout = source["rollout"]
     assert isinstance(rollout, dict)
+    # Reconstruct the historical v8 value rather than leaking the current
+    # preheat profile's recurring-probe policy into a legacy fixture.
+    rollout["deterministic_probe_interval_episodes"] = 0
     del rollout["deterministic_probe_environment_steps"]
 
     migrated = _diagnostic_model_initialization_config(source)

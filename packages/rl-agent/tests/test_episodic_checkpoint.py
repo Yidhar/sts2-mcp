@@ -25,6 +25,11 @@ from sts2_rl.training import (
     save_training_checkpoint,
 )
 from sts2_rl.training import checkpointing as checkpointing_module
+from sts2_rl.training.transaction import (
+    TransactionEffect,
+    TransactionStep,
+    TransactionTrace,
+)
 from tests.test_episode_replay import _linear_episode, _snapshot
 from tests.test_rollout_queue import _unroll
 from tests.test_v2_training_pipeline import FakeCombatBackend, _config
@@ -64,6 +69,26 @@ def _episodic_config():
     )
 
 
+def _transaction_config():
+    base = _config()
+    return replace(
+        base,
+        transaction_learning=replace(
+            base.transaction_learning,
+            enabled=True,
+            replay_capacity=8,
+            replay_byte_capacity=20_000_000,
+            sample_traces=2,
+            burn_in_steps=0,
+        ),
+        runtime=replace(
+            base.runtime,
+            device="cpu",
+            collector_device="cpu",
+        ),
+    )
+
+
 def _sequence_identity(sequences: tuple[Any, ...]) -> tuple[tuple[Any, ...], ...]:
     return tuple(
         (
@@ -81,6 +106,33 @@ def _active_snapshot(config: Any):
         _snapshot(),
         config=config.model.to_encoding_config(),
         encoding_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
+    )
+
+
+def _transaction_trace(config: Any, *, trace_id: str) -> TransactionTrace:
+    return TransactionTrace(
+        trace_id=trace_id,
+        episode_id=f"episode-{trace_id}",
+        surface_key="checkpoint-selection-surface",
+        start_step=0,
+        policy_version=3,
+        initial_recurrent_state=np.zeros(
+            config.model.recurrent_hidden_dim,
+            dtype=np.float32,
+        ),
+        steps=(
+            TransactionStep(
+                snapshot=_active_snapshot(config),
+                action_index=0,
+                node_key="checkpoint-selection-node",
+                next_node_key="checkpoint-selection-exit",
+                action_fingerprint="select:first-candidate",
+                effect=TransactionEffect.EXIT,
+                selected_count_delta=1,
+                transaction_return=1.0,
+                return_steps=1,
+            ),
+        ),
     )
 
 
@@ -105,11 +157,7 @@ def _rewrite_as_v3_without_long_heads(checkpoint: Path) -> dict[str, torch.Tenso
     network_path = checkpoint / "network.pt"
     state = torch.load(network_path, map_location="cpu", weights_only=True)
     assert isinstance(state, dict)
-    legacy = {
-        key: value
-        for key, value in state.items()
-        if not key.startswith(_LONG_HEAD_PREFIXES)
-    }
+    legacy = {key: value for key, value in state.items() if not key.startswith(_LONG_HEAD_PREFIXES)}
     torch.save(legacy, network_path)
 
     metadata_path = checkpoint / "metadata.json"
@@ -171,9 +219,7 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
             state=state,
             checkpoint_load_mode="fresh",
         )
-        expected_next = _sequence_identity(
-            source.episodic_replay.sample(5, learn_steps=2, burn_in_steps=1)
-        )
+        expected_next = _sequence_identity(source.episodic_replay.sample(5, learn_steps=2, burn_in_steps=1))
     finally:
         source.close()
 
@@ -181,12 +227,8 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
     assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v4"
     assert metadata["episodic_replay_enabled"] is True
     assert metadata["episodic_replay_spec"] == saved_metrics
-    manifest = json.loads(
-        (checkpoint / "checkpoint.manifest.json").read_text(encoding="utf-8")
-    )
-    sidecar_entries = [
-        entry for entry in manifest["files"] if entry["path"] == "episodic_replay.pkl"
-    ]
+    manifest = json.loads((checkpoint / "checkpoint.manifest.json").read_text(encoding="utf-8"))
+    sidecar_entries = [entry for entry in manifest["files"] if entry["path"] == "episodic_replay.pkl"]
     assert len(sidecar_entries) == 1
     assert len(sidecar_entries[0]["sha256"]) == 64
 
@@ -200,9 +242,7 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
         assert [item.episode_id for item in restored.episodic_replay.snapshot()] == [
             item.episode_id for item in episodes
         ]
-        assert _sequence_identity(
-            restored.episodic_replay.sample(5, learn_steps=2, burn_in_steps=1)
-        ) == expected_next
+        assert _sequence_identity(restored.episodic_replay.sample(5, learn_steps=2, burn_in_steps=1)) == expected_next
     finally:
         restored.close()
 
@@ -227,9 +267,7 @@ def test_missing_episodic_sidecar_fails_before_live_resource_mutation(
     target = build_training_resources(config, backend=FakeCombatBackend())
     try:
         assert target.episodic_replay is not None
-        model_before = {
-            key: value.detach().clone() for key, value in target.model.state_dict().items()
-        }
+        model_before = {key: value.detach().clone() for key, value in target.model.state_dict().items()}
         replay_before = target.episodic_replay.state_dict()
         collector_before = target.collector.state_dict()
         python_before = random.getstate()
@@ -281,9 +319,7 @@ def test_invalid_hashed_episodic_payload_is_probed_before_any_live_mutation(
     target = build_training_resources(config, backend=FakeCombatBackend())
     try:
         assert target.episodic_replay is not None
-        model_before = {
-            key: value.detach().clone() for key, value in target.model.state_dict().items()
-        }
+        model_before = {key: value.detach().clone() for key, value in target.model.state_dict().items()}
         replay_before = target.episodic_replay.state_dict()
         collector_before = target.collector.state_dict()
         torch_before = torch.get_rng_state().clone()
@@ -381,6 +417,172 @@ def test_hash_consistent_snapshot_abi_corruption_fails_before_live_mutation(
         target.close()
 
 
+def test_transaction_replay_restore_reowns_and_freezes_legacy_snapshot_arrays(
+    tmp_path: Path,
+) -> None:
+    config = _transaction_config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        assert source.transaction_replay is not None
+        assert source.transaction_replay.put(_transaction_trace(config, trace_id="legacy-arrays"))
+        checkpoint = save_training_checkpoint(
+            tmp_path / "transaction-legacy-arrays",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=17),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    sidecar = checkpoint / "transaction_replay.pkl"
+    with sidecar.open("rb") as handle:
+        payload = pickle.load(handle)
+    # Protocol 4 reproduces legacy NumPy restoration where read-only flags are
+    # lost. The semantic payload and manifest remain internally consistent.
+    payload = pickle.loads(pickle.dumps(payload, protocol=4))
+    raw_snapshot = payload["items"][0].steps[0].snapshot
+    assert raw_snapshot.action_mask.flags.writeable
+    with sidecar.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=4)
+    _update_manifest_entry(checkpoint, "transaction_replay.pkl")
+
+    target = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        load_training_checkpoint(checkpoint, config=config, resources=target)
+        assert target.transaction_replay is not None
+        restored_snapshot = target.transaction_replay.snapshot()[0].steps[0].snapshot
+        arrays = (
+            restored_snapshot.world.feature_indptr,
+            restored_snapshot.world.feature_indices,
+            restored_snapshot.world.feature_values,
+            restored_snapshot.world.ids,
+            restored_snapshot.candidates.feature_indptr,
+            restored_snapshot.candidates.feature_indices,
+            restored_snapshot.candidates.feature_values,
+            restored_snapshot.candidates.ids,
+            restored_snapshot.locals.feature_indptr,
+            restored_snapshot.locals.feature_indices,
+            restored_snapshot.locals.feature_values,
+            restored_snapshot.locals.ids,
+            restored_snapshot.local_offsets,
+            restored_snapshot.action_mask,
+        )
+        assert all(not array.flags.writeable for array in arrays)
+        assert all(array.flags.owndata for array in arrays)
+    finally:
+        target.close()
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    (
+        ("trace_version", "unsupported transaction trace version"),
+        ("step_return", "observed transaction return requires positive return_steps"),
+        ("fingerprint", "fingerprint differs"),
+        ("config", "config differs"),
+        ("candidate_shape", "action mask length"),
+        ("hidden_shape", "recurrent state differs from model hidden size"),
+        ("accounting", "accounting is inconsistent"),
+    ),
+)
+def test_hash_consistent_transaction_replay_corruption_fails_before_live_mutation(
+    tmp_path: Path,
+    corruption: str,
+    message: str,
+) -> None:
+    config = _transaction_config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        assert source.transaction_replay is not None
+        assert source.transaction_replay.put(_transaction_trace(config, trace_id=f"corrupt-{corruption}"))
+        checkpoint = save_training_checkpoint(
+            tmp_path / f"transaction-{corruption}",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=17),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    sidecar = checkpoint / "transaction_replay.pkl"
+    with sidecar.open("rb") as handle:
+        payload = pickle.load(handle)
+    trace = payload["items"][0]
+    step = trace.steps[0]
+    snapshot = step.snapshot
+    if corruption == "trace_version":
+        object.__setattr__(trace, "version", "corrupt-transaction-trace")
+    elif corruption == "step_return":
+        object.__setattr__(step, "return_steps", None)
+    elif corruption == "fingerprint":
+        object.__setattr__(snapshot, "encoding_fingerprint", "0" * 64)
+    elif corruption == "config":
+        object.__setattr__(
+            snapshot,
+            "config",
+            replace(snapshot.config, max_candidates=snapshot.config.max_candidates + 1),
+        )
+    elif corruption == "candidate_shape":
+        edited_mask = np.asarray([True], dtype=np.bool_)
+        edited_mask.setflags(write=False)
+        object.__setattr__(snapshot, "action_mask", edited_mask)
+    elif corruption == "hidden_shape":
+        edited_hidden = np.zeros(
+            config.model.recurrent_hidden_dim + 1,
+            dtype=np.float32,
+        )
+        edited_hidden.setflags(write=False)
+        object.__setattr__(trace, "initial_recurrent_state", edited_hidden)
+    elif corruption == "accounting":
+        payload["put_count"] += 1
+    else:  # pragma: no cover - parametrization guard
+        raise AssertionError(corruption)
+
+    # The nested payload validator is the restore preflight that understands
+    # transaction trace v3.  A hash-consistent pickle can bypass the atomic
+    # manifest check, but it must not bypass these semantic/shape contracts.
+    with pytest.raises(ValueError, match=message):
+        checkpointing_module._validated_transaction_replay_payload(
+            payload,
+            config=config,
+        )
+
+    with sidecar.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    _update_manifest_entry(checkpoint, "transaction_replay.pkl")
+
+    target = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        assert target.transaction_replay is not None
+        queue_before = target.rollout_queue.snapshot()
+        closed_before = target.rollout_queue.closed
+        model_before = _model_copy(target.model)
+        actor_before = _model_copy(target.collector_model)
+        replay_before = target.transaction_replay.state_dict()
+        collector_before = target.collector.state_dict()
+        python_before = random.getstate()
+        numpy_before = np.random.get_state()
+        torch_before = torch.get_rng_state().clone()
+
+        with pytest.raises(ValueError, match=message):
+            load_training_checkpoint(checkpoint, config=config, resources=target)
+
+        _assert_models_equal(target.model.state_dict(), model_before)
+        _assert_models_equal(target.collector_model.state_dict(), actor_before)
+        assert target.transaction_replay.state_dict() == replay_before
+        assert target.collector.state_dict() == collector_before
+        assert target.rollout_queue.snapshot() == queue_before
+        assert target.rollout_queue.closed is closed_before
+        assert random.getstate() == python_before
+        _assert_numpy_rng_equal(np.random.get_state(), numpy_before)
+        assert torch.equal(torch.get_rng_state(), torch_before)
+        assert len(target.optimizer.state) == 0
+    finally:
+        target.close()
+
+
 @pytest.mark.parametrize("queue_state", ("nonempty", "closed"))
 def test_queue_restore_precondition_fails_before_any_live_resource_mutation(
     tmp_path: Path,
@@ -451,9 +653,7 @@ def test_stochastic_state_captures_collector_only_cuda_rng_without_real_gpu(
     monkeypatch.setattr(torch.cuda, "get_rng_state_all", get_rng_state_all)
     resources = SimpleNamespace(
         device=torch.device("cpu"),
-        collector_model=SimpleNamespace(
-            parameters=lambda: iter((SimpleNamespace(device=torch.device("cuda")),))
-        ),
+        collector_model=SimpleNamespace(parameters=lambda: iter((SimpleNamespace(device=torch.device("cuda")),))),
         collector=SimpleNamespace(state_dict=lambda: {"sentinel": True}),
     )
 
@@ -474,9 +674,7 @@ def test_stochastic_state_cpu_path_does_not_probe_cuda_driver(
     monkeypatch.setattr(torch.cuda, "is_available", unexpected_probe)
     resources = SimpleNamespace(
         device=torch.device("cpu"),
-        collector_model=SimpleNamespace(
-            parameters=lambda: iter((SimpleNamespace(device=torch.device("cpu")),))
-        ),
+        collector_model=SimpleNamespace(parameters=lambda: iter((SimpleNamespace(device=torch.device("cpu")),))),
         collector=SimpleNamespace(state_dict=lambda: {"sentinel": True}),
     )
 
@@ -515,16 +713,8 @@ def test_v3_is_model_initialization_only_and_six_heads_migrate_all_or_none(
 
     target_model = RecurrentCandidateModel(config.model.to_model_config())
     target = target_model.state_dict()
-    legacy = {
-        key: value.detach().clone()
-        for key, value in target.items()
-        if not key.startswith(_LONG_HEAD_PREFIXES)
-    }
-    fresh_heads = {
-        key: value.detach().clone()
-        for key, value in target.items()
-        if key.startswith(_LONG_HEAD_PREFIXES)
-    }
+    legacy = {key: value.detach().clone() for key, value in target.items() if not key.startswith(_LONG_HEAD_PREFIXES)}
+    fresh_heads = {key: value.detach().clone() for key, value in target.items() if key.startswith(_LONG_HEAD_PREFIXES)}
     migrated = checkpointing_module._model_parameter_initialization_state(
         legacy,
         target_state=target,
@@ -625,9 +815,7 @@ def test_v3_parameter_initialization_starts_fresh_optimizer_replays_rng_and_line
         assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v4"
         assert metadata["training_state"] == asdict(TrainingState())
         assert metadata["provenance"]["checkpoint_load_mode"] == "model_initialization"
-        assert metadata["provenance"]["parent_checkpoint"]["relation"] == (
-            "model_parameter_initialization"
-        )
+        assert metadata["provenance"]["parent_checkpoint"]["relation"] == ("model_parameter_initialization")
         assert (migrated / "episodic_replay.pkl").is_file()
     finally:
         target.close()

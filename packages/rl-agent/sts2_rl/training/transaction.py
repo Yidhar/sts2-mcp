@@ -35,8 +35,8 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v2"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v2"
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v3"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v3"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -141,6 +141,14 @@ class TransactionStep:
     selected_count_delta: int
     transaction_return: float | None
     return_steps: int | None
+    # ``node_key`` remains the exact reward/Q identity.  Liveness policy
+    # credit sometimes needs a deliberately coarser identity: for example an
+    # event page can repeat while HP, max HP and native-revival telemetry keep
+    # changing.  Keeping the two keys separate prevents policy-cycle matching
+    # from accidentally merging reward-distinct Q states.  ``None`` preserves
+    # the exact key for ordinary and card-selection transactions.
+    policy_node_key: str | None = None
+    policy_action_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, EncodedDecisionSnapshot):
@@ -153,7 +161,16 @@ class TransactionStep:
             raise ValueError("transaction selected an encoder-disabled candidate")
         _require_key(self.node_key, label="node_key")
         _require_key(self.next_node_key, label="next_node_key")
+        if (self.policy_node_key is None) != (self.policy_action_fingerprint is None):
+            raise ValueError("transaction liveness policy node/action identities must be both present or both absent")
+        if self.policy_node_key is not None:
+            _require_key(self.policy_node_key, label="policy_node_key")
         _require_key(self.action_fingerprint, label="action_fingerprint")
+        if self.policy_action_fingerprint is not None:
+            _require_key(
+                self.policy_action_fingerprint,
+                label="policy_action_fingerprint",
+            )
         if not isinstance(self.effect, TransactionEffect):
             raise TypeError("transaction effect must be TransactionEffect")
         selection_delta_index(self.selected_count_delta)
@@ -169,12 +186,26 @@ class TransactionStep:
     def q_observed(self) -> bool:
         return self.transaction_return is not None
 
+    @property
+    def effective_policy_node_key(self) -> str:
+        """Return the factual node identity used only for policy liveness."""
+
+        return self.policy_node_key or self.node_key
+
+    @property
+    def effective_policy_action_fingerprint(self) -> str:
+        """Return the action identity used only for policy liveness."""
+
+        return self.policy_action_fingerprint or self.action_fingerprint
+
     def storage_nbytes(self) -> int:
         return (
             self.snapshot.storage_nbytes()
             + len(self.node_key.encode("utf-8"))
             + len(self.next_node_key.encode("utf-8"))
+            + (len(self.policy_node_key.encode("utf-8")) if self.policy_node_key is not None else 0)
             + len(self.action_fingerprint.encode("utf-8"))
+            + (len(self.policy_action_fingerprint.encode("utf-8")) if self.policy_action_fingerprint is not None else 0)
             + 64
         )
 
@@ -265,12 +296,13 @@ def factual_transaction_policy_targets(
     are avoided. This labels an explored wrong branch without penalizing the
     corrective deselect that factually returned to the successful route.
 
-    A deadlocked trace has no successful suffix. Only its factual
-    cycle-closing ``STAY``/``REVISIT`` transitions or repeated exact
-    node/action pairs are avoided. A delayed no-progress window containing only
-    unique moving transitions is authoritative value evidence but cannot name
-    one causal action, so it contributes no policy target. Censored traces also
-    contribute no policy target.
+    A deadlocked trace has no successful suffix. Only repeated factual
+    node/action pairs are avoided. A one-off ``STAY``/``REVISIT`` may be a
+    corrective return that merely occurs earlier in the retained failure tail;
+    it is not causal evidence by itself. A delayed no-progress window
+    containing only unique transitions is authoritative value evidence but
+    cannot name one causal action, so it contributes no policy target. Censored
+    traces also contribute no policy target.
 
     The key includes the full semantic transaction node, so a deselect used
     once to correct a choice on a subsequently completed route is preferred;
@@ -292,15 +324,21 @@ def factual_transaction_policy_targets(
         handled_nodes: set[str] = set()
         for local_index in range(len(learn_steps) - 1, -1, -1):
             step = learn_steps[local_index]
-            if step.node_key in handled_nodes:
+            # A local transaction completion is proved against the exact
+            # transaction graph.  Coarse event-liveness identities may also be
+            # carried by these steps so a separate global DEADLOCK trace can
+            # recognize a reopen cycle, but they must never turn a locally
+            # completed prompt into fabricated coarse PREFER credit.
+            policy_node_key = step.node_key
+            if policy_node_key in handled_nodes:
                 continue
-            handled_nodes.add(step.node_key)
+            handled_nodes.add(policy_node_key)
             if step.next_node_key not in reachable_nodes:
                 continue
-            reachable_nodes.add(step.node_key)
+            reachable_nodes.add(policy_node_key)
             if step.effect is not TransactionEffect.STAY:
                 preferred_indices.add(trace.burn_in_steps + local_index)
-                preferred_actions[step.node_key] = step.action_fingerprint
+                preferred_actions[policy_node_key] = step.action_fingerprint
 
     avoided_indices: set[int] = set()
     if trace.outcome is TransactionOutcome.COMPLETED:
@@ -311,12 +349,26 @@ def factual_transaction_policy_targets(
     elif trace.outcome is TransactionOutcome.DEADLOCK:
         pair_counts: dict[tuple[str, str], int] = {}
         for step in learn_steps:
-            pair = (step.node_key, step.action_fingerprint)
+            pair = (
+                step.effective_policy_node_key,
+                step.effective_policy_action_fingerprint,
+            )
             pair_counts[pair] = pair_counts.get(pair, 0) + 1
         for local_index, step in enumerate(learn_steps):
+            # A forced transition can be part of a liveness failure, but there
+            # is no alternative whose probability the actor could increase.
+            # Keep its factual Q/value target and never manufacture policy
+            # blame that would make the learner's AVOID loss undefined.
+            if np.count_nonzero(step.snapshot.action_mask) <= 1:
+                continue
             if (
-                step.effect in {TransactionEffect.STAY, TransactionEffect.REVISIT}
-                or pair_counts[(step.node_key, step.action_fingerprint)] > 1
+                pair_counts[
+                    (
+                        step.effective_policy_node_key,
+                        step.effective_policy_action_fingerprint,
+                    )
+                ]
+                > 1
             ):
                 avoided_indices.add(trace.burn_in_steps + local_index)
 
@@ -466,6 +518,21 @@ def _has_factual_avoid_target(trace: TransactionTrace) -> bool:
     return any(item.target is TransactionPolicyTarget.AVOID for item in factual_transaction_policy_targets(trace))
 
 
+def _selection_replay_stratum(trace: TransactionTrace) -> str | None:
+    """Classify factual selection structure without card/event heuristics."""
+
+    deltas = {step.selected_count_delta for step in trace.learn_steps}
+    has_positive = 1 in deltas
+    has_negative = -1 in deltas
+    if trace.outcome is TransactionOutcome.DEADLOCK:
+        if has_positive and has_negative and _has_factual_avoid_target(trace):
+            return "selection_cycle"
+        return None
+    if trace.outcome is not TransactionOutcome.COMPLETED or not has_positive:
+        return None
+    return "corrective_completion" if has_negative else "monotonic_completion"
+
+
 class BoundedTransactionReplay:
     """Thread-safe, byte-bounded replay sidecar with exact checkpoint state."""
 
@@ -487,6 +554,11 @@ class BoundedTransactionReplay:
         # Derived entirely from immutable traces; checkpoint state need not
         # duplicate it and load reconstructs it fail-closed.
         self._actionable_avoid_trace_ids: set[str] = set()
+        self._selection_strata: dict[str, set[str]] = {
+            "selection_cycle": set(),
+            "monotonic_completion": set(),
+            "corrective_completion": set(),
+        }
         self._storage_nbytes = 0
         self._put_count = 0
         self._sample_count = 0
@@ -505,6 +577,7 @@ class BoundedTransactionReplay:
         if size > self.byte_capacity:
             raise ValueError("one transaction trace exceeds replay byte capacity")
         has_factual_avoid = _has_factual_avoid_target(trace)
+        selection_stratum = _selection_replay_stratum(trace)
         with self._lock:
             if trace.trace_id in self._trace_ids:
                 self._duplicate_count += 1
@@ -518,21 +591,20 @@ class BoundedTransactionReplay:
                 # completions and delayed deadlocks whose unique-moving
                 # windows cannot name a causal action.  Within equal strata,
                 # eviction remains deterministic FIFO.
+                protected_trace_ids = {
+                    *self._actionable_avoid_trace_ids,
+                    *(trace_id for ids in self._selection_strata.values() for trace_id in ids),
+                }
                 eviction_index = next(
                     (
                         index
                         for index, item in enumerate(self._items)
                         if (
-                            item.outcome is not TransactionOutcome.DEADLOCK
-                            and item.trace_id not in self._actionable_avoid_trace_ids
+                            item.outcome is not TransactionOutcome.DEADLOCK and item.trace_id not in protected_trace_ids
                         )
                     ),
                     next(
-                        (
-                            index
-                            for index, item in enumerate(self._items)
-                            if item.trace_id not in self._actionable_avoid_trace_ids
-                        ),
+                        (index for index, item in enumerate(self._items) if item.trace_id not in protected_trace_ids),
                         0,
                     ),
                 )
@@ -540,12 +612,16 @@ class BoundedTransactionReplay:
                 del self._items[eviction_index]
                 self._trace_ids.remove(evicted.trace_id)
                 self._actionable_avoid_trace_ids.discard(evicted.trace_id)
+                for trace_ids in self._selection_strata.values():
+                    trace_ids.discard(evicted.trace_id)
                 self._storage_nbytes -= evicted.storage_nbytes()
                 self._eviction_count += 1
             self._items.append(trace)
             self._trace_ids.add(trace.trace_id)
             if has_factual_avoid:
                 self._actionable_avoid_trace_ids.add(trace.trace_id)
+            if selection_stratum is not None:
+                self._selection_strata[selection_stratum].add(trace.trace_id)
             self._storage_nbytes += size
             self._put_count += 1
             return True
@@ -558,18 +634,50 @@ class BoundedTransactionReplay:
                 return ()
             items = tuple(self._items)
             count = min(maximum, len(items))
+            selected: list[int] = []
+
+            # Selection liveness has three complementary factual structures:
+            # exact +/- cycles, monotonic automatic completion, and completed
+            # corrective deselection.  Sample one of every available structure
+            # before the broad deadlock/ordinary pools so hundreds of unrelated
+            # event traces cannot erase the actor signal needed to escape a
+            # recurrent select/deselect attractor.
+            def select_stratum(stratum: str) -> None:
+                if len(selected) >= count:
+                    return
+                candidates = np.asarray(
+                    [
+                        index
+                        for index, item in enumerate(items)
+                        if item.trace_id in self._selection_strata[stratum] and index not in selected
+                    ],
+                    dtype=np.int64,
+                )
+                if candidates.size:
+                    selected.append(int(self._rng.choice(candidates, size=1, replace=False)[0]))
+
+            # An exact selection cycle is itself an actionable AVOID trace and
+            # gets first refusal.  If no such cycle is available, preserve the
+            # older guarantee that a generic factual AVOID cannot be displaced
+            # by a routine selection completion when ``maximum`` is tiny.
+            select_stratum("selection_cycle")
             actionable_indices = np.asarray(
-                [index for index, item in enumerate(items) if item.trace_id in self._actionable_avoid_trace_ids],
+                [
+                    index
+                    for index, item in enumerate(items)
+                    if (item.trace_id in self._actionable_avoid_trace_ids and index not in set(selected))
+                ],
                 dtype=np.int64,
             )
-            selected: list[int] = []
-            # One factual AVOID-bearing trace is mandatory whenever replay has
-            # one.  Without this separate stratum, hundreds of delayed
-            # deadlocks with intentionally label-free unique transitions can
-            # make exact select/deselect-cycle supervision disappear for many
-            # consecutive learner updates even though it remains in memory.
-            if actionable_indices.size:
+            # Preserve the pre-existing guarantee for non-selection AVOID
+            # traces as well.  A selected cycle already fulfils it.
+            selected_has_actionable = any(
+                items[index].trace_id in self._actionable_avoid_trace_ids for index in selected
+            )
+            if len(selected) < count and not selected_has_actionable and actionable_indices.size:
                 selected.append(int(self._rng.choice(actionable_indices, size=1, replace=False)[0]))
+            select_stratum("monotonic_completion")
+            select_stratum("corrective_completion")
 
             selected_set = set(selected)
             deadlock_indices = np.asarray(
@@ -658,6 +766,10 @@ class BoundedTransactionReplay:
                 "eviction_count": self._eviction_count,
                 "duplicate_count": self._duplicate_count,
                 "deadlock_size": sum(item.outcome is TransactionOutcome.DEADLOCK for item in self._items),
+                "actionable_avoid_size": len(self._actionable_avoid_trace_ids),
+                "selection_cycle_size": len(self._selection_strata["selection_cycle"]),
+                "selection_monotonic_completion_size": len(self._selection_strata["monotonic_completion"]),
+                "selection_corrective_completion_size": len(self._selection_strata["corrective_completion"]),
             }
 
     def state_dict(self) -> dict[str, Any]:
@@ -709,16 +821,30 @@ class BoundedTransactionReplay:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"transaction replay {name} must be non-negative integer")
             counters[name] = value
+        if counters["put_count"] != len(items) + counters["eviction_count"]:
+            raise ValueError(
+                "transaction replay accounting is inconsistent: " "put_count must equal live items plus evictions"
+            )
         probe = np.random.default_rng()
         try:
             probe.bit_generator.state = dict(payload["rng_state"])
         except (TypeError, ValueError) as exc:
             raise ValueError("transaction replay RNG checkpoint is invalid") from exc
         actionable_avoid_trace_ids = {item.trace_id for item in items if _has_factual_avoid_target(item)}
+        selection_strata: dict[str, set[str]] = {
+            "selection_cycle": set(),
+            "monotonic_completion": set(),
+            "corrective_completion": set(),
+        }
+        for item in items:
+            stratum = _selection_replay_stratum(item)
+            if stratum is not None:
+                selection_strata[stratum].add(item.trace_id)
         with self._lock:
             self._items = deque(items)
             self._trace_ids = set(ids)
             self._actionable_avoid_trace_ids = actionable_avoid_trace_ids
+            self._selection_strata = selection_strata
             self._storage_nbytes = storage_nbytes
             self._rng.bit_generator.state = dict(payload["rng_state"])
             self._put_count = counters["put_count"]

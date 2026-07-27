@@ -326,10 +326,12 @@ reversible UI loop earlier. Separately, a 256-decision combat window requires a
 5% net reduction in current enemy-health burden or a real phase/wave advance.
 Damage followed by healing and summon churn do not reset the window. A second
 256-decision non-combat window advances only on durable run progress: run/room/
-event identity, HP/max HP, gold, permanent deck, relic or potion composition,
-or completion. Dynamic preview counters, page/option text, screen/phase and
-selection membership do not reset it, so changing `HpLoss` values and alternating
-select/cancel operations cannot evade the bound. Same-room resource fingerprints
+event identity, gold, permanent deck, relic or potion composition, or completion.
+HP/max HP, transient native death/revival lifecycle flags and cumulative loss
+remain reward/evaluation costs, not forward room progress. Dynamic preview counters, page/option text,
+screen/phase and selection membership do not reset it, so changing vitality,
+`HpLoss` values and alternating select/cancel operations cannot evade the bound.
+Same-room resource fingerprints
 are remembered: a new durable resource state may reset the window once, but a
 bounded `A -> B -> A` or multi-state cycle cannot reset it again. These generic
 fact boundaries do not branch on any particular card/event ID and contain no
@@ -375,7 +377,30 @@ removing only transport identities such as request UUIDs, dispatch handles,
 timestamps and revision counters. Repeated semantic decision/action pairs in a
 bounded window produce explicit `DeadlockEvidence` and terminate the task as a
 failure. Combat and non-combat progress trackers independently catch changing-
-state loops that cannot recur under an exact semantic fingerprint.
+state loops that cannot recur under an exact semantic fingerprint. A separate
+positive-allowlist event-page transition tracker recognizes factual A↔B and
+same-page action cycles while HP, max HP, damage previews and revival counters
+continue changing. A recurrence also requires the same complete semantic legal-
+action surface, so a newly exposed alternative cannot be mistaken for the old
+decision. Strict-equivalence multiplicity and enabled/locked status are part of
+that surface. Its recurrence window is measured in environment decisions, so a
+choice cannot remain actionable after an arbitrarily long suffix of forced
+pages has left the learner trace. It never names an event or assumes which
+unexecuted option is the exit. A forced one-candidate transition (including one
+enabled option beside locked alternatives) can still end under the generic
+safety boundary, but it never receives actor `AVOID` credit; event-cycle policy
+failure requires at least two factual enabled alternatives at the repeated
+decision.
+
+Confirmed event/selection cycles are authoritative policy failures. Complete-run
+replay receives failure value targets, while the bounded transaction sidecar uses
+a coarse liveness-only policy node/action key and retains exact reward/Q nodes.
+Only the repeatedly executed factual action receives `AVOID`; other legal actions
+are not fabricated as `PREFER`. Transaction replay samples exact selection cycles,
+monotonic auto-submit completions and completed corrective deselections as
+separate structures. The preheat profile also records one training-partition,
+epsilon-zero liveness probe every 16 episodes so deterministic argmax failures can
+enter replay without contaminating held-out evaluation.
 
 These are generic loop detectors, not card/UI/boss heuristics. A combat-progress
 termination populates `EpisodeMetrics.stall_evidence` exactly once; every

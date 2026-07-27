@@ -116,6 +116,12 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "combat_policy_failure_count": 0,
             "combat_policy_failure_rate": 0.0,
             "noncombat_progress_stall_rate": 0.0,
+            "trusted_policy_failure_count": 0,
+            "trusted_policy_failure_rate": 0.0,
+            "noncombat_event_cycle_count": 0,
+            "noncombat_event_cycle_rate": 0.0,
+            "selection_action_cycle_count": 0,
+            "selection_action_cycle_rate": 0.0,
             "mean_max_floor": 0.0,
             "maximum_floor": 0,
             "mean_max_act": 0.0,
@@ -157,6 +163,12 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "combat_policy_failure_count": sum(item.combat_policy_failed for item in episodes),
         "combat_policy_failure_rate": (sum(item.combat_policy_failed for item in episodes) / count),
         "noncombat_progress_stall_rate": (sum(item.noncombat_progress_stalled for item in episodes) / count),
+        "trusted_policy_failure_count": sum(item.trusted_policy_failure for item in episodes),
+        "trusted_policy_failure_rate": (sum(item.trusted_policy_failure for item in episodes) / count),
+        "noncombat_event_cycle_count": sum(item.noncombat_event_cycle for item in episodes),
+        "noncombat_event_cycle_rate": (sum(item.noncombat_event_cycle for item in episodes) / count),
+        "selection_action_cycle_count": sum(item.selection_action_cycle for item in episodes),
+        "selection_action_cycle_rate": (sum(item.selection_action_cycle for item in episodes) / count),
         "mean_max_floor": statistics.fmean(item.max_floor for item in episodes),
         "maximum_floor": max(item.max_floor for item in episodes),
         "mean_max_act": statistics.fmean(item.max_act for item in episodes),
@@ -296,7 +308,7 @@ def evaluate_policy(
                         raise
                     if backend_factory is None or attempts >= infrastructure_retries_per_seed:
                         raise EvaluationInfrastructureError(
-                            "held-out evaluation is infrastructure-invalid for " f"seed={evaluation_seed}: {exc}"
+                            f"held-out evaluation is infrastructure-invalid for seed={evaluation_seed}: {exc}"
                         ) from exc
                     attempts += 1
                     infrastructure_retries += 1
@@ -989,7 +1001,7 @@ def run_training(
                         "incidents_last_100_attempts": (incident.incidents_last_100_attempts),
                     },
                 )
-                raise RuntimeError("actor infrastructure circuit breaker opened for " f"{incident.fingerprint}")
+                raise RuntimeError(f"actor infrastructure circuit breaker opened for {incident.fingerprint}")
             if recovery_backend_factory is None:
                 raise RuntimeError(
                     "recoverable actor incident requires an explicit backend "
@@ -1158,7 +1170,7 @@ def run_training(
                 if resources.episodic_replay is not None:
                     if episode.completed_episode is None:
                         raise RuntimeError(
-                            "episodic learning is enabled but the collector emitted no " "completed episode"
+                            "episodic learning is enabled but the collector emitted no completed episode"
                         )
                     episodic_episode_stored = resources.episodic_replay.put(episode.completed_episode)
                 state = replace(
@@ -1297,9 +1309,7 @@ def run_training(
             if actor_result is None:
                 break
             if isinstance(actor_result, RecoverableActorIncident):
-                raise RuntimeError(
-                    "actor exited with an unhandled recoverable incident: " f"{actor_result.incident_id}"
-                )
+                raise RuntimeError(f"actor exited with an unhandled recoverable incident: {actor_result.incident_id}")
             episode = actor_result
             if resources.transaction_replay is not None:
                 for trace in episode.transaction_traces:
@@ -1309,7 +1319,7 @@ def run_training(
             if resources.episodic_replay is not None:
                 if episode.completed_episode is None:
                     raise RuntimeError(
-                        "episodic learning is enabled but the collector emitted no " "completed episode during drain"
+                        "episodic learning is enabled but the collector emitted no completed episode during drain"
                     )
                 resources.episodic_replay.put(episode.completed_episode)
             state = replace(

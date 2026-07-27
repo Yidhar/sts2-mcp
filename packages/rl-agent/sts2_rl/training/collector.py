@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -64,6 +64,7 @@ from .transaction import (
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
+    factual_transaction_policy_targets,
 )
 
 
@@ -114,6 +115,12 @@ class EpisodeMetrics:
     # separate from run_defeat (environment outcome) and transport incidents
     # (which never produce EpisodeMetrics).
     combat_policy_failed: bool = False
+    # Generic confirmed policy-liveness failures include exact semantic cycles
+    # and recurrent non-combat event-page actions.  They are authoritative task
+    # losses even when native revival keeps the simulator run alive.
+    trusted_policy_failure: bool = False
+    noncombat_event_cycle: bool = False
+    selection_action_cycle: bool = False
     maximum_observed_semantic_candidates: int = 0
     maximum_equivalence_class_size: int = 0
     # Cumulative efficiency counters at successful, real Act boundaries.  The
@@ -290,13 +297,9 @@ def _branch_balanced_epsilon_behavior(
     """
 
     if policy.ndim != 1 or valid.ndim != 1 or policy_branch_ids.ndim != 1:
-        raise CollectionProtocolError(
-            "policy, valid mask, and policy branch IDs must be one-dimensional"
-        )
+        raise CollectionProtocolError("policy, valid mask, and policy branch IDs must be one-dimensional")
     if policy.shape != valid.shape or policy.shape != policy_branch_ids.shape:
-        raise CollectionProtocolError(
-            "policy, valid mask, and policy branch IDs have different shapes"
-        )
+        raise CollectionProtocolError("policy, valid mask, and policy branch IDs have different shapes")
     normalized_epsilon = float(epsilon)
     if not math.isfinite(normalized_epsilon) or not 0.0 <= normalized_epsilon <= 1.0:
         raise ValueError("exploration epsilon must be finite and in [0, 1]")
@@ -324,23 +327,16 @@ def _branch_balanced_epsilon_behavior(
         raise CollectionProtocolError("model produced no legal policy branch")
 
     exploration = np.zeros(policy.shape, dtype=np.float64)
-    exploration[valid_indices] = 1.0 / (
-        float(branch_count) * branch_candidate_counts[inverse].astype(np.float64)
-    )
+    exploration[valid_indices] = 1.0 / (float(branch_count) * branch_candidate_counts[inverse].astype(np.float64))
     behavior = np.zeros(policy.shape, dtype=np.float64)
     behavior[valid_indices] = (
-        (1.0 - normalized_epsilon) * valid_policy / policy_mass
-        + normalized_epsilon * exploration[valid_indices]
-    )
+        1.0 - normalized_epsilon
+    ) * valid_policy / policy_mass + normalized_epsilon * exploration[valid_indices]
     behavior_mass = float(behavior.sum())
     if not math.isfinite(behavior_mass) or behavior_mass <= 0.0:
         raise CollectionProtocolError("collector produced zero/non-finite behavior policy mass")
     behavior /= behavior_mass
-    if (
-        not np.all(np.isfinite(behavior))
-        or np.any(behavior < 0.0)
-        or np.any(behavior[~valid] != 0.0)
-    ):
+    if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0) or np.any(behavior[~valid] != 0.0):
         raise CollectionProtocolError("collector produced an invalid behavior policy")
     return behavior
 
@@ -416,6 +412,41 @@ def _semantic_action_multiplicity(action: Mapping[str, object]) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
         raise CollectionProtocolError("semantic action group has invalid multiplicity")
     return raw
+
+
+def _semantic_surface_action_fingerprint(action: Mapping[str, object]) -> str:
+    """Return the exact learned action identity for one semantic candidate."""
+
+    prototype = _semantic_action_prototype(action)
+    raw_equivalence = action.get("equivalence_fingerprint")
+    equivalence_fingerprint = str(raw_equivalence) if raw_equivalence is not None else None
+    return _transaction_action_fingerprint(
+        prototype,
+        equivalence_fingerprint=equivalence_fingerprint,
+    )
+
+
+def _semantic_action_enabled(action: Mapping[str, object]) -> bool:
+    prototype = _semantic_action_prototype(action)
+    return bool(action.get("enabled", prototype.get("is_enabled", prototype.get("enabled", True))))
+
+
+def _semantic_surface_candidate_identity(
+    action: Mapping[str, object],
+) -> tuple[str, int, bool]:
+    """Return all candidate facts that can change the actor's scored input.
+
+    Strictly equal physical actions share one learned candidate, but their
+    multiplicity is encoded into that candidate. Liveness recurrence must
+    therefore distinguish a group of N equal choices from a group of N-1;
+    dropping the count could attach an AVOID label to a different actor node.
+    """
+
+    return (
+        _semantic_surface_action_fingerprint(action),
+        _semantic_action_multiplicity(action),
+        _semantic_action_enabled(action),
+    )
 
 
 _TRANSACTION_SURFACE_FIELDS = (
@@ -1449,11 +1480,12 @@ def _noncombat_durable_projections(
     """Split forward run locus from same-locus persistent resources.
 
     This deliberately excludes event/card/relic ``dynamic_vars``, descriptions,
-    pages, screens, selection membership, damage/heal previews, counters and
-    legal-option text.  Those values are reversible or may change forever
-    without moving the run.  The positive allowlist keeps the detector generic
-    across events while preventing a newly exposed preview counter from
-    silently disabling it.
+    pages, screens, selection membership, HP/max-HP vitality, native-revival
+    telemetry, damage/heal previews, counters and legal-option text.  Those
+    values are costs or reversible state and may change forever without moving
+    the run.  The positive allowlist keeps the detector generic across events
+    while preventing a newly exposed preview counter from silently disabling
+    it.
     """
 
     raw_run = observation.get("run")
@@ -1467,8 +1499,6 @@ def _noncombat_durable_projections(
 
     run_projection: dict[str, object] = {}
     for key, aliases in {
-        "active": ("active", "run_active"),
-        "game_over": ("game_over",),
         "act": ("act", "act_index"),
         "floor": ("floor", "total_floor"),
         "room_type": ("room_type",),
@@ -1488,8 +1518,6 @@ def _noncombat_durable_projections(
     player_projection: dict[str, object] = {}
     for key, aliases in {
         "character": ("character_id", "character", "id"),
-        "hp": ("hp", "current_hp"),
-        "max_hp": ("max_hp", "maximum_hp"),
         "gold": ("gold",),
         "open_potion_slots": ("open_potion_slots",),
     }.items():
@@ -1562,6 +1590,10 @@ def _durable_action_projection(action: Mapping[str, object]) -> Mapping[str, obj
         "slot_index",
         "selection_operation",
         "is_selected",
+        "option_id",
+        "choice_id",
+        "text_key",
+        "is_proceed",
     ):
         item = _first_durable_scalar(action, key)
         if item is not None:
@@ -1581,6 +1613,14 @@ def _durable_action_projection(action: Mapping[str, object]) -> Mapping[str, obj
             "option_index",
             "index",
         )
+        for key, aliases in (
+            ("option_id", ("option_id", "choice_id", "id")),
+            ("option_text_key", ("text_key", "label_key")),
+            ("option_is_proceed", ("is_proceed",)),
+        ):
+            value = _first_durable_scalar(option, *aliases)
+            if value is not None:
+                result[key] = value
     return result
 
 
@@ -1602,6 +1642,282 @@ def _noncombat_context_summary(
         "event_id": str(event.get("event_id", event.get("id")) or ""),
         "event_finished": event.get("is_finished") is True,
     }
+
+
+_EVENT_PAGE_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("description_key", ("description_key",)),
+    ("page_id", ("page_id", "page_key", "current_page_id")),
+    ("page", ("page", "current_page")),
+    ("state_id", ("state_id", "event_state_id")),
+    ("stage_id", ("stage_id", "dialogue_id")),
+)
+
+
+def _noncombat_event_page_projection(
+    observation: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Return a positive-allowlist identity for one visible event page.
+
+    Event pages are *not* durable progress: a finite page cycle must not reset
+    the room-level clock.  They are nevertheless useful factual cycle nodes.
+    This projection intentionally excludes HP, max HP, previews, dynamic vars,
+    option text, damage counters and native-revival telemetry.
+    """
+
+    raw_event = observation.get("event")
+    if not isinstance(raw_event, Mapping):
+        return None
+    event_id = _first_durable_scalar(
+        raw_event,
+        "event_id",
+        "id",
+        "model_id",
+    )
+    if event_id is None:
+        return None
+    page: dict[str, object] = {}
+    for label, aliases in _EVENT_PAGE_FIELDS:
+        value = _first_durable_scalar(raw_event, *aliases)
+        if value is not None:
+            page[label] = value
+    if not page:
+        return None
+    return {
+        "event_id": event_id,
+        "page": page,
+    }
+
+
+def _noncombat_liveness_selection_projection(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> Mapping[str, object] | None:
+    """Project visible prompt/membership facts without vitality/world costs."""
+
+    surface_key = _transaction_surface_key(observation, legal_actions)
+    if surface_key is None:
+        return None
+    selection = _transaction_selection_context(observation, legal_actions) or {}
+    remaining: object | None = None
+    for key in ("remaining_select", "remaining_picks", "remaining", "required_remaining"):
+        if selection.get(key) is not None:
+            remaining = selection[key]
+            break
+    can_confirm = selection.get("can_confirm")
+    if can_confirm is None:
+        can_confirm = any(
+            str(action.get("model_action_variant") or action.get("kind") or "").lower()
+            in {"confirm", "confirm_selection"}
+            for action in _selection_actions(legal_actions)
+        )
+    return {
+        "surface_key": surface_key,
+        "selected": _transaction_selected_identities(observation, legal_actions),
+        "selected_count": _transaction_selected_count(observation, legal_actions),
+        "remaining": remaining,
+        "can_confirm": bool(can_confirm),
+    }
+
+
+def _noncombat_liveness_policy_node_key(
+    observation: Mapping[str, object],
+    legal_actions: tuple[Mapping[str, object], ...],
+) -> str | None:
+    """Build a stable event-cycle policy node without weakening Q identity.
+
+    The exact transaction ``node_key`` still owns complete reward-relevant
+    state.  This second key exists only to decide whether the *same visible
+    event-page action* has factually recurred while vitality and revival costs
+    changed.  Durable resources remain in the key so an action that is really
+    gaining gold, cards, relics or potions is not mislabeled as a loop.
+    """
+
+    if _combat_in_progress(observation) or sum(_semantic_action_enabled(action) for action in legal_actions) <= 1:
+        return None
+    page = _noncombat_event_page_projection(observation)
+    if page is None:
+        return None
+    locus, resources = _noncombat_durable_projections(observation)
+    selection = _noncombat_liveness_selection_projection(
+        observation,
+        legal_actions,
+    )
+    return semantic_fingerprint(
+        {
+            "kind": "noncombat_event_liveness_policy_node",
+            "locus": locus,
+            "resources": resources,
+            "page": page,
+            "decision_domain": observation.get("decision_domain"),
+            "state_type": observation.get("state_type"),
+            "selection": selection,
+            "legal_actions": tuple(sorted(_semantic_surface_candidate_identity(action) for action in legal_actions)),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _NonCombatEventCycleEvidence:
+    window: int
+    repeat_threshold: int
+    occurrences: int
+    cycle_span: int
+    transition_fingerprint: str
+    from_page_fingerprint: str
+    to_page_fingerprint: str
+    action_fingerprint: str
+    policy_node_key: str
+    detected_step: int
+    context: Mapping[str, object]
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "kind": "noncombat_event_action_cycle",
+            "window": self.window,
+            "repeat_threshold": self.repeat_threshold,
+            "occurrences": self.occurrences,
+            "cycle_span": self.cycle_span,
+            "transition_fingerprint": self.transition_fingerprint,
+            "from_page_fingerprint": self.from_page_fingerprint,
+            "to_page_fingerprint": self.to_page_fingerprint,
+            "action_fingerprint": self.action_fingerprint,
+            "policy_node_key": self.policy_node_key,
+            "detected_step": self.detected_step,
+            "context": dict(self.context),
+        }
+
+
+class _NonCombatEventCycleTracker:
+    """Detect repeated factual event-page transitions under volatile vitality.
+
+    A transition includes its source page, complete semantic action surface,
+    chosen semantic action and factual successor page.  Therefore a novel exit
+    or genuinely different choice surface at the threshold clears the
+    recurrence naturally, while A<->B and same-page cycles are detected without
+    naming an event or guessing which unexecuted option is the exit.
+    """
+
+    def __init__(self, *, window: int, repeat_threshold: int) -> None:
+        if window < 2 or repeat_threshold < 2 or repeat_threshold > window:
+            raise ValueError("event cycle window/threshold are inconsistent")
+        self.window = int(window)
+        self.repeat_threshold = int(repeat_threshold)
+        self._history: deque[tuple[int, str]] = deque()
+        self._counts: dict[str, int] = {}
+        self._last_steps: dict[str, int] = {}
+        self._locus_fingerprint = ""
+
+    def reset(self) -> None:
+        self._history.clear()
+        self._counts.clear()
+        self._last_steps.clear()
+        self._locus_fingerprint = ""
+
+    def _append(self, *, step: int, fingerprint: str) -> tuple[int, int]:
+        if self._history and step <= self._history[-1][0]:
+            raise RuntimeError("event-cycle observations must have increasing environment steps")
+
+        # The emitted learner trace is bounded by environment decisions, not by
+        # the number of policy choices. Forced pages may separate two choices
+        # by hundreds of steps, so evict by absolute step age before counting a
+        # recurrence. Otherwise an old choice absent from the learnable tail
+        # could still manufacture a trusted AVOID target.
+        while self._history and step - self._history[0][0] >= self.window:
+            old_step, old = self._history.popleft()
+            remaining = self._counts[old] - 1
+            if remaining:
+                self._counts[old] = remaining
+                if self._last_steps.get(old) == old_step:
+                    self._last_steps[old] = max(
+                        historical_step for historical_step, historical in self._history if historical == old
+                    )
+            else:
+                del self._counts[old]
+                self._last_steps.pop(old, None)
+
+        previous_step = self._last_steps.get(fingerprint)
+        self._history.append((step, fingerprint))
+        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+        self._last_steps[fingerprint] = step
+        return self._counts[fingerprint], (0 if previous_step is None else step - previous_step)
+
+    def observe(
+        self,
+        *,
+        step: int,
+        before_observation: Mapping[str, object],
+        after_observation: Mapping[str, object],
+        action_fingerprint: str,
+        policy_node_key: str | None,
+        durable_progress_kind: str,
+        terminated: bool = False,
+        truncated: bool = False,
+    ) -> _NonCombatEventCycleEvidence | None:
+        if terminated or truncated or _combat_in_progress(before_observation) or _combat_in_progress(after_observation):
+            self.reset()
+            return None
+        before_page = _noncombat_event_page_projection(before_observation)
+        after_page = _noncombat_event_page_projection(after_observation)
+        if before_page is None or after_page is None:
+            self.reset()
+            return None
+        before_locus, _ = _noncombat_durable_projections(before_observation)
+        after_locus, _ = _noncombat_durable_projections(after_observation)
+        before_locus_fingerprint = semantic_fingerprint(before_locus)
+        after_locus_fingerprint = semantic_fingerprint(after_locus)
+        if before_locus_fingerprint != after_locus_fingerprint:
+            self.reset()
+            return None
+        if self._locus_fingerprint and self._locus_fingerprint != after_locus_fingerprint:
+            self.reset()
+        self._locus_fingerprint = after_locus_fingerprint
+        # A genuinely novel structural resource state resets the actionable
+        # cycle history.  HP/max HP/revival churn cannot produce this kind.
+        if durable_progress_kind in {
+            "forward_locus_changed",
+            "new_durable_resource_state",
+            "noncombat_started",
+        }:
+            self._history.clear()
+            self._counts.clear()
+            self._last_steps.clear()
+            return None
+        # The exact coarse node used by actor liveness credit is the authority
+        # for recurrence too. This makes page/domain/state/legal-action/durable-
+        # resource identity congruent with the eventual AVOID grouping. A
+        # forced event transition has no such node; keep prior actionable
+        # history across it but omit the forced action from recurrence counts.
+        if policy_node_key is None:
+            return None
+
+        from_page_fingerprint = semantic_fingerprint(before_page)
+        to_page_fingerprint = semantic_fingerprint(after_page)
+        transition_fingerprint = semantic_fingerprint(
+            {
+                "policy_node_key": policy_node_key,
+                "action": action_fingerprint,
+                "to_page": to_page_fingerprint,
+            }
+        )
+        occurrences, cycle_span = self._append(
+            step=step,
+            fingerprint=transition_fingerprint,
+        )
+        if occurrences < self.repeat_threshold:
+            return None
+        return _NonCombatEventCycleEvidence(
+            window=self.window,
+            repeat_threshold=self.repeat_threshold,
+            occurrences=occurrences,
+            cycle_span=cycle_span,
+            transition_fingerprint=transition_fingerprint,
+            from_page_fingerprint=from_page_fingerprint,
+            to_page_fingerprint=to_page_fingerprint,
+            action_fingerprint=action_fingerprint,
+            policy_node_key=policy_node_key,
+            detected_step=step,
+            context=_noncombat_context_summary(after_observation),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2111,6 +2427,8 @@ class GroundedCollector:
             label="combat_net_progress_encounter_windows",
         )
         self.noncombat_durable_progress_window = noncombat_durable_progress_window
+        self.deadlock_window = deadlock_window
+        self.deadlock_repeat_threshold = deadlock_repeat_threshold
         self.combat_min_net_hp_fraction = float(combat_min_net_hp_fraction)
         self.additional_relics = tuple(str(item) for item in additional_relics)
         self.revival_relic_id = (
@@ -2574,8 +2892,12 @@ class GroundedCollector:
         deadlocked = False
         combat_progress_stalled = False
         noncombat_progress_stalled = False
+        noncombat_durable_stalled = False
+        noncombat_event_cycle = False
+        selection_action_cycle = False
         trusted_policy_failure = False
         stall_evidence: dict[str, object] | None = None
+        event_cycle_evidence: _NonCombatEventCycleEvidence | None = None
         combat_window_selection = _combat_progress_window_selection(
             state.observation,
             default_window=self.combat_net_progress_window,
@@ -2589,6 +2911,17 @@ class GroundedCollector:
         runaway_combat_guard = RunawayCombatGuard()
         noncombat_progress = _NonCombatDurableProgressTracker(
             window=self.noncombat_durable_progress_window,
+        )
+        # A trusted event recurrence must fit wholly inside the learnable tail
+        # of its emitted global trace; otherwise the detector could prove an
+        # old sparse repeat that no longer owns a factual actor AVOID label.
+        liveness_learn_tail_steps = max(
+            _LIVENESS_LEARN_TAIL_STEPS,
+            self.deadlock_repeat_threshold,
+        )
+        noncombat_event_cycles = _NonCombatEventCycleTracker(
+            window=min(self.deadlock_window, liveness_learn_tail_steps),
+            repeat_threshold=self.deadlock_repeat_threshold,
         )
         noncombat_progress_status = noncombat_progress.seed(
             step=0,
@@ -2619,17 +2952,20 @@ class GroundedCollector:
         last_selected_action_kind = ""
         transaction_enabled = bool(record and self.transaction_burn_in_steps is not None)
         transaction_context: deque[tuple[int, TransactionStep]] = deque(
-            maxlen=(self.transaction_burn_in_steps or 0) + _LIVENESS_LEARN_TAIL_STEPS
+            maxlen=(self.transaction_burn_in_steps or 0) + liveness_learn_tail_steps
         )
         # A liveness window can end with a long forced-action suffix. Keep a
         # tiny factual prefix around the most recent actual policy decision so
         # a trusted deadlock still yields an actionable AVOID target instead
         # of a trace containing only singleton choices.
-        last_liveness_policy_prefix: tuple[
-            int,
-            tuple[TransactionStep, ...],
-            int,
-        ] | None = None
+        last_liveness_policy_prefix: (
+            tuple[
+                int,
+                tuple[TransactionStep, ...],
+                int,
+            ]
+            | None
+        ) = None
         transaction_traces_pending: list[TransactionTrace] = []
         active_transaction_surface: str | None = None
         active_transaction_steps: list[TransactionStep] = []
@@ -2639,7 +2975,6 @@ class GroundedCollector:
         active_transaction_seen_nodes: set[str] = set()
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
-        last_task_terminal = False
         # Complete-run replay is collected independently of fixed unroll
         # streaming.  These are immutable CPU snapshots, never recurrent
         # hidden tensors or autograd graphs.
@@ -2719,6 +3054,10 @@ class GroundedCollector:
                 )
                 if transaction_enabled
                 else ""
+            )
+            current_transaction_policy_node = _noncombat_liveness_policy_node_key(
+                state.observation,
+                choice.semantic_actions,
             )
             if current_transaction_surface is not None:
                 if active_transaction_surface is None:
@@ -2818,16 +3157,10 @@ class GroundedCollector:
             runaway_combat_stalled = bool(
                 runaway_combat_status.triggered and not result_terminal and not forced_horizon
             )
+            semantic_liveness_eligible = bool(not result_terminal and not forced_horizon)
             combat_progress_stalled = bool(
-                (combat_progress_status.stalled or runaway_combat_stalled)
-                and not result_terminal
-                and not forced_horizon
+                (combat_progress_status.stalled or runaway_combat_stalled) and semantic_liveness_eligible
             )
-            # A bounded, mechanics-agnostic no-net-progress window is a task
-            # outcome: the policy failed to solve this combat. Native revival
-            # may keep the avatar alive, but it must not turn a strategically
-            # lost state into censored data or an infrastructure timeout.
-            trusted_policy_failure = combat_progress_stalled
             if runaway_combat_stalled:
                 # The accepted transition is the factual terminal learning
                 # prefix. Do not dispatch another forced end-turn into a
@@ -2875,7 +3208,19 @@ class GroundedCollector:
                 maximum_noncombat_no_durable_progress_steps,
                 noncombat_progress_status.maximum_age_steps,
             )
-            noncombat_progress_stalled = bool(noncombat_progress_status.stalled and not result_terminal)
+            noncombat_durable_stalled = bool(noncombat_progress_status.stalled and semantic_liveness_eligible)
+            event_cycle_evidence = noncombat_event_cycles.observe(
+                step=steps_taken,
+                before_observation=state.observation,
+                after_observation=next_state.observation,
+                action_fingerprint=transaction_action_fingerprint,
+                policy_node_key=current_transaction_policy_node,
+                durable_progress_kind=noncombat_progress_status.progress_kind,
+                terminated=next_state.terminated,
+                truncated=next_state.truncated,
+            )
+            noncombat_event_cycle = bool(event_cycle_evidence is not None and semantic_liveness_eligible)
+            noncombat_progress_stalled = bool(noncombat_durable_stalled or noncombat_event_cycle)
             # ``maximum_steps`` may be a runtime's remaining global budget,
             # which can cut an otherwise healthy episode after only one or a
             # few decisions. Only the configured task horizon is a semantic
@@ -2886,7 +3231,47 @@ class GroundedCollector:
             # EnvironmentResult is the terminal authority. The pre-action
             # recurrence has now also been confirmed against its factual
             # successor, so a novel semantic exit is not a synthetic deadlock.
-            effective_deadlock_evidence = None if result_terminal else deadlock_evidence
+            effective_deadlock_evidence = deadlock_evidence if semantic_liveness_eligible else None
+            exact_cycle_has_policy_choice = bool(
+                choice.valid_count > 1
+                or (
+                    current_transaction_surface is not None
+                    and any(
+                        np.count_nonzero(step.snapshot.action_mask) > 1
+                        for step in active_transaction_steps[active_transaction_burn_in:]
+                    )
+                )
+            )
+            selection_action_cycle = bool(
+                effective_deadlock_evidence is not None
+                and current_transaction_surface is not None
+                and exact_cycle_has_policy_choice
+                and not forced_horizon
+            )
+            # Combat no-progress, a repeated factual event transition and a
+            # confirmed exact semantic cycle with a factual choice are policy
+            # outcomes.  Native
+            # revival may keep the avatar alive, but cannot turn these into a
+            # censored infrastructure timeout.  A generic unique-moving
+            # noncombat durable-window stop remains censored because it cannot
+            # factually name a responsible action.
+            trusted_policy_failure = bool(
+                combat_progress_stalled
+                or noncombat_event_cycle
+                or (effective_deadlock_evidence is not None and exact_cycle_has_policy_choice and not forced_horizon)
+            )
+            if noncombat_event_cycle:
+                if event_cycle_evidence is None:  # pragma: no cover - invariant
+                    raise RuntimeError("event cycle lost its terminal evidence")
+                stall_evidence = event_cycle_evidence.to_mapping()
+            elif selection_action_cycle and effective_deadlock_evidence is not None:
+                stall_evidence = dict(effective_deadlock_evidence.to_mapping())
+            elif (
+                effective_deadlock_evidence is not None
+                and not combat_progress_stalled
+                and not noncombat_durable_stalled
+            ):
+                stall_evidence = dict(effective_deadlock_evidence.to_mapping())
             breakdown = self.reward_calculator.evaluate(
                 state,
                 next_state,
@@ -2899,7 +3284,6 @@ class GroundedCollector:
                 horizon_exhausted=bool(curriculum_horizon and self.horizon_as_failure),
             )
             reward_total += breakdown.reward
-            last_task_terminal = breakdown.task_terminal
             revivals_used += breakdown.revivals_used_delta
             player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
@@ -2950,9 +3334,7 @@ class GroundedCollector:
             # its threshold. Keep the terminal reward/value target and the
             # bounded transaction trace, but do not assign that -1 directly to
             # the final selected action through FIFO or episodic policy loss.
-            one_step_policy_decision = bool(
-                choice.valid_count > 1 and breakdown.outcome != "deadlock"
-            )
+            one_step_policy_decision = bool(choice.valid_count > 1 and breakdown.outcome != "deadlock")
             if episodic_enabled:
                 episodic_steps.append(
                     EpisodeDecisionStep(
@@ -3033,14 +3415,14 @@ class GroundedCollector:
                     selected_count_delta=selected_count_delta,
                     transaction_return=None,
                     return_steps=None,
+                    policy_node_key=current_transaction_policy_node,
+                    policy_action_fingerprint=(
+                        transaction_action_fingerprint if current_transaction_policy_node is not None else None
+                    ),
                 )
                 if choice.valid_count > 1:
                     prefix_burn_in = self.transaction_burn_in_steps or 0
-                    prefix_context = (
-                        tuple(transaction_context)[-prefix_burn_in:]
-                        if prefix_burn_in
-                        else ()
-                    )
+                    prefix_context = tuple(transaction_context)[-prefix_burn_in:] if prefix_burn_in else ()
                     last_liveness_policy_prefix = (
                         prefix_context[0][0] if prefix_context else step_offset,
                         (
@@ -3049,9 +3431,10 @@ class GroundedCollector:
                         ),
                         len(prefix_context),
                     )
+                trusted_deadlock_trace_emitted = False
                 if current_transaction_surface is not None:
                     active_transaction_steps.append(factual_transaction_step)
-                    maximum_transaction_steps = (self.transaction_burn_in_steps or 0) + _LIVENESS_LEARN_TAIL_STEPS
+                    maximum_transaction_steps = (self.transaction_burn_in_steps or 0) + liveness_learn_tail_steps
                     if len(active_transaction_steps) > maximum_transaction_steps:
                         overflow = len(active_transaction_steps) - maximum_transaction_steps
                         del active_transaction_steps[:overflow]
@@ -3070,6 +3453,24 @@ class GroundedCollector:
                     if transaction_ended:
                         if active_transaction_surface is None:  # pragma: no cover - start invariant
                             raise RuntimeError("active transaction lost its surface")
+                        if breakdown.outcome == "deadlock" and trusted_policy_failure:
+                            # A same-surface recurrence is itself the grounded
+                            # failed transaction.  If the final action locally
+                            # exits the selection surface but closes a larger
+                            # event/combat liveness cycle, censor this local
+                            # completion and emit a separate global DEADLOCK
+                            # trace below.  Otherwise local EXIT would create a
+                            # PREFER label for the very action the run must
+                            # learn to avoid.
+                            active_transaction_outcome = (
+                                TransactionOutcome.DEADLOCK
+                                if next_transaction_surface == current_transaction_surface
+                                else TransactionOutcome.CENSORED
+                            )
+                        elif next_transaction_surface != current_transaction_surface:
+                            active_transaction_outcome = TransactionOutcome.COMPLETED
+                        else:
+                            active_transaction_outcome = TransactionOutcome.CENSORED
                         transaction_traces_pending.append(
                             TransactionTrace(
                                 trace_id=(
@@ -3087,30 +3488,24 @@ class GroundedCollector:
                                 ),
                                 steps=tuple(active_transaction_steps),
                                 burn_in_steps=active_transaction_burn_in,
-                                outcome=(
-                                    TransactionOutcome.COMPLETED
-                                    if next_transaction_surface != current_transaction_surface
-                                    else TransactionOutcome.DEADLOCK
-                                    if breakdown.outcome == "deadlock"
-                                    else TransactionOutcome.CENSORED
-                                ),
+                                outcome=active_transaction_outcome,
                             )
                         )
+                        trusted_deadlock_trace_emitted = active_transaction_outcome is TransactionOutcome.DEADLOCK
                         active_transaction_surface = None
                         active_transaction_steps = []
                         active_transaction_seen_nodes = set()
-                elif breakdown.outcome == "deadlock":
-                    # Selection cycles are emitted by the active transaction
-                    # above. Other trusted liveness failures (semantic action
-                    # cycles and bounded combat/non-combat no-progress
-                    # windows) still need a factual replay trace. Retain a
-                    # bounded pre-failure prefix: the configured recurrent
-                    # burn-in is detached by the learner and the remaining
-                    # tail supplies liveness/Q labels.
-                    maximum_liveness_steps = (
-                        (self.transaction_burn_in_steps or 0)
-                        + _LIVENESS_LEARN_TAIL_STEPS
-                    )
+                if breakdown.outcome == "deadlock" and (
+                    current_transaction_surface is None
+                    or (trusted_policy_failure and not trusted_deadlock_trace_emitted)
+                ):
+                    # Same-surface selection cycles are emitted by the active
+                    # transaction above. Global liveness failures whose final
+                    # action locally exits/reopens a transaction, plus failures
+                    # outside a transaction, still need this factual trace.
+                    # Retain a bounded prefix: configured recurrent burn-in is
+                    # detached by the learner and the tail supplies labels.
+                    maximum_liveness_steps = (self.transaction_burn_in_steps or 0) + liveness_learn_tail_steps
                     context = (
                         *tuple(transaction_context),
                         (step_offset, factual_transaction_step),
@@ -3122,8 +3517,7 @@ class GroundedCollector:
                     )
                     liveness_start_step = context[0][0]
                     if not any(
-                        np.count_nonzero(step.snapshot.action_mask) > 1
-                        for step in liveness_steps[liveness_burn_in:]
+                        np.count_nonzero(step.snapshot.action_mask) > 1 for step in liveness_steps[liveness_burn_in:]
                     ):
                         # The bounded tail may be entirely forced even though
                         # an earlier policy choice caused the failure. Prefer
@@ -3138,8 +3532,12 @@ class GroundedCollector:
                     failure_kind = (
                         "combat_no_net_progress"
                         if combat_progress_stalled
+                        else "noncombat_event_action_cycle"
+                        if noncombat_event_cycle
+                        else "selection_action_cycle"
+                        if selection_action_cycle
                         else "noncombat_no_durable_progress"
-                        if noncombat_progress_stalled
+                        if noncombat_durable_stalled
                         else "semantic_action_cycle"
                     )
                     failure_surface = semantic_fingerprint(
@@ -3153,26 +3551,57 @@ class GroundedCollector:
                             },
                         }
                     )
-                    transaction_traces_pending.append(
-                        TransactionTrace(
-                            trace_id=(
-                                f"seed-{reset_seed}:{state.episode_id}:"
-                                f"{liveness_start_step}:"
-                                f"{step_offset}:{failure_surface}"
-                            ),
-                            episode_id=f"seed-{reset_seed}:{state.episode_id}",
-                            surface_key=failure_surface,
-                            start_step=liveness_start_step,
-                            policy_version=segment_policy_version,
-                            initial_recurrent_state=np.zeros(
-                                self.model.config.recurrent_hidden_dim,
-                                dtype=np.float32,
-                            ),
-                            steps=liveness_steps,
-                            burn_in_steps=liveness_burn_in,
-                            outcome=TransactionOutcome.DEADLOCK,
-                        )
+                    liveness_trace = TransactionTrace(
+                        trace_id=(
+                            f"seed-{reset_seed}:{state.episode_id}:"
+                            f"{liveness_start_step}:"
+                            f"{step_offset}:{failure_surface}"
+                        ),
+                        episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                        surface_key=failure_surface,
+                        start_step=liveness_start_step,
+                        policy_version=segment_policy_version,
+                        initial_recurrent_state=np.zeros(
+                            self.model.config.recurrent_hidden_dim,
+                            dtype=np.float32,
+                        ),
+                        steps=liveness_steps,
+                        burn_in_steps=liveness_burn_in,
+                        outcome=(
+                            TransactionOutcome.DEADLOCK if trusted_policy_failure else TransactionOutcome.CENSORED
+                        ),
                     )
+                    if trusted_policy_failure:
+                        failed_policy_pairs = {
+                            (
+                                liveness_trace.steps[target.step_index].effective_policy_node_key,
+                                liveness_trace.steps[target.step_index].effective_policy_action_fingerprint,
+                            )
+                            for target in factual_transaction_policy_targets(liveness_trace)
+                        }
+                        if failed_policy_pairs:
+                            # Before the global loop became provable, its action
+                            # may have locally completed/reopened one or more
+                            # selection prompts. Censor only COMPLETED traces
+                            # containing a now-grounded AVOID pair so the same
+                            # actor action cannot receive contradictory PREFER
+                            # and AVOID labels. Q/effect facts remain intact.
+                            for trace_index, pending_trace in enumerate(transaction_traces_pending):
+                                if pending_trace.outcome is not TransactionOutcome.COMPLETED:
+                                    continue
+                                if any(
+                                    (
+                                        step.effective_policy_node_key,
+                                        step.effective_policy_action_fingerprint,
+                                    )
+                                    in failed_policy_pairs
+                                    for step in pending_trace.learn_steps
+                                ):
+                                    transaction_traces_pending[trace_index] = replace(
+                                        pending_trace,
+                                        outcome=TransactionOutcome.CENSORED,
+                                    )
+                    transaction_traces_pending.append(liveness_trace)
                 transaction_context.append((step_offset, factual_transaction_step))
             if trajectory_journal is not None:
                 journal_deadlock: Mapping[str, object] | None = None
@@ -3180,7 +3609,15 @@ class GroundedCollector:
                     if stall_evidence is None:  # pragma: no cover - construction invariant
                         raise RuntimeError("combat stall lost its terminal evidence")
                     journal_deadlock = stall_evidence
-                elif noncombat_progress_stalled:
+                elif noncombat_event_cycle:
+                    if stall_evidence is None:  # pragma: no cover - construction invariant
+                        raise RuntimeError("event cycle lost its terminal evidence")
+                    journal_deadlock = stall_evidence
+                elif selection_action_cycle:
+                    if effective_deadlock_evidence is None:  # pragma: no cover - invariant
+                        raise RuntimeError("selection cycle lost its terminal evidence")
+                    journal_deadlock = effective_deadlock_evidence.to_mapping()
+                elif noncombat_durable_stalled:
                     journal_deadlock = {
                         "kind": "noncombat_no_durable_progress",
                         "window": self.noncombat_durable_progress_window,
@@ -3371,9 +3808,23 @@ class GroundedCollector:
             raise RuntimeError("collector exited with an unflushed rollout segment")
         if active_transaction_surface is not None:
             raise RuntimeError("collector exited with an unclosed transaction trace")
+        terminal_facts = state.transition.facts if state.transition is not None else {}
+        typed_run_result = terminal_facts.get("run_result")
+        typed_combat_result = terminal_facts.get("combat_result")
+        authoritative_native_outcome = bool(
+            state.terminated
+            and (
+                (self.objective == "run" and typed_run_result in {"victory", "defeat"})
+                or (self.objective == "combat" and typed_combat_result in {"victory", "defeat"})
+            )
+        )
+        # Only typed simulator terminals and failures with grounded policy
+        # evidence may create Monte-Carlo Q labels.  A generic liveness stop is
+        # deliberately censored: ``last_task_terminal`` merely says that the
+        # collector stopped, not that the selected action factually failed.
+        authoritative_outcome = bool(authoritative_native_outcome or trusted_policy_failure)
         transaction_traces: tuple[TransactionTrace, ...] = ()
         if transaction_traces_pending:
-            authoritative_outcome = bool(state.terminated or last_task_terminal)
             transaction_traces = tuple(
                 backfill_factual_monte_carlo_returns(
                     trace,
@@ -3383,7 +3834,6 @@ class GroundedCollector:
                 )
                 for trace in transaction_traces_pending
             )
-        terminal_facts = state.transition.facts if state.transition is not None else {}
         run_won = bool(self.objective == "run" and state.terminated and terminal_facts.get("run_result") == "victory")
         combat_won = bool(
             self.objective == "combat" and state.terminated and terminal_facts.get("combat_result") == "victory"
@@ -3395,10 +3845,14 @@ class GroundedCollector:
         resolved_terminal_reason = (
             "combat_progress_stall"
             if combat_progress_stalled
+            else "noncombat_event_action_cycle"
+            if noncombat_event_cycle
+            else "selection_action_cycle"
+            if selection_action_cycle
             else "noncombat_progress_stall"
-            if noncombat_progress_stalled
+            if noncombat_durable_stalled
             else "semantic_deadlock"
-            if deadlocked
+            if effective_deadlock_evidence is not None
             else "curriculum_horizon"
             if curriculum_horizon and self.horizon_as_failure
             else "collection_budget"
@@ -3409,7 +3863,6 @@ class GroundedCollector:
         if episodic_enabled:
             if not episodic_steps:  # reset validation and a positive horizon make this unreachable
                 raise RuntimeError("run episode ended without an accepted episodic decision")
-            typed_run_result = terminal_facts.get("run_result")
             authoritative_run_outcome = bool(state.terminated and typed_run_result in {"victory", "defeat"})
             observed_task_outcome = bool(authoritative_run_outcome or trusted_policy_failure)
             completion = EpisodeCompletion(
@@ -3460,7 +3913,10 @@ class GroundedCollector:
                 revival_free_run_win=bool(run_won and revivals_used == 0),
                 player_hp_lost=player_hp_lost,
                 stall_evidence=stall_evidence,
-                combat_policy_failed=trusted_policy_failure,
+                combat_policy_failed=combat_progress_stalled,
+                trusted_policy_failure=trusted_policy_failure,
+                noncombat_event_cycle=noncombat_event_cycle,
+                selection_action_cycle=selection_action_cycle,
                 maximum_observed_semantic_candidates=(maximum_observed_semantic_candidates),
                 maximum_equivalence_class_size=(maximum_equivalence_class_size),
                 act_revival_counts=tuple(item[0] for item in ordered_act_efficiency),

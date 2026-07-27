@@ -63,11 +63,7 @@ def _observation(
         "combat": {
             "in_progress": combat,
             "encounter_id": encounter_id,
-            "enemies": (
-                [{"id": "enemy", "hp": 20, "max_hp": 20}]
-                if combat
-                else []
-            ),
+            "enemies": ([{"id": "enemy", "hp": 20, "max_hp": 20}] if combat else []),
         },
         "run": {
             "active": True,
@@ -173,22 +169,15 @@ class _ScriptedRunBackend:
         self._step += 1
         state_index = min(self._step, len(self.states) - 1)
         after_observation = self.states[state_index]
-        terminal = bool(
-            self.terminal_result is not None
-            and self._step >= len(self.states) - 1
-        )
+        terminal = bool(self.terminal_result is not None and self._step >= len(self.states) - 1)
         before_combat = bool(before_observation["combat"]["in_progress"])
         after_combat = bool(after_observation["combat"]["in_progress"])
         combat_result = (
             "victory"
-            if before_combat and not after_combat and not (
-                terminal and self.terminal_result == "defeat"
-            )
+            if before_combat and not after_combat and not (terminal and self.terminal_result == "defeat")
             else "none"
         )
-        terminal_reason = (
-            f"run_{self.terminal_result}" if terminal else None
-        )
+        terminal_reason = f"run_{self.terminal_result}" if terminal else None
         episode_id = f"scripted-run-{self._episode}"
         return EnvironmentResult(
             episode_id=episode_id,
@@ -237,11 +226,7 @@ class _AuditableReward:
         run_result = facts.get("run_result")
         task_terminal = bool(after.terminated or deadlock or horizon_exhausted)
         terminal_reward = (
-            1.0
-            if run_result == "victory"
-            else -1.0
-            if run_result == "defeat" or deadlock or horizon_exhausted
-            else 0.0
+            1.0 if run_result == "victory" else -1.0 if run_result == "defeat" or deadlock or horizon_exhausted else 0.0
         )
         progress_reward = float(self.progress_by_step.get(after.step_index, 0.0))
         # The +37 shaped component must never enter EpisodeDecisionStep.task_reward.
@@ -295,9 +280,7 @@ def _run_config(
             deadlock_repeat_threshold=64,
             combat_net_progress_window=combat_window,
             combat_net_progress_room_windows=combat_room_windows or {},
-            combat_net_progress_encounter_windows=(
-                combat_encounter_windows or {}
-            ),
+            combat_net_progress_encounter_windows=(combat_encounter_windows or {}),
             noncombat_durable_progress_window=durable_window,
             combat_min_net_hp_fraction=0.05,
             journal_policy_topk=5,
@@ -338,10 +321,7 @@ def test_decision_surface_uses_factual_state_identity_and_canonical_combat() -> 
         )
         == "combat"
     )
-    assert (
-        _episodic_decision_surface({}, combat_in_progress=False)
-        == "noncombat"
-    )
+    assert _episodic_decision_surface({}, combat_in_progress=False) == "noncombat"
 
 
 def test_streamed_full_run_backfills_boundaries_exact_costs_and_primary_reward() -> None:
@@ -513,7 +493,6 @@ def test_collection_budget_is_censored_and_does_not_fabricate_targets() -> None:
     assert not only.combat.observed
 
 
-
 def test_durable_deck_fingerprint_is_multiplicity_aware_and_bounded() -> None:
     card = {"id": "CARD.STRIKE_IRONCLAD", "upgrade_level": 0}
     expanded = {"player": {"deck_cards": [dict(card) for _ in range(7)]}}
@@ -529,6 +508,49 @@ def test_durable_deck_fingerprint_is_multiplicity_aware_and_bounded() -> None:
     deck = compressed_resources["player"]["deck"]
     assert len(deck) == 1
     assert deck[0][-1] == 7
+
+
+def test_noncombat_progress_projection_ignores_vitality_and_revival_churn() -> None:
+    before = _observation(
+        act=1,
+        floor=9,
+        combat=False,
+        revivals=0,
+        hp_loss=0.0,
+        room_model_id="EVENT.VITALITY",
+    )
+    after = _observation(
+        act=1,
+        floor=9,
+        combat=False,
+        revivals=999,
+        hp_loss=1_000_000.0,
+        room_model_id="EVENT.VITALITY",
+    )
+    before_player = before["player"]
+    after_player = after["player"]
+    assert isinstance(before_player, dict)
+    assert isinstance(after_player, dict)
+    before_player.update({"hp": 1, "max_hp": 80})
+    after_player.update({"hp": 500, "max_hp": 2_000})
+    before_run = before["run"]
+    after_run = after["run"]
+    assert isinstance(before_run, dict)
+    assert isinstance(after_run, dict)
+    # Native death/revival can transiently toggle run-lifecycle flags without
+    # leaving the current Act/floor/room/event.  Terminality is handled by the
+    # accepted transition, not by treating these volatile flags as progress.
+    before_run.update({"active": True, "game_over": False})
+    after_run.update({"active": False, "game_over": True})
+
+    before_locus, before_resources = _noncombat_durable_projections(before)
+    after_locus, after_resources = _noncombat_durable_projections(after)
+    assert before_locus == after_locus
+    assert before_resources == after_resources
+
+    after_player["gold"] = int(after_player.get("gold", 0)) + 1
+    _, gold_resources = _noncombat_durable_projections(after)
+    assert gold_resources != before_resources
 
 
 def test_combat_stall_is_observed_policy_failure_with_full_run_credit() -> None:
@@ -560,6 +582,7 @@ def test_combat_stall_is_observed_policy_failure_with_full_run_credit() -> None:
     assert all(step.act.observed and step.act.success is False for step in completed.steps)
     assert all(step.run.observed and step.run.success is False for step in completed.steps)
     assert all(not step.run.efficiency_eligible for step in completed.steps)
+
 
 @pytest.mark.parametrize(
     (
@@ -639,12 +662,8 @@ def test_combat_stall_uses_scoped_room_or_encounter_window_and_records_source(
     assert evidence["default_window"] == 8
     assert evidence["window_source"] == source
     assert evidence["window_match_id"] == match_id
-    assert evidence["room_model_id"] == (
-        room_model_id.strip().upper() if room_model_id is not None else None
-    )
-    assert evidence["encounter_id"] == (
-        encounter_id.strip().upper() if encounter_id is not None else None
-    )
+    assert evidence["room_model_id"] == (room_model_id.strip().upper() if room_model_id is not None else None)
+    assert evidence["encounter_id"] == (encounter_id.strip().upper() if encounter_id is not None else None)
     assert progress
     assert progress[-1].combat_net_progress_window == window
     assert progress[-1].combat_progress_window_source == source
@@ -903,10 +922,7 @@ def test_one_episode_runtime_learns_after_storing_complete_episode(
     assert replay_spec["sample_count"] >= 1
     assert (metadata_paths[0].parent / "episodic_replay.pkl").is_file()
     metrics_path = next(tmp_path.rglob("metrics.jsonl"))
-    events = [
-        json.loads(line)
-        for line in metrics_path.read_text(encoding="utf-8").splitlines()
-    ]
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     learner_updates = [item for item in events if item["event"] == "learner_update"]
     assert len(learner_updates) == 1
     assert learner_updates[0]["unrolls"] == 1

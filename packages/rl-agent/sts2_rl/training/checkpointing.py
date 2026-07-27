@@ -7,7 +7,7 @@ import pickle
 import random
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,11 @@ from .config import TrainingConfig, training_config_from_mapping
 from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
 from .seeding import SIGNED_INT32_MAX
-from .transaction import BoundedTransactionReplay
+from .transaction import (
+    BoundedTransactionReplay,
+    TransactionStep,
+    TransactionTrace,
+)
 
 _CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v4"
 _LEGACY_MODEL_INITIALIZATION_FORMATS = frozenset({"sts2-recurrent-vtrace-checkpoint-v3"})
@@ -369,6 +373,16 @@ def _validated_transaction_replay_payload(
     *,
     config: TrainingConfig,
 ) -> dict[str, Any]:
+    """Validate and normalize a detached transaction replay payload.
+
+    Pickle restores dataclass instances without invoking their ``__post_init__``
+    methods.  The replay container can therefore prove its own capacity, RNG,
+    and index invariants while still containing a stale or malformed nested
+    trace.  Reconstruct every trace/step to re-run the v3 dataclass contracts,
+    and validate every encoded snapshot against the active decision ABI before
+    any live learner resource is mutated.
+    """
+
     if not isinstance(payload, dict):
         raise TypeError("transaction replay checkpoint must be an object")
     probe = BoundedTransactionReplay(
@@ -378,12 +392,50 @@ def _validated_transaction_replay_payload(
     )
     probe.load_state_dict(payload)
     configured_burn_in = config.transaction_learning.burn_in_steps
+    expected_config = config.model.to_encoding_config()
+    expected_fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+    expected_hidden_shape = (config.model.recurrent_hidden_dim,)
+    validated_traces: list[TransactionTrace] = []
     for trace in probe.snapshot():
-        if trace.burn_in_steps > configured_burn_in:
+        validated_steps: list[TransactionStep] = []
+        for step in trace.steps:
+            raw_snapshot = step.snapshot
+            # Protocol-5 checkpoints preserve NumPy read-only flags, but direct
+            # state dictionaries and older pickle protocols do not. Rebuild all
+            # three sparse tables and the snapshot so every nested array is an
+            # owned, immutable replay object before it can reach live state.
+            validated_snapshot = replace(
+                raw_snapshot,
+                world=replace(raw_snapshot.world),
+                candidates=replace(raw_snapshot.candidates),
+                locals=replace(raw_snapshot.locals),
+            )
+            # ``replace`` invokes the generated constructor and consequently
+            # ``TransactionStep.__post_init__``.  This is intentionally done on
+            # a detached copy: validation during checkpoint publication must
+            # not mutate the immutable trace already owned by the live replay.
+            validated_step = replace(step, snapshot=validated_snapshot)
+            validated_step.snapshot.validate(
+                expected_config=expected_config,
+                expected_fingerprint=expected_fingerprint,
+            )
+            validated_steps.append(validated_step)
+        # Likewise, reconstructing the trace re-applies its version, training
+        # partition, key, outcome, burn-in, and zero-state invariants that
+        # pickle itself does not execute.
+        validated_trace = replace(trace, steps=tuple(validated_steps))
+        if validated_trace.initial_recurrent_state.shape != expected_hidden_shape:
+            raise ValueError("checkpoint transaction recurrent state differs from model hidden size")
+        if validated_trace.burn_in_steps > configured_burn_in:
             raise ValueError("checkpoint transaction trace exceeds configured burn-in")
-        if trace.start_step > 0 and trace.burn_in_steps != configured_burn_in:
+        if validated_trace.start_step > 0 and validated_trace.burn_in_steps != configured_burn_in:
             raise ValueError("checkpoint non-initial transaction trace lacks configured burn-in")
-    return payload
+        validated_traces.append(validated_trace)
+    # Load exact continuation from the reconstructed immutable objects rather
+    # than the raw pickle graph.  Ordering and replay-owned RNG/counters remain
+    # byte-for-byte equivalent; only construction-time ownership/invariants are
+    # normalized.
+    return {**payload, "items": tuple(validated_traces)}
 
 
 def _new_episodic_replay(*, config: TrainingConfig) -> BoundedEpisodicReplay:
