@@ -19,14 +19,17 @@ from sts2_rl.training import (
     load_training_config,
     training_config_from_mapping,
 )
-from sts2_rl.training.config import EpisodicLearningConfig
+from sts2_rl.training.config import (
+    EpisodicLearningConfig,
+    model_initialization_config_from_mapping,
+)
 
 
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v10"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v11"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -40,6 +43,9 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert not combat.episodic_learning.enabled
     assert preheat.episodic_learning.enabled
     assert preheat.episodic_learning.sample_sequences == 2
+    assert default.episodic_learning.fresh_policy_sequences == 0
+    assert combat.episodic_learning.fresh_policy_sequences == 0
+    assert preheat.episodic_learning.fresh_policy_sequences == 0
     assert preheat.episodic_learning.burn_in_steps == 32
     assert preheat.episodic_learning.learn_steps == 32
     assert preheat.episodic_learning.macro_sample_fraction == 0.5
@@ -201,6 +207,68 @@ def test_v25_budget64_overlay_changes_only_the_revival_curriculum_lineage() -> N
     assert finite.runtime.final_audit_steps == (100_000,)
     assert finite.runtime.final_audit_episodes == 32
     assert finite.runtime.evaluation_liveness_guard_enabled
+
+
+def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None:
+    experiment_root = Path(__file__).parents[1] / "config" / "experiments"
+    predecessor = load_training_config(
+        profile="preheat",
+        config_path=(experiment_root / "full_run_revival_v25_budget64_model_init.toml"),
+    )
+    restored_signal = load_training_config(
+        profile="preheat",
+        config_path=(
+            experiment_root
+            / "full_run_revival_v26_fresh_policy_credit_model_init.toml"
+        ),
+    )
+
+    # This lineage isolates the signal-path repair: network/encoding, reward,
+    # finite-revival curriculum, environment and diagnostics remain frozen.
+    assert restored_signal.model == predecessor.model
+    assert restored_signal.optimization == predecessor.optimization
+    assert restored_signal.curriculum == predecessor.curriculum
+    assert restored_signal.transaction_learning == predecessor.transaction_learning
+    assert restored_signal.environment == predecessor.environment
+    assert restored_signal.diagnostics == predecessor.diagnostics
+
+    assert predecessor.episodic_learning.fresh_policy_sequences == 0
+    assert restored_signal.episodic_learning == replace(
+        predecessor.episodic_learning,
+        fresh_policy_sequences=1,
+    )
+    assert predecessor.rollout.queue_capacity == 64
+    assert restored_signal.rollout == replace(
+        predecessor.rollout,
+        queue_capacity=24,
+    )
+
+    expected_lineage = predecessor.lineage_mapping()
+    expected_lineage["episodic_learning"] = {
+        **expected_lineage["episodic_learning"],
+        "fresh_policy_sequences": 1,
+    }
+    expected_lineage["rollout"] = {
+        **expected_lineage["rollout"],
+        "queue_capacity": 24,
+    }
+    assert restored_signal.lineage_mapping() == expected_lineage
+
+    assert restored_signal.runtime.total_environment_steps == 100_000
+    assert restored_signal.runtime.evaluation_steps == (
+        0,
+        25_000,
+        50_000,
+        75_000,
+        90_000,
+    )
+    assert restored_signal.runtime.early_evaluation_steps == (5_000, 10_000, 20_000)
+    assert restored_signal.runtime.final_audit_steps == (100_000,)
+    assert restored_signal.runtime.final_audit_episodes == 32
+    assert restored_signal.runtime.log_dir.endswith(
+        "full-run-revival-v26-fresh-policy-credit-model-init"
+    )
+
 
 def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
@@ -399,6 +467,34 @@ def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
         training_config_from_mapping(payload)
 
 
+def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v10"
+    episodic = source["episodic_learning"]
+    assert isinstance(episodic, dict)
+    del episodic["fresh_policy_sequences"]
+
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.episodic_learning.fresh_policy_sequences == 0
+
+    unexpected = dict(source)
+    unexpected["episodic_learning"] = {
+        **episodic,
+        "fresh_policy_sequences": 1,
+    }
+    with pytest.raises(ValueError, match="unexpectedly contains"):
+        model_initialization_config_from_mapping(unexpected)
+
+    unsupported = dict(source)
+    unsupported["version"] = "sts2-relational-curriculum-config-v9"
+    with pytest.raises(ValueError, match="no reviewed config migration"):
+        model_initialization_config_from_mapping(unsupported)
+
+
 def test_unknown_replay_section_is_rejected() -> None:
     payload = TrainingConfig().to_mapping()
     payload["replay"] = {"capacity": 100_000}
@@ -410,6 +506,7 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
     config = EpisodicLearningConfig(enabled=True)
     assert config.replay_capacity_episodes == 64
     assert config.sample_sequences * config.learn_steps == 64
+    assert config.fresh_policy_sequences == 0
     assert config.policy_gradient_max_lag == 128
     with pytest.raises(TypeError, match="enabled must be a boolean"):
         EpisodicLearningConfig(enabled=1)  # type: ignore[arg-type]
@@ -434,6 +531,15 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
         EpisodicLearningConfig(macro_sample_fraction=1.01)
     with pytest.raises(ValueError, match="macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=float("nan"))
+    with pytest.raises(TypeError, match="fresh_policy_sequences"):
+        EpisodicLearningConfig(fresh_policy_sequences=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fresh_policy_sequences"):
+        EpisodicLearningConfig(fresh_policy_sequences=-1)
+    with pytest.raises(ValueError, match="cannot exceed sample_sequences"):
+        EpisodicLearningConfig(
+            sample_sequences=2,
+            fresh_policy_sequences=3,
+        )
 
 
 def test_missing_episodic_section_uses_disabled_compatibility_defaults() -> None:
@@ -462,3 +568,17 @@ def test_episodic_learning_contract_is_part_of_lineage_identity() -> None:
     round_tripped = training_config_from_mapping(changed_sampling.to_mapping())
     assert round_tripped.episodic_learning.macro_sample_fraction == 0.5
     assert round_tripped == changed_sampling
+
+    changed_fresh_sampling = replace(
+        base,
+        episodic_learning=replace(
+            base.episodic_learning,
+            fresh_policy_sequences=1,
+        ),
+    )
+    assert changed_fresh_sampling.lineage_mapping() != base.lineage_mapping()
+    fresh_round_trip = training_config_from_mapping(
+        changed_fresh_sampling.to_mapping()
+    )
+    assert fresh_round_trip.episodic_learning.fresh_policy_sequences == 1
+    assert fresh_round_trip == changed_fresh_sampling

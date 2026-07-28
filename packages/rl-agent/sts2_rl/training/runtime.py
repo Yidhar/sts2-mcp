@@ -422,7 +422,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     return {
         "config_version": config.version,
         "profile": config.profile,
-        "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
+        "pipeline": "bounded-fifo-async-vtrace-episodic-v5",
         "collector_device": config.runtime.collector_device,
         "architecture": config.model.architecture,
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
@@ -448,6 +448,9 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "replay_capacity_bytes": config.episodic_learning.replay_capacity_bytes,
             "per_episode_capacity_bytes": (config.episodic_learning.per_episode_capacity_bytes),
             "sample_sequences": config.episodic_learning.sample_sequences,
+            "fresh_policy_sequences": (
+                config.episodic_learning.fresh_policy_sequences
+            ),
             "burn_in_steps": config.episodic_learning.burn_in_steps,
             "learn_steps": config.episodic_learning.learn_steps,
             "macro_sample_fraction": (config.episodic_learning.macro_sample_fraction),
@@ -675,7 +678,7 @@ def run_training(
                 "config": config.to_mapping(),
                 "config_fingerprint_sha256": config.fingerprint_sha256(),
                 "runtime_provenance": dict(runtime_provenance or {}),
-                "pipeline": "bounded-fifo-async-vtrace-episodic-v4",
+                "pipeline": "bounded-fifo-async-vtrace-episodic-v5",
                 "checkpoint_load": {
                     "mode": load_mode,
                     "parent_checkpoint": (str(parent_checkpoint) if parent_checkpoint is not None else None),
@@ -1042,21 +1045,37 @@ def run_training(
             if not batch:
                 raise ValueError("runtime cannot learn an empty rollout batch")
             update_number = state.learner_updates + 1
+            policy_version_before_update = state.policy_version
             batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
             transaction_traces = (
                 resources.transaction_replay.sample(config.transaction_learning.sample_traces)
                 if resources.transaction_replay is not None
                 else ()
             )
-            episodic_sequences = (
-                resources.episodic_replay.sample(
+            episodic_sample = (
+                resources.episodic_replay.sample_for_learning(
                     config.episodic_learning.sample_sequences,
                     learn_steps=config.episodic_learning.learn_steps,
                     burn_in_steps=config.episodic_learning.burn_in_steps,
                     macro_sample_fraction=(config.episodic_learning.macro_sample_fraction),
+                    current_policy_version=policy_version_before_update,
+                    policy_gradient_max_lag=(
+                        config.episodic_learning.policy_gradient_max_lag
+                    ),
+                    fresh_policy_sequences=(
+                        config.episodic_learning.fresh_policy_sequences
+                    ),
                 )
                 if resources.episodic_replay is not None
-                else ()
+                else None
+            )
+            episodic_sequences = (
+                episodic_sample.sequences if episodic_sample is not None else ()
+            )
+            episodic_sampling = (
+                episodic_sample.diagnostics.to_mapping()
+                if episodic_sample is not None
+                else None
             )
             metrics.write(
                 "learner_update_start",
@@ -1064,6 +1083,7 @@ def run_training(
                     "update_number": update_number,
                     "environment_steps": pipeline.environment_steps,
                     "policy_version": state.policy_version,
+                    "policy_version_before_update": policy_version_before_update,
                     "unrolls": len(batch),
                     "batch_environment_steps": batch_environment_steps,
                     "transaction_traces": len(transaction_traces),
@@ -1072,6 +1092,7 @@ def run_training(
                     ),
                     "episodic_sequences": len(episodic_sequences),
                     "episodic_learn_steps": sum(len(sequence.learn_steps) for sequence in episodic_sequences),
+                    "episodic_sampling": episodic_sampling,
                     "episodic_replay": (
                         resources.episodic_replay.metrics() if resources.episodic_replay is not None else None
                     ),
@@ -1098,7 +1119,7 @@ def run_training(
 
             learner_metrics = resources.learner.update(
                 batch,
-                current_policy_version=state.policy_version,
+                current_policy_version=policy_version_before_update,
                 transaction_traces=transaction_traces,
                 episodic_sequences=episodic_sequences,
                 progress=learner_progress,
@@ -1115,10 +1136,18 @@ def run_training(
                 {
                     "environment_steps": pipeline.environment_steps,
                     "policy_version": state.policy_version,
+                    "policy_version_before_update": policy_version_before_update,
+                    "policy_version_after_update": state.policy_version,
                     "actor_progress": (
                         asdict(pipeline.actor_progress) if pipeline.actor_progress is not None else None
                     ),
                     "rollout_queue": resources.rollout_queue.metrics(),
+                    "episodic_sampling": episodic_sampling,
+                    "episodic_replay": (
+                        resources.episodic_replay.metrics()
+                        if resources.episodic_replay is not None
+                        else None
+                    ),
                     **learner_metrics.to_mapping(),
                 },
             )

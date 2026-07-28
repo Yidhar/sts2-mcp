@@ -249,6 +249,7 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     assert isinstance(episodic, dict)
     assert isinstance(rollout, dict)
     del episodic["macro_sample_fraction"]
+    del episodic["fresh_policy_sequences"]
     del rollout["deterministic_probe_environment_steps"]
 
     migrated = _diagnostic_model_initialization_config(source)
@@ -287,6 +288,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     del rollout["deterministic_probe_interval_episodes"]
     del rollout["deterministic_probe_environment_steps"]
     del episodic["policy_gradient_max_lag"]
+    del episodic["fresh_policy_sequences"]
     for key in (
         "early_evaluation_steps",
         "early_evaluation_episodes",
@@ -319,11 +321,14 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
     rollout = source["rollout"]
+    episodic = source["episodic_learning"]
     assert isinstance(rollout, dict)
+    assert isinstance(episodic, dict)
     # Reconstruct the historical v8 value rather than leaking the current
     # preheat profile's recurring-probe policy into a legacy fixture.
     rollout["deterministic_probe_interval_episodes"] = 0
     del rollout["deterministic_probe_environment_steps"]
+    del episodic["fresh_policy_sequences"]
 
     migrated = _diagnostic_model_initialization_config(source)
 
@@ -334,5 +339,28 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
 
     unexpected = active.to_mapping()
     unexpected["version"] = "sts2-relational-curriculum-config-v8"
+    with pytest.raises(ValueError, match="unexpectedly contains"):
+        _diagnostic_model_initialization_config(unexpected)
+
+
+def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
+    active = load_training_config(profile="preheat")
+    source = active.to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v10"
+    episodic = source["episodic_learning"]
+    assert isinstance(episodic, dict)
+    del episodic["fresh_policy_sequences"]
+
+    migrated = _diagnostic_model_initialization_config(source)
+
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.model == active.model
+    assert migrated.episodic_learning.fresh_policy_sequences == 0
+
+    unexpected = dict(source)
+    unexpected["episodic_learning"] = {
+        **episodic,
+        "fresh_policy_sequences": 1,
+    }
     with pytest.raises(ValueError, match="unexpectedly contains"):
         _diagnostic_model_initialization_config(unexpected)

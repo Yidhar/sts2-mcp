@@ -17,7 +17,8 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v10"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v11"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -421,6 +422,10 @@ class EpisodicLearningConfig:
     per_episode_capacity_bytes: int = 536_870_912
     max_segments_per_episode: int = 8
     sample_sequences: int = 2
+    # Reserve this many existing sampling slots for suffixes that are known to
+    # contain at least one successful policy label inside the strict policy-lag
+    # gate. Remaining slots keep the all-age value/outcome replay plane.
+    fresh_policy_sequences: int = 0
     burn_in_steps: int = 32
     learn_steps: int = 32
     # Complete runs contain far more combat actions than build/route/resource
@@ -458,6 +463,16 @@ class EpisodicLearningConfig:
                 getattr(self, name),
                 label=f"episodic_learning.{name}",
                 minimum=1,
+            )
+        _require_int(
+            self.fresh_policy_sequences,
+            label="episodic_learning.fresh_policy_sequences",
+            minimum=0,
+        )
+        if self.fresh_policy_sequences > self.sample_sequences:
+            raise ValueError(
+                "episodic_learning.fresh_policy_sequences cannot exceed "
+                "sample_sequences"
             )
         _require_int(
             self.burn_in_steps,
@@ -1034,6 +1049,50 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
     )
 
 
+def model_initialization_config_from_mapping(
+    payload: Mapping[str, Any],
+) -> TrainingConfig:
+    """Interpret one reviewed source-config change for model-only use.
+
+    V11 adds only the replay-view selector ``fresh_policy_sequences``.  A V10
+    checkpoint therefore has an identical network/encoding ABI, and can be
+    evaluated or used as an explicit model-parameter initialization source by
+    filling the new selector with its behavior-preserving disabled value.
+
+    This helper is deliberately separate from :func:`training_config_from_mapping`.
+    Exact resume continues to call that strict parser, so a V10 checkpoint can
+    never acquire V11 replay semantics while retaining optimizer, queue, replay,
+    recurrent, RNG, or counter state.
+    """
+
+    source_version = payload.get("version", CONFIG_VERSION)
+    if source_version == CONFIG_VERSION:
+        return training_config_from_mapping(payload)
+    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V10:
+        raise ValueError(
+            "model-parameter initialization has no reviewed config migration "
+            f"from {source_version!r} to {CONFIG_VERSION!r}"
+        )
+    raw_episodic = payload.get("episodic_learning")
+    if not isinstance(raw_episodic, Mapping):
+        raise ValueError(
+            "reviewed V10 model-initialization config migration requires an "
+            "episodic_learning table"
+        )
+    if "fresh_policy_sequences" in raw_episodic:
+        raise ValueError(
+            "V10 model-initialization config unexpectedly contains "
+            "fresh_policy_sequences"
+        )
+    migrated = dict(payload)
+    migrated["episodic_learning"] = {
+        **dict(raw_episodic),
+        "fresh_policy_sequences": 0,
+    }
+    migrated["version"] = CONFIG_VERSION
+    return training_config_from_mapping(migrated)
+
+
 def _table(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     value = payload.get(name, {})
     if not isinstance(value, Mapping):
@@ -1081,6 +1140,7 @@ __all__ = [
     "TransactionLearningConfig",
     "engine_revival_identity",
     "load_training_config",
+    "model_initialization_config_from_mapping",
     "replace_runtime",
     "training_config_from_mapping",
 ]

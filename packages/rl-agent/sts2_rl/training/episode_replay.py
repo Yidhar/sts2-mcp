@@ -757,6 +757,50 @@ class ReplaySequence:
         return len(self.episode_id.encode("utf-8")) + sum(step.storage_nbytes() for step in self.steps)
 
 
+@dataclass(frozen=True, slots=True)
+class EpisodicReplaySampleDiagnostics:
+    """Ephemeral facts about one replay sampling decision.
+
+    These diagnostics are deliberately not part of the persisted replay ABI.
+    They describe the relationship between the immutable stored trajectories
+    and the *current* policy version, so serializing them would only preserve a
+    stale derived view.  Exact resume remains governed by the replay items and
+    RNG state.
+    """
+
+    fresh_policy_quota_requested: int = 0
+    fresh_policy_quota_filled: int = 0
+    fresh_policy_candidate_episodes: int = 0
+    fresh_policy_candidate_decisions: int = 0
+    sampled_fresh_policy_lag_min: int | None = None
+    sampled_fresh_policy_lag_mean: float | None = None
+    sampled_fresh_policy_lag_max: int | None = None
+
+    @property
+    def fresh_policy_quota_missed(self) -> int:
+        return self.fresh_policy_quota_requested - self.fresh_policy_quota_filled
+
+    def to_mapping(self) -> dict[str, int | float | None]:
+        return {
+            "fresh_policy_quota_requested": self.fresh_policy_quota_requested,
+            "fresh_policy_quota_filled": self.fresh_policy_quota_filled,
+            "fresh_policy_quota_missed": self.fresh_policy_quota_missed,
+            "fresh_policy_candidate_episodes": self.fresh_policy_candidate_episodes,
+            "fresh_policy_candidate_decisions": self.fresh_policy_candidate_decisions,
+            "sampled_fresh_policy_lag_min": self.sampled_fresh_policy_lag_min,
+            "sampled_fresh_policy_lag_mean": self.sampled_fresh_policy_lag_mean,
+            "sampled_fresh_policy_lag_max": self.sampled_fresh_policy_lag_max,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodicReplaySample:
+    """Sequences for one learner update plus non-persistent sampling facts."""
+
+    sequences: tuple[ReplaySequence, ...]
+    diagnostics: EpisodicReplaySampleDiagnostics
+
+
 def _exact_recurrent_prefix(
     episode: CompletedEpisode,
     *,
@@ -918,6 +962,108 @@ def _stratified_episode_order(
         offset += 1
 
 
+def _primary_policy_target(step: BackfilledEpisodeStep) -> HorizonTargets | None:
+    """Mirror the learner's longest-observed primary-horizon selection."""
+
+    for target in (step.run, step.act, step.combat):
+        if target.observed:
+            return target
+    return None
+
+
+def _fresh_policy_candidates(
+    episodes: tuple[CompletedEpisode, ...],
+    *,
+    episode_order: tuple[int, ...],
+    current_policy_version: int,
+    maximum_policy_lag: int,
+    rng: np.random.Generator,
+) -> tuple[tuple[tuple[int, int, int], ...], int, int]:
+    """Return one surface-balanced fresh successful decision per episode.
+
+    The returned triples are ``(episode_index, decision_index, policy_lag)``.
+    A candidate is useful only when starting the differentiable suffix at that
+    exact decision would produce a policy label in the current learner.  Merely
+    selecting an episode that contains a fresh action is insufficient because a
+    random window from the same episode may still be entirely stale or forced.
+
+    Complete run wins are visited before censored lower-horizon successes.  The
+    latter remain valid factual policy targets when run outcome is unobserved,
+    but they must not displace an available full-run success.
+    """
+
+    per_episode: dict[int, dict[str, list[tuple[int, int]]]] = {}
+    full_run_successes: set[int] = set()
+    candidate_decisions = 0
+    for episode_index in episode_order:
+        episode = episodes[episode_index]
+        per_surface: dict[str, list[tuple[int, int]]] = {}
+        for step in episode.steps:
+            decision = step.decision
+            if not decision.policy_decision:
+                continue
+            lag = current_policy_version - decision.policy_version
+            if lag < 0:
+                raise ValueError(
+                    "episodic replay contains a behavior policy newer than the learner"
+                )
+            primary = _primary_policy_target(step)
+            if (
+                primary is None
+                or primary.success is not True
+                or lag > maximum_policy_lag
+            ):
+                continue
+            per_surface.setdefault(decision.decision_surface, []).append(
+                (step.step_index, lag)
+            )
+            candidate_decisions += 1
+        if not per_surface:
+            continue
+        per_episode[episode_index] = per_surface
+        if episode.completion.authoritative and episode.won is True:
+            full_run_successes.add(episode_index)
+
+    surface_counts: Counter[str] = Counter()
+    result: list[tuple[int, int, int]] = []
+    prioritized_order = (
+        tuple(index for index in episode_order if index in full_run_successes)
+        + tuple(
+            index
+            for index in episode_order
+            if index in per_episode and index not in full_run_successes
+        )
+    )
+    for episode_index in prioritized_order:
+        candidates = per_episode[episode_index]
+        # A non-combat fresh suffix can satisfy both the fresh-policy and the
+        # existing macro reservation with one GPU slot.  Prefer that overlap;
+        # fall back to combat only when the episode has no eligible macro
+        # decision.  Online V-trace already supplies dense combat policy
+        # gradients, whereas map/build/resource decisions otherwise receive
+        # very sparse long-horizon action credit.
+        eligible_surfaces = tuple(
+            surface
+            for surface in candidates
+            if surface != COMBAT_DECISION_SURFACE
+        ) or tuple(candidates)
+        minimum_count = min(
+            surface_counts[surface] for surface in eligible_surfaces
+        )
+        least_used = tuple(
+            surface
+            for surface in eligible_surfaces
+            if surface_counts[surface] == minimum_count
+        )
+        surface = least_used[int(rng.integers(0, len(least_used)))]
+        values = candidates[surface]
+        decision_index, lag = values[int(rng.integers(0, len(values)))]
+        result.append((episode_index, decision_index, lag))
+        surface_counts[surface] += 1
+
+    return tuple(result), len(per_episode), candidate_decisions
+
+
 class BoundedEpisodicReplay:
     """Thread-safe byte/episode bounded, outcome-stratified replay.
 
@@ -1012,6 +1158,83 @@ class BoundedEpisodicReplay:
         burn_in_steps: int,
         macro_sample_fraction: float = 0.0,
     ) -> tuple[ReplaySequence, ...]:
+        """Sample the legacy all-age value/outcome-stratified replay view."""
+
+        return self._sample(
+            maximum,
+            learn_steps=learn_steps,
+            burn_in_steps=burn_in_steps,
+            macro_sample_fraction=macro_sample_fraction,
+            current_policy_version=None,
+            policy_gradient_max_lag=None,
+            fresh_policy_sequences=0,
+        ).sequences
+
+    def sample_for_learning(
+        self,
+        maximum: int,
+        *,
+        learn_steps: int,
+        burn_in_steps: int,
+        macro_sample_fraction: float,
+        current_policy_version: int,
+        policy_gradient_max_lag: int,
+        fresh_policy_sequences: int,
+    ) -> EpisodicReplaySample:
+        """Reserve fresh successful policy credit without deleting old value data.
+
+        Fresh reservations consume slots from ``maximum``; they do not enlarge
+        the GPU graph.  Any remaining slots retain the existing all-age,
+        outcome-stratified sampler so stale and failed episodes continue to
+        supervise factual value heads.  When no policy-eligible trajectory is
+        available, the method safely falls back to the all-age sampler rather
+        than fabricating an action label or returning an empty batch.
+        """
+
+        _integer(
+            maximum,
+            label="episodic replay sample maximum",
+            minimum=1,
+        )
+        _integer(
+            current_policy_version,
+            label="episodic replay current_policy_version",
+        )
+        _integer(
+            policy_gradient_max_lag,
+            label="episodic replay policy_gradient_max_lag",
+        )
+        _integer(
+            fresh_policy_sequences,
+            label="episodic replay fresh_policy_sequences",
+        )
+        if current_policy_version < 0 or policy_gradient_max_lag < 0:
+            raise ValueError("episodic replay policy versions and lag must be non-negative")
+        if not 0 <= fresh_policy_sequences <= maximum:
+            raise ValueError(
+                "episodic replay fresh_policy_sequences must be in [0, maximum]"
+            )
+        return self._sample(
+            maximum,
+            learn_steps=learn_steps,
+            burn_in_steps=burn_in_steps,
+            macro_sample_fraction=macro_sample_fraction,
+            current_policy_version=current_policy_version,
+            policy_gradient_max_lag=policy_gradient_max_lag,
+            fresh_policy_sequences=fresh_policy_sequences,
+        )
+
+    def _sample(
+        self,
+        maximum: int,
+        *,
+        learn_steps: int,
+        burn_in_steps: int,
+        macro_sample_fraction: float,
+        current_policy_version: int | None,
+        policy_gradient_max_lag: int | None,
+        fresh_policy_sequences: int,
+    ) -> EpisodicReplaySample:
         _integer(maximum, label="episodic replay sample maximum", minimum=1)
         _integer(learn_steps, label="episodic replay learn_steps", minimum=1)
         _integer(burn_in_steps, label="episodic replay burn_in_steps")
@@ -1026,7 +1249,12 @@ class BoundedEpisodicReplay:
             )
         with self._lock:
             if not self._items:
-                return ()
+                return EpisodicReplaySample(
+                    sequences=(),
+                    diagnostics=EpisodicReplaySampleDiagnostics(
+                        fresh_policy_quota_requested=fresh_policy_sequences,
+                    ),
+                )
             episodes = tuple(self._items)
             order = _stratified_episode_order(episodes, rng=self._rng)
             choices: dict[int, tuple[int, ...]] = {}
@@ -1045,7 +1273,78 @@ class BoundedEpisodicReplay:
                 int(math.ceil(maximum * macro_fraction)),
             )
             macro_added = 0
-            if macro_limit:
+            fresh_lags: list[int] = []
+            fresh_candidate_episodes = 0
+            fresh_candidate_decisions = 0
+            if fresh_policy_sequences:
+                if current_policy_version is None or policy_gradient_max_lag is None:
+                    raise RuntimeError("fresh policy sampling is missing its policy contract")
+                (
+                    fresh_candidates,
+                    fresh_candidate_episodes,
+                    fresh_candidate_decisions,
+                ) = _fresh_policy_candidates(
+                    episodes,
+                    episode_order=order,
+                    current_policy_version=current_policy_version,
+                    maximum_policy_lag=policy_gradient_max_lag,
+                    rng=self._rng,
+                )
+                for episode_index, decision_index, lag in fresh_candidates:
+                    if len(fresh_lags) >= fresh_policy_sequences:
+                        break
+                    if per_episode_count[episode_index] >= self.max_segments_per_episode:
+                        continue
+                    key = (episode_index, decision_index)
+                    if key in selected_starts:
+                        continue
+                    episode = episodes[episode_index]
+                    sequences.append(
+                        _replay_sequence(
+                            episode,
+                            learn_start=decision_index,
+                            learn_steps=learn_steps,
+                            burn_in_steps=burn_in_steps,
+                        )
+                    )
+                    selected_starts.add(key)
+                    per_episode_count[episode_index] += 1
+                    fresh_lags.append(lag)
+                    if (
+                        episode.steps[decision_index].snapshot.domain_id
+                        != COMBAT_DOMAIN_ID
+                        and macro_added < macro_limit
+                    ):
+                        macro_added += 1
+
+            def result() -> EpisodicReplaySample:
+                self._sample_count += len(sequences)
+                self._macro_sample_count += macro_added
+                return EpisodicReplaySample(
+                    sequences=tuple(sequences),
+                    diagnostics=EpisodicReplaySampleDiagnostics(
+                        fresh_policy_quota_requested=fresh_policy_sequences,
+                        fresh_policy_quota_filled=len(fresh_lags),
+                        fresh_policy_candidate_episodes=fresh_candidate_episodes,
+                        fresh_policy_candidate_decisions=fresh_candidate_decisions,
+                        sampled_fresh_policy_lag_min=(
+                            min(fresh_lags) if fresh_lags else None
+                        ),
+                        sampled_fresh_policy_lag_mean=(
+                            float(sum(fresh_lags) / len(fresh_lags))
+                            if fresh_lags
+                            else None
+                        ),
+                        sampled_fresh_policy_lag_max=(
+                            max(fresh_lags) if fresh_lags else None
+                        ),
+                    ),
+                )
+
+            if len(sequences) >= maximum:
+                return result()
+
+            if macro_added < macro_limit:
                 for episode_index, decision_index in _macro_surface_candidates(
                     episodes,
                     episode_order=order,
@@ -1070,9 +1369,7 @@ class BoundedEpisodicReplay:
                     if macro_added >= macro_limit:
                         break
                 if len(sequences) >= maximum:
-                    self._sample_count += len(sequences)
-                    self._macro_sample_count += macro_added
-                    return tuple(sequences)
+                    return result()
 
             for quota_index in range(self.max_segments_per_episode):
                 for episode_index in order:
@@ -1105,13 +1402,9 @@ class BoundedEpisodicReplay:
                     selected_starts.add((episode_index, learn_start))
                     per_episode_count[episode_index] += 1
                     if len(sequences) >= maximum:
-                        self._sample_count += len(sequences)
-                        self._macro_sample_count += macro_added
-                        return tuple(sequences)
+                        return result()
 
-            self._sample_count += len(sequences)
-            self._macro_sample_count += macro_added
-            return tuple(sequences)
+            return result()
 
     def snapshot(self) -> tuple[CompletedEpisode, ...]:
         with self._lock:
@@ -1270,6 +1563,8 @@ __all__ = [
     "CompletedEpisode",
     "EpisodeCompletion",
     "EpisodeDecisionStep",
+    "EpisodicReplaySample",
+    "EpisodicReplaySampleDiagnostics",
     "HorizonTargets",
     "ReplaySequence",
     "backfill_completed_episode",

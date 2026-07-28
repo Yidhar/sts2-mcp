@@ -1,0 +1,54 @@
+# Fresh v26 lineage initialized from the closest complete v25 checkpoint to
+# the 25k held-out peak: periodic-step-000030578.
+#
+# This is intentionally *not* an exact resume.  The model parameters are
+# inherited with ``--initialize-from`` while optimizer, replay, RNGs, counters,
+# queue state, policy version, and evaluation state restart.  v26 preserves the
+# frozen model/observation/action/reward contracts and changes only the
+# long-horizon replay sampling contract plus a smaller bounded collector FIFO.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[episodic_learning]
+# Of the existing two detached complete-episode suffixes, reserve one for a
+# successful label that is still inside the strict policy-lag gate.  The other
+# remains an all-age factual/value sample.  This does not enlarge the GPU graph.
+fresh_policy_sequences = 1
+
+[rollout]
+# The former 64-unroll FIFO let behavior lag grow while the learner was the
+# throughput bottleneck.  A bounded 24-unroll queue preserves overlap and
+# backpressure while reducing the maximum backlog from sixteen learner batches
+# to six (the learner consumes four unrolls per update).
+queue_capacity = 24
+# Preserve recurring training-only deterministic probes so factual event and
+# selection failures continue to enter replay without using held-out episodes.
+deterministic_probe_interval_episodes = 16
+
+[runtime]
+# Early gates verify restored policy-active episodic updates before a long run;
+# the 32-seed final audit remains the promotion decision.
+total_environment_steps = 100000
+seed = 1000000
+log_dir = "runs/full-run-revival-v26-fresh-policy-credit-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v26-fresh-policy-credit-model-init"
+checkpoint_interval_steps = 10000
+
+evaluation_steps = [0, 25000, 50000, 75000, 90000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000]
+early_evaluation_episodes = 4
+final_audit_steps = [100000]
+final_audit_episodes = 32
+
+evaluation_liveness_guard_enabled = true

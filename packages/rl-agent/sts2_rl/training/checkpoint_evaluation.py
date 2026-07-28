@@ -29,7 +29,7 @@ from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.macro_evaluation import read_macro_journal
 
 from .checkpointing import initialize_model_from_checkpoint, preflight_model_initialization
-from .config import TrainingConfig, training_config_from_mapping
+from .config import TrainingConfig, model_initialization_config_from_mapping
 from .factory import build_backend, build_training_resources
 from .runtime import evaluate_policy
 
@@ -126,14 +126,16 @@ def checkpoint_training_config(checkpoint: str | Path) -> TrainingConfig:
 
     ``validate_resume_checkpoint`` verifies every required payload hash before
     the configuration is trusted.  Missing or newly unknown configuration
-    fields still fail closed in ``training_config_from_mapping``.
+    fields still fail closed in the narrow model-initialization parser.  The
+    only reviewed historical interpretation is V10 -> V11 with fresh-policy
+    replay disabled; exact resume does not use this function.
     """
 
     validated = validate_resume_checkpoint(checkpoint)
     payload = validated.metadata.get("training_config")
     if not isinstance(payload, dict):
         raise ValueError("checkpoint metadata has no training_config object")
-    return training_config_from_mapping(payload)
+    return model_initialization_config_from_mapping(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +177,8 @@ def _evaluate_checkpoint_policy_unprotected(
     config_payload = validated.metadata.get("training_config")
     if not isinstance(config_payload, dict):
         raise ValueError("checkpoint metadata has no training_config object")
-    config = training_config_from_mapping(config_payload)
+    source_config_version = config_payload.get("version")
+    config = model_initialization_config_from_mapping(config_payload)
     runtime = replace(
         config.runtime,
         device=str(device),
@@ -263,6 +266,9 @@ def _evaluate_checkpoint_policy_unprotected(
                 "training_state": training_state,
             },
             "policy_source": "network.pt",
+            "source_training_config_version": source_config_version,
+            "evaluation_training_config_version": config.version,
+            "config_load_mode": "evaluation_model_parameter_initialization",
             "learner_updates_performed": 0,
             "optimizer_loaded": False,
             "rollout_queue_loaded": False,

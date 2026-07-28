@@ -82,7 +82,9 @@ class LearnerMetrics:
     episodic_sequences: int
     episodic_burn_in_steps: int
     episodic_learn_steps: int
+    episodic_success_policy_candidate_labels: int
     episodic_policy_labels: int
+    episodic_policy_active_sequences: int
     episodic_failure_policy_suppressed_labels: int
     episodic_policy_lag_suppressed_labels: int
     episodic_task_value_labels: int
@@ -138,7 +140,9 @@ class _EpisodicLossBatch:
     revival_policy_loss: Tensor
     burn_in_steps: int
     learn_steps: int
+    success_policy_candidate_labels: int
     policy_labels: int
+    policy_active_sequences: int
     failure_policy_suppressed_labels: int
     policy_lag_suppressed_labels: int
     task_value_labels: int
@@ -648,7 +652,13 @@ class VTraceLearner:
             episodic_sequences=len(episodic_sequences),
             episodic_burn_in_steps=episodic_losses.burn_in_steps,
             episodic_learn_steps=episodic_losses.learn_steps,
+            episodic_success_policy_candidate_labels=(
+                episodic_losses.success_policy_candidate_labels
+            ),
             episodic_policy_labels=episodic_losses.policy_labels,
+            episodic_policy_active_sequences=(
+                episodic_losses.policy_active_sequences
+            ),
             episodic_failure_policy_suppressed_labels=(
                 episodic_losses.failure_policy_suppressed_labels
             ),
@@ -810,7 +820,9 @@ class VTraceLearner:
                 revival_policy_loss=zero,
                 burn_in_steps=0,
                 learn_steps=0,
+                success_policy_candidate_labels=0,
                 policy_labels=0,
+                policy_active_sequences=0,
                 failure_policy_suppressed_labels=0,
                 policy_lag_suppressed_labels=0,
                 task_value_labels=0,
@@ -867,6 +879,8 @@ class VTraceLearner:
         revival_policy_terms: list[Tensor] = []
         combined_policy_terms: list[Tensor] = []
         importance_ratios: list[Tensor] = []
+        success_policy_candidate_labels = 0
+        policy_active_sequence_indexes: set[int] = set()
         efficiency_policy_labels = 0
         failure_policy_suppressed_labels = 0
         policy_lag_suppressed_labels = 0
@@ -921,15 +935,6 @@ class VTraceLearner:
 
                 if not decision.policy_decision:
                     continue
-                policy_lag = current_policy_version - decision.policy_version
-                if policy_lag > self.episodic_config.policy_gradient_max_lag:
-                    # Complete episodes remain authoritative long-horizon value
-                    # supervision after their behavior policy becomes stale.
-                    # They must not, however, keep applying selected-action
-                    # likelihood gradients to a policy hundreds of updates
-                    # newer than the one that generated those decisions.
-                    policy_lag_suppressed_labels += 1
-                    continue
                 primary = next(
                     (
                         item
@@ -956,6 +961,18 @@ class VTraceLearner:
                     # only after an observed successful horizon.
                     failure_policy_suppressed_labels += 1
                     continue
+                success_policy_candidate_labels += 1
+                policy_lag = current_policy_version - decision.policy_version
+                if policy_lag > self.episodic_config.policy_gradient_max_lag:
+                    # Complete episodes remain authoritative long-horizon value
+                    # supervision after their successful behavior policy becomes
+                    # stale. They must not, however, keep applying selected-action
+                    # likelihood gradients to a policy hundreds of updates newer
+                    # than the one that generated those decisions. Failed primary
+                    # horizons are classified above and never pollute this counter.
+                    policy_lag_suppressed_labels += 1
+                    continue
+                policy_active_sequence_indexes.add(active[row])
                 raw_ratio = torch.exp(
                     (
                         selected_log_probability
@@ -1121,7 +1138,9 @@ class VTraceLearner:
             revival_policy_loss=revival_policy_loss,
             burn_in_steps=total_burn_in_steps,
             learn_steps=total_learn_steps,
+            success_policy_candidate_labels=success_policy_candidate_labels,
             policy_labels=len(primary_policy_terms),
+            policy_active_sequences=len(policy_active_sequence_indexes),
             failure_policy_suppressed_labels=failure_policy_suppressed_labels,
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
             task_value_labels=len(task_predictions),

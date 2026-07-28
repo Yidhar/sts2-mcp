@@ -238,7 +238,19 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
     queue = _mapping(event.get("rollout_queue"))
     timings = _mapping(event.get("timings"))
     episodic_replay = _mapping(event.get("episodic_replay"))
+    episodic_sampling = _mapping(event.get("episodic_sampling"))
     transaction_replay = _mapping(event.get("transaction_replay"))
+    episodic_sequences = _finite_number(event.get("episodic_sequences"))
+    episodic_policy_labels = _finite_number(event.get("episodic_policy_labels"))
+    episodic_policy_active_sequences = _finite_number(event.get("episodic_policy_active_sequences"))
+    episodic_policy_active = (
+        episodic_policy_active_sequences > 0 if episodic_policy_active_sequences is not None else None
+    )
+    episodic_zero_policy_label_update = (
+        episodic_sequences > 0 and episodic_policy_labels == 0
+        if episodic_sequences is not None and episodic_policy_labels is not None
+        else None
+    )
     point = {
         "timestamp": _finite_number(event.get("unix_s")),
         "environment_steps": event.get("environment_steps"),
@@ -248,6 +260,21 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "policy_loss": event.get("policy_loss"),
         "value_loss": event.get("value_loss"),
         "episodic_loss": event.get("episodic_loss"),
+        "episodic_success_policy_candidate_labels": event.get("episodic_success_policy_candidate_labels"),
+        "episodic_policy_labels": event.get("episodic_policy_labels"),
+        "episodic_policy_active_sequences": event.get("episodic_policy_active_sequences"),
+        "episodic_failure_policy_suppressed_labels": event.get("episodic_failure_policy_suppressed_labels"),
+        "episodic_policy_lag_suppressed_labels": event.get("episodic_policy_lag_suppressed_labels"),
+        "episodic_policy_active": episodic_policy_active,
+        "episodic_zero_policy_label_update": episodic_zero_policy_label_update,
+        "fresh_policy_quota_requested": episodic_sampling.get("fresh_policy_quota_requested"),
+        "fresh_policy_quota_filled": episodic_sampling.get("fresh_policy_quota_filled"),
+        "fresh_policy_quota_missed": episodic_sampling.get("fresh_policy_quota_missed"),
+        "fresh_policy_candidate_episodes": episodic_sampling.get("fresh_policy_candidate_episodes"),
+        "fresh_policy_candidate_decisions": episodic_sampling.get("fresh_policy_candidate_decisions"),
+        "sampled_fresh_policy_lag_min": episodic_sampling.get("sampled_fresh_policy_lag_min"),
+        "sampled_fresh_policy_lag_mean": episodic_sampling.get("sampled_fresh_policy_lag_mean"),
+        "sampled_fresh_policy_lag_max": episodic_sampling.get("sampled_fresh_policy_lag_max"),
         "gradient_norm": event.get("gradient_norm"),
         "entropy": event.get("entropy"),
         "maximum_policy_lag": event.get("maximum_policy_lag"),

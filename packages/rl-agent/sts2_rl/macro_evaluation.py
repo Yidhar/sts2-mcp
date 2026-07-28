@@ -33,7 +33,11 @@ from sts2_rl.checkpoints import validate_resume_checkpoint
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.models import RecurrentCandidateModel, RecurrentCandidateOutput
 from sts2_rl.training.checkpointing import preflight_model_initialization
-from sts2_rl.training.config import CONFIG_VERSION, TrainingConfig, training_config_from_mapping
+from sts2_rl.training.config import (
+    CONFIG_VERSION,
+    TrainingConfig,
+    model_initialization_config_from_mapping,
+)
 from sts2_rl.training.trajectory import semantic_action_fingerprint
 
 MacroSurface: TypeAlias = Literal["card_reward", "map", "rest", "shop"]
@@ -49,11 +53,13 @@ FIXED_MACRO_PROBE_SUITE_VERSION: Final = "grounded-visible-facts-v1"
 _V6_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v6"
 _V7_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v7"
 _V8_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v8"
+_V10_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v10"
 _REVIEWED_DIAGNOSTIC_CONFIG_VERSIONS: Final = frozenset(
     {
         _V6_CONFIG_VERSION,
         _V7_CONFIG_VERSION,
         _V8_CONFIG_VERSION,
+        _V10_CONFIG_VERSION,
     }
 )
 
@@ -923,17 +929,18 @@ def _diagnostic_model_initialization_config(
     model-initialization path used by training. A v18/v6 source predates the
     replay-sampling ``macro_sample_fraction`` field. A v19/v7 source predates
     v8 runtime schedules and scalar optimization/replay controls. V6--v8 all
-    predate v9 environment-step liveness-probe milestones. None of those
-    missing fields shape model tensors. Reviewed disabled defaults are filled
-    explicitly before the version is advanced.
+    predate v9 environment-step liveness-probe milestones. V10 predates V11's
+    opt-in fresh-policy replay view. None of those missing fields shape model
+    tensors. Reviewed disabled defaults are filled explicitly before the
+    version is advanced.
 
     This is explicitly not exact resume and does not relax any checkpoint,
     tensor, or grounding-encoding validation.
     """
 
     source_version = payload.get("version")
-    if source_version == CONFIG_VERSION:
-        return training_config_from_mapping(payload)
+    if source_version in {CONFIG_VERSION, _V10_CONFIG_VERSION}:
+        return model_initialization_config_from_mapping(payload)
     if source_version not in _REVIEWED_DIAGNOSTIC_CONFIG_VERSIONS:
         raise ValueError(
             "macro checkpoint evaluation has no reviewed config migration "
@@ -968,8 +975,22 @@ def _diagnostic_model_initialization_config(
             )
         episodic["macro_sample_fraction"] = 0.0
         migrated["episodic_learning"] = episodic
-    migrated["version"] = CONFIG_VERSION
-    return training_config_from_mapping(migrated)
+    raw_episodic = migrated.get("episodic_learning")
+    if not isinstance(raw_episodic, Mapping):
+        raise ValueError(
+            "reviewed macro checkpoint config migration requires an "
+            "episodic_learning table"
+        )
+    if "fresh_policy_sequences" in raw_episodic:
+        raise ValueError(
+            f"{source_version} macro checkpoint config unexpectedly contains "
+            "fresh_policy_sequences"
+        )
+    # Chain the historical diagnostic defaults through the one reviewed V10
+    # -> V11 model-only migration.  The strict exact-resume parser remains
+    # untouched.
+    migrated["version"] = _V10_CONFIG_VERSION
+    return model_initialization_config_from_mapping(migrated)
 
 
 def evaluate_checkpoint_macro_sensitivity(

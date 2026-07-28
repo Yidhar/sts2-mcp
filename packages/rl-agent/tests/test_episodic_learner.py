@@ -145,10 +145,14 @@ def _episode(
     won: bool,
     final_revivals: int = 0,
     policy_decisions: tuple[bool, ...] | None = None,
+    policy_versions: tuple[int, ...] | None = None,
 ) -> CompletedEpisode:
     if policy_decisions is None:
         policy_decisions = (True,) * len(snapshots)
+    if policy_versions is None:
+        policy_versions = (0,) * len(snapshots)
     assert len(policy_decisions) == len(snapshots)
+    assert len(policy_versions) == len(snapshots)
     steps = tuple(
         EpisodeDecisionStep(
             snapshot=snapshot,
@@ -156,7 +160,7 @@ def _episode(
             action_index=0,
             behavior_log_probability=-0.6931471805599453,
             policy_decision=policy_decisions[index],
-            policy_version=0,
+            policy_version=policy_versions[index],
             act=1,
             combat_id=None,
             task_reward=0.0,
@@ -315,8 +319,11 @@ def test_failed_horizon_is_value_only_without_anti_imitation_policy_label() -> N
     )
 
     assert losses.task_value_labels == 2
+    assert losses.success_policy_candidate_labels == 0
     assert losses.policy_labels == 0
+    assert losses.policy_active_sequences == 0
     assert losses.failure_policy_suppressed_labels == 1
+    assert losses.policy_lag_suppressed_labels == 0
     assert losses.revival_value_labels == 0
     assert losses.efficiency_policy_labels == 0
     assert losses.primary_policy_loss.detach().item() == 0.0
@@ -344,11 +351,55 @@ def test_stale_episode_keeps_value_labels_but_suppresses_policy_gradient() -> No
         ),
     )
 
+    assert losses.success_policy_candidate_labels == 1
     assert losses.policy_labels == 0
+    assert losses.policy_active_sequences == 0
     assert losses.policy_lag_suppressed_labels == 1
+    assert losses.failure_policy_suppressed_labels == 0
     assert losses.task_value_labels == 2
     assert losses.revival_value_labels == 2
     assert losses.task_value_loss.detach().item() > 0.0
+
+
+def test_policy_label_classification_separates_fresh_stale_and_failed_sequences() -> None:
+    learner, encoding = _learner(learn_steps=1)
+    snapshot = _snapshot(encoding, domain_id=0)
+    current_policy_version = learner.episodic_config.policy_gradient_max_lag + 1
+    fresh_success = _episode(
+        (snapshot,),
+        episode_id="fresh-success",
+        won=True,
+        policy_versions=(current_policy_version,),
+    )
+    stale_success = _episode(
+        (snapshot,),
+        episode_id="stale-success",
+        won=True,
+        policy_versions=(0,),
+    )
+    stale_failure = _episode(
+        (snapshot,),
+        episode_id="stale-failure",
+        won=False,
+        policy_versions=(0,),
+    )
+
+    losses = learner._episodic_losses(
+        (
+            _sequence(fresh_success),
+            _sequence(stale_success),
+            _sequence(stale_failure),
+        ),
+        current_policy_version=current_policy_version,
+    )
+
+    assert losses.success_policy_candidate_labels == 2
+    assert losses.policy_labels == 1
+    assert losses.policy_active_sequences == 1
+    assert losses.policy_lag_suppressed_labels == 1
+    assert losses.failure_policy_suppressed_labels == 1
+    assert losses.task_value_labels == 6
+    assert losses.revival_value_labels == 4
 
 
 def test_forced_singleton_trains_values_without_any_policy_label() -> None:
@@ -367,7 +418,11 @@ def test_forced_singleton_trains_values_without_any_policy_label() -> None:
 
     assert losses.task_value_labels == 2
     assert losses.revival_value_labels == 2
+    assert losses.success_policy_candidate_labels == 0
     assert losses.policy_labels == 0
+    assert losses.policy_active_sequences == 0
+    assert losses.failure_policy_suppressed_labels == 0
+    assert losses.policy_lag_suppressed_labels == 0
     assert losses.efficiency_policy_labels == 0
     assert losses.task_value_loss.detach().item() > 0.0
     assert losses.revival_value_loss.detach().item() > 0.0
