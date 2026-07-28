@@ -18,6 +18,7 @@ from sts2_rl.encoding.grounded import (
     _ACTION_GROUP_MULTIPLICITY_SLOT,
     _DYNAMIC_VALUE_SLOT_BY_KEY,
     _NUMERIC_SLOT_BY_KEY,
+    _UNKNOWN_ZONE_HASH_START,
     _ZONE_IDS,
     _aggregate_orderless_card_multiset,
     _bounded_number,
@@ -29,6 +30,7 @@ from sts2_rl.encoding.grounded import (
     _canonical_relic,
     _hash_id,
     _pile_count,
+    _stable_zone_id,
     _strict_card_selection_projection,
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
@@ -50,7 +52,7 @@ def _small_model_config() -> GroundedCandidateConfig:
         type_vocab_size=32,
         role_vocab_size=32,
         owner_vocab_size=16,
-        entity_vocab_size=128,
+        entity_vocab_size=8192,
         zone_vocab_size=16,
         order_vocab_size=32,
     )
@@ -213,10 +215,14 @@ def test_live_semantic_previews_and_transport_positions_are_not_model_inputs() -
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "target_owner_ids",
         "target_entity_ids",
         "target_entity_aux_ids",
+        "target_definition_binding_ids",
+        "target_relation_binding_ids",
         "local_features",
         "local_mask",
         "local_type_ids",
@@ -224,6 +230,8 @@ def test_live_semantic_previews_and_transport_positions_are_not_model_inputs() -
         "local_owner_ids",
         "local_entity_ids",
         "local_entity_aux_ids",
+        "local_definition_binding_ids",
+        "local_relation_binding_ids",
         "local_zone_ids",
         "local_order_ids",
     ):
@@ -302,6 +310,8 @@ def test_candidate_character_and_selection_identity_use_typed_fields_not_ui_labe
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "local_features",
         "local_entity_ids",
@@ -571,6 +581,8 @@ def test_public_discard_and_exhaust_composition_is_set_like_but_not_count_only()
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "order_ids",
     ):
@@ -782,6 +794,8 @@ def test_real_live_and_headless_candidate_dtos_are_canonical_and_non_aliasing() 
         "local_owner_ids",
         "local_entity_ids",
         "local_entity_aux_ids",
+        "local_definition_binding_ids",
+        "local_relation_binding_ids",
         "local_zone_ids",
         "local_order_ids",
     )
@@ -841,6 +855,8 @@ def test_real_live_root_map_dto_matches_headless_nested_map_node() -> None:
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "local_features",
         "local_mask",
@@ -902,6 +918,8 @@ def test_live_target_is_joined_to_world_facts_like_headless_target() -> None:
         "target_owner_ids",
         "target_entity_ids",
         "target_entity_aux_ids",
+        "target_definition_binding_ids",
+        "target_relation_binding_ids",
         "local_features",
         "local_mask",
         "local_type_ids",
@@ -909,6 +927,8 @@ def test_live_target_is_joined_to_world_facts_like_headless_target() -> None:
         "local_owner_ids",
         "local_entity_ids",
         "local_entity_aux_ids",
+        "local_definition_binding_ids",
+        "local_relation_binding_ids",
         "local_zone_ids",
         "local_order_ids",
     ):
@@ -1056,6 +1076,8 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "order_ids",
     ):
@@ -1227,7 +1249,250 @@ def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     assert grounding_encoding_identity() == identity
 
 
-def test_secondary_entity_hash_disambiguates_primary_bucket_collisions() -> None:
+def test_unknown_zone_hashes_are_disjoint_from_every_fixed_zone() -> None:
+    size = 32
+    fixed = set(_ZONE_IDS.values())
+    unknown = {
+        _stable_zone_id(f"future_zone_{index}", size)
+        for index in range(256)
+    }
+
+    assert _UNKNOWN_ZONE_HASH_START == max(fixed) + 1
+    assert unknown
+    assert unknown.isdisjoint(fixed)
+    assert unknown <= set(range(_UNKNOWN_ZONE_HASH_START, size))
+    assert _stable_zone_id("rewards", size) == _ZONE_IDS["reward"]
+    assert _stable_zone_id("unknown", size) == 1
+    # Undersized fixture vocabularies retain valid fixed IDs but cannot safely
+    # represent future zones; they must use the reserved unknown ID rather than
+    # aliasing an unrelated fixed zone.
+    assert _stable_zone_id("deck", 16) == _ZONE_IDS["deck"]
+    assert _stable_zone_id("world", 16) == 1
+    assert _stable_zone_id("future_zone", 16) == 1
+
+
+def test_exact_native_upgrade_preview_reaches_world_and_candidate_binding() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=64,
+            max_candidates=2,
+            max_candidate_local_tokens=16,
+        )
+    )
+    source = {
+        "id": "CARD.UPGRADE_TEST",
+        "instance_uuid": "upgrade-source",
+        "upgrade_level": 0,
+        "is_upgraded": False,
+        "cost": 2,
+    }
+    preview = {
+        "id": "CARD.UPGRADE_TEST",
+        "upgrade_level": 1,
+        "is_upgraded": True,
+        "cost": 1,
+    }
+    observation = {
+        "phase": "deck_upgrade",
+        "decision_domain": "build",
+        "player": {
+            "id": "player",
+            "hp": 50,
+            "max_hp": 80,
+            "deck": [source],
+        },
+        "deck_upgrade_selection": {
+            "visible": True,
+            "options": [
+                {
+                    "card": source,
+                    "upgrade_preview": preview,
+                    "is_selected": False,
+                }
+            ],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "upgrade:select",
+            "kind": "deck_upgrade",
+            "model_action_kind": "deck_upgrade",
+            "model_action_variant": "select",
+            "card": source,
+            "upgrade_preview": preview,
+        }
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    candidate = batch.candidates
+    active_local = candidate.local_mask[0, 0]
+    local_features = candidate.local_features[0, 0, active_local]
+    upgrade_slot = _NUMERIC_SLOT_BY_KEY["upgrade_level"]
+    assert any(
+        row[upgrade_slot].item() == pytest.approx(_bounded_number(1))
+        for row in local_features
+    )
+
+    source_relation = candidate.entity_aux_ids[0, 0]
+    source_relation_binding = candidate.relation_binding_ids[0, 0]
+    local_relations = candidate.local_entity_aux_ids[0, 0, active_local]
+    local_relation_bindings = candidate.local_relation_binding_ids[
+        0,
+        0,
+        active_local,
+    ]
+    # Both the source card and the exact upgraded projection bind to the same
+    # physical source instance.
+    assert int((local_relations == source_relation).sum().item()) >= 2
+    assert (
+        int(
+            (local_relation_bindings == source_relation_binding)
+            .sum()
+            .item()
+        )
+        >= 2
+    )
+    world_active = batch.world.mask[0]
+    world_relations = batch.world.entity_aux_ids[0, world_active]
+    world_relation_bindings = batch.world.relation_binding_ids[
+        0,
+        world_active,
+    ]
+    assert int((world_relations == source_relation).sum().item()) >= 2
+    assert (
+        int(
+            (world_relation_bindings == source_relation_binding)
+            .sum()
+            .item()
+        )
+        >= 2
+    )
+
+
+def test_world_upgrade_previews_are_not_dependent_on_candidate_preview() -> None:
+    model = _small_model_config()
+    encoder = GroundedObservationEncoder(
+        GroundedEncodingConfig.from_model_config(
+            model,
+            max_world_tokens=64,
+            max_candidates=2,
+            max_candidate_local_tokens=16,
+        )
+    )
+    source = {
+        "id": "CARD.WORLD_UPGRADE_TEST",
+        "instance_uuid": "world-upgrade-source",
+        "upgrade_level": 0,
+        "is_upgraded": False,
+        "cost": 2,
+    }
+    observation = {
+        "phase": "deck_upgrade",
+        "decision_domain": "build",
+        "player": {"id": "player", "hp": 50, "max_hp": 80},
+        "deck_upgrade_selection": {
+            "visible": True,
+            "options": [
+                {
+                    "card": source,
+                    "upgrade_preview": {
+                        "id": "CARD.WORLD_UPGRADE_TEST",
+                        "upgrade_level": 1,
+                        "is_upgraded": True,
+                        "cost": 1,
+                    },
+                    "is_selected": False,
+                }
+            ],
+        },
+    }
+    # Deliberately omit upgrade_preview from the legal action.  The upgraded
+    # alternative must still be a world fact; candidate-local projection must
+    # not be able to make this test pass accidentally.
+    actions = [
+        {
+            "action_handle": "upgrade:select",
+            "kind": "deck_upgrade",
+            "model_action_kind": "deck_upgrade",
+            "model_action_variant": "select",
+            "card": source,
+        }
+    ]
+
+    batch = encoder.encode(observation, actions).batch
+    upgrade_slot = _NUMERIC_SLOT_BY_KEY["upgrade_level"]
+    upgraded_rows = torch.nonzero(
+        torch.isclose(
+            batch.world.features[0, :, upgrade_slot],
+            torch.tensor(_bounded_number(1)),
+        )
+        & batch.world.mask[0],
+        as_tuple=False,
+    ).flatten()
+
+    assert upgraded_rows.numel() == 1
+    source_relation_binding = batch.candidates.relation_binding_ids[0, 0]
+    assert (
+        batch.world.relation_binding_ids[0, upgraded_rows[0]]
+        == source_relation_binding
+    )
+
+
+def test_only_exact_upgrade_preview_keys_bypass_preview_firewall() -> None:
+    encoder = _encoder()
+    source = {
+        "id": "CARD.UPGRADE_TEST",
+        "instance_uuid": "upgrade-source",
+        "upgrade_level": 0,
+    }
+    clean = {
+        "action_handle": "clean",
+        "kind": "deck_upgrade",
+        "model_action_kind": "deck_upgrade",
+        "card": source,
+    }
+    engineered = {
+        **clean,
+        "action_handle": "engineered",
+        "effect_preview": {
+            "id": "CARD.FAKE",
+            "upgrade_level": 99,
+        },
+        "damage_preview": {
+            "id": "CARD.FAKE",
+            "upgrade_level": 99,
+        },
+    }
+    factual = {
+        **clean,
+        "action_handle": "factual",
+        "upgrade_preview": {
+            "id": "CARD.UPGRADE_TEST",
+            "upgrade_level": 1,
+        },
+    }
+
+    candidates = encoder.encode(
+        _observation(),
+        [clean, engineered, factual],
+    ).batch.candidates
+    assert torch.equal(
+        candidates.local_mask[:, 0],
+        candidates.local_mask[:, 1],
+    )
+    assert torch.equal(
+        candidates.local_features[:, 0],
+        candidates.local_features[:, 1],
+    )
+    assert not torch.equal(
+        candidates.local_mask[:, 0],
+        candidates.local_mask[:, 2],
+    )
+
+
+def test_entity_hash_collision_keeps_distinct_exact_definition_bindings() -> None:
     model = _small_model_config()
     size = model.entity_vocab_size
 
@@ -1259,12 +1524,118 @@ def test_secondary_entity_hash_disambiguates_primary_bucket_collisions() -> None
         }
         for index, card_id in enumerate(pair)
     ]
-    candidates = _encoder(model).encode(_observation(), actions).batch.candidates
-    assert torch.equal(candidates.entity_ids[:, 0], candidates.entity_ids[:, 1])
-    assert not torch.equal(
-        candidates.entity_aux_ids[:, 0],
-        candidates.entity_aux_ids[:, 1],
+    encoded = _encoder(model).encode(_observation(), actions)
+    candidates = encoded.batch.candidates
+
+    assert candidates.entity_ids[0, 0] == candidates.entity_ids[0, 1]
+    assert (
+        candidates.definition_binding_ids[0, 0]
+        != candidates.definition_binding_ids[0, 1]
     )
+    assert encoded.definition_hash_collisions >= 1
+
+
+def test_entity_aux_hash_collision_keeps_distinct_exact_relation_bindings() -> None:
+    model = _small_model_config()
+    size = model.entity_vocab_size
+    seen: dict[int, tuple[str, str]] = {}
+    pair: tuple[tuple[str, str], tuple[str, str]] | None = None
+    for index in range(50_000):
+        card_id = f"CARD.RELATION_COLLISION_{index}"
+        instance = f"runtime-{index}"
+        relation = f"instance:{instance}"
+        auxiliary = _hash_id("entity_aux", relation, size)
+        previous = seen.get(auxiliary)
+        if previous is not None and _hash_id(
+            "entity",
+            previous[0],
+            size,
+        ) != _hash_id("entity", card_id, size):
+            pair = (previous, (card_id, instance))
+            break
+        seen[auxiliary] = (card_id, instance)
+    assert pair is not None
+    actions = [
+        {
+            "action_handle": f"play:{index}",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "card": {
+                "id": card_id,
+                "instance_uuid": instance,
+                "cost": 1,
+            },
+        }
+        for index, (card_id, instance) in enumerate(pair)
+    ]
+
+    encoded = _encoder(model).encode(_observation(), actions)
+    candidates = encoded.batch.candidates
+
+    assert candidates.entity_aux_ids[0, 0] == candidates.entity_aux_ids[0, 1]
+    assert (
+        candidates.relation_binding_ids[0, 0]
+        != candidates.relation_binding_ids[0, 1]
+    )
+    assert encoded.relation_hash_collisions >= 1
+
+
+def test_exact_binding_namespace_spans_world_and_candidate_tables() -> None:
+    model = _small_model_config()
+    size = model.entity_vocab_size
+    seen: dict[int, str] = {}
+    pair: tuple[str, str] | None = None
+    for index in range(50_000):
+        identity = f"CARD.CROSS_TABLE_COLLISION_{index}"
+        bucket = _hash_id("entity", identity, size)
+        previous = seen.get(bucket)
+        if previous is not None and _hash_id(
+            "entity_aux",
+            f"entity:{previous}",
+            size,
+        ) != _hash_id("entity_aux", f"entity:{identity}", size):
+            pair = (previous, identity)
+            break
+        seen[bucket] = identity
+    assert pair is not None
+    observation = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "player": {
+            "id": "player",
+            "hp": 50,
+            "max_hp": 80,
+            "deck": [{"id": pair[0], "cost": 1}],
+        },
+    }
+    actions = [
+        {
+            "action_handle": "play:collision",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "card": {"id": pair[1], "cost": 1},
+        }
+    ]
+
+    encoded = _encoder(model).encode(observation, actions)
+    batch = encoded.batch
+    candidate_hash = batch.candidates.entity_ids[0, 0]
+    candidate_binding = batch.candidates.definition_binding_ids[0, 0]
+    colliding_world_rows = torch.nonzero(
+        batch.world.entity_ids[0] == candidate_hash,
+        as_tuple=False,
+    ).flatten()
+
+    assert colliding_world_rows.numel() >= 1
+    assert not bool(
+        (
+            batch.world.definition_binding_ids[0, colliding_world_rows]
+            == candidate_binding
+        )
+        .any()
+        .item()
+    )
+    assert encoded.definition_hash_collisions >= 1
 
 
 def test_encoder_stack_pads_only_to_active_batch_capacity() -> None:
@@ -1312,7 +1683,23 @@ def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
         (original.world.mask, restored_batch.world.mask),
         (original.world.type_ids, restored_batch.world.type_ids),
         (original.world.entity_ids, restored_batch.world.entity_ids),
+        (
+            original.world.definition_binding_ids,
+            restored_batch.world.definition_binding_ids,
+        ),
+        (
+            original.world.relation_binding_ids,
+            restored_batch.world.relation_binding_ids,
+        ),
         (original.candidates.features, restored_batch.candidates.features),
+        (
+            original.candidates.definition_binding_ids,
+            restored_batch.candidates.definition_binding_ids,
+        ),
+        (
+            original.candidates.target_relation_binding_ids,
+            restored_batch.candidates.target_relation_binding_ids,
+        ),
         (original.candidates.local_features, restored_batch.candidates.local_features),
         (original.candidates.local_mask, restored_batch.candidates.local_mask),
         (original.candidates.action_mask, restored_batch.candidates.action_mask),
@@ -1328,6 +1715,8 @@ def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
         original.world.owner_ids,
         original.world.entity_ids,
         original.world.entity_aux_ids,
+        original.world.definition_binding_ids,
+        original.world.relation_binding_ids,
         original.world.zone_ids,
         original.world.order_ids,
         original.candidates.features,
@@ -1336,10 +1725,14 @@ def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
         original.candidates.owner_ids,
         original.candidates.entity_ids,
         original.candidates.entity_aux_ids,
+        original.candidates.definition_binding_ids,
+        original.candidates.relation_binding_ids,
         original.candidates.zone_ids,
         original.candidates.target_owner_ids,
         original.candidates.target_entity_ids,
         original.candidates.target_entity_aux_ids,
+        original.candidates.target_definition_binding_ids,
+        original.candidates.target_relation_binding_ids,
         original.candidates.local_features,
         original.candidates.local_mask,
         original.candidates.local_type_ids,
@@ -1347,6 +1740,8 @@ def test_encoded_snapshot_is_compact_pickleable_and_exactly_collates() -> None:
         original.candidates.local_owner_ids,
         original.candidates.local_entity_ids,
         original.candidates.local_entity_aux_ids,
+        original.candidates.local_definition_binding_ids,
+        original.candidates.local_relation_binding_ids,
         original.candidates.local_zone_ids,
         original.candidates.local_order_ids,
         original.candidates.action_mask,
@@ -2306,6 +2701,8 @@ def test_runtime_mechanics_v6_set_like_status_and_inventory_are_permutation_inva
         "owner_ids",
         "entity_ids",
         "entity_aux_ids",
+        "definition_binding_ids",
+        "relation_binding_ids",
         "zone_ids",
         "order_ids",
     ):
@@ -2372,7 +2769,13 @@ def test_runtime_instance_relations_bind_actions_cards_targets_and_modifiers() -
 
     batch = encoder.encode(observation, actions).batch
     candidate_relations = batch.candidates.entity_aux_ids[0, :2]
+    candidate_relation_bindings = batch.candidates.relation_binding_ids[0, :2]
     assert candidate_relations[0] != candidate_relations[1]
+    assert candidate_relation_bindings[0] != candidate_relation_bindings[1]
+    assert (
+        batch.candidates.definition_binding_ids[0, 0]
+        == batch.candidates.definition_binding_ids[0, 1]
+    )
 
     twin_definition = _hash_id("entity", "CARD.TWIN", model.entity_vocab_size)
     twin_rows = torch.nonzero(
@@ -2382,6 +2785,13 @@ def test_runtime_instance_relations_bind_actions_cards_targets_and_modifiers() -
     assert twin_rows.numel() == 2
     twin_relations = set(batch.world.entity_aux_ids[0, twin_rows].tolist())
     assert twin_relations == set(candidate_relations.tolist())
+    twin_relation_bindings = set(
+        batch.world.relation_binding_ids[0, twin_rows].tolist()
+    )
+    assert twin_relation_bindings == set(candidate_relation_bindings.tolist())
+    assert len(
+        set(batch.world.definition_binding_ids[0, twin_rows].tolist())
+    ) == 1
 
     damage_definition = _hash_id("entity", "Damage", model.entity_vocab_size)
     enchantment_definition = _hash_id("entity", "ENCHANTMENT.SHARP", model.entity_vocab_size)
@@ -2395,6 +2805,7 @@ def test_runtime_instance_relations_bind_actions_cards_targets_and_modifiers() -
         assert first_relation in batch.world.entity_aux_ids[0, rows].tolist()
 
     enemy_relation = batch.candidates.target_entity_aux_ids[0, 0]
+    enemy_relation_binding = batch.candidates.target_relation_binding_ids[0, 0]
     assert enemy_relation == batch.candidates.target_entity_aux_ids[0, 1]
     enemy_definition = _hash_id("entity", "MONSTER.TEST", model.entity_vocab_size)
     enemy_rows = torch.nonzero(
@@ -2403,6 +2814,10 @@ def test_runtime_instance_relations_bind_actions_cards_targets_and_modifiers() -
     ).flatten()
     assert enemy_rows.numel() == 1
     assert batch.world.entity_aux_ids[0, enemy_rows[0]] == enemy_relation
+    assert (
+        batch.world.relation_binding_ids[0, enemy_rows[0]]
+        == enemy_relation_binding
+    )
 
     power_rows = torch.nonzero(
         batch.world.entity_ids[0] == _hash_id("entity", "POWER.VULNERABLE", model.entity_vocab_size),

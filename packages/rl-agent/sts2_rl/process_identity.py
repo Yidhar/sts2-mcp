@@ -20,7 +20,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 class ProcessIdentityError(RuntimeError):
@@ -84,49 +84,79 @@ if sys.platform == "win32":
     _WINDOWS_EPOCH_OFFSET_100NS = 116_444_736_000_000_000
 
     class _FILETIME(ctypes.Structure):
-        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]  # noqa: RUF012
+        _fields_: ClassVar[list[tuple[str, Any]]] = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
 
 
-def _filetime_value(value: _FILETIME) -> int:
-    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+    def _filetime_value(value: _FILETIME) -> int:
+        return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
 
 
-def _windows_snapshot_from_handle(handle: int, pid: int) -> ProcessIdentity:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    creation = _FILETIME()
-    exit_time = _FILETIME()
-    kernel = _FILETIME()
-    user = _FILETIME()
-    if not kernel32.GetProcessTimes(
-        handle,
-        ctypes.byref(creation),
-        ctypes.byref(exit_time),
-        ctypes.byref(kernel),
-        ctypes.byref(user),
-    ):
-        raise ProcessIdentityError(f"GetProcessTimes failed for pid={pid}.")
+    def _windows_snapshot_from_handle(handle: int, pid: int) -> ProcessIdentity:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        creation = _FILETIME()
+        exit_time = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            raise ProcessIdentityError(f"GetProcessTimes failed for pid={pid}.")
 
-    capacity = wintypes.DWORD(32_768)
-    buffer = ctypes.create_unicode_buffer(capacity.value)
-    if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(capacity)):
-        raise ProcessIdentityError(f"QueryFullProcessImageNameW failed for pid={pid}.")
+        capacity = wintypes.DWORD(32_768)
+        buffer = ctypes.create_unicode_buffer(capacity.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(capacity)):
+            raise ProcessIdentityError(f"QueryFullProcessImageNameW failed for pid={pid}.")
 
-    created_100ns = _filetime_value(creation)
-    return ProcessIdentity(
-        pid=pid,
-        creation_marker=f"win-filetime:{created_100ns}",
-        executable=_normalized_executable(buffer.value),
-        started_at_unix_ns=max(0, created_100ns - _WINDOWS_EPOCH_OFFSET_100NS) * 100,
-    )
+        created_100ns = _filetime_value(creation)
+        return ProcessIdentity(
+            pid=pid,
+            creation_marker=f"win-filetime:{created_100ns}",
+            executable=_normalized_executable(buffer.value),
+            started_at_unix_ns=max(0, created_100ns - _WINDOWS_EPOCH_OFFSET_100NS) * 100,
+        )
 
 
-def _open_windows_process(pid: int, access: int) -> int:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.OpenProcess(access, False, pid)
-    if not handle:
-        error = ctypes.get_last_error()
-        raise ProcessIdentityError(f"OpenProcess failed for pid={pid} (winerror={error}).")
-    return int(handle)
+    def _open_windows_process(pid: int, access: int) -> int:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(access, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            raise ProcessIdentityError(f"OpenProcess failed for pid={pid} (winerror={error}).")
+        return int(handle)
+
+
+    def _terminate_windows(expected: ProcessIdentity, timeout_s: float) -> TerminationResult:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        access = _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_TERMINATE | _SYNCHRONIZE
+        try:
+            handle = _open_windows_process(expected.pid, access)
+        except ProcessIdentityError:
+            return TerminationResult(terminated=True, reason="already_exited")
+        try:
+            try:
+                actual = _windows_snapshot_from_handle(handle, expected.pid)
+            except ProcessIdentityError:
+                return TerminationResult(terminated=False, reason="identity_uninspectable")
+            if not same_process(expected, actual):
+                return TerminationResult(terminated=False, reason="identity_mismatch")
+            if not kernel32.TerminateProcess(handle, 1):
+                return TerminationResult(terminated=False, reason="terminate_failed")
+            wait_ms = max(0, min(int(timeout_s * 1_000), 2_147_483_647))
+            wait_result = int(kernel32.WaitForSingleObject(handle, wait_ms))
+            if wait_result == _WAIT_OBJECT_0:
+                return TerminationResult(terminated=True, reason="terminated_owned_process")
+            if wait_result == _WAIT_TIMEOUT:
+                return TerminationResult(terminated=False, reason="termination_timeout")
+            return TerminationResult(terminated=False, reason="wait_failed")
+        finally:
+            kernel32.CloseHandle(handle)
 
 
 def _linux_command_fingerprint(pid: int) -> str | None:
@@ -139,7 +169,10 @@ def _linux_command_fingerprint(pid: int) -> str | None:
 
 def _linux_started_at_ns(start_ticks: int) -> int | None:
     try:
-        clock_ticks = int(os.sysconf("SC_CLK_TCK"))  # type: ignore[attr-defined]
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            return None
+        clock_ticks = int(sysconf("SC_CLK_TCK"))
         boot_line = next(
             line for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines() if line.startswith("btime ")
         )
@@ -209,33 +242,6 @@ def verify_process_identity(expected: ProcessIdentity) -> TerminationResult:
     if not same_process(expected, actual):
         return TerminationResult(terminated=False, reason="identity_mismatch")
     return TerminationResult(terminated=False, reason="identity_verified")
-
-
-def _terminate_windows(expected: ProcessIdentity, timeout_s: float) -> TerminationResult:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    access = _PROCESS_QUERY_LIMITED_INFORMATION | _PROCESS_TERMINATE | _SYNCHRONIZE
-    try:
-        handle = _open_windows_process(expected.pid, access)
-    except ProcessIdentityError:
-        return TerminationResult(terminated=True, reason="already_exited")
-    try:
-        try:
-            actual = _windows_snapshot_from_handle(handle, expected.pid)
-        except ProcessIdentityError:
-            return TerminationResult(terminated=False, reason="identity_uninspectable")
-        if not same_process(expected, actual):
-            return TerminationResult(terminated=False, reason="identity_mismatch")
-        if not kernel32.TerminateProcess(handle, 1):
-            return TerminationResult(terminated=False, reason="terminate_failed")
-        wait_ms = max(0, min(int(timeout_s * 1_000), 2_147_483_647))
-        wait_result = int(kernel32.WaitForSingleObject(handle, wait_ms))
-        if wait_result == _WAIT_OBJECT_0:
-            return TerminationResult(terminated=True, reason="terminated_owned_process")
-        if wait_result == _WAIT_TIMEOUT:
-            return TerminationResult(terminated=False, reason="termination_timeout")
-        return TerminationResult(terminated=False, reason="wait_failed")
-    finally:
-        kernel32.CloseHandle(handle)
 
 
 def _linux_alive(expected: ProcessIdentity) -> bool:

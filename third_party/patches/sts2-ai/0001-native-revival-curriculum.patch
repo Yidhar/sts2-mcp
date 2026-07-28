@@ -1,5 +1,5 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
-index 87bbbf1..ccaae29 100644
+index 87bbbf15c2a7496d4b321bad9261b3a01dfe1289..ccaae295449e750a79b83925d77e4252db592b65 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/BinaryProtocol.cs
 @@ -183,8 +183,8 @@ internal sealed class BinarySearchCombatMctsRequest
@@ -29,7 +29,7 @@ index 87bbbf1..ccaae29 100644
  
  	private sealed class PlayerStaticCard
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
-index ae63755..df3b192 100644
+index ae637559e229a345a63c9c6257bfde736967cfd8..df3b192a3a0339117bdbec55fe524e8613daf854 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 @@ -806,7 +806,9 @@ internal static class Program
@@ -327,7 +327,7 @@ index ae63755..df3b192 100644
  	{
  		return BuildCombatApiState(CombatTrainingEnvService.Instance.GetState());
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
-index fab2a82..008a847 100644
+index fab2a820c23683ffa8d3c0559a94e2f9a40c7b9a..008a8471fbbca0361c8adfc93a99193ff72d84e7 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/ProtoStateBuilder.cs
 @@ -283,6 +283,17 @@ internal static class ProtoStateBuilder
@@ -367,7 +367,7 @@ index fab2a82..008a847 100644
  			{
  				gs.LegalActions.Add(new LegalAction { Action = "confirm_selection", Label = "Confirm" });
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..7c94561 100644
+index 76abc62c76de7bb5d51d4e98f24762fb67c1ce88..7c945619079209a63f3d72a74eb070d9627e3ac4 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -46,6 +46,9 @@ public static class FullRunApiStateBuilder
@@ -796,7 +796,7 @@ index 76abc62..7c94561 100644
  				?? fallback;
  		}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..8e56f53 100644
+index 15bb206d3ded53ecfc49efe5b1b8efd0f465e332..8e56f53fd376d247306bf31c55ca189b66abeb16 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 @@ -14,6 +14,10 @@ public sealed class FullRunApiAction
@@ -1224,7 +1224,7 @@ index 15bb206..8e56f53 100644
  
  	public List<FullRunApiAction> legal_actions { get; set; } = new List<FullRunApiAction>();
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
-index 29357a3..bb65445 100644
+index 29357a36e173c3c4e7fa61f138d3f9d01cb910cb..bb654450ef72869b25a7aa3edfdb8e3c107eb8ae 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationChoiceBridge.cs
 @@ -72,12 +72,16 @@ public sealed class FullRunPendingCombatCardSelectionRestoreSnapshot
@@ -1545,7 +1545,7 @@ index 29357a3..bb65445 100644
  		return prefs;
  	}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
-index 6f1ecf4..10841df 100644
+index 6f1ecf47bae5128473576d937584355ad2768e12..10841df2b6bc23e8dc4d50cd2dc6b53e694b140e 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationDtos.cs
 @@ -30,6 +30,12 @@ public sealed class SimulationBuildSpec
@@ -1573,7 +1573,7 @@ index 6f1ecf4..10841df 100644
  
  	public uint? TargetId { get; set; }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
-index 4093373..d2e7d64 100644
+index 4093373904522462db4a968fb0fe9716d686a6e1..d2e7d6422f9a28bd6acf5e7eafe1fab1f72b675c 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs
 @@ -129,6 +129,16 @@ private static string ResolveStateType(RunState runState, AbstractRoom? currentR
@@ -1754,7 +1754,7 @@ index 4093373..d2e7d64 100644
  			{
  				Godot.GD.PrintErr($"[BuildCombatLegalActions] Returning empty: IsPlayPhase={combatState.IsPlayPhase} PlayerActionsDisabled={combatState.PlayerActionsDisabled} IsActionQueueRunning={combatState.IsActionQueueRunning} PlayerHP={combatState.Player?.CurrentHp}");
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
-index 217a7c3..a7d1ae3 100644
+index 217a7c3b3e367e9d10f7b524329a511a6bc064ce..a7d1ae35b58f72cb63c62911dfad82cb84a26987 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 @@ -763,6 +763,24 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
@@ -1842,7 +1842,7 @@ index 217a7c3..a7d1ae3 100644
  		return true;
  	}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
-index 658be06..3ed8f30 100644
+index 658be06cff3a4baacde675674d194443d18c5e9d..3ed8f3054dc216460fa51b4c5e963c91192f8daa 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/SimulationBuildSupport.cs
 @@ -29,6 +29,8 @@ internal static class SimulationBuildSupport
@@ -1888,7 +1888,7 @@ index 658be06..3ed8f30 100644
  			save.MaxHp = Math.Max(1, build.MaxHp.Value);
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
 new file mode 100644
-index 0000000..6dacd8a
+index 0000000000000000000000000000000000000000..6dacd8ae1becdd57f7cc76a1bb4ebdcd0f9f1a99
 --- /dev/null
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/TrainingRevivalController.cs
 @@ -0,0 +1,62 @@
@@ -1955,7 +1955,7 @@ index 0000000..6dacd8a
 +	}
 +}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
-index 981b065..182d1f0 100644
+index 981b065e3a0fb4460c582e21c859a70734c3cc7b..182d1f01c43c0d663ec68a26a2a8fef6ab71ab04 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingActionType.cs
 @@ -8,5 +8,7 @@ public enum CombatTrainingActionType
@@ -1968,7 +1968,7 @@ index 981b065..182d1f0 100644
 +	DeselectCardChoice = 8
  }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
-index be21d69..bcbc45b 100644
+index be21d699f2c73c2e662c4dc5363b3a39c114851a..bcbc45b8b30c019e33b062a4ae3676e966264912 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 @@ -1,6 +1,7 @@
@@ -2350,7 +2350,7 @@ index be21d69..bcbc45b 100644
  	{
  		error = "";
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
-index 245c978..9eacd11 100644
+index 245c978824d2a2574c728b872414624cfdd8d386..9eacd1124bc5bc9aeb01587aa835be7f337cfc24 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
 @@ -110,6 +110,32 @@ public sealed class CombatTrainingCreatureSnapshot
@@ -2658,7 +2658,7 @@ index 245c978..9eacd11 100644
 +	public List<CombatTrainingCardModifierSnapshot> Afflictions { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
  }
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
-index f0f6080..656947f 100644
+index f0f60805d9466ddfdeb380f397caa676e665bde1..656947fd9bde286f6bbb55752e3852a1f05f0956 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingEnvService.cs
 @@ -149,6 +149,23 @@ public sealed class CombatTrainingEnvService
@@ -2821,7 +2821,7 @@ index f0f6080..656947f 100644
  	}
  
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
-index 46e3b00..e72b0f2 100644
+index 46e3b00e66e7c461e231e2a15de58d7a8715db97..e72b0f24e683269637768708858c144b1a0745db 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingSimulatorChoiceBridge.cs
 @@ -37,27 +37,40 @@ internal sealed class CombatTrainingSimulatorChoiceBridge : ICombatChoiceAdapter
@@ -3038,7 +3038,7 @@ index 46e3b00..e72b0f2 100644
  		try
  		{
 diff --git a/src/Core/Commands/CardSelectCmd.cs b/src/Core/Commands/CardSelectCmd.cs
-index 1bfd860..76d2461 100644
+index 1bfd860e3713e25c6a676907a6159f56edffd21f..76d24611e37f45df93f69d2b7f419fd41a18af2b 100644
 --- a/src/Core/Commands/CardSelectCmd.cs
 +++ b/src/Core/Commands/CardSelectCmd.cs
 @@ -122,6 +122,26 @@ public static class CardSelectCmd
@@ -3165,7 +3165,7 @@ index 1bfd860..76d2461 100644
  		else
  		{
 diff --git a/src/Core/Entities/Creatures/Creature.cs b/src/Core/Entities/Creatures/Creature.cs
-index 644a57f..c8c963e 100644
+index 644a57f522c0d306de00c50f7cb88046135a1a40..c8c963e556b183dc4de01a874435e9eff28a4bd7 100644
 --- a/src/Core/Entities/Creatures/Creature.cs
 +++ b/src/Core/Entities/Creatures/Creature.cs
 @@ -16,6 +16,7 @@ using MegaCrit.Sts2.Core.Nodes.Rooms;
@@ -3185,7 +3185,7 @@ index 644a57f..c8c963e 100644
  		{
  			UnblockedDamage = currentHp - CurrentHp,
 diff --git a/src/Core/Models/Relics/LizardTail.cs b/src/Core/Models/Relics/LizardTail.cs
-index dffe5c6..e4bdc17 100644
+index dffe5c6af54ea0a15a2bed9f2ce139a583ce4214..e4bdc175b4b40e61b6cb6efea555fad552ac9f36 100644
 --- a/src/Core/Models/Relics/LizardTail.cs
 +++ b/src/Core/Models/Relics/LizardTail.cs
 @@ -6,6 +6,7 @@ using MegaCrit.Sts2.Core.Entities.Creatures;

@@ -56,6 +56,12 @@ from .seeding import (
 )
 from .trajectory import TrajectoryJournal
 
+# Human-readable training-system ABI persisted in inspection and run_start
+# telemetry.  Exact-resume safety is enforced independently by the config,
+# encoding, replay and episodic-objective checkpoint contracts; this marker
+# makes the one-terminal-unit/fresh-policy release distinguishable in metrics.
+_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-episodic-v6"
+
 
 def exploration_epsilon(config: TrainingConfig, environment_steps: int) -> float:
     curriculum = config.curriculum
@@ -130,6 +136,10 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "mean_revivals_used": 0.0,
             "mean_player_hp_lost": 0.0,
             "maximum_observed_candidates": 0,
+            "maximum_definition_hash_collisions_per_decision": 0,
+            "maximum_relation_hash_collisions_per_decision": 0,
+            "definition_hash_collisions_total": 0,
+            "relation_hash_collisions_total": 0,
             "revival_free_combat_win_rate": 0.0,
             "revival_free_act1_clear_rate": 0.0,
             "revival_free_run_win_rate": 0.0,
@@ -177,6 +187,20 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "mean_revivals_used": statistics.fmean(item.revivals_used for item in episodes),
         "mean_player_hp_lost": statistics.fmean(item.player_hp_lost for item in episodes),
         "maximum_observed_candidates": max(item.maximum_observed_candidates for item in episodes),
+        "maximum_definition_hash_collisions_per_decision": max(
+            item.maximum_definition_hash_collisions_per_decision
+            for item in episodes
+        ),
+        "maximum_relation_hash_collisions_per_decision": max(
+            item.maximum_relation_hash_collisions_per_decision
+            for item in episodes
+        ),
+        "definition_hash_collisions_total": sum(
+            item.definition_hash_collisions_total for item in episodes
+        ),
+        "relation_hash_collisions_total": sum(
+            item.relation_hash_collisions_total for item in episodes
+        ),
         "revival_free_combat_win_rate": (sum(item.revival_free_combat_win for item in episodes) / count),
         "revival_free_act1_clear_rate": (sum(item.revival_free_act1_clear for item in episodes) / count),
         "revival_free_run_win_rate": (sum(item.revival_free_run_win for item in episodes) / count),
@@ -422,7 +446,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     return {
         "config_version": config.version,
         "profile": config.profile,
-        "pipeline": "bounded-fifo-async-vtrace-episodic-v5",
+        "pipeline": _TRAINING_PIPELINE_ABI,
         "collector_device": config.runtime.collector_device,
         "architecture": config.model.architecture,
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
@@ -678,7 +702,7 @@ def run_training(
                 "config": config.to_mapping(),
                 "config_fingerprint_sha256": config.fingerprint_sha256(),
                 "runtime_provenance": dict(runtime_provenance or {}),
-                "pipeline": "bounded-fifo-async-vtrace-episodic-v5",
+                "pipeline": _TRAINING_PIPELINE_ABI,
                 "checkpoint_load": {
                     "mode": load_mode,
                     "parent_checkpoint": (str(parent_checkpoint) if parent_checkpoint is not None else None),
@@ -1052,6 +1076,7 @@ def run_training(
                 if resources.transaction_replay is not None
                 else ()
             )
+            episodic_sampling_started_ns = time.perf_counter_ns()
             episodic_sample = (
                 resources.episodic_replay.sample_for_learning(
                     config.episodic_learning.sample_sequences,
@@ -1069,14 +1094,19 @@ def run_training(
                 if resources.episodic_replay is not None
                 else None
             )
+            episodic_sampling_ms = (
+                (time.perf_counter_ns() - episodic_sampling_started_ns)
+                / 1_000_000.0
+                if resources.episodic_replay is not None
+                else None
+            )
             episodic_sequences = (
                 episodic_sample.sequences if episodic_sample is not None else ()
             )
-            episodic_sampling = (
-                episodic_sample.diagnostics.to_mapping()
-                if episodic_sample is not None
-                else None
-            )
+            episodic_sampling = None
+            if episodic_sample is not None:
+                episodic_sampling = episodic_sample.diagnostics.to_mapping()
+                episodic_sampling["sampling_ms"] = episodic_sampling_ms
             metrics.write(
                 "learner_update_start",
                 {

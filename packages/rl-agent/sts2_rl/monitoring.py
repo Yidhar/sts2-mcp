@@ -229,6 +229,18 @@ def _project_episode(event: JsonDict, episode_number: int) -> JsonDict:
         "maximum_observed_candidates": event.get("maximum_observed_candidates"),
         "maximum_observed_semantic_candidates": event.get("maximum_observed_semantic_candidates"),
         "maximum_equivalence_class_size": event.get("maximum_equivalence_class_size"),
+        "maximum_definition_hash_collisions_per_decision": event.get(
+            "maximum_definition_hash_collisions_per_decision"
+        ),
+        "maximum_relation_hash_collisions_per_decision": event.get(
+            "maximum_relation_hash_collisions_per_decision"
+        ),
+        "definition_hash_collisions_total": event.get(
+            "definition_hash_collisions_total"
+        ),
+        "relation_hash_collisions_total": event.get(
+            "relation_hash_collisions_total"
+        ),
         "act_revival_counts": event.get("act_revival_counts"),
         "act_hp_loss_counts": event.get("act_hp_loss_counts"),
     }
@@ -275,6 +287,7 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "sampled_fresh_policy_lag_min": episodic_sampling.get("sampled_fresh_policy_lag_min"),
         "sampled_fresh_policy_lag_mean": episodic_sampling.get("sampled_fresh_policy_lag_mean"),
         "sampled_fresh_policy_lag_max": episodic_sampling.get("sampled_fresh_policy_lag_max"),
+        "episodic_sampling_ms": episodic_sampling.get("sampling_ms"),
         "gradient_norm": event.get("gradient_norm"),
         "entropy": event.get("entropy"),
         "maximum_policy_lag": event.get("maximum_policy_lag"),
@@ -319,6 +332,18 @@ def _project_actor(event: JsonDict) -> JsonDict:
         "maximum_observed_candidates": actor.get("maximum_observed_candidates"),
         "maximum_observed_semantic_candidates": actor.get("maximum_observed_semantic_candidates"),
         "maximum_equivalence_class_size": actor.get("maximum_equivalence_class_size"),
+        "maximum_definition_hash_collisions_per_decision": actor.get(
+            "maximum_definition_hash_collisions_per_decision"
+        ),
+        "maximum_relation_hash_collisions_per_decision": actor.get(
+            "maximum_relation_hash_collisions_per_decision"
+        ),
+        "definition_hash_collisions_total": actor.get(
+            "definition_hash_collisions_total"
+        ),
+        "relation_hash_collisions_total": actor.get(
+            "relation_hash_collisions_total"
+        ),
         "hand_cards": actor.get("hand_cards"),
         "draw_cards": actor.get("draw_cards"),
         "discard_cards": actor.get("discard_cards"),
@@ -792,6 +817,18 @@ def _normalise_evaluation(event: JsonDict) -> JsonDict:
         "infrastructure_retries": _integer(event.get("infrastructure_retries")),
         "maximum_observed_candidates": event.get("maximum_observed_candidates"),
         "run_maximum_observed_candidates": event.get("run_maximum_observed_candidates"),
+        "maximum_definition_hash_collisions_per_decision": event.get(
+            "maximum_definition_hash_collisions_per_decision"
+        ),
+        "maximum_relation_hash_collisions_per_decision": event.get(
+            "maximum_relation_hash_collisions_per_decision"
+        ),
+        "definition_hash_collisions_total": event.get(
+            "definition_hash_collisions_total"
+        ),
+        "relation_hash_collisions_total": event.get(
+            "relation_hash_collisions_total"
+        ),
     }
 
 

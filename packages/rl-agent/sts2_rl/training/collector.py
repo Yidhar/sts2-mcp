@@ -129,6 +129,10 @@ class EpisodeMetrics:
     # focused tests source-compatible.
     act_revival_counts: tuple[int, ...] = ()
     act_hp_loss_counts: tuple[float, ...] = ()
+    maximum_definition_hash_collisions_per_decision: int = 0
+    maximum_relation_hash_collisions_per_decision: int = 0
+    definition_hash_collisions_total: int = 0
+    relation_hash_collisions_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +184,10 @@ class EpisodeProgress:
     combat_net_progress_window: int = 0
     combat_progress_window_source: str = "default"
     combat_progress_window_match_id: str = ""
+    maximum_definition_hash_collisions_per_decision: int = 0
+    maximum_relation_hash_collisions_per_decision: int = 0
+    definition_hash_collisions_total: int = 0
+    relation_hash_collisions_total: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +242,8 @@ class _ActionChoice:
     value: float
     encoding_ms: float
     policy_forward_ms: float
+    definition_hash_collisions: int
+    relation_hash_collisions: int
 
 
 @dataclass(slots=True)
@@ -2757,6 +2767,10 @@ class GroundedCollector:
                 value=value,
                 encoding_ms=encoding_ms,
                 policy_forward_ms=policy_forward_ms,
+                definition_hash_collisions=(
+                    encoded.definition_hash_collisions
+                ),
+                relation_hash_collisions=encoded.relation_hash_collisions,
             )
 
         behavior = _branch_balanced_epsilon_behavior(
@@ -2783,6 +2797,8 @@ class GroundedCollector:
             value=value,
             encoding_ms=encoding_ms,
             policy_forward_ms=policy_forward_ms,
+            definition_hash_collisions=encoded.definition_hash_collisions,
+            relation_hash_collisions=encoded.relation_hash_collisions,
         )
 
     def _step(
@@ -2882,6 +2898,10 @@ class GroundedCollector:
         maximum_observed_candidates = 0
         maximum_observed_semantic_candidates = 0
         maximum_equivalence_class_size = 0
+        maximum_definition_hash_collisions_per_decision = 0
+        maximum_relation_hash_collisions_per_decision = 0
+        definition_hash_collisions_total = 0
+        relation_hash_collisions_total = 0
         steps_taken = 0
         final_outcome = "ongoing"
         deadlocked = False
@@ -3016,6 +3036,16 @@ class GroundedCollector:
                 maximum_equivalence_class_size,
                 *(reference.multiplicity for reference in choice.action_references),
             )
+            maximum_definition_hash_collisions_per_decision = max(
+                maximum_definition_hash_collisions_per_decision,
+                choice.definition_hash_collisions,
+            )
+            maximum_relation_hash_collisions_per_decision = max(
+                maximum_relation_hash_collisions_per_decision,
+                choice.relation_hash_collisions,
+            )
+            definition_hash_collisions_total += choice.definition_hash_collisions
+            relation_hash_collisions_total += choice.relation_hash_collisions
             policy_decisions += int(choice.valid_count > 1)
             forced_decisions += int(choice.valid_count == 1)
             selected_action = state.legal_actions[choice.dispatch_position]
@@ -3790,6 +3820,18 @@ class GroundedCollector:
                             combat_net_progress_window=(combat_window_selection.effective_window),
                             combat_progress_window_source=(combat_window_selection.source),
                             combat_progress_window_match_id=(combat_window_selection.match_id),
+                            maximum_definition_hash_collisions_per_decision=(
+                                maximum_definition_hash_collisions_per_decision
+                            ),
+                            maximum_relation_hash_collisions_per_decision=(
+                                maximum_relation_hash_collisions_per_decision
+                            ),
+                            definition_hash_collisions_total=(
+                                definition_hash_collisions_total
+                            ),
+                            relation_hash_collisions_total=(
+                                relation_hash_collisions_total
+                            ),
                         )
                     )
                 segment_steps = []
@@ -3916,6 +3958,18 @@ class GroundedCollector:
                 maximum_equivalence_class_size=(maximum_equivalence_class_size),
                 act_revival_counts=tuple(item[0] for item in ordered_act_efficiency),
                 act_hp_loss_counts=tuple(item[1] for item in ordered_act_efficiency),
+                maximum_definition_hash_collisions_per_decision=(
+                    maximum_definition_hash_collisions_per_decision
+                ),
+                maximum_relation_hash_collisions_per_decision=(
+                    maximum_relation_hash_collisions_per_decision
+                ),
+                definition_hash_collisions_total=(
+                    definition_hash_collisions_total
+                ),
+                relation_hash_collisions_total=(
+                    relation_hash_collisions_total
+                ),
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,

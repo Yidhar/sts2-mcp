@@ -1201,6 +1201,7 @@ def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
     config = _config()
     report = inspect_baseline(config)
+    assert report["pipeline"] == "bounded-fifo-async-vtrace-episodic-v6"
     assert report["active_shape_batching"] is True
     assert report["deterministic_probe_environment_steps"] == []
     assert report["encoding_capacities"]["candidates"] == 6

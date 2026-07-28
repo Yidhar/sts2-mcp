@@ -28,10 +28,11 @@ from sts2_rl.models.grounded_candidate import (
     WorldTokenBatch,
 )
 
-ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v2"
-_WORLD_ID_WIDTH: Final = 7
-_CANDIDATE_ID_WIDTH: Final = 9
-_LOCAL_ID_WIDTH: Final = 7
+ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v3"
+_WORLD_ID_WIDTH: Final = 9
+_CANDIDATE_ID_WIDTH: Final = 13
+_LOCAL_ID_WIDTH: Final = 9
+_INT32_ID_BOUND: Final = int(np.iinfo(np.int32).max) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +381,8 @@ class EncodedDecisionSnapshot:
             cfg.owner_vocab_size,
             cfg.entity_vocab_size,
             cfg.entity_vocab_size,
+            _INT32_ID_BOUND,
+            _INT32_ID_BOUND,
             cfg.zone_vocab_size,
             cfg.max_order_id,
         )
@@ -389,10 +392,14 @@ class EncodedDecisionSnapshot:
             cfg.owner_vocab_size,
             cfg.entity_vocab_size,
             cfg.entity_vocab_size,
+            _INT32_ID_BOUND,
+            _INT32_ID_BOUND,
             cfg.zone_vocab_size,
             cfg.owner_vocab_size,
             cfg.entity_vocab_size,
             cfg.entity_vocab_size,
+            _INT32_ID_BOUND,
+            _INT32_ID_BOUND,
         )
         self.world.validate(
             feature_dim=cfg.feature_dim,
@@ -593,8 +600,10 @@ def collate_encoded_snapshots(
             owner_ids=world_ids_tensor[:, :, 2],
             entity_ids=world_ids_tensor[:, :, 3],
             entity_aux_ids=world_ids_tensor[:, :, 4],
-            zone_ids=world_ids_tensor[:, :, 5],
-            order_ids=world_ids_tensor[:, :, 6],
+            definition_binding_ids=world_ids_tensor[:, :, 5],
+            relation_binding_ids=world_ids_tensor[:, :, 6],
+            zone_ids=world_ids_tensor[:, :, 7],
+            order_ids=world_ids_tensor[:, :, 8],
         ),
         candidates=CandidateTokenBatch(
             features=_tensor(candidate_features, device=dev),
@@ -603,10 +612,14 @@ def collate_encoded_snapshots(
             owner_ids=candidate_ids_tensor[:, :, 2],
             entity_ids=candidate_ids_tensor[:, :, 3],
             entity_aux_ids=candidate_ids_tensor[:, :, 4],
-            zone_ids=candidate_ids_tensor[:, :, 5],
-            target_owner_ids=candidate_ids_tensor[:, :, 6],
-            target_entity_ids=candidate_ids_tensor[:, :, 7],
-            target_entity_aux_ids=candidate_ids_tensor[:, :, 8],
+            definition_binding_ids=candidate_ids_tensor[:, :, 5],
+            relation_binding_ids=candidate_ids_tensor[:, :, 6],
+            zone_ids=candidate_ids_tensor[:, :, 7],
+            target_owner_ids=candidate_ids_tensor[:, :, 8],
+            target_entity_ids=candidate_ids_tensor[:, :, 9],
+            target_entity_aux_ids=candidate_ids_tensor[:, :, 10],
+            target_definition_binding_ids=candidate_ids_tensor[:, :, 11],
+            target_relation_binding_ids=candidate_ids_tensor[:, :, 12],
             local_features=_tensor(local_features, device=dev),
             local_mask=_tensor(local_mask, device=dev),
             local_type_ids=local_ids_tensor[:, :, :, 0],
@@ -614,8 +627,10 @@ def collate_encoded_snapshots(
             local_owner_ids=local_ids_tensor[:, :, :, 2],
             local_entity_ids=local_ids_tensor[:, :, :, 3],
             local_entity_aux_ids=local_ids_tensor[:, :, :, 4],
-            local_zone_ids=local_ids_tensor[:, :, :, 5],
-            local_order_ids=local_ids_tensor[:, :, :, 6],
+            local_definition_binding_ids=local_ids_tensor[:, :, :, 5],
+            local_relation_binding_ids=local_ids_tensor[:, :, :, 6],
+            local_zone_ids=local_ids_tensor[:, :, :, 7],
+            local_order_ids=local_ids_tensor[:, :, :, 8],
             action_mask=_tensor(action_mask, device=dev),
         ),
         domain_ids=_tensor(domain_ids, device=dev),

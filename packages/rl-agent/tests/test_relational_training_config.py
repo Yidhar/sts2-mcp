@@ -270,6 +270,98 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
     )
 
 
+def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal() -> None:
+    experiment_root = Path(__file__).parents[1] / "config" / "experiments"
+    preheat = load_training_config(profile="preheat")
+    v26 = load_training_config(
+        profile="preheat",
+        config_path=(
+            experiment_root
+            / "full_run_revival_v26_fresh_policy_credit_model_init.toml"
+        ),
+    )
+    fresh = load_training_config(
+        profile="preheat",
+        config_path=(
+            experiment_root
+            / "full_run_revival_v27_infinite_random_init.toml"
+        ),
+    )
+
+    # A fresh random network must use the broad preheat optimizer/exploration
+    # schedule rather than v26's conservative mature-policy hyperparameters.
+    assert fresh.model == preheat.model == v26.model
+    assert fresh.optimization == preheat.optimization
+    assert fresh.optimization != v26.optimization
+    assert fresh.curriculum == replace(
+        preheat.curriculum,
+        epsilon_decay_steps=150_000,
+    )
+    assert fresh.curriculum.mode == "native-revival-preheat"
+    assert fresh.curriculum.revival_mechanism == ENGINE_REVIVAL_MECHANISM
+    assert fresh.curriculum.revival_budget == -1
+    assert fresh.curriculum.epsilon_start == pytest.approx(0.70)
+    assert fresh.curriculum.epsilon_end == pytest.approx(0.10)
+
+    # Preserve only the v26 sampling/backpressure signal changes; all factual
+    # environment, transaction, diagnostics, and model contracts stay frozen.
+    assert fresh.transaction_learning == preheat.transaction_learning
+    assert fresh.environment == preheat.environment
+    assert fresh.diagnostics == preheat.diagnostics
+    assert fresh.episodic_learning == replace(
+        preheat.episodic_learning,
+        fresh_policy_sequences=1,
+    )
+    assert fresh.rollout == replace(preheat.rollout, queue_capacity=24)
+    assert fresh.rollout.deterministic_probe_interval_episodes == 16
+
+    expected_lineage = preheat.lineage_mapping()
+    expected_lineage["curriculum"] = {
+        **expected_lineage["curriculum"],
+        "epsilon_decay_steps": 150_000,
+    }
+    expected_lineage["episodic_learning"] = {
+        **expected_lineage["episodic_learning"],
+        "fresh_policy_sequences": 1,
+    }
+    expected_lineage["rollout"] = {
+        **expected_lineage["rollout"],
+        "queue_capacity": 24,
+    }
+    expected_lineage["runtime"] = {
+        **expected_lineage["runtime"],
+        "seed": 1_000_000,
+    }
+    assert fresh.lineage_mapping() == expected_lineage
+
+    # Gates are disjoint, begin only after learning starts, and retain a large
+    # never-reused final audit at the end of this full 250k preheat lineage.
+    assert fresh.runtime.total_environment_steps == 250_000
+    assert fresh.runtime.seed == 1_000_000
+    assert fresh.runtime.evaluation_steps == (
+        25_000,
+        50_000,
+        75_000,
+        100_000,
+        150_000,
+        200_000,
+        225_000,
+    )
+    assert 0 not in fresh.runtime.evaluation_steps
+    assert fresh.runtime.evaluation_episodes == 8
+    assert fresh.runtime.early_evaluation_steps == (5_000, 10_000, 20_000)
+    assert fresh.runtime.early_evaluation_episodes == 4
+    assert fresh.runtime.final_audit_steps == (250_000,)
+    assert fresh.runtime.final_audit_episodes == 32
+    assert fresh.runtime.evaluation_liveness_guard_enabled
+    assert fresh.runtime.log_dir.endswith(
+        "full-run-revival-v27-infinite-random-init"
+    )
+    assert fresh.runtime.checkpoint_dir.endswith(
+        "full-run-revival-v27-infinite-random-init"
+    )
+
+
 def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
     warmstart = load_training_config(

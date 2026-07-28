@@ -1,9 +1,9 @@
 {
   "name": "sts2-ai",
   "url": "https://github.com/frankqwang/sts2-ai.git",
-  "commit": "459f30873eac374c160f0b409d2d8167e7eead7c",
-  "tree": "0712bffbcd18348eb81479c4f3c65b94b254a646",
-  "observed_branch": "sim-upgrade-0.103.2",
+  "commit": "252bf989feb598c61c20267d3979b00bf316edb5",
+  "tree": "9b3674ad857a20ce201a3b78a277621007d3ddda",
+  "observed_branch": "main (reachable ancestor of origin/main at 2026-07-29 fetch)",
   "destination": "dependencies/sts2-ai",
   "license_status": "review-required",
   "distribution_allowed": false,
@@ -17,7 +17,7 @@
   "patches": [
     {
       "path": "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
-      "sha256": "7b234d288d18d982e105fc590c38309e9b3bf4f51c001c3fa6a76536f61cc33d"
+      "sha256": "1d8383428686d63ce83fbecc1961e7cc714cac2c229dd5831c76c561aea46708"
     },
     {
       "path": "third_party/patches/sts2-ai/0002-stable-settlement-contract.patch",
@@ -25,31 +25,37 @@
     },
     {
       "path": "third_party/patches/sts2-ai/0003-guard-orb-state-lifecycle.patch",
-      "sha256": "cd7adc3a4e5697facbc42b6adafd2109e34ef5b8917b4c16a855e14211b0835b"
+      "sha256": "bdb5de1bacabf451f70ffa69bd533a4c518af070c013ed3dd81e28d1b7a29181"
     },
     {
       "path": "third_party/patches/sts2-ai/0004-fail-closed-legal-action-eligibility.patch",
-      "sha256": "0cefdeaa44262132d5916f829607b770f3e5c8d001dc713301fca614603a870b"
+      "sha256": "670f11c03dd282f4802fab41bd624c41bb3a3042b7f8bd727b58fe6b30609461"
     },
     {
       "path": "third_party/patches/sts2-ai/0005-authoritative-victory-and-reward-claims.patch",
-      "sha256": "80f331708d1da6261ab9fb864ddcd01536539d4ae8522eb680089fc32fa63deb"
+      "sha256": "1fbff6fbd093f3dde903afa9dee2c0960af6b49b84d3bad460c3b509f798c5c0"
     },
     {
       "path": "third_party/patches/sts2-ai/0006-bound-orderless-pile-multisets.patch",
-      "sha256": "20932db56131c96c4b51bfcc33f77ab93d5580b0055ea0bcbbfbf258ca5edb1e"
+      "sha256": "c4272be50381869807143a585c56b992882e6da65c897c6456327a396708e67c"
     },
     {
       "path": "third_party/patches/sts2-ai/0007-grounded-macro-observation-contract.patch",
-      "sha256": "aead1a9049799dcae5be9e5357db4a34918e5ee8c42c4466692133e5bb40ba69"
+      "sha256": "add14202f0be25a98f02bea18bd7b09a02429e55cb6ad7ce99f5be5cd9a48b60"
     },
     {
       "path": "third_party/patches/sts2-ai/0008-guard-unowned-shop-potion-context.patch",
-      "sha256": "a7d8eedece05e91f38e0c841e43bd8ada4c8cbc327d4a580655e64331c6a4aa0"
+      "sha256": "c4ad0547228af939099838e882e9dba3ec0f4416a953be909a8503c9d2f14afb"
     },
     {
       "path": "third_party/patches/sts2-ai/0009-clean-hidden-training-revival.patch",
-      "sha256": "722c11906b9996b52af7f6ee94e7f840578eff47f40164d3a5f01f7ae1ceeab9"
+      "sha256": "d42325e723b02478a5b1b15fe68a27b3cf87f4d38cbe98d42928f04e49dbe574"
     }
+  ],
+  "patched_tree": "2f2f01e00b65621b1c37d859326659da1ab9e7eb",
+  "migration_notes": [
+    "The former local-only 459f30873eac374c160f0b409d2d8167e7eead7c / 0712bffbcd18348eb81479c4f3c65b94b254a646 pin was lost and is not advertised by the upstream remote.",
+    "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",
+    "Obsolete STS2AI/ENV/Sim/Overlay mirror hunks were intentionally removed: that tree was deleted upstream before this base and is not the canonical project."
   ]
 }

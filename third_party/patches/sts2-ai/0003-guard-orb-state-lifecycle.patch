@@ -1,5 +1,5 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Program.cs b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
-index 665e676..8d802e4 100644
+index 665e676f3724121344adc9c54728537f6dc17a35..8d802e4ab6a8c3076011779a5e326b542e15cc4d 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Program.cs
 @@ -65,6 +65,12 @@ internal static class Program
@@ -35,7 +35,7 @@ index 665e676..8d802e4 100644
  						options.UseStdio = true;
  						break;
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 784f635..407e087 100644
+index 784f6352bce2c7c542532b73fc6cec5f0196a879..407e08728bc08181b571607ab194a5167c535e13 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -34,7 +34,9 @@ public static class FullRunApiStateBuilder
@@ -188,7 +188,7 @@ index 784f635..407e087 100644
  				?? new List<FullRunApiPotionState>();
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs
 new file mode 100644
-index 0000000..2c108c2
+index 0000000000000000000000000000000000000000..2c108c2721e77e90722c629b1acb1920731e2d3b
 --- /dev/null
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunPlayerResourceLifecycle.cs
 @@ -0,0 +1,75 @@
@@ -268,7 +268,7 @@ index 0000000..2c108c2
 +	}
 +}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
-index efa60df..3ec25a2 100644
+index efa60df44a370af25ef96bfca982d5be261f3d66..3ec25a25c3b46434193d38632784ec60c79553f3 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 @@ -21,6 +21,8 @@ using MegaCrit.Sts2.Core.Events;

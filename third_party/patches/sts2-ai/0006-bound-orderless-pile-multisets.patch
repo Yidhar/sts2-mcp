@@ -1,8 +1,8 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index 76abc62..1013d9b 100644
+index 407e08728bc08181b571607ab194a5167c535e13..a1047cd2bf59f946d91e967bd3296bbbd1be55ef 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-@@ -540,20 +540,35 @@ public static class FullRunApiStateBuilder
+@@ -591,20 +591,35 @@ public static class FullRunApiStateBuilder
  	{
  		try
  		{
@@ -24,17 +24,16 @@ index 76abc62..1013d9b 100644
 +				option.quantity = 1;
 +				string identity = JsonSerializer.Serialize(option);
 +				if (grouped.TryGetValue(identity, out FullRunApiCardOption? existing))
-+				{
-+					existing.quantity = checked((existing.quantity ?? 1) + 1);
-+				}
-+				else
  				{
 -					int j = rng.Next(i + 1);
 -					(list[i], list[j]) = (list[j], list[i]);
-+					grouped.Add(identity, option);
++					existing.quantity = checked((existing.quantity ?? 1) + 1);
  				}
- 			}
--			return list;
++				else
++				{
++					grouped.Add(identity, option);
++				}
++			}
 +
 +			// A deterministic identity order reveals no hidden draw order. Retain
 +			// compact contiguous indexes for diagnostics and older consumers.
@@ -42,14 +41,14 @@ index 76abc62..1013d9b 100644
 +			for (int index = 0; index < result.Count; index++)
 +			{
 +				result[index].index = index;
-+			}
+ 			}
+-			return list;
 +			_ = shuffle;
 +			return result;
  		}
  		catch
  		{
-@@ -978,15 +993,13 @@ public static class FullRunApiStateBuilder
- 	private static List<FullRunApiCardOption> SafeBuildDeck(Player player)
+@@ -1250,11 +1265,9 @@ public static class FullRunApiStateBuilder
  	{
  		try
  		{
@@ -64,14 +63,11 @@ index 76abc62..1013d9b 100644
  		}
  		catch
  		{
- 			return new List<FullRunApiCardOption>();
- 		}
- 	}
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index 15bb206..357e8a5 100644
+index 9b7c5c80a33de1c0603335f5293ba43f41287fe0..cb7636198b187a04bdc23fa5ac365dd03854a695 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-@@ -109,6 +109,10 @@ public sealed class FullRunApiCardOption
+@@ -207,6 +207,10 @@ public sealed class FullRunApiCardOption
  {
  	public int index { get; set; }
  
@@ -82,3 +78,16 @@ index 15bb206..357e8a5 100644
  	public string? id { get; set; }
  
  	public string? name { get; set; }
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index d51be31286c7389fc0f744e12f430f11c4218731..a31221a33d7c8e57af8dfaa05684ac30d16b3d5b 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -3213,7 +3213,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		}
+ 		if (projected.hp != player.Creature.CurrentHp
+ 			|| projected.max_hp != player.Creature.MaxHp
+-			|| projected.deck.Count != player.Deck.Cards.Count)
++			|| projected.deck.Sum(static card => card.quantity ?? 1) != player.Deck.Cards.Count)
+ 		{
+ 			throw new InvalidOperationException(
+ 				$"Non-combat player projection lost persistent fields for state_type={stateType}, orb={orbId}.");

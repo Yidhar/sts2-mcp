@@ -14,6 +14,9 @@ from tools.release import build_sbom
 
 
 ROOT = Path(__file__).resolve().parents[2]
+STS2_AI_RUNTIME_COMMIT = "252bf989feb598c61c20267d3979b00bf316edb5"
+STS2_AI_RUNTIME_PURL = f"pkg:github/frankqwang/sts2-ai@{STS2_AI_RUNTIME_COMMIT}"
+STS2_AI_GAME_DATA_SNAPSHOT_COMMIT = "459f30873eac374c160f0b409d2d8167e7eead7c"
 
 
 def _properties(component: dict[str, object]) -> dict[str, str]:
@@ -45,7 +48,7 @@ class RepositorySbomTests(unittest.TestCase):
             "pkg:npm/%40modelcontextprotocol/sdk@1.29.0",
             "pkg:pypi/numpy@2.4.3?download_profile=windows-cp313",
             "pkg:pypi/torch@2.9.1%2Brocm7.2.1.lw.gitff65f5bc?download_profile=wsl-cp312-rocm-7.2.1",
-            "pkg:github/frankqwang/sts2-ai@459f30873eac374c160f0b409d2d8167e7eead7c",
+            STS2_AI_RUNTIME_PURL,
         }
         self.assertTrue(expected.issubset(components))
 
@@ -65,9 +68,7 @@ class RepositorySbomTests(unittest.TestCase):
         self.assertEqual(numpy["hashes"][0]["alg"], "SHA-256")
         self.assertEqual(len(numpy["hashes"][0]["content"]), 64)
 
-        third_party = components[
-            "pkg:github/frankqwang/sts2-ai@459f30873eac374c160f0b409d2d8167e7eead7c"
-        ]
+        third_party = components[STS2_AI_RUNTIME_PURL]
         third_party_properties = _properties(third_party)
         self.assertEqual(
             third_party_properties["sts2:license-status"], "review-required"
@@ -75,7 +76,7 @@ class RepositorySbomTests(unittest.TestCase):
         self.assertEqual(third_party_properties["sts2:distribution-allowed"], "false")
         self.assertEqual(
             third_party["hashes"],
-            [{"alg": "SHA-1", "content": "459f30873eac374c160f0b409d2d8167e7eead7c"}],
+            [{"alg": "SHA-1", "content": STS2_AI_RUNTIME_COMMIT}],
         )
 
         def all_keys(value: object) -> set[str]:
@@ -91,6 +92,25 @@ class RepositorySbomTests(unittest.TestCase):
 
         self.assertNotIn("timestamp", all_keys(bom))
         self.assertNotIn(str(ROOT), first.decode("utf-8"))
+
+    def test_game_data_snapshot_provenance_is_independent_of_runtime_pin(self) -> None:
+        """A simulator re-pin must not silently relabel existing generated game data."""
+
+        game_data_manifest = json.loads(
+            (ROOT / "game-data" / "manifest.json").read_text(encoding="utf-8")
+        )
+        runtime_lock = json.loads(
+            (ROOT / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(runtime_lock["commit"], STS2_AI_RUNTIME_COMMIT)
+        self.assertEqual(
+            game_data_manifest["upstream_sts2_ai_commit"],
+            STS2_AI_GAME_DATA_SNAPSHOT_COMMIT,
+        )
+        self.assertNotEqual(
+            game_data_manifest["upstream_sts2_ai_commit"], runtime_lock["commit"]
+        )
 
     def test_output_option_writes_identical_bytes(self) -> None:
         with (

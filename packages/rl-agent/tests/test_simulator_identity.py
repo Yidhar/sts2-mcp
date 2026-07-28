@@ -17,6 +17,22 @@ from sts2_rl.simulator_identity import (
 from sts2_rl.training.checkpointing import TrainingState
 from sts2_rl.training.config import TrainingConfig
 
+EXPECTED_STS2_AI_COMMIT = "252bf989feb598c61c20267d3979b00bf316edb5"
+EXPECTED_STS2_AI_TREE = "9b3674ad857a20ce201a3b78a277621007d3ddda"
+EXPECTED_STS2_AI_PATCHED_TREE = "2f2f01e00b65621b1c37d859326659da1ab9e7eb"
+CANONICAL_HEADLESS_PROJECT = "STS2AI/ENV/Sim/HeadlessSim/HeadlessSim.csproj"
+EXPECTED_PATCH_CHAIN = [
+    "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
+    "third_party/patches/sts2-ai/0002-stable-settlement-contract.patch",
+    "third_party/patches/sts2-ai/0003-guard-orb-state-lifecycle.patch",
+    "third_party/patches/sts2-ai/0004-fail-closed-legal-action-eligibility.patch",
+    "third_party/patches/sts2-ai/0005-authoritative-victory-and-reward-claims.patch",
+    "third_party/patches/sts2-ai/0006-bound-orderless-pile-multisets.patch",
+    "third_party/patches/sts2-ai/0007-grounded-macro-observation-contract.patch",
+    "third_party/patches/sts2-ai/0008-guard-unowned-shop-potion-context.patch",
+    "third_party/patches/sts2-ai/0009-clean-hidden-training-revival.patch",
+]
+
 
 def _lock(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     payload = {
@@ -105,6 +121,29 @@ def _simulator_for_repository_lock(tmp_path: Path) -> Path:
     return executable
 
 
+def test_repository_simulator_lock_names_one_canonical_patched_tree() -> None:
+    root = repository_root()
+    lock = json.loads(
+        (root / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8")
+    )
+
+    assert lock["commit"] == EXPECTED_STS2_AI_COMMIT
+    assert lock["tree"] == EXPECTED_STS2_AI_TREE
+    assert lock["patched_tree"] == EXPECTED_STS2_AI_PATCHED_TREE
+    assert lock["canonical_headless_project"] == CANONICAL_HEADLESS_PROJECT
+    assert lock["excluded_duplicate_project"] == (
+        "STS2AI/ENV/Sim/Runtime/HeadlessSim/HeadlessSim.csproj"
+    )
+    assert [record["path"] for record in lock["patches"]] == EXPECTED_PATCH_CHAIN
+
+    for record in lock["patches"]:
+        patch_path = root / record["path"]
+        assert record["sha256"] == sha256_file(patch_path)
+        patch = patch_path.read_text(encoding="utf-8")
+        assert "STS2AI/ENV/Sim/Overlay/" not in patch
+        assert "STS2AI/ENV/Sim/Runtime/HeadlessSim/" not in patch
+
+
 def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable() -> None:
     root = repository_root()
     lock = json.loads((root / "third_party" / "sts2-ai.lock.json").read_text(encoding="utf-8"))
@@ -128,15 +167,12 @@ def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable()
     headless_helper_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunLegalActionEligibility.cs"
     settlement_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs"
     headless_builder_path = "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulationStateBuilder.cs"
-    overlay_helper_path = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs"
-    overlay_builder_path = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs"
     assert set(sections) == {
         headless_helper_path,
         settlement_path,
         headless_builder_path,
-        overlay_helper_path,
-        overlay_builder_path,
     }
+    assert all("/Overlay/" not in path for path in sections)
 
     def changed_lines(section: str, prefix: str) -> list[str]:
         header_prefix = prefix * 3
@@ -148,8 +184,6 @@ def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable()
         return "\n".join(changed_lines(section, "+"))
 
     headless_helper = added_source(sections[headless_helper_path])
-    overlay_helper = added_source(sections[overlay_helper_path])
-    assert headless_helper == overlay_helper
     assert "internal static bool IsShopPurchaseSupported(" in headless_helper
     assert "bool hasOpenPotionSlots," in headless_helper
     assert "bool canProcurePotion)" in headless_helper
@@ -174,11 +208,7 @@ def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable()
     assert settlement_added == ["\t\tFullRunLegalActionEligibility.RunSelfTests();", ""]
 
     headless_builder_added = changed_lines(sections[headless_builder_path], "+")
-    overlay_builder_added = changed_lines(sections[overlay_builder_path], "+")
     headless_builder_removed = changed_lines(sections[headless_builder_path], "-")
-    overlay_builder_removed = changed_lines(sections[overlay_builder_path], "-")
-    assert headless_builder_added == overlay_builder_added
-    assert headless_builder_removed == overlay_builder_removed
     builder_added_source = "\n".join(headless_builder_added)
 
     assert "using MegaCrit.Sts2.Core.Hooks;" in headless_builder_added
@@ -199,13 +229,12 @@ def test_legal_action_eligibility_patch_is_locked_fail_closed_and_index_stable()
 
     # Raw merchant indices remain attached before support filtering; a sparse
     # simulator slot such as 11 must never be replaced by candidate ordinal 1.
-    for builder_path in (headless_builder_path, overlay_builder_path):
-        section = sections[builder_path]
-        context = changed_lines(section, " ")
-        added = changed_lines(section, "+")
-        removed = changed_lines(section, "-")
-        assert "\t\t\t\tIndex = index++," in context
-        assert not any(line.lstrip().startswith("Index =") for line in added + removed)
+    section = sections[headless_builder_path]
+    context = changed_lines(section, " ")
+    added = changed_lines(section, "+")
+    removed = changed_lines(section, "-")
+    assert "\t\t\t\tIndex = index++," in context
+    assert not any(line.lstrip().startswith("Index =") for line in added + removed)
 
     old_guard = "\t\t\t\tif (card3.RequiresTarget && validTargetIds.Count > 0)"
     assert old_guard in headless_builder_removed
@@ -251,16 +280,6 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     headless_runtime = (
         "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs"
     )
-    overlay_eligibility = (
-        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunLegalActionEligibility.cs"
-    )
-    overlay_outcome = (
-        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationOutcomeContract.cs"
-    )
-    overlay_builder = "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulationStateBuilder.cs"
-    overlay_runtime = (
-        "STS2AI/ENV/Sim/Overlay/Simulation/FullRunSimulatorRuntimeFacade.cs"
-    )
     combat_manager = "STS2AI/ENV/Sim/SrcCompat/Source01032/Core/Combat/CombatManager.cs"
     run_manager = "src/Core/Runs/RunManager.cs"
     assert set(sections) == {
@@ -269,13 +288,10 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
         headless_outcome,
         headless_builder,
         headless_runtime,
-        overlay_eligibility,
-        overlay_outcome,
-        overlay_builder,
-        overlay_runtime,
         combat_manager,
         run_manager,
     }
+    assert all("/Overlay/" not in path for path in sections)
 
     def changed_lines(section: str, prefix: str) -> list[str]:
         header_prefix = prefix * 3
@@ -289,8 +305,6 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
         return "\n".join(changed_lines(section, "+"))
 
     headless_eligibility_added = added_source(sections[headless_eligibility])
-    overlay_eligibility_added = added_source(sections[overlay_eligibility])
-    assert headless_eligibility_added == overlay_eligibility_added
     assert "internal static bool IsRewardClaimSupported(bool claimable)" in headless_eligibility_added
     assert "return claimable;" in headless_eligibility_added
     assert "unclaimable rewards must never be emitted as supported legal actions" in (
@@ -313,8 +327,6 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     assert "executor must reject an unsupported claim" in headless_eligibility_added
 
     headless_outcome_added = added_source(sections[headless_outcome])
-    overlay_outcome_added = added_source(sections[overlay_outcome])
-    assert headless_outcome_added == overlay_outcome_added
     assert "internal static long NormalizeVictoryTime(long runTime)" in headless_outcome_added
     assert "return Math.Max(1L, runTime);" in headless_outcome_added
     assert "NormalizeVictoryTime(0L) == 1L" in headless_outcome_added
@@ -332,11 +344,7 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     assert settlement_added == ["\t\tFullRunSimulationOutcomeContract.RunSelfTests();"]
 
     headless_builder_added = changed_lines(sections[headless_builder], "+")
-    overlay_builder_added = changed_lines(sections[overlay_builder], "+")
     headless_builder_removed = changed_lines(sections[headless_builder], "-")
-    overlay_builder_removed = changed_lines(sections[overlay_builder], "-")
-    assert headless_builder_added == overlay_builder_added
-    assert headless_builder_removed == overlay_builder_removed
     builder_added_source = "\n".join(headless_builder_added)
     builder_context = changed_lines(sections[headless_builder], " ")
     assert "FullRunSimulationOutcomeContract.ResolveTerminalOutcome(" in builder_added_source
@@ -355,13 +363,8 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     )
 
     runtime_added = added_source(sections[headless_runtime])
-    overlay_runtime_added = added_source(sections[overlay_runtime])
     runtime_removed = "\n".join(changed_lines(sections[headless_runtime], "-"))
-    overlay_runtime_removed = "\n".join(changed_lines(sections[overlay_runtime], "-"))
     runtime_section = sections[headless_runtime]
-    overlay_runtime_section = sections[overlay_runtime]
-    assert runtime_added == overlay_runtime_added
-    assert runtime_removed == overlay_runtime_removed
     assert "FullRunPendingRewardSelectionSnapshot? rewardSelection =" in runtime_added
     assert "state.CachedBridgeSnapshots?.RewardSelection;" in runtime_added
     assert "rewardIndex >= rewardSelection.Rewards.Count" in runtime_added
@@ -377,13 +380,6 @@ def test_authoritative_victory_and_reward_claim_patch_is_locked_and_fail_closed(
     assert runtime_section.index('"full_run_reward_not_claimable"') < runtime_section.index(
         "TrySelectReward(rewardIndex"
     )
-    assert overlay_runtime_section.index("IsRewardClaimRequestSupported(") < (
-        overlay_runtime_section.index("TrySelectReward(rewardIndex")
-    )
-    assert overlay_runtime_section.index('"full_run_reward_not_claimable"') < (
-        overlay_runtime_section.index("TrySelectReward(rewardIndex")
-    )
-
     # Reward observation projection remains independent and visible. This patch
     # only closes the executable claim surface; it must not delete or rewrite
     # FullRunApiStateBuilder's rewards.items projection.
@@ -424,6 +420,7 @@ def test_orderless_pile_multiset_patch_is_locked_and_lossless() -> None:
     assert set(sections) == {
         "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs",
         "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs",
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs",
     }
 
     builder = sections[
@@ -431,6 +428,9 @@ def test_orderless_pile_multiset_patch_is_locked_and_lossless() -> None:
     ]
     dto = sections[
         "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs"
+    ]
+    runtime = sections[
+        "STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs"
     ]
     assert "SortedDictionary<string, FullRunApiCardOption>" in builder
     assert "JsonSerializer.Serialize(option)" in builder
@@ -440,6 +440,11 @@ def test_orderless_pile_multiset_patch_is_locked_and_lossless() -> None:
     assert "Take(" not in builder
     assert "public int? quantity { get; set; }" in dto
     assert "SafeBuildPileCards(cards, shuffle: false)" in builder
+    assert (
+        "+\t\t\t|| projected.deck.Sum(static card => card.quantity ?? 1) "
+        "!= player.Deck.Cards.Count)"
+    ) in runtime
+    assert "-\t\t\t|| projected.deck.Count != player.Deck.Cards.Count)" in runtime
 
 def test_verifies_lock_and_exact_binary_bytes(tmp_path: Path) -> None:
     executable, identity_path, lock_path, _ = _simulator(tmp_path)
@@ -462,7 +467,10 @@ def test_missing_sidecar_is_refused_without_path_or_version_fallback(tmp_path: P
     executable.write_bytes(b"fake")
     executable.with_suffix(".dll").write_bytes(b"fake-managed-code")
 
-    with pytest.raises(SimulatorIdentityError, match="sidecar is missing.*unverified binaries are refused"):
+    with pytest.raises(
+        SimulatorIdentityError,
+        match=r"sidecar is missing.*unverified binaries are refused",
+    ):
         verify_headless_simulator(executable, lock_path=_lock(tmp_path)[0])
 
 

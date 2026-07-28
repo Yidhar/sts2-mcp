@@ -164,6 +164,7 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
                 "sampled_fresh_policy_lag_min": None,
                 "sampled_fresh_policy_lag_mean": None,
                 "sampled_fresh_policy_lag_max": None,
+                "sampling_ms": 12.5,
             },
         },
     )
@@ -188,6 +189,7 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
     assert projected["sampled_fresh_policy_lag_min"] is None
     assert projected["sampled_fresh_policy_lag_mean"] is None
     assert projected["sampled_fresh_policy_lag_max"] is None
+    assert projected["episodic_sampling_ms"] == 12.5
     assert parser.learner_series[-1]["episodic_policy_labels"] == 0
     assert parser.learner_series[-1]["episodic_zero_policy_label_update"] is True
     assert parser.learner_series[-1]["fresh_policy_quota_missed"] == 1
@@ -214,6 +216,13 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
                 "sampled_fresh_policy_lag_min": 2,
                 "sampled_fresh_policy_lag_mean": 2.0,
                 "sampled_fresh_policy_lag_max": 2,
+                "sampling_ms": 2.25,
+            },
+            "actor_progress": {
+                "maximum_definition_hash_collisions_per_decision": 6,
+                "maximum_relation_hash_collisions_per_decision": 7,
+                "definition_hash_collisions_total": 14,
+                "relation_hash_collisions_total": 15,
             },
         },
     )
@@ -226,9 +235,19 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
     assert parser.latest_learner["sampled_fresh_policy_lag_min"] == 2
     assert parser.latest_learner["sampled_fresh_policy_lag_mean"] == 2.0
     assert parser.latest_learner["sampled_fresh_policy_lag_max"] == 2
+    assert parser.latest_learner["episodic_sampling_ms"] == 2.25
     snapshot = DashboardStore(root, now=lambda: 3.0).snapshot()
     assert snapshot["latest_learner"]["episodic_policy_active"] is True
     assert snapshot["latest_learner"]["fresh_policy_quota_filled"] == 1
+    assert snapshot["latest_learner"]["episodic_sampling_ms"] == 2.25
+    assert snapshot["latest_actor"][
+        "maximum_definition_hash_collisions_per_decision"
+    ] == 6
+    assert snapshot["latest_actor"][
+        "maximum_relation_hash_collisions_per_decision"
+    ] == 7
+    assert snapshot["latest_actor"]["definition_hash_collisions_total"] == 14
+    assert snapshot["latest_actor"]["relation_hash_collisions_total"] == 15
     assert snapshot["learner_series"][-1]["episodic_policy_labels"] == 5
 
 
@@ -259,6 +278,7 @@ def test_learner_projection_does_not_invent_missing_policy_signal(tmp_path: Path
     assert parser.latest_learner["sampled_fresh_policy_lag_min"] is None
     assert parser.latest_learner["sampled_fresh_policy_lag_mean"] is None
     assert parser.latest_learner["sampled_fresh_policy_lag_max"] is None
+    assert parser.latest_learner["episodic_sampling_ms"] is None
 
 
 def test_discovery_uses_run_start_time_and_only_canonical_paths(tmp_path: Path) -> None:
@@ -317,6 +337,10 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
             "mean_revivals_used": 3.0,
             "mean_player_hp_lost": 90.0,
             "deadlock_rate": 0.5,
+            "maximum_definition_hash_collisions_per_decision": 4,
+            "maximum_relation_hash_collisions_per_decision": 5,
+            "definition_hash_collisions_total": 8,
+            "relation_hash_collisions_total": 9,
         },
         {
             "event": "checkpoint",
@@ -363,6 +387,10 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
             "max_floor": 12,
             "revivals_used": 1,
             "maximum_observed_candidates": 111,
+            "maximum_definition_hash_collisions_per_decision": 2,
+            "maximum_relation_hash_collisions_per_decision": 3,
+            "definition_hash_collisions_total": 5,
+            "relation_hash_collisions_total": 7,
         },
         {
             "event": "learner_update",
@@ -386,9 +414,25 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
     assert snapshot["progress"]["evaluation_episodes"] == 2
     assert snapshot["progress"]["maximum_observed_candidates"] == 111
     assert [episode["max_floor"] for episode in snapshot["episodes"]] == [8, 12]
+    assert snapshot["episodes"][-1][
+        "maximum_definition_hash_collisions_per_decision"
+    ] == 2
+    assert snapshot["episodes"][-1][
+        "maximum_relation_hash_collisions_per_decision"
+    ] == 3
+    assert snapshot["episodes"][-1]["definition_hash_collisions_total"] == 5
+    assert snapshot["episodes"][-1]["relation_hash_collisions_total"] == 7
     assert len(snapshot["evaluations"]) == 1
     assert snapshot["evaluations"][0]["evaluation_gate"] == 0
     assert snapshot["evaluations"][0]["act_1_success_rate"] == 0.0
+    assert snapshot["evaluations"][0][
+        "maximum_definition_hash_collisions_per_decision"
+    ] == 4
+    assert snapshot["evaluations"][0][
+        "maximum_relation_hash_collisions_per_decision"
+    ] == 5
+    assert snapshot["evaluations"][0]["definition_hash_collisions_total"] == 8
+    assert snapshot["evaluations"][0]["relation_hash_collisions_total"] == 9
     assert [point["policy_version"] for point in snapshot["learner_series"]] == [2, 3]
     assert [point["loss"] for point in snapshot["learner_series"]] == [0.8, 0.5]
     assert snapshot["context"] == {

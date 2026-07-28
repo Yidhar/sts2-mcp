@@ -21,6 +21,7 @@ from sts2_rl.training import (
     build_training_resources,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
+    preflight_model_initialization,
     preflight_training_checkpoint,
     save_training_checkpoint,
 )
@@ -225,6 +226,9 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
 
     metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v4"
+    assert metadata["episodic_target_abi"] == (
+        "sts2-episodic-task-targets-one-terminal-unit-v2"
+    )
     assert metadata["episodic_replay_enabled"] is True
     assert metadata["episodic_replay_spec"] == saved_metrics
     manifest = json.loads((checkpoint / "checkpoint.manifest.json").read_text(encoding="utf-8"))
@@ -245,6 +249,48 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
         assert _sequence_identity(restored.episodic_replay.sample(5, learn_steps=2, burn_in_steps=1)) == expected_next
     finally:
         restored.close()
+
+
+def test_episodic_target_abi_is_exact_resume_only(
+    tmp_path: Path,
+) -> None:
+    config = _episodic_config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        checkpoint = save_training_checkpoint(
+            tmp_path / "episodic-target-abi",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=13),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    metadata_path = checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("episodic_target_abi")
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _update_manifest_entry(checkpoint, "metadata.json")
+
+    with pytest.raises(
+        ValueError,
+        match="exact-resume checkpoint has no episodic target ABI marker",
+    ):
+        preflight_training_checkpoint(
+            checkpoint,
+            config=config,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+        )
+
+    # Parameter initialization deliberately imports only compatible learned
+    # tensors. It must not pretend to resume the old optimizer/replay objective,
+    # but it may use the source network as a fresh lineage initializer.
+    assert preflight_model_initialization(checkpoint, config=config).root == checkpoint.resolve()
 
 
 def test_missing_episodic_sidecar_fails_before_live_resource_mutation(

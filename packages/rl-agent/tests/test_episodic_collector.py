@@ -402,6 +402,50 @@ def test_streamed_full_run_backfills_boundaries_exact_costs_and_primary_reward()
     assert completed.steps[0].run.future_revivals == 3
 
 
+def test_collector_aggregates_bounded_hash_collision_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = [
+        _observation(act=0, floor=0, combat=False),
+        _observation(act=1, floor=1, combat=False),
+        _observation(act=1, floor=2, combat=False),
+    ]
+    resources = build_training_resources(
+        _run_config(),
+        backend=_ScriptedRunBackend(states, terminal_result="victory"),
+    )
+    original_encode = resources.collector.encoder.encode
+
+    def annotated_encode(*args: Any, **kwargs: Any) -> Any:
+        return replace(
+            original_encode(*args, **kwargs),
+            definition_hash_collisions=3,
+            relation_hash_collisions=5,
+        )
+
+    monkeypatch.setattr(resources.collector.encoder, "encode", annotated_encode)
+    progress: list[Any] = []
+    try:
+        episode = resources.collector.collect_episode(
+            deterministic=True,
+            record=True,
+            progress_sink=progress.append,
+        )
+    finally:
+        resources.close()
+
+    assert episode.metrics.steps == 2
+    assert episode.metrics.maximum_definition_hash_collisions_per_decision == 3
+    assert episode.metrics.maximum_relation_hash_collisions_per_decision == 5
+    assert episode.metrics.definition_hash_collisions_total == 6
+    assert episode.metrics.relation_hash_collisions_total == 10
+    assert progress
+    assert progress[-1].maximum_definition_hash_collisions_per_decision == 3
+    assert progress[-1].maximum_relation_hash_collisions_per_decision == 5
+    assert progress[-1].definition_hash_collisions_total == 6
+    assert progress[-1].relation_hash_collisions_total == 10
+
+
 def test_authoritative_run_defeat_closes_active_combat_and_act_as_failure() -> None:
     states = [
         _observation(act=1, floor=7, combat=True),
@@ -803,6 +847,10 @@ def _evaluation_metric(
     hp_lost: float,
     act_revivals: tuple[int, ...],
     act_hp_loss: tuple[float, ...],
+    maximum_definition_hash_collisions: int = 0,
+    maximum_relation_hash_collisions: int = 0,
+    definition_hash_collisions_total: int = 0,
+    relation_hash_collisions_total: int = 0,
 ) -> EpisodeMetrics:
     return EpisodeMetrics(
         episode_id=episode_id,
@@ -832,6 +880,14 @@ def _evaluation_metric(
         stall_evidence=None,
         act_revival_counts=act_revivals,
         act_hp_loss_counts=act_hp_loss,
+        maximum_definition_hash_collisions_per_decision=(
+            maximum_definition_hash_collisions
+        ),
+        maximum_relation_hash_collisions_per_decision=(
+            maximum_relation_hash_collisions
+        ),
+        definition_hash_collisions_total=definition_hash_collisions_total,
+        relation_hash_collisions_total=relation_hash_collisions_total,
     )
 
 
@@ -845,6 +901,10 @@ def test_evaluation_keeps_completion_primary_and_efficiency_conditional() -> Non
                 hp_lost=20.0,
                 act_revivals=(0, 1, 1),
                 act_hp_loss=(5.0, 12.0, 20.0),
+                maximum_definition_hash_collisions=2,
+                maximum_relation_hash_collisions=3,
+                definition_hash_collisions_total=7,
+                relation_hash_collisions_total=11,
             ),
             _evaluation_metric(
                 episode_id="loss",
@@ -853,11 +913,19 @@ def test_evaluation_keeps_completion_primary_and_efficiency_conditional() -> Non
                 hp_lost=30.0,
                 act_revivals=(0,),
                 act_hp_loss=(10.0,),
+                maximum_definition_hash_collisions=5,
+                maximum_relation_hash_collisions=4,
+                definition_hash_collisions_total=13,
+                relation_hash_collisions_total=17,
             ),
         ]
     )
 
     assert summary["run_win_rate"] == 0.5
+    assert summary["maximum_definition_hash_collisions_per_decision"] == 5
+    assert summary["maximum_relation_hash_collisions_per_decision"] == 4
+    assert summary["definition_hash_collisions_total"] == 20
+    assert summary["relation_hash_collisions_total"] == 28
     assert summary["run_win_at_most_one_revival_count"] == 1
     assert summary["run_win_at_most_one_revival_rate"] == 0.5
     assert summary["successful_run_count"] == 1

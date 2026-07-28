@@ -40,6 +40,7 @@ COMBAT_DOMAIN_ID: Final = 1
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 _INTEGER_DTYPES = frozenset({torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8})
+_MAX_BINDING_ID: Final = 2**31 - 1
 
 
 def _require_rank(name: str, value: Tensor, rank: int) -> None:
@@ -69,6 +70,25 @@ def _require_ids(name: str, value: Tensor, size: int) -> None:
         raise TypeError(f"{name} must use an integer dtype, got {value.dtype}")
     if value.numel() and (int(value.min().item()) < 0 or int(value.max().item()) >= size):
         raise ValueError(f"{name} contains an ID outside [0, {size})")
+
+
+def _require_binding_ids(name: str, value: Tensor) -> None:
+    """Validate collision-free decision-local semantic binding IDs.
+
+    Binding IDs are not embedding-table indexes.  They only participate in
+    exact equality pooling and therefore use the full non-negative int32
+    snapshot range rather than ``entity_vocab_size``.
+    """
+
+    if value.dtype not in _INTEGER_DTYPES:
+        raise TypeError(f"{name} must use an integer dtype, got {value.dtype}")
+    if value.numel() and (
+        int(value.min().item()) < 0
+        or int(value.max().item()) > _MAX_BINDING_ID
+    ):
+        raise ValueError(
+            f"{name} contains a binding ID outside [0, {_MAX_BINDING_ID}]"
+        )
 
 
 def _require_same_device(name: str, reference: Tensor, value: Tensor) -> None:
@@ -184,6 +204,8 @@ class WorldTokenBatch:
     owner_ids: Tensor  # [B, W]
     entity_ids: Tensor  # [B, W]
     entity_aux_ids: Tensor  # [B, W]
+    definition_binding_ids: Tensor  # [B, W], exact decision-local identity
+    relation_binding_ids: Tensor  # [B, W], exact decision-local relation
     zone_ids: Tensor  # [B, W]
     order_ids: Tensor  # [B, W]
 
@@ -206,6 +228,8 @@ class WorldTokenBatch:
             ("owner_ids", self.owner_ids),
             ("entity_ids", self.entity_ids),
             ("entity_aux_ids", self.entity_aux_ids),
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
             ("zone_ids", self.zone_ids),
             ("order_ids", self.order_ids),
         ):
@@ -222,6 +246,11 @@ class WorldTokenBatch:
             ("order_ids", self.order_ids, config.order_vocab_size),
         ):
             _require_ids(f"world.{name}", value, size)
+        for name, value in (
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
+        ):
+            _require_binding_ids(f"world.{name}", value)
         if world_count <= 0:
             raise ValueError("world token capacity must be positive")
         return batch_size, world_count
@@ -242,10 +271,14 @@ class CandidateTokenBatch:
     owner_ids: Tensor  # [B, A]
     entity_ids: Tensor  # [B, A]
     entity_aux_ids: Tensor  # [B, A]
+    definition_binding_ids: Tensor  # [B, A]
+    relation_binding_ids: Tensor  # [B, A]
     zone_ids: Tensor  # [B, A]
     target_owner_ids: Tensor  # [B, A]
     target_entity_ids: Tensor  # [B, A]
     target_entity_aux_ids: Tensor  # [B, A]
+    target_definition_binding_ids: Tensor  # [B, A]
+    target_relation_binding_ids: Tensor  # [B, A]
     local_features: Tensor  # [B, A, L, F]
     local_mask: Tensor  # [B, A, L]
     local_type_ids: Tensor  # [B, A, L]
@@ -253,6 +286,8 @@ class CandidateTokenBatch:
     local_owner_ids: Tensor  # [B, A, L]
     local_entity_ids: Tensor  # [B, A, L]
     local_entity_aux_ids: Tensor  # [B, A, L]
+    local_definition_binding_ids: Tensor  # [B, A, L]
+    local_relation_binding_ids: Tensor  # [B, A, L]
     local_zone_ids: Tensor  # [B, A, L]
     local_order_ids: Tensor  # [B, A, L]
     action_mask: Tensor  # [B, A]
@@ -275,10 +310,17 @@ class CandidateTokenBatch:
             ("owner_ids", self.owner_ids),
             ("entity_ids", self.entity_ids),
             ("entity_aux_ids", self.entity_aux_ids),
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
             ("zone_ids", self.zone_ids),
             ("target_owner_ids", self.target_owner_ids),
             ("target_entity_ids", self.target_entity_ids),
             ("target_entity_aux_ids", self.target_entity_aux_ids),
+            (
+                "target_definition_binding_ids",
+                self.target_definition_binding_ids,
+            ),
+            ("target_relation_binding_ids", self.target_relation_binding_ids),
             ("action_mask", self.action_mask),
         ):
             _require_shape(f"candidates.{name}", value, candidate_shape)
@@ -301,6 +343,16 @@ class CandidateTokenBatch:
             ),
         ):
             _require_ids(f"candidates.{name}", value, size)
+        for name, value in (
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
+            (
+                "target_definition_binding_ids",
+                self.target_definition_binding_ids,
+            ),
+            ("target_relation_binding_ids", self.target_relation_binding_ids),
+        ):
+            _require_binding_ids(f"candidates.{name}", value)
 
         _require_rank("candidates.local_features", self.local_features, 4)
         _require_finite_floating("candidates.local_features", self.local_features)
@@ -324,6 +376,11 @@ class CandidateTokenBatch:
             ("local_owner_ids", self.local_owner_ids),
             ("local_entity_ids", self.local_entity_ids),
             ("local_entity_aux_ids", self.local_entity_aux_ids),
+            (
+                "local_definition_binding_ids",
+                self.local_definition_binding_ids,
+            ),
+            ("local_relation_binding_ids", self.local_relation_binding_ids),
             ("local_zone_ids", self.local_zone_ids),
             ("local_order_ids", self.local_order_ids),
         ):
@@ -344,6 +401,14 @@ class CandidateTokenBatch:
             ("local_order_ids", self.local_order_ids, config.order_vocab_size),
         ):
             _require_ids(f"candidates.{name}", value, size)
+        for name, value in (
+            (
+                "local_definition_binding_ids",
+                self.local_definition_binding_ids,
+            ),
+            ("local_relation_binding_ids", self.local_relation_binding_ids),
+        ):
+            _require_binding_ids(f"candidates.{name}", value)
         if action_count <= 0 or local_count <= 0:
             raise ValueError("candidate and candidate-local capacities must be positive")
         return batch_size, action_count, local_count
@@ -365,11 +430,27 @@ class CandidateTokenBatch:
             owner_ids=_candidate_axis(self.owner_ids, permutation),
             entity_ids=_candidate_axis(self.entity_ids, permutation),
             entity_aux_ids=_candidate_axis(self.entity_aux_ids, permutation),
+            definition_binding_ids=_candidate_axis(
+                self.definition_binding_ids,
+                permutation,
+            ),
+            relation_binding_ids=_candidate_axis(
+                self.relation_binding_ids,
+                permutation,
+            ),
             zone_ids=_candidate_axis(self.zone_ids, permutation),
             target_owner_ids=_candidate_axis(self.target_owner_ids, permutation),
             target_entity_ids=_candidate_axis(self.target_entity_ids, permutation),
             target_entity_aux_ids=_candidate_axis(
                 self.target_entity_aux_ids,
+                permutation,
+            ),
+            target_definition_binding_ids=_candidate_axis(
+                self.target_definition_binding_ids,
+                permutation,
+            ),
+            target_relation_binding_ids=_candidate_axis(
+                self.target_relation_binding_ids,
                 permutation,
             ),
             local_features=_candidate_axis(self.local_features, permutation),
@@ -380,6 +461,14 @@ class CandidateTokenBatch:
             local_entity_ids=_candidate_axis(self.local_entity_ids, permutation),
             local_entity_aux_ids=_candidate_axis(
                 self.local_entity_aux_ids,
+                permutation,
+            ),
+            local_definition_binding_ids=_candidate_axis(
+                self.local_definition_binding_ids,
+                permutation,
+            ),
+            local_relation_binding_ids=_candidate_axis(
+                self.local_relation_binding_ids,
                 permutation,
             ),
             local_zone_ids=_candidate_axis(self.local_zone_ids, permutation),
@@ -425,6 +514,8 @@ class WorldEncoding:
     world_mask: Tensor  # [B, W]
     entity_ids: Tensor  # [B, W]
     entity_aux_ids: Tensor  # [B, W], concrete/group relation identity
+    definition_binding_ids: Tensor  # [B, W], collision-free per decision
+    relation_binding_ids: Tensor  # [B, W], collision-free per decision
 
     def validate(
         self,
@@ -455,6 +546,12 @@ class WorldEncoding:
         ):
             _require_shape(f"world_encoding.{name}", value, token_shape)
             _require_ids(f"world_encoding.{name}", value, config.entity_vocab_size)
+        for name, value in (
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
+        ):
+            _require_shape(f"world_encoding.{name}", value, token_shape)
+            _require_binding_ids(f"world_encoding.{name}", value)
         _require_finite_floating("world_encoding.latents", self.latents)
         _require_finite_floating("world_encoding.state_embedding", self.state_embedding)
         _require_finite_floating("world_encoding.tokens", self.tokens)
@@ -465,6 +562,8 @@ class WorldEncoding:
             ("tokens", self.tokens),
             ("entity_ids", self.entity_ids),
             ("entity_aux_ids", self.entity_aux_ids),
+            ("definition_binding_ids", self.definition_binding_ids),
+            ("relation_binding_ids", self.relation_binding_ids),
         ):
             _require_same_device(f"world_encoding.{name}", self.latents, value)
 
@@ -1268,6 +1367,8 @@ class RecurrentCandidateModel(nn.Module):
             world_mask=world_mask,
             entity_ids=world.entity_ids,
             entity_aux_ids=world.entity_aux_ids,
+            definition_binding_ids=world.definition_binding_ids,
+            relation_binding_ids=world.relation_binding_ids,
         )
 
     def encode_candidates(
@@ -1348,13 +1449,15 @@ class RecurrentCandidateModel(nn.Module):
             need_weights=False,
         )
         source_exact, source_definition = self._matched_world_contexts(
-            definition_ids=candidates.entity_ids,
-            relation_ids=candidates.entity_aux_ids,
+            definition_binding_ids=candidates.definition_binding_ids,
+            relation_binding_ids=candidates.relation_binding_ids,
             world_encoding=world_encoding,
         )
         target_exact, target_definition = self._matched_world_contexts(
-            definition_ids=candidates.target_entity_ids,
-            relation_ids=candidates.target_entity_aux_ids,
+            definition_binding_ids=(
+                candidates.target_definition_binding_ids
+            ),
+            relation_binding_ids=candidates.target_relation_binding_ids,
             world_encoding=world_encoding,
         )
         relation_context = self.relation_projection(
@@ -1381,23 +1484,33 @@ class RecurrentCandidateModel(nn.Module):
     @staticmethod
     def _matched_world_contexts(
         *,
-        definition_ids: Tensor,
-        relation_ids: Tensor,
+        definition_binding_ids: Tensor,
+        relation_binding_ids: Tensor,
         world_encoding: WorldEncoding,
     ) -> tuple[Tensor, Tensor]:
         """Pool exact-instance and same-definition evidence independently.
 
-        A missing/unknown ID (0/1) never matches, so padded candidates and
-        unseen entities receive zero context rather than an accidental global
-        pool.  The projection consuming these two channels learns how much to
-        use each kind of relation instead of relying on a hand-written ratio.
+        Stable entity hash IDs remain inputs to the learned embedding tables,
+        but are deliberately *not* used here: two different semantic keys can
+        share a finite hash bucket.  Collision-free decision-local binding IDs
+        drive equality pooling instead.  A missing/unknown binding (0/1) never
+        matches, so padded candidates and unseen entities receive zero context
+        rather than an accidental global pool.  The projection consuming these
+        two channels learns how much to use each kind of relation instead of a
+        hand-written ratio.
         """
 
         world_mask = world_encoding.world_mask.unsqueeze(1)
-        relation_valid = relation_ids.unsqueeze(-1) > 1
-        definition_valid = definition_ids.unsqueeze(-1) > 1
-        relation_match = relation_valid & (relation_ids.unsqueeze(-1) == world_encoding.entity_aux_ids.unsqueeze(1))
-        definition_match = definition_valid & (definition_ids.unsqueeze(-1) == world_encoding.entity_ids.unsqueeze(1))
+        relation_valid = relation_binding_ids.unsqueeze(-1) > 1
+        definition_valid = definition_binding_ids.unsqueeze(-1) > 1
+        relation_match = relation_valid & (
+            relation_binding_ids.unsqueeze(-1)
+            == world_encoding.relation_binding_ids.unsqueeze(1)
+        )
+        definition_match = definition_valid & (
+            definition_binding_ids.unsqueeze(-1)
+            == world_encoding.definition_binding_ids.unsqueeze(1)
+        )
 
         def _pool(matches: Tensor) -> Tensor:
             weights = matches.to(dtype=world_encoding.tokens.dtype) * world_mask.to(dtype=world_encoding.tokens.dtype)

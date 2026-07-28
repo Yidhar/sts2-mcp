@@ -27,6 +27,7 @@ from sts2_rl.training.episode_replay import (
     CompletedEpisode,
     EpisodeCompletion,
     EpisodeDecisionStep,
+    HorizonTargets,
     ReplaySequence,
     backfill_completed_episode,
 )
@@ -113,24 +114,24 @@ def _snapshot(
         encoding_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
         world=sparse_token_table(
             features=(tuple(world),),
-            ids=((2, 2, 2, 2, 2, 2, 0),),
+            ids=((2, 2, 2, 2, 2, 2, 2, 2, 0),),
             feature_dim=feature_dim,
-            id_width=7,
+            id_width=9,
         ),
         candidates=sparse_token_table(
             features=(tuple(action_a), tuple(action_b)),
             ids=(
-                (2, 2, 2, 3, 3, 2, 2, 4, 4),
-                (3, 3, 2, 4, 4, 2, 2, 3, 3),
+                (2, 2, 2, 3, 3, 3, 3, 2, 2, 4, 4, 4, 4),
+                (3, 3, 2, 4, 4, 4, 4, 2, 2, 3, 3, 3, 3),
             ),
             feature_dim=feature_dim,
-            id_width=9,
+            id_width=13,
         ),
         locals=sparse_token_table(
             features=(),
             ids=(),
             feature_dim=feature_dim,
-            id_width=7,
+            id_width=9,
         ),
         local_offsets=np.asarray([0, 0, 0], dtype=np.uint32),
         action_mask=np.asarray([True, not singleton], dtype=np.bool_),
@@ -163,8 +164,10 @@ def _episode(
             policy_version=policy_versions[index],
             act=1,
             combat_id=None,
-            task_reward=0.0,
-            discount=1.0,
+            task_reward=(1.0 if won else -1.0)
+            if index == len(snapshots) - 1
+            else 0.0,
+            discount=0.0 if index == len(snapshots) - 1 else 1.0,
             revivals_before=0,
             revivals_after=final_revivals if index == len(snapshots) - 1 else 0,
             hp_loss_before=0.0,
@@ -251,6 +254,86 @@ def _learner(
     )
     assert learner.device == CPU
     return learner, encoding
+
+
+def _horizon(
+    *,
+    success: bool,
+    task_return: float,
+    return_steps: int,
+) -> HorizonTargets:
+    return HorizonTargets(
+        success=success,
+        future_revivals=0,
+        future_hp_loss=0.0,
+        task_return=task_return,
+        return_steps=return_steps,
+    )
+
+
+@pytest.mark.parametrize(
+    ("success", "terminal_return"),
+    ((True, 1.0), (False, -1.0)),
+)
+def test_run_task_target_consumes_factual_terminal_outcome_exactly_once(
+    success: bool,
+    terminal_return: float,
+) -> None:
+    target = _horizon(
+        success=success,
+        task_return=terminal_return,
+        return_steps=4,
+    )
+
+    assert VTraceLearner._episodic_task_target(
+        "run",
+        target,
+        run_target=target,
+    ) == pytest.approx(terminal_return)
+
+
+@pytest.mark.parametrize("horizon", ("combat", "act"))
+def test_local_task_target_adds_one_boundary_unit_unless_run_terminal_is_shared(
+    horizon: str,
+) -> None:
+    run_target = _horizon(success=True, task_return=1.5, return_steps=8)
+    earlier_local_boundary = _horizon(
+        success=True,
+        task_return=0.25,
+        return_steps=3,
+    )
+    terminal_local_boundary = _horizon(
+        success=True,
+        task_return=1.5,
+        return_steps=8,
+    )
+
+    assert VTraceLearner._episodic_task_target(
+        horizon,
+        earlier_local_boundary,
+        run_target=run_target,
+    ) == pytest.approx(1.25)
+    assert VTraceLearner._episodic_task_target(
+        horizon,
+        terminal_local_boundary,
+        run_target=run_target,
+    ) == pytest.approx(1.5)
+
+
+def test_local_boundary_cannot_conflict_with_shared_run_terminal_outcome() -> None:
+    run_failure = _horizon(success=False, task_return=-1.0, return_steps=2)
+    conflicting_local_success = _horizon(
+        success=True,
+        task_return=-1.0,
+        return_steps=2,
+    )
+
+    with pytest.raises(ValueError, match="conflicting outcome"):
+        VTraceLearner._episodic_task_target(
+            "combat",
+            conflicting_local_success,
+            run_target=run_failure,
+        )
 
 
 def _policy_gradient(model: RecurrentCandidateModel) -> torch.Tensor:
@@ -675,10 +758,10 @@ def test_success_tie_keeps_revival_preference_after_primary_calibration() -> Non
             ],
             device=CPU,
         )
-        # The helper trajectory has task_return=0 and an explicit successful
-        # boundary outcome of +1.  Make the run value exactly calibrated so
-        # its policy advantage is zero; only the success-stratum revival
-        # tie-break may distinguish the two otherwise successful paths.
+        # The helper trajectory contains the factual +1 run-terminal reward.
+        # Make the run value exactly calibrated so its policy advantage is
+        # zero; only the success-stratum revival tie-break may distinguish the
+        # two otherwise successful paths.
         _constant_head_output(learner.model.run_task_value_head, 1.0)
         with torch.no_grad():
             before = float(

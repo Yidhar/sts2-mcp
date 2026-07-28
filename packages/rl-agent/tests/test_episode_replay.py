@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import threading
 from collections import Counter
 from dataclasses import replace
 
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+import sts2_rl.training.episode_replay as episode_replay_module
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 from sts2_rl.encoding.snapshot import sparse_token_table
 from sts2_rl.training.episode_replay import (
@@ -36,24 +38,24 @@ def _snapshot(*, domain_id: int = 0) -> EncodedDecisionSnapshot:
         encoding_fingerprint="0" * 64,
         world=sparse_token_table(
             features=(world,),
-            ids=((2, 2, 2, 2, 2, 2, 0),),
+            ids=((2, 2, 2, 2, 2, 2, 2, 2, 0),),
             feature_dim=feature_dim,
-            id_width=7,
+            id_width=9,
         ),
         candidates=sparse_token_table(
             features=(action_a, action_b),
             ids=(
-                (2, 2, 2, 3, 3, 2, 2, 4, 4),
-                (3, 3, 2, 4, 4, 2, 2, 3, 3),
+                (2, 2, 2, 3, 3, 3, 3, 2, 2, 4, 4, 4, 4),
+                (3, 3, 2, 4, 4, 4, 4, 2, 2, 3, 3, 3, 3),
             ),
             feature_dim=feature_dim,
-            id_width=9,
+            id_width=13,
         ),
         locals=sparse_token_table(
             features=(),
             ids=(),
             feature_dim=feature_dim,
-            id_width=7,
+            id_width=9,
         ),
         local_offsets=np.asarray([0, 0, 0], dtype=np.uint32),
         action_mask=np.asarray([True, True], dtype=np.bool_),
@@ -1547,3 +1549,249 @@ def test_replay_rejects_hash_consistent_accounting_edits_atomically() -> None:
     with pytest.raises(ValueError, match="put/eviction accounting"):
         replay.load_state_dict(edited)
     assert replay.state_dict() == before
+
+
+def test_fresh_sampling_reuses_put_time_index_without_reclassifying_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A learner update must not scan every stored step for fresh candidates."""
+
+    episode = _surface_episode(
+        episode_id="indexed-fresh",
+        surfaces=("event", "card_reward", "map"),
+        won=True,
+    )
+    size = episode.storage_nbytes()
+    replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=size,
+        episode_byte_capacity=size,
+        max_segments_per_episode=3,
+        seed=29,
+    )
+    assert replay.put(episode)
+
+    def unexpected_reclassification(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("fresh sampling rescanned an indexed episode")
+
+    monkeypatch.setattr(
+        episode_replay_module,
+        "_primary_policy_target",
+        unexpected_reclassification,
+    )
+    sample = replay.sample_for_learning(
+        1,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=0.0,
+        current_policy_version=7,
+        policy_gradient_max_lag=0,
+        fresh_policy_sequences=1,
+    )
+
+    assert len(sample.sequences) == 1
+    assert sample.sequences[0].episode_id == episode.episode_id
+    assert sample.diagnostics.fresh_policy_candidate_decisions == 3
+    assert sample.diagnostics.fresh_policy_quota_filled == 1
+
+
+def test_indexed_fresh_sampling_preserves_legacy_step_order_for_version_runs() -> None:
+    episode = _with_policy_versions(
+        _surface_episode(
+            episode_id="indexed-version-runs",
+            surfaces=("event", "event", "event"),
+            won=True,
+        ),
+        (7, 6, 7),
+    )
+    sampling_index = episode_replay_module._build_episode_sampling_index(
+        episode,
+        storage_nbytes=episode.storage_nbytes(),
+    )
+
+    for seed in range(16):
+        expected_rng = np.random.default_rng(seed)
+        # The legacy implementation consumed one draw to resolve the sole
+        # surface tie, then indexed the eligible decisions in episode order.
+        expected_rng.integers(0, 1)
+        expected_step = int(expected_rng.integers(0, 3))
+        actual, candidate_episodes, candidate_decisions = (
+            episode_replay_module._fresh_policy_candidates(
+                (episode,),
+                (sampling_index,),
+                episode_order=(0,),
+                current_policy_version=7,
+                maximum_policy_lag=1,
+                rng=np.random.default_rng(seed),
+            )
+        )
+
+        assert actual == ((0, expected_step, 7 - (7, 6, 7)[expected_step]),)
+        assert candidate_episodes == 1
+        assert candidate_decisions == 3
+
+
+def test_concurrent_put_completes_while_sampling_materializes_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow learner sample must not retain the replay item/deque lock."""
+
+    snapshot = _snapshot()
+    first = _linear_episode(
+        snapshot,
+        episode_id="concurrent-first",
+        length=4,
+        won=True,
+    )
+    second = _linear_episode(
+        snapshot,
+        episode_id="concurrent-second",
+        length=5,
+        won=True,
+    )
+    byte_capacity = first.storage_nbytes() + second.storage_nbytes()
+    replay = BoundedEpisodicReplay(
+        capacity=2,
+        byte_capacity=byte_capacity,
+        episode_byte_capacity=max(
+            first.storage_nbytes(),
+            second.storage_nbytes(),
+        ),
+        max_segments_per_episode=1,
+        seed=31,
+    )
+    assert replay.put(first)
+
+    sampling_started = threading.Event()
+    release_sampling = threading.Event()
+    put_finished = threading.Event()
+    errors: list[BaseException] = []
+    original = episode_replay_module._fresh_policy_candidates
+
+    def paused_fresh_candidates(*args: object, **kwargs: object) -> object:
+        sampling_started.set()
+        if not release_sampling.wait(timeout=5.0):
+            raise TimeoutError("test did not release paused sampling")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        episode_replay_module,
+        "_fresh_policy_candidates",
+        paused_fresh_candidates,
+    )
+
+    def sample_worker() -> None:
+        try:
+            replay.sample_for_learning(
+                1,
+                learn_steps=1,
+                burn_in_steps=0,
+                macro_sample_fraction=0.0,
+                current_policy_version=7,
+                policy_gradient_max_lag=0,
+                fresh_policy_sequences=1,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    def put_worker() -> None:
+        try:
+            assert replay.put(second)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            put_finished.set()
+
+    sampler = threading.Thread(target=sample_worker, daemon=True)
+    putter = threading.Thread(target=put_worker, daemon=True)
+    sampler.start()
+    assert sampling_started.wait(timeout=2.0)
+    putter.start()
+    # Event ordering, rather than elapsed-duration comparison, proves that put
+    # can acquire the deque lock while the sampler remains deliberately paused.
+    assert put_finished.wait(timeout=2.0)
+    assert sampler.is_alive()
+    release_sampling.set()
+    sampler.join(timeout=5.0)
+    putter.join(timeout=5.0)
+
+    assert not sampler.is_alive()
+    assert not putter.is_alive()
+    assert errors == []
+    assert [item.episode_id for item in replay.snapshot()] == [
+        first.episode_id,
+        second.episode_id,
+    ]
+
+
+def test_sampling_index_tracks_eviction_duplicate_bytes_and_future_failure() -> None:
+    snapshot = _snapshot()
+    first = _linear_episode(
+        snapshot,
+        episode_id="indexed-evicted",
+        length=2,
+        won=True,
+    )
+    second = _linear_episode(
+        snapshot,
+        episode_id="indexed-retained",
+        length=3,
+        won=True,
+    )
+    capacity = max(first.storage_nbytes(), second.storage_nbytes())
+    replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=capacity,
+        episode_byte_capacity=capacity,
+        max_segments_per_episode=1,
+        seed=37,
+    )
+    assert replay.put(first)
+    assert replay.put(second)
+    assert not replay.put(second)
+
+    sample = replay.sample_for_learning(
+        1,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=0.0,
+        current_policy_version=7,
+        policy_gradient_max_lag=0,
+        fresh_policy_sequences=1,
+    )
+    assert [sequence.episode_id for sequence in sample.sequences] == [second.episode_id]
+    metrics = replay.metrics()
+    assert metrics["size"] == 1
+    assert metrics["storage_nbytes"] == second.storage_nbytes()
+    assert metrics["put_count"] == 2
+    assert metrics["eviction_count"] == 1
+    assert metrics["duplicate_count"] == 1
+
+    failed_future = _with_policy_versions(
+        _linear_episode(
+            snapshot,
+            episode_id="indexed-failed-future",
+            length=1,
+            won=False,
+        ),
+        (8,),
+    )
+    failed_size = failed_future.storage_nbytes()
+    future_replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=failed_size,
+        episode_byte_capacity=failed_size,
+        max_segments_per_episode=1,
+        seed=41,
+    )
+    assert future_replay.put(failed_future)
+    with pytest.raises(ValueError, match="newer than the learner"):
+        future_replay.sample_for_learning(
+            1,
+            learn_steps=1,
+            burn_in_steps=0,
+            macro_sample_fraction=0.0,
+            current_policy_version=7,
+            policy_gradient_max_lag=128,
+            fresh_policy_sequences=1,
+        )

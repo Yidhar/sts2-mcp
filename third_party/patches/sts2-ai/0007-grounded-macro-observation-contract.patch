@@ -1,5 +1,5 @@
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
-index a1047cd..a2bcbf6 100644
+index a1047cd2bf59f946d91e967bd3296bbbd1be55ef..a2bcbf69fdc464142c513ba85d5cbc279e5082ab 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
 @@ -60,7 +60,12 @@ public static class FullRunApiStateBuilder
@@ -132,7 +132,7 @@ index a1047cd..a2bcbf6 100644
  		}
  		return state;
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
-index cb76361..c1bbd95 100644
+index cb7636198b187a04bdc23fa5ac365dd03854a695..c1bbd95dee60427b46688ed48f61c0e497f1ea13 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
 @@ -68,6 +68,10 @@ public sealed class FullRunApiRun

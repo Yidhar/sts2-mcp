@@ -558,6 +558,16 @@ _ENGINEERED_KEY_FRAGMENTS: Final[tuple[str, ...]] = (
     "score",
     "strategy",
 )
+# Exact native card-upgrade projections are factual alternative card states,
+# not planner/action-effect previews.  Keep this exemption deliberately exact:
+# ``effect_preview``, ``damage_preview`` and any future preview-like key remain
+# behind the engineered-input firewall.
+_ENGINEERED_FRAGMENT_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "upgrade_preview",
+        "upgrade_previews",
+    }
+)
 _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
     {
         "affliction",
@@ -625,6 +635,7 @@ _FACT_CONTAINER_KEYS: Final[frozenset[str]] = frozenset(
         "target",
         "treasure",
         "upgrade_preview",
+        "upgrade_previews",
         "keywords",
         "tags",
         "traits",
@@ -687,6 +698,7 @@ _ZONE_IDS: Final[dict[str, int]] = {
     "candidate": 24,
     "world": 25,
 }
+_UNKNOWN_ZONE_HASH_START: Final = max(_ZONE_IDS.values()) + 1
 
 # Feature ABI v1.  Numeric state keys must never share a slot: doing so makes
 # observations such as ``block=3,max_hp=80`` alias a value-swapped state.  The
@@ -721,13 +733,13 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V11 preserves every emitted tensor and feature slot from v10.  The version
-# bump records the policy-facing semantic ABI: candidate ``role_ids`` now drive
-# a count-balanced hierarchical branch distribution rather than a flat
-# candidate softmax.  Exact resume must not silently continue optimizer/replay
-# state across that behavior-policy change, while explicitly reviewed
-# model-parameter initialization remains shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v11"
+# V12 admits only the exact native ``upgrade_preview(s)`` factual containers
+# through the preview firewall and moves unknown future zones into the region
+# above every fixed zone ID.  Tensor shapes and feature slots remain stable,
+# but token presence and zone-embedding semantics change.  Exact resume must
+# therefore fail closed; explicitly reviewed model-parameter initialization is
+# still shape compatible.
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v12"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -753,6 +765,9 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "domain_ids": _DOMAIN_IDS,
         "model_action_kinds": sorted(MODEL_ACTION_KIND_VOCABULARY),
         "entity_hash_namespaces": ["entity", "entity_aux"],
+        "entity_collision_policy": (
+            "stable-hash-embeddings-plus-exact-decision-local-bindings-v1"
+        ),
         "summary_slot_count": _SUMMARY_SLOT_COUNT,
         "numeric_slots": _NUMERIC_SLOT_BY_KEY,
         "category_slot_start": _CATEGORY_SLOT_START,
@@ -765,6 +780,10 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "action_group_multiplicity_slot": _ACTION_GROUP_MULTIPLICITY_SLOT,
         "world_excluded_keys": sorted(_WORLD_EXCLUDED_KEYS),
         "candidate_excluded_keys": sorted(_CANDIDATE_EXCLUDED_KEYS),
+        "engineered_key_fragments": list(_ENGINEERED_KEY_FRAGMENTS),
+        "engineered_fragment_exempt_keys": sorted(
+            _ENGINEERED_FRAGMENT_EXEMPT_KEYS
+        ),
         "card_selection_equivalence_operations": sorted(
             _CARD_SELECTION_EQUIVALENCE_OPERATIONS
         ),
@@ -788,6 +807,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "source_keys": list(_SOURCE_KEYS),
         "candidate_local_roots": sorted(_CANDIDATE_LOCAL_ROOTS),
         "zone_ids": _ZONE_IDS,
+        "unknown_zone_hash_start": _UNKNOWN_ZONE_HASH_START,
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
@@ -1025,6 +1045,8 @@ class EncodedDecision:
     snapshot: EncodedDecisionSnapshot
     encoding_fingerprint: str
     semantic_groups: tuple[SemanticActionGroup, ...]
+    definition_hash_collisions: int = 0
+    relation_hash_collisions: int = 0
 
     def __post_init__(self) -> None:
         if len(self.actions) != self.snapshot.candidate_count:
@@ -1040,6 +1062,14 @@ class EncodedDecision:
             )
         ):
             raise ValueError("semantic group references must match the dispatch table")
+        for label, value in (
+            ("definition_hash_collisions", self.definition_hash_collisions),
+            ("relation_hash_collisions", self.relation_hash_collisions),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{label} must be an integer")
+            if value < 0:
+                raise ValueError(f"{label} must be non-negative")
 
     def action(self, position: int) -> ActionReference:
         if position < 0 or position >= len(self.actions):
@@ -1058,6 +1088,9 @@ class _Token:
     owner_id: int
     entity_id: int
     entity_aux_id: int
+    entity_key: str
+    entity_aux_key: str
+    entity_aux_is_relation: bool
     zone_id: int
     order_id: int
 
@@ -1068,8 +1101,21 @@ class _Candidate:
     target_owner_id: int
     target_entity_id: int
     target_entity_aux_id: int
+    target_entity_key: str
+    target_entity_aux_key: str
+    target_entity_aux_is_relation: bool
     locals: tuple[_Token, ...]
     enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _EntityBindingAllocation:
+    """Collision-free equality IDs plus auditable stable-hash collisions."""
+
+    definitions: dict[str, int]
+    relations: dict[tuple[str, bool], int]
+    definition_hash_collisions: int
+    relation_hash_collisions: int
 
 
 @dataclass(slots=True)
@@ -1102,7 +1148,14 @@ def _hash_id(namespace: str, value: Any, size: int) -> int:
 
 
 def _stable_zone_id(value: Any, size: int) -> int:
-    """Encode reviewed zones collision-free and future zones deterministically."""
+    """Encode fixed zones collision-free and hash future zones disjointly.
+
+    IDs 0/1 remain padding/unknown.  Reviewed zones retain their fixed IDs.
+    Unknown future zones use only the remaining vocabulary above the largest
+    fixed ID; a deliberately undersized test/model vocabulary has no such
+    region and therefore returns the honest unknown ID instead of colliding
+    with an unrelated reviewed zone.
+    """
 
     normalized = _normalize_key(value)
     aliases = {
@@ -1128,9 +1181,14 @@ def _stable_zone_id(value: Any, size: int) -> int:
     }
     canonical = aliases.get(normalized, normalized)
     stable = _ZONE_IDS.get(canonical)
-    if stable is not None and stable < size:
-        return stable
-    return _hash_id("zone", canonical, size)
+    if stable is not None:
+        return stable if stable < size else 1
+    if not canonical or canonical == "unknown" or size <= _UNKNOWN_ZONE_HASH_START:
+        return 1
+    digest = hashlib.sha256(f"zone\0{canonical}".encode()).digest()
+    return _UNKNOWN_ZONE_HASH_START + int.from_bytes(digest[:8], "big") % (
+        size - _UNKNOWN_ZONE_HASH_START
+    )
 
 
 def _instance_field(value: Mapping[str, Any]) -> str:
@@ -1230,6 +1288,7 @@ def _zone_label(value: Mapping[str, Any], path: tuple[str, ...]) -> str:
             "play_pile",
             "deck_cards",
             "card_reward_selection",
+            "rewards",
             "enchantments",
             "afflictions",
             "dynamic_vars",
@@ -3121,11 +3180,13 @@ class GroundedObservationEncoder:
             if candidate.enabled is not group.reference.enabled:  # pragma: no cover - strict invariant
                 raise RuntimeError("semantic action prototype changed representative enabled state")
             references.append(group.reference)
+        bindings = self._entity_binding_allocation(world_tokens, candidates)
         domain_id = self._domain_id(model_observation)
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         snapshot = self._snapshot(
             world_tokens,
             candidates,
+            bindings=bindings,
             domain_id=domain_id,
             encoding_fingerprint=fingerprint,
         )
@@ -3136,6 +3197,120 @@ class GroundedObservationEncoder:
             snapshot=snapshot,
             encoding_fingerprint=fingerprint,
             semantic_groups=action_groups,
+            definition_hash_collisions=(
+                bindings.definition_hash_collisions
+            ),
+            relation_hash_collisions=bindings.relation_hash_collisions,
+        )
+
+    @staticmethod
+    def _definition_binding_key(value: str) -> str:
+        return str(value).strip().lower()
+
+    @classmethod
+    def _relation_binding_key(
+        cls,
+        value: str,
+        is_relation: bool,
+    ) -> tuple[str, bool]:
+        return cls._definition_binding_key(value), bool(is_relation)
+
+    def _entity_binding_allocation(
+        self,
+        world_tokens: Sequence[_Token],
+        candidates: Sequence[_Candidate],
+    ) -> _EntityBindingAllocation:
+        """Allocate exact, deterministic equality IDs for one decision.
+
+        Learned entity embeddings intentionally retain their stable finite SHA
+        buckets.  Equality pooling must not inherit those buckets' collisions,
+        so this method gathers semantic keys across world, candidate, target,
+        and local tables and assigns sorted unique keys dense decision-local
+        IDs starting at 2 (0=padding, 1=unknown).  The auxiliary namespace
+        includes the relation-vs-definition-fallback marker: identical text in
+        those two roles is not the same exact relation.
+
+        Collision counts report the number of excess distinct semantic keys
+        occupying a stable embedding bucket.  They are diagnostic only; a
+        collision no longer stops collection or corrupts equality pooling.
+        """
+
+        definition_keys: set[str] = set()
+        relation_keys: set[tuple[str, bool]] = set()
+        definition_hash_buckets: dict[int, set[str]] = {}
+        relation_hash_buckets: dict[int, set[tuple[str, bool]]] = {}
+
+        def register(
+            *,
+            entity_id: int,
+            entity_aux_id: int,
+            entity_key: str,
+            entity_aux_key: str,
+            entity_aux_is_relation: bool,
+        ) -> None:
+            normalized_entity = self._definition_binding_key(entity_key)
+            normalized_relation = self._relation_binding_key(
+                entity_aux_key,
+                entity_aux_is_relation,
+            )
+            if normalized_entity:
+                definition_keys.add(normalized_entity)
+                definition_hash_buckets.setdefault(entity_id, set()).add(
+                    normalized_entity
+                )
+            if normalized_relation[0]:
+                relation_keys.add(normalized_relation)
+                relation_hash_buckets.setdefault(entity_aux_id, set()).add(
+                    normalized_relation
+                )
+
+        def register_token(token: _Token) -> None:
+            register(
+                entity_id=token.entity_id,
+                entity_aux_id=token.entity_aux_id,
+                entity_key=token.entity_key,
+                entity_aux_key=token.entity_aux_key,
+                entity_aux_is_relation=token.entity_aux_is_relation,
+            )
+
+        for token in world_tokens:
+            register_token(token)
+        for candidate in candidates:
+            register_token(candidate.token)
+            register(
+                entity_id=candidate.target_entity_id,
+                entity_aux_id=candidate.target_entity_aux_id,
+                entity_key=candidate.target_entity_key,
+                entity_aux_key=candidate.target_entity_aux_key,
+                entity_aux_is_relation=(
+                    candidate.target_entity_aux_is_relation
+                ),
+            )
+            for token in candidate.locals:
+                register_token(token)
+
+        max_binding_id = int(np.iinfo(np.int32).max)
+        if len(definition_keys) > max_binding_id - 1:
+            raise ValueError("definition binding namespace exceeds int32 capacity")
+        if len(relation_keys) > max_binding_id - 1:
+            raise ValueError("relation binding namespace exceeds int32 capacity")
+
+        def collision_count(buckets: Mapping[int, set[Any]]) -> int:
+            return sum(max(0, len(keys) - 1) for keys in buckets.values())
+
+        return _EntityBindingAllocation(
+            definitions={
+                key: index
+                for index, key in enumerate(sorted(definition_keys), start=2)
+            },
+            relations={
+                key: index
+                for index, key in enumerate(sorted(relation_keys), start=2)
+            },
+            definition_hash_collisions=collision_count(
+                definition_hash_buckets
+            ),
+            relation_hash_collisions=collision_count(relation_hash_buckets),
         )
 
     def stack(self, decisions: Sequence[EncodedDecision]) -> GroundedCandidateBatch:
@@ -3171,9 +3346,18 @@ class GroundedObservationEncoder:
         world_tokens: Sequence[_Token],
         candidates: Sequence[_Candidate],
         *,
+        bindings: _EntityBindingAllocation,
         domain_id: int,
         encoding_fingerprint: str,
     ) -> EncodedDecisionSnapshot:
+        def definition_binding(value: str) -> int:
+            key = self._definition_binding_key(value)
+            return bindings.definitions[key] if key else 1
+
+        def relation_binding(value: str, is_relation: bool) -> int:
+            key = self._relation_binding_key(value, is_relation)
+            return bindings.relations[key] if key[0] else 1
+
         world = sparse_token_table(
             features=tuple(token.features for token in world_tokens),
             ids=tuple(
@@ -3183,13 +3367,18 @@ class GroundedObservationEncoder:
                     token.owner_id,
                     token.entity_id,
                     token.entity_aux_id,
+                    definition_binding(token.entity_key),
+                    relation_binding(
+                        token.entity_aux_key,
+                        token.entity_aux_is_relation,
+                    ),
                     token.zone_id,
                     token.order_id,
                 )
                 for token in world_tokens
             ),
             feature_dim=self.config.feature_dim,
-            id_width=7,
+            id_width=9,
         )
         candidate_tokens = tuple(candidate.token for candidate in candidates)
         candidate_table = sparse_token_table(
@@ -3201,15 +3390,25 @@ class GroundedObservationEncoder:
                     token.owner_id,
                     token.entity_id,
                     token.entity_aux_id,
+                    definition_binding(token.entity_key),
+                    relation_binding(
+                        token.entity_aux_key,
+                        token.entity_aux_is_relation,
+                    ),
                     token.zone_id,
                     candidate.target_owner_id,
                     candidate.target_entity_id,
                     candidate.target_entity_aux_id,
+                    definition_binding(candidate.target_entity_key),
+                    relation_binding(
+                        candidate.target_entity_aux_key,
+                        candidate.target_entity_aux_is_relation,
+                    ),
                 )
                 for token, candidate in zip(candidate_tokens, candidates, strict=True)
             ),
             feature_dim=self.config.feature_dim,
-            id_width=9,
+            id_width=13,
         )
         flattened_locals = tuple(local for candidate in candidates for local in candidate.locals)
         local_table = sparse_token_table(
@@ -3221,13 +3420,18 @@ class GroundedObservationEncoder:
                     token.owner_id,
                     token.entity_id,
                     token.entity_aux_id,
+                    definition_binding(token.entity_key),
+                    relation_binding(
+                        token.entity_aux_key,
+                        token.entity_aux_is_relation,
+                    ),
                     token.zone_id,
                     token.order_id,
                 )
                 for token in flattened_locals
             ),
             feature_dim=self.config.feature_dim,
-            id_width=7,
+            id_width=9,
         )
         local_offsets = [0]
         for candidate in candidates:
@@ -3341,6 +3545,7 @@ class GroundedObservationEncoder:
                 if source.get(key) is not None and str(source[key]).strip()
             ]
             entity = " | ".join(visible_parts)
+        source_aux = source_relation or entity
         token = _Token(
             # Root action DTOs differ substantially between live/headless and
             # often carry previews or transport positions.  Only the action
@@ -3359,9 +3564,12 @@ class GroundedObservationEncoder:
             entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
             entity_aux_id=_hash_id(
                 "entity_aux",
-                source_relation or entity,
+                source_aux,
                 self.config.entity_vocab_size,
             ),
+            entity_key=entity,
+            entity_aux_key=source_aux,
+            entity_aux_is_relation=bool(source_relation),
             zone_id=_stable_zone_id(
                 source_zone_label,
                 self.config.zone_vocab_size,
@@ -3377,6 +3585,7 @@ class GroundedObservationEncoder:
             path=("candidate", "target"),
             inherited="",
         )
+        target_aux = target_relation or target_entity
 
         locals_: list[_Token] = []
         queue: deque[_WalkItem] = deque()
@@ -3432,9 +3641,12 @@ class GroundedObservationEncoder:
             target_entity_id=_hash_id("entity", target_entity, self.config.entity_vocab_size),
             target_entity_aux_id=_hash_id(
                 "entity_aux",
-                target_relation or target_entity,
+                target_aux,
                 self.config.entity_vocab_size,
             ),
+            target_entity_key=target_entity,
+            target_entity_aux_key=target_aux,
+            target_entity_aux_is_relation=bool(target_relation),
             locals=tuple(locals_),
             enabled=enabled,
         )
@@ -3472,7 +3684,13 @@ class GroundedObservationEncoder:
         return (
             lowered.startswith("_")
             or lowered in excluded
-            or any(fragment in lowered for fragment in _ENGINEERED_KEY_FRAGMENTS)
+            or (
+                lowered not in _ENGINEERED_FRAGMENT_EXEMPT_KEYS
+                and any(
+                    fragment in lowered
+                    for fragment in _ENGINEERED_KEY_FRAGMENTS
+                )
+            )
         )
 
     def _node_admitted(
@@ -3583,6 +3801,7 @@ class GroundedObservationEncoder:
                 path=item.path,
                 inherited=item.inherited_relation,
             )
+            entity_aux = relation or entity
             mapping_children: list[_WalkItem] = []
             for key in sorted(value):
                 if self._excluded(str(key), excluded):
@@ -3622,9 +3841,12 @@ class GroundedObservationEncoder:
                 entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
                 entity_aux_id=_hash_id(
                     "entity_aux",
-                    relation or entity,
+                    entity_aux,
                     self.config.entity_vocab_size,
                 ),
+                entity_key=entity,
+                entity_aux_key=entity_aux,
+                entity_aux_is_relation=bool(relation),
                 zone_id=_stable_zone_id(
                     _zone_label(value, item.path),
                     self.config.zone_vocab_size,
@@ -3665,6 +3887,9 @@ class GroundedObservationEncoder:
                     item.inherited_relation,
                     self.config.entity_vocab_size,
                 ),
+                entity_key="",
+                entity_aux_key=item.inherited_relation,
+                entity_aux_is_relation=bool(item.inherited_relation),
                 zone_id=_stable_zone_id(zone, self.config.zone_vocab_size),
                 order_id=min(max(item.order + 1, 0), self.config.max_order_id - 1),
             )
@@ -3676,6 +3901,7 @@ class GroundedObservationEncoder:
         if number is not None:
             scalar_features[3] = number
         entity = str(value) if isinstance(value, str | int) else type(value).__name__
+        entity_aux = item.inherited_relation or entity
         token = _Token(
             features=tuple(scalar_features),
             type_id=_hash_id("type", f"scalar:{type(value).__name__}", self.config.type_vocab_size),
@@ -3684,9 +3910,12 @@ class GroundedObservationEncoder:
             entity_id=_hash_id("entity", entity, self.config.entity_vocab_size),
             entity_aux_id=_hash_id(
                 "entity_aux",
-                item.inherited_relation or entity,
+                entity_aux,
                 self.config.entity_vocab_size,
             ),
+            entity_key=entity,
+            entity_aux_key=entity_aux,
+            entity_aux_is_relation=bool(item.inherited_relation),
             zone_id=_stable_zone_id(zone, self.config.zone_vocab_size),
             order_id=min(max(item.order + 1, 0), self.config.max_order_id - 1),
         )

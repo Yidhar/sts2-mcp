@@ -85,7 +85,7 @@ index a25f828f68938bf0074f07860c370b8050688977..f1bc9230712b6264e73101fd258c60e5
  [JsonSerializable(typeof(FullRunPendingRewardSelectionRestoreSnapshot))]
  [JsonSerializable(typeof(FullRunPendingCardRewardRestoreSnapshot))]
 diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
-index d51be31286c7389fc0f744e12f430f11c4218731..6e0ad98fc80004dbfe023347f1ec9d041c4430c0 100644
+index a31221a33d7c8e57af8dfaa05684ac30d16b3d5b..cd9e20d70048bfb978c16faae8a396ecec6b8b65 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
 @@ -111,6 +111,8 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp

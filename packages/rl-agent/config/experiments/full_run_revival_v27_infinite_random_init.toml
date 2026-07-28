@@ -1,0 +1,48 @@
+# Fresh v27 baseline rebuilt after the v25/v26 checkpoint corpus was lost.
+#
+# Launch without ``--resume`` and without ``--initialize-from``.  Model,
+# optimizer, replay, RNGs, queue state, counters, and policy version all start
+# from a new lineage.  This preserves the v26 asynchronous/fresh-policy signal
+# contract while returning the curriculum to unlimited hidden native revival so
+# a random policy can first learn complete-run coverage.  Revival remains
+# hidden from the observation and is a cost target, never an action or relic.
+# The optimization table is deliberately inherited unchanged from ``preheat``:
+# v26's lower learning rate and entropy schedule were for a mature inherited
+# policy, not a newly initialized network.
+
+[curriculum]
+revival_budget = -1
+# A random policy needs the original broad preheat exploration schedule; v26's
+# 0.15 -> 0.05 schedule was appropriate only for its inherited v25 policy.
+epsilon_start = 0.70
+epsilon_end = 0.10
+epsilon_decay_steps = 150000
+
+[episodic_learning]
+# Preserve v26's effective long-horizon policy signal: one of two detached
+# suffixes must carry a successful label inside the strict policy-lag gate.
+fresh_policy_sequences = 1
+
+[rollout]
+# Preserve v26's bounded collector backlog and deterministic training probes.
+queue_capacity = 24
+deterministic_probe_interval_episodes = 16
+
+[runtime]
+total_environment_steps = 250000
+seed = 1000000
+log_dir = "runs/full-run-revival-v27-infinite-random-init"
+checkpoint_dir = "checkpoints/full-run-revival-v27-infinite-random-init"
+checkpoint_interval_steps = 10000
+
+# A random step-zero policy has no learned claim worth spending eight long
+# held-out runs on.  Runtime/candidate semantics receive a separate smoke test;
+# held-out learning gates begin once the first updates exist.
+evaluation_steps = [25000, 50000, 75000, 100000, 150000, 200000, 225000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000]
+early_evaluation_episodes = 4
+final_audit_steps = [250000]
+final_audit_episodes = 32
+
+evaluation_liveness_guard_enabled = true

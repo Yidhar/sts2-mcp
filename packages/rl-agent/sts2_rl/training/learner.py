@@ -700,23 +700,45 @@ class VTraceLearner:
         )
 
     @staticmethod
-    def _episodic_task_target(target: HorizonTargets) -> float:
-        """Return a completion-dominant, cost-free primary target.
+    def _episodic_task_target(
+        horizon: str,
+        target: HorizonTargets,
+        *,
+        run_target: HorizonTargets,
+    ) -> float:
+        """Return one-outcome-unit, cost-free primary supervision.
 
-        ``task_return`` contains only the base terminal/progress reward captured
-        by the collector; revival, HP-loss, and pace shaping are deliberately
-        absent.  The explicit boundary outcome is added once so a successful
-        combat/Act remains supervised even when no run-progress reward happened
-        inside that short horizon.  This outcome term is primary-task evidence,
-        not a hand-authored action preference.
+        ``task_return`` contains the base terminal/progress reward captured by
+        the collector; revival, HP-loss, and pace shaping are deliberately
+        absent.  An authoritative run terminal already contributes its factual
+        ``+1``/``-1`` terminal reward, so the run head must consume that return
+        directly.  A combat or Act boundary normally has no task terminal of its
+        own and therefore receives one explicit local outcome unit.  When that
+        local boundary coincides with the authoritative run terminal, its return
+        already contains the same terminal unit and must not add it again.
         """
 
+        if horizon not in {"combat", "act", "run"}:
+            raise ValueError(f"unsupported episodic horizon {horizon!r}")
         if (
             not target.observed
             or target.success is None
             or target.task_return is None
         ):
             raise ValueError("episodic task target is not observed")
+        if horizon == "run":
+            return float(target.task_return)
+
+        shares_run_terminal = bool(
+            run_target.observed
+            and target.return_steps == run_target.return_steps
+        )
+        if shares_run_terminal:
+            if target.success is not run_target.success:
+                raise ValueError(
+                    "a local boundary sharing the run terminal has a conflicting outcome"
+                )
+            return float(target.task_return)
         return float(target.task_return + (1.0 if target.success else -1.0))
 
     @staticmethod
@@ -922,11 +944,17 @@ class VTraceLearner:
                     run=step.run,
                 )
 
-                for _, target, task_prediction, revival_prediction in horizons:
+                for horizon, target, task_prediction, revival_prediction in horizons:
                     if not target.observed:
                         continue
                     task_predictions.append(task_prediction)
-                    task_targets.append(self._episodic_task_target(target))
+                    task_targets.append(
+                        self._episodic_task_target(
+                            horizon,
+                            target,
+                            run_target=step.run,
+                        )
+                    )
                     if target.efficiency_eligible:
                         if target.future_revivals is None:  # pragma: no cover - invariant
                             raise RuntimeError("successful horizon has no revival target")
@@ -945,7 +973,7 @@ class VTraceLearner:
                 )
                 if primary is None:
                     continue
-                _, primary_target, primary_prediction, _ = primary
+                primary_horizon, primary_target, primary_prediction, _ = primary
                 if primary_target.success is not True:
                     # A failed long horizon is authoritative evidence for the
                     # task-value heads, but it is not a counterfactual action
@@ -991,7 +1019,11 @@ class VTraceLearner:
                 )
                 primary_advantage = (
                     primary_prediction.new_tensor(
-                        self._episodic_task_target(primary_target)
+                        self._episodic_task_target(
+                            primary_horizon,
+                            primary_target,
+                            run_target=step.run,
+                        )
                     )
                     - primary_prediction
                 )

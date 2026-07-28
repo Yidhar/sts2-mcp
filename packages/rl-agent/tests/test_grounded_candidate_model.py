@@ -64,6 +64,14 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         owner_ids=_ids((batch_size, world_count), config.owner_vocab_size),
         entity_ids=_ids((batch_size, world_count), config.entity_vocab_size),
         entity_aux_ids=_ids((batch_size, world_count), config.entity_vocab_size),
+        definition_binding_ids=_ids(
+            (batch_size, world_count),
+            config.entity_vocab_size,
+        ),
+        relation_binding_ids=_ids(
+            (batch_size, world_count),
+            config.entity_vocab_size,
+        ),
         zone_ids=_ids((batch_size, world_count), config.zone_vocab_size),
         order_ids=_ids((batch_size, world_count), config.order_vocab_size),
     )
@@ -74,10 +82,26 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         owner_ids=_ids((batch_size, action_count), config.owner_vocab_size),
         entity_ids=_ids((batch_size, action_count), config.entity_vocab_size),
         entity_aux_ids=_ids((batch_size, action_count), config.entity_vocab_size),
+        definition_binding_ids=_ids(
+            (batch_size, action_count),
+            config.entity_vocab_size,
+        ),
+        relation_binding_ids=_ids(
+            (batch_size, action_count),
+            config.entity_vocab_size,
+        ),
         zone_ids=_ids((batch_size, action_count), config.zone_vocab_size),
         target_owner_ids=_ids((batch_size, action_count), config.owner_vocab_size),
         target_entity_ids=_ids((batch_size, action_count), config.entity_vocab_size),
         target_entity_aux_ids=_ids(
+            (batch_size, action_count),
+            config.entity_vocab_size,
+        ),
+        target_definition_binding_ids=_ids(
+            (batch_size, action_count),
+            config.entity_vocab_size,
+        ),
+        target_relation_binding_ids=_ids(
             (batch_size, action_count),
             config.entity_vocab_size,
         ),
@@ -110,6 +134,14 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         local_owner_ids=_ids((batch_size, action_count, local_count), config.owner_vocab_size),
         local_entity_ids=_ids((batch_size, action_count, local_count), config.entity_vocab_size),
         local_entity_aux_ids=_ids(
+            (batch_size, action_count, local_count),
+            config.entity_vocab_size,
+        ),
+        local_definition_binding_ids=_ids(
+            (batch_size, action_count, local_count),
+            config.entity_vocab_size,
+        ),
+        local_relation_binding_ids=_ids(
             (batch_size, action_count, local_count),
             config.entity_vocab_size,
         ),
@@ -554,6 +586,8 @@ def test_tensor_contract_rejects_zero_sized_batch(
             owner_ids=batch.world.owner_ids[:0],
             entity_ids=batch.world.entity_ids[:0],
             entity_aux_ids=batch.world.entity_aux_ids[:0],
+            definition_binding_ids=batch.world.definition_binding_ids[:0],
+            relation_binding_ids=batch.world.relation_binding_ids[:0],
             zone_ids=batch.world.zone_ids[:0],
             order_ids=batch.world.order_ids[:0],
         ),
@@ -565,10 +599,20 @@ def test_tensor_contract_rejects_zero_sized_batch(
             owner_ids=batch.candidates.owner_ids[:0],
             entity_ids=batch.candidates.entity_ids[:0],
             entity_aux_ids=batch.candidates.entity_aux_ids[:0],
+            definition_binding_ids=(
+                batch.candidates.definition_binding_ids[:0]
+            ),
+            relation_binding_ids=batch.candidates.relation_binding_ids[:0],
             zone_ids=batch.candidates.zone_ids[:0],
             target_owner_ids=batch.candidates.target_owner_ids[:0],
             target_entity_ids=batch.candidates.target_entity_ids[:0],
             target_entity_aux_ids=batch.candidates.target_entity_aux_ids[:0],
+            target_definition_binding_ids=(
+                batch.candidates.target_definition_binding_ids[:0]
+            ),
+            target_relation_binding_ids=(
+                batch.candidates.target_relation_binding_ids[:0]
+            ),
             local_features=batch.candidates.local_features[:0],
             local_mask=batch.candidates.local_mask[:0],
             local_type_ids=batch.candidates.local_type_ids[:0],
@@ -576,6 +620,12 @@ def test_tensor_contract_rejects_zero_sized_batch(
             local_owner_ids=batch.candidates.local_owner_ids[:0],
             local_entity_ids=batch.candidates.local_entity_ids[:0],
             local_entity_aux_ids=batch.candidates.local_entity_aux_ids[:0],
+            local_definition_binding_ids=(
+                batch.candidates.local_definition_binding_ids[:0]
+            ),
+            local_relation_binding_ids=(
+                batch.candidates.local_relation_binding_ids[:0]
+            ),
             local_zone_ids=batch.candidates.local_zone_ids[:0],
             local_order_ids=batch.candidates.local_order_ids[:0],
             action_mask=batch.candidates.action_mask[:0],
@@ -600,6 +650,8 @@ def test_public_candidate_encoder_rejects_broadcastable_world_state(
         world_mask=world.world_mask,
         entity_ids=world.entity_ids,
         entity_aux_ids=world.entity_aux_ids,
+        definition_binding_ids=world.definition_binding_ids,
+        relation_binding_ids=world.relation_binding_ids,
     )
     with pytest.raises(ValueError, match="state_embedding"):
         model.encode_candidates(batch.candidates, malformed)
@@ -619,11 +671,13 @@ def test_relation_pool_separates_runtime_instance_from_shared_definition(
         world_mask=torch.ones(1, 3, dtype=torch.bool),
         entity_ids=torch.tensor([[10, 10, 11]], dtype=torch.long),
         entity_aux_ids=torch.tensor([[21, 22, 23]], dtype=torch.long),
+        definition_binding_ids=torch.tensor([[10, 10, 11]], dtype=torch.long),
+        relation_binding_ids=torch.tensor([[21, 22, 23]], dtype=torch.long),
     )
 
     exact, definition = RecurrentCandidateModel._matched_world_contexts(
-        definition_ids=torch.tensor([[10, 10, 0]], dtype=torch.long),
-        relation_ids=torch.tensor([[21, 22, 0]], dtype=torch.long),
+        definition_binding_ids=torch.tensor([[10, 10, 0]], dtype=torch.long),
+        relation_binding_ids=torch.tensor([[21, 22, 0]], dtype=torch.long),
         world_encoding=world,
     )
 
@@ -633,6 +687,38 @@ def test_relation_pool_separates_runtime_instance_from_shared_definition(
     torch.testing.assert_close(definition[0, 1], (token_a + token_b) / 2.0)
     assert torch.count_nonzero(exact[0, 2]) == 0
     assert torch.count_nonzero(definition[0, 2]) == 0
+
+
+def test_relation_pool_never_uses_colliding_embedding_hash_ids(
+    config: GroundedCandidateConfig,
+) -> None:
+    """Exact grounding is independent of finite learned embedding buckets."""
+
+    token_a = torch.full((config.d_model,), 3.0)
+    token_b = torch.full((config.d_model,), 17.0)
+    world = WorldEncoding(
+        latents=torch.zeros(1, config.latent_slots, config.d_model),
+        state_embedding=torch.zeros(1, config.d_model),
+        tokens=torch.stack([token_a, token_b]).unsqueeze(0),
+        world_mask=torch.ones(1, 2, dtype=torch.bool),
+        # Deliberately collide both learned embedding namespaces.
+        entity_ids=torch.tensor([[7, 7]], dtype=torch.long),
+        entity_aux_ids=torch.tensor([[9, 9]], dtype=torch.long),
+        # Exact decision-local bindings remain collision-free.
+        definition_binding_ids=torch.tensor([[101, 102]], dtype=torch.long),
+        relation_binding_ids=torch.tensor([[201, 202]], dtype=torch.long),
+    )
+
+    exact, definition = RecurrentCandidateModel._matched_world_contexts(
+        definition_binding_ids=torch.tensor([[101, 102]], dtype=torch.long),
+        relation_binding_ids=torch.tensor([[201, 202]], dtype=torch.long),
+        world_encoding=world,
+    )
+
+    torch.testing.assert_close(exact[0, 0], token_a)
+    torch.testing.assert_close(exact[0, 1], token_b)
+    torch.testing.assert_close(definition[0, 0], token_a)
+    torch.testing.assert_close(definition[0, 1], token_b)
 
 
 def test_run_and_combat_memory_have_separate_update_scales(

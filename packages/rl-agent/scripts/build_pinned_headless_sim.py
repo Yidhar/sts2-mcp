@@ -112,6 +112,30 @@ def _locked_patches(lock: dict[str, Any]) -> list[dict[str, str]]:
     return records
 
 
+def _materialized_worktree_tree(source: Path) -> str:
+    """Return the Git tree for tracked and newly-added patch material.
+
+    The locked patches deliberately remain outside the dependency checkout, so
+    applying them leaves a dirty worktree rather than a commit.  Use an isolated
+    temporary index to materialize that worktree without changing the real index
+    or the detached checkout.  Ignored build outputs remain excluded by
+    ``git add --all`` exactly as they would in a real commit.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="sts2-ai-patched-index-") as directory:
+        index = Path(directory) / "index"
+        environment = os.environ.copy()
+        environment["GIT_INDEX_FILE"] = str(index)
+        subprocess.check_call(["git", "read-tree", "HEAD"], cwd=source, env=environment)
+        subprocess.check_call(["git", "add", "--all"], cwd=source, env=environment)
+        return subprocess.check_output(
+            ["git", "write-tree"],
+            cwd=source,
+            env=environment,
+            text=True,
+        ).strip()
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -172,6 +196,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 subprocess.check_call(["git", "apply", str(patch)], cwd=source)
                 applied.append(record)
+        expected_patched_tree = str(lock.get("patched_tree") or "").strip()
+        if expected_patched_tree:
+            actual_patched_tree = _materialized_worktree_tree(source)
+            if actual_patched_tree != expected_patched_tree:
+                raise SystemExit(
+                    "sts2-ai patched tree mismatch: "
+                    f"{actual_patched_tree} != {expected_patched_tree}"
+                )
         if not args.no_build:
             subprocess.check_call(build_command, cwd=source)
     finally:

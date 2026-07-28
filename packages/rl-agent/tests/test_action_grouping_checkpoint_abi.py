@@ -62,6 +62,12 @@ _V11_ENCODING = {
     "feature_abi_end": 215,
     "fingerprint_sha256": ("5d150d5949c70e49203f7808e663abcfcbd897bcb9d18a55852b117292503bb7"),
 }
+_V12_ENCODING = {
+    "version": "grounded-relational-runtime-encoding-v12",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": ("d1bc0220f7aa58e7afacaa83c1fa1ce339b65d58729f651012cd81d5ad4febf3"),
+}
 
 
 class _CombatBackend:
@@ -292,14 +298,14 @@ def _rewrite_checkpoint_encoding_contract(
 
 @pytest.mark.parametrize(
     "archived_encoding",
-    [_V8_ENCODING, _V9_ENCODING, _V10_ENCODING],
+    [_V8_ENCODING, _V9_ENCODING, _V10_ENCODING, _V11_ENCODING],
 )
-def test_only_reviewed_legacy_to_v11_model_initialization_crosses_decision_abi(
+def test_only_reviewed_legacy_to_v12_model_initialization_crosses_decision_abi(
     tmp_path: Path,
     archived_encoding: dict[str, Any],
 ) -> None:
     config = _config()
-    assert grounding_encoding_identity() == _V11_ENCODING
+    assert grounding_encoding_identity() == _V12_ENCODING
     archived = _validated_metadata(
         tmp_path,
         config=config,
@@ -454,7 +460,7 @@ def test_v9_observation_v2_initialization_inherits_only_model_parameters(
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["encoding_contract"] == _V11_ENCODING
+        assert metadata["encoding_contract"] == _V12_ENCODING
         assert metadata["training_state"] == asdict(TrainingState())
         provenance = metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"
