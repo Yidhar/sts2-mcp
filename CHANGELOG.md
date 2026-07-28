@@ -44,6 +44,11 @@ historical RL artifacts.
 
 ### Added
 
+- Added a finite-revival curriculum stage that initializes the held-out-validated
+  v24 network into a fresh lineage with a hidden, run-scoped bailout budget of
+  64. The stage retains the frozen model/replay contracts, resets all optimizer,
+  replay, RNG and counter state through explicit model-only initialization, and
+  uses a 100k-step schedule with a 32-seed final promotion audit.
 - Added a run-scoped, snapshot-preserved HeadlessSim training bailout that runs
   only after native death preventers decline, restores 50% maximum HP, and
   never creates a relic, power, card, status or action candidate. Forced kills

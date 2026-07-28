@@ -1,0 +1,43 @@
+# Fresh finite-revival curriculum lineage initialized from the held-out-validated
+# v24 policy at periodic-step-000150449.
+#
+# This is intentionally *not* an exact resume.  The engine bailout remains
+# hidden from the model, but is now limited to 64 uses per full run.  Launch
+# with ``--initialize-from`` so only compatible network parameters are
+# inherited; optimizer, replay, RNGs, counters and evaluation state restart.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[rollout]
+# Preserve recurring training-only deterministic probes so factual event and
+# selection failures continue to enter replay without using held-out episodes.
+deterministic_probe_interval_episodes = 16
+
+[runtime]
+# This is a bounded curriculum stage rather than another unlimited-revival
+# campaign.  Regular gates provide paired trend data; the larger final audit is
+# the promotion gate for the next, tighter budget.
+total_environment_steps = 100000
+seed = 1000000
+log_dir = "runs/full-run-revival-v25-budget64-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v25-budget64-model-init"
+checkpoint_interval_steps = 10000
+
+evaluation_steps = [0, 25000, 50000, 75000, 90000]
+evaluation_episodes = 8
+early_evaluation_steps = [5000, 10000, 20000]
+early_evaluation_episodes = 4
+final_audit_steps = [100000]
+final_audit_episodes = 32
+
+evaluation_liveness_guard_enabled = true

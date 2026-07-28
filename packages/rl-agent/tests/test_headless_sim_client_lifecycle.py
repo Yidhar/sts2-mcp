@@ -56,20 +56,21 @@ def test_reset_forwards_seed_and_timeout() -> None:
     )
 
 
-def test_full_run_reset_forwards_native_revival_build() -> None:
+@pytest.mark.parametrize("revival_budget", (-1, 64))
+def test_full_run_reset_forwards_native_revival_build(revival_budget: int) -> None:
     client = _bare_client()
     client._rpc = mock.Mock(return_value={"state_type": "event"})
     with mock.patch.object(module, "_build_bridge_step_response", return_value={"episode_id": "ep"}):
         client.reset(
             additional_relics=["RELIC.LIZARD_TAIL"],
-            training_revival_budget=-1,
+            training_revival_budget=revival_budget,
         )
     client._rpc.assert_called_once_with(
         "reset",
         {
             "build": {
                 "additional_relics": [{"id": "LIZARD_TAIL"}],
-                "training_revival_budget": -1,
+                "training_revival_budget": revival_budget,
             }
         },
         timeout_s=45.0,

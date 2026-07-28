@@ -155,6 +155,53 @@ def test_v22_policy3918_warmstart_overlay_is_conservative_and_fully_audited() ->
     assert config.runtime.final_audit_episodes == 20
 
 
+def test_v25_budget64_overlay_changes_only_the_revival_curriculum_lineage() -> None:
+    experiment_root = Path(__file__).parents[1] / "config" / "experiments"
+    unlimited = load_training_config(
+        profile="preheat",
+        config_path=(experiment_root / "full_run_revival_v24_engine_bailout_model_init.toml"),
+    )
+    finite = load_training_config(
+        profile="preheat",
+        config_path=(experiment_root / "full_run_revival_v25_budget64_model_init.toml"),
+    )
+
+    # The model/data/replay contracts stay frozen for a strict parameter-only
+    # initialization.  Only the hidden engine-bailout budget changes training
+    # semantics; runtime paths and evaluation cadence are not lineage identity.
+    assert finite.model == unlimited.model
+    assert finite.rollout == unlimited.rollout
+    assert finite.optimization == unlimited.optimization
+    assert finite.transaction_learning == unlimited.transaction_learning
+    assert finite.episodic_learning == unlimited.episodic_learning
+    assert finite.environment == unlimited.environment
+    assert finite.diagnostics == unlimited.diagnostics
+    assert finite.curriculum.mode == "native-revival-preheat"
+    assert finite.curriculum.revival_mechanism == ENGINE_REVIVAL_MECHANISM
+    assert unlimited.curriculum.revival_budget == -1
+    assert finite.curriculum.revival_budget == 64
+
+    expected_lineage = unlimited.lineage_mapping()
+    expected_lineage["curriculum"] = {
+        **expected_lineage["curriculum"],
+        "revival_budget": 64,
+    }
+    assert finite.lineage_mapping() != unlimited.lineage_mapping()
+    assert finite.lineage_mapping() == expected_lineage
+
+    assert finite.runtime.total_environment_steps == 100_000
+    assert finite.runtime.seed == unlimited.runtime.seed == 1_000_000
+    assert finite.runtime.log_dir.endswith("full-run-revival-v25-budget64-model-init")
+    assert finite.runtime.checkpoint_dir.endswith("full-run-revival-v25-budget64-model-init")
+    assert finite.runtime.checkpoint_interval_steps == 10_000
+    assert finite.runtime.evaluation_steps == (0, 25_000, 50_000, 75_000, 90_000)
+    assert finite.runtime.evaluation_episodes == 8
+    assert finite.runtime.early_evaluation_steps == (5_000, 10_000, 20_000)
+    assert finite.runtime.early_evaluation_episodes == 4
+    assert finite.runtime.final_audit_steps == (100_000,)
+    assert finite.runtime.final_audit_episodes == 32
+    assert finite.runtime.evaluation_liveness_guard_enabled
+
 def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
     warmstart = load_training_config(

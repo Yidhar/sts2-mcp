@@ -1323,7 +1323,7 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
             mode="native-revival-preheat",
             reward_objective="combat",
             revival_mechanism=ENGINE_REVIVAL_MECHANISM,
-            revival_budget=-1,
+            revival_budget=64,
             epsilon_start=0.2,
             epsilon_end=0.1,
             epsilon_decay_steps=10,
@@ -1335,7 +1335,7 @@ def test_runtime_budget_cut_bootstraps_instead_of_fabricating_preheat_loss() -> 
     )
     try:
         assert resources.collector.additional_relics == ()
-        assert resources.collector.training_revival_budget == -1
+        assert resources.collector.training_revival_budget == 64
         episode = resources.collector.collect_episode(
             record=True,
             maximum_steps=1,
