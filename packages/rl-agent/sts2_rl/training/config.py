@@ -617,6 +617,11 @@ class CurriculumConfig:
 class RuntimeConfig:
     device: str = "auto"
     collector_device: str = "cpu"
+    # Execution-only kernel selection.  This is recorded in run/checkpoint
+    # provenance but deliberately excluded from immutable learning lineage:
+    # an exact resume still restores model/optimizer/replay/RNG/counters while
+    # allowing a reviewed ROCm kernel hardening transition.
+    rocm_sdpa_backend: Literal["auto", "math"] = "auto"
     total_environment_steps: int = 1_000_000
     seed: int = 0
     log_dir: str = "runs/recurrent-vtrace"
@@ -733,6 +738,10 @@ class RuntimeConfig:
             raise TypeError("runtime.device must be a non-empty string")
         if not isinstance(self.collector_device, str) or not self.collector_device.strip():
             raise TypeError("runtime.collector_device must be a non-empty string")
+        if self.rocm_sdpa_backend not in ("auto", "math"):
+            raise ValueError(
+                "runtime.rocm_sdpa_backend must be 'auto' or 'math'"
+            )
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -940,6 +949,9 @@ class TrainingConfig:
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")
         for key in (
+            # Kernel backend selection is execution provenance like the
+            # resolved device/driver, not optimizer or task semantics.
+            "rocm_sdpa_backend",
             "total_environment_steps",
             "log_dir",
             "checkpoint_dir",

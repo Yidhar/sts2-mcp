@@ -338,6 +338,7 @@ def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal()
     # never-reused final audit at the end of this full 250k preheat lineage.
     assert fresh.runtime.total_environment_steps == 250_000
     assert fresh.runtime.seed == 1_000_000
+    assert fresh.runtime.rocm_sdpa_backend == "math"
     assert fresh.runtime.evaluation_steps == (
         25_000,
         50_000,

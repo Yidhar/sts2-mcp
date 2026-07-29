@@ -1,11 +1,11 @@
-# Fresh v27 baseline rebuilt after the v25/v26 checkpoint corpus was lost.
-#
-# Launch without ``--resume`` and without ``--initialize-from``.  Model,
-# optimizer, replay, RNGs, queue state, counters, and policy version all start
-# from a new lineage.  This preserves the v26 asynchronous/fresh-policy signal
-# contract while returning the curriculum to unlimited hidden native revival so
-# a random policy can first learn complete-run coverage.  Revival remains
-# hidden from the observation and is a cost target, never an action or relic.
+# v27 began as the fresh baseline rebuilt after the v25/v26 checkpoint corpus
+# was lost.  Its initial launch used neither ``--resume`` nor
+# ``--initialize-from``.  Audited successors now use exact resume, restoring
+# model, optimizer, replay, RNGs, queue state, counters, and policy version;
+# model-only initialization remains forbidden for this lineage.  This preserves
+# the v26 asynchronous/fresh-policy signal contract while keeping unlimited
+# hidden native revival for complete-run coverage.  Revival remains hidden from
+# the observation and is a cost target, never an action or relic.
 # The optimization table is deliberately inherited unchanged from ``preheat``:
 # v26's lower learning rate and entropy schedule were for a mature inherited
 # policy, not a newly initialized network.
@@ -29,6 +29,11 @@ queue_capacity = 24
 deterministic_probe_interval_episodes = 16
 
 [runtime]
+# ROCm fused SDPA kernels have produced native ROCr aborts in this lineage.
+# Force the stable math implementation process-wide on ROCm; CPU composition
+# remains untouched.  This is recorded execution provenance and may change at
+# exact resume without changing model/optimizer/replay/RNG continuation.
+rocm_sdpa_backend = "math"
 total_environment_steps = 250000
 seed = 1000000
 log_dir = "runs/full-run-revival-v27-infinite-random-init"

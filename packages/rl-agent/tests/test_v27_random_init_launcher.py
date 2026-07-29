@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import signal
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -162,4 +164,243 @@ def test_default_paths_are_fixed_to_original_e_runtime() -> None:
     assert "/mnt/f/" not in paths.simulator_executable.as_posix().casefold()
     assert paths.venv_python.as_posix().endswith(
         "/runtime/environments/wsl-rocm/bin/python"
+    )
+
+
+def _resume_checkpoint_summary(paths: object) -> dict[str, object]:
+    return {
+        "root": str(launcher.resume_checkpoint_path(paths)),
+        "checkpoint_id": launcher.RESUME_CHECKPOINT_ID,
+        "manifest_sha256": launcher.RESUME_MANIFEST_SHA256,
+        "metadata_sha256": launcher.RESUME_METADATA_SHA256,
+        "manifest_files": [{"path": "model.pt", "sha256": "1" * 64}],
+        "experiment_run_id": launcher.RESUME_RUN_ID,
+        "environment_steps": launcher.RESUME_STEP,
+        "policy_version": 325,
+        "learner_updates": 325,
+        "total_environment_steps": 250_000,
+        "config_version": "sts2-rl-v2",
+        "checkpoint_format": "sts2-rl-training-checkpoint-v1",
+    }
+
+
+def _append_event(path: Path, event: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _supervised_manifest(
+    paths: object,
+    *,
+    manifest_path: Path,
+    log_path: Path,
+    status: str = "running",
+) -> dict[str, object]:
+    return {
+        "schema_version": launcher.SUPERVISED_SCHEMA_VERSION,
+        "run_name": launcher.RUN_NAME,
+        "launch_id": "supervised-launch-a",
+        "status": status,
+        "trainer_command": list(launcher.build_resume_trainer_command(paths)),
+        "initialization": {
+            "mode": "exact-resume",
+            "resume_checkpoint": str(launcher.resume_checkpoint_path(paths)),
+        },
+        "resume_checkpoint": _resume_checkpoint_summary(paths),
+        "preexisting_run_directories": [],
+        "supervisor_process_identity": None,
+        "trainer_process_identity": None,
+        "metrics_path": None,
+        "log_path": str(log_path),
+        "manifest_path": str(manifest_path),
+    }
+
+
+def test_exact_resume_command_has_one_reviewed_source_and_no_model_init(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(_paths(tmp_path), enforce_active_root=False)
+    command = launcher.build_resume_trainer_command(paths)
+
+    assert command.count("--resume") == 1
+    assert command[command.index("--resume") + 1] == str(
+        launcher.resume_checkpoint_path(paths)
+    )
+    assert "--initialize-from" not in command
+    assert launcher.RESUME_RUN_ID in command[command.index("--resume") + 1]
+    assert command[command.index("--resume") + 1].endswith(
+        "periodic-step-000020943"
+    )
+
+    with pytest.raises(launcher.LaunchError, match="unreviewed checkpoint"):
+        launcher.validate_fixed_resume_command(
+            (*command[:-1], str(tmp_path / "other-checkpoint")),
+            paths=paths,
+        )
+    with pytest.raises(launcher.LaunchError, match="cannot initialize"):
+        launcher.validate_fixed_resume_command(
+            (*command, "--initialize-from", "bad"),
+            paths=paths,
+        )
+
+
+def test_resume_checkpoint_summary_is_pinned_by_ids_hashes_and_step(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(_paths(tmp_path), enforce_active_root=False)
+    summary = _resume_checkpoint_summary(paths)
+    assert launcher._validate_resume_checkpoint_summary(summary, paths=paths) == summary
+
+    for key, wrong in (
+        ("checkpoint_id", "other"),
+        ("manifest_sha256", "0" * 64),
+        ("metadata_sha256", "0" * 64),
+        ("environment_steps", launcher.RESUME_STEP + 1),
+    ):
+        altered = {**summary, key: wrong}
+        with pytest.raises(launcher.LaunchError, match=f"{key} mismatch"):
+            launcher._validate_resume_checkpoint_summary(altered, paths=paths)
+
+
+def test_supervised_manifest_rejects_command_drift(tmp_path: Path) -> None:
+    paths = launcher.validate_layout(_paths(tmp_path), enforce_active_root=False)
+    manifest_path = paths.manifest_dir / "resume.launch.json"
+    manifest = _supervised_manifest(
+        paths,
+        manifest_path=manifest_path,
+        log_path=paths.launcher_dir / "logs" / "resume.log",
+    )
+    manifest["trainer_command"] = [
+        *manifest["trainer_command"],
+        "--initialize-from",
+        "bad",
+    ]
+    launcher.atomic_write_json(manifest_path, manifest)
+
+    with pytest.raises(launcher.LaunchError, match="command was modified"):
+        launcher._validate_supervised_manifest(paths, manifest_path=manifest_path)
+
+
+def test_watchdog_native_abort_appends_one_auditable_failure_and_terminalizes(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(_paths(tmp_path), enforce_active_root=False)
+    manifest_path = paths.manifest_dir / "resume.launch.json"
+    log_path = paths.launcher_dir / "logs" / "resume.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "AqlQueue::HandleInsufficientScratch Assertion `queue' failed\n",
+        encoding="utf-8",
+    )
+    launcher.atomic_write_json(
+        manifest_path,
+        _supervised_manifest(
+            paths,
+            manifest_path=manifest_path,
+            log_path=log_path,
+        ),
+    )
+    metrics = (
+        paths.artifact_root
+        / "runs"
+        / launcher.RUN_NAME
+        / "run-successor"
+        / "metrics.jsonl"
+    )
+    _append_event(
+        metrics,
+        {
+            "event": "run_start",
+            "unix_s": 1.0,
+            "run_id": "successor",
+            "state": {"environment_steps": launcher.RESUME_STEP},
+            "checkpoint_load": {
+                "mode": "exact_resume",
+                "parent_checkpoint": str(launcher.resume_checkpoint_path(paths)),
+            },
+        },
+    )
+    supervisor = launcher.ProcessIdentity(101, 1, "1" * 64, "/python")
+    trainer = launcher.ProcessIdentity(102, 2, "2" * 64, "/python")
+
+    terminal = launcher.finalize_supervised_exit(
+        paths,
+        manifest_path=manifest_path,
+        returncode=-signal.SIGABRT,
+        supervisor_identity=supervisor,
+        trainer_identity=trainer,
+        metrics_path=metrics,
+        enforce_active_root=False,
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["terminal"]["classification"]["kind"] == "native_abort"
+    assert terminal["terminal"]["classification"]["native_abort"] is True
+    events = launcher._metrics_events(metrics)
+    failures = [event for event in events if event.get("event") == "run_failed"]
+    assert len(failures) == 1
+    assert failures[0]["source"] == "persistent-native-exit-watchdog"
+    assert failures[0]["resume_checkpoint_id"] == launcher.RESUME_CHECKPOINT_ID
+    assert failures[0]["trainer_process_identity"]["pid"] == 102
+
+    # Terminalization is retry-safe across a supervisor/status race.
+    launcher.finalize_supervised_exit(
+        paths,
+        manifest_path=manifest_path,
+        returncode=-signal.SIGABRT,
+        supervisor_identity=supervisor,
+        trainer_identity=trainer,
+        metrics_path=metrics,
+        enforce_active_root=False,
+    )
+    failures = [
+        event
+        for event in launcher._metrics_events(metrics)
+        if event.get("event") == "run_failed"
+    ]
+    assert len(failures) == 1
+
+
+def test_watchdog_clean_completion_never_appends_run_failed(tmp_path: Path) -> None:
+    paths = launcher.validate_layout(_paths(tmp_path), enforce_active_root=False)
+    manifest_path = paths.manifest_dir / "resume.launch.json"
+    log_path = paths.launcher_dir / "logs" / "resume.log"
+    launcher.atomic_write_json(
+        manifest_path,
+        _supervised_manifest(
+            paths,
+            manifest_path=manifest_path,
+            log_path=log_path,
+        ),
+    )
+    metrics = (
+        paths.artifact_root
+        / "runs"
+        / launcher.RUN_NAME
+        / "run-successor"
+        / "metrics.jsonl"
+    )
+    _append_event(metrics, {"event": "run_start", "unix_s": 1.0})
+    _append_event(
+        metrics,
+        {
+            "event": "run_complete",
+            "unix_s": 2.0,
+            "environment_steps": 250_000,
+        },
+    )
+    terminal = launcher.finalize_supervised_exit(
+        paths,
+        manifest_path=manifest_path,
+        returncode=0,
+        supervisor_identity=None,
+        trainer_identity=None,
+        metrics_path=metrics,
+        enforce_active_root=False,
+    )
+
+    assert terminal["status"] == "completed"
+    assert not any(
+        event.get("event") == "run_failed"
+        for event in launcher._metrics_events(metrics)
     )

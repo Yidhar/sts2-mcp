@@ -50,6 +50,7 @@ from .factory import (
     resolve_device,
 )
 from .pipeline import ActorLearnerPipeline, RecoverableActorIncident
+from .sdpa import sdpa_transition_provenance
 from .seeding import (
     final_audit_evaluation_seeds,
     held_out_evaluation_seeds,
@@ -448,6 +449,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "profile": config.profile,
         "pipeline": _TRAINING_PIPELINE_ABI,
         "collector_device": config.runtime.collector_device,
+        "rocm_sdpa_backend": config.runtime.rocm_sdpa_backend,
         "architecture": config.model.architecture,
         "recurrent_hidden_dim": config.model.recurrent_hidden_dim,
         "unroll_length": config.rollout.unroll_length,
@@ -603,6 +605,7 @@ def _save(
     load_mode: str,
     actor_supervisor_state: ActorSupervisorState,
     evaluation_state: EvaluationGateState,
+    runtime_provenance: Mapping[str, Any] | None,
 ) -> Path:
     return save_training_checkpoint(
         _checkpoint_path(checkpoint_root, state, prefix=prefix),
@@ -614,6 +617,7 @@ def _save(
         checkpoint_load_mode=load_mode,
         actor_supervisor_state=actor_supervisor_state,
         evaluation_state=evaluation_state,
+        execution_provenance=runtime_provenance,
         parent_relation=(
             "model_parameter_initialization"
             if parent_checkpoint is not None and load_mode == "model_initialization"
@@ -693,6 +697,25 @@ def run_training(
             )
             load_mode = "model_initialization"
 
+        previous_sdpa = (
+            prevalidated_resume.metadata.get("sdpa_backend")
+            if prevalidated_resume is not None
+            else None
+        )
+        resources.sdpa_backend_transition = sdpa_transition_provenance(
+            previous=previous_sdpa,
+            current=resources.sdpa_backend,
+            checkpoint_load_mode=load_mode,
+            # Model-parameter initialization does not inherit the source
+            # process's execution backend.  Only exact resume describes the
+            # old checkpoint as the prior execution context.
+            parent_checkpoint_present=(prevalidated_resume is not None),
+        )
+        structured_runtime_provenance = dict(runtime_provenance or {})
+        structured_runtime_provenance["sdpa_backend"] = dict(
+            resources.sdpa_backend_transition
+        )
+
         metrics.write(
             "run_start",
             {
@@ -701,7 +724,7 @@ def run_training(
                 "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
                 "config_fingerprint_sha256": config.fingerprint_sha256(),
-                "runtime_provenance": dict(runtime_provenance or {}),
+                "runtime_provenance": structured_runtime_provenance,
                 "pipeline": _TRAINING_PIPELINE_ABI,
                 "checkpoint_load": {
                     "mode": load_mode,
@@ -1329,6 +1352,7 @@ def run_training(
                         load_mode=load_mode,
                         actor_supervisor_state=pipeline.supervisor_state,
                         evaluation_state=current_evaluation_state(),
+                        runtime_provenance=runtime_provenance,
                     )
                     parent_checkpoint = checkpoint
                     load_mode = "in_process_successor"
@@ -1356,6 +1380,7 @@ def run_training(
                         load_mode=load_mode,
                         actor_supervisor_state=pipeline.supervisor_state,
                         evaluation_state=current_evaluation_state(),
+                        runtime_provenance=runtime_provenance,
                     )
                     parent_checkpoint = checkpoint
                     load_mode = "in_process_successor"
@@ -1414,6 +1439,7 @@ def run_training(
             load_mode=load_mode,
             actor_supervisor_state=pipeline.supervisor_state,
             evaluation_state=current_evaluation_state(),
+            runtime_provenance=runtime_provenance,
         )
         metrics.write(
             "run_complete",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -19,6 +20,11 @@ from .collector import GroundedCollector
 from .config import TrainingConfig
 from .episode_replay import BoundedEpisodicReplay
 from .learner import VTraceLearner
+from .sdpa import (
+    SdpaExecutionState,
+    configure_rocm_sdpa_backend,
+    sdpa_transition_provenance,
+)
 from .transaction import BoundedTransactionReplay
 
 
@@ -35,6 +41,8 @@ class TrainingResources:
     transaction_replay: BoundedTransactionReplay | None
     episodic_replay: BoundedEpisodicReplay | None
     device: torch.device
+    sdpa_backend: SdpaExecutionState
+    sdpa_backend_transition: dict[str, Any]
 
     def publish_collector_policy(self) -> float:
         """Publish one consistent learner snapshot to the idle collector model.
@@ -136,6 +144,16 @@ def build_training_resources(
 ) -> TrainingResources:
     device = resolve_device(config.runtime.device)
     collector_device = resolve_device(config.runtime.collector_device)
+    sdpa_backend = configure_rocm_sdpa_backend(
+        config.runtime.rocm_sdpa_backend,
+        devices=(device, collector_device),
+    )
+    sdpa_backend_transition = sdpa_transition_provenance(
+        previous=None,
+        current=sdpa_backend,
+        checkpoint_load_mode="fresh",
+        parent_checkpoint_present=False,
+    )
     seed_everything(
         config.runtime.seed,
         seed_accelerators=(
@@ -256,6 +274,8 @@ def build_training_resources(
             transaction_replay=transaction_replay,
             episodic_replay=episodic_replay,
             device=device,
+            sdpa_backend=sdpa_backend,
+            sdpa_backend_transition=sdpa_backend_transition,
         )
     except BaseException:
         # Once returned, TrainingResources owns and closes any backend.  If

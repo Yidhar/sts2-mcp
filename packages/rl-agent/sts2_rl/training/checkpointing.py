@@ -30,6 +30,10 @@ from sts2_rl.encoding import grounding_encoding_identity
 from .config import TrainingConfig, training_config_from_mapping
 from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
+from .sdpa import (
+    validate_sdpa_execution_mapping,
+    validate_sdpa_transition_mapping,
+)
 from .seeding import SIGNED_INT32_MAX
 from .transaction import (
     BoundedTransactionReplay,
@@ -748,6 +752,24 @@ def _validate_metadata(
         raise ValueError("checkpoint has no model tensor specification")
     if model_only:
         return
+    recorded_sdpa = metadata.get("sdpa_backend")
+    execution_provenance = metadata.get("execution_provenance")
+    if recorded_sdpa is not None:
+        normalized_sdpa = validate_sdpa_execution_mapping(recorded_sdpa)
+        if not isinstance(execution_provenance, Mapping):
+            raise ValueError(
+                "checkpoint with SDPA state has no execution provenance"
+            )
+        validate_sdpa_transition_mapping(
+            execution_provenance.get("sdpa_backend"),
+            expected_current=normalized_sdpa,
+        )
+    elif isinstance(execution_provenance, Mapping) and (
+        "sdpa_backend" in execution_provenance
+    ):
+        raise ValueError(
+            "checkpoint SDPA transition has no recorded current execution state"
+        )
     training_state = training_state_from_metadata(metadata)
     actor_supervisor_state_from_metadata(metadata)
     evaluation_state = evaluation_gate_state_from_metadata(metadata)
@@ -866,6 +888,7 @@ def save_training_checkpoint(
     parent_relation: str | None = None,
     actor_supervisor_state: ActorSupervisorState | None = None,
     evaluation_state: EvaluationGateState | None = None,
+    execution_provenance: Mapping[str, Any] | None = None,
 ) -> Path:
     """Publish a checkpoint while the actor is quiescent between episodes."""
 
@@ -880,6 +903,11 @@ def save_training_checkpoint(
         raise TypeError("evaluation_state must be EvaluationGateState or None")
     _validate_evaluation_gate_state_horizon(evaluation_state, state)
     _validate_evaluation_gate_state_schedule(evaluation_state, config)
+    if execution_provenance is not None and not isinstance(
+        execution_provenance,
+        Mapping,
+    ):
+        raise TypeError("execution_provenance must be a mapping or None")
     provenance = build_checkpoint_provenance(
         parent_checkpoint=parent_checkpoint,
         experiment_run_id=run_id,
@@ -938,6 +966,17 @@ def save_training_checkpoint(
                     handle,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
+        checkpoint_execution_provenance = dict(execution_provenance or {})
+        # The process-owned state is authoritative.  Callers may attach other
+        # execution facts, but may not replace the verified SDPA transition.
+        checkpoint_execution_provenance["sdpa_backend"] = dict(
+            resources.sdpa_backend_transition
+        )
+        recorded_sdpa = resources.sdpa_backend.to_mapping()
+        validate_sdpa_transition_mapping(
+            checkpoint_execution_provenance["sdpa_backend"],
+            expected_current=recorded_sdpa,
+        )
         metadata = {
             "format": _CHECKPOINT_FORMAT,
             "checkpoint_id": publisher.checkpoint_id,
@@ -955,6 +994,8 @@ def save_training_checkpoint(
             "queue_spec": _queue_spec(queue_payload),
             "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
             "episodic_target_abi": _EPISODIC_TARGET_ABI,
+            "sdpa_backend": recorded_sdpa,
+            "execution_provenance": checkpoint_execution_provenance,
             "transaction_heads_enabled": config.transaction_learning.enabled,
             "transaction_replay_spec": (
                 _transaction_replay_spec(transaction_replay_payload) if transaction_replay_payload is not None else None
