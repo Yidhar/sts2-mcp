@@ -19,7 +19,7 @@ from sts2_rl.training.config import TrainingConfig
 
 EXPECTED_STS2_AI_COMMIT = "252bf989feb598c61c20267d3979b00bf316edb5"
 EXPECTED_STS2_AI_TREE = "9b3674ad857a20ce201a3b78a277621007d3ddda"
-EXPECTED_STS2_AI_PATCHED_TREE = "2f2f01e00b65621b1c37d859326659da1ab9e7eb"
+EXPECTED_STS2_AI_PATCHED_TREE = "f94b594ce17925bc393873489f38875fb6621d4f"
 CANONICAL_HEADLESS_PROJECT = "STS2AI/ENV/Sim/HeadlessSim/HeadlessSim.csproj"
 EXPECTED_PATCH_CHAIN = [
     "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
@@ -31,6 +31,7 @@ EXPECTED_PATCH_CHAIN = [
     "third_party/patches/sts2-ai/0007-grounded-macro-observation-contract.patch",
     "third_party/patches/sts2-ai/0008-guard-unowned-shop-potion-context.patch",
     "third_party/patches/sts2-ai/0009-clean-hidden-training-revival.patch",
+    "third_party/patches/sts2-ai/0010-headless-event-and-post-combat-lifecycle.patch",
 ]
 
 

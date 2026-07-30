@@ -25,6 +25,7 @@ import re
 from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Final
 
 import numpy as np
@@ -819,9 +820,20 @@ def grounding_encoding_identity() -> dict[str, Any]:
     }
 
 
+_CAMEL_CASE_BOUNDARY: Final = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+@lru_cache(maxsize=8_192)
+def _normalize_key_text(text: str) -> str:
+    normalized = text.strip().replace("-", "_")
+    return _CAMEL_CASE_BOUNDARY.sub("_", normalized).lower()
+
+
 def _normalize_key(value: Any) -> str:
-    text = str(value).strip().replace("-", "_")
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", text).lower()
+    # Field names, entity IDs, and relation labels recur thousands of times in
+    # one run.  The normalization is pure and the bounded cache carries no
+    # stochastic or checkpoint continuation state.
+    return _normalize_key_text(str(value))
 
 
 def _card_selection_equivalence_operation(
@@ -1358,6 +1370,41 @@ def _as_mapping_list(value: Any, *, label: str) -> list[Mapping[str, Any]]:
 
 
 def _first_present(value: Mapping[str, Any], *keys: str) -> Any:
+    # The simulator's maintained DTOs already use the canonical snake_case
+    # spellings below.  Building a normalized copy of an entire card/entity
+    # mapping for every individual field lookup made encoding effectively
+    # quadratic in the number of fields (hundreds of thousands of regex calls
+    # for a late-run deck).  Preserve the compatibility fallback for legacy
+    # camel/Pascal-case payloads, but keep the overwhelmingly common canonical
+    # path free of regex normalization.
+    exact: Any = None
+    for key in keys:
+        if key in value and value[key] is not None:
+            exact = value[key]
+            break
+
+    requested = {
+        key if key == key.strip() and key == key.lower() and "-" not in key else _normalize_key(key)
+        for key in keys
+    }
+    relevant_compatibility_alias = False
+    for raw_key in value:
+        if (
+            isinstance(raw_key, str)
+            and raw_key == raw_key.strip()
+            and raw_key == raw_key.lower()
+            and "-" not in raw_key
+        ):
+            continue
+        if _normalize_key(raw_key) in requested:
+            relevant_compatibility_alias = True
+            break
+    if not relevant_compatibility_alias:
+        return exact
+
+    # A relevant compatibility alias can collide with an exact spelling.  Use
+    # the original full-map projection in that uncommon case so insertion-order
+    # last-wins behavior remains byte-for-byte compatible with old checkpoints.
     normalized = {_normalize_key(key): item for key, item in value.items()}
     for key in keys:
         if key in normalized and normalized[key] is not None:

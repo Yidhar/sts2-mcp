@@ -50,9 +50,13 @@
     {
       "path": "third_party/patches/sts2-ai/0009-clean-hidden-training-revival.patch",
       "sha256": "d42325e723b02478a5b1b15fe68a27b3cf87f4d38cbe98d42928f04e49dbe574"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0010-headless-event-and-post-combat-lifecycle.patch",
+      "sha256": "976f34ce70ecfea44989e0f2b4e0015abc9d0e0c95dd31c25731c48220750d1c"
     }
   ],
-  "patched_tree": "2f2f01e00b65621b1c37d859326659da1ab9e7eb",
+  "patched_tree": "f94b594ce17925bc393873489f38875fb6621d4f",
   "migration_notes": [
     "The former local-only 459f30873eac374c160f0b409d2d8167e7eead7c / 0712bffbcd18348eb81479c4f3c65b94b254a646 pin was lost and is not advertised by the upstream remote.",
     "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",

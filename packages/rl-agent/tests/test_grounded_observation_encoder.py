@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+import sts2_rl.encoding.grounded as grounded_encoding
 from sts2_rl.encoding import (
     GROUNDING_ENCODING_VERSION,
     GroundedEncodingConfig,
@@ -28,6 +29,7 @@ from sts2_rl.encoding.grounded import (
     _canonical_potion,
     _canonical_power,
     _canonical_relic,
+    _first_present,
     _hash_id,
     _pile_count,
     _stable_zone_id,
@@ -56,6 +58,22 @@ def _small_model_config() -> GroundedCandidateConfig:
         zone_vocab_size=16,
         order_vocab_size=32,
     )
+
+
+def test_first_present_canonical_fast_path_skips_regex_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_normalization(_value: object) -> str:
+        raise AssertionError("canonical DTO lookup must not invoke regex normalization")
+
+    monkeypatch.setattr(grounded_encoding, "_normalize_key", unexpected_normalization)
+    assert _first_present({"hp": 51, "max_hp": 80}, "hp") == 51
+    assert _first_present({"hp": 51, "max_hp": 80}, "block") is None
+
+
+def test_first_present_compatibility_alias_keeps_last_normalized_key_wins() -> None:
+    assert _first_present({"current_cost": 1, "CurrentCost": 2}, "current_cost") == 2
+    assert _first_present({"CurrentCost": 2, "current_cost": 1}, "current_cost") == 1
 
 
 def _encoder(model_config: GroundedCandidateConfig | None = None) -> GroundedObservationEncoder:

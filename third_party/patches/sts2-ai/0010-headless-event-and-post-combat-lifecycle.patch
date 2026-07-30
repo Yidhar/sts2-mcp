@@ -1,0 +1,300 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+index d838437..30b51b3 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSettlementContract.cs
+@@ -33,6 +33,32 @@ public static class FullRunSettlementContract
+ 			: PostCombatProceedWithoutRewards;
+ 	}
+ 
++	/// <summary>
++	/// Mirrors CombatManager.IsEnding: only a living primary enemy blocks the
++	/// authoritative post-combat continuation.  Secondary summons may remain
++	/// alive after their owner dies and must not strand the room lifecycle.
++	/// </summary>
++	public static bool BlocksPostCombatContinuation(bool isAlive, bool isPrimaryEnemy)
++	{
++		return isAlive && isPrimaryEnemy;
++	}
++
++	/// <summary>
++	/// A changed post-combat pending snapshot is still transitional.  Treat it
++	/// as settled only after it reaches an actionable combat decision surface
++	/// or a non-combat state other than the explicit pending sentinel.
++	/// </summary>
++	public static bool IsCombatFollowupSettled(
++		bool stateChanged,
++		bool isPostCombatPending,
++		bool isCombatState,
++		bool isActionableCombatState)
++	{
++		return stateChanged
++			&& !isPostCombatPending
++			&& (!isCombatState || isActionableCombatState);
++	}
++
+ 	public static string ClassifySnapshot(FullRunSimulationStateSnapshot snapshot)
+ 	{
+ 		ArgumentNullException.ThrowIfNull(snapshot);
+@@ -105,6 +131,49 @@ public static class FullRunSettlementContract
+ 			);
+ 		}
+ 
++		// Fabricator can die to thorns while a secondary Zapbot remains alive.
++		// This is an authoritative victory because no living primary enemy
++		// remains; the surviving secondary must not block reward settlement.
++		if (BlocksPostCombatContinuation(isAlive: false, isPrimaryEnemy: true)
++			|| BlocksPostCombatContinuation(isAlive: true, isPrimaryEnemy: false)
++			|| !BlocksPostCombatContinuation(isAlive: true, isPrimaryEnemy: true))
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: only living primary enemies may block post-combat continuation."
++			);
++		}
++
++		if (IsCombatFollowupSettled(
++				stateChanged: true,
++				isPostCombatPending: true,
++				isCombatState: false,
++				isActionableCombatState: true)
++			|| !IsCombatFollowupSettled(
++				stateChanged: true,
++				isPostCombatPending: false,
++				isCombatState: false,
++				isActionableCombatState: true)
++			|| !IsCombatFollowupSettled(
++				stateChanged: true,
++				isPostCombatPending: false,
++				isCombatState: true,
++				isActionableCombatState: true)
++			|| IsCombatFollowupSettled(
++				stateChanged: false,
++				isPostCombatPending: false,
++				isCombatState: false,
++				isActionableCombatState: true)
++			|| IsCombatFollowupSettled(
++				stateChanged: true,
++				isPostCombatPending: false,
++				isCombatState: true,
++				isActionableCombatState: false))
++		{
++			throw new InvalidOperationException(
++				"Settlement contract self-test failed: post-combat pending must remain unsettled."
++			);
++		}
++
+ 		// Reset/load invalidation and continuation registration share the same
+ 		// generation gate. Prove that a stale or cancelled continuation cannot
+ 		// register a choice after invalidation, while a fresh generation can.
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+index cd9e20d..ea2d1b1 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunSimulatorRuntimeFacade.cs
+@@ -1210,7 +1210,10 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		}
+ 
+ 		CombatState? combatState = CombatManager.Instance.DebugOnlyGetState();
+-		if (combatState?.Enemies.Any(static enemy => !enemy.IsDead) == true)
++		if (combatState?.Enemies.Any(static enemy =>
++			FullRunSettlementContract.BlocksPostCombatContinuation(
++				enemy.IsAlive,
++				enemy.IsPrimaryEnemy)) == true)
+ 		{
+ 			return null;
+ 		}
+@@ -1563,8 +1566,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				// Executor blocked - likely waiting for player input (hand_select).
+ 				// Return early if the state is already actionable to avoid deadlock.
+ 				ObservedState mid = ObserveState();
+-				if (mid.Signature != previousSignature
+-					&& (!IsCombatState(mid.Snapshot.StateType) || IsActionableCombatSnapshot(mid.Snapshot)))
++				if (HasSettledCombatFollowup(previousSignature, mid))
+ 				{
+ 					FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase1_hits");
+ 					return mid.Snapshot;
+@@ -1577,22 +1579,29 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 					FullRunSimulationStateSnapshot? yielded = await TryAdvanceBlockedExecutorAsync(
+ 						"settle.wait_combat_followup.phase1",
+ 						previousSignature,
+-						static (_, observed, signature) => observed.Signature != signature
+-							&& (!IsCombatState(observed.Snapshot.StateType) || IsActionableCombatSnapshot(observed.Snapshot)));
++						static (_, observed, signature) => HasSettledCombatFollowup(signature, observed));
+ 					if (yielded != null)
+ 					{
+ 						return yielded;
+ 					}
++					ObservedState afterYield = ObserveState();
++					if (IsPostCombatPendingState(afterYield.Snapshot.StateType))
++					{
++						FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase1_post_combat_pending_exhausted");
++						throw new FullRunSettlementUnsettledException(
++							afterYield.Snapshot,
++							"Post-combat continuation remained pending after bounded scheduler settlement."
++						);
++					}
+ 					FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase1_hits");
+-					return mid.Snapshot;
++					return afterYield.Snapshot;
+ 				}
+ 			}
+ 			await execTask;
+ 		}
+ 		{
+ 			ObservedState early = ObserveState();
+-			if (early.Signature != previousSignature
+-				&& (!IsCombatState(early.Snapshot.StateType) || IsActionableCombatSnapshot(early.Snapshot)))
++			if (HasSettledCombatFollowup(previousSignature, early))
+ 			{
+ 				FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase1_hits");
+ 				return early.Snapshot;
+@@ -1605,8 +1614,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				FullRunSimulationStateSnapshot? yielded = await TryAdvancePendingCombatContinuationAsync(
+ 					"settle.wait_combat_followup.phase1_pending",
+ 					previousSignature,
+-					static (_, observed, signature) => observed.Signature != signature
+-						&& (!IsCombatState(observed.Snapshot.StateType) || IsActionableCombatSnapshot(observed.Snapshot)));
++					static (_, observed, signature) => HasSettledCombatFollowup(signature, observed));
+ 				if (yielded != null)
+ 				{
+ 					return yielded;
+@@ -1650,8 +1658,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				{
+ 					FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase2_blocked_executor");
+ 					ObservedState mid = ObserveState();
+-					if (mid.Signature != previousSignature
+-						&& (!IsCombatState(mid.Snapshot.StateType) || IsActionableCombatSnapshot(mid.Snapshot)))
++					if (HasSettledCombatFollowup(previousSignature, mid))
+ 					{
+ 						FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase2_hits");
+ 						return mid.Snapshot;
+@@ -1661,8 +1668,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 						FullRunSimulationStateSnapshot? yielded = await TryAdvanceBlockedExecutorAsync(
+ 							"settle.wait_combat_followup.phase2",
+ 							previousSignature,
+-							static (_, observed, signature) => observed.Signature != signature
+-								&& (!IsCombatState(observed.Snapshot.StateType) || IsActionableCombatSnapshot(observed.Snapshot)));
++							static (_, observed, signature) => HasSettledCombatFollowup(signature, observed));
+ 						if (yielded != null)
+ 						{
+ 							return yielded;
+@@ -1682,8 +1688,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 					FullRunSimulationStateSnapshot? yielded = await TryAdvancePendingCombatContinuationAsync(
+ 						"settle.wait_combat_followup.phase2_pending",
+ 						previousSignature,
+-						static (_, observed, signature) => observed.Signature != signature
+-							&& (!IsCombatState(observed.Snapshot.StateType) || IsActionableCombatSnapshot(observed.Snapshot)));
++						static (_, observed, signature) => HasSettledCombatFollowup(signature, observed));
+ 					if (yielded != null)
+ 					{
+ 						return yielded;
+@@ -1691,7 +1696,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				}
+ 				continue;
+ 			}
+-			if (!IsCombatState(current.Snapshot.StateType) || IsActionableCombatSnapshot(current.Snapshot))
++			if (HasSettledCombatFollowup(previousSignature, current))
+ 			{
+ 				FullRunSimulationDiagnostics.Increment("settle.wait_combat_followup.phase2_hits");
+ 				return current.Snapshot;
+@@ -1702,8 +1707,7 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 				FullRunSimulationStateSnapshot? yielded = await TryAdvancePendingCombatContinuationAsync(
+ 					"settle.wait_combat_followup.phase2_pending_non_actionable",
+ 					previousSignature,
+-					static (_, observed, signature) => observed.Signature != signature
+-						&& (!IsCombatState(observed.Snapshot.StateType) || IsActionableCombatSnapshot(observed.Snapshot)));
++					static (_, observed, signature) => HasSettledCombatFollowup(signature, observed));
+ 				if (yielded != null)
+ 				{
+ 					return yielded;
+@@ -2578,7 +2582,10 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		CombatState? combatState = CombatManager.Instance.DebugOnlyGetState();
+ 		if (me == null
+ 			|| me.Creature.IsDead
+-			|| combatState?.Enemies.Any(static enemy => !enemy.IsDead) == true)
++			|| combatState?.Enemies.Any(static enemy =>
++				FullRunSettlementContract.BlocksPostCombatContinuation(
++					enemy.IsAlive,
++					enemy.IsPrimaryEnemy)) == true)
+ 		{
+ 			return false;
+ 		}
+@@ -4331,6 +4338,17 @@ public sealed class FullRunSimulatorRuntimeFacade : IFullRunRuntimeFacade, IDisp
+ 		}
+ 	}
+ 
++	private static bool HasSettledCombatFollowup(
++		string previousSignature,
++		ObservedState observed)
++	{
++		return FullRunSettlementContract.IsCombatFollowupSettled(
++			stateChanged: !string.Equals(observed.Signature, previousSignature, StringComparison.Ordinal),
++			isPostCombatPending: IsPostCombatPendingState(observed.Snapshot.StateType),
++			isCombatState: IsCombatState(observed.Snapshot.StateType),
++			isActionableCombatState: IsActionableCombatSnapshot(observed.Snapshot));
++	}
++
+ 	private static bool IsActionableCombatState(CombatTrainingStateSnapshot state)
+ 	{
+ 		if (!state.IsCombatActive)
+diff --git a/src/Core/Models/Events/Amalgamator.cs b/src/Core/Models/Events/Amalgamator.cs
+index 2b4a7cb..42dc51c 100644
+--- a/src/Core/Models/Events/Amalgamator.cs
++++ b/src/Core/Models/Events/Amalgamator.cs
+@@ -43,10 +43,10 @@ public sealed class Amalgamator : EventModel
+ 		List<CardModel> cards = (await CardSelectCmd.FromDeckForRemoval(prefs: new CardSelectorPrefs(CardSelectorPrefs.RemoveSelectionPrompt, 2), player: base.Owner, filter: (CardModel c) => IsValid(CardTag.Strike, c))).ToList();
+ 		await CardPileCmd.RemoveFromDeck(cards);
+ 		NDebugAudioManager.Instance?.Play("card_smith.mp3", 1f, PitchVariance.Small);
+-		NGame.Instance.ScreenShakeTrauma(ShakeStrength.Strong);
++		NGame.Instance?.ScreenShakeTrauma(ShakeStrength.Strong);
+ 		await Task.Delay(300);
+ 		NDebugAudioManager.Instance?.Play("card_smith.mp3", 1f, PitchVariance.Small);
+-		NGame.Instance.ScreenShakeTrauma(ShakeStrength.Strong);
++		NGame.Instance?.ScreenShakeTrauma(ShakeStrength.Strong);
+ 		CardModel card = base.Owner.RunState.CreateCard<UltimateStrike>(base.Owner);
+ 		CardCmd.PreviewCardPileAdd(await CardPileCmd.Add(card, PileType.Deck), 2f);
+ 		SetEventFinished(L10NLookup("AMALGAMATOR.pages.COMBINE_STRIKES.description"));
+@@ -57,10 +57,10 @@ public sealed class Amalgamator : EventModel
+ 		List<CardModel> cards = (await CardSelectCmd.FromDeckForRemoval(prefs: new CardSelectorPrefs(CardSelectorPrefs.RemoveSelectionPrompt, 2), player: base.Owner, filter: (CardModel c) => IsValid(CardTag.Defend, c))).ToList();
+ 		await CardPileCmd.RemoveFromDeck(cards);
+ 		NDebugAudioManager.Instance?.Play("card_smith.mp3", 1f, PitchVariance.Small);
+-		NGame.Instance.ScreenShakeTrauma(ShakeStrength.Strong);
++		NGame.Instance?.ScreenShakeTrauma(ShakeStrength.Strong);
+ 		await Task.Delay(300);
+ 		NDebugAudioManager.Instance?.Play("card_smith.mp3", 1f, PitchVariance.Small);
+-		NGame.Instance.ScreenShakeTrauma(ShakeStrength.Strong);
++		NGame.Instance?.ScreenShakeTrauma(ShakeStrength.Strong);
+ 		CardModel card = base.Owner.RunState.CreateCard<UltimateDefend>(base.Owner);
+ 		CardCmd.PreviewCardPileAdd(await CardPileCmd.Add(card, PileType.Deck), 2f);
+ 		SetEventFinished(L10NLookup("AMALGAMATOR.pages.COMBINE_DEFENDS.description"));
+diff --git a/src/Core/Models/Events/DenseVegetation.cs b/src/Core/Models/Events/DenseVegetation.cs
+index b646b25..45d9cca 100644
+--- a/src/Core/Models/Events/DenseVegetation.cs
++++ b/src/Core/Models/Events/DenseVegetation.cs
+@@ -72,11 +72,11 @@ public sealed class DenseVegetation : EventModel
+ 		await PlayerCmd.MimicRestSiteHeal(base.Owner, playSfx: false);
+ 		if (LocalContext.IsMe(base.Owner))
+ 		{
+-			int restHandle = NDebugAudioManager.Instance.Play("sleep.tres", 0.8f);
++			int restHandle = NDebugAudioManager.Instance?.Play("sleep.tres", 0.8f) ?? 0;
+ 			await Cmd.CustomScaledWait(0.7f, 1.5f);
+-			NDebugAudioManager.Instance.Stop(restHandle);
+-			NDebugAudioManager.Instance.Play("hiss.mp3", 0.8f, PitchVariance.Large);
+-			NGame.Instance.ScreenRumble(ShakeStrength.Medium, ShakeDuration.Normal, RumbleStyle.Rumble);
++			NDebugAudioManager.Instance?.Stop(restHandle);
++			NDebugAudioManager.Instance?.Play("hiss.mp3", 0.8f, PitchVariance.Large);
++			NGame.Instance?.ScreenRumble(ShakeStrength.Medium, ShakeDuration.Normal, RumbleStyle.Rumble);
+ 		}
+ 		SetEventState(L10NLookup("DENSE_VEGETATION.pages.REST.description"), new global::_003C_003Ez__ReadOnlySingleElementList<EventOption>(new EventOption(this, Fight, "DENSE_VEGETATION.pages.REST.options.FIGHT")));
+ 	}
+diff --git a/src/Core/Models/Events/PunchOff.cs b/src/Core/Models/Events/PunchOff.cs
+index d1e84e1..c7a5912 100644
+--- a/src/Core/Models/Events/PunchOff.cs
++++ b/src/Core/Models/Events/PunchOff.cs
+@@ -108,7 +108,7 @@ public sealed class PunchOff : EventModel
+ 	private async Task Nab()
+ 	{
+ 		await CardPileCmd.AddCurseToDeck<Injury>(base.Owner);
+-		NGame.Instance.ScreenShakeTrauma(ShakeStrength.Strong);
++		NGame.Instance?.ScreenShakeTrauma(ShakeStrength.Strong);
+ 		NDebugAudioManager.Instance?.Play("blunt_attack.mp3");
+ 		await Cmd.CustomScaledWait(0.25f, 0.5f);
+ 		await RewardsCmd.OfferCustom(base.Owner, new List<Reward>(1)
