@@ -918,9 +918,14 @@ def test_evaluation_keeps_completion_primary_and_efficiency_conditional() -> Non
                 definition_hash_collisions_total=13,
                 relation_hash_collisions_total=17,
             ),
-        ]
+        ],
+        objective="run",
     )
 
+    assert summary["evaluation_objective"] == "run"
+    assert summary["combat_win_rate_applicable"] is False
+    assert summary["combat_win_rate"] is None
+    assert summary["revival_free_combat_win_rate"] is None
     assert summary["run_win_rate"] == 0.5
     assert summary["maximum_definition_hash_collisions_per_decision"] == 5
     assert summary["maximum_relation_hash_collisions_per_decision"] == 4
@@ -935,6 +940,29 @@ def test_evaluation_keeps_completion_primary_and_efficiency_conditional() -> Non
     assert summary["act1_boundary_count"] == 2
     assert summary["act1_boundary_mean_revivals"] == 0.0
     assert summary["act1_boundary_mean_hp_lost"] == 7.5
+
+
+def test_combat_evaluation_reports_terminal_combat_success_as_applicable() -> None:
+    metric = replace(
+        _evaluation_metric(
+            episode_id="combat-win",
+            run_won=False,
+            revivals_used=0,
+            hp_lost=0.0,
+            act_revivals=(),
+            act_hp_loss=(),
+        ),
+        terminal_reason="combat_victory",
+        combat_won=True,
+        revival_free_combat_win=True,
+    )
+
+    summary = summarize_evaluation([metric], objective="combat")
+
+    assert summary["evaluation_objective"] == "combat"
+    assert summary["combat_win_rate_applicable"] is True
+    assert summary["combat_win_rate"] == 1.0
+    assert summary["revival_free_combat_win_rate"] == 1.0
 
 
 def test_one_episode_runtime_learns_after_storing_complete_episode(

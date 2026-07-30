@@ -1,0 +1,48 @@
+# Mature-policy refinement lineage.  The source checkpoint is deliberately not
+# named here: it must first win a paired frozen-policy checkpoint comparison and
+# is then supplied explicitly through ``--initialize-from``.  This is never an
+# exact resume.  Network parameters are inherited, while optimizer, replay,
+# rollout queue, RNGs, counters, policy version and evaluation state restart.
+#
+# Keep the v27 model/environment/reward/diagnostic contract, v26's bounded
+# actor backlog and fresh successful episodic suffix, unlimited hidden native
+# revival for complete-run coverage, and the reviewed ROCm math-only backend.
+# Only the optimizer/exploration schedule moves to the conservative values that
+# were previously used for the mature v22 warm start.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[rollout]
+queue_capacity = 24
+
+[episodic_learning]
+fresh_policy_sequences = 1
+
+[curriculum]
+revival_budget = -1
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[runtime]
+rocm_sdpa_backend = "math"
+total_environment_steps = 100000
+seed = 3000000
+log_dir = "runs/full-run-revival-v28-mature-refinement-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v28-mature-refinement-model-init"
+checkpoint_interval_steps = 10000
+
+# Step zero is the inherited-policy baseline on the new validation seed prefix.
+# The 5k/10k probes are small liveness checks; normal gates retain the same 16
+# paired seeds; the 100k final audit uses a disjoint 64-seed namespace.
+evaluation_steps = [0, 25000, 50000, 75000]
+evaluation_episodes = 16
+early_evaluation_steps = [5000, 10000]
+early_evaluation_episodes = 8
+final_audit_steps = [100000]
+final_audit_episodes = 64
+evaluation_liveness_guard_enabled = true

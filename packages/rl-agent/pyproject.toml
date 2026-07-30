@@ -32,6 +32,7 @@ dev = [
 [project.scripts]
 sts2-train = "sts2_rl.train:main"
 sts2-evaluate-checkpoint = "sts2_rl.evaluate_checkpoint:main"
+sts2-analyze-paired-evaluation = "sts2_rl.paired_evaluation_report:main"
 sts2-monitor = "sts2_rl.monitor_dashboard:main"
 
 [tool.setuptools]

@@ -1637,6 +1637,21 @@ def test_exact_binding_namespace_spans_world_and_candidate_tables() -> None:
     )
     assert encoded.definition_hash_collisions >= 1
 
+    # Stable hash buckets intentionally share learned embeddings, but semantic
+    # equality and relationship pooling use the collision-free decision-local
+    # binding IDs instead of hash equality.
+    network = RecurrentCandidateModel(model).eval()
+    with torch.inference_mode():
+        world_encoding = network.encode_world(batch.world, batch.domain_ids)
+        source_exact, source_definition = network._matched_world_contexts(
+            definition_binding_ids=batch.candidates.definition_binding_ids,
+            relation_binding_ids=batch.candidates.relation_binding_ids,
+            world_encoding=world_encoding,
+        )
+
+    assert torch.count_nonzero(source_exact).item() == 0
+    assert torch.count_nonzero(source_definition).item() == 0
+
 
 def test_encoder_stack_pads_only_to_active_batch_capacity() -> None:
     encoder = _encoder()

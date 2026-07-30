@@ -3101,6 +3101,8 @@ def test_evaluation_uses_odd_heldout_seeds_and_records_no_unrolls(
             evaluation_context=context,
         )
         assert len(episodes) == 2
+        assert summary["evaluation_objective"] == "combat"
+        assert summary["combat_win_rate_applicable"] is True
         assert summary["combat_win_rate"] == 1.0
         assert summary["act1_clear_count"] == 0
         assert summary["act3_reach_count"] == 0

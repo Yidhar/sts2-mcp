@@ -108,16 +108,39 @@ def _model_state_sha256(model: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
-def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | int]:
+def summarize_evaluation(
+    episodes: list[EpisodeMetrics],
+    *,
+    objective: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate held-out metrics without inventing inapplicable combat wins.
+
+    ``EpisodeMetrics.combat_won`` is authoritative only for a combat-objective
+    collector. Full-run episodes do not retain a per-combat numerator, so their
+    terminal ``combat_won=False`` must not be presented as a 0% combat win rate.
+    """
+
+    if objective not in {None, "combat", "act1", "run"}:
+        raise ValueError(
+            "evaluation objective must be one of None, 'combat', 'act1', or 'run'"
+        )
+    combat_win_rate_applicable: bool | None = (
+        None if objective is None else objective == "combat"
+    )
+    evaluation_objective = objective or "unspecified"
     if not episodes:
         return {
+            "evaluation_objective": evaluation_objective,
+            "combat_win_rate_applicable": combat_win_rate_applicable,
             "episodes": 0,
             "act1_clear_count": 0,
             "act1_clear_rate": 0.0,
             "act3_reach_count": 0,
             "act3_reach_rate": 0.0,
             "run_win_rate": 0.0,
-            "combat_win_rate": 0.0,
+            "combat_win_rate": (
+                0.0 if combat_win_rate_applicable is not False else None
+            ),
             "deadlock_rate": 0.0,
             "combat_progress_stall_rate": 0.0,
             "combat_policy_failure_count": 0,
@@ -141,7 +164,9 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
             "maximum_relation_hash_collisions_per_decision": 0,
             "definition_hash_collisions_total": 0,
             "relation_hash_collisions_total": 0,
-            "revival_free_combat_win_rate": 0.0,
+            "revival_free_combat_win_rate": (
+                0.0 if combat_win_rate_applicable is not False else None
+            ),
             "revival_free_act1_clear_rate": 0.0,
             "revival_free_run_win_rate": 0.0,
             "act1_clear_at_most_one_revival_rate": 0.0,
@@ -162,13 +187,19 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         if item.act_revival_counts and item.act_hp_loss_counts
     ]
     return {
+        "evaluation_objective": evaluation_objective,
+        "combat_win_rate_applicable": combat_win_rate_applicable,
         "episodes": count,
         "act1_clear_count": sum(item.act1_cleared for item in episodes),
         "act1_clear_rate": sum(item.act1_cleared for item in episodes) / count,
         "act3_reach_count": sum(item.max_act >= 3 for item in episodes),
         "act3_reach_rate": sum(item.max_act >= 3 for item in episodes) / count,
         "run_win_rate": sum(item.run_won for item in episodes) / count,
-        "combat_win_rate": sum(item.combat_won for item in episodes) / count,
+        "combat_win_rate": (
+            sum(item.combat_won for item in episodes) / count
+            if combat_win_rate_applicable is not False
+            else None
+        ),
         "deadlock_rate": sum(item.deadlocked for item in episodes) / count,
         "combat_progress_stall_rate": (sum(item.combat_progress_stalled for item in episodes) / count),
         "combat_policy_failure_count": sum(item.combat_policy_failed for item in episodes),
@@ -202,7 +233,11 @@ def summarize_evaluation(episodes: list[EpisodeMetrics]) -> dict[str, float | in
         "relation_hash_collisions_total": sum(
             item.relation_hash_collisions_total for item in episodes
         ),
-        "revival_free_combat_win_rate": (sum(item.revival_free_combat_win for item in episodes) / count),
+        "revival_free_combat_win_rate": (
+            sum(item.revival_free_combat_win for item in episodes) / count
+            if combat_win_rate_applicable is not False
+            else None
+        ),
         "revival_free_act1_clear_rate": (sum(item.revival_free_act1_clear for item in episodes) / count),
         "revival_free_run_win_rate": (sum(item.revival_free_run_win for item in episodes) / count),
         # Completion remains the primary denominator.  Efficiency metrics do
@@ -347,7 +382,9 @@ def evaluate_policy(
                         replacement.close()
                         raise
             results.append(episode.metrics)
-        summary: dict[str, Any] = dict(summarize_evaluation(results))
+        summary: dict[str, Any] = dict(
+            summarize_evaluation(results, objective=resources.collector.objective)
+        )
         summary["infrastructure_retries"] = infrastructure_retries
         summary["data_partition"] = data_partition
         summary["evaluation_seed_count"] = len(evaluation_seeds)
