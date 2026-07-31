@@ -30,6 +30,7 @@ from sts2_rl.training import (
     DiagnosticsConfig,
     EnvironmentConfig,
     EvaluationGateState,
+    FailureCreditConfig,
     ModelConfig,
     OptimizationConfig,
     RolloutConfig,
@@ -59,6 +60,7 @@ from sts2_rl.training.collector import (
     _CombatNetProgressTracker,
     _NonCombatEventCycleTracker,
 )
+from sts2_rl.training.failure_credit import EvidenceStratum
 from sts2_rl.training.pipeline import ActorLearnerPipeline, RecoverableActorIncident
 from sts2_rl.training.runtime import EvaluationInfrastructureError
 from sts2_rl.training.trajectory import TrajectoryJournal
@@ -1028,6 +1030,141 @@ def test_collector_emits_contiguous_recurrent_unroll() -> None:
         resources.close()
 
 
+def test_collector_shadow_emits_separate_formal_failure_credit_records() -> None:
+    base = _config()
+    config = replace(
+        base,
+        failure_credit=FailureCreditConfig(
+            mode="shadow",
+            burn_in_steps=1,
+            maximum_context_steps=8,
+        ),
+    )
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        resources.collector.bind_failure_credit_run_id("collector-shadow-test")
+        episode = resources.collector.collect_episode(
+            epsilon=0.0,
+            record=True,
+            policy_version=3,
+        )
+        assert episode.failure_credit_records
+        assert episode.failure_credit_shadow_metrics is not None
+        assert episode.failure_credit_shadow_metrics.decisions == 2
+        assert all(
+            record.incident.provenance.run_id == "collector-shadow-test" for record in episode.failure_credit_records
+        )
+        assert all(record.plan.actor_label_count == 0 for record in episode.failure_credit_records)
+        # Legacy transaction-v3 remains an independent compatibility plane.
+        assert episode.transaction_traces == ()
+    finally:
+        resources.close()
+
+
+def test_failure_credit_factory_modes_do_not_depend_on_transaction_v3() -> None:
+    base = replace(
+        _config(),
+        transaction_learning=TransactionLearningConfig(enabled=False),
+    )
+    for mode in ("disabled", "shadow", "learning"):
+        config = replace(
+            base,
+            failure_credit=FailureCreditConfig(
+                mode=mode,
+                burn_in_steps=1,
+                maximum_context_steps=8,
+            ),
+        )
+        resources = build_training_resources(
+            config,
+            backend=FakeCombatBackend(),
+        )
+        try:
+            assert resources.transaction_replay is None
+            assert not resources.model.transaction_heads_enabled
+            assert not resources.collector_model.transaction_heads_enabled
+            assert resources.collector.failure_credit_shadow_enabled is (mode == "shadow")
+            assert resources.collector.failure_credit_learning_enabled is (mode == "learning")
+            assert resources.model.liveness_head_enabled is (mode == "learning")
+            assert resources.collector_model.liveness_head_enabled is (mode == "learning")
+            assert (resources.failure_credit_replay is not None) is (mode == "learning")
+            assert resources.learner.failure_credit_config.mode == mode
+        finally:
+            resources.close()
+
+
+def test_runtime_failure_credit_quotas_cover_every_learnable_stratum() -> None:
+    config = replace(
+        _config(),
+        failure_credit=FailureCreditConfig(
+            mode="learning",
+            sample_records=6,
+            direct_witness_quota=1,
+            multi_edge_cycle_quota=1,
+            risk_sequence_quota=1,
+            unresolved_stall_quota=1,
+            completion_control_quota=1,
+            matched_outcome_pair_quota=1,
+            liveness_risk_actor_start_update=512,
+        ),
+    )
+
+    quotas = runtime_module._failure_credit_quotas(config)
+
+    assert {item.stratum: item.minimum for item in quotas} == {
+        EvidenceStratum.DIRECT_WITNESS: 1,
+        EvidenceStratum.MULTI_EDGE_CYCLE: 1,
+        EvidenceStratum.RISK_SEQUENCE: 1,
+        EvidenceStratum.UNRESOLVED_STALL: 1,
+        EvidenceStratum.COMPLETION_CONTROL: 1,
+        EvidenceStratum.MATCHED_OUTCOME_PAIR: 1,
+    }
+    assert EvidenceStratum.CENSORED not in {item.stratum for item in quotas}
+
+    calibration_quotas = runtime_module._failure_credit_quotas(
+        config,
+        learner_updates=511,
+    )
+    assert EvidenceStratum.RISK_SEQUENCE not in {
+        item.stratum for item in calibration_quotas
+    }
+    mature_quotas = runtime_module._failure_credit_quotas(
+        config,
+        learner_updates=512,
+    )
+    assert {item.stratum: item.minimum for item in mature_quotas} == {
+        item.stratum: item.minimum for item in quotas
+    }
+
+
+def test_failure_credit_retention_covers_every_configured_stall_window() -> None:
+    base = _config()
+    config = replace(
+        base,
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=16,
+            combat_net_progress_window=32,
+            noncombat_durable_progress_window=64,
+            combat_net_progress_room_windows={"wide_room": 512},
+            combat_net_progress_encounter_windows={"wide_encounter": 384},
+        ),
+        failure_credit=FailureCreditConfig(
+            mode="shadow",
+            burn_in_steps=1,
+            maximum_context_steps=8,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=FakeCombatBackend(),
+    )
+    try:
+        assert resources.collector.failure_credit_pipeline_config.detector_window_steps == 512
+    finally:
+        resources.close()
+
+
 def test_collector_learns_group_index_but_dispatches_raw_representative(
     tmp_path: Path,
 ) -> None:
@@ -1201,12 +1338,14 @@ def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
     config = _config()
     report = inspect_baseline(config)
-    assert report["pipeline"] == "bounded-fifo-async-vtrace-episodic-v6"
+    assert report["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v4-v7")
     assert report["active_shape_batching"] is True
     assert report["deterministic_probe_environment_steps"] == []
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
     assert report["episodic_learning"]["macro_sample_fraction"] == 0.0
+    assert report["failure_credit"]["sampling_quotas"][EvidenceStratum.UNRESOLVED_STALL.value] == 1
+    assert report["failure_credit"]["censored_quota"] == 0
 
 
 def test_cpu_resource_build_does_not_seed_or_initialize_unused_cuda(
@@ -2139,6 +2278,7 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
         metrics = resources.learner.update(
             (unroll,),
             current_policy_version=0,
+            current_learner_update=0,
             progress=lambda stage, payload: progress.append((stage, payload)),
         )
         assert metrics.environment_steps == 2
@@ -2169,7 +2309,11 @@ def test_async_pipeline_streams_fifo_data_and_finishes_exact_horizon() -> None:
     try:
         pipeline.start()
         first = resources.rollout_queue.get_batch(1, minimum=1, timeout=5.0)
-        metrics = resources.learner.update(first, current_policy_version=0)
+        metrics = resources.learner.update(
+            first,
+            current_policy_version=0,
+            current_learner_update=0,
+        )
         assert metrics.environment_steps == 2
         pipeline.request_policy_publication(1)
         episodes = []
@@ -2491,6 +2635,181 @@ def test_runtime_checkpoints_each_crossed_episode_boundary(
     assert '"actor_progress": {' in metrics_text
     assert '"maximum_observed_candidates": 2' in metrics_text
     assert '"run_maximum_observed_candidates": 2' in metrics_text
+
+
+@pytest.mark.parametrize("mode", ["shadow", "learning"])
+def test_runtime_failure_credit_modes_preserve_shadow_isolation_and_episode_order(
+    mode: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-batch episode publishes evidence before its only learner sample.
+
+    This is also the shadow-mode isolation guard: shadow compiles and reports
+    the same episode evidence but owns neither liveness heads nor replay and
+    supplies no failure-credit plans to the learner.
+    """
+
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=2)
+    config = replace(
+        base,
+        transaction_learning=TransactionLearningConfig(enabled=False),
+        failure_credit=FailureCreditConfig(
+            mode=mode,
+            replay_capacity=8,
+            replay_byte_capacity=10_000_000,
+            sample_records=1,
+            burn_in_steps=1,
+            maximum_context_steps=8,
+            maximum_episode_completion_bytes=1_000_000,
+            direct_witness_quota=0,
+            multi_edge_cycle_quota=0,
+            risk_sequence_quota=0,
+            unresolved_stall_quota=0,
+            completion_control_quota=1,
+            matched_outcome_pair_quota=0,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir=f"runs/failure-credit-{mode}",
+            checkpoint_dir=f"checkpoints/failure-credit-{mode}",
+            checkpoint_interval_steps=100,
+        ),
+    )
+
+    state = run_training(config, backend=FakeCombatBackend())
+
+    assert state.environment_steps == 2
+    assert state.episodes == 1
+    assert state.learner_updates == state.consumed_unrolls == 1
+    metrics_path = next((tmp_path / "runs" / f"failure-credit-{mode}").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    run_start = next(item for item in events if item["event"] == "run_start")
+    assert run_start["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v4-v7")
+    train_episode = next(item for item in events if item["event"] == "train_episode")
+    assert train_episode["failure_credit_mode"] == mode
+    assert train_episode["failure_credit_records_emitted"] >= 1
+    assert train_episode["failure_credit_shadow_funnel"]["records"] >= 1
+    learner_start = next(item for item in events if item["event"] == "learner_update_start")
+    learner_update = next(item for item in events if item["event"] == "learner_update")
+    checkpoint = next((tmp_path / "checkpoints" / f"failure-credit-{mode}").glob("run-*/final-*"))
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+
+    if mode == "learning":
+        assert train_episode["failure_credit_records_stored"] >= 1
+        assert train_episode["failure_credit_replay"]["put_batch_count"] == 1
+        assert learner_start["failure_credit_records"] >= 1
+        assert learner_start["failure_credit_replay"]["sample_request_count"] == 1
+        assert events.index(train_episode) < events.index(learner_start)
+        assert learner_start["failure_credit_quota"]["satisfied"] is True
+        assert learner_update["liveness_credit_plans"] >= 1
+        assert learner_update["liveness_value_labels"] >= 1
+        assert learner_update["liveness_q_labels"] >= 1
+        # Generic completion is a zero-cost critic control, not PREFER.
+        assert learner_update["liveness_completion_policy_labels"] == 0
+        assert metadata["liveness_cost_heads_enabled"] is True
+        assert metadata["failure_credit_replay_enabled"] is True
+        assert metadata["failure_credit_replay_spec"]["size"] >= 1
+        assert metadata["failure_credit_replay_spec"]["put_batch_count"] == 1
+        assert metadata["failure_credit_replay_spec"]["sample_request_count"] == 1
+        assert (checkpoint / "failure_credit_replay.pkl").is_file()
+    else:
+        assert train_episode["failure_credit_records_stored"] == 0
+        assert learner_start["failure_credit_records"] == 0
+        assert learner_start["failure_credit_quota"] is None
+        assert learner_update["liveness_credit_plans"] == 0
+        assert learner_update["liveness_cost_labels"] == 0
+        assert learner_update["liveness_credit_loss"] == 0.0
+        assert metadata["liveness_cost_heads_enabled"] is False
+        assert metadata["failure_credit_replay_enabled"] is False
+        assert metadata["failure_credit_replay_spec"] is None
+        assert not (checkpoint / "failure_credit_replay.pkl").exists()
+
+
+def test_terminal_native_exit_cannot_flush_pending_before_evidence_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduce a boundary message becoming visible just after native exit."""
+
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    real_pipeline = ActorLearnerPipeline
+
+    class DelayedTerminalBoundaryPipeline:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._inner = real_pipeline(*args, **kwargs)
+            self._held_result: object | None = None
+            self._delayed_once = False
+
+        @property
+        def alive(self) -> bool:
+            # Simulate the native worker having exited immediately after it
+            # published the boundary into its transport, before the runtime's
+            # first non-blocking poll observed that message.
+            if self._held_result is not None:
+                return False
+            return self._inner.alive
+
+        def next_episode(self, *, timeout: float | None = None) -> object | None:
+            if self._held_result is not None:
+                result = self._held_result
+                self._held_result = None
+                return result
+            result = self._inner.next_episode(timeout=timeout)
+            if result is not None and not self._delayed_once:
+                self._delayed_once = True
+                self._held_result = result
+                self._inner.resources.rollout_queue.close()
+                return None
+            return result
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "ActorLearnerPipeline",
+        DelayedTerminalBoundaryPipeline,
+    )
+    base = _config(total_steps=2)
+    config = replace(
+        base,
+            failure_credit=FailureCreditConfig(
+                mode="learning",
+                replay_capacity=8,
+                replay_byte_capacity=10_000_000,
+                maximum_episode_completion_bytes=10_000_000,
+                sample_records=1,
+            burn_in_steps=1,
+            maximum_context_steps=8,
+            direct_witness_quota=0,
+            multi_edge_cycle_quota=0,
+            risk_sequence_quota=0,
+            unresolved_stall_quota=0,
+            completion_control_quota=1,
+            matched_outcome_pair_quota=0,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/failure-credit-terminal-race",
+            checkpoint_dir="checkpoints/failure-credit-terminal-race",
+            checkpoint_interval_steps=100,
+        ),
+    )
+
+    state = run_training(config, backend=FakeCombatBackend())
+
+    assert state.learner_updates == state.consumed_unrolls == 1
+    metrics_path = next((tmp_path / "runs" / "failure-credit-terminal-race").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    train_index = next(index for index, item in enumerate(events) if item["event"] == "train_episode")
+    learner_index, learner = next(
+        (index, item) for index, item in enumerate(events) if item["event"] == "learner_update_start"
+    )
+    assert train_index < learner_index
+    assert learner["failure_credit_records"] >= 1
+    assert learner["failure_credit_quota"]["satisfied"] is True
 
 
 def test_runtime_final_audit_matches_final_policy_after_all_learning(

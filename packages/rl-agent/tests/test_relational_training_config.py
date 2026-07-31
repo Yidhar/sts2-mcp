@@ -10,6 +10,7 @@ from sts2_rl.training import (
     ENGINE_REVIVAL_MECHANISM,
     CurriculumConfig,
     DiagnosticsConfig,
+    FailureCreditConfig,
     ModelConfig,
     OptimizationConfig,
     RolloutConfig,
@@ -29,7 +30,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v11"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v12"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -39,6 +40,11 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
     assert preheat.transaction_learning.completion_policy_weight == 0.25
+    # Failure-credit v4 generic completions are zero-cost critic controls.
+    # They are not causal PREFER evidence for the final action.
+    assert default.failure_credit.liveness_completion_policy_weight == 0.0
+    assert combat.failure_credit.liveness_completion_policy_weight == 0.0
+    assert preheat.failure_credit.liveness_completion_policy_weight == 0.0
     assert not default.episodic_learning.enabled
     assert not combat.episodic_learning.enabled
     assert preheat.episodic_learning.enabled
@@ -55,6 +61,12 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.episodic_learning.policy_gradient_max_lag == 128
     assert preheat.episodic_learning.revival_value_weight == 0.02
     assert preheat.transaction_learning.pairwise_ranking_weight == 0.10
+    assert default.failure_credit.unresolved_stall_quota == 1
+    assert combat.failure_credit.unresolved_stall_quota == 1
+    assert preheat.failure_credit.unresolved_stall_quota == 1
+    assert default.failure_credit.matched_outcome_pair_quota == 0
+    assert combat.failure_credit.matched_outcome_pair_quota == 0
+    assert preheat.failure_credit.matched_outcome_pair_quota == 0
     assert preheat.optimization.entropy_weight == 0.02
     assert preheat.optimization.entropy_weight_end == 0.004
     assert preheat.optimization.entropy_decay_updates == 2_000
@@ -123,6 +135,53 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert "q_weight" not in mapping["optimization"]
     assert "reward_weight" not in mapping["optimization"]
     assert "terminal_weight" not in mapping["optimization"]
+
+
+def test_failure_credit_quota_budget_accounts_for_all_learnable_strata() -> None:
+    valid = FailureCreditConfig(
+        sample_records=6,
+        direct_witness_quota=1,
+        multi_edge_cycle_quota=1,
+        risk_sequence_quota=1,
+        unresolved_stall_quota=1,
+        completion_control_quota=1,
+        matched_outcome_pair_quota=1,
+    )
+    assert valid.sample_records == 6
+
+    with pytest.raises(
+        ValueError,
+        match="evidence quotas cannot exceed sample_records",
+    ):
+        FailureCreditConfig(
+            sample_records=5,
+            direct_witness_quota=1,
+            multi_edge_cycle_quota=1,
+            risk_sequence_quota=1,
+            unresolved_stall_quota=1,
+            completion_control_quota=1,
+            matched_outcome_pair_quota=1,
+        )
+
+
+def test_v29_failure_credit_lineage_retires_transaction_v3_explicitly() -> None:
+    overlay = (
+        Path(__file__).parents[1] / "config" / "experiments" / "full_run_revival_v29_failure_credit_v4_model_init.toml"
+    )
+    config = load_training_config(
+        profile="preheat",
+        config_path=overlay,
+    )
+
+    assert not config.transaction_learning.enabled
+    assert config.failure_credit.mode == "learning"
+    assert config.failure_credit.sample_records == 8
+    assert config.failure_credit.unresolved_stall_quota == 1
+    assert config.failure_credit.matched_outcome_pair_quota == 0
+    assert config.failure_credit.liveness_completion_policy_weight == 0.0
+    assert config.rollout.deterministic_probe_interval_episodes > 0
+    assert config.episodic_learning.enabled
+    assert config.curriculum.revival_budget == -1
 
 
 def test_v22_policy3918_warmstart_overlay_is_conservative_and_fully_audited() -> None:
@@ -217,10 +276,7 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
     )
     restored_signal = load_training_config(
         profile="preheat",
-        config_path=(
-            experiment_root
-            / "full_run_revival_v26_fresh_policy_credit_model_init.toml"
-        ),
+        config_path=(experiment_root / "full_run_revival_v26_fresh_policy_credit_model_init.toml"),
     )
 
     # This lineage isolates the signal-path repair: network/encoding, reward,
@@ -265,9 +321,7 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
     assert restored_signal.runtime.early_evaluation_steps == (5_000, 10_000, 20_000)
     assert restored_signal.runtime.final_audit_steps == (100_000,)
     assert restored_signal.runtime.final_audit_episodes == 32
-    assert restored_signal.runtime.log_dir.endswith(
-        "full-run-revival-v26-fresh-policy-credit-model-init"
-    )
+    assert restored_signal.runtime.log_dir.endswith("full-run-revival-v26-fresh-policy-credit-model-init")
 
 
 def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal() -> None:
@@ -275,17 +329,11 @@ def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal()
     preheat = load_training_config(profile="preheat")
     v26 = load_training_config(
         profile="preheat",
-        config_path=(
-            experiment_root
-            / "full_run_revival_v26_fresh_policy_credit_model_init.toml"
-        ),
+        config_path=(experiment_root / "full_run_revival_v26_fresh_policy_credit_model_init.toml"),
     )
     fresh = load_training_config(
         profile="preheat",
-        config_path=(
-            experiment_root
-            / "full_run_revival_v27_infinite_random_init.toml"
-        ),
+        config_path=(experiment_root / "full_run_revival_v27_infinite_random_init.toml"),
     )
 
     # A fresh random network must use the broad preheat optimizer/exploration
@@ -355,12 +403,8 @@ def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal()
     assert fresh.runtime.final_audit_steps == (250_000,)
     assert fresh.runtime.final_audit_episodes == 32
     assert fresh.runtime.evaluation_liveness_guard_enabled
-    assert fresh.runtime.log_dir.endswith(
-        "full-run-revival-v27-infinite-random-init"
-    )
-    assert fresh.runtime.checkpoint_dir.endswith(
-        "full-run-revival-v27-infinite-random-init"
-    )
+    assert fresh.runtime.log_dir.endswith("full-run-revival-v27-infinite-random-init")
+    assert fresh.runtime.checkpoint_dir.endswith("full-run-revival-v27-infinite-random-init")
 
 
 def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
@@ -491,9 +535,7 @@ def test_engine_revival_identity_is_explicit_and_fail_closed() -> None:
     assert identity["version"] == ENGINE_REVIVAL_MECHANISM
     assert identity["model_visible_game_entity"] is None
     assert identity["forced_kill_policy"] == "not intercepted"
-    assert identity["native_death_prevention_order"] == (
-        "native hooks before training bailout"
-    )
+    assert identity["native_death_prevention_order"] == ("native hooks before training bailout")
     assert len(identity["fingerprint_sha256"]) == 64
 
     with pytest.raises(ValueError, match="engine revival mechanism"):
@@ -563,16 +605,17 @@ def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
 def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    source.pop("failure_credit")
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
-
     with pytest.raises(ValueError, match="unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
     assert migrated.episodic_learning.fresh_policy_sequences == 0
+    assert not migrated.failure_credit.shadow_enabled
 
     unexpected = dict(source)
     unexpected["episodic_learning"] = {
@@ -586,6 +629,19 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     unsupported["version"] = "sts2-relational-curriculum-config-v9"
     with pytest.raises(ValueError, match="no reviewed config migration"):
         model_initialization_config_from_mapping(unsupported)
+
+
+def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v11"
+    source.pop("failure_credit")
+
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert not migrated.failure_credit.shadow_enabled
 
 
 def test_unknown_replay_section_is_rejected() -> None:
@@ -670,8 +726,6 @@ def test_episodic_learning_contract_is_part_of_lineage_identity() -> None:
         ),
     )
     assert changed_fresh_sampling.lineage_mapping() != base.lineage_mapping()
-    fresh_round_trip = training_config_from_mapping(
-        changed_fresh_sampling.to_mapping()
-    )
+    fresh_round_trip = training_config_from_mapping(changed_fresh_sampling.to_mapping())
     assert fresh_round_trip.episodic_learning.fresh_policy_sequences == 1
     assert fresh_round_trip == changed_fresh_sampling

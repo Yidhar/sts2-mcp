@@ -49,6 +49,12 @@ from .factory import (
     build_training_resources,
     resolve_device,
 )
+from .failure_credit import EvidenceStratum, StratumQuota
+from .launch_contract import (
+    SupervisedLaunchContract,
+    checkpoint_source_identity,
+    validate_supervised_model_initialization_binding,
+)
 from .pipeline import ActorLearnerPipeline, RecoverableActorIncident
 from .sdpa import sdpa_transition_provenance
 from .seeding import (
@@ -59,9 +65,64 @@ from .trajectory import TrajectoryJournal
 
 # Human-readable training-system ABI persisted in inspection and run_start
 # telemetry.  Exact-resume safety is enforced independently by the config,
-# encoding, replay and episodic-objective checkpoint contracts; this marker
-# makes the one-terminal-unit/fresh-policy release distinguishable in metrics.
-_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-episodic-v6"
+# encoding, replay and objective checkpoint contracts; this marker makes the
+# failure-credit-v4 publication/sampling order distinguishable in metrics.
+_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v4-v7"
+
+
+def _failure_credit_quotas(
+    config: TrainingConfig,
+    *,
+    learner_updates: int | None = None,
+) -> tuple[StratumQuota, ...]:
+    """Return the explicit v4 evidence minima for one learner sample.
+
+    ``None`` describes the configured mature-phase quotas for static
+    provenance.  A live learner update suppresses the risk-actor quota until
+    that actor channel is enabled; risk records may still be sampled normally
+    for critic calibration, but cannot falsely satisfy an actor quota.
+    """
+
+    credit = config.failure_credit
+    if learner_updates is not None and (
+        isinstance(learner_updates, bool) or not isinstance(learner_updates, int) or learner_updates < 0
+    ):
+        raise ValueError("learner_updates must be a non-negative integer or None")
+    return tuple(
+        StratumQuota(stratum=stratum, minimum=minimum)
+        for stratum, minimum in (
+            (
+                EvidenceStratum.DIRECT_WITNESS,
+                credit.direct_witness_quota,
+            ),
+            (
+                EvidenceStratum.MULTI_EDGE_CYCLE,
+                credit.multi_edge_cycle_quota,
+            ),
+            (
+                EvidenceStratum.RISK_SEQUENCE,
+                credit.risk_sequence_quota,
+            ),
+            (
+                EvidenceStratum.UNRESOLVED_STALL,
+                credit.unresolved_stall_quota,
+            ),
+            (
+                EvidenceStratum.COMPLETION_CONTROL,
+                credit.completion_control_quota,
+            ),
+            (
+                EvidenceStratum.MATCHED_OUTCOME_PAIR,
+                credit.matched_outcome_pair_quota,
+            ),
+        )
+        if minimum > 0
+        and (
+            stratum is not EvidenceStratum.RISK_SEQUENCE
+            or learner_updates is None
+            or learner_updates >= credit.liveness_risk_actor_start_update
+        )
+    )
 
 
 def exploration_epsilon(config: TrainingConfig, environment_steps: int) -> float:
@@ -121,12 +182,8 @@ def summarize_evaluation(
     """
 
     if objective not in {None, "combat", "act1", "run"}:
-        raise ValueError(
-            "evaluation objective must be one of None, 'combat', 'act1', or 'run'"
-        )
-    combat_win_rate_applicable: bool | None = (
-        None if objective is None else objective == "combat"
-    )
+        raise ValueError("evaluation objective must be one of None, 'combat', 'act1', or 'run'")
+    combat_win_rate_applicable: bool | None = None if objective is None else objective == "combat"
     evaluation_objective = objective or "unspecified"
     if not episodes:
         return {
@@ -138,9 +195,7 @@ def summarize_evaluation(
             "act3_reach_count": 0,
             "act3_reach_rate": 0.0,
             "run_win_rate": 0.0,
-            "combat_win_rate": (
-                0.0 if combat_win_rate_applicable is not False else None
-            ),
+            "combat_win_rate": (0.0 if combat_win_rate_applicable is not False else None),
             "deadlock_rate": 0.0,
             "combat_progress_stall_rate": 0.0,
             "combat_policy_failure_count": 0,
@@ -164,9 +219,7 @@ def summarize_evaluation(
             "maximum_relation_hash_collisions_per_decision": 0,
             "definition_hash_collisions_total": 0,
             "relation_hash_collisions_total": 0,
-            "revival_free_combat_win_rate": (
-                0.0 if combat_win_rate_applicable is not False else None
-            ),
+            "revival_free_combat_win_rate": (0.0 if combat_win_rate_applicable is not False else None),
             "revival_free_act1_clear_rate": 0.0,
             "revival_free_run_win_rate": 0.0,
             "act1_clear_at_most_one_revival_rate": 0.0,
@@ -196,9 +249,7 @@ def summarize_evaluation(
         "act3_reach_rate": sum(item.max_act >= 3 for item in episodes) / count,
         "run_win_rate": sum(item.run_won for item in episodes) / count,
         "combat_win_rate": (
-            sum(item.combat_won for item in episodes) / count
-            if combat_win_rate_applicable is not False
-            else None
+            sum(item.combat_won for item in episodes) / count if combat_win_rate_applicable is not False else None
         ),
         "deadlock_rate": sum(item.deadlocked for item in episodes) / count,
         "combat_progress_stall_rate": (sum(item.combat_progress_stalled for item in episodes) / count),
@@ -220,19 +271,13 @@ def summarize_evaluation(
         "mean_player_hp_lost": statistics.fmean(item.player_hp_lost for item in episodes),
         "maximum_observed_candidates": max(item.maximum_observed_candidates for item in episodes),
         "maximum_definition_hash_collisions_per_decision": max(
-            item.maximum_definition_hash_collisions_per_decision
-            for item in episodes
+            item.maximum_definition_hash_collisions_per_decision for item in episodes
         ),
         "maximum_relation_hash_collisions_per_decision": max(
-            item.maximum_relation_hash_collisions_per_decision
-            for item in episodes
+            item.maximum_relation_hash_collisions_per_decision for item in episodes
         ),
-        "definition_hash_collisions_total": sum(
-            item.definition_hash_collisions_total for item in episodes
-        ),
-        "relation_hash_collisions_total": sum(
-            item.relation_hash_collisions_total for item in episodes
-        ),
+        "definition_hash_collisions_total": sum(item.definition_hash_collisions_total for item in episodes),
+        "relation_hash_collisions_total": sum(item.relation_hash_collisions_total for item in episodes),
         "revival_free_combat_win_rate": (
             sum(item.revival_free_combat_win for item in episodes) / count
             if combat_win_rate_applicable is not False
@@ -382,9 +427,7 @@ def evaluate_policy(
                         replacement.close()
                         raise
             results.append(episode.metrics)
-        summary: dict[str, Any] = dict(
-            summarize_evaluation(results, objective=resources.collector.objective)
-        )
+        summary: dict[str, Any] = dict(summarize_evaluation(results, objective=resources.collector.objective))
         summary["infrastructure_retries"] = infrastructure_retries
         summary["data_partition"] = data_partition
         summary["evaluation_seed_count"] = len(evaluation_seeds)
@@ -455,6 +498,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
     model = RecurrentCandidateModel(
         model_config,
         enable_transaction_heads=config.transaction_learning.enabled,
+        enable_liveness_head=config.failure_credit.learning_enabled,
     ).eval()
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
     decision = encoder.encode(
@@ -505,15 +549,26 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "completion_policy_weight": (config.transaction_learning.completion_policy_weight),
             "pairwise_ranking_weight": (config.transaction_learning.pairwise_ranking_weight),
         },
+        "failure_credit": {
+            "mode": config.failure_credit.mode,
+            "shadow_enabled": config.failure_credit.shadow_enabled,
+            "learning_enabled": config.failure_credit.learning_enabled,
+            "replay_capacity": config.failure_credit.replay_capacity,
+            "replay_byte_capacity": config.failure_credit.replay_byte_capacity,
+            "sample_records": config.failure_credit.sample_records,
+            "burn_in_steps": config.failure_credit.burn_in_steps,
+            "maximum_context_steps": (config.failure_credit.maximum_context_steps),
+            "policy_gradient_max_lag": (config.failure_credit.policy_gradient_max_lag),
+            "sampling_quotas": {item.stratum.value: item.minimum for item in _failure_credit_quotas(config)},
+            "censored_quota": 0,
+        },
         "episodic_learning": {
             "enabled": config.episodic_learning.enabled,
             "replay_capacity_episodes": (config.episodic_learning.replay_capacity_episodes),
             "replay_capacity_bytes": config.episodic_learning.replay_capacity_bytes,
             "per_episode_capacity_bytes": (config.episodic_learning.per_episode_capacity_bytes),
             "sample_sequences": config.episodic_learning.sample_sequences,
-            "fresh_policy_sequences": (
-                config.episodic_learning.fresh_policy_sequences
-            ),
+            "fresh_policy_sequences": (config.episodic_learning.fresh_policy_sequences),
             "burn_in_steps": config.episodic_learning.burn_in_steps,
             "learn_steps": config.episodic_learning.learn_steps,
             "macro_sample_fraction": (config.episodic_learning.macro_sample_fraction),
@@ -552,11 +607,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "reward_objective": config.curriculum.reward_objective,
         "curriculum_mode": config.curriculum.mode,
         "revival_mechanism": config.curriculum.revival_mechanism,
-        "revival_contract": (
-            engine_revival_identity()
-            if config.curriculum.revival_mechanism is not None
-            else None
-        ),
+        "revival_contract": (engine_revival_identity() if config.curriculum.revival_mechanism is not None else None),
         "revival_budget": config.curriculum.revival_budget,
     }
 
@@ -674,6 +725,7 @@ def run_training(
     resume_from: str | Path | None = None,
     initialize_from: str | Path | None = None,
     runtime_provenance: Mapping[str, Any] | None = None,
+    supervised_launch_contract: SupervisedLaunchContract | None = None,
 ) -> TrainingState:
     if resume_from is not None and initialize_from is not None:
         raise ValueError("resume_from and initialize_from are mutually exclusive")
@@ -682,6 +734,8 @@ def run_training(
         Mapping,
     ):
         raise TypeError("runtime_provenance must be a mapping or None")
+    if supervised_launch_contract is not None and (resume_from is not None or initialize_from is None):
+        raise ValueError("supervised_launch_contract requires model initialization and forbids exact resume")
 
     # Fail before backend launch or artifact creation when checkpoint ABI/device
     # identity is incompatible.
@@ -701,6 +755,15 @@ def run_training(
             initialize_from,
             config=config,
         )
+    supervised_source: dict[str, Any] | None = None
+    if supervised_launch_contract is not None:
+        if prevalidated_initialization is None:  # pragma: no cover - guarded above
+            raise RuntimeError("supervised launch lost its initialization checkpoint")
+        supervised_source = validate_supervised_model_initialization_binding(
+            supervised_launch_contract,
+            config_fingerprint_sha256=config.fingerprint_sha256(),
+            checkpoint=prevalidated_initialization,
+        )
 
     run_id = str(uuid4())
     log_root = resolve_artifact_path(config.runtime.log_dir)
@@ -708,6 +771,8 @@ def run_training(
     run_log_root = log_root / f"run-{run_id}"
     metrics = JsonlMetrics(run_log_root / "metrics.jsonl")
     resources = build_training_resources(config, backend=backend)
+    if config.failure_credit.shadow_enabled:
+        resources.collector.bind_failure_credit_run_id(run_id)
     recovery_backend_factory: Callable[[], EnvironmentBackend] | None = (
         None if backend is not None else lambda: build_backend(config)
     )
@@ -734,11 +799,7 @@ def run_training(
             )
             load_mode = "model_initialization"
 
-        previous_sdpa = (
-            prevalidated_resume.metadata.get("sdpa_backend")
-            if prevalidated_resume is not None
-            else None
-        )
+        previous_sdpa = prevalidated_resume.metadata.get("sdpa_backend") if prevalidated_resume is not None else None
         resources.sdpa_backend_transition = sdpa_transition_provenance(
             previous=previous_sdpa,
             current=resources.sdpa_backend,
@@ -749,9 +810,19 @@ def run_training(
             parent_checkpoint_present=(prevalidated_resume is not None),
         )
         structured_runtime_provenance = dict(runtime_provenance or {})
-        structured_runtime_provenance["sdpa_backend"] = dict(
-            resources.sdpa_backend_transition
+        structured_runtime_provenance["sdpa_backend"] = dict(resources.sdpa_backend_transition)
+        if supervised_launch_contract is not None:
+            structured_runtime_provenance["supervised_launch"] = supervised_launch_contract.provenance_mapping()
+        source_checkpoint = (
+            checkpoint_source_identity(prevalidated_initialization) if prevalidated_initialization is not None else None
         )
+        if supervised_source is not None and source_checkpoint != supervised_source:
+            raise RuntimeError("supervised source checkpoint identity changed after model initialization")
+        initial_state = asdict(state)
+        if supervised_launch_contract is not None and initial_state != dict(
+            supervised_launch_contract.initial_training_state
+        ):
+            raise RuntimeError("model-initialization state differs from immutable supervised launch contract")
 
         metrics.write(
             "run_start",
@@ -771,6 +842,7 @@ def run_training(
                         if prevalidated_initialization is not None
                         else None
                     ),
+                    "source_checkpoint": source_checkpoint,
                     "network_parameters_initialized": (load_mode == "model_initialization"),
                     "optimizer_rollouts_rng_and_counters_reset": (load_mode == "model_initialization"),
                 },
@@ -1136,6 +1208,40 @@ def run_training(
                 if resources.transaction_replay is not None
                 else ()
             )
+            failure_credit_sample = (
+                resources.failure_credit_replay.sample(
+                    config.failure_credit.sample_records,
+                    quotas=_failure_credit_quotas(
+                        config,
+                        learner_updates=state.learner_updates,
+                    ),
+                    current_policy_version=policy_version_before_update,
+                    policy_gradient_max_lag=(config.failure_credit.policy_gradient_max_lag),
+                    risk_actor_enabled=(
+                        state.learner_updates >= config.failure_credit.liveness_risk_actor_start_update
+                    ),
+                )
+                if resources.failure_credit_replay is not None
+                else None
+            )
+            failure_credit_records = failure_credit_sample.records if failure_credit_sample is not None else ()
+            credit_plans = tuple(record.plan for record in failure_credit_records)
+            failure_credit_quota = (
+                {
+                    "satisfied": (failure_credit_sample.quota_diagnostics.satisfied),
+                    "total_deficit": (failure_credit_sample.quota_diagnostics.total_deficit),
+                    "statuses": [asdict(status) for status in (failure_credit_sample.quota_diagnostics.statuses)],
+                }
+                if failure_credit_sample is not None
+                else None
+            )
+            # Publication happens on this main thread at episode boundaries,
+            # so one post-sample snapshot is authoritative for both start/end
+            # telemetry of this update.  Do not repeat replay accounting work
+            # or report two superficially different snapshots for one sample.
+            failure_credit_replay_metrics = (
+                resources.failure_credit_replay.metrics() if resources.failure_credit_replay is not None else None
+            )
             episodic_sampling_started_ns = time.perf_counter_ns()
             episodic_sample = (
                 resources.episodic_replay.sample_for_learning(
@@ -1144,25 +1250,18 @@ def run_training(
                     burn_in_steps=config.episodic_learning.burn_in_steps,
                     macro_sample_fraction=(config.episodic_learning.macro_sample_fraction),
                     current_policy_version=policy_version_before_update,
-                    policy_gradient_max_lag=(
-                        config.episodic_learning.policy_gradient_max_lag
-                    ),
-                    fresh_policy_sequences=(
-                        config.episodic_learning.fresh_policy_sequences
-                    ),
+                    policy_gradient_max_lag=(config.episodic_learning.policy_gradient_max_lag),
+                    fresh_policy_sequences=(config.episodic_learning.fresh_policy_sequences),
                 )
                 if resources.episodic_replay is not None
                 else None
             )
             episodic_sampling_ms = (
-                (time.perf_counter_ns() - episodic_sampling_started_ns)
-                / 1_000_000.0
+                (time.perf_counter_ns() - episodic_sampling_started_ns) / 1_000_000.0
                 if resources.episodic_replay is not None
                 else None
             )
-            episodic_sequences = (
-                episodic_sample.sequences if episodic_sample is not None else ()
-            )
+            episodic_sequences = episodic_sample.sequences if episodic_sample is not None else ()
             episodic_sampling = None
             if episodic_sample is not None:
                 episodic_sampling = episodic_sample.diagnostics.to_mapping()
@@ -1174,12 +1273,22 @@ def run_training(
                     "environment_steps": pipeline.environment_steps,
                     "policy_version": state.policy_version,
                     "policy_version_before_update": policy_version_before_update,
+                    "learner_updates_before_update": state.learner_updates,
+                    "liveness_head_calibration_active": int(
+                        state.learner_updates < config.failure_credit.liveness_head_calibration_updates
+                    ),
+                    "liveness_risk_actor_enabled": int(
+                        state.learner_updates >= config.failure_credit.liveness_risk_actor_start_update
+                    ),
                     "unrolls": len(batch),
                     "batch_environment_steps": batch_environment_steps,
                     "transaction_traces": len(transaction_traces),
                     "transaction_replay": (
                         resources.transaction_replay.metrics() if resources.transaction_replay is not None else None
                     ),
+                    "failure_credit_records": len(failure_credit_records),
+                    "failure_credit_quota": failure_credit_quota,
+                    "failure_credit_replay": failure_credit_replay_metrics,
                     "episodic_sequences": len(episodic_sequences),
                     "episodic_learn_steps": sum(len(sequence.learn_steps) for sequence in episodic_sequences),
                     "episodic_sampling": episodic_sampling,
@@ -1210,7 +1319,9 @@ def run_training(
             learner_metrics = resources.learner.update(
                 batch,
                 current_policy_version=policy_version_before_update,
+                current_learner_update=state.learner_updates,
                 transaction_traces=transaction_traces,
+                credit_plans=credit_plans,
                 episodic_sequences=episodic_sequences,
                 progress=learner_progress,
             )
@@ -1234,10 +1345,10 @@ def run_training(
                     "rollout_queue": resources.rollout_queue.metrics(),
                     "episodic_sampling": episodic_sampling,
                     "episodic_replay": (
-                        resources.episodic_replay.metrics()
-                        if resources.episodic_replay is not None
-                        else None
+                        resources.episodic_replay.metrics() if resources.episodic_replay is not None else None
                     ),
+                    "failure_credit_quota": failure_credit_quota,
+                    "failure_credit_replay": failure_credit_replay_metrics,
                     **learner_metrics.to_mapping(),
                 },
             )
@@ -1267,17 +1378,40 @@ def run_training(
                 fetched_batch = ()
 
             batch_to_learn: tuple[SequenceUnroll, ...] = ()
-            if resources.episodic_replay is None:
+            if resources.episodic_replay is None and resources.failure_credit_replay is None:
                 batch_to_learn = fetched_batch
             elif fetched_batch:
                 batch_to_learn = pending_batch
                 pending_batch = fetched_batch
 
             boundary_committed = False
+            terminal_boundary_poll_attempted = False
             while True:
                 actor_result = pipeline.next_episode(timeout=0.0)
                 if actor_result is None:
-                    break
+                    # A replay-backed final batch must not sample before the
+                    # episode/incident result that owns its evidence has been
+                    # committed.  The actor normally waits for that boundary
+                    # acknowledgement before exiting; this second poll closes
+                    # the narrow native-exit/message-publication race without
+                    # reverting to the old uncredited ``terminal_drain``.
+                    terminal_boundary_required = bool(
+                        pending_batch
+                        and not boundary_committed
+                        and not pipeline.alive
+                        and resources.rollout_queue.closed
+                        and len(resources.rollout_queue) == 0
+                    )
+                    if terminal_boundary_required and not terminal_boundary_poll_attempted:
+                        terminal_boundary_poll_attempted = True
+                        actor_result = pipeline.next_episode(timeout=0.20)
+                    if actor_result is None:
+                        if terminal_boundary_required:
+                            raise RuntimeError(
+                                "actor exited with an uncommitted replay-backed "
+                                "pending batch and no terminal boundary result"
+                            )
+                        break
                 if isinstance(actor_result, RecoverableActorIncident):
                     handle_actor_incident(actor_result)
                     boundary_committed = True
@@ -1290,6 +1424,19 @@ def run_training(
                     )
                 elif episode.transaction_traces:
                     raise RuntimeError("collector emitted transaction traces while replay is disabled")
+                failure_credit_records_stored = 0
+                if resources.failure_credit_replay is not None:
+                    # An episode's evidence is one publication transaction.
+                    # This preserves matched-pair atomicity and prevents the
+                    # learner from observing a partially published terminal
+                    # boundary while the remainder is still being indexed.
+                    failure_credit_records_stored = resources.failure_credit_replay.put_many(
+                        episode.failure_credit_records
+                    )
+                elif episode.failure_credit_records and not config.failure_credit.shadow_enabled:
+                    raise RuntimeError(
+                        "collector emitted failure-credit records while the " "formal pipeline is disabled"
+                    )
                 episodic_episode_stored = False
                 if resources.episodic_replay is not None:
                     if episode.completed_episode is None:
@@ -1340,6 +1487,28 @@ def run_training(
                         "transaction_replay": (
                             resources.transaction_replay.metrics() if resources.transaction_replay is not None else None
                         ),
+                        "failure_credit_mode": config.failure_credit.mode,
+                        "failure_credit_records_emitted": len(episode.failure_credit_records),
+                        "failure_credit_records_stored": (failure_credit_records_stored),
+                        "failure_credit_actor_labels": sum(
+                            record.plan.actor_label_count for record in episode.failure_credit_records
+                        ),
+                        "failure_credit_strata": {
+                            stratum.value: sum(
+                                stratum in record.plan.strata for record in episode.failure_credit_records
+                            )
+                            for stratum in EvidenceStratum
+                        },
+                        "failure_credit_replay": (
+                            resources.failure_credit_replay.metrics()
+                            if resources.failure_credit_replay is not None
+                            else None
+                        ),
+                        "failure_credit_shadow_funnel": (
+                            asdict(episode.failure_credit_shadow_metrics)
+                            if episode.failure_credit_shadow_metrics is not None
+                            else None
+                        ),
                         "episodic_episode_emitted": (episode.completed_episode is not None),
                         "episodic_episode_stored": episodic_episode_stored,
                         "episodic_episode_storage_nbytes": (
@@ -1363,11 +1532,8 @@ def run_training(
 
             if batch_to_learn:
                 learn_rollout_batch(batch_to_learn)
-            if resources.episodic_replay is not None and pending_batch:
-                terminal_drain = bool(
-                    not pipeline.alive and resources.rollout_queue.closed and len(resources.rollout_queue) == 0
-                )
-                if boundary_committed or terminal_drain:
+            if (resources.episodic_replay is not None or resources.failure_credit_replay is not None) and pending_batch:
+                if boundary_committed:
                     learn_rollout_batch(pending_batch)
                     pending_batch = ()
 
@@ -1442,6 +1608,10 @@ def run_training(
                     resources.transaction_replay.put(trace)
             elif episode.transaction_traces:
                 raise RuntimeError("collector emitted transaction traces while replay is disabled")
+            if resources.failure_credit_replay is not None:
+                resources.failure_credit_replay.put_many(episode.failure_credit_records)
+            elif episode.failure_credit_records and not config.failure_credit.shadow_enabled:
+                raise RuntimeError("collector emitted failure-credit records while the " "formal pipeline is disabled")
             if resources.episodic_replay is not None:
                 if episode.completed_episode is None:
                     raise RuntimeError(

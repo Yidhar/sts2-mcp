@@ -12,6 +12,9 @@ from sts2_rl.training.config import CONFIG_VERSION, TrainingConfig
 def _v10_payload() -> dict[str, Any]:
     payload = TrainingConfig().to_mapping()
     payload["version"] = "sts2-relational-curriculum-config-v10"
+    # V10 predates the failure-credit table. Reconstruct the historical
+    # payload instead of only relabeling the current V12 mapping.
+    del payload["failure_credit"]
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]

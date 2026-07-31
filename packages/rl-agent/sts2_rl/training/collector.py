@@ -22,6 +22,7 @@ from sts2_baseline import (
     TaskRewardCalculator,
 )
 from sts2_rl.contracts import (
+    ENVIRONMENT_SCHEMA_VERSION,
     CombatResetRequest,
     EnvironmentBackend,
     EnvironmentResult,
@@ -42,6 +43,12 @@ from .episode_replay import (
     EpisodeCompletion,
     EpisodeDecisionStep,
     backfill_completed_episode,
+)
+from .failure_credit import (
+    EvidenceRecord,
+    FailureCreditEpisodePipeline,
+    FailureCreditPipelineConfig,
+    FailureCreditShadowMetrics,
 )
 from .runaway_combat import RunawayCombatGuard
 from .seeding import (
@@ -145,6 +152,11 @@ class CollectedEpisode:
     transaction_traces: tuple[TransactionTrace, ...] = ()
     completed_episode: CompletedEpisode | None = None
     liveness_probe: bool = False
+    # Formal v4 evidence is kept separate from legacy transaction-v3 traces.
+    # In shadow mode these immutable records are audited but never sampled by
+    # the learner; learning mode may insert exactly this tuple into replay-v4.
+    failure_credit_records: tuple[EvidenceRecord, ...] = ()
+    failure_credit_shadow_metrics: FailureCreditShadowMetrics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2329,6 +2341,30 @@ def _combat_stall_evidence(
     }
 
 
+def _failure_credit_game_version(state: EnvironmentResult) -> str:
+    """Return an auditable game build identity without guessing from schemas."""
+
+    sources: tuple[Mapping[str, object], ...] = (
+        state.observation,
+        state.info,
+        state.raw,
+    )
+    for source in sources:
+        for key in ("game_version", "game_build", "build_id"):
+            raw = source.get(key)
+            if raw is not None and str(raw).strip():
+                return str(raw).strip()
+        nested = source.get("game")
+        if isinstance(nested, Mapping):
+            for key in ("version", "build", "build_id"):
+                raw = nested.get(key)
+                if raw is not None and str(raw).strip():
+                    return str(raw).strip()
+    # Absence is itself useful provenance.  Never substitute a protocol or
+    # mod schema version and pretend it identifies the game build.
+    return "game-version:not-exposed"
+
+
 class GroundedCollector:
     """Collect policy trajectories with no MCTS, guard, or action rewrite."""
 
@@ -2360,6 +2396,10 @@ class GroundedCollector:
         horizon_as_failure: bool = False,
         transaction_burn_in_steps: int | None = None,
         episodic_learning_enabled: bool = False,
+        failure_credit_shadow_enabled: bool = False,
+        failure_credit_learning_enabled: bool = False,
+        failure_credit_run_id: str | None = None,
+        failure_credit_pipeline_config: FailureCreditPipelineConfig | None = None,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -2394,6 +2434,21 @@ class GroundedCollector:
             raise TypeError("episodic_learning_enabled must be a boolean")
         if episodic_learning_enabled and (scenario != "full-run" or objective != "run"):
             raise ValueError("episodic learning requires the full-run scenario and run objective")
+        if not isinstance(failure_credit_shadow_enabled, bool):
+            raise TypeError("failure_credit_shadow_enabled must be a boolean")
+        if not isinstance(failure_credit_learning_enabled, bool):
+            raise TypeError("failure_credit_learning_enabled must be a boolean")
+        if failure_credit_shadow_enabled and failure_credit_learning_enabled:
+            raise ValueError("failure-credit shadow and learning modes are mutually exclusive")
+        if failure_credit_run_id is not None and (
+            not isinstance(failure_credit_run_id, str) or not failure_credit_run_id.strip()
+        ):
+            raise ValueError("failure_credit_run_id must be a non-empty string or null")
+        if failure_credit_pipeline_config is not None and not isinstance(
+            failure_credit_pipeline_config,
+            FailureCreditPipelineConfig,
+        ):
+            raise TypeError("failure_credit_pipeline_config has the wrong type")
         if isinstance(journal_policy_topk, bool) or not isinstance(journal_policy_topk, int):
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
@@ -2444,11 +2499,15 @@ class GroundedCollector:
         self.horizon_as_failure = bool(horizon_as_failure)
         self.transaction_burn_in_steps = transaction_burn_in_steps
         self.episodic_learning_enabled = episodic_learning_enabled
+        self.failure_credit_shadow_enabled = failure_credit_shadow_enabled
+        self.failure_credit_learning_enabled = failure_credit_learning_enabled
+        self.failure_credit_pipeline_config = failure_credit_pipeline_config or FailureCreditPipelineConfig(
+            detector_window_steps=deadlock_window,
+            context_burn_in_steps=transaction_burn_in_steps or 0,
+        )
+        self._failure_credit_run_id = failure_credit_run_id
         if self.training_revival_budget is not None:
-            if (
-                isinstance(self.training_revival_budget, bool)
-                or not isinstance(self.training_revival_budget, int)
-            ):
+            if isinstance(self.training_revival_budget, bool) or not isinstance(self.training_revival_budget, int):
                 raise TypeError("training_revival_budget must be an integer or null")
             if self.training_revival_budget < -1:
                 raise ValueError("training_revival_budget must be -1 or non-negative")
@@ -2463,6 +2522,20 @@ class GroundedCollector:
             window_size=deadlock_window,
             repeat_threshold=deadlock_repeat_threshold,
         )
+
+    @property
+    def failure_credit_enabled(self) -> bool:
+        return bool(self.failure_credit_shadow_enabled or self.failure_credit_learning_enabled)
+
+    def bind_failure_credit_run_id(self, run_id: str) -> None:
+        """Bind runtime provenance exactly once before recorded collection."""
+
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("failure-credit run_id must be a non-empty string")
+        normalized = run_id.strip()
+        if self._failure_credit_run_id is not None and self._failure_credit_run_id != normalized:
+            raise RuntimeError("failure-credit collector is already bound to a different run_id")
+        self._failure_credit_run_id = normalized
 
     @property
     def device(self) -> torch.device:
@@ -2767,9 +2840,7 @@ class GroundedCollector:
                 value=value,
                 encoding_ms=encoding_ms,
                 policy_forward_ms=policy_forward_ms,
-                definition_hash_collisions=(
-                    encoded.definition_hash_collisions
-                ),
+                definition_hash_collisions=(encoded.definition_hash_collisions),
                 relation_hash_collisions=encoded.relation_hash_collisions,
             )
 
@@ -2881,6 +2952,25 @@ class GroundedCollector:
         reset_started_ns = time.perf_counter_ns()
         state = self.reset(evaluation_seed=evaluation_seed)
         timings.record("reset", reset_started_ns)
+        failure_credit_pipeline: FailureCreditEpisodePipeline | None = None
+        if record and self.failure_credit_enabled:
+            run_id = self._failure_credit_run_id
+            if run_id is None:
+                raise RuntimeError(
+                    "failure-credit collection requires bind_failure_credit_run_id() "
+                    "before the first recorded episode"
+                )
+            provenance = FailureCreditEpisodePipeline.build_provenance(
+                run_id=run_id,
+                game_version=_failure_credit_game_version(state),
+                environment_schema_version=ENVIRONMENT_SCHEMA_VERSION,
+                policy_version=policy_version,
+            )
+            failure_credit_pipeline = FailureCreditEpisodePipeline(
+                episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                provenance=provenance,
+                config=self.failure_credit_pipeline_config,
+            )
         self.deadlock_detector.reset()
         recurrent_state = self.model.initial_state(1, device=self.device)
         segment_initial_state = recurrent_state[0].detach().float().cpu().numpy().copy()
@@ -3016,6 +3106,11 @@ class GroundedCollector:
             step_combat_id = active_combat_id
             revivals_before_step = revivals_used
             hp_loss_before_step = player_hp_lost
+            failure_credit_pre_recurrent_state = (
+                recurrent_state[0].detach().float().cpu().numpy().copy()
+                if failure_credit_pipeline is not None
+                else None
+            )
             choice = self._choose_action(
                 state,
                 recurrent_state,
@@ -3133,6 +3228,27 @@ class GroundedCollector:
                 ),
                 legal_actions=next_semantic_actions,
             )
+            if failure_credit_pipeline is not None:
+                if failure_credit_pre_recurrent_state is None:  # pragma: no cover - construction invariant
+                    raise RuntimeError("failure-credit transition lost its pre-step recurrent state")
+                failure_credit_started_ns = time.perf_counter_ns()
+                failure_credit_pipeline.observe_transition(
+                    episode_step=state.step_index,
+                    before_observation=state.observation,
+                    before_legal_actions=state.legal_actions,
+                    after_observation=next_state.observation,
+                    after_legal_actions=next_state.legal_actions,
+                    snapshot=choice.snapshot,
+                    action_index=choice.candidate_index,
+                    behavior_log_probability=choice.behavior_log_probability,
+                    policy_version=segment_policy_version,
+                    pre_recurrent_state=failure_credit_pre_recurrent_state,
+                    terminal=result_terminal,
+                )
+                timings.record(
+                    "failure_credit_shadow",
+                    failure_credit_started_ns,
+                )
             if next_state.transition is None:  # pragma: no cover - validated above
                 raise CollectionProtocolError("step result lost its typed transition")
             # The validated transition may itself expose a much wider next
@@ -3826,12 +3942,8 @@ class GroundedCollector:
                             maximum_relation_hash_collisions_per_decision=(
                                 maximum_relation_hash_collisions_per_decision
                             ),
-                            definition_hash_collisions_total=(
-                                definition_hash_collisions_total
-                            ),
-                            relation_hash_collisions_total=(
-                                relation_hash_collisions_total
-                            ),
+                            definition_hash_collisions_total=(definition_hash_collisions_total),
+                            relation_hash_collisions_total=(relation_hash_collisions_total),
                         )
                     )
                 segment_steps = []
@@ -3921,6 +4033,28 @@ class GroundedCollector:
                 completion=completion,
                 data_partition="training",
             )
+        failure_credit_records: tuple[EvidenceRecord, ...] = ()
+        failure_credit_shadow_metrics: FailureCreditShadowMetrics | None = None
+        if failure_credit_pipeline is not None:
+            formal_local_failure = bool(
+                combat_progress_stalled
+                or noncombat_event_cycle
+                or selection_action_cycle
+                or noncombat_durable_stalled
+                or effective_deadlock_evidence is not None
+            )
+            failure_credit_result = failure_credit_pipeline.finalize(
+                failure_kind=(
+                    str(resolved_terminal_reason)
+                    if formal_local_failure and resolved_terminal_reason is not None
+                    else None
+                ),
+                local_failure=formal_local_failure,
+                terminal_succeeded=bool(final_outcome == "success"),
+                censored_reason=str(resolved_terminal_reason or "episode_boundary_censored"),
+            )
+            failure_credit_records = failure_credit_result.records
+            failure_credit_shadow_metrics = failure_credit_result.metrics
         ordered_act_efficiency = tuple(act_boundary_efficiency[act] for act in sorted(act_boundary_efficiency))
         return CollectedEpisode(
             unrolls=tuple(unrolls),
@@ -3958,18 +4092,10 @@ class GroundedCollector:
                 maximum_equivalence_class_size=(maximum_equivalence_class_size),
                 act_revival_counts=tuple(item[0] for item in ordered_act_efficiency),
                 act_hp_loss_counts=tuple(item[1] for item in ordered_act_efficiency),
-                maximum_definition_hash_collisions_per_decision=(
-                    maximum_definition_hash_collisions_per_decision
-                ),
-                maximum_relation_hash_collisions_per_decision=(
-                    maximum_relation_hash_collisions_per_decision
-                ),
-                definition_hash_collisions_total=(
-                    definition_hash_collisions_total
-                ),
-                relation_hash_collisions_total=(
-                    relation_hash_collisions_total
-                ),
+                maximum_definition_hash_collisions_per_decision=(maximum_definition_hash_collisions_per_decision),
+                maximum_relation_hash_collisions_per_decision=(maximum_relation_hash_collisions_per_decision),
+                definition_hash_collisions_total=(definition_hash_collisions_total),
+                relation_hash_collisions_total=(relation_hash_collisions_total),
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,
@@ -3977,6 +4103,8 @@ class GroundedCollector:
             transaction_traces=transaction_traces,
             completed_episode=completed_episode,
             liveness_probe=liveness_probe,
+            failure_credit_records=failure_credit_records,
+            failure_credit_shadow_metrics=failure_credit_shadow_metrics,
         )
 
 

@@ -33,9 +33,9 @@ from sts2_rl.encoding.grounded import (
     _hash_id,
     _pile_count,
     _stable_zone_id,
-    _strict_card_selection_projection,
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
+from sts2_rl.semantics import strict_action_groups
 
 
 def _small_model_config() -> GroundedCandidateConfig:
@@ -2071,9 +2071,9 @@ def test_2068_strictly_equal_card_selection_instances_form_16_semantic_groups() 
         ),
     )
 
-    projection = _strict_card_selection_projection(actions[0])
-    assert projection is not None
-    prototype, _, _ = projection
+    groups = strict_action_groups(actions)
+    assert len(groups) == 16
+    prototype = groups[0].prototype
     prototype_card = prototype["card"]
     assert isinstance(prototype_card, dict)
     assert "instance_uuid" not in prototype_card

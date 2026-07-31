@@ -93,6 +93,85 @@ def _write_event(path: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(event) + "\n")
 
 
+def test_frozen_v28_contract_retires_the_old_start_recipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    contract_path = paths.checkout_root / launcher.FROZEN_V28_CONTRACT_RELATIVE
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "sts2-frozen-checkpoint-contract-v1",
+                "name": "v28-mature-refinement-100k",
+                "environment_steps": 100_000,
+                "policy_version": 1_569,
+                "exact_resume_permitted": False,
+                "usage": "model_parameter_initialization_only",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launcher, "require_wsl", lambda: None)
+
+    with pytest.raises(
+        launcher.LaunchError,
+        match="v28 is frozen.*old recipe is retired",
+    ):
+        launcher.start(paths)
+
+
+def test_missing_frozen_v28_contract_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    monkeypatch.setattr(launcher, "require_wsl", lambda: None)
+
+    with pytest.raises(
+        launcher.LaunchError,
+        match="mandatory frozen v28 retirement contract is missing.*fail-closed",
+    ):
+        launcher.start(paths)
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    (
+        ("{not-json\n", "cannot read frozen v28 contract"),
+        (
+            json.dumps(
+                {
+                    "schema_version": "sts2-frozen-checkpoint-contract-v1",
+                    "name": "v28-mature-refinement-100k",
+                    "environment_steps": 100_000,
+                    "policy_version": 1_569,
+                    "exact_resume_permitted": True,
+                    "usage": "model_parameter_initialization_only",
+                }
+            ),
+            "frozen v28 retirement contract exact_resume_permitted changed",
+        ),
+    ),
+)
+def test_unreadable_or_changed_frozen_v28_contract_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+    match: str,
+) -> None:
+    paths = _paths(tmp_path)
+    contract_path = paths.checkout_root / launcher.FROZEN_V28_CONTRACT_RELATIVE
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(launcher, "require_wsl", lambda: None)
+
+    with pytest.raises(launcher.LaunchError, match=match):
+        launcher.start(paths)
+
+
 def _run_start(paths: Any) -> dict[str, Any]:
     return {
         "event": "run_start",

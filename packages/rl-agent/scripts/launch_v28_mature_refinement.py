@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Persistent, fail-closed WSL supervisor for the reviewed v28 refinement.
+"""Retired, fail-closed WSL supervisor for the reviewed v28 refinement.
 
-The public ``start`` action can launch exactly one training command: a
-``model_initialization`` from the frozen v27 200,044-step checkpoint selected
-by the paired held-out evaluation.  It never accepts trainer arguments and it
-has no exact-resume path.  An optional ``--reviewed-preflight`` JSON file may
-be supplied, but it must prove that same checkpoint and command and is checked
-again against a live preflight before anything is spawned.
+Historically the public ``start`` action launched exactly one training
+command: a ``model_initialization`` from the frozen v27 200,044-step
+checkpoint selected by the paired held-out evaluation.  The reviewed v28
+100k result is now frozen as the v29 model ancestor, so a source-tree
+retirement contract makes every new ``start`` fail closed.  ``status`` and
+watchdog reconciliation remain available for audit of the completed lineage.
 
 ``start`` detaches a Linux supervisor, not a bare trainer.  The supervisor
 records native process identities for itself and its child, binds the newly
@@ -73,6 +73,11 @@ FIXED_INITIALIZATION_RELATIVE = Path(
     "checkpoints/full-run-revival-v27-infinite-random-init"
     f"/run-{FIXED_SOURCE_RUN_ID}/periodic-step-{FIXED_INITIALIZATION_STEP:09d}"
 )
+# The reviewed v28 policy is now a frozen model-initialization ancestor for
+# v29.  Keeping this retirement marker in the source tree prevents the old
+# supervised recipe from silently creating another v28 lineage after the
+# operator has declared the 100k result final.
+FROZEN_V28_CONTRACT_RELATIVE = Path("contracts/frozen-checkpoints/v28-mature-refinement-100k.json")
 TERMINAL_STATUSES = frozenset({"completed", "interrupted", "failed"})
 
 
@@ -239,6 +244,36 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise LaunchError(f"{label} must be a JSON object: {path}")
     return payload
+
+
+def _reject_retired_v28_start(paths: LaunchPaths) -> None:
+    contract_path = (paths.checkout_root / FROZEN_V28_CONTRACT_RELATIVE).resolve(strict=False)
+    if not contract_path.is_file():
+        raise LaunchError(
+            "the mandatory frozen v28 retirement contract is missing; "
+            "fail-closed refusal prevents the retired v28 recipe from "
+            "starting another lineage",
+        )
+    contract = _load_json_object(
+        contract_path,
+        label="frozen v28 contract",
+    )
+    required = {
+        "schema_version": "sts2-frozen-checkpoint-contract-v1",
+        "name": "v28-mature-refinement-100k",
+        "environment_steps": 100_000,
+        "policy_version": 1_569,
+        "exact_resume_permitted": False,
+        "usage": "model_parameter_initialization_only",
+    }
+    for key, expected in required.items():
+        if contract.get(key) != expected:
+            raise LaunchError(f"frozen v28 retirement contract {key} changed")
+    raise LaunchError(
+        "v28 is frozen at 100,000 environment steps; the old recipe is "
+        "retired and may not start another lineage. Use the reviewed v29 "
+        "failure-credit-v4 model-initialization launcher."
+    )
 
 
 def _run_checked(
@@ -1229,7 +1264,7 @@ def supervise(paths: LaunchPaths, *, manifest_path: Path) -> dict[str, Any]:
             )
         except Exception:
             pass
-        if isinstance(exc, (LaunchError, v28_preflight.PreflightError)):
+        if isinstance(exc, LaunchError | v28_preflight.PreflightError):
             raise LaunchError(str(exc)) from exc
         raise LaunchError(f"supervisor failed: {type(exc).__name__}: {exc}") from exc
 
@@ -1240,6 +1275,7 @@ def start(
     reviewed_preflight: Path | None = None,
 ) -> dict[str, Any]:
     require_wsl()
+    _reject_retired_v28_start(paths)
     preflight = run_preflight(paths, reviewed_preflight=reviewed_preflight)
     paths = validate_layout(paths)
     paths.launcher_dir.mkdir(parents=True, exist_ok=True)

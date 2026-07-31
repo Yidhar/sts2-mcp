@@ -225,10 +225,8 @@ def test_episodic_replay_checkpoint_roundtrip_restores_order_bytes_and_rng(
         source.close()
 
     metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v4"
-    assert metadata["episodic_target_abi"] == (
-        "sts2-episodic-task-targets-one-terminal-unit-v2"
-    )
+    assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v5"
+    assert metadata["episodic_target_abi"] == ("sts2-episodic-task-targets-one-terminal-unit-v2")
     assert metadata["episodic_replay_enabled"] is True
     assert metadata["episodic_replay_spec"] == saved_metrics
     manifest = json.loads((checkpoint / "checkpoint.manifest.json").read_text(encoding="utf-8"))
@@ -868,7 +866,7 @@ def test_v3_parameter_initialization_starts_fresh_optimizer_replays_rng_and_line
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v4"
+        assert metadata["format"] == "sts2-recurrent-vtrace-checkpoint-v5"
         assert metadata["training_state"] == asdict(TrainingState())
         assert metadata["provenance"]["checkpoint_load_mode"] == "model_initialization"
         assert metadata["provenance"]["parent_checkpoint"]["relation"] == ("model_parameter_initialization")

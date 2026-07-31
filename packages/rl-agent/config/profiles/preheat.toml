@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v11"
+version = "sts2-relational-curriculum-config-v12"
 profile = "preheat"
 
 [model]
@@ -64,6 +64,33 @@ pairwise_ranking_weight = 0.10
 pairwise_margin = 0.10
 minimum_return_gap = 0.0
 maximum_pairs = 256
+
+[failure_credit]
+# Historical transaction-v3 remains enabled for this frozen profile. Formal
+# evidence v4 is disabled here and starts only in a reviewed successor.
+mode = "disabled"
+replay_capacity = 4096
+replay_byte_capacity = 536870912
+sample_records = 8
+burn_in_steps = 32
+maximum_context_steps = 256
+direct_witness_quota = 1
+multi_edge_cycle_quota = 1
+risk_sequence_quota = 1
+unresolved_stall_quota = 1
+completion_control_quota = 1
+matched_outcome_pair_quota = 0
+policy_gradient_max_lag = 128
+liveness_value_critic_weight = 0.10
+liveness_cost_critic_weight = 0.25
+liveness_cost_actor_weight = 0.10
+liveness_direct_policy_weight = 0.25
+liveness_cycle_policy_weight = 0.10
+liveness_contrast_policy_weight = 0.10
+# Generic completion records are zero-cost critic controls, not PREFER labels.
+liveness_completion_policy_weight = 0.0
+liveness_risk_advantage_clip = 0.25
+liveness_contrast_margin = 0.10
 
 [episodic_learning]
 # Complete episodes provide long-horizon labels while GPU autograd remains

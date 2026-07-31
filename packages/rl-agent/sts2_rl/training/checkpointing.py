@@ -22,14 +22,31 @@ from sts2_rl.checkpoints import (
     ValidatedResumeCheckpoint,
     build_checkpoint_provenance,
     contract_metadata,
+    reject_frozen_exact_resume,
     validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
 from sts2_rl.encoding import grounding_encoding_identity
+from sts2_rl.semantics import (
+    DECISION_IDENTITY_CONTRACT_VERSION,
+    MACRO_EDGE_CONTRACT_VERSION,
+    PROGRESS_RECEIPT_CONTRACT_VERSION,
+    PROGRESS_SCOPE_CONTRACT_VERSION,
+    SURFACE_REGISTRY_CONTRACT_VERSION,
+)
+from sts2_rl.semantics.identity import SEMANTIC_KEY_CONTRACT_VERSION
 
 from .config import TrainingConfig, training_config_from_mapping
 from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
+from .failure_credit import (
+    FAILURE_CREDIT_COLLECTOR_VERSION,
+    FAILURE_CREDIT_COMPILER_VERSION,
+    FAILURE_CREDIT_DETECTOR_VERSION,
+    FAILURE_CREDIT_SCHEMA_VERSION,
+    FAILURE_EVIDENCE_REPLAY_VERSION,
+    BoundedFailureCreditReplay,
+)
 from .sdpa import (
     validate_sdpa_execution_mapping,
     validate_sdpa_transition_mapping,
@@ -41,13 +58,21 @@ from .transaction import (
     TransactionTrace,
 )
 
-_CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v4"
-_LEGACY_MODEL_INITIALIZATION_FORMATS = frozenset({"sts2-recurrent-vtrace-checkpoint-v3"})
+_CHECKPOINT_FORMAT = "sts2-recurrent-vtrace-checkpoint-v5"
+_MODEL_INITIALIZATION_FORMATS = frozenset(
+    {
+        _CHECKPOINT_FORMAT,
+        "sts2-recurrent-vtrace-checkpoint-v4",
+        "sts2-recurrent-vtrace-checkpoint-v3",
+    }
+)
+_LONG_HORIZON_MISSING_FORMATS = frozenset({"sts2-recurrent-vtrace-checkpoint-v3"})
 _QUEUE_PAYLOAD_VERSION = "sts2-rollout-queue-pickle-v2"
 _ACTOR_SUPERVISOR_STATE_VERSION = "sts2-actor-supervisor-state-v1"
 _EVALUATION_GATE_STATE_VERSION = "sts2-evaluation-gate-state-v1"
 _LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
 _EPISODIC_TARGET_ABI = "sts2-episodic-task-targets-one-terminal-unit-v2"
+_LIVENESS_COST_HEAD_ABI = "sts2-liveness-cost-heads-v1"
 
 _LONG_HORIZON_HEAD_PREFIXES = (
     "combat_task_value_head.",
@@ -57,6 +82,56 @@ _LONG_HORIZON_HEAD_PREFIXES = (
     "act_revival_cost_value_head.",
     "run_revival_cost_value_head.",
 )
+_LIVENESS_HEAD_PREFIXES = (
+    "liveness_cost_value_head.",
+    "candidate_liveness_cost_head.",
+)
+_TRANSACTION_HEAD_PREFIXES = (
+    "candidate_effect_head.",
+    "selection_delta_head.",
+    "transaction_q_head.",
+)
+_TRANSACTION_HEAD_SUFFIXES = frozenset(
+    {
+        "0.weight",
+        "0.bias",
+        "1.weight",
+        "1.bias",
+        "3.weight",
+        "3.bias",
+    }
+)
+
+
+def _decision_semantics_abi() -> dict[str, str]:
+    """Return the complete factual-decision identity used by failure replay.
+
+    A checkpoint must not resume into a process that interprets the same
+    stored evidence under different surface, scope, progress, or macro-edge
+    semantics.  Keeping the component versions explicit makes reviewable
+    migrations possible without treating a single opaque digest as authority.
+    """
+
+    return {
+        "semantic_key": SEMANTIC_KEY_CONTRACT_VERSION,
+        "decision_identity": DECISION_IDENTITY_CONTRACT_VERSION,
+        "surface_registry": SURFACE_REGISTRY_CONTRACT_VERSION,
+        "progress_scope": PROGRESS_SCOPE_CONTRACT_VERSION,
+        "progress_receipt": PROGRESS_RECEIPT_CONTRACT_VERSION,
+        "macro_edge": MACRO_EDGE_CONTRACT_VERSION,
+    }
+
+
+def _failure_credit_abi() -> dict[str, str]:
+    return {
+        "schema": FAILURE_CREDIT_SCHEMA_VERSION,
+        "collector": FAILURE_CREDIT_COLLECTOR_VERSION,
+        "detector": FAILURE_CREDIT_DETECTOR_VERSION,
+        "compiler": FAILURE_CREDIT_COMPILER_VERSION,
+        "replay": FAILURE_EVIDENCE_REPLAY_VERSION,
+        "liveness_heads": _LIVENESS_COST_HEAD_ABI,
+    }
+
 
 # Exact resume always requires the complete active encoding identity.  Model
 # parameter initialization has deliberately narrow legacy exceptions.  V9
@@ -107,22 +182,16 @@ _V12_ENCODING_IDENTITY = {
     "feature_abi_end": 215,
     "fingerprint_sha256": "d1bc0220f7aa58e7afacaa83c1fa1ce339b65d58729f651012cd81d5ad4febf3",
 }
+_V13_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v13",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": "ac119f0d1fe0de5c09394e091169f3b7712084bce8a90a9d02be4732f60ce5bf",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
-        _V8_ENCODING_IDENTITY,
         _V12_ENCODING_IDENTITY,
-    ),
-    (
-        _V9_ENCODING_IDENTITY,
-        _V12_ENCODING_IDENTITY,
-    ),
-    (
-        _V10_ENCODING_IDENTITY,
-        _V12_ENCODING_IDENTITY,
-    ),
-    (
-        _V11_ENCODING_IDENTITY,
-        _V12_ENCODING_IDENTITY,
+        _V13_ENCODING_IDENTITY,
     ),
 )
 
@@ -506,6 +575,46 @@ def _episodic_replay_spec(
     return dict(probe.metrics())
 
 
+def _new_failure_credit_replay(
+    *,
+    config: TrainingConfig,
+) -> BoundedFailureCreditReplay:
+    return BoundedFailureCreditReplay(
+        capacity=config.failure_credit.replay_capacity,
+        byte_capacity=config.failure_credit.replay_byte_capacity,
+        seed=config.runtime.seed,
+    )
+
+
+def _validated_failure_credit_replay_payload(
+    payload: object,
+    *,
+    config: TrainingConfig,
+) -> dict[str, object]:
+    """Validate an exact replay-v4 continuation in a detached owner.
+
+    The typed corpus, atomic matched pairs, capacity/byte accounting, owned RNG,
+    and all replay counters are validated before any live resource is mutated.
+    A v3 transaction sidecar is never accepted under this filename or ABI.
+    """
+
+    if not isinstance(payload, dict):
+        raise TypeError("failure-credit replay checkpoint must be an object")
+    probe = _new_failure_credit_replay(config=config)
+    probe.load_state_dict(payload)
+    return payload
+
+
+def _failure_credit_replay_spec(
+    payload: dict[str, object],
+    *,
+    config: TrainingConfig,
+) -> dict[str, int | str]:
+    probe = _new_failure_credit_replay(config=config)
+    probe.load_state_dict(payload)
+    return dict(probe.metrics())
+
+
 def _stochastic_state(resources: TrainingResources) -> dict[str, Any]:
     collector_device = next(resources.collector_model.parameters()).device
     cuda_rng_is_live = (
@@ -705,9 +814,9 @@ def _validate_encoding_contract(
     Exact continuation may never cross a changed decision space: queued
     ``action_index`` values, behavior probabilities, transaction replay and
     recurrent state all belong to the source encoder.  Explicit model
-    parameter initialization may cross only the explicitly reviewed legacy ->
-    v12 migrations whose existing feature slots and parameter tensors are
-    stable.
+    parameter initialization may cross only the explicitly reviewed v12 ->
+    v13 migration.  Its tensor features are unchanged while strict action
+    grouping moves to the single Decision Semantics Kernel authority.
     Shape-compatible but otherwise unknown encoders remain rejected.
     """
 
@@ -735,8 +844,7 @@ def _validate_metadata(
     metadata = validated.metadata
     checkpoint_format = metadata.get("format")
     if model_only:
-        accepted_formats = {_CHECKPOINT_FORMAT, *_LEGACY_MODEL_INITIALIZATION_FORMATS}
-        if checkpoint_format not in accepted_formats:
+        if checkpoint_format not in _MODEL_INITIALIZATION_FORMATS:
             raise ValueError("unsupported model-initialization checkpoint format: " f"{checkpoint_format!r}")
     elif checkpoint_format != _CHECKPOINT_FORMAT:
         raise ValueError(
@@ -757,19 +865,13 @@ def _validate_metadata(
     if recorded_sdpa is not None:
         normalized_sdpa = validate_sdpa_execution_mapping(recorded_sdpa)
         if not isinstance(execution_provenance, Mapping):
-            raise ValueError(
-                "checkpoint with SDPA state has no execution provenance"
-            )
+            raise ValueError("checkpoint with SDPA state has no execution provenance")
         validate_sdpa_transition_mapping(
             execution_provenance.get("sdpa_backend"),
             expected_current=normalized_sdpa,
         )
-    elif isinstance(execution_provenance, Mapping) and (
-        "sdpa_backend" in execution_provenance
-    ):
-        raise ValueError(
-            "checkpoint SDPA transition has no recorded current execution state"
-        )
+    elif isinstance(execution_provenance, Mapping) and ("sdpa_backend" in execution_provenance):
+        raise ValueError("checkpoint SDPA transition has no recorded current execution state")
     training_state = training_state_from_metadata(metadata)
     actor_supervisor_state_from_metadata(metadata)
     evaluation_state = evaluation_gate_state_from_metadata(metadata)
@@ -801,6 +903,44 @@ def _validate_metadata(
         raise ValueError("exact resume requires the same actor device")
     if not isinstance(metadata.get("queue_spec"), dict):
         raise ValueError("checkpoint has no rollout queue specification")
+    if metadata.get("decision_semantics_abi") != _decision_semantics_abi():
+        raise ValueError("exact-resume checkpoint decision-semantics ABI differs")
+    if metadata.get("failure_credit_abi") != _failure_credit_abi():
+        raise ValueError("exact-resume checkpoint failure-credit ABI differs")
+    if metadata.get("failure_credit_mode") != config.failure_credit.mode:
+        raise ValueError("exact-resume checkpoint failure-credit mode differs")
+    liveness_enabled = config.failure_credit.learning_enabled
+    if metadata.get("liveness_cost_heads_enabled") is not liveness_enabled:
+        raise ValueError("exact-resume checkpoint liveness-head marker differs")
+    for state_spec_name in ("model_state_spec", "actor_model_state_spec"):
+        raw_state_spec = metadata.get(state_spec_name)
+        if not isinstance(raw_state_spec, dict):
+            raise ValueError(f"checkpoint has no {state_spec_name.replace('_', ' ')}")
+        liveness_state_keys = {
+            key for key in raw_state_spec if isinstance(key, str) and key.startswith(_LIVENESS_HEAD_PREFIXES)
+        }
+        liveness_prefixes_present = {
+            prefix for prefix in _LIVENESS_HEAD_PREFIXES if any(key.startswith(prefix) for key in liveness_state_keys)
+        }
+        if liveness_enabled and liveness_prefixes_present != set(_LIVENESS_HEAD_PREFIXES):
+            raise ValueError("exact-resume checkpoint has an incomplete liveness-head " f"family in {state_spec_name}")
+        if not liveness_enabled and liveness_state_keys:
+            raise ValueError(
+                "checkpoint contains liveness heads while failure-credit " f"learning is disabled in {state_spec_name}"
+            )
+    if liveness_enabled:
+        if metadata.get("failure_credit_replay_enabled") is not True:
+            raise ValueError("failure-credit learning checkpoint has no replay-v4 marker")
+        if not isinstance(
+            metadata.get("failure_credit_replay_spec"),
+            dict,
+        ):
+            raise ValueError("failure-credit learning checkpoint has no replay-v4 specification")
+    else:
+        if metadata.get("failure_credit_replay_enabled") is not False:
+            raise ValueError("failure-credit replay marker differs from the non-learning mode")
+        if metadata.get("failure_credit_replay_spec") is not None:
+            raise ValueError("non-learning checkpoint cannot contain a failure-credit " "replay specification")
     if metadata.get("long_horizon_value_head_abi") != _LONG_HORIZON_VALUE_HEAD_ABI:
         raise ValueError("exact-resume checkpoint has no long-horizon value-head ABI marker")
     if config.transaction_learning.enabled:
@@ -825,6 +965,8 @@ def _exact_resume_required_files(config: TrainingConfig) -> frozenset[str]:
         required.add("transaction_replay.pkl")
     if config.episodic_learning.enabled:
         required.add("episodic_replay.pkl")
+    if config.failure_credit.learning_enabled:
+        required.add("failure_credit_replay.pkl")
     return frozenset(required)
 
 
@@ -842,6 +984,7 @@ def preflight_training_checkpoint(
     # hashes every manifest-listed file, including optional sidecars, so the
     # second phase only needs to require their manifest entries.
     validated = validate_resume_checkpoint(checkpoint)
+    reject_frozen_exact_resume(validated)
     _validate_metadata(
         validated,
         config=config,
@@ -941,6 +1084,15 @@ def save_training_checkpoint(
                 episodic_replay_payload,
                 config=config,
             )
+        failure_credit_replay_payload = None
+        if config.failure_credit.learning_enabled:
+            if resources.failure_credit_replay is None:
+                raise RuntimeError("failure-credit learning resources have no replay-v4 sidecar")
+            failure_credit_replay_payload = resources.failure_credit_replay.state_dict()
+            _validated_failure_credit_replay_payload(
+                failure_credit_replay_payload,
+                config=config,
+            )
         torch.save(network_state, staging / "network.pt")
         torch.save(actor_network_state, staging / "actor_network.pt")
         torch.save(optimizer_state, staging / "optimizer.pt")
@@ -966,12 +1118,17 @@ def save_training_checkpoint(
                     handle,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
+        if failure_credit_replay_payload is not None:
+            with (staging / "failure_credit_replay.pkl").open("wb") as handle:
+                pickle.dump(
+                    failure_credit_replay_payload,
+                    handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
         checkpoint_execution_provenance = dict(execution_provenance or {})
         # The process-owned state is authoritative.  Callers may attach other
         # execution facts, but may not replace the verified SDPA transition.
-        checkpoint_execution_provenance["sdpa_backend"] = dict(
-            resources.sdpa_backend_transition
-        )
+        checkpoint_execution_provenance["sdpa_backend"] = dict(resources.sdpa_backend_transition)
         recorded_sdpa = resources.sdpa_backend.to_mapping()
         validate_sdpa_transition_mapping(
             checkpoint_execution_provenance["sdpa_backend"],
@@ -992,6 +1149,19 @@ def save_training_checkpoint(
             "actor_model_state_spec": _tensor_spec(actor_network_state),
             "optimizer_spec": _optimizer_spec(resources.optimizer, optimizer_state),
             "queue_spec": _queue_spec(queue_payload),
+            "decision_semantics_abi": _decision_semantics_abi(),
+            "failure_credit_abi": _failure_credit_abi(),
+            "failure_credit_mode": config.failure_credit.mode,
+            "liveness_cost_heads_enabled": (config.failure_credit.learning_enabled),
+            "failure_credit_replay_enabled": (config.failure_credit.learning_enabled),
+            "failure_credit_replay_spec": (
+                _failure_credit_replay_spec(
+                    failure_credit_replay_payload,
+                    config=config,
+                )
+                if failure_credit_replay_payload is not None
+                else None
+            ),
             "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
             "episodic_target_abi": _EPISODIC_TARGET_ABI,
             "sdpa_backend": recorded_sdpa,
@@ -1041,6 +1211,8 @@ def load_training_checkpoint(
         raise RuntimeError("transaction-enabled resources have no replay sidecar")
     if config.episodic_learning.enabled and resources.episodic_replay is None:
         raise RuntimeError("episodic-learning resources have no replay sidecar")
+    if config.failure_credit.learning_enabled and resources.failure_credit_replay is None:
+        raise RuntimeError("failure-credit learning resources have no replay-v4 sidecar")
 
     validated = preflight_training_checkpoint(
         checkpoint,
@@ -1076,6 +1248,10 @@ def load_training_checkpoint(
     if config.episodic_learning.enabled:
         with (validated.root / "episodic_replay.pkl").open("rb") as handle:
             episodic_replay_payload = pickle.load(handle)
+    failure_credit_replay_payload = None
+    if config.failure_credit.learning_enabled:
+        with (validated.root / "failure_credit_replay.pkl").open("rb") as handle:
+            failure_credit_replay_payload = pickle.load(handle)
 
     base_payloads = (
         network_state,
@@ -1112,6 +1288,16 @@ def load_training_checkpoint(
             config=config,
         ):
             raise ValueError("checkpoint episodic replay metadata differs from payload")
+    if config.failure_credit.learning_enabled:
+        failure_credit_replay_payload = _validated_failure_credit_replay_payload(
+            failure_credit_replay_payload,
+            config=config,
+        )
+        if validated.metadata.get("failure_credit_replay_spec") != _failure_credit_replay_spec(
+            failure_credit_replay_payload,
+            config=config,
+        ):
+            raise ValueError("checkpoint failure-credit replay metadata differs from payload")
     state = training_state_from_metadata(validated.metadata)
 
     # Probe all mutable Torch payloads against independent objects.  Nothing
@@ -1151,6 +1337,9 @@ def load_training_checkpoint(
     if episodic_replay_payload is not None:
         assert resources.episodic_replay is not None  # precondition above
         resources.episodic_replay.load_state_dict(episodic_replay_payload)
+    if failure_credit_replay_payload is not None:
+        assert resources.failure_credit_replay is not None  # precondition above
+        resources.failure_credit_replay.load_state_dict(failure_credit_replay_payload)
     _restore_stochastic_state(stochastic, resources=resources)
     return state
 
@@ -1166,9 +1355,10 @@ def initialize_model_from_checkpoint(
     This is deliberately not exact resume: optimizer moments, queued unrolls,
     transaction/episodic replay, collector/RNG state, environment counters,
     and policy-version counters are left at their newly constructed values.
-    Compatible learned tensors are inherited into a new lineage; the six v4
-    long-horizon heads may remain freshly initialized only for a validated
-    older-format source that predates their ABI.
+    Compatible learned tensors are inherited into a new lineage. The six
+    long-horizon heads and the two-part liveness-cost head group can remain
+    freshly initialized only through their explicit, all-or-none migration
+    gates. Exact resume never uses these gates.
     """
 
     validated = preflight_model_initialization(checkpoint, config=config)
@@ -1186,7 +1376,9 @@ def initialize_model_from_checkpoint(
         state,
         target_state=target_state,
         allow_missing_transaction_heads=config.transaction_learning.enabled,
-        allow_missing_long_horizon_heads=(validated.metadata.get("format") in _LEGACY_MODEL_INITIALIZATION_FORMATS),
+        allow_source_transaction_head_drop=(not config.transaction_learning.enabled),
+        allow_missing_long_horizon_heads=(validated.metadata.get("format") in _LONG_HORIZON_MISSING_FORMATS),
+        allow_missing_liveness_heads=config.failure_credit.learning_enabled,
     )
     # Preserve the freshly constructed target-only parameters and RNG lineage;
     # the migration overlays compatible learned tensors onto that exact model
@@ -1203,35 +1395,68 @@ def _model_parameter_initialization_state(
     *,
     target_state: dict[str, Any],
     allow_missing_transaction_heads: bool,
+    allow_source_transaction_head_drop: bool = False,
     allow_missing_long_horizon_heads: bool = False,
+    allow_missing_liveness_heads: bool = False,
 ) -> dict[str, Any]:
     """Fail-closed overlay used only by explicit parameter initialization.
 
-    Exact resume never calls this path. Optional transaction heads and the six
-    v4 long-horizon state heads are independent all-or-none migration groups.
-    Only a validated older-format checkpoint may omit the latter group. Every
-    shared tensor must still match by exact name, shape, and dtype. The caller
-    keeps the target model's fresh parameters for omitted groups and does not
-    import optimizer, queue, replay, RNG, or training counters.
+    Exact resume never calls this path. Optional transaction heads, the six
+    long-horizon state heads, and the two-part liveness-cost head family are
+    independent all-or-none migration groups. Only a validated older-format
+    checkpoint may omit long-horizon heads. Liveness heads may be omitted only
+    when the target explicitly enables the new failure-credit learner. A
+    target that explicitly retires transaction-v3 may drop its complete
+    source-only three-head family, but a partial or unknown source family is
+    rejected. Every shared tensor must still match by exact name, shape, and
+    dtype. The caller keeps the target model's fresh parameters for omitted
+    groups and does not import optimizer, queue, replay, RNG, or training
+    counters.
     """
 
     if not isinstance(source_state, dict):
         raise ValueError("checkpoint network payload must be an object")
     if not all(isinstance(key, str) for key in source_state):
         raise TypeError("model initialization source must contain named tensors")
-    unexpected = sorted(set(source_state) - set(target_state))
+    source_transaction_heads = {key for key in source_state if key.startswith(_TRANSACTION_HEAD_PREFIXES)}
+    target_transaction_heads = {key for key in target_state if key.startswith(_TRANSACTION_HEAD_PREFIXES)}
+    if target_transaction_heads:
+        target_transaction_suffixes = {
+            prefix: {key.removeprefix(prefix) for key in target_transaction_heads if key.startswith(prefix)}
+            for prefix in _TRANSACTION_HEAD_PREFIXES
+        }
+        if not all(suffixes == _TRANSACTION_HEAD_SUFFIXES for suffixes in target_transaction_suffixes.values()):
+            raise ValueError("model initialization target has an incomplete " "transaction-head family")
+    permitted_source_only: set[str] = set()
+    if source_transaction_heads and not target_transaction_heads:
+        source_transaction_suffixes = {
+            prefix: {key.removeprefix(prefix) for key in source_transaction_heads if key.startswith(prefix)}
+            for prefix in _TRANSACTION_HEAD_PREFIXES
+        }
+        complete_source_only_group = all(
+            suffixes == _TRANSACTION_HEAD_SUFFIXES for suffixes in source_transaction_suffixes.values()
+        )
+        if not allow_source_transaction_head_drop or not complete_source_only_group:
+            raise ValueError(
+                "model initialization source must contain either all or none "
+                "of the source-only transaction-head tensors"
+            )
+        permitted_source_only.update(source_transaction_heads)
+
+    unexpected = sorted(set(source_state) - set(target_state) - permitted_source_only)
     if unexpected:
         raise ValueError("model initialization source contains unsupported tensors: " + ", ".join(unexpected))
-
-    transaction_prefixes = (
-        "candidate_effect_head.",
-        "selection_delta_head.",
-        "transaction_q_head.",
-    )
-    target_transaction_heads = {key for key in target_state if key.startswith(transaction_prefixes)}
     target_long_horizon_heads = {key for key in target_state if key.startswith(_LONG_HORIZON_HEAD_PREFIXES)}
+    target_liveness_heads = {key for key in target_state if key.startswith(_LIVENESS_HEAD_PREFIXES)}
     if not target_long_horizon_heads:
         raise ValueError("model initialization target has no long-horizon head tensors")
+    target_liveness_prefixes = {
+        prefix for prefix in _LIVENESS_HEAD_PREFIXES if any(key.startswith(prefix) for key in target_liveness_heads)
+    }
+    if target_liveness_heads and target_liveness_prefixes != set(_LIVENESS_HEAD_PREFIXES):
+        raise ValueError("model initialization target has an incomplete liveness-head family")
+    if allow_missing_liveness_heads and not target_liveness_heads:
+        raise ValueError("liveness-head migration was enabled but the target has no liveness tensors")
 
     missing = set(target_state) - set(source_state)
     permitted_missing: set[str] = set()
@@ -1252,6 +1477,14 @@ def _model_parameter_initialization_state(
             )
         permitted_missing.update(target_long_horizon_heads)
 
+    missing_liveness = missing & target_liveness_heads
+    if missing_liveness:
+        if not allow_missing_liveness_heads or missing_liveness != target_liveness_heads:
+            raise ValueError(
+                "model initialization source must contain either all or none " "of the liveness-head tensors"
+            )
+        permitted_missing.update(target_liveness_heads)
+
     shared_missing = sorted(missing - permitted_missing)
     if shared_missing:
         raise ValueError("model initialization source is missing shared tensors: " + ", ".join(shared_missing))
@@ -1260,6 +1493,8 @@ def _model_parameter_initialization_state(
     for key, value in source_state.items():
         if not isinstance(value, torch.Tensor):
             raise TypeError("model initialization source must contain named tensors")
+        if key in permitted_source_only:
+            continue
         target = target_state[key]
         if not isinstance(target, torch.Tensor):
             raise TypeError("model initialization target must contain named tensors")

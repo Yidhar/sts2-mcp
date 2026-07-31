@@ -244,6 +244,7 @@ def test_macro_journal_cli_writes_standalone_diagnostic_report(
 def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
+    del source["failure_credit"]
     episodic = source["episodic_learning"]
     rollout = source["rollout"]
     assert isinstance(episodic, dict)
@@ -275,6 +276,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v7"
+    del source["failure_credit"]
     optimization = source["optimization"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
@@ -320,6 +322,7 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
+    del source["failure_credit"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
     assert isinstance(rollout, dict)
@@ -347,6 +350,7 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    del source["failure_credit"]
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]

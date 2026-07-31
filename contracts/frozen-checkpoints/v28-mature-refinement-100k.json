@@ -1,0 +1,13 @@
+{
+  "checkpoint_id": "f670deda-97d5-46f2-be07-d69a5842eeec",
+  "environment_steps": 100000,
+  "exact_resume_permitted": false,
+  "manifest_sha256": "cfd4d23bf20e064e7a1b21939e94ff01a9f5bf48ab7d70690c66d71f9f2e7af3",
+  "metadata_sha256": "e1933292cc0fbca95cd3b80e073b0b2cda40c1ea29731b59a4bfa21f4f8b5127",
+  "name": "v28-mature-refinement-100k",
+  "policy_version": 1569,
+  "relative_path": "checkpoints/full-run-revival-v28-mature-refinement-model-init/run-071a43f5-120a-485f-a6dc-a67a55a1efc2/periodic-step-000100000",
+  "schema_version": "sts2-frozen-checkpoint-contract-v1",
+  "source_git_commit": "129094067b19c450030d7f8aaeb28f8963163137",
+  "usage": "model_parameter_initialization_only"
+}

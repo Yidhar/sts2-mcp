@@ -17,8 +17,9 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v11"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v12"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -35,16 +36,12 @@ def engine_revival_identity() -> dict[str, Any]:
         "native_death_prevention_order": "native hooks before training bailout",
         "forced_kill_policy": "not intercepted",
         "nonpositive_max_hp_policy": "not intercepted",
-        "telemetry": (
-            "observation._training.revival_budget+revivals_used+player_hp_lost"
-        ),
+        "telemetry": ("observation._training.revival_budget+revivals_used+player_hp_lost"),
         "model_input_policy": "underscore training telemetry excluded",
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
-    payload["fingerprint_sha256"] = hashlib.sha256(
-        serialized.encode("utf-8")
-    ).hexdigest()
+    payload["fingerprint_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return payload
 
 
@@ -257,9 +254,7 @@ class OptimizationConfig:
             if value < 0.0:
                 raise ValueError(f"{name} must be non-negative")
         if self.entropy_weight_end > self.entropy_weight:
-            raise ValueError(
-                "entropy_weight_end cannot exceed entropy_weight"
-            )
+            raise ValueError("entropy_weight_end cannot exceed entropy_weight")
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,10 +315,7 @@ class RolloutConfig:
                 minimum=1,
             )
             if step <= previous:
-                raise ValueError(
-                    "rollout.deterministic_probe_environment_steps must be "
-                    "strictly increasing"
-                )
+                raise ValueError("rollout.deterministic_probe_environment_steps must be " "strictly increasing")
             previous = step
         if self.minimum_unrolls > self.queue_capacity:
             raise ValueError("rollout minimum_unrolls cannot exceed queue_capacity")
@@ -395,6 +387,184 @@ class TransactionLearningConfig:
                 label=f"transaction_learning.{name}",
                 minimum=0.0,
             )
+
+
+@dataclass(frozen=True, slots=True)
+class FailureCreditConfig:
+    """Formal detector-evidence, replay-v4 and liveness-learning contract.
+
+    This plane is deliberately independent from the legacy transaction-v3
+    sidecar.  ``shadow`` performs the complete semantic/evidence compilation
+    and emits funnel metrics but cannot alter learner gradients.  ``learning``
+    additionally owns a bounded replay-v4 corpus and enables the independent
+    state/candidate liveness heads.  Changing mode is therefore a lineage
+    change; it is never an exact-resume-compatible runtime toggle.
+    """
+
+    mode: Literal["disabled", "shadow", "learning"] = "disabled"
+    replay_capacity: int = 4_096
+    replay_byte_capacity: int = 536_870_912
+    sample_records: int = 8
+    burn_in_steps: int = 32
+    maximum_context_steps: int = 256
+    # Collector-side completion controls are staged until the authoritative
+    # episode boundary.  These two independent limits prevent ordinary
+    # progress transitions from retaining an unbounded number of encoded DTOs.
+    maximum_episode_completion_controls: int = 32
+    maximum_episode_completion_bytes: int = 134_217_728
+    # Minimum evidence representation per learner sample. Deficits are
+    # explicit metrics, never silently back-filled by unrelated evidence.
+    direct_witness_quota: int = 1
+    multi_edge_cycle_quota: int = 1
+    risk_sequence_quota: int = 1
+    # DIRECT/MULTI records may also carry RISK_SEQUENCE.  This independent
+    # quota guarantees that unique unresolved stalls are represented rather
+    # than letting those overlap records satisfy the whole risk policy.
+    unresolved_stall_quota: int = 1
+    completion_control_quota: int = 1
+    # Matched pairs are optional until the cross-episode matcher has produced
+    # a non-empty stratum, but remain an explicit sampling-policy field.
+    matched_outcome_pair_quota: int = 0
+    # Critics may use all authoritative evidence. Actor labels older than this
+    # policy distance are retained for audit/value learning but suppressed.
+    policy_gradient_max_lag: int = 128
+    # Newly initialized liveness heads first learn against detached world,
+    # recurrent and candidate features.  This keeps their initially
+    # uncalibrated gradients out of the inherited policy trunk while still
+    # allowing the heads themselves to fit factual zero/one controls.  The
+    # checkpointed learner-update counter is the sole phase clock.
+    liveness_head_calibration_updates: int = 256
+    # The centered-risk actor consumes predictions from the new candidate
+    # cost head, so it starts only after the detached-head calibration phase.
+    # Direct/cycle/contrast witnesses do not depend on that head and remain
+    # independently eligible throughout calibration.
+    liveness_risk_actor_start_update: int = 512
+    # Failure-credit autograd is deliberately one evidence record at a time.
+    # This v1 execution contract makes objective normalization independent of
+    # incidental batch packing and prevents an 8 x 256 recurrent graph.
+    liveness_records_per_autograd_batch: int = 1
+    # Detach recurrent state at each trainable window boundary.  Together with
+    # the one-record microbatch this bounds graph depth without discarding any
+    # factual target or shortening the no-grad recurrent reconstruction.
+    liveness_tbptt_window_steps: int = 16
+    # Matched outcome evidence may add one comparison context to the incident
+    # context.  More contexts in one record are rejected until a reviewed
+    # learner ABI explicitly raises this bound.
+    liveness_maximum_contexts_per_record: int = 2
+    # Aggregate hard work budgets cover the sampled record set.  They are
+    # checked before the first model forward and fail closed rather than
+    # partially training or silently dropping replay evidence.
+    liveness_maximum_replayed_steps_per_update: int = 4_096
+    liveness_maximum_replayed_candidates_per_update: int = 1_048_576
+    liveness_value_critic_weight: float = 0.10
+    liveness_cost_critic_weight: float = 0.25
+    liveness_cost_actor_weight: float = 0.10
+    liveness_direct_policy_weight: float = 0.25
+    liveness_cycle_policy_weight: float = 0.10
+    liveness_contrast_policy_weight: float = 0.10
+    # Generic durable/FLOW completion is a zero-cost critic control, not
+    # evidence that the final action should be imitated.  Keep the standalone
+    # completion actor channel disabled unless a future evidence contract adds
+    # an explicit, causal PREFER witness.
+    liveness_completion_policy_weight: float = 0.0
+    liveness_risk_advantage_clip: float = 0.25
+    liveness_contrast_margin: float = 0.10
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"disabled", "shadow", "learning"}:
+            raise ValueError("failure_credit.mode must be 'disabled', 'shadow', or 'learning'")
+        for name in (
+            "replay_capacity",
+            "replay_byte_capacity",
+            "sample_records",
+            "maximum_context_steps",
+            "maximum_episode_completion_controls",
+            "maximum_episode_completion_bytes",
+            "policy_gradient_max_lag",
+            "liveness_records_per_autograd_batch",
+            "liveness_tbptt_window_steps",
+            "liveness_maximum_contexts_per_record",
+            "liveness_maximum_replayed_steps_per_update",
+            "liveness_maximum_replayed_candidates_per_update",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"failure_credit.{name}",
+                minimum=1,
+            )
+        _require_int(
+            self.burn_in_steps,
+            label="failure_credit.burn_in_steps",
+            minimum=0,
+        )
+        _require_int(
+            self.liveness_head_calibration_updates,
+            label="failure_credit.liveness_head_calibration_updates",
+            minimum=0,
+        )
+        _require_int(
+            self.liveness_risk_actor_start_update,
+            label="failure_credit.liveness_risk_actor_start_update",
+            minimum=0,
+        )
+        if self.burn_in_steps >= self.maximum_context_steps:
+            raise ValueError("failure_credit.burn_in_steps must be smaller than " "maximum_context_steps")
+        if self.maximum_episode_completion_bytes > self.replay_byte_capacity:
+            raise ValueError(
+                "failure_credit.maximum_episode_completion_bytes cannot exceed " "failure_credit.replay_byte_capacity"
+            )
+        if self.liveness_risk_actor_start_update < self.liveness_head_calibration_updates:
+            raise ValueError(
+                "failure_credit.liveness_risk_actor_start_update cannot precede "
+                "failure_credit.liveness_head_calibration_updates"
+            )
+        if self.liveness_records_per_autograd_batch != 1:
+            raise ValueError(
+                "failure_credit.liveness_records_per_autograd_batch must be 1 "
+                "for the reviewed per-record objective ABI"
+            )
+        quota_total = 0
+        for name in (
+            "direct_witness_quota",
+            "multi_edge_cycle_quota",
+            "risk_sequence_quota",
+            "unresolved_stall_quota",
+            "completion_control_quota",
+            "matched_outcome_pair_quota",
+        ):
+            quota_total += _require_int(
+                getattr(self, name),
+                label=f"failure_credit.{name}",
+                minimum=0,
+            )
+        if quota_total > self.sample_records:
+            raise ValueError("failure_credit evidence quotas cannot exceed sample_records")
+        for name in (
+            "liveness_value_critic_weight",
+            "liveness_cost_critic_weight",
+            "liveness_cost_actor_weight",
+            "liveness_direct_policy_weight",
+            "liveness_cycle_policy_weight",
+            "liveness_contrast_policy_weight",
+            "liveness_completion_policy_weight",
+            "liveness_risk_advantage_clip",
+            "liveness_contrast_margin",
+        ):
+            _require_finite_number(
+                getattr(self, name),
+                label=f"failure_credit.{name}",
+                minimum=0.0,
+            )
+        if self.liveness_risk_advantage_clip > 1.0:
+            raise ValueError("failure_credit.liveness_risk_advantage_clip must be in [0, 1]")
+
+    @property
+    def shadow_enabled(self) -> bool:
+        return self.mode in {"shadow", "learning"}
+
+    @property
+    def learning_enabled(self) -> bool:
+        return self.mode == "learning"
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,10 +640,7 @@ class EpisodicLearningConfig:
             minimum=0,
         )
         if self.fresh_policy_sequences > self.sample_sequences:
-            raise ValueError(
-                "episodic_learning.fresh_policy_sequences cannot exceed "
-                "sample_sequences"
-            )
+            raise ValueError("episodic_learning.fresh_policy_sequences cannot exceed " "sample_sequences")
         _require_int(
             self.burn_in_steps,
             label="episodic_learning.burn_in_steps",
@@ -486,10 +653,7 @@ class EpisodicLearningConfig:
             maximum=1.0,
         )
         if self.per_episode_capacity_bytes > self.replay_capacity_bytes:
-            raise ValueError(
-                "episodic_learning.per_episode_capacity_bytes cannot exceed "
-                "replay_capacity_bytes"
-            )
+            raise ValueError("episodic_learning.per_episode_capacity_bytes cannot exceed " "replay_capacity_bytes")
         for name in (
             "primary_policy_weight",
             "task_value_weight",
@@ -576,14 +740,9 @@ class CurriculumConfig:
             label="curriculum.revival_mechanism",
         )
         if self.revival_mechanism not in {None, ENGINE_REVIVAL_MECHANISM}:
-            raise ValueError(
-                "curriculum.revival_mechanism must be "
-                f"{ENGINE_REVIVAL_MECHANISM!r} or null"
-            )
+            raise ValueError("curriculum.revival_mechanism must be " f"{ENGINE_REVIVAL_MECHANISM!r} or null")
         if self.mode == "standard" and self.revival_mechanism is not None:
-            raise ValueError(
-                "standard curriculum cannot enable an engine revival mechanism"
-            )
+            raise ValueError("standard curriculum cannot enable an engine revival mechanism")
         if self.mode == "standard" and self.revival_budget is not None:
             raise ValueError("standard curriculum cannot set a revival budget")
         if self.mode == "native-revival-preheat" and self.revival_mechanism is None:
@@ -674,9 +833,7 @@ class RuntimeConfig:
                 minimum=0,
             )
         if not isinstance(self.evaluation_liveness_guard_enabled, bool):
-            raise TypeError(
-                "runtime.evaluation_liveness_guard_enabled must be a boolean"
-            )
+            raise TypeError("runtime.evaluation_liveness_guard_enabled must be a boolean")
         for name in (
             "evaluation_steps",
             "early_evaluation_steps",
@@ -694,35 +851,18 @@ class RuntimeConfig:
                     minimum=0,
                 )
                 if step <= previous:
-                    raise ValueError(
-                        f"runtime.{name} must be strictly increasing"
-                    )
+                    raise ValueError(f"runtime.{name} must be strictly increasing")
                 previous = step
         if set(self.early_evaluation_steps) & set(self.evaluation_steps):
-            raise ValueError(
-                "runtime early_evaluation_steps and evaluation_steps must be disjoint"
-            )
-        if set(self.final_audit_steps) & (
-            set(self.early_evaluation_steps) | set(self.evaluation_steps)
-        ):
-            raise ValueError(
-                "runtime final_audit_steps must be disjoint from repeated validation"
-            )
+            raise ValueError("runtime early_evaluation_steps and evaluation_steps must be disjoint")
+        if set(self.final_audit_steps) & (set(self.early_evaluation_steps) | set(self.evaluation_steps)):
+            raise ValueError("runtime final_audit_steps must be disjoint from repeated validation")
         if self.early_evaluation_steps and self.early_evaluation_episodes <= 0:
-            raise ValueError(
-                "runtime early_evaluation_steps require early_evaluation_episodes"
-            )
+            raise ValueError("runtime early_evaluation_steps require early_evaluation_episodes")
         if self.final_audit_steps and self.final_audit_episodes <= 0:
-            raise ValueError(
-                "runtime final_audit_steps require final_audit_episodes"
-            )
-        if (
-            self.evaluation_liveness_guard_enabled
-            and not self.early_evaluation_steps
-        ):
-            raise ValueError(
-                "runtime evaluation liveness guard requires early evaluation gates"
-            )
+            raise ValueError("runtime final_audit_steps require final_audit_episodes")
+        if self.evaluation_liveness_guard_enabled and not self.early_evaluation_steps:
+            raise ValueError("runtime evaluation liveness guard requires early evaluation gates")
         for name in (
             "evaluation_guard_max_confirm_failure_rate",
             "evaluation_guard_max_multi_action_end_turn_rate",
@@ -739,9 +879,7 @@ class RuntimeConfig:
         if not isinstance(self.collector_device, str) or not self.collector_device.strip():
             raise TypeError("runtime.collector_device must be a non-empty string")
         if self.rocm_sdpa_backend not in ("auto", "math"):
-            raise ValueError(
-                "runtime.rocm_sdpa_backend must be 'auto' or 'math'"
-            )
+            raise ValueError("runtime.rocm_sdpa_backend must be 'auto' or 'math'")
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -801,15 +939,10 @@ class DiagnosticsConfig:
             normalized: dict[str, int] = {}
             for raw_identifier, raw_window in raw.items():
                 if not isinstance(raw_identifier, str) or not raw_identifier.strip():
-                    raise TypeError(
-                        f"diagnostics.{name} identifiers must be non-empty strings"
-                    )
+                    raise TypeError(f"diagnostics.{name} identifiers must be non-empty strings")
                 identifier = raw_identifier.strip().upper()
                 if identifier in normalized:
-                    raise ValueError(
-                        f"diagnostics.{name} contains duplicate normalized identifier "
-                        f"{identifier!r}"
-                    )
+                    raise ValueError(f"diagnostics.{name} contains duplicate normalized identifier " f"{identifier!r}")
                 normalized[identifier] = _require_int(
                     raw_window,
                     label=f"diagnostics.{name}[{identifier!r}]",
@@ -829,9 +962,7 @@ class DiagnosticsConfig:
             maximum=1.0,
         )
         if minimum_fraction <= 0.0:
-            raise ValueError(
-                "diagnostics.combat_min_net_hp_fraction must be greater than zero"
-            )
+            raise ValueError("diagnostics.combat_min_net_hp_fraction must be greater than zero")
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,12 +972,9 @@ class TrainingConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
-    transaction_learning: TransactionLearningConfig = field(
-        default_factory=TransactionLearningConfig
-    )
-    episodic_learning: EpisodicLearningConfig = field(
-        default_factory=EpisodicLearningConfig
-    )
+    transaction_learning: TransactionLearningConfig = field(default_factory=TransactionLearningConfig)
+    failure_credit: FailureCreditConfig = field(default_factory=FailureCreditConfig)
+    episodic_learning: EpisodicLearningConfig = field(default_factory=EpisodicLearningConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -864,6 +992,7 @@ class TrainingConfig:
             ("optimization", OptimizationConfig),
             ("rollout", RolloutConfig),
             ("transaction_learning", TransactionLearningConfig),
+            ("failure_credit", FailureCreditConfig),
             ("episodic_learning", EpisodicLearningConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
@@ -880,12 +1009,24 @@ class TrainingConfig:
             raise ValueError("full-run scenarios require objective='act1' or objective='run'")
         if self.episodic_learning.enabled:
             if self.environment.scenario != "full-run":
-                raise ValueError(
-                    "episodic learning requires environment.scenario='full-run'"
-                )
+                raise ValueError("episodic learning requires environment.scenario='full-run'")
             if self.curriculum.reward_objective != "run":
+                raise ValueError("episodic learning requires curriculum.reward_objective='run'")
+        if self.failure_credit.learning_enabled:
+            maximum_replay_contexts = (
+                self.failure_credit.sample_records * self.failure_credit.liveness_maximum_contexts_per_record
+            )
+            required_step_budget = maximum_replay_contexts * self.failure_credit.maximum_context_steps
+            if self.failure_credit.liveness_maximum_replayed_steps_per_update < required_step_budget:
                 raise ValueError(
-                    "episodic learning requires curriculum.reward_objective='run'"
+                    "failure_credit.liveness_maximum_replayed_steps_per_update "
+                    "cannot cover sample_records * maximum contexts * maximum_context_steps"
+                )
+            required_candidate_budget = required_step_budget * self.model.max_candidates
+            if self.failure_credit.liveness_maximum_replayed_candidates_per_update < required_candidate_budget:
+                raise ValueError(
+                    "failure_credit.liveness_maximum_replayed_candidates_per_update "
+                    "cannot cover the configured active candidate capacity"
                 )
         if (
             (
@@ -893,9 +1034,10 @@ class TrainingConfig:
                 or bool(self.rollout.deterministic_probe_environment_steps)
             )
             and not self.transaction_learning.enabled
+            and not self.failure_credit.shadow_enabled
         ):
             raise ValueError(
-                "deterministic liveness probes require transaction learning"
+                "deterministic liveness probes require transaction-v3 or " "formal failure-credit collection"
             )
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
@@ -942,9 +1084,7 @@ class TrainingConfig:
         # Metadata JSON represents immutable tuples as arrays. Canonicalize the
         # new lineage schedule before comparison so a checkpoint written from
         # this exact config can resume without a tuple/list false mismatch.
-        rollout["deterministic_probe_environment_steps"] = list(
-            self.rollout.deterministic_probe_environment_steps
-        )
+        rollout["deterministic_probe_environment_steps"] = list(self.rollout.deterministic_probe_environment_steps)
         runtime = payload["runtime"]
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")
@@ -1049,6 +1189,11 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
             _table(payload, "transaction_learning"),
             label="transaction_learning",
         ),
+        failure_credit=_construct(
+            FailureCreditConfig,
+            _table(payload, "failure_credit"),
+            label="failure_credit",
+        ),
         episodic_learning=_construct(
             EpisodicLearningConfig,
             _table(payload, "episodic_learning"),
@@ -1066,41 +1211,49 @@ def model_initialization_config_from_mapping(
 ) -> TrainingConfig:
     """Interpret one reviewed source-config change for model-only use.
 
-    V11 adds only the replay-view selector ``fresh_policy_sequences``.  A V10
-    checkpoint therefore has an identical network/encoding ABI, and can be
-    evaluated or used as an explicit model-parameter initialization source by
-    filling the new selector with its behavior-preserving disabled value.
+    V12 adds the independent liveness-credit model/loss ABI.  V11 checkpoints
+    can initialize compatible shared parameters only; their missing liveness
+    head is freshly initialized by the reviewed checkpoint overlay.  V10 also
+    predates ``fresh_policy_sequences``, so that field receives its
+    behavior-preserving disabled value before applying the same V12 migration.
 
     This helper is deliberately separate from :func:`training_config_from_mapping`.
-    Exact resume continues to call that strict parser, so a V10 checkpoint can
-    never acquire V11 replay semantics while retaining optimizer, queue, replay,
-    recurrent, RNG, or counter state.
+    Exact resume continues to call that strict parser, so a pre-V12 checkpoint
+    can never acquire V12 liveness semantics while retaining optimizer, queue,
+    replay, recurrent, RNG, or counter state.
     """
 
     source_version = payload.get("version", CONFIG_VERSION)
     if source_version == CONFIG_VERSION:
         return training_config_from_mapping(payload)
-    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V10:
+    if source_version not in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V10,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
+    }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
             f"from {source_version!r} to {CONFIG_VERSION!r}"
         )
-    raw_episodic = payload.get("episodic_learning")
-    if not isinstance(raw_episodic, Mapping):
-        raise ValueError(
-            "reviewed V10 model-initialization config migration requires an "
-            "episodic_learning table"
-        )
-    if "fresh_policy_sequences" in raw_episodic:
-        raise ValueError(
-            "V10 model-initialization config unexpectedly contains "
-            "fresh_policy_sequences"
-        )
     migrated = dict(payload)
-    migrated["episodic_learning"] = {
-        **dict(raw_episodic),
-        "fresh_policy_sequences": 0,
-    }
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V10:
+        raw_episodic = payload.get("episodic_learning")
+        if not isinstance(raw_episodic, Mapping):
+            raise ValueError(
+                "reviewed V10 model-initialization config migration requires " "an episodic_learning table"
+            )
+        if "fresh_policy_sequences" in raw_episodic:
+            raise ValueError("V10 model-initialization config unexpectedly contains " "fresh_policy_sequences")
+        migrated["episodic_learning"] = {
+            **dict(raw_episodic),
+            "fresh_policy_sequences": 0,
+        }
+    if "failure_credit" in payload:
+        raise ValueError("pre-V12 model-initialization config unexpectedly contains a " "failure_credit table")
+    # A legacy checkpoint can provide compatible shared model parameters, but
+    # it cannot claim the new semantic/evidence/replay contract.  The target
+    # experiment may explicitly enable that contract after this migration;
+    # the migrated source identity itself remains disabled.
+    migrated["failure_credit"] = {"mode": "disabled"}
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 
@@ -1144,6 +1297,7 @@ __all__ = [
     "DiagnosticsConfig",
     "EnvironmentConfig",
     "EpisodicLearningConfig",
+    "FailureCreditConfig",
     "ModelConfig",
     "OptimizationConfig",
     "RolloutConfig",

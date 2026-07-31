@@ -19,6 +19,10 @@ from sts2_rl.models import RecurrentCandidateModel
 from .collector import GroundedCollector
 from .config import TrainingConfig
 from .episode_replay import BoundedEpisodicReplay
+from .failure_credit import (
+    BoundedFailureCreditReplay,
+    FailureCreditPipelineConfig,
+)
 from .learner import VTraceLearner
 from .sdpa import (
     SdpaExecutionState,
@@ -39,6 +43,7 @@ class TrainingResources:
     collector: GroundedCollector
     learner: VTraceLearner
     transaction_replay: BoundedTransactionReplay | None
+    failure_credit_replay: BoundedFailureCreditReplay | None
     episodic_replay: BoundedEpisodicReplay | None
     device: torch.device
     sdpa_backend: SdpaExecutionState
@@ -126,9 +131,8 @@ def _build_collector_model(
         collector_model = RecurrentCandidateModel(
             config.model.to_model_config(),
             enable_transaction_heads=config.transaction_learning.enabled,
-        ).to(
-            resolve_device(config.runtime.collector_device)
-        )
+            enable_liveness_head=config.failure_credit.learning_enabled,
+        ).to(resolve_device(config.runtime.collector_device))
         collector_model.load_state_dict(learner_model.state_dict(), strict=True)
     finally:
         torch.set_rng_state(cpu_rng)
@@ -157,14 +161,13 @@ def build_training_resources(
     seed_everything(
         config.runtime.seed,
         seed_accelerators=(
-            device.type == "cuda"
-            or collector_device.type == "cuda"
-            or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+            device.type == "cuda" or collector_device.type == "cuda" or torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
         ),
     )
     model = RecurrentCandidateModel(
         config.model.to_model_config(),
         enable_transaction_heads=config.transaction_learning.enabled,
+        enable_liveness_head=config.failure_credit.learning_enabled,
     ).to(device)
     collector_model = _build_collector_model(config, learner_model=model)
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
@@ -178,6 +181,15 @@ def build_training_resources(
             seed=config.runtime.seed,
         )
         if config.transaction_learning.enabled
+        else None
+    )
+    failure_credit_replay = (
+        BoundedFailureCreditReplay(
+            capacity=config.failure_credit.replay_capacity,
+            byte_capacity=config.failure_credit.replay_byte_capacity,
+            seed=config.runtime.seed,
+        )
+        if config.failure_credit.learning_enabled
         else None
     )
     episodic_replay = (
@@ -222,21 +234,11 @@ def build_training_resources(
             unroll_length=config.rollout.unroll_length,
             deadlock_window=config.diagnostics.deadlock_window,
             deadlock_repeat_threshold=config.diagnostics.deadlock_repeat_threshold,
-            combat_net_progress_window=(
-                config.diagnostics.combat_net_progress_window
-            ),
-            combat_net_progress_room_windows=(
-                config.diagnostics.combat_net_progress_room_windows
-            ),
-            combat_net_progress_encounter_windows=(
-                config.diagnostics.combat_net_progress_encounter_windows
-            ),
-            noncombat_durable_progress_window=(
-                config.diagnostics.noncombat_durable_progress_window
-            ),
-            combat_min_net_hp_fraction=(
-                config.diagnostics.combat_min_net_hp_fraction
-            ),
+            combat_net_progress_window=(config.diagnostics.combat_net_progress_window),
+            combat_net_progress_room_windows=(config.diagnostics.combat_net_progress_room_windows),
+            combat_net_progress_encounter_windows=(config.diagnostics.combat_net_progress_encounter_windows),
+            noncombat_durable_progress_window=(config.diagnostics.noncombat_durable_progress_window),
+            combat_min_net_hp_fraction=(config.diagnostics.combat_min_net_hp_fraction),
             journal_policy_topk=config.diagnostics.journal_policy_topk,
             reward_calculator=reward_calculator,
             # The maintained preheat uses private engine state and injects no
@@ -246,11 +248,28 @@ def build_training_resources(
             training_revival_budget=config.curriculum.revival_budget,
             horizon_as_failure=config.curriculum.mode == "native-revival-preheat",
             transaction_burn_in_steps=(
-                config.transaction_learning.burn_in_steps
-                if config.transaction_learning.enabled
-                else None
+                config.transaction_learning.burn_in_steps if config.transaction_learning.enabled else None
             ),
             episodic_learning_enabled=config.episodic_learning.enabled,
+            failure_credit_shadow_enabled=(config.failure_credit.mode == "shadow"),
+            failure_credit_learning_enabled=(config.failure_credit.learning_enabled),
+            failure_credit_pipeline_config=FailureCreditPipelineConfig(
+                detector_window_steps=max(
+                    config.diagnostics.deadlock_window,
+                    config.diagnostics.combat_net_progress_window,
+                    config.diagnostics.noncombat_durable_progress_window,
+                    *config.diagnostics.combat_net_progress_room_windows.values(),
+                    *config.diagnostics.combat_net_progress_encounter_windows.values(),
+                ),
+                context_burn_in_steps=config.failure_credit.burn_in_steps,
+                learning_tail_steps=(config.failure_credit.maximum_context_steps - config.failure_credit.burn_in_steps),
+                maximum_completion_controls=(
+                    config.failure_credit.maximum_episode_completion_controls
+                ),
+                maximum_completion_bytes=(
+                    config.failure_credit.maximum_episode_completion_bytes
+                ),
+            ),
         )
         learner = VTraceLearner(
             model=model,
@@ -260,6 +279,7 @@ def build_training_resources(
             maximum_unroll_length=config.rollout.unroll_length,
             maximum_policy_lag=config.rollout.max_policy_lag,
             transaction_config=config.transaction_learning,
+            failure_credit_config=config.failure_credit,
             episodic_config=config.episodic_learning,
         )
         return TrainingResources(
@@ -272,6 +292,7 @@ def build_training_resources(
             collector=collector,
             learner=learner,
             transaction_replay=transaction_replay,
+            failure_credit_replay=failure_credit_replay,
             episodic_replay=episodic_replay,
             device=device,
             sdpa_backend=sdpa_backend,

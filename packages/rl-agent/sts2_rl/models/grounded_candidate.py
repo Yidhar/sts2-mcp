@@ -82,13 +82,8 @@ def _require_binding_ids(name: str, value: Tensor) -> None:
 
     if value.dtype not in _INTEGER_DTYPES:
         raise TypeError(f"{name} must use an integer dtype, got {value.dtype}")
-    if value.numel() and (
-        int(value.min().item()) < 0
-        or int(value.max().item()) > _MAX_BINDING_ID
-    ):
-        raise ValueError(
-            f"{name} contains a binding ID outside [0, {_MAX_BINDING_ID}]"
-        )
+    if value.numel() and (int(value.min().item()) < 0 or int(value.max().item()) > _MAX_BINDING_ID):
+        raise ValueError(f"{name} contains a binding ID outside [0, {_MAX_BINDING_ID}]")
 
 
 def _require_same_device(name: str, reference: Tensor, value: Tensor) -> None:
@@ -619,6 +614,15 @@ class RecurrentCandidateOutput:
     candidate_effect_logits: Tensor | None = None  # [B, A, 4]
     selection_delta_logits: Tensor | None = None  # [B, A, 3]
     transaction_q_values: Tensor | None = None  # [B, A]
+    # Bounded factual liveness-risk estimate for every currently legal
+    # candidate.  This is deliberately separate from the task-return Q/value
+    # heads: once an ordinary failure baseline has converged to ``-1``, a
+    # centered candidate risk can still distinguish the action that re-enters
+    # a witnessed loop from an available exit.  Invalid candidates are zero.
+    candidate_liveness_cost_values: Tensor | None = None  # [B, A], [0, 1]
+    # Candidate-independent bounded risk, trained from the formal
+    # liveness-value targets rather than aliasing them onto the candidate Q.
+    liveness_cost_value: Tensor | None = None  # [B], [0, 1]
 
     def validate(self, config: GroundedCandidateConfig) -> tuple[int, int]:
         """Validate the complete model-output ABI and return ``(B, A)``.
@@ -729,6 +733,16 @@ class RecurrentCandidateOutput:
                 self.transaction_q_values,
                 candidate_shape,
             ),
+            (
+                "candidate_liveness_cost_values",
+                self.candidate_liveness_cost_values,
+                candidate_shape,
+            ),
+            (
+                "liveness_cost_value",
+                self.liveness_cost_value,
+                (batch_size,),
+            ),
         ):
             if optional_value is None:
                 continue
@@ -739,6 +753,16 @@ class RecurrentCandidateOutput:
                 self.state_embedding,
                 optional_value,
             )
+        if self.candidate_liveness_cost_values is not None:
+            liveness_cost = self.candidate_liveness_cost_values
+            if bool((self.action_mask & ((liveness_cost < 0.0) | (liveness_cost > 1.0))).any().item()):
+                raise ValueError("output.candidate_liveness_cost_values must be in [0, 1]")
+            if bool((liveness_cost.masked_select(~self.action_mask) != 0.0).any().item()):
+                raise ValueError("output.candidate_liveness_cost_values must be zero on " "invalid candidates")
+        if self.liveness_cost_value is not None and bool(
+            ((self.liveness_cost_value < 0.0) | (self.liveness_cost_value > 1.0)).any().item()
+        ):
+            raise ValueError("output.liveness_cost_value must be in [0, 1]")
 
         return batch_size, action_count
 
@@ -811,9 +835,7 @@ class RecurrentCandidateOutput:
         )
         branch_exp_sum = torch.zeros_like(counts)
         branch_exp_sum.scatter_add_(1, branch_ids, centered_exp)
-        branch_logsumexp = safe_branch_max + torch.log(
-            branch_exp_sum.clamp_min(torch.finfo(logits.dtype).tiny)
-        )
+        branch_logsumexp = safe_branch_max + torch.log(branch_exp_sum.clamp_min(torch.finfo(logits.dtype).tiny))
         branch_logits = branch_logsumexp - torch.log(counts.clamp_min(1.0))
         branch_logits = torch.where(
             branch_mask,
@@ -841,8 +863,7 @@ class RecurrentCandidateOutput:
         )
         joint_log_probabilities = torch.where(
             mask,
-            branch_log_probabilities.gather(1, branch_ids)
-            + within_log_probabilities,
+            branch_log_probabilities.gather(1, branch_ids) + within_log_probabilities,
             torch.full_like(logits, -torch.inf),
         )
         return (
@@ -893,10 +914,7 @@ class RecurrentCandidateOutput:
         _, branch_log_probabilities, _, _ = self._policy_components()
         branch_valid = torch.isfinite(branch_log_probabilities)
         selected_branch = branch_log_probabilities.argmax(dim=-1)
-        in_selected_branch = (
-            self.policy_branch_ids.long()
-            == selected_branch.unsqueeze(-1)
-        ) & self.action_mask.bool()
+        in_selected_branch = (self.policy_branch_ids.long() == selected_branch.unsqueeze(-1)) & self.action_mask.bool()
         candidate_logits = torch.where(
             in_selected_branch,
             self.policy_logits.float(),
@@ -934,9 +952,7 @@ class RecurrentCandidateOutput:
             branch_log_probabilities,
             torch.zeros_like(branch_log_probabilities),
         )
-        branch_entropy = -(
-            branch_probabilities * safe_branch_logs
-        ).sum(dim=-1)
+        branch_entropy = -(branch_probabilities * safe_branch_logs).sum(dim=-1)
 
         within_probabilities = torch.where(
             self.action_mask.bool(),
@@ -960,9 +976,7 @@ class RecurrentCandidateOutput:
             conditional_entropy / torch.log(counts.clamp_min(2.0)),
             torch.zeros_like(conditional_entropy),
         )
-        return branch_entropy + (
-            branch_probabilities * conditional_entropy
-        ).sum(dim=-1)
+        return branch_entropy + (branch_probabilities * conditional_entropy).sum(dim=-1)
 
 
 def _make_transformer_stack(
@@ -1104,12 +1118,16 @@ class RecurrentCandidateModel(nn.Module):
         config: GroundedCandidateConfig | None = None,
         *,
         enable_transaction_heads: bool = False,
+        enable_liveness_head: bool = False,
     ) -> None:
         super().__init__()
         if not isinstance(enable_transaction_heads, bool):
             raise TypeError("enable_transaction_heads must be a boolean")
+        if not isinstance(enable_liveness_head, bool):
+            raise TypeError("enable_liveness_head must be a boolean")
         self.config = config or GroundedCandidateConfig()
         self.transaction_heads_enabled = enable_transaction_heads
+        self.liveness_head_enabled = enable_liveness_head
         cfg = self.config
 
         self.token_embedder = _StructuredTokenEmbedder(cfg)
@@ -1226,6 +1244,12 @@ class RecurrentCandidateModel(nn.Module):
             self.candidate_effect_head = None
             self.selection_delta_head = None
             self.transaction_q_head = None
+        self.candidate_liveness_cost_head: nn.Module | None = (
+            self._bounded_scalar_head(cfg.d_model) if enable_liveness_head else None
+        )
+        self.liveness_cost_value_head: nn.Module | None = (
+            self._bounded_scalar_head(cfg.recurrent_hidden_dim) if enable_liveness_head else None
+        )
 
         nn.init.normal_(self.world_null_token, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_queries, mean=0.0, std=0.02)
@@ -1255,6 +1279,25 @@ class RecurrentCandidateModel(nn.Module):
             nn.GELU(),
             nn.Linear(input_dim, 1),
             nn.Softplus(),
+        )
+
+    @staticmethod
+    def _bounded_scalar_head(input_dim: int) -> nn.Sequential:
+        """Small candidate head for a calibrated probability-like cost.
+
+        A sigmoid gives the learner an explicit, finite ``[0, 1]`` support for
+        factual liveness targets.  The narrower hidden layer keeps this
+        auxiliary head cheap relative to candidate/world attention and avoids
+        turning a credit-repair objective into a model-capacity expansion.
+        """
+
+        hidden_dim = max(16, input_dim // 2)
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
         )
 
     @staticmethod
@@ -1454,9 +1497,7 @@ class RecurrentCandidateModel(nn.Module):
             world_encoding=world_encoding,
         )
         target_exact, target_definition = self._matched_world_contexts(
-            definition_binding_ids=(
-                candidates.target_definition_binding_ids
-            ),
+            definition_binding_ids=(candidates.target_definition_binding_ids),
             relation_binding_ids=candidates.target_relation_binding_ids,
             world_encoding=world_encoding,
         )
@@ -1504,12 +1545,10 @@ class RecurrentCandidateModel(nn.Module):
         relation_valid = relation_binding_ids.unsqueeze(-1) > 1
         definition_valid = definition_binding_ids.unsqueeze(-1) > 1
         relation_match = relation_valid & (
-            relation_binding_ids.unsqueeze(-1)
-            == world_encoding.relation_binding_ids.unsqueeze(1)
+            relation_binding_ids.unsqueeze(-1) == world_encoding.relation_binding_ids.unsqueeze(1)
         )
         definition_match = definition_valid & (
-            definition_binding_ids.unsqueeze(-1)
-            == world_encoding.definition_binding_ids.unsqueeze(1)
+            definition_binding_ids.unsqueeze(-1) == world_encoding.definition_binding_ids.unsqueeze(1)
         )
 
         def _pool(matches: Tensor) -> Tensor:
@@ -1526,6 +1565,7 @@ class RecurrentCandidateModel(nn.Module):
         recurrent_state: Tensor | None = None,
         *,
         validate: bool = True,
+        detach_liveness_shared_features: bool = False,
     ) -> RecurrentCandidateOutput:
         """Run the model, validating untrusted tensor contracts by default.
 
@@ -1535,6 +1575,10 @@ class RecurrentCandidateModel(nn.Module):
         the fail-closed default.
         """
 
+        if not isinstance(detach_liveness_shared_features, bool):
+            raise TypeError("detach_liveness_shared_features must be a boolean")
+        if detach_liveness_shared_features and not self.liveness_head_enabled:
+            raise ValueError("detach_liveness_shared_features requires enabled liveness heads")
         if validate:
             batch.validate(self.config)
         batch_size = int(batch.domain_ids.shape[0])
@@ -1603,6 +1647,19 @@ class RecurrentCandidateModel(nn.Module):
                 0.0,
             )
             transaction_q_values = transaction_q_values.masked_fill(~mask, 0.0)
+        candidate_liveness_cost_values = None
+        liveness_cost_value = None
+        if self.liveness_head_enabled:
+            if self.candidate_liveness_cost_head is None or self.liveness_cost_value_head is None:  # pragma: no cover
+                raise RuntimeError("liveness head configuration is inconsistent")
+            liveness_policy_features = policy_features.detach() if detach_liveness_shared_features else policy_features
+            liveness_recurrent_state = (
+                next_recurrent_state.detach() if detach_liveness_shared_features else next_recurrent_state
+            )
+            candidate_liveness_cost_values = (
+                self.candidate_liveness_cost_head(liveness_policy_features).squeeze(-1).masked_fill(~mask, 0.0)
+            )
+            liveness_cost_value = self.liveness_cost_value_head(liveness_recurrent_state).squeeze(-1)
 
         output = RecurrentCandidateOutput(
             world_latents=world.latents,
@@ -1623,6 +1680,8 @@ class RecurrentCandidateModel(nn.Module):
             candidate_effect_logits=candidate_effect_logits,
             selection_delta_logits=selection_delta_logits,
             transaction_q_values=transaction_q_values,
+            candidate_liveness_cost_values=candidate_liveness_cost_values,
+            liveness_cost_value=liveness_cost_value,
         )
         if validate:
             output.validate(self.config)

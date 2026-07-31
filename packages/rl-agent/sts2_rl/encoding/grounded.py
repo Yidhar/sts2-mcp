@@ -35,6 +35,10 @@ from sts2_rl.models.grounded_candidate import (
     MIN_TOKEN_FEATURE_DIM,
     GroundedCandidateBatch,
 )
+from sts2_rl.semantics.grouping import (
+    strict_action_grouping_contract,
+    strict_action_groups,
+)
 
 from .snapshot import (
     ENCODED_DECISION_SNAPSHOT_VERSION,
@@ -172,42 +176,6 @@ _CANDIDATE_EXCLUDED_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-# A selectable card may be represented by thousands of concrete transport
-# actions even though every player-visible/runtime fact is identical.  The
-# policy must choose between semantic actions, not receive an accidental
-# ``log(copy_count)`` softmax prior from repeated physical instances.
-#
-# Grouping is deliberately much stricter than the model-facing projection:
-# every field in the full legal-action DTO participates unless it is on one of
-# these reviewed identity-only lists.  In particular, an unknown future field
-# is retained and therefore prevents grouping when its value differs.  The
-# raw environment action remains available through :class:`ActionReference`;
-# these exclusions apply only to the semantic group prototype.
-_CARD_SELECTION_EQUIVALENCE_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {"select", "deselect"}
-)
-_CARD_SELECTION_EQUIVALENCE_KINDS: Final[dict[str, str]] = {
-    "select_card": "select",
-    "select_hand_card": "select",
-    "combat_select_card": "select",
-    "select_card_option": "select",
-    "deselect_card": "deselect",
-    "deselect_hand_card": "deselect",
-    "combat_deselect_card": "deselect",
-    "deselect_card_option": "deselect",
-}
-_CARD_SELECTION_ROOT_DISPATCH_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "action_handle",
-        "action_id",
-        "action_index",
-        "card_index",
-        "choice_index",
-        "idx",
-        "index",
-        "option_index",
-    }
-)
 _IDENTITY_KEYS: Final[tuple[str, ...]] = (
     "model_id",
     "entity_id",
@@ -237,13 +205,6 @@ _INSTANCE_KEYS: Final[tuple[str, ...]] = (
     "uuid",
     "uid",
     "combat_id",
-)
-_CARD_SELECTION_CARD_INSTANCE_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "card_instance_id",
-        "instance_id",
-        "instance_uuid",
-    }
 )
 _ROLE_KEYS: Final[tuple[str, ...]] = (
     "kind",
@@ -734,13 +695,13 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V12 admits only the exact native ``upgrade_preview(s)`` factual containers
+# V13 admits only the exact native ``upgrade_preview(s)`` factual containers
 # through the preview firewall and moves unknown future zones into the region
 # above every fixed zone ID.  Tensor shapes and feature slots remain stable,
 # but token presence and zone-embedding semantics change.  Exact resume must
 # therefore fail closed; explicitly reviewed model-parameter initialization is
 # still shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v12"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v13"
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -785,16 +746,7 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "engineered_fragment_exempt_keys": sorted(
             _ENGINEERED_FRAGMENT_EXEMPT_KEYS
         ),
-        "card_selection_equivalence_operations": sorted(
-            _CARD_SELECTION_EQUIVALENCE_OPERATIONS
-        ),
-        "card_selection_equivalence_kinds": _CARD_SELECTION_EQUIVALENCE_KINDS,
-        "card_selection_root_dispatch_keys": sorted(
-            _CARD_SELECTION_ROOT_DISPATCH_KEYS
-        ),
-        "card_selection_card_instance_keys": sorted(
-            _CARD_SELECTION_CARD_INSTANCE_KEYS
-        ),
+        "strict_action_grouping": strict_action_grouping_contract(),
         "identity_keys": list(_IDENTITY_KEYS),
         "instance_keys": list(_INSTANCE_KEYS),
         "role_keys": list(_ROLE_KEYS),
@@ -834,162 +786,6 @@ def _normalize_key(value: Any) -> str:
     # one run.  The normalization is pure and the bounded cache carries no
     # stochastic or checkpoint continuation state.
     return _normalize_key_text(str(value))
-
-
-def _card_selection_equivalence_operation(
-    action: Mapping[str, Any],
-) -> str | None:
-    """Return the reviewed select/deselect operation, or decline grouping.
-
-    Conflicting compatibility views fail safe by leaving the action as a
-    singleton.  The transport translator validates these views separately;
-    the encoder must never merge a malformed action merely because one alias
-    happens to say ``select``.
-    """
-
-    if str(action.get("model_action_kind") or "").strip() != "card_selection":
-        return None
-    reported: list[str] = []
-    for raw in (
-        action.get("selection_operation"),
-        action.get("model_action_variant"),
-    ):
-        if raw is not None and str(raw).strip():
-            reported.append(_normalize_key(raw))
-    nested = action.get("selection")
-    if isinstance(nested, Mapping):
-        raw_nested = nested.get("operation_type", nested.get("selection_operation"))
-        if raw_nested is not None and str(raw_nested).strip():
-            reported.append(_normalize_key(raw_nested))
-    for key in ("kind", "action"):
-        raw_kind = action.get(key)
-        if raw_kind is None:
-            continue
-        mapped = _CARD_SELECTION_EQUIVALENCE_KINDS.get(_normalize_key(raw_kind))
-        if mapped is not None:
-            reported.append(mapped)
-    if not reported:
-        return None
-    operations = set(reported)
-    if len(operations) != 1:
-        return None
-    operation = reported[0]
-    return operation if operation in _CARD_SELECTION_EQUIVALENCE_OPERATIONS else None
-
-
-def _strict_card_selection_value(
-    value: Any,
-    *,
-    path: tuple[str, ...] = (),
-) -> Any:
-    """Copy one action while removing only reviewed physical identity.
-
-    Unlike the model projection this walk retains every unknown field.  New
-    runtime facts therefore make actions unequal by default.  The few removed
-    indexes are positions used solely to dispatch a concrete member of this
-    select/deselect class; all operation, membership, source-zone, card,
-    modifier, lifecycle, and unknown facts remain in the strict payload.
-    """
-
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        parent = _normalize_key(path[-1]) if path else ""
-        inside_sim_raw = bool(path and _normalize_key(path[0]) == "_sim_raw")
-        for raw_key, child in value.items():
-            if not isinstance(raw_key, str):
-                raise TypeError("strict action equivalence requires string mapping keys")
-            key = _normalize_key(raw_key)
-            if not path and key in _CARD_SELECTION_ROOT_DISPATCH_KEYS:
-                continue
-            if inside_sim_raw and len(path) == 1 and key in _CARD_SELECTION_ROOT_DISPATCH_KEYS:
-                continue
-            if parent in {"card", "upgrade_preview"}:
-                if key in _CARD_SELECTION_CARD_INSTANCE_KEYS:
-                    continue
-                if key in {
-                    "card_index",
-                    "choice_index",
-                    "idx",
-                    "index",
-                    "option_index",
-                }:
-                    continue
-            result[raw_key] = _strict_card_selection_value(
-                child,
-                path=(*path, raw_key),
-            )
-        return result
-    if isinstance(value, list | tuple):
-        return [
-            _strict_card_selection_value(item, path=(*path, "item"))
-            for item in value
-        ]
-    if value is None or isinstance(value, str | bool | int | float):
-        return value
-    raise TypeError(
-        "strict action equivalence supports only JSON-compatible values, got "
-        f"{type(value).__name__} at {'.'.join(path) or '<root>'}"
-    )
-
-
-def _strict_card_selection_projection(
-    action: Mapping[str, Any],
-) -> tuple[dict[str, Any], str, str] | None:
-    """Return ``(prototype, canonical JSON, fingerprint)`` when groupable."""
-
-    if _card_selection_equivalence_operation(action) is None:
-        return None
-    try:
-        prototype = _strict_card_selection_value(action)
-        if not isinstance(prototype, dict):  # pragma: no cover - mapping root invariant
-            return None
-        canonical = json.dumps(
-            prototype,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError):
-        # A future non-JSON field is not evidence of equivalence.  Preserve the
-        # action as a singleton instead of dropping it or failing training.
-        return None
-    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return prototype, canonical, fingerprint
-
-
-def _strict_action_groups(
-    legal_actions: Sequence[Mapping[str, Any]],
-) -> tuple[_ActionGroupBuilder, ...]:
-    """Project legal actions to stable first-occurrence semantic groups."""
-
-    groups: list[_ActionGroupBuilder] = []
-    group_by_payload: dict[str, int] = {}
-    for position, action in enumerate(legal_actions):
-        projection = _strict_card_selection_projection(action)
-        if projection is None:
-            groups.append(
-                _ActionGroupBuilder(
-                    prototype=dict(action),
-                    member_positions=[position],
-                    equivalence_fingerprint=None,
-                )
-            )
-            continue
-        prototype, canonical, fingerprint = projection
-        existing = group_by_payload.get(canonical)
-        if existing is not None:
-            groups[existing].member_positions.append(position)
-            continue
-        group_by_payload[canonical] = len(groups)
-        groups.append(
-            _ActionGroupBuilder(
-                prototype=prototype,
-                member_positions=[position],
-                equivalence_fingerprint=fingerprint,
-            )
-        )
-    return tuple(groups)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1128,15 +924,6 @@ class _EntityBindingAllocation:
     relations: dict[tuple[str, bool], int]
     definition_hash_collisions: int
     relation_hash_collisions: int
-
-
-@dataclass(slots=True)
-class _ActionGroupBuilder:
-    """Mutable construction record for one strict semantic action class."""
-
-    prototype: dict[str, Any]
-    member_positions: list[int]
-    equivalence_fingerprint: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3136,7 +2923,10 @@ class GroundedObservationEncoder:
             if not isinstance(action, Mapping):
                 raise TypeError(f"legal action {position} must be a mapping")
             validated_actions.append(action)
-        builders = _strict_action_groups(validated_actions)
+        # ``semantics.grouping`` is the sole grouping authority.  Encoding,
+        # deadlock detection, and action dispatch must never maintain parallel
+        # notions of strict equality.
+        builders = strict_action_groups(validated_actions)
         result: list[SemanticActionGroup] = []
         for group in builders:
             representative_position = group.member_positions[0]

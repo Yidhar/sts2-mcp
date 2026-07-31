@@ -25,16 +25,21 @@ from sts2_rl.training.config import (
     engine_revival_identity,
     load_training_config,
 )
+from sts2_rl.training.launch_contract import (
+    SupervisedLaunchContract,
+    SupervisedLaunchContractError,
+    load_supervised_launch_contract,
+    validate_supervised_runtime_readiness,
+    validate_supervised_source_authority,
+    validate_supervised_trainer_environment,
+)
 from sts2_rl.training.runtime import inspect_baseline, run_training
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m sts2_rl.train",
-        description=(
-            "Train the recurrent legal-candidate V-trace baseline with a "
-            "bounded asynchronous rollout queue."
-        ),
+        description=("Train the recurrent legal-candidate V-trace baseline with a bounded asynchronous rollout queue."),
     )
     parser.add_argument("--profile", default="default", help="built-in TOML profile")
     parser.add_argument("--config", help="additional versioned TOML config")
@@ -63,10 +68,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", help="exact baseline checkpoint directory")
     parser.add_argument(
         "--initialize-from",
-        help=(
-            "compatible atomic checkpoint model for a fresh lineage; "
-            "never exact resume"
-        ),
+        help=("compatible atomic checkpoint model for a fresh lineage; never exact resume"),
+    )
+    parser.add_argument(
+        "--launch-contract",
+        help="absolute immutable supervised-launch contract path",
+    )
+    parser.add_argument(
+        "--launch-contract-sha256",
+        help="expected SHA-256 of --launch-contract; both arguments are required together",
     )
     parser.add_argument(
         "--dry-run",
@@ -100,6 +110,30 @@ def _cli_overrides(config: TrainingConfig, args: argparse.Namespace) -> Training
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if bool(args.launch_contract) != bool(args.launch_contract_sha256):
+        raise SystemExit("--launch-contract and --launch-contract-sha256 must be supplied together")
+    supervised_launch: SupervisedLaunchContract | None = None
+    if args.launch_contract is not None:
+        try:
+            supervised_launch = load_supervised_launch_contract(
+                args.launch_contract,
+                expected_sha256=str(args.launch_contract_sha256),
+            )
+            validate_supervised_trainer_environment(
+                supervised_launch,
+            )
+            # These checks intentionally happen before config loading, backend
+            # construction, run-directory creation, or any training-state
+            # initialization.  The external contract seal binds exact clean
+            # launch commit B while source_authority proves the reviewed
+            # generation-commit-A closure.  Runtime readiness is independent
+            # non-training evidence and is re-opened/re-hashed in this process.
+            validate_supervised_source_authority(supervised_launch)
+            validate_supervised_runtime_readiness(supervised_launch)
+        except SupervisedLaunchContractError as exc:
+            raise SystemExit(f"supervised launch contract failed: {exc}") from exc
+        if not args.initialize_from or args.resume:
+            raise SystemExit("a supervised launch contract requires --initialize-from and forbids --resume")
     config = load_training_config(
         profile=args.profile,
         config_path=args.config,
@@ -115,11 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--sim-identity is only valid for the headless backend")
     runtime_provenance: dict[str, object] = {
         "backend": config.environment.backend,
-        "training_revival": (
-            engine_revival_identity()
-            if config.curriculum.revival_mechanism is not None
-            else None
-        ),
+        "training_revival": (engine_revival_identity() if config.curriculum.revival_mechanism is not None else None),
     }
     if config.environment.backend == "headless":
         try:
@@ -158,9 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_provenance = {
             "backend": "headless",
             "training_revival": (
-                engine_revival_identity()
-                if config.curriculum.revival_mechanism is not None
-                else None
+                engine_revival_identity() if config.curriculum.revival_mechanism is not None else None
             ),
             "simulator_identity": simulator.to_mapping(),
             "simulator_identity_audit_path": str(audit_path),
@@ -185,11 +213,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         resume = resolve_external_input_path(args.resume)
     if args.initialize_from:
         initialization = resolve_external_input_path(args.initialize_from)
+    if supervised_launch is not None:
+        # run_training writes this mapping to run_start and forwards the same
+        # execution provenance to every periodic/final checkpoint.  Do not
+        # rely only on its run_start-only convenience injection: checkpoint
+        # metadata must retain the exact implementation/readiness authority.
+        runtime_provenance["supervised_launch"] = supervised_launch.provenance_mapping()
     final_state = run_training(
         config,
         resume_from=resume,
         initialize_from=initialization,
         runtime_provenance=runtime_provenance,
+        supervised_launch_contract=supervised_launch,
     )
     print(json.dumps({"status": "complete", **asdict(final_state)}, sort_keys=True))
     return 0

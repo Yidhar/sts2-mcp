@@ -68,6 +68,12 @@ _V12_ENCODING = {
     "feature_abi_end": 215,
     "fingerprint_sha256": ("d1bc0220f7aa58e7afacaa83c1fa1ce339b65d58729f651012cd81d5ad4febf3"),
 }
+_V13_ENCODING = {
+    "version": "grounded-relational-runtime-encoding-v13",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": ("ac119f0d1fe0de5c09394e091169f3b7712084bce8a90a9d02be4732f60ce5bf"),
+}
 
 
 class _CombatBackend:
@@ -263,7 +269,7 @@ def _validated_metadata(
         root=tmp_path,
         manifest={},
         metadata={
-            "format": "sts2-recurrent-vtrace-checkpoint-v4",
+            "format": "sts2-recurrent-vtrace-checkpoint-v5",
             "model_config": asdict(config.model.to_model_config()),
             "encoding_contract": encoding,
             "model_state_spec": {},
@@ -300,12 +306,12 @@ def _rewrite_checkpoint_encoding_contract(
     "archived_encoding",
     [_V8_ENCODING, _V9_ENCODING, _V10_ENCODING, _V11_ENCODING],
 )
-def test_only_reviewed_legacy_to_v12_model_initialization_crosses_decision_abi(
+def test_pre_v12_model_initialization_cannot_jump_to_v13(
     tmp_path: Path,
     archived_encoding: dict[str, Any],
 ) -> None:
     config = _config()
-    assert grounding_encoding_identity() == _V12_ENCODING
+    assert grounding_encoding_identity() == _V13_ENCODING
     archived = _validated_metadata(
         tmp_path,
         config=config,
@@ -320,13 +326,14 @@ def test_only_reviewed_legacy_to_v12_model_initialization_crosses_decision_abi(
             resolved_collector_device=None,
             model_only=False,
         )
-    checkpointing_module._validate_metadata(
-        archived,
-        config=config,
-        resolved_device=None,
-        resolved_collector_device=None,
-        model_only=True,
-    )
+    with pytest.raises(ValueError, match="no reviewed.*initialization migration"):
+        checkpointing_module._validate_metadata(
+            archived,
+            config=config,
+            resolved_device=None,
+            resolved_collector_device=None,
+            model_only=True,
+        )
 
     unknown_shape_compatible = _validated_metadata(
         tmp_path,
@@ -343,7 +350,7 @@ def test_only_reviewed_legacy_to_v12_model_initialization_crosses_decision_abi(
         )
 
 
-def test_v9_observation_v2_initialization_inherits_only_model_parameters(
+def test_reviewed_v12_to_v13_initialization_inherits_only_model_parameters(
     tmp_path: Path,
 ) -> None:
     config = _config()
@@ -392,7 +399,7 @@ def test_v9_observation_v2_initialization_inherits_only_model_parameters(
 
     _rewrite_checkpoint_encoding_contract(
         checkpoint,
-        encoding_contract=_V9_ENCODING,
+        encoding_contract=_V12_ENCODING,
     )
     with pytest.raises(ValueError, match="encoding contract does not match"):
         preflight_training_checkpoint(
@@ -460,7 +467,7 @@ def test_v9_observation_v2_initialization_inherits_only_model_parameters(
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["encoding_contract"] == _V12_ENCODING
+        assert metadata["encoding_contract"] == _V13_ENCODING
         assert metadata["training_state"] == asdict(TrainingState())
         provenance = metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"

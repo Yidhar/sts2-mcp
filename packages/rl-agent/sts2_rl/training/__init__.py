@@ -26,6 +26,7 @@ from .config import (
     DiagnosticsConfig,
     EnvironmentConfig,
     EpisodicLearningConfig,
+    FailureCreditConfig,
     ModelConfig,
     OptimizationConfig,
     RolloutConfig,
@@ -55,7 +56,16 @@ from .factory import (
     resolve_device,
     seed_everything,
 )
-from .learner import LearnerMetrics, VTraceLearner
+from .learner import (
+    LearnerMetrics,
+    LivenessCreditLosses,
+    LivenessLabelManifest,
+    LivenessLabelRow,
+    LivenessReplayWork,
+    VTraceLearner,
+    compile_liveness_label_manifest,
+    liveness_credit_losses,
+)
 from .pipeline import ActorLearnerPipeline
 from .runtime import (
     evaluate_policy,
@@ -100,9 +110,14 @@ __all__ = [
     "EpisodicReplaySampleDiagnostics",
     "EvaluationGateState",
     "FactualTransactionPolicyTarget",
+    "FailureCreditConfig",
     "GroundedCollector",
     "HorizonTargets",
     "LearnerMetrics",
+    "LivenessCreditLosses",
+    "LivenessLabelManifest",
+    "LivenessLabelRow",
+    "LivenessReplayWork",
     "ModelConfig",
     "ObservedTransactionPair",
     "OptimizationConfig",
@@ -125,6 +140,7 @@ __all__ = [
     "build_backend",
     "build_training_resources",
     "checkpoint_summary",
+    "compile_liveness_label_manifest",
     "engine_revival_identity",
     "evaluate_policy",
     "evaluation_gate_state_from_metadata",
@@ -132,6 +148,7 @@ __all__ = [
     "factual_transaction_policy_targets",
     "initialize_model_from_checkpoint",
     "inspect_baseline",
+    "liveness_credit_losses",
     "load_training_checkpoint",
     "load_training_config",
     "observed_outcome_pairs",
