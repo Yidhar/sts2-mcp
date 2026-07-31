@@ -15,14 +15,18 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_ROOT = PACKAGE_ROOT.parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v29_failure_credit_v4.py"
-SPEC = importlib.util.spec_from_file_location(
-    "v29_supervised_launcher",
-    SCRIPT,
-)
-assert SPEC is not None and SPEC.loader is not None
-launcher = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = launcher
-SPEC.loader.exec_module(launcher)
+
+
+def _load_launcher_module(name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+launcher = _load_launcher_module("v29_supervised_launcher")
 
 ABI = launcher._expected_abi_contract()
 TEST_RUN_ID = "44444444-4444-4444-8444-444444444444"
@@ -618,15 +622,19 @@ def test_current_runtime_exposes_full_v29_abi() -> None:
     reason="formal shadow integration uses the reviewed WSL artifact root",
 )
 def test_formal_shadow_contract_matches_current_reports_and_code() -> None:
-    paths = launcher.validate_layout(launcher.default_paths())
-    proof = launcher._validate_shadow_contract(paths)
+    # The synthetic unit-test authority above deliberately replaces seal
+    # constants on ``launcher``.  Formal integration must instead validate
+    # the immutable constants embedded in the tracked launcher itself.
+    formal_launcher = _load_launcher_module("v29_supervised_launcher_formal")
+    paths = formal_launcher.validate_layout(formal_launcher.default_paths())
+    proof = formal_launcher._validate_shadow_contract(paths)
 
-    assert proof["contract"]["schema_version"] == launcher.SHADOW_CONTRACT_SCHEMA
-    assert proof["contract"]["sha256"] == launcher.SHADOW_CONTRACT_SHA256
-    assert len(proof["validated_code_sha256"]) == launcher.SHADOW_VALIDATED_CODE_COUNT
+    assert proof["contract"]["schema_version"] == formal_launcher.SHADOW_CONTRACT_SCHEMA
+    assert proof["contract"]["sha256"] == formal_launcher.SHADOW_CONTRACT_SHA256
+    assert len(proof["validated_code_sha256"]) == formal_launcher.SHADOW_VALIDATED_CODE_COUNT
     assert proof["generation_source"]["worktree_clean"] is True
     evidence = proof["reports"]["evidence_live"]
-    assert evidence["sha256"] == launcher.EVIDENCE_SHADOW_SHA256
+    assert evidence["sha256"] == formal_launcher.EVIDENCE_SHADOW_SHA256
     assert evidence["decisions"] >= 1_000
     assert evidence["semantic_censored_transitions"] == 0
     assert evidence["prefer_targets"] == 0
@@ -634,7 +642,7 @@ def test_formal_shadow_contract_matches_current_reports_and_code() -> None:
     assert evidence["completion_staging_is_bounded"] is True
     assert 0 <= evidence["maximum_episode_completion_storage_nbytes"] <= 134_217_728
     actor = proof["reports"]["evidence_actor"]
-    assert actor["sha256"] == launcher.ACTOR_EVIDENCE_SHADOW_SHA256
+    assert actor["sha256"] == formal_launcher.ACTOR_EVIDENCE_SHADOW_SHA256
     assert actor["cases"] == 6
     assert actor["actor_actionable_records"] == 4
     assert actor["risk_sequence_records"] == 5
