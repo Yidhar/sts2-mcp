@@ -95,16 +95,16 @@ FAILURE_CREDIT_REPLAY_V4 = "sts2-failure-evidence-replay-v4"
 TRAINING_PIPELINE_V7 = "bounded-fifo-async-vtrace-failure-credit-v4-v7"
 SHADOW_CONTRACT_SCHEMA = "sts2-shadow-validation-contract-v3"
 SHADOW_CONTRACT_RELATIVE = Path("contracts/shadow-validation/v29-failure-credit-v4-bootstrap.json")
-SHADOW_CONTRACT_SHA256 = "629e0b1769d1a3ed62d9e0d0c6ef0626342579b7513fccc4240a76ca92bdb321"
-SEMANTICS_SHADOW_SHA256 = "3d17efaaf57c365765f8896106fb1428bb58911e2d68092a08a692c04738b577"
-EVIDENCE_SHADOW_SHA256 = "454497b68ff5980db7402fa38fa72839acc4145eb213a20df3ab618c0fb85a98"
-ACTOR_EVIDENCE_SHADOW_SHA256 = "5359a0ac426f62b0ff8335bbf259116393d5a9f9ea018e5f83038f8c710b952b"
-SHADOW_VALIDATED_CODE_COUNT = 37
-SHADOW_VALIDATED_CODE_MAPPING_SHA256 = "e5b20d80dc63a32a96db863d98ebac61e90a113e607c9808dbe0a9e23f5fb7f1"
+SHADOW_CONTRACT_SHA256 = "14714ded0bf29ad0870f86ae09e00d16a07e3bbb3f6a132041bc694b5ca1b486"
+SEMANTICS_SHADOW_SHA256 = "7e9cd8f36a1c9cc7801ed57fe08a90c2f5ca5e07b52a7cf86e27bb97a64ed15c"
+EVIDENCE_SHADOW_SHA256 = "aa10e4ee6511417590017db3cf307250d01a53f6118ec733cbf80a13f2ac47d8"
+ACTOR_EVIDENCE_SHADOW_SHA256 = "781629162663b5be52fbcdc05bebbc4c3d9e30019547fcbd8c25cac4f7492bb7"
+SHADOW_VALIDATED_CODE_COUNT = 48
+SHADOW_VALIDATED_CODE_MAPPING_SHA256 = "bde478f0bec0930c20a1c08f04cc59e93f2bd92a11ee65d2157bd1f848defa0f"
 # Updated together with the formal shadow contract after the final report set
 # is frozen.  It authenticates the path-independent proof embedded in every
 # supervised launch manifest, so lifecycle reads never need mutable reports.
-SHADOW_AUTHORITY_SHA256 = "b902fbc818f9baff58315dfe1ca4a8f50bf9a7cb31eb8c98f8b02190805b292a"
+SHADOW_AUTHORITY_SHA256 = "14cf8ed73ff85b46064ea428b6461cb12dbcec666254d57152ae47ba6e44f7f2"
 RUNTIME_READINESS_REPORT_SCHEMA = "sts2-liveness-head-active-shape-stress-v3"
 FORMAL_REPORT_GENERATION_SOURCE_SCHEMA = "sts2-formal-report-generation-source-v1"
 FORMAL_REPORT_VALIDATORS = {
@@ -117,7 +117,7 @@ RUNTIME_READINESS_EVIDENCE_SCHEMA = "sts2-runtime-readiness-evidence-v1"
 RUNTIME_READINESS_REPORT_RELATIVE = Path(
     "reports/failure-credit-v4/liveness-head-stress-v29.json",
 )
-RUNTIME_READINESS_REPORT_SHA256 = "d4e714ef6d5286b1cbb43da7959da2fbe635bdbab3a3a0f8da04aae7becdac6f"
+RUNTIME_READINESS_REPORT_SHA256 = "73733771936b08844e68ed6745d0f5c00b38b2d7f6e98289d44f01af7a05eba3"
 SOURCE_AUTHORITY_SCHEMA = "sts2-two-phase-source-authority-v1"
 EXTERNAL_SEAL_SCHEMA = "sts2-external-launch-contract-seal-v1"
 REVIEWED_SEAL_PATHS = (
