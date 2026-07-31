@@ -334,6 +334,46 @@ def _verify_args(fixture: dict[str, Any], plan_path: Path, shadow_path: Path) ->
     )
 
 
+def test_load_runtime_identity_invokes_venv_entry_not_resolved_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout_root = tmp_path / "checkout"
+    (checkout_root / "packages/rl-agent").mkdir(parents=True)
+    artifact_root = tmp_path / "artifacts"
+    system_python = tmp_path / "system" / "python"
+    system_python.parent.mkdir()
+    system_python.write_bytes(b"")
+    venv_python = artifact_root / "environments/wsl-rocm/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(system_python)
+    assert venv_python.resolve() == system_python.resolve()
+
+    observed_command: tuple[str, ...] | None = None
+
+    def fake_run(command: tuple[str, ...], **_: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal observed_command
+        observed_command = command
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(_runtime_identity()),
+            stderr="",
+        )
+
+    monkeypatch.setattr(seal.subprocess, "run", fake_run)
+    identity = seal._load_runtime_identity(
+        argparse.Namespace(runtime_identity_json=None, runtime_python=None),
+        checkout_root=checkout_root,
+        artifact_root=artifact_root,
+    )
+
+    assert identity == _runtime_identity()
+    assert observed_command is not None
+    assert Path(observed_command[0]) == venv_python.absolute()
+    assert Path(observed_command[0]) != system_python.resolve()
+
+
 def test_prepare_is_deterministic_non_launching_and_verify_accepts_exact_two_phase(
     authority_fixture: dict[str, Any],
 ) -> None:

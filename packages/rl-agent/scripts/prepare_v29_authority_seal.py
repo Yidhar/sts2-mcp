@@ -733,10 +733,15 @@ def _load_runtime_identity(args: argparse.Namespace, *, checkout_root: Path, art
             _load_json(Path(identity_path).expanduser().resolve(), label="live runtime identity"),
             label="live runtime identity",
         )
+    # Do not resolve the interpreter symlink: resolving
+    # ``.../wsl-rocm/bin/python`` to ``/usr/bin/python`` discards the virtual
+    # environment's ``pyvenv.cfg`` and therefore queries the wrong runtime.
+    # ``absolute()`` normalizes the lexical path while preserving the venv
+    # entry point that was explicitly reviewed.
     python_path = (
-        Path(runtime_python).expanduser().resolve()
+        Path(runtime_python).expanduser().absolute()
         if runtime_python
-        else (artifact_root / "environments/wsl-rocm/bin/python").resolve()
+        else (artifact_root / "environments/wsl-rocm/bin/python").absolute()
     )
     if not python_path.is_file():
         raise SealError("live runtime identity is required; supply --runtime-identity-json or a valid --runtime-python")
