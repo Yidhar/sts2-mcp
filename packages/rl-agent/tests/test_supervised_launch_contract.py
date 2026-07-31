@@ -45,7 +45,8 @@ def _trainer_environment() -> dict[str, str]:
         "MKL_NUM_THREADS": "4",
         "OPENBLAS_NUM_THREADS": "4",
         "NUMEXPR_NUM_THREADS": "4",
-        "PATH": "/tmp/venv/bin:/usr/bin",
+        "LC_CTYPE": "C.UTF-8",
+        "PATH": "/tmp/venv/bin:/usr/bin:/bin",
     }
 
 

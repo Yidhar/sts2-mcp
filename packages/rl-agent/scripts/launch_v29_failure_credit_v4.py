@@ -141,6 +141,37 @@ REQUIRED_SHADOW_CODE_PATHS = frozenset(
 )
 TERMINAL_STATUSES = frozenset({"completed", "interrupted", "failed"})
 
+# v29 deliberately does not inherit the launcher's ambient environment.  This
+# is a process-boundary ABI: preflight, the detached supervisor, the bootstrap
+# and the exec'd trainer must all observe this exact key set.  In particular,
+# explicitly setting ``LC_CTYPE`` prevents CPython's locale coercion from
+# adding it after ``execve(2)`` and thereby changing the trainer-side digest.
+_V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS = (
+    "STS2_ARTIFACT_ROOT",
+    "PYTHONPATH",
+    "PYTHONNOUSERSITE",
+    "PYTHONUNBUFFERED",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "LC_CTYPE",
+    "PATH",
+)
+_V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS = (
+    "PYTHONHOME",
+    "VENV_DIR",
+    "STS2_HEADLESS_SIM_EXE",
+)
+_V29_HERMETIC_SYSTEM_PATH = (
+    "/usr/bin",
+    "/bin",
+)
+HERMETIC_RUNTIME_PROBE_SCHEMA = "sts2-v29-hermetic-runtime-probe-v1"
+HERMETIC_RUNTIME_PROBE_ACTION = "_runtime-probe"
+HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS = 180.0
+HERMETIC_RUNTIME_PROBE_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
 
 class LaunchError(RuntimeError):
     """The reviewed v29 launch contract could not be proven."""
@@ -191,31 +222,72 @@ class _V29PreflightNamespace:
         *,
         base_environment: dict[str, str] | None = None,
     ) -> dict[str, str]:
-        """Build the reviewed environment without duplicating the venv PATH.
+        """Build the v29-only hermetic trainer environment.
 
-        The detached supervisor inherits the launcher's already-reviewed
-        environment and then re-runs preflight.  The v28 helper always
-        prepends the virtual-environment directory, so calling it naively in
-        both processes would change PATH on the second pass.  Normalize only
-        repeated leading copies before delegating, making the v29 reproof
-        idempotent while preserving the rest of the exact ambient environment.
+        ``base_environment`` remains in the compatibility surface so tests and
+        lifecycle callers can prove independence from two different ambient
+        processes.  Its contents are intentionally never copied.  v28 keeps
+        its historical ambient-overlay behavior in the common preflight.
         """
 
-        environment = dict(os.environ if base_environment is None else base_environment)
-        venv_bin = os.fspath(paths.venv_python.parent)
-        path_parts = environment.get("PATH", "").split(os.pathsep)
-        while path_parts and os.path.normpath(path_parts[0]) == os.path.normpath(
-            venv_bin,
-        ):
-            path_parts.pop(0)
-        environment["PATH"] = os.pathsep.join(path_parts)
-        return _common_preflight.build_trainer_environment(
-            paths,
-            base_environment=environment,
-        )
+        del base_environment
+        return {
+            "STS2_ARTIFACT_ROOT": os.fspath(paths.artifact_root),
+            "PYTHONPATH": os.fspath(paths.package_root),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "OMP_NUM_THREADS": "4",
+            "MKL_NUM_THREADS": "4",
+            "OPENBLAS_NUM_THREADS": "4",
+            "NUMEXPR_NUM_THREADS": "4",
+            "LC_CTYPE": "C.UTF-8",
+            "PATH": os.pathsep.join(
+                (
+                    os.fspath(paths.venv_python.parent),
+                    *_V29_HERMETIC_SYSTEM_PATH,
+                )
+            ),
+        }
 
-    validate_trainer_environment = staticmethod(_common_preflight.validate_trainer_environment)
-    trainer_environment_contract = staticmethod(_common_preflight.trainer_environment_contract)
+    @classmethod
+    def validate_trainer_environment(
+        cls,
+        environment: dict[str, str],
+        *,
+        paths: _common_preflight.PreflightPaths,
+    ) -> dict[str, str]:
+        expected = cls.build_trainer_environment(paths)
+        actual_keys = set(environment)
+        expected_keys = set(_V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+        if actual_keys != expected_keys:
+            raise PreflightError(
+                "v29 hermetic trainer environment keys changed: "
+                f"missing={sorted(expected_keys - actual_keys)} "
+                f"extra={sorted(actual_keys - expected_keys)}"
+            )
+        if environment != expected:
+            changed = sorted(key for key in _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS if environment[key] != expected[key])
+            raise PreflightError("v29 hermetic trainer environment values changed: " + ", ".join(changed))
+        return environment
+
+    @staticmethod
+    def trainer_environment_contract(
+        environment: dict[str, str],
+    ) -> dict[str, Any]:
+        actual_keys = set(environment)
+        expected_keys = set(_V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+        if actual_keys != expected_keys:
+            raise PreflightError(
+                "v29 hermetic trainer environment contract keys changed: "
+                f"missing={sorted(expected_keys - actual_keys)} "
+                f"extra={sorted(actual_keys - expected_keys)}"
+            )
+        return {
+            "set": {key: environment[key] for key in _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS},
+            "unset": list(
+                _V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS,
+            ),
+        }
 
     @staticmethod
     def build_trainer_command(
@@ -579,21 +651,21 @@ def _environment_from_contract(contract: Mapping[str, Any]) -> dict[str, str]:
         raise LaunchError("reviewed trainer environment has a malformed set contract")
     if not isinstance(raw_unset, list) or not all(isinstance(item, str) for item in raw_unset):
         raise LaunchError("reviewed trainer environment has a malformed unset contract")
-    if set(raw_set) != set(_common_preflight._REVIEWED_TRAINER_ENVIRONMENT_KEYS):
+    if set(raw_set) != set(_V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS):
         raise LaunchError(
             "reviewed trainer environment set keys changed",
         )
-    if raw_unset != list(_common_preflight._REMOVED_TRAINER_ENVIRONMENT_KEYS):
+    if raw_unset != list(_V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS):
         raise LaunchError(
             "reviewed trainer environment unset keys changed or reordered",
         )
     if set(raw_set) & set(raw_unset):
         raise LaunchError("reviewed trainer environment sets and unsets the same key")
-    environment = dict(os.environ)
-    for key in raw_unset:
-        environment.pop(key, None)
-    environment.update({str(key): str(value) for key, value in raw_set.items()})
-    return environment
+    # Never reconstruct a reviewed process environment by overlaying it onto
+    # this invocation's ambient state.  Preflight and start are intentionally
+    # allowed to be separate processes; the contract itself is the complete
+    # environment passed to supervisor/bootstrap/trainer.
+    return {key: str(raw_set[key]) for key in _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS}
 
 
 def _exact_trainer_environment_payload(
@@ -603,20 +675,18 @@ def _exact_trainer_environment_payload(
 
     if not all(isinstance(key, str) and isinstance(value, str) for key, value in environment.items()):
         raise LaunchError("trainer environment contains non-text entries")
-    missing = [key for key in _common_preflight._REVIEWED_TRAINER_ENVIRONMENT_KEYS if key not in environment]
-    if missing:
+    actual_keys = set(environment)
+    expected_keys = set(_V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+    if actual_keys != expected_keys:
         raise LaunchError(
-            "trainer environment is missing reviewed keys: " + ", ".join(missing),
-        )
-    retained = [key for key in _common_preflight._REMOVED_TRAINER_ENVIRONMENT_KEYS if key in environment]
-    if retained:
-        raise LaunchError(
-            "trainer environment retained forbidden keys: " + ", ".join(retained),
+            "trainer environment is not the exact v29 hermetic set: "
+            f"missing={sorted(expected_keys - actual_keys)} "
+            f"extra={sorted(actual_keys - expected_keys)}",
         )
     return {
-        "set": dict(environment),
+        "set": {key: environment[key] for key in _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS},
         "unset": list(
-            _common_preflight._REMOVED_TRAINER_ENVIRONMENT_KEYS,
+            _V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS,
         ),
     }
 
@@ -2107,7 +2177,101 @@ def _preflight_model_initialization_migration(
         resources.close()
 
 
-def _verify_runtime_inputs(paths: PreflightPaths) -> dict[str, Any]:
+def _hermetic_runtime_probe_command(
+    paths: PreflightPaths,
+) -> tuple[str, ...]:
+    """Return the only command allowed to produce v29 runtime proof."""
+
+    launcher = (paths.package_root / "scripts/launch_v29_failure_credit_v4.py").resolve(strict=False)
+    return (
+        os.fspath(paths.venv_python),
+        os.fspath(launcher),
+        HERMETIC_RUNTIME_PROBE_ACTION,
+    )
+
+
+def _runtime_probe_result_mapping(
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "runtime_identity": runtime.get("runtime_identity"),
+        "simulator": runtime.get("simulator"),
+        "runtime_mechanics": runtime.get("runtime_mechanics"),
+        "training_revival": runtime.get("training_revival"),
+    }
+
+
+def _validate_hermetic_runtime_probe_payload(
+    payload: Mapping[str, Any],
+    *,
+    paths: PreflightPaths,
+    trainer_environment_sha256: str,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "probe_command",
+        "timeout_seconds",
+        "trainer_environment_sha256",
+        "result_sha256",
+        "torch_version",
+        "device_name",
+        "runtime_identity",
+        "simulator",
+        "runtime_mechanics",
+        "training_revival",
+    }
+    if set(payload) != expected_fields:
+        raise LaunchError(
+            "hermetic runtime probe fields changed: "
+            f"missing={sorted(expected_fields - set(payload))} "
+            f"extra={sorted(set(payload) - expected_fields)}"
+        )
+    if payload.get("schema_version") != HERMETIC_RUNTIME_PROBE_SCHEMA:
+        raise LaunchError("hermetic runtime probe schema changed")
+    command = payload.get("probe_command")
+    if not isinstance(command, list) or command != list(_hermetic_runtime_probe_command(paths)):
+        raise LaunchError("hermetic runtime probe command changed")
+    if payload.get("timeout_seconds") != HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS:
+        raise LaunchError("hermetic runtime probe timeout changed")
+    if payload.get("trainer_environment_sha256") != trainer_environment_sha256:
+        raise LaunchError("hermetic runtime probe environment binding changed")
+    runtime_identity = payload.get("runtime_identity")
+    simulator = payload.get("simulator")
+    mechanics = payload.get("runtime_mechanics")
+    revival = payload.get("training_revival")
+    if not isinstance(runtime_identity, Mapping):
+        raise LaunchError("hermetic runtime probe has no ROCm runtime identity")
+    accelerator = runtime_identity.get("accelerator")
+    if (
+        not isinstance(accelerator, Mapping)
+        or payload.get("torch_version") != runtime_identity.get("torch_version")
+        or payload.get("device_name") != accelerator.get("name")
+    ):
+        raise LaunchError("hermetic runtime probe ROCm summary changed")
+    if not isinstance(simulator, Mapping):
+        raise LaunchError("hermetic runtime probe has no verified HeadlessSim identity")
+    if (
+        not isinstance(mechanics, Mapping)
+        or mechanics.get("schema") != "sts2-runtime-mechanics-audit-v1"
+        or mechanics.get("runtime_event_checked") is not True
+        or mechanics.get("runtime_combat_checked") is not True
+    ):
+        raise LaunchError("hermetic runtime probe mechanics gate is incomplete")
+    if not isinstance(revival, Mapping):
+        raise LaunchError("hermetic runtime probe has no revival identity")
+    result_sha256 = payload.get("result_sha256")
+    if (
+        not isinstance(result_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+        or result_sha256 != _canonical_json_sha256(_runtime_probe_result_mapping(payload))
+    ):
+        raise LaunchError("hermetic runtime probe result digest changed")
+    return dict(payload)
+
+
+def _execute_hermetic_runtime_probe(paths: PreflightPaths) -> dict[str, Any]:
+    """Execute the fixed runtime gate inside an already-hermetic process."""
+
     from sts2_rl.runtime_mechanics import (
         run_runtime_mechanics_preflight,
     )
@@ -2115,15 +2279,30 @@ def _verify_runtime_inputs(paths: PreflightPaths) -> dict[str, Any]:
     from sts2_rl.training.config import engine_revival_identity
     from sts2_rl.training.launch_contract import current_rocm_runtime_identity
 
-    runtime_identity = current_rocm_runtime_identity()
-    simulator = verify_headless_simulator(
-        paths.simulator_executable,
-        identity_path=paths.simulator_identity,
-    )
-    runtime_mechanics = run_runtime_mechanics_preflight(
-        simulator.executable,
-    )
-    return {
+    environment = dict(os.environ)
+    try:
+        v29_preflight.validate_trainer_environment(
+            environment,
+            paths=paths,
+        )
+        environment_sha256 = _exact_trainer_environment_sha256(environment)
+        runtime_identity = current_rocm_runtime_identity()
+        simulator = verify_headless_simulator(
+            paths.simulator_executable,
+            identity_path=paths.simulator_identity,
+        )
+        runtime_mechanics = run_runtime_mechanics_preflight(
+            simulator.executable,
+        )
+    except LaunchError:
+        raise
+    except Exception as exc:
+        raise LaunchError(f"fixed hermetic runtime probe failed: {type(exc).__name__}: {exc}") from exc
+    runtime: dict[str, Any] = {
+        "schema_version": HERMETIC_RUNTIME_PROBE_SCHEMA,
+        "probe_command": list(_hermetic_runtime_probe_command(paths)),
+        "timeout_seconds": HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        "trainer_environment_sha256": environment_sha256,
         "torch_version": runtime_identity["torch_version"],
         "device_name": runtime_identity["accelerator"]["name"],
         "runtime_identity": runtime_identity,
@@ -2131,6 +2310,314 @@ def _verify_runtime_inputs(paths: PreflightPaths) -> dict[str, Any]:
         "runtime_mechanics": runtime_mechanics,
         "training_revival": engine_revival_identity(),
     }
+    runtime["result_sha256"] = _canonical_json_sha256(_runtime_probe_result_mapping(runtime))
+    return _validate_hermetic_runtime_probe_payload(
+        runtime,
+        paths=paths,
+        trainer_environment_sha256=environment_sha256,
+    )
+
+
+def _verify_runtime_inputs(
+    paths: PreflightPaths,
+    *,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Run the fixed production probe in a bounded hermetic subprocess."""
+
+    v29_preflight.validate_trainer_environment(
+        environment,
+        paths=paths,
+    )
+    environment_sha256 = _exact_trainer_environment_sha256(environment)
+    command = _hermetic_runtime_probe_command(paths)
+    returncode, stdout_raw, stderr_raw = _run_bounded_runtime_probe_process(
+        command,
+        cwd=paths.package_root,
+        environment=environment,
+        timeout_seconds=HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        maximum_output_bytes=HERMETIC_RUNTIME_PROBE_MAX_OUTPUT_BYTES,
+    )
+    if returncode != 0:
+        diagnostic = (
+            (stderr_raw or stdout_raw)
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
+            .strip()
+        )
+        raise LaunchError(f"fixed hermetic runtime probe failed ({returncode}): {diagnostic[-4000:]}")
+    try:
+        payload = json.loads(stdout_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LaunchError("fixed hermetic runtime probe returned malformed JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise LaunchError("fixed hermetic runtime probe result is not an object")
+    return _validate_hermetic_runtime_probe_payload(
+        payload,
+        paths=paths,
+        trainer_environment_sha256=environment_sha256,
+    )
+
+
+def _runtime_probe_live_group_members(
+    process_group_id: int,
+) -> tuple[int, ...]:
+    """Return non-zombie Linux processes that still belong to ``pgrp``.
+
+    The probe leader is deliberately left unreaped while this function is
+    used, so its PID (and therefore the newly-created process-group ID) cannot
+    be reused between inspection and ``killpg(2)``.  ``killpg(..., 0)`` is not
+    sufficient here because a zombie-only group still exists in the kernel
+    even though it has no process that can execute or retain resources.
+    """
+
+    if os.name != "posix" or not Path("/proc").is_dir():
+        return ()
+    members: list[int] = []
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        raise LaunchError("cannot enumerate fixed runtime probe process group") from exc
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            # The process disappeared between /proc enumeration and read.
+            continue
+        except OSError as exc:
+            raise LaunchError(
+                "cannot inspect fixed runtime probe process group member",
+            ) from exc
+        # /proc/<pid>/stat field 2 is parenthesised and may itself contain
+        # spaces or ')'.  Everything after the final ')' starts with fields
+        # 3=state, 4=ppid and 5=pgrp.
+        _separator, found, suffix = stat.rpartition(")")
+        fields = suffix.strip().split() if found else []
+        if len(fields) < 3:
+            raise LaunchError("malformed /proc stat while inspecting runtime probe group")
+        state = fields[0]
+        try:
+            member_group_id = int(fields[2])
+        except ValueError as exc:
+            raise LaunchError("malformed process group in runtime probe /proc stat") from exc
+        if member_group_id == process_group_id and state != "Z":
+            members.append(int(entry.name))
+    return tuple(sorted(members))
+
+
+def _runtime_probe_group_exists(process_group_id: int) -> bool:
+    """Compatibility predicate meaning the group has a *live* member."""
+
+    return bool(_runtime_probe_live_group_members(process_group_id))
+
+
+def _signal_runtime_probe_group(
+    process_group_id: int,
+    signal_number: int,
+) -> None:
+    """Signal an unreaped probe group, accepting a concurrent clean exit."""
+
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise LaunchError("cannot signal fixed runtime probe process group") from exc
+
+
+def _wait_for_no_live_runtime_probe_group_members(
+    process_group_id: int,
+    *,
+    timeout_seconds: float,
+) -> tuple[int, ...]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        members = _runtime_probe_live_group_members(process_group_id)
+        if not members or time.monotonic() >= deadline:
+            return members
+        time.sleep(0.01)
+
+
+def _terminate_and_reap_runtime_probe_group(
+    process: subprocess.Popen[bytes],
+    *,
+    process_group_id: int | None,
+) -> int:
+    """Terminate all live members, then reap the still-unique group leader.
+
+    No ``wait``/``poll`` is permitted before all group-directed signals have
+    finished.  Keeping the leader unreaped is what makes a raw numeric PGID
+    safe from reuse.  Once the final ``process.wait`` begins this function
+    never calls ``killpg`` again.
+    """
+
+    cleanup_error: BaseException | None = None
+    if process_group_id is not None and os.name == "posix":
+        try:
+            members = _runtime_probe_live_group_members(process_group_id)
+            if members:
+                _signal_runtime_probe_group(process_group_id, signal.SIGTERM)
+                members = _wait_for_no_live_runtime_probe_group_members(
+                    process_group_id,
+                    timeout_seconds=2.0,
+                )
+            if members:
+                _signal_runtime_probe_group(process_group_id, signal.SIGKILL)
+                members = _wait_for_no_live_runtime_probe_group_members(
+                    process_group_id,
+                    timeout_seconds=2.0,
+                )
+            if members:
+                cleanup_error = LaunchError(
+                    f"fixed runtime probe process group retained live members after SIGKILL: {list(members)}",
+                )
+        except BaseException as exc:
+            # Enumeration itself is a proof obligation.  If it fails, make a
+            # best-effort TERM+KILL while the unreaped leader still protects
+            # the PGID from reuse, then report the original inspection error.
+            cleanup_error = exc
+            for signal_number in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    _signal_runtime_probe_group(
+                        process_group_id,
+                        signal_number,
+                    )
+                except BaseException:
+                    pass
+    else:  # pragma: no cover - production execution is Linux/WSL only.
+        try:
+            process.terminate()
+            time.sleep(0.05)
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+    # This is deliberately the first and only operation that may reap the
+    # leader.  There must be no PGID-directed operation after this point.
+    try:
+        returncode = process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired as exc:
+        raise LaunchError("fixed runtime probe leader could not be reaped") from exc
+    if cleanup_error is not None:
+        if isinstance(cleanup_error, LaunchError):
+            raise cleanup_error
+        raise LaunchError("fixed runtime probe group cleanup failed") from cleanup_error
+    return returncode
+
+
+def _close_runtime_probe_resources(
+    selector: selectors.BaseSelector | None,
+    streams: Sequence[Any],
+) -> BaseException | None:
+    """Best-effort close every local resource and return the first failure."""
+
+    first_error: BaseException | None = None
+    if selector is not None:
+        try:
+            selector.close()
+        except BaseException as exc:
+            first_error = exc
+    for stream in streams:
+        try:
+            stream.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    return first_error
+
+
+def _run_bounded_runtime_probe_process(
+    command: tuple[str, ...],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: float,
+    maximum_output_bytes: int,
+) -> tuple[int, bytes, bytes]:
+    """Drain both probe streams with hard bounds and own its process group."""
+
+    if os.name != "posix":
+        raise LaunchError("fixed hermetic runtime probe execution requires Linux/WSL")
+    process_group_id: int | None = None
+    stdout = bytearray()
+    stderr = bytearray()
+    streams: dict[int, tuple[Any, bytearray, str]] = {}
+    all_streams: tuple[Any, ...] = ()
+    selector: selectors.BaseSelector | None = None
+    returncode: int | None = None
+    # All potentially-failing Python-side initialization has happened before
+    # spawning.  Consequently the first statement after successful Popen is
+    # the cleanup guard itself.
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        bufsize=0,
+    )
+    try:
+        process_group_id = process.pid
+        all_streams = tuple(stream for stream in (process.stdout, process.stderr) if stream is not None)
+        if process.stdout is None or process.stderr is None:
+            raise LaunchError("fixed runtime probe pipes were not created")
+        selector = selectors.DefaultSelector()
+        for stream, destination, label in (
+            (process.stdout, stdout, "stdout"),
+            (process.stderr, stderr, "stderr"),
+        ):
+            descriptor = stream.fileno()
+            streams[descriptor] = (stream, destination, label)
+            selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        while streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise LaunchError(f"fixed hermetic runtime probe exceeded {timeout_seconds:.0f}s")
+            events = selector.select(min(remaining, 0.1))
+            if not events:
+                continue
+            for key, _mask in events:
+                descriptor = int(key.fd)
+                stream, destination, label = streams[descriptor]
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    del streams[descriptor]
+                    continue
+                if len(destination) + len(chunk) > maximum_output_bytes:
+                    raise LaunchError(f"fixed hermetic runtime probe {label} exceeded {maximum_output_bytes} bytes")
+                destination.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise LaunchError(f"fixed hermetic runtime probe exceeded {timeout_seconds:.0f}s")
+    finally:
+        had_primary_error = sys.exc_info()[0] is not None
+        resource_error: BaseException | None = None
+        try:
+            resource_error = _close_runtime_probe_resources(
+                selector,
+                all_streams,
+            )
+        finally:
+            returncode = _terminate_and_reap_runtime_probe_group(
+                process,
+                process_group_id=process_group_id,
+            )
+        if resource_error is not None and not had_primary_error:
+            raise LaunchError("fixed runtime probe resource cleanup failed") from resource_error
+    if returncode is None:  # pragma: no cover - cleanup always assigns or raises.
+        raise LaunchError("fixed runtime probe did not reap its leader")
+    return returncode, bytes(stdout), bytes(stderr)
 
 
 def _validate_runtime_readiness_evidence(
@@ -2253,7 +2740,18 @@ def _run_v29_preflight(
                 f"expected={FIXED_RUNTIME_CONFIG_FINGERPRINT_SHA256} "
                 f"actual={effective_fingerprint}"
             )
-        runtime = _verify_runtime_inputs(paths) if verify_runtime else None
+        environment = v29_preflight.validate_trainer_environment(
+            v29_preflight.build_trainer_environment(paths),
+            paths=paths,
+        )
+        runtime = (
+            _verify_runtime_inputs(
+                paths,
+                environment=environment,
+            )
+            if verify_runtime
+            else None
+        )
         runtime_readiness = _validate_runtime_readiness_evidence(
             launch_paths,
             runtime=runtime,
@@ -2266,10 +2764,6 @@ def _run_v29_preflight(
             ),
             paths=paths,
             initialize_from=selected,
-        )
-        environment = v29_preflight.validate_trainer_environment(
-            v29_preflight.build_trainer_environment(paths),
-            paths=paths,
         )
         source_state = frozen.metadata.get("training_state")
         return {
@@ -2440,13 +2934,18 @@ def _validate_preflight_payload(
         raise LaunchError(
             "reviewed preflight has no exact trainer environment digest",
         )
-    if verify_live_shadow and claimed_environment_sha256 != (_exact_trainer_environment_sha256(environment)):
+    if claimed_environment_sha256 != _exact_trainer_environment_sha256(environment):
         raise LaunchError(
             "reviewed preflight exact trainer environment changed",
         )
     runtime = payload.get("runtime")
     if not isinstance(runtime, Mapping):
         raise LaunchError("reviewed preflight did not prove the GPU/simulator runtime")
+    runtime = _validate_hermetic_runtime_probe_payload(
+        runtime,
+        paths=paths.preflight,
+        trainer_environment_sha256=claimed_environment_sha256,
+    )
     simulator = runtime.get("simulator")
     mechanics = runtime.get("runtime_mechanics")
     revival = runtime.get("training_revival")
@@ -2463,12 +2962,12 @@ def _validate_preflight_payload(
     binding = embedded_readiness.get("report_binding")
     if not isinstance(binding, Mapping) or binding.get("runtime_identity") != runtime.get("runtime_identity"):
         raise LaunchError("reviewed preflight runtime readiness/live identity changed")
-        if verify_live_shadow and embedded_readiness != _validate_runtime_readiness_evidence(
-            paths,
-            runtime=runtime,
-            shadow=embedded_shadow,
-        ):
-            raise LaunchError("reviewed preflight runtime readiness report changed")
+    if verify_live_shadow and embedded_readiness != _validate_runtime_readiness_evidence(
+        paths,
+        runtime=runtime,
+        shadow=embedded_shadow,
+    ):
+        raise LaunchError("reviewed preflight runtime readiness report changed")
     return dict(payload)
 
 
@@ -6193,7 +6692,13 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         nargs="?",
         default="status",
-        choices=("preflight", "start", "status", "supervise"),
+        choices=(
+            "preflight",
+            "start",
+            "status",
+            "supervise",
+            HERMETIC_RUNTIME_PROBE_ACTION,
+        ),
     )
     parser.add_argument(
         "--reviewed-preflight",
@@ -6212,7 +6717,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError(f"{args.action} does not accept --manifest")
         if args.action not in {"preflight", "start"} and args.reviewed_preflight is not None:
             raise LaunchError(f"{args.action} does not accept --reviewed-preflight")
-        if args.action == "preflight":
+        if args.action == HERMETIC_RUNTIME_PROBE_ACTION:
+            require_wsl()
+            paths = validate_layout(paths)
+            require_exact_artifact_environment(paths)
+            payload = _execute_hermetic_runtime_probe(paths.preflight)
+        elif args.action == "preflight":
             require_wsl()
             payload = run_preflight(paths, reviewed_preflight=args.reviewed_preflight)
         elif args.action == "start":

@@ -46,7 +46,10 @@ _INITIAL_STATE_FIELDS = (
     "consumed_unrolls",
     "maximum_observed_candidates",
 )
-_REVIEWED_TRAINER_ENVIRONMENT_KEYS = (
+# The v2 supervised contract is the v29 model-init boundary.  It accepts the
+# exact environment produced by the v29 launcher, rather than the larger
+# ambient-overlay environment historically used by the retired v28 launcher.
+V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS: Final = (
     "STS2_ARTIFACT_ROOT",
     "PYTHONPATH",
     "PYTHONNOUSERSITE",
@@ -55,9 +58,10 @@ _REVIEWED_TRAINER_ENVIRONMENT_KEYS = (
     "MKL_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
+    "LC_CTYPE",
     "PATH",
 )
-_REMOVED_TRAINER_ENVIRONMENT_KEYS = (
+V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS: Final = (
     "PYTHONHOME",
     "VENV_DIR",
     "STS2_HEADLESS_SIM_EXE",
@@ -651,15 +655,17 @@ def _trainer_environment_payload(
         raise SupervisedLaunchContractError(
             "trainer environment keys and values must be text",
         )
-    missing = [key for key in _REVIEWED_TRAINER_ENVIRONMENT_KEYS if key not in environment]
-    if missing:
-        raise SupervisedLaunchContractError("trainer environment is missing reviewed keys: " + ", ".join(missing))
-    retained = [key for key in _REMOVED_TRAINER_ENVIRONMENT_KEYS if key in environment]
-    if retained:
-        raise SupervisedLaunchContractError("trainer environment retained forbidden keys: " + ", ".join(retained))
+    actual_keys = set(environment)
+    expected_keys = set(V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+    if actual_keys != expected_keys:
+        raise SupervisedLaunchContractError(
+            "trainer environment is not the exact v29 hermetic set: "
+            f"missing={sorted(expected_keys - actual_keys)} "
+            f"extra={sorted(actual_keys - expected_keys)}"
+        )
     return {
-        "set": dict(environment),
-        "unset": list(_REMOVED_TRAINER_ENVIRONMENT_KEYS),
+        "set": {key: environment[key] for key in V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS},
+        "unset": list(V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS),
     }
 
 
@@ -1321,6 +1327,8 @@ __all__ = [
     "RUNTIME_READINESS_SEAL_VERSION",
     "SOURCE_AUTHORITY_VERSION",
     "SUPERVISED_LAUNCH_CONTRACT_VERSION",
+    "V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS",
+    "V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS",
     "SupervisedLaunchContract",
     "SupervisedLaunchContractError",
     "checkpoint_source_identity",

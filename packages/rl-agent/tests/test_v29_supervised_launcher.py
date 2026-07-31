@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from sts2_rl.training import launch_contract as trainer_launch_contract
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_ROOT = PACKAGE_ROOT.parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v29_failure_credit_v4.py"
@@ -202,6 +204,9 @@ def _payload(paths: Any) -> dict[str, Any]:
     exact_environment = launcher._environment_from_contract(
         environment_contract,
     )
+    environment_sha256 = launcher._exact_trainer_environment_sha256(
+        exact_environment,
+    )
     runtime_identity = _test_runtime_identity()
     implementation_source = {
         "checkout_root": str(paths.checkout_root),
@@ -248,6 +253,29 @@ def _payload(paths: Any) -> dict[str, Any]:
             "version": launcher.RUNTIME_READINESS_REPORT_SCHEMA,
         },
     }
+    runtime: dict[str, Any] = {
+        "schema_version": launcher.HERMETIC_RUNTIME_PROBE_SCHEMA,
+        "probe_command": list(
+            launcher._hermetic_runtime_probe_command(paths.preflight),
+        ),
+        "timeout_seconds": launcher.HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        "trainer_environment_sha256": environment_sha256,
+        "torch_version": "test",
+        "device_name": "test-gpu",
+        "runtime_identity": runtime_identity,
+        "simulator": {"schema_version": "test"},
+        "runtime_mechanics": {
+            "schema": "sts2-runtime-mechanics-audit-v1",
+            "runtime_event_checked": True,
+            "runtime_combat_checked": True,
+        },
+        "training_revival": {
+            "mechanism": "test-engine-revival",
+        },
+    }
+    runtime["result_sha256"] = launcher._canonical_json_sha256(
+        launcher._runtime_probe_result_mapping(runtime),
+    )
     return {
         "status": "preflight-passed",
         "run_name": launcher.RUN_NAME,
@@ -282,21 +310,8 @@ def _payload(paths: Any) -> dict[str, Any]:
             )
         ),
         "trainer_environment": environment_contract,
-        "trainer_environment_sha256": (launcher._exact_trainer_environment_sha256(exact_environment)),
-        "runtime": {
-            "torch_version": "test",
-            "device_name": "test-gpu",
-            "runtime_identity": runtime_identity,
-            "simulator": {"schema_version": "test"},
-            "runtime_mechanics": {
-                "schema": "sts2-runtime-mechanics-audit-v1",
-                "runtime_event_checked": True,
-                "runtime_combat_checked": True,
-            },
-            "training_revival": {
-                "mechanism": "test-engine-revival",
-            },
-        },
+        "trainer_environment_sha256": environment_sha256,
+        "runtime": runtime,
     }
 
 
@@ -702,6 +717,66 @@ def test_reviewed_payload_is_model_initialization_only(
         launcher._validate_preflight_payload(changed, paths=paths)
 
 
+def test_preflight_payload_validation_reopens_runtime_readiness_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    payload = _payload(paths)
+    monkeypatch.setattr(
+        launcher,
+        "_validate_shadow_contract",
+        lambda _paths: SHADOW,
+    )
+    calls: list[tuple[Any, Any, Any]] = []
+
+    def reopen_readiness(
+        observed_paths: Any,
+        *,
+        runtime: Any,
+        shadow: Any,
+    ) -> dict[str, Any]:
+        calls.append((observed_paths, runtime, shadow))
+        return payload["runtime_readiness_evidence"]
+
+    monkeypatch.setattr(
+        launcher,
+        "_validate_runtime_readiness_evidence",
+        reopen_readiness,
+    )
+    assert (
+        launcher._validate_preflight_payload(
+            payload,
+            paths=paths,
+            verify_live_shadow=True,
+        )
+        == payload
+    )
+    assert calls == [(paths, payload["runtime"], SHADOW)]
+
+    changed_readiness = json.loads(
+        json.dumps(payload["runtime_readiness_evidence"]),
+    )
+    changed_readiness["report_binding"]["status"] = "changed"
+    monkeypatch.setattr(
+        launcher,
+        "_validate_runtime_readiness_evidence",
+        lambda _paths, *, runtime, shadow: changed_readiness,
+    )
+    with pytest.raises(
+        launcher.LaunchError,
+        match="runtime readiness report changed",
+    ):
+        launcher._validate_preflight_payload(
+            payload,
+            paths=paths,
+            verify_live_shadow=True,
+        )
+
+
 def test_pre_spawn_reproof_rejects_trainer_environment_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -754,6 +829,7 @@ def test_pre_spawn_reproof_rejects_trainer_environment_drift(
 
 def test_v29_trainer_environment_is_idempotent_across_supervisor(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = launcher.validate_layout(
         _paths(tmp_path),
@@ -762,16 +838,714 @@ def test_v29_trainer_environment_is_idempotent_across_supervisor(
     first = launcher.v29_preflight.build_trainer_environment(
         paths.preflight,
         base_environment={
-            "PATH": "/usr/bin",
-            "LD_PRELOAD": "/reviewed/lib.so",
+            "PATH": "/first-process/bin",
+            "LD_PRELOAD": "/first-process/lib.so",
+            "OMP_NUM_THREADS": "99",
         },
     )
     second = launcher.v29_preflight.build_trainer_environment(
         paths.preflight,
-        base_environment=first,
+        base_environment={
+            "PATH": "/second-process/bin",
+            "LD_LIBRARY_PATH": "/second-process/lib",
+            "PYTHONHOME": "/second-process/python",
+        },
     )
     assert second == first
+    assert set(first) == set(
+        launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS,
+    )
+    assert first["LC_CTYPE"] == "C.UTF-8"
+    assert first["OMP_NUM_THREADS"] == "4"
+    assert first["PATH"] == launcher.os.pathsep.join(
+        (
+            str(paths.preflight.venv_python.parent),
+            *launcher._V29_HERMETIC_SYSTEM_PATH,
+        )
+    )
+    assert "LD_PRELOAD" not in first
+    assert "LD_LIBRARY_PATH" not in first
     assert launcher._exact_trainer_environment_sha256(second) == (launcher._exact_trainer_environment_sha256(first))
+
+    # Reconstructing the reviewed contract happens in ``start`` and later in
+    # the detached supervisor.  Ambient drift in either invocation must not
+    # enter the process environment or change its exact digest.
+    contract = launcher.v29_preflight.trainer_environment_contract(first)
+    monkeypatch.setenv("LD_PRELOAD", "/ambient/after-preflight.so")
+    monkeypatch.setenv("PATH", "/ambient/after-preflight/bin")
+    reconstructed = launcher._environment_from_contract(contract)
+    assert reconstructed == first
+    assert launcher._exact_trainer_environment_sha256(reconstructed) == (
+        launcher._exact_trainer_environment_sha256(first)
+    )
+
+
+def test_v29_launcher_and_trainer_environment_contracts_have_exact_parity(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    launcher_contract = launcher.v29_preflight.trainer_environment_contract(
+        environment,
+    )
+
+    assert launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS == (
+        trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS
+    )
+    assert launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS == (
+        trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS
+    )
+    assert tuple(environment) == (trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+    assert tuple(launcher_contract["set"]) == (trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
+    assert launcher_contract["unset"] == list(
+        trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS,
+    )
+    assert launcher._exact_trainer_environment_sha256(environment) == (
+        trainer_launch_contract.trainer_environment_sha256(environment)
+    )
+
+
+def test_v29_fixed_runtime_probe_uses_only_hermetic_environment_and_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    expected = _payload(paths)["runtime"]
+    observed: dict[str, Any] = {}
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> Any:
+        observed["command"] = command
+        observed.update(kwargs)
+        return 0, json.dumps(expected).encode("utf-8"), b""
+
+    monkeypatch.setattr(
+        launcher,
+        "_run_bounded_runtime_probe_process",
+        fake_run,
+    )
+    assert (
+        launcher._verify_runtime_inputs(
+            paths.preflight,
+            environment=environment,
+        )
+        == expected
+    )
+    assert observed["command"] == launcher._hermetic_runtime_probe_command(
+        paths.preflight,
+    )
+    assert observed["cwd"] == paths.package_root
+    assert observed["environment"] == environment
+    assert set(observed["environment"]) == set(
+        launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS,
+    )
+    assert observed["timeout_seconds"] == (launcher.HERMETIC_RUNTIME_PROBE_TIMEOUT_SECONDS)
+    assert observed["maximum_output_bytes"] == (launcher.HERMETIC_RUNTIME_PROBE_MAX_OUTPUT_BYTES)
+
+
+@pytest.mark.parametrize(
+    ("process_result", "message"),
+    (
+        ((17, b"", b"probe failed"), r"probe failed \(17\)"),
+        ((0, b"{", b""), "malformed JSON"),
+        ((0, b"[]", b""), "not an object"),
+    ),
+)
+def test_v29_runtime_probe_rejects_nonzero_malformed_and_non_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_result: tuple[int, bytes, bytes],
+    message: str,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_run_bounded_runtime_probe_process",
+        lambda *args, **kwargs: process_result,
+    )
+    with pytest.raises(launcher.LaunchError, match=message):
+        launcher._verify_runtime_inputs(
+            paths.preflight,
+            environment=environment,
+        )
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="process-group cleanup is the Linux/WSL production path",
+)
+def test_bounded_runtime_probe_timeout_kills_leader_and_descendant_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "descendant.pid"
+    program = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+with open(sys.argv[1], "w", encoding="ascii") as handle:
+    handle.write(str(child.pid))
+    handle.flush()
+time.sleep(30)
+"""
+    real_popen = launcher.subprocess.Popen
+    observed: list[Any] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        observed.append(process)
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", recording_popen)
+    with pytest.raises(launcher.LaunchError, match="exceeded"):
+        launcher._run_bounded_runtime_probe_process(
+            (sys.executable, "-c", program, str(marker)),
+            cwd=tmp_path,
+            environment=dict(launcher.os.environ),
+            timeout_seconds=0.25,
+            maximum_output_bytes=4096,
+        )
+    assert len(observed) == 1
+    assert observed[0].poll() is not None
+    assert not launcher._runtime_probe_group_exists(observed[0].pid)
+    descendant_pid = int(marker.read_text(encoding="ascii"))
+    deadline = launcher.time.monotonic() + 2.0
+    while (Path("/proc") / str(descendant_pid)).exists() and (launcher.time.monotonic() < deadline):
+        launcher.time.sleep(0.01)
+    assert not (Path("/proc") / str(descendant_pid)).exists()
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="pipe selectors are the Linux/WSL production path",
+)
+def test_bounded_runtime_probe_overflow_terminates_and_reaps_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = launcher.subprocess.Popen
+    observed: list[Any] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        observed.append(process)
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", recording_popen)
+    with pytest.raises(launcher.LaunchError, match="stdout exceeded"):
+        launcher._run_bounded_runtime_probe_process(
+            (
+                sys.executable,
+                "-c",
+                "import os, time; os.write(1, b'x' * 8192); time.sleep(30)",
+            ),
+            cwd=tmp_path,
+            environment=dict(launcher.os.environ),
+            timeout_seconds=2.0,
+            maximum_output_bytes=1024,
+        )
+    assert len(observed) == 1
+    assert observed[0].poll() is not None
+    assert not launcher._runtime_probe_group_exists(observed[0].pid)
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="process-group cleanup is the Linux/WSL production path",
+)
+def test_bounded_runtime_probe_success_reaps_session_without_false_positive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = launcher.subprocess.Popen
+    observed: list[Any] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        observed.append(process)
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", recording_popen)
+    result = launcher._run_bounded_runtime_probe_process(
+        (
+            sys.executable,
+            "-c",
+            "import os; os.write(1, b'{\"ok\":true}'); os.write(2, b'note')",
+        ),
+        cwd=tmp_path,
+        environment=dict(launcher.os.environ),
+        timeout_seconds=2.0,
+        maximum_output_bytes=4096,
+    )
+    assert result == (0, b'{"ok":true}', b"note")
+    assert len(observed) == 1
+    assert observed[0].poll() == 0
+    assert not launcher._runtime_probe_group_exists(observed[0].pid)
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="process-group cleanup is the Linux/WSL production path",
+)
+def test_selector_construction_failure_still_closes_pipes_and_reaps_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = launcher.subprocess.Popen
+    observed: list[Any] = []
+
+    def recording_popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        observed.append(process)
+        return process
+
+    def exploding_selector() -> Any:
+        raise RuntimeError("selector construction failed")
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(
+        launcher.selectors,
+        "DefaultSelector",
+        exploding_selector,
+    )
+    with pytest.raises(RuntimeError, match="selector construction failed"):
+        launcher._run_bounded_runtime_probe_process(
+            (sys.executable, "-c", "import time; time.sleep(30)"),
+            cwd=tmp_path,
+            environment=dict(launcher.os.environ),
+            timeout_seconds=2.0,
+            maximum_output_bytes=4096,
+        )
+    assert len(observed) == 1
+    assert observed[0].returncode is not None
+    assert observed[0].stdout.closed
+    assert observed[0].stderr.closed
+    assert not (Path("/proc") / str(observed[0].pid)).exists()
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="resource cleanup fault injection is the Linux/WSL production path",
+)
+def test_selector_and_stream_close_failures_cannot_bypass_group_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_calls: list[str] = []
+    observed: list[Any] = []
+    real_popen = launcher.subprocess.Popen
+    real_selector = launcher.selectors.DefaultSelector
+
+    class FailingCloseStream:
+        def __init__(self, stream: Any, label: str) -> None:
+            self._stream = stream
+            self._label = label
+
+        def fileno(self) -> int:
+            return int(self._stream.fileno())
+
+        def close(self) -> None:
+            close_calls.append(self._label)
+            self._stream.close()
+            raise OSError(f"{self._label} close failed")
+
+    class FailingCloseSelector:
+        def __init__(self) -> None:
+            self._selector = real_selector()
+
+        def register(self, *args: Any, **kwargs: Any) -> Any:
+            return self._selector.register(*args, **kwargs)
+
+        def unregister(self, *args: Any, **kwargs: Any) -> Any:
+            return self._selector.unregister(*args, **kwargs)
+
+        def select(self, *args: Any, **kwargs: Any) -> Any:
+            return self._selector.select(*args, **kwargs)
+
+        def close(self) -> None:
+            close_calls.append("selector")
+            self._selector.close()
+            raise OSError("selector close failed")
+
+    def wrapped_popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        process.stdout = FailingCloseStream(process.stdout, "stdout")
+        process.stderr = FailingCloseStream(process.stderr, "stderr")
+        observed.append(process)
+        return process
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", wrapped_popen)
+    monkeypatch.setattr(
+        launcher.selectors,
+        "DefaultSelector",
+        FailingCloseSelector,
+    )
+    with pytest.raises(
+        launcher.LaunchError,
+        match="resource cleanup failed",
+    ):
+        launcher._run_bounded_runtime_probe_process(
+            (sys.executable, "-c", "import os; os.write(1, b'{}')"),
+            cwd=tmp_path,
+            environment=dict(launcher.os.environ),
+            timeout_seconds=2.0,
+            maximum_output_bytes=4096,
+        )
+    assert close_calls == ["selector", "stdout", "stderr"]
+    assert observed[0].returncode == 0
+    assert not (Path("/proc") / str(observed[0].pid)).exists()
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="signal-before-reap ordering is the Linux/WSL production path",
+)
+def test_success_cleanup_signals_live_descendant_before_reaping_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program = """
+import os, subprocess, sys
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+)
+os.write(1, str(child.pid).encode("ascii"))
+"""
+    events: list[tuple[str, int]] = []
+    real_popen = launcher.subprocess.Popen
+    real_signal_group = launcher._signal_runtime_probe_group
+
+    class RecordingProcess:
+        def __init__(self, process: Any) -> None:
+            self._process = process
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._process, name)
+
+        def wait(self, *args: Any, **kwargs: Any) -> int:
+            events.append(("wait", self.pid))
+            return int(self._process.wait(*args, **kwargs))
+
+    def wrapped_popen(*args: Any, **kwargs: Any) -> Any:
+        return RecordingProcess(real_popen(*args, **kwargs))
+
+    def recording_signal(process_group_id: int, signal_number: int) -> None:
+        events.append(("signal", signal_number))
+        real_signal_group(process_group_id, signal_number)
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", wrapped_popen)
+    monkeypatch.setattr(
+        launcher,
+        "_signal_runtime_probe_group",
+        recording_signal,
+    )
+    returncode, stdout, stderr = launcher._run_bounded_runtime_probe_process(
+        (sys.executable, "-c", program),
+        cwd=tmp_path,
+        environment=dict(launcher.os.environ),
+        timeout_seconds=2.0,
+        maximum_output_bytes=4096,
+    )
+    assert (returncode, stderr) == (0, b"")
+    assert int(stdout.decode("ascii")) > 0
+    wait_positions = [index for index, event in enumerate(events) if event[0] == "wait"]
+    signal_positions = [index for index, event in enumerate(events) if event[0] == "signal"]
+    assert len(wait_positions) == 1
+    assert signal_positions
+    assert max(signal_positions) < wait_positions[0]
+    assert wait_positions[0] == len(events) - 1
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="zombie process-group inspection requires Linux /proc",
+)
+def test_zombie_only_runtime_probe_group_has_no_live_members_or_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = launcher.subprocess.Popen(
+        (sys.executable, "-c", "pass"),
+        stdin=launcher.subprocess.DEVNULL,
+        stdout=launcher.subprocess.DEVNULL,
+        stderr=launcher.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    stat_path = Path("/proc") / str(process.pid) / "stat"
+    deadline = launcher.time.monotonic() + 2.0
+    state = ""
+    while launcher.time.monotonic() < deadline:
+        stat = stat_path.read_text(encoding="utf-8")
+        state = stat.rpartition(")")[2].strip().split()[0]
+        if state == "Z":
+            break
+        launcher.time.sleep(0.01)
+    assert state == "Z"
+    assert launcher._runtime_probe_live_group_members(process.pid) == ()
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        launcher,
+        "_signal_runtime_probe_group",
+        lambda process_group_id, signal_number: signals.append(
+            (process_group_id, signal_number),
+        ),
+    )
+    try:
+        assert (
+            launcher._terminate_and_reap_runtime_probe_group(
+                process,
+                process_group_id=process.pid,
+            )
+            == 0
+        )
+    finally:
+        if process.returncode is None:
+            process.wait(timeout=2.0)
+    assert signals == []
+    assert not stat_path.exists()
+
+
+def test_internal_runtime_probe_cli_rejects_every_extra_option(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        launcher.build_parser().parse_args(
+            [launcher.HERMETIC_RUNTIME_PROBE_ACTION, "--command", "bad"],
+        )
+    assert (
+        launcher.main(
+            [
+                launcher.HERMETIC_RUNTIME_PROBE_ACTION,
+                "--manifest",
+                "/tmp/not-accepted.json",
+            ]
+        )
+        == 2
+    )
+    assert "does not accept --manifest" in capsys.readouterr().err
+
+
+def test_v29_runtime_probe_binding_rejects_environment_command_and_result_drift(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    reviewed = _payload(paths)
+    mutations: tuple[Callable[[dict[str, Any]], None], ...] = (
+        lambda value: value["runtime"].__setitem__(
+            "trainer_environment_sha256",
+            "0" * 64,
+        ),
+        lambda value: value["runtime"]["probe_command"].append(
+            "--arbitrary-command",
+        ),
+        lambda value: value["runtime"].__setitem__(
+            "result_sha256",
+            "0" * 64,
+        ),
+    )
+    for mutate in mutations:
+        changed = json.loads(json.dumps(reviewed))
+        mutate(changed)
+        with pytest.raises(launcher.LaunchError, match="runtime probe"):
+            launcher._validate_preflight_payload(
+                changed,
+                paths=paths,
+                verify_live_shadow=False,
+            )
+
+
+def test_exact_environment_digest_is_checked_when_reports_are_not_reopened(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    changed = _payload(paths)
+    changed["trainer_environment_sha256"] = "0" * 64
+    changed["runtime"]["trainer_environment_sha256"] = "0" * 64
+    with pytest.raises(
+        launcher.LaunchError,
+        match="exact trainer environment changed",
+    ):
+        launcher._validate_preflight_payload(
+            changed,
+            paths=paths,
+            verify_live_shadow=False,
+        )
+
+
+def test_v29_launcher_rejects_non_hermetic_environment_extras(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    environment["LD_PRELOAD"] = "/unreviewed/lib.so"
+
+    with pytest.raises(
+        launcher.PreflightError,
+        match="hermetic trainer environment keys changed",
+    ):
+        launcher.v29_preflight.validate_trainer_environment(
+            environment,
+            paths=paths.preflight,
+        )
+    with pytest.raises(
+        launcher.PreflightError,
+        match="contract keys changed",
+    ):
+        launcher.v29_preflight.trainer_environment_contract(environment)
+    with pytest.raises(
+        launcher.LaunchError,
+        match="exact v29 hermetic set",
+    ):
+        launcher._exact_trainer_environment_sha256(environment)
+
+
+def test_v29_hermetic_environment_survives_python_exec_as_exact_set(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    result = launcher.subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import json, os; print(json.dumps(dict(os.environ), sort_keys=True))",
+        ),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == environment
+
+
+@pytest.mark.skipif(
+    launcher.os.name != "posix",
+    reason="READY/GO bootstrap exec integration is Linux-specific",
+)
+def test_ready_go_bootstrap_exec_preserves_exact_v29_ten_key_environment(
+    tmp_path: Path,
+) -> None:
+    paths = launcher.validate_layout(
+        _paths(tmp_path),
+        enforce_active_root=False,
+    )
+    environment = launcher.v29_preflight.build_trainer_environment(
+        paths.preflight,
+    )
+    marker = tmp_path / "exec-environment.json"
+    gate_read, gate_write = launcher.os.pipe()
+    status_read, status_write = launcher.os.pipe()
+    nonce = "a" * 64
+    trainer_program = (
+        "import json, os, sys; json.dump(dict(os.environ), open(sys.argv[1], 'w', encoding='utf-8'), sort_keys=True)"
+    )
+    command = (
+        sys.executable,
+        str(PACKAGE_ROOT / "scripts/supervised_trainer_bootstrap.py"),
+        "--expected-parent-pid",
+        str(launcher.os.getpid()),
+        "--expected-parent-start-ticks",
+        str(
+            launcher._trainer_bootstrap.process_start_ticks(
+                launcher.os.getpid(),
+            )
+        ),
+        "--gate-fd",
+        str(gate_read),
+        "--status-fd",
+        str(status_write),
+        "--nonce",
+        nonce,
+        "--timeout-seconds",
+        "2",
+        "--",
+        sys.executable,
+        "-c",
+        trainer_program,
+        str(marker),
+    )
+    process = launcher.subprocess.Popen(
+        command,
+        env=environment,
+        stdin=launcher.subprocess.DEVNULL,
+        stdout=launcher.subprocess.PIPE,
+        stderr=launcher.subprocess.PIPE,
+        close_fds=True,
+        pass_fds=(gate_read, status_write),
+    )
+    launcher.os.close(gate_read)
+    launcher.os.close(status_write)
+    try:
+        ready = launcher._trainer_bootstrap.read_bounded_frame(
+            status_read,
+            2.0,
+        )
+        assert ready["kind"] == launcher._trainer_bootstrap.READY_KIND
+        launcher.os.write(
+            gate_write,
+            launcher._trainer_bootstrap.canonical_frame(
+                {
+                    "kind": launcher._trainer_bootstrap.GO_KIND,
+                    "nonce": nonce,
+                    "protocol": launcher.TRAINER_BOOTSTRAP_PROTOCOL,
+                }
+            ),
+        )
+        launcher.os.close(gate_write)
+        gate_write = -1
+        stdout, stderr = process.communicate(timeout=5.0)
+        assert process.returncode == 0, (stdout, stderr)
+    finally:
+        if gate_write >= 0:
+            launcher.os.close(gate_write)
+        launcher.os.close(status_read)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2.0)
+    observed = json.loads(marker.read_text(encoding="utf-8"))
+    assert observed == environment
+    assert len(observed) == 10
+    assert tuple(observed) == tuple(sorted(environment))
+    assert set(observed) == set(
+        trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS,
+    )
 
 
 def _make_shadow_fixture(
