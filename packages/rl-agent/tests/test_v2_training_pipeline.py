@@ -1125,16 +1125,12 @@ def test_runtime_failure_credit_quotas_cover_every_learnable_stratum() -> None:
         config,
         learner_updates=511,
     )
-    assert EvidenceStratum.RISK_SEQUENCE not in {
-        item.stratum for item in calibration_quotas
-    }
+    assert EvidenceStratum.RISK_SEQUENCE not in {item.stratum for item in calibration_quotas}
     mature_quotas = runtime_module._failure_credit_quotas(
         config,
         learner_updates=512,
     )
-    assert {item.stratum: item.minimum for item in mature_quotas} == {
-        item.stratum: item.minimum for item in quotas
-    }
+    assert {item.stratum: item.minimum for item in mature_quotas} == {item.stratum: item.minimum for item in quotas}
 
 
 def test_failure_credit_retention_covers_every_configured_stall_window() -> None:
@@ -2775,12 +2771,12 @@ def test_terminal_native_exit_cannot_flush_pending_before_evidence_boundary(
     base = _config(total_steps=2)
     config = replace(
         base,
-            failure_credit=FailureCreditConfig(
-                mode="learning",
-                replay_capacity=8,
-                replay_byte_capacity=10_000_000,
-                maximum_episode_completion_bytes=10_000_000,
-                sample_records=1,
+        failure_credit=FailureCreditConfig(
+            mode="learning",
+            replay_capacity=8,
+            replay_byte_capacity=10_000_000,
+            maximum_episode_completion_bytes=10_000_000,
+            sample_records=1,
             burn_in_steps=1,
             maximum_context_steps=8,
             direct_witness_quota=0,
@@ -2810,6 +2806,111 @@ def test_terminal_native_exit_cannot_flush_pending_before_evidence_boundary(
     assert train_index < learner_index
     assert learner["failure_credit_records"] >= 1
     assert learner["failure_credit_quota"]["satisfied"] is True
+
+
+def test_boundary_result_visible_before_rollout_tail_is_drained_before_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep separate rollout/result transports ordered at a budget boundary."""
+
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    real_pipeline = ActorLearnerPipeline
+
+    class BoundaryFirstRolloutQueue:
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+            self.pipeline: ActorLearnerPipeline | None = None
+            self._hid_first_read = False
+
+        def get_batch(self, *args: object, **kwargs: object) -> object:
+            if not self._hid_first_read:
+                if self.pipeline is None:  # pragma: no cover - construction invariant
+                    raise RuntimeError("test rollout proxy has no actor pipeline")
+                deadline = time.monotonic() + 5.0
+                while not self.pipeline.at_episode_boundary:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("actor did not reach the test boundary")
+                    time.sleep(0.001)
+                self._hid_first_read = True
+                return ()
+            return self._inner.get_batch(*args, **kwargs)  # type: ignore[attr-defined,no-any-return]
+
+        def __len__(self) -> int:
+            return len(self._inner)  # type: ignore[arg-type]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    class BoundaryFirstPipeline:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            resources = args[0]
+            original_queue = resources.rollout_queue  # type: ignore[attr-defined]
+            proxy = BoundaryFirstRolloutQueue(original_queue)
+            resources.rollout_queue = proxy  # type: ignore[attr-defined,assignment]
+            self._inner = real_pipeline(*args, **kwargs)
+            proxy.pipeline = self._inner
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(runtime_module, "ActorLearnerPipeline", BoundaryFirstPipeline)
+    # Reproduce the production v29 terminal tail: seventeen unrolls, learner
+    # batches of four, and one non-divisible remainder, all owned by the same
+    # collection-budget boundary.
+    base = _config(total_steps=34)
+    config = replace(
+        base,
+        optimization=replace(base.optimization, batch_unrolls=4),
+        rollout=replace(base.rollout, queue_capacity=24),
+        environment=replace(base.environment, max_episode_steps=1_000),
+        diagnostics=replace(
+            base.diagnostics,
+            deadlock_window=1_000,
+            deadlock_repeat_threshold=999,
+            combat_net_progress_window=1_000,
+            noncombat_durable_progress_window=1_000,
+        ),
+        transaction_learning=TransactionLearningConfig(enabled=False),
+        failure_credit=FailureCreditConfig(
+            mode="learning",
+            replay_capacity=8,
+            replay_byte_capacity=10_000_000,
+            maximum_episode_completion_bytes=10_000_000,
+            sample_records=1,
+            burn_in_steps=1,
+            maximum_context_steps=8,
+            direct_witness_quota=0,
+            multi_edge_cycle_quota=0,
+            risk_sequence_quota=0,
+            unresolved_stall_quota=0,
+            completion_control_quota=1,
+            matched_outcome_pair_quota=0,
+        ),
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/boundary-first-tail",
+            checkpoint_dir="checkpoints/boundary-first-tail",
+            checkpoint_interval_steps=100,
+        ),
+    )
+
+    state = run_training(config, backend=FakeCombatBackend(terminal_step=10_000))
+
+    assert state.environment_steps == 34
+    assert state.episodes == 1
+    assert state.learner_updates == 5
+    assert state.consumed_unrolls == 17
+    metrics_path = next((tmp_path / "runs" / "boundary-first-tail").glob("run-*/metrics.jsonl"))
+    events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    train_index = next(index for index, item in enumerate(events) if item["event"] == "train_episode")
+    learner_index = next(index for index, item in enumerate(events) if item["event"] == "learner_update_start")
+    drain = next(item for item in events if item["event"] == "rollout_boundary_drain")
+    assert train_index < learner_index
+    assert drain["boundary_kind"] == "episode"
+    assert drain["unrolls"] == 17
+    assert drain["rollout_steps"] == 34
+    assert any(item["event"] == "run_complete" for item in events)
 
 
 def test_runtime_final_audit_matches_final_policy_after_all_learning(
@@ -3221,6 +3322,12 @@ def test_runtime_marks_only_the_first_post_resume_checkpoint_as_exact_resume(
     )
 
     assert state.environment_steps == 4
+    resumed_metrics = next((tmp_path / "runs" / "exact-resume-lineage").glob("run-*/metrics.jsonl"))
+    resumed_events = [json.loads(line) for line in resumed_metrics.read_text(encoding="utf-8").splitlines()]
+    restored_drain = next(event for event in resumed_events if event["event"] == "restored_rollout_queue_drain")
+    assert restored_drain["unrolls"] == 1
+    assert restored_drain["rollout_steps"] == 2
+    assert restored_drain["evidence_boundary"] == "checkpoint_committed"
     checkpoint_root = tmp_path / "checkpoints" / "exact-resume-lineage"
     periodic = next(checkpoint_root.glob("run-*/periodic-*"))
     periodic_metadata = json.loads((periodic / "metadata.json").read_text(encoding="utf-8"))

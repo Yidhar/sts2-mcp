@@ -1112,10 +1112,20 @@ def run_training(
         ) * config.runtime.checkpoint_interval_steps
         unrolls_since_publication = 0
         maintenance_requested = False
-        pipeline.start()
 
-        def handle_actor_incident(incident: RecoverableActorIncident) -> None:
-            """Commit an infrastructure abort and replace its poisoned session."""
+        def handle_actor_incident(
+            incident: RecoverableActorIncident,
+            *,
+            release_boundary: bool = True,
+        ) -> None:
+            """Commit an infrastructure abort and replace its poisoned session.
+
+            The asynchronous learner may need to drain rollout items that were
+            published before the incident message became visible.  Callers can
+            therefore defer the boundary acknowledgement until that FIFO prefix
+            has been consumed.  This prevents the replacement session from
+            publishing a new episode into the same replay-backed tail window.
+            """
 
             nonlocal state, maintenance_requested
             state = replace(
@@ -1192,7 +1202,8 @@ def run_training(
             if crossed_evaluation or crossed_checkpoint:
                 maintenance_requested = True
                 pipeline.request_pause()
-            pipeline.release_incident_boundary()
+            if release_boundary:
+                pipeline.release_incident_boundary()
 
         def learn_rollout_batch(batch: tuple[SequenceUnroll, ...]) -> None:
             """Consume one FIFO batch exactly once, including replay sidecars."""
@@ -1356,6 +1367,45 @@ def run_training(
                 pipeline.request_policy_publication(state.policy_version)
                 unrolls_since_publication = 0
 
+        if load_mode == "exact_resume" and len(resources.rollout_queue) > 0:
+            # Atomic checkpoints are written only after their episode/incident
+            # boundary and replay sidecars have been committed.  Their queued
+            # rollout prefix is therefore already evidence-backed.  Consume it
+            # before the actor can publish a new episode, preserving both FIFO
+            # order and the tail/boundary ownership invariant across processes.
+            restored_unrolls = 0
+            restored_steps = 0
+            while True:
+                try:
+                    restored_batch = resources.rollout_queue.get_batch(
+                        config.optimization.batch_unrolls,
+                        minimum=1,
+                        timeout=0.0,
+                    )
+                except TimeoutError:
+                    break
+                if not restored_batch:
+                    break
+                restored_unrolls += len(restored_batch)
+                restored_steps += sum(unroll.environment_steps for unroll in restored_batch)
+                learn_rollout_batch(restored_batch)
+            resources.publish_collector_policy()
+            pipeline.set_paused_policy_version(state.policy_version)
+            state = replace(state, actor_policy_version=state.policy_version)
+            unrolls_since_publication = 0
+            metrics.write(
+                "restored_rollout_queue_drain",
+                {
+                    "environment_steps": state.environment_steps,
+                    "policy_version": state.policy_version,
+                    "unrolls": restored_unrolls,
+                    "rollout_steps": restored_steps,
+                    "evidence_boundary": "checkpoint_committed",
+                },
+            )
+
+        pipeline.start()
+
         # With episodic learning enabled, retain at most one fetched FIFO batch.
         # A following batch proves the retained one was not the episode's tail;
         # an episode/incident boundary makes the tail outcome known.  This keeps
@@ -1385,6 +1435,7 @@ def run_training(
                 pending_batch = fetched_batch
 
             boundary_committed = False
+            boundary_release_kind: str | None = None
             terminal_boundary_poll_attempted = False
             while True:
                 actor_result = pipeline.next_episode(timeout=0.0)
@@ -1413,9 +1464,10 @@ def run_training(
                             )
                         break
                 if isinstance(actor_result, RecoverableActorIncident):
-                    handle_actor_incident(actor_result)
+                    handle_actor_incident(actor_result, release_boundary=False)
                     boundary_committed = True
-                    continue
+                    boundary_release_kind = "incident"
+                    break
                 episode = actor_result
                 transaction_traces_stored = 0
                 if resources.transaction_replay is not None:
@@ -1528,7 +1580,8 @@ def run_training(
                 boundary_committed = True
                 # The actor cannot reset into the next run until metrics and
                 # maintenance intent for this completed episode are committed.
-                pipeline.release_episode_boundary()
+                boundary_release_kind = "episode"
+                break
 
             if batch_to_learn:
                 learn_rollout_batch(batch_to_learn)
@@ -1536,6 +1589,46 @@ def run_training(
                 if boundary_committed:
                     learn_rollout_batch(pending_batch)
                     pending_batch = ()
+
+            if boundary_release_kind is not None:
+                # Rollouts and boundary results use separate FIFO transports.
+                # A boundary message can therefore become visible while the
+                # final unroll is still queued.  Keep the actor quiescent at the
+                # boundary, drain that already-published prefix, and only then
+                # acknowledge the boundary.  Releasing first permits the next
+                # episode to interleave with the old tail and made a healthy
+                # collection-budget stop look like an uncommitted terminal.
+                boundary_drain_unrolls = 0
+                boundary_drain_steps = 0
+                while True:
+                    try:
+                        boundary_batch = resources.rollout_queue.get_batch(
+                            config.optimization.batch_unrolls,
+                            minimum=1,
+                            timeout=0.0,
+                        )
+                    except TimeoutError:
+                        break
+                    if not boundary_batch:
+                        break
+                    boundary_drain_unrolls += len(boundary_batch)
+                    boundary_drain_steps += sum(unroll.environment_steps for unroll in boundary_batch)
+                    learn_rollout_batch(boundary_batch)
+                if boundary_drain_unrolls:
+                    metrics.write(
+                        "rollout_boundary_drain",
+                        {
+                            "environment_steps": pipeline.environment_steps,
+                            "policy_version": state.policy_version,
+                            "boundary_kind": boundary_release_kind,
+                            "unrolls": boundary_drain_unrolls,
+                            "rollout_steps": boundary_drain_steps,
+                        },
+                    )
+                if boundary_release_kind == "episode":
+                    pipeline.release_episode_boundary()
+                else:
+                    pipeline.release_incident_boundary()
 
             actor_idle = not pipeline.alive or pipeline.paused
             if maintenance_requested and actor_idle:

@@ -1,0 +1,30 @@
+{
+  "checkpoint_id": "075b8174-1dab-4293-90bd-9c63f0aab277",
+  "continuation_config": "packages/rl-agent/config/experiments/full_run_revival_v29_failure_credit_v4_exact_continuation_350k.toml",
+  "environment_steps": 100000,
+  "exact_resume_permitted": true,
+  "expected_additional_environment_steps": 250000,
+  "expected_load_mode": "exact_resume",
+  "expected_total_environment_steps": 350000,
+  "manifest_filename": "checkpoint.manifest.json",
+  "manifest_sha256": "d7c80dcfbcd222d8ed93f6b7dd8bc4735b5637ac91516fae1b707a55b53a7565",
+  "metadata_filename": "metadata.json",
+  "metadata_sha256": "a8a8396bad5799b1cd96591751c7d8c1c7f3732ad702aeafdd25468cf934c29c",
+  "name": "v29-failure-credit-v4-100k",
+  "policy_version": 1572,
+  "relative_path": "checkpoints/full-run-revival-v29-failure-credit-v4-model-init/run-78554f34-a31e-48ed-8e3e-8e58effc2790/periodic-step-000100000",
+  "schema_version": "sts2-exact-resume-checkpoint-contract-v1",
+  "source_git_commit": "0c6cafb6aa313d85df2b9057e8160ea4a4e508a7",
+  "source_run_id": "78554f34-a31e-48ed-8e3e-8e58effc2790",
+  "training_state": {
+    "actor_policy_version": 1572,
+    "consumed_unrolls": 6288,
+    "environment_steps": 100000,
+    "episodes": 110,
+    "evaluation_episodes": 80,
+    "learner_updates": 1572,
+    "maximum_observed_candidates": 269,
+    "policy_version": 1572
+  },
+  "usage": "exact_resume_only"
+}

@@ -636,12 +636,25 @@ def test_current_runtime_exposes_full_v29_abi() -> None:
     not _running_in_wsl(),
     reason="formal shadow integration uses the reviewed WSL artifact root",
 )
-def test_formal_shadow_contract_matches_current_reports_and_code() -> None:
+def test_formal_shadow_contract_matches_current_code_or_retires_fail_closed() -> None:
     # The synthetic unit-test authority above deliberately replaces seal
     # constants on ``launcher``.  Formal integration must instead validate
-    # the immutable constants embedded in the tracked launcher itself.
+    # the immutable constants embedded in the tracked launcher itself.  A
+    # later production commit is allowed to retire this historical launch
+    # authority, but must make the old launcher fail closed rather than let
+    # the old reports authorize the changed code.
     formal_launcher = _load_launcher_module("v29_supervised_launcher_formal")
     paths = formal_launcher.validate_layout(formal_launcher.default_paths())
+    runtime_relative = "packages/rl-agent/sts2_rl/training/runtime.py"
+    current_runtime_sha256 = hashlib.sha256((paths.checkout_root / runtime_relative).read_bytes()).hexdigest()
+    if current_runtime_sha256 != TEST_CODE_HASHES[runtime_relative]:
+        with pytest.raises(
+            formal_launcher.LaunchError,
+            match="shadow-validated code hash changed",
+        ):
+            formal_launcher._validate_shadow_contract(paths)
+        return
+
     proof = formal_launcher._validate_shadow_contract(paths)
 
     assert proof["contract"]["schema_version"] == formal_launcher.SHADOW_CONTRACT_SCHEMA
