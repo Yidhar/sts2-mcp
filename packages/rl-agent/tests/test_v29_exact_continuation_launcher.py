@@ -241,6 +241,12 @@ def test_resume_preflight_emits_absolute_horizon_and_effective_runtime_contract(
     assert payload["supervision"] == {
         "mode": "persistent-detached-watchdog",
         "native_exit_terminalization": True,
+        "learner_stall_watchdog": {
+            "enabled": True,
+            "timeout_seconds": launcher.LEARNER_STALL_TIMEOUT_SECONDS,
+            "event": "learner_stall_detected",
+            "automatic_restart": False,
+        },
         "automatic_restart": False,
     }
     assert commands == [(*launcher.build_resume_trainer_command(paths), "--dry-run")]

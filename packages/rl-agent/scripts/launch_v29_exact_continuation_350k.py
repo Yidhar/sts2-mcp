@@ -64,6 +64,10 @@ SCHEMA_VERSION = "sts2-v29-exact-continuation-350k-preflight-v1"
 STATE_SCHEMA_VERSION = "sts2-v29-exact-continuation-350k-state-v1"
 SUPERVISED_SCHEMA_VERSION = "sts2-v29-exact-continuation-350k-supervised-launch-v1"
 SUPERVISED_STATE_SCHEMA_VERSION = "sts2-v29-exact-continuation-350k-supervised-state-v1"
+# Keep the watchdog deliberately coarse: normal learner updates complete in
+# seconds, while a long evaluation/checkpoint still gets ample headroom.  A
+# wedged forward must become a durable failure instead of remaining unknown.
+LEARNER_STALL_TIMEOUT_SECONDS = 30.0 * 60.0
 
 
 def _load_supervisor_core() -> Any:
@@ -360,6 +364,12 @@ def run_resume_preflight(paths: Any) -> dict[str, Any]:
         "supervision": {
             "mode": "persistent-detached-watchdog",
             "native_exit_terminalization": True,
+            "learner_stall_watchdog": {
+                "enabled": True,
+                "timeout_seconds": LEARNER_STALL_TIMEOUT_SECONDS,
+                "event": "learner_stall_detected",
+                "automatic_restart": False,
+            },
             "automatic_restart": False,
         },
         "canary": "write-read-delete-passed",
@@ -387,6 +397,7 @@ def _configure_supervisor_core() -> None:
     _core.validate_fixed_resume_command = validate_fixed_resume_command
     _core._validate_resume_checkpoint_summary = _validate_checkpoint_summary
     _core._verify_resume_checkpoint = _verify_source_checkpoint
+    _core.SUPERVISED_STALL_TIMEOUT_SECONDS = LEARNER_STALL_TIMEOUT_SECONDS
 
 
 _configure_supervisor_core()

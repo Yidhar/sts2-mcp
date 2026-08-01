@@ -50,6 +50,8 @@ STATE_SCHEMA_VERSION = "sts2-v27-random-init-launch-state-v1"
 SUPERVISED_SCHEMA_VERSION = "sts2-v27-exact-resume-supervised-launch-v1"
 SUPERVISED_STATE_SCHEMA_VERSION = "sts2-v27-exact-resume-supervised-state-v1"
 WATCHDOG_EVENT_SCHEMA_VERSION = "sts2-native-exit-watchdog-v1"
+# Disabled by default; continuation adapters opt in explicitly.
+SUPERVISED_STALL_TIMEOUT_SECONDS: float | None = None
 RUN_NAME = "full-run-revival-v27-infinite-random-init"
 ACTIVE_ARTIFACT_ROOT = Path(
     "/mnt/e/game/project/sts2_mcp_artifacts/runtime"
@@ -1688,6 +1690,7 @@ def supervise(paths: LaunchPaths, *, manifest_path: Path) -> dict[str, Any]:
     trainer: subprocess.Popen[bytes] | None = None
     bound_metrics: Path | None = None
     returncode: int | None = None
+    reconciliation_reason: str | None = None
     try:
         # Re-prove the mutable inputs from the detached process.  In
         # particular, this invokes production checkpoint preflight with the
@@ -1791,6 +1794,54 @@ def supervise(paths: LaunchPaths, *, manifest_path: Path) -> dict[str, Any]:
                         metrics_path=bound_metrics,
                         run_start=run_start,
                     )
+            stall_timeout = SUPERVISED_STALL_TIMEOUT_SECONDS
+            if (
+                returncode is None
+                and bound_metrics is not None
+                and stall_timeout is not None
+                and stall_timeout > 0.0
+            ):
+                try:
+                    telemetry_age = max(
+                        0.0, time.time() - bound_metrics.stat().st_mtime
+                    )
+                except OSError:
+                    telemetry_age = None
+                if telemetry_age is not None and telemetry_age > stall_timeout:
+                    event_id = _sha256_bytes(
+                        f"{launch_id}:learner-stall-watchdog-v1".encode()
+                    )
+                    _append_jsonl_event_once(
+                        bound_metrics,
+                        {
+                            "event": "learner_stall_detected",
+                            "unix_s": time.time(),
+                            "schema_version": "sts2-learner-stall-watchdog-v1",
+                            "source": "persistent-learner-stall-watchdog",
+                            "watchdog_event_id": event_id,
+                            "launch_id": launch_id,
+                            "run_name": RUN_NAME,
+                            "telemetry_age_s": telemetry_age,
+                            "stall_timeout_s": stall_timeout,
+                            "trainer_process_identity": (
+                                asdict(trainer_identity)
+                                if trainer_identity is not None
+                                else None
+                            ),
+                        },
+                        event_id=event_id,
+                    )
+                    reconciliation_reason = (
+                        "learner_stall_timeout:"
+                        f"{telemetry_age:.3f}s>{stall_timeout:.3f}s"
+                    )
+                    trainer.terminate()
+                    try:
+                        returncode = trainer.wait(timeout=15.0)
+                    except subprocess.TimeoutExpired:
+                        trainer.kill()
+                        returncode = trainer.wait(timeout=15.0)
+                    break
             if returncode is not None:
                 break
             time.sleep(1.0)
@@ -1822,6 +1873,7 @@ def supervise(paths: LaunchPaths, *, manifest_path: Path) -> dict[str, Any]:
             supervisor_identity=supervisor_identity,
             trainer_identity=trainer_identity,
             metrics_path=bound_metrics,
+            reconciliation_reason=reconciliation_reason,
         )
     except Exception as exc:
         if trainer is not None and trainer.poll() is None:

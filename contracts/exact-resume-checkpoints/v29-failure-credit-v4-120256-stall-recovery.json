@@ -1,0 +1,28 @@
+{
+  "schema_version": "sts2-exact-resume-checkpoint-contract-v1",
+  "contract_name": "v29-failure-credit-v4-120256-stall-recovery",
+  "usage": "exact_resume_only",
+  "expected_load_mode": "exact_resume",
+  "exact_resume_permitted": true,
+  "source_checkpoint": {
+    "run_id": "d55c6f9a-c4d1-4b3f-95aa-e3cd75c25ce4",
+    "checkpoint_id": "94b3ef10-a3d4-4618-b010-f6f91c60e8fd",
+    "relative_path": "checkpoints/full-run-revival-v29-failure-credit-v4-exact-continuation-350k/run-d55c6f9a-c4d1-4b3f-95aa-e3cd75c25ce4/periodic-step-000120256",
+    "manifest_sha256": "dbbd56525d5068ed5e1938a1108a3614375344071557d98ab206b5dfe4a4b642",
+    "metadata_sha256": "7807e8e7102a2a48b18fc6347f6d9a54672976cfd9bee853943f2456ab2c49c8",
+    "environment_steps": 120256,
+    "policy_version": 1903,
+    "learner_updates": 1903,
+    "episodes": 133,
+    "evaluation_episodes": 88,
+    "maximum_observed_candidates": 269
+  },
+  "continuation": {
+    "target_total_environment_steps": 350000,
+    "additional_environment_steps": 229744,
+    "model_initialization": false,
+    "optimizer_replay_rng_restored": true,
+    "recovery_reason": "learner_stall_after_update_1919_recurrent_forward"
+  },
+  "source_commit": "cc6d67246165f763664d919c3326a1a1d25d8e40"
+}
