@@ -395,18 +395,50 @@ def evaluate_liveness_guard(
 
     episode_count = _integer(telemetry.get("episode_count")) or 0
     liveness_failure_rate = telemetry.get("liveness_failure_episode_rate")
+    baseline_episodes = config.evaluation_guard_liveness_baseline_episodes
+    baseline_failures = config.evaluation_guard_liveness_baseline_failures
+    baseline_rate = (
+        baseline_failures / baseline_episodes
+        if baseline_episodes > 0
+        else None
+    )
+    effective_liveness_threshold = (
+        min(
+            1.0,
+            max(
+                config.evaluation_guard_max_liveness_failure_episode_rate,
+                baseline_rate
+                + config.evaluation_guard_min_liveness_regression_rate,
+            ),
+        )
+        if baseline_rate is not None
+        else config.evaluation_guard_max_liveness_failure_episode_rate
+    )
     if (
         episode_count >= config.evaluation_guard_min_liveness_episodes
         and isinstance(liveness_failure_rate, int | float)
         and float(liveness_failure_rate)
-        >= config.evaluation_guard_max_liveness_failure_episode_rate
+        >= effective_liveness_threshold
     ):
         violations.append(
             {
                 "kind": "liveness_failure_collapse",
                 "observed": float(liveness_failure_rate),
-                "threshold": (
+                "threshold": effective_liveness_threshold,
+                "absolute_threshold": (
                     config.evaluation_guard_max_liveness_failure_episode_rate
+                ),
+                "baseline": (
+                    {
+                        "episodes": baseline_episodes,
+                        "failures": baseline_failures,
+                        "rate": baseline_rate,
+                        "minimum_regression_rate": (
+                            config.evaluation_guard_min_liveness_regression_rate
+                        ),
+                    }
+                    if baseline_rate is not None
+                    else None
                 ),
                 "episodes": episode_count,
                 "failures": (
@@ -447,6 +479,14 @@ def evaluate_liveness_guard(
             ),
             "maximum_liveness_failure_episode_rate": (
                 config.evaluation_guard_max_liveness_failure_episode_rate
+            ),
+            "liveness_baseline_failures": baseline_failures,
+            "liveness_baseline_episodes": baseline_episodes,
+            "minimum_liveness_regression_rate": (
+                config.evaluation_guard_min_liveness_regression_rate
+            ),
+            "effective_liveness_failure_episode_rate": (
+                effective_liveness_threshold
             ),
         },
     }

@@ -69,6 +69,10 @@ def test_v31_recipe_expands_failure_replay_without_truncating_context() -> None:
     assert config.failure_credit.multi_edge_cycle_quota == 1
     assert config.episodic_learning.replay_capacity_bytes == 2_147_483_648
     assert config.runtime.total_environment_steps == 250_000
+    assert config.runtime.early_evaluation_episodes == 16
+    assert config.runtime.evaluation_guard_liveness_baseline_failures == 9
+    assert config.runtime.evaluation_guard_liveness_baseline_episodes == 16
+    assert config.runtime.evaluation_guard_min_liveness_regression_rate == 0.20
 
 
 def test_v31_is_model_initialization_from_frozen_v30_not_exact_resume(

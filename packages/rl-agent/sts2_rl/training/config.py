@@ -817,6 +817,14 @@ class RuntimeConfig:
     evaluation_guard_max_multi_action_end_turn_rate: float = 0.75
     evaluation_guard_max_selection_cycle_episode_rate: float = 0.75
     evaluation_guard_max_liveness_failure_episode_rate: float = 0.50
+    # A weak model-initialization policy may already exceed the absolute
+    # liveness ceiling.  Repeated validation must then detect regression from
+    # that frozen Gate-0 control instead of stopping the first time the same
+    # baseline failure rate is sampled again.  A zero baseline keeps the
+    # historical absolute-only contract.
+    evaluation_guard_liveness_baseline_failures: int = 0
+    evaluation_guard_liveness_baseline_episodes: int = 0
+    evaluation_guard_min_liveness_regression_rate: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -844,6 +852,8 @@ class RuntimeConfig:
             "evaluation_guard_min_confirm_ready",
             "evaluation_guard_min_multi_action_end_turn",
             "evaluation_guard_min_liveness_episodes",
+            "evaluation_guard_liveness_baseline_failures",
+            "evaluation_guard_liveness_baseline_episodes",
         ):
             _require_int(
                 getattr(self, name),
@@ -852,6 +862,13 @@ class RuntimeConfig:
             )
         if not isinstance(self.evaluation_liveness_guard_enabled, bool):
             raise TypeError("runtime.evaluation_liveness_guard_enabled must be a boolean")
+        if (
+            self.evaluation_guard_liveness_baseline_episodes == 0
+            and self.evaluation_guard_liveness_baseline_failures != 0
+        ):
+            raise ValueError("runtime evaluation liveness baseline failures require baseline episodes")
+        if self.evaluation_guard_liveness_baseline_failures > self.evaluation_guard_liveness_baseline_episodes:
+            raise ValueError("runtime evaluation liveness baseline failures cannot exceed episodes")
         for name in (
             "evaluation_steps",
             "early_evaluation_steps",
@@ -888,6 +905,7 @@ class RuntimeConfig:
             "evaluation_guard_max_multi_action_end_turn_rate",
             "evaluation_guard_max_selection_cycle_episode_rate",
             "evaluation_guard_max_liveness_failure_episode_rate",
+            "evaluation_guard_min_liveness_regression_rate",
         ):
             _require_finite_number(
                 getattr(self, name),
@@ -1131,6 +1149,9 @@ class TrainingConfig:
             "evaluation_guard_max_multi_action_end_turn_rate",
             "evaluation_guard_max_selection_cycle_episode_rate",
             "evaluation_guard_max_liveness_failure_episode_rate",
+            "evaluation_guard_liveness_baseline_failures",
+            "evaluation_guard_liveness_baseline_episodes",
+            "evaluation_guard_min_liveness_regression_rate",
         ):
             runtime.pop(key)
         return payload

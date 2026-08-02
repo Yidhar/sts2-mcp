@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sts2_rl.training.config import RuntimeConfig
 from sts2_rl.training.evaluation_liveness import (
     evaluate_liveness_guard,
@@ -385,3 +387,67 @@ def test_three_step_shop_removal_cancel_cycle_is_a_liveness_failure(
         item["kind"] == "liveness_failure_collapse"
         for item in guard["violations"]
     )
+
+
+def test_liveness_guard_uses_frozen_baseline_before_stopping() -> None:
+    config = RuntimeConfig(
+        evaluation_steps=(5_000,),
+        evaluation_episodes=16,
+        evaluation_liveness_guard_enabled=True,
+        evaluation_guard_liveness_baseline_failures=9,
+        evaluation_guard_liveness_baseline_episodes=16,
+        evaluation_guard_min_liveness_regression_rate=0.20,
+    )
+
+    equivalent_sample = evaluate_liveness_guard(
+        {
+            "episode_count": 8,
+            "liveness_failure_episode_count": 5,
+            "liveness_failure_episode_rate": 5 / 8,
+            "selection_cycle_episode_rate": 0.0,
+        },
+        config,
+    )
+    assert equivalent_sample["stop_requested"] is False
+    assert (
+        equivalent_sample["thresholds"][
+            "effective_liveness_failure_episode_rate"
+        ]
+        == pytest.approx(0.7625)
+    )
+
+    collapsed = evaluate_liveness_guard(
+        {
+            "episode_count": 16,
+            "liveness_failure_episode_count": 13,
+            "liveness_failure_episode_rate": 13 / 16,
+            "selection_cycle_episode_rate": 0.0,
+        },
+        config,
+    )
+    assert collapsed["stop_requested"] is True
+    violation = next(
+        item
+        for item in collapsed["violations"]
+        if item["kind"] == "liveness_failure_collapse"
+    )
+    assert violation["threshold"] == pytest.approx(0.7625)
+    assert violation["baseline"] == {
+        "episodes": 16,
+        "failures": 9,
+        "rate": 9 / 16,
+        "minimum_regression_rate": 0.20,
+    }
+
+
+def test_liveness_baseline_configuration_is_fail_closed() -> None:
+    with pytest.raises(ValueError, match="failures cannot exceed episodes"):
+        RuntimeConfig(
+            evaluation_guard_liveness_baseline_failures=10,
+            evaluation_guard_liveness_baseline_episodes=8,
+        )
+    with pytest.raises(ValueError, match="require baseline episodes"):
+        RuntimeConfig(
+            evaluation_guard_liveness_baseline_failures=1,
+            evaluation_guard_liveness_baseline_episodes=0,
+        )
