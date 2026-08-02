@@ -546,12 +546,27 @@ class BoundedFailureCreditReplay:
 
         with self._lock:
             corpus = self._corpus
+            record_count = len(corpus.records)
+            mean_record_nbytes = self._storage_nbytes // record_count if record_count else 0
+            observed_worst_case_record_capacity = (
+                self.byte_capacity // self._maximum_observed_record_nbytes
+                if self._maximum_observed_record_nbytes
+                else self.capacity
+            )
             result: dict[str, int | str] = {
                 "version": FAILURE_EVIDENCE_REPLAY_VERSION,
-                "size": len(corpus.records),
+                "size": record_count,
                 "capacity": self.capacity,
                 "storage_nbytes": self._storage_nbytes,
                 "byte_capacity": self.byte_capacity,
+                "byte_headroom_nbytes": self.byte_capacity - self._storage_nbytes,
+                "byte_utilization_ppm": self._storage_nbytes * 1_000_000 // self.byte_capacity,
+                "mean_record_nbytes": mean_record_nbytes,
+                # Based on the largest record ever observed, not the current
+                # mean, so transient eviction cannot hide byte starvation.
+                "observed_worst_case_record_capacity": (
+                    observed_worst_case_record_capacity
+                ),
                 "put_count": self._put_count,
                 "put_batch_count": self._put_batch_count,
                 "sample_request_count": self._sample_request_count,

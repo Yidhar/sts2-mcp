@@ -403,7 +403,13 @@ class FailureCreditConfig:
 
     mode: Literal["disabled", "shadow", "learning"] = "disabled"
     replay_capacity: int = 4_096
-    replay_byte_capacity: int = 536_870_912
+    # Failure records retain recurrent snapshots plus collision-auditable
+    # semantic identities. Production traces have demonstrated records near
+    # 90 MiB, so the old 512 MiB default could hold only a handful of worst-case
+    # records and continuously evicted completion controls. Match the episodic
+    # replay's reviewed host-memory budget instead of silently starving the
+    # evidence strata.
+    replay_byte_capacity: int = 2_147_483_648
     sample_records: int = 8
     burn_in_steps: int = 32
     maximum_context_steps: int = 256

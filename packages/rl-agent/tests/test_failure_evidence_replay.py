@@ -556,6 +556,26 @@ def test_oversize_and_duplicate_records_are_fail_closed_and_counted() -> None:
     assert replay.metrics()["duplicate_count"] == 1
 
 
+def test_replay_reports_byte_capacity_health_from_observed_records() -> None:
+    record = _record("capacity-health")
+    record_size = evidence_record_storage_nbytes(record)
+    byte_capacity = record_size * 5 + 7
+    replay = BoundedFailureCreditReplay(
+        capacity=32,
+        byte_capacity=byte_capacity,
+        seed=19,
+    )
+
+    assert replay.put(record)
+    metrics = replay.metrics()
+
+    assert metrics["storage_nbytes"] == record_size
+    assert metrics["byte_headroom_nbytes"] == byte_capacity - record_size
+    assert metrics["byte_utilization_ppm"] == record_size * 1_000_000 // byte_capacity
+    assert metrics["mean_record_nbytes"] == record_size
+    assert metrics["observed_worst_case_record_capacity"] == byte_capacity // record_size
+
+
 def test_put_many_builds_and_publishes_one_corpus_for_an_atomic_episode_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

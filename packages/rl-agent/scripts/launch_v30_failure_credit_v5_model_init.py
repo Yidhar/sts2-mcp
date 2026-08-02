@@ -61,6 +61,7 @@ SOURCE_CHECKPOINT_RELATIVE = Path(
 )
 ACTIVE_ARTIFACT_ROOT = Path("/mnt/e/game/project/sts2_mcp_artifacts/runtime")
 CONFIG_FILE = "full_run_revival_v30_failure_credit_v5_model_init.toml"
+LINEAGE_LABEL = "v30"
 
 SCHEMA_VERSION = "sts2-v30-failure-credit-v5-model-init-preflight-v1"
 STATE_SCHEMA_VERSION = "sts2-v30-failure-credit-v5-model-init-state-v1"
@@ -76,7 +77,7 @@ def _load_supervisor_core() -> Any:
     """Load the tested durable supervisor as a private implementation."""
 
     path = Path(__file__).resolve().with_name("launch_v27_infinite_random_init.py")
-    module_name = "_sts2_v30_model_init_supervisor_core"
+    module_name = f"_{__name__.replace('.', '_')}_supervisor_core"
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
@@ -165,15 +166,15 @@ def validate_fixed_model_initialization_command(
     values = tuple(command)
     expected = _unchecked_trainer_command(paths)
     if values != expected:
-        raise LaunchError("v30 model-initialization trainer command was modified")
+        raise LaunchError(f"{LINEAGE_LABEL} model-initialization trainer command was modified")
     if values.count("--initialize-from") != 1 or "--resume" in values:
-        raise LaunchError("v30 must initialize model parameters, never exact-resume")
+        raise LaunchError(f"{LINEAGE_LABEL} must initialize model parameters, never exact-resume")
     if values.count("--device") != 1 or values[values.index("--device") + 1] != "cuda":
-        raise LaunchError("v30 learner must use the ROCm cuda device")
+        raise LaunchError(f"{LINEAGE_LABEL} learner must use the ROCm cuda device")
     if values.count("--collector-device") != 1 or values[values.index("--collector-device") + 1] != "cpu":
-        raise LaunchError("v30 collector must use cpu")
+        raise LaunchError(f"{LINEAGE_LABEL} collector must use cpu")
     if values.count("--backend") != 1 or values[values.index("--backend") + 1] != "headless":
-        raise LaunchError("v30 must use the headless backend")
+        raise LaunchError(f"{LINEAGE_LABEL} must use the headless backend")
 
 
 def build_resume_trainer_command(paths: Any) -> tuple[str, ...]:
@@ -399,7 +400,7 @@ def _validate_supervised_manifest(
         raise LaunchError("supervised manifest escapes the fixed manifest directory")
     manifest = _core._load_json_object(
         manifest_path,
-        label="v30 supervised launch manifest",
+        label=f"{LINEAGE_LABEL} supervised launch manifest",
     )
     if manifest.get("schema_version") != SUPERVISED_SCHEMA_VERSION:
         raise LaunchError("supervised launch manifest has an unsupported schema")
@@ -545,7 +546,7 @@ def initialize(paths: Any) -> dict[str, Any]:
         previous = _core.read_status(paths)
         if previous["running"] is True:
             raise LaunchError(
-                "v30 model-initialization lineage already has an active process: "
+                f"{LINEAGE_LABEL} model-initialization lineage already has an active process: "
                 f"status={previous.get('status')}, launch_id={previous.get('launch_id')}"
             )
         launch_id = str(uuid.uuid4())
@@ -602,7 +603,7 @@ def initialize(paths: Any) -> dict[str, Any]:
                 metrics_path=None,
                 reconciliation_reason=f"supervisor_spawn_failed:{exc}",
             )
-            raise LaunchError(f"could not spawn the v30 supervisor: {exc}") from exc
+            raise LaunchError(f"could not spawn the {LINEAGE_LABEL} supervisor: {exc}") from exc
         with _core._terminal_lock(paths, launch_id):
             manifest = _core._validate_supervised_manifest(
                 paths,
@@ -649,7 +650,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _core.require_exact_artifact_environment(_core.validate_layout(paths))
             payload = _core.read_status(paths)
     except (LaunchError, _core.LaunchError) as exc:
-        print(f"[v30-model-init-launcher] {exc}", file=sys.stderr)
+        print(f"[{LINEAGE_LABEL}-model-init-launcher] {exc}", file=sys.stderr)
         return 2
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

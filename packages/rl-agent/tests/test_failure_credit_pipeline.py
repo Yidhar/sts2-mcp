@@ -245,6 +245,8 @@ def test_event_two_state_loop_captures_detector_time_direct_witness_and_forced_s
     witness = failure.incident.witnesses[0]
     assert witness.supporting_episode_steps == (0, 1, 2, 3)
     assert witness.loop_edges[0].supporting_episode_steps == (0, 2)
+    assert result.metrics.detected_direct_cycles == 1
+    assert result.metrics.detected_multi_edge_cycles == 0
 
 
 def test_detector_confirmed_cycle_is_drainable_before_episode_boundary_once() -> None:
@@ -287,6 +289,8 @@ def test_detector_confirmed_cycle_is_drainable_before_episode_boundary_once() ->
     assert not any(record.incident.outcome is FailureOutcome.DEADLOCK_CYCLE for record in result.records)
     assert result.metrics.streamed_records == 1
     assert result.metrics.streamed_actor_actionable_records == 1
+    assert result.metrics.detected_direct_cycles == 1
+    assert result.metrics.detected_multi_edge_cycles == 0
 
 
 def test_multiselect_select_deselect_cycle_is_multi_edge_not_last_action_blame() -> None:
@@ -349,6 +353,8 @@ def test_multiselect_select_deselect_cycle_is_multi_edge_not_last_action_blame()
     )
     assert attributed == (2, 3)
     assert len(failure.incident.witnesses[0].loop_edges) == 2
+    assert result.metrics.detected_direct_cycles == 0
+    assert result.metrics.detected_multi_edge_cycles == 1
 
 
 def test_unique_unresolved_stall_has_risk_value_credit_but_no_avoid_target() -> None:

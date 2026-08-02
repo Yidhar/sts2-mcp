@@ -181,6 +181,10 @@ class FailureCreditShadowMetrics:
     censored_semantic_transitions: int
     streamed_records: int = 0
     streamed_actor_actionable_records: int = 0
+    # Distinguish "no one-edge self-loop was observed" from downstream direct
+    # witness rejection. These detector-side facts survive into episode metrics.
+    detected_direct_cycles: int = 0
+    detected_multi_edge_cycles: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +310,8 @@ class FailureCreditEpisodePipeline:
         self._receipt_counts: dict[ProgressKind, int] = {}
         self._decision_count = 0
         self._detected_cycles = 0
+        self._detected_direct_cycles = 0
+        self._detected_multi_edge_cycles = 0
         self._progress_epoch = 0
         self._semantic_censored_transitions = 0
         self._finalized = False
@@ -598,6 +604,10 @@ class FailureCreditEpisodePipeline:
                 progress_epoch=self._progress_epoch,
             )
             self._detected_cycles += 1
+            if witness_kind is WitnessKind.DIRECT_WITNESS:
+                self._detected_direct_cycles += 1
+            else:
+                self._detected_multi_edge_cycles += 1
             cycle_key = _stable_id(
                 "stream-cycle",
                 self.episode_id,
@@ -1091,6 +1101,8 @@ class FailureCreditEpisodePipeline:
                 censored_semantic_transitions=self._semantic_censored_transitions,
                 streamed_records=self._streamed_records,
                 streamed_actor_actionable_records=(self._streamed_actor_actionable_records),
+                detected_direct_cycles=self._detected_direct_cycles,
+                detected_multi_edge_cycles=self._detected_multi_edge_cycles,
             ),
         )
 
