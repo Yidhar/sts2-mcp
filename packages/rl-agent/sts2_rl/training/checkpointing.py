@@ -591,7 +591,7 @@ def _validated_failure_credit_replay_payload(
     *,
     config: TrainingConfig,
 ) -> dict[str, object]:
-    """Validate an exact replay-v4 continuation in a detached owner.
+    """Validate an exact replay-v5 continuation in a detached owner.
 
     The typed corpus, atomic matched pairs, capacity/byte accounting, owned RNG,
     and all replay counters are validated before any live resource is mutated.
@@ -930,12 +930,12 @@ def _validate_metadata(
             )
     if liveness_enabled:
         if metadata.get("failure_credit_replay_enabled") is not True:
-            raise ValueError("failure-credit learning checkpoint has no replay-v4 marker")
+            raise ValueError("failure-credit learning checkpoint has no replay-v5 marker")
         if not isinstance(
             metadata.get("failure_credit_replay_spec"),
             dict,
         ):
-            raise ValueError("failure-credit learning checkpoint has no replay-v4 specification")
+            raise ValueError("failure-credit learning checkpoint has no replay-v5 specification")
     else:
         if metadata.get("failure_credit_replay_enabled") is not False:
             raise ValueError("failure-credit replay marker differs from the non-learning mode")
@@ -1087,7 +1087,7 @@ def save_training_checkpoint(
         failure_credit_replay_payload = None
         if config.failure_credit.learning_enabled:
             if resources.failure_credit_replay is None:
-                raise RuntimeError("failure-credit learning resources have no replay-v4 sidecar")
+                raise RuntimeError("failure-credit learning resources have no replay-v5 sidecar")
             failure_credit_replay_payload = resources.failure_credit_replay.state_dict()
             _validated_failure_credit_replay_payload(
                 failure_credit_replay_payload,
@@ -1212,7 +1212,7 @@ def load_training_checkpoint(
     if config.episodic_learning.enabled and resources.episodic_replay is None:
         raise RuntimeError("episodic-learning resources have no replay sidecar")
     if config.failure_credit.learning_enabled and resources.failure_credit_replay is None:
-        raise RuntimeError("failure-credit learning resources have no replay-v4 sidecar")
+        raise RuntimeError("failure-credit learning resources have no replay-v5 sidecar")
 
     validated = preflight_training_checkpoint(
         checkpoint,

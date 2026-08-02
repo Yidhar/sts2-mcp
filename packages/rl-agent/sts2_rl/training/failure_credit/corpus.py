@@ -1,4 +1,4 @@
-"""Immutable, pre-indexed evidence corpus for failure-credit v4."""
+"""Immutable, pre-indexed evidence corpus for failure-credit v5."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from .contracts import (
     SemanticKey,
 )
 
-FAILURE_EVIDENCE_REPLAY_VERSION: Final = "sts2-failure-evidence-replay-v4"
+FAILURE_EVIDENCE_REPLAY_VERSION: Final = "sts2-failure-evidence-replay-v5"
 ACTOR_QUOTA_STRATA: Final = ACTOR_CREDIT_STRATA
 
 
@@ -46,9 +46,7 @@ class EvidenceRecord:
         # let incident provenance and learner inputs silently diverge, while
         # also making byte accounting undercount the second retained graph.
         if self.plan.context is not self.incident.context:
-            raise ValueError(
-                "evidence record incident/plan must share one immutable context"
-            )
+            raise ValueError("evidence record incident/plan must share one immutable context")
         if self.plan.provenance != self.incident.provenance:
             raise ValueError("evidence record incident/plan provenance differs")
 

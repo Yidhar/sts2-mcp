@@ -247,6 +247,48 @@ def test_event_two_state_loop_captures_detector_time_direct_witness_and_forced_s
     assert witness.loop_edges[0].supporting_episode_steps == (0, 2)
 
 
+def test_detector_confirmed_cycle_is_drainable_before_episode_boundary_once() -> None:
+    pipeline, encoder = _pipeline()
+    linger = _event("LINGER9", hp=60, revivals=0)
+    warning = _event("DEATH_WARNING", hp=0, revivals=1)
+
+    for step, (before, actions, selected, after, after_actions) in enumerate(
+        (
+            (linger, _event_actions(), 0, warning, _forced_proceed()),
+            (warning, _forced_proceed(), 0, linger, _event_actions()),
+            (linger, _event_actions(), 0, warning, _forced_proceed()),
+            (warning, _forced_proceed(), 0, linger, _event_actions()),
+        )
+    ):
+        _observe(
+            pipeline,
+            encoder,
+            step=step,
+            before=before,
+            actions=actions,
+            selected=selected,
+            after=after,
+            after_actions=after_actions,
+        )
+
+    streamed = pipeline.drain_ready_records()
+    assert len(streamed) == 1
+    assert streamed[0].incident.outcome is FailureOutcome.DEADLOCK_CYCLE
+    assert EvidenceStratum.DIRECT_WITNESS in streamed[0].plan.strata
+    assert pipeline.drain_ready_records() == ()
+
+    # The terminal detector may report the same still-active cycle, but the
+    # already-streamed local incident must not be duplicated at the boundary.
+    result = pipeline.finalize(
+        failure_kind="noncombat_event_action_cycle",
+        local_failure=True,
+        terminal_succeeded=False,
+    )
+    assert not any(record.incident.outcome is FailureOutcome.DEADLOCK_CYCLE for record in result.records)
+    assert result.metrics.streamed_records == 1
+    assert result.metrics.streamed_actor_actionable_records == 1
+
+
 def test_multiselect_select_deselect_cycle_is_multi_edge_not_last_action_blame() -> None:
     pipeline, encoder = _pipeline()
     empty = _event("SELECT", selected_count=0)
@@ -528,16 +570,16 @@ def test_completion_staging_is_count_bounded_and_context_is_critic_minimal() -> 
 
     def map_action(floor: int) -> tuple[dict[str, Any], ...]:
         return (
-                {
-                    "action_handle": f"map-{floor + 1}",
-                    "model_action_kind": "map",
-                    "kind": "map",
+            {
+                "action_handle": f"map-{floor + 1}",
+                "model_action_kind": "map",
+                "kind": "map",
                 "coordinate": {"x": (floor + 1) % 3, "y": floor + 1},
             },
-                {
-                    "action_handle": f"map-alt-{floor + 1}",
-                    "model_action_kind": "map",
-                    "kind": "map",
+            {
+                "action_handle": f"map-alt-{floor + 1}",
+                "model_action_kind": "map",
+                "kind": "map",
                 "coordinate": {"x": (floor + 2) % 3, "y": floor + 1},
             },
         )
@@ -559,11 +601,7 @@ def test_completion_staging_is_count_bounded_and_context_is_critic_minimal() -> 
         local_failure=False,
         terminal_succeeded=False,
     )
-    completions = [
-        record
-        for record in result.records
-        if record.incident.outcome is FailureOutcome.COMPLETED
-    ]
+    completions = [record for record in result.records if record.incident.outcome is FailureOutcome.COMPLETED]
 
     assert len(completions) == 2
     assert result.metrics.completion_controls == 2

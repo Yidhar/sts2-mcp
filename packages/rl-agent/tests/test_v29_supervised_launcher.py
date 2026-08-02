@@ -607,29 +607,17 @@ def test_launcher_is_pinned_to_explicit_v28_100k_contract() -> None:
     importlib.util.find_spec("torch") is None,
     reason="runtime ABI probe requires the training Torch environment",
 )
-def test_current_runtime_exposes_full_v29_abi() -> None:
+def test_replay_v5_runtime_retires_the_historical_v29_launcher_fail_closed() -> None:
     from sts2_rl.checkpoints.frozen import V28_100K_FROZEN
+    from sts2_rl.training import checkpointing
 
     assert launcher._v28_frozen_contract() is V28_100K_FROZEN
-    abi = launcher._abi_contract()
-    assert abi == launcher._expected_abi_contract()
-    assert abi["checkpoint_format"] == "sts2-recurrent-vtrace-checkpoint-v5"
-    assert abi["failure_credit"] == {
-        "schema": "sts2-failure-credit-v4",
-        "collector": "sts2-failure-credit-collector-v3",
-        "detector": "sts2-semantic-macro-cycle-detector-v3",
-        "compiler": "sts2-failure-credit-compiler-v1",
-        "replay": "sts2-failure-evidence-replay-v4",
-        "liveness_heads": "sts2-liveness-cost-heads-v1",
-    }
-    assert abi["decision_semantics"] == {
-        "semantic_key": "sts2-semantic-key-v1",
-        "decision_identity": "sts2-decision-identity-v1",
-        "surface_registry": "sts2-surface-registry-v1",
-        "progress_scope": "sts2-progress-scope-v1",
-        "progress_receipt": "sts2-progress-receipt-v1",
-        "macro_edge": "sts2-policy-macro-edge-v1",
-    }
+    actual = checkpointing._failure_credit_abi()
+    assert actual["collector"] == "sts2-failure-credit-collector-v4"
+    assert actual["detector"] == "sts2-semantic-macro-cycle-detector-v4"
+    assert actual["replay"] == "sts2-failure-evidence-replay-v5"
+    with pytest.raises(launcher.LaunchError, match="failure-credit-v4 ABI changed"):
+        launcher._abi_contract()
 
 
 @pytest.mark.skipif(

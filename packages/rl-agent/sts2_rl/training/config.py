@@ -391,12 +391,12 @@ class TransactionLearningConfig:
 
 @dataclass(frozen=True, slots=True)
 class FailureCreditConfig:
-    """Formal detector-evidence, replay-v4 and liveness-learning contract.
+    """Formal detector-evidence, replay-v5 and liveness-learning contract.
 
     This plane is deliberately independent from the legacy transaction-v3
     sidecar.  ``shadow`` performs the complete semantic/evidence compilation
     and emits funnel metrics but cannot alter learner gradients.  ``learning``
-    additionally owns a bounded replay-v4 corpus and enables the independent
+    additionally owns a bounded replay-v5 corpus and enables the independent
     state/candidate liveness heads.  Changing mode is therefore a lineage
     change; it is never an exact-resume-compatible runtime toggle.
     """
@@ -425,6 +425,10 @@ class FailureCreditConfig:
     # Matched pairs are optional until the cross-episode matcher has produced
     # a non-empty stratum, but remain an explicit sampling-policy field.
     matched_outcome_pair_quota: int = 0
+    # The matcher is stateless, but one terminal publication may expose many
+    # retained completion controls. Bound how many failed incidents it may
+    # enrich at once so a publication cannot create unbounded compile work.
+    maximum_matched_pairs_per_publication: int = 8
     # Critics may use all authoritative evidence. Actor labels older than this
     # policy distance are retained for audit/value learning but suppressed.
     policy_gradient_max_lag: int = 128
@@ -500,6 +504,11 @@ class FailureCreditConfig:
         _require_int(
             self.liveness_head_calibration_updates,
             label="failure_credit.liveness_head_calibration_updates",
+            minimum=0,
+        )
+        _require_int(
+            self.maximum_matched_pairs_per_publication,
+            label="failure_credit.maximum_matched_pairs_per_publication",
             minimum=0,
         )
         _require_int(

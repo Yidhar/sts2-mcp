@@ -333,11 +333,7 @@ def _multi_step_actor_record(
         policy_versions=policy_versions,
     )
     provenance = _provenance(
-        policy_version=(
-            max(policy_versions)
-            if provenance_policy_version is None
-            else provenance_policy_version
-        )
+        policy_version=(max(policy_versions) if provenance_policy_version is None else provenance_policy_version)
     )
     incident = FailureIncident(
         incident_id=f"incident-{identity}",
@@ -718,10 +714,7 @@ def test_actor_quota_uses_exact_row_and_group_freshness_semantics() -> None:
         current_policy_version=100,
         policy_gradient_max_lag=5,
     )
-    statuses = {
-        status.stratum: status
-        for status in sample.quota_diagnostics.statuses
-    }
+    statuses = {status.stratum: status for status in sample.quota_diagnostics.statuses}
     # Direct and risk targets are independent rows: their fresh row can train
     # even though another row in the same record is stale.
     assert statuses[EvidenceStratum.DIRECT_WITNESS].available_actor_fresh == 1
@@ -987,12 +980,70 @@ def test_matched_pair_is_inserted_checkpointed_and_evicted_atomically() -> None:
     assert restored_pair.worse.incident_id == "incident-atomic-worse"
     assert len(restored.snapshot().records) == 1
 
-    assert restored.put(_record("replacement"))
-    assert not restored.snapshot().outcome_pairs
-    assert _incident_ids(restored) == ("incident-replacement",)
+    # A critic-only completion must not evict the sole matched actor record in
+    # a constrained replay.  Admission fails closed and the pair remains one
+    # atomic live value.
+    assert not restored.put(_record("replacement"))
+    assert tuple(restored.snapshot().outcome_pairs) == ("pair-atomic",)
+    assert restored.metrics()["admission_rejection_count"] == 1
 
 
-def test_exact_v4_roundtrip_preserves_rng_counters_and_next_sample() -> None:
+def test_completion_flood_cannot_evict_last_direct_or_multi_edge_actor_records() -> None:
+    direct = _actor_record(
+        "protected-direct",
+        stratum=EvidenceStratum.DIRECT_WITNESS,
+        policy_version=10,
+    )
+    multi = _actor_record(
+        "protected-multi",
+        stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
+        policy_version=10,
+    )
+    replay = BoundedFailureCreditReplay(
+        capacity=4,
+        byte_capacity=100_000_000,
+        seed=404,
+    )
+    assert replay.put_many((direct, multi, _record("completion-0"))) == 3
+    for index in range(1, 20):
+        assert replay.put(_record(f"completion-{index}"))
+
+    live_ids = {record.incident.incident_id for record in replay.snapshot().records}
+    assert direct.incident.incident_id in live_ids
+    assert multi.incident.incident_id in live_ids
+    assert replay.metrics()["stratum_completion_control_size"] == 2
+    assert replay.metrics()["evicted_primary_completion_control_count"] >= 18
+
+
+def test_actor_stratum_refresh_replaces_stale_peer_before_protected_other_strata() -> None:
+    direct_old = _actor_record(
+        "direct-old",
+        stratum=EvidenceStratum.DIRECT_WITNESS,
+        policy_version=1,
+    )
+    multi = _actor_record(
+        "multi-stays",
+        stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
+        policy_version=1,
+    )
+    direct_fresh = _actor_record(
+        "direct-fresh",
+        stratum=EvidenceStratum.DIRECT_WITNESS,
+        policy_version=100,
+    )
+    replay = BoundedFailureCreditReplay(
+        capacity=2,
+        byte_capacity=100_000_000,
+        seed=405,
+    )
+    assert replay.put_many((direct_old, multi)) == 2
+    assert replay.put(direct_fresh)
+    live_ids = tuple(record.incident.incident_id for record in replay.snapshot().records)
+    assert live_ids == (multi.incident.incident_id, direct_fresh.incident.incident_id)
+    assert replay.metrics()["evicted_primary_direct_witness_count"] == 1
+
+
+def test_exact_v5_roundtrip_preserves_rng_counters_and_next_sample() -> None:
     replay = BoundedFailureCreditReplay(
         capacity=4,
         byte_capacity=100_000_000,
@@ -1014,19 +1065,13 @@ def test_exact_v4_roundtrip_preserves_rng_counters_and_next_sample() -> None:
     assert restored.metrics() == replay.metrics()
     assert _incident_ids(restored) == _incident_ids(replay)
 
-    expected = tuple(
-        record.incident.incident_id
-        for record in replay.sample(3, risk_actor_enabled=True).records
-    )
-    actual = tuple(
-        record.incident.incident_id
-        for record in restored.sample(3, risk_actor_enabled=True).records
-    )
+    expected = tuple(record.incident.incident_id for record in replay.sample(3, risk_actor_enabled=True).records)
+    actual = tuple(record.incident.incident_id for record in restored.sample(3, risk_actor_enabled=True).records)
     assert actual == expected
     assert restored.metrics() == replay.metrics()
 
 
-def test_exact_v4_roundtrip_preserves_actor_fresh_sampling_and_counters() -> None:
+def test_exact_v5_roundtrip_preserves_actor_fresh_sampling_and_counters() -> None:
     replay = BoundedFailureCreditReplay(
         capacity=4,
         byte_capacity=100_000_000,
@@ -1094,7 +1139,7 @@ def test_exact_v4_roundtrip_preserves_actor_fresh_sampling_and_counters() -> Non
     assert restored.metrics() == replay.metrics()
 
 
-def test_exact_v4_sampling_is_independent_of_python_hash_seed(
+def test_exact_v5_sampling_is_independent_of_python_hash_seed(
     tmp_path: Path,
 ) -> None:
     replay = BoundedFailureCreditReplay(
@@ -1111,7 +1156,7 @@ def test_exact_v4_sampling_is_independent_of_python_hash_seed(
         for index in range(12)
     )
     assert replay.put_many(records) == len(records)
-    state_path = tmp_path / "failure-replay-v4.pkl"
+    state_path = tmp_path / "failure-replay-v5.pkl"
     state_path.write_bytes(pickle.dumps(replay.state_dict()))
     script = """
 import json

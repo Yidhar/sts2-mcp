@@ -18,6 +18,7 @@ from sts2_rl.contracts import EnvironmentBackend
 from .checkpointing import ActorSupervisorState
 from .collector import CollectedEpisode, EpisodeProgress
 from .factory import TrainingResources
+from .failure_credit import EvidenceRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,20 +87,12 @@ class ActorLearnerPipeline:
             or not isinstance(deterministic_probe_interval_episodes, int)
             or deterministic_probe_interval_episodes < 0
         ):
-            raise ValueError(
-                "deterministic_probe_interval_episodes must be a non-negative integer"
-            )
+            raise ValueError("deterministic_probe_interval_episodes must be a non-negative integer")
         if not isinstance(deterministic_probe_environment_steps, tuple):
-            deterministic_probe_environment_steps = tuple(
-                deterministic_probe_environment_steps
-            )
+            deterministic_probe_environment_steps = tuple(deterministic_probe_environment_steps)
         previous_probe_step = 0
         for index, probe_step in enumerate(deterministic_probe_environment_steps):
-            if (
-                isinstance(probe_step, bool)
-                or not isinstance(probe_step, int)
-                or probe_step <= previous_probe_step
-            ):
+            if isinstance(probe_step, bool) or not isinstance(probe_step, int) or probe_step <= previous_probe_step:
                 raise ValueError(
                     "deterministic_probe_environment_steps must contain "
                     "strictly increasing positive integers; invalid item at "
@@ -116,29 +109,26 @@ class ActorLearnerPipeline:
         self._actor_policy_version = starting_policy_version
         self._epsilon = epsilon
         self._completed_training_episodes = starting_episode_count
-        self._deterministic_probe_interval_episodes = (
-            deterministic_probe_interval_episodes
-        )
-        self._deterministic_probe_environment_steps = (
-            deterministic_probe_environment_steps
-        )
+        self._deterministic_probe_interval_episodes = deterministic_probe_interval_episodes
+        self._deterministic_probe_environment_steps = deterministic_probe_environment_steps
         # Exact resume must not replay early probes that belong to the already
         # committed prefix. A milestone exactly at the restored step is part of
         # that prefix; later milestones become due only after collection crosses
         # them. This needs no mutable checkpoint sidecar.
         self._next_deterministic_probe_step = 0
         while (
-            self._next_deterministic_probe_step
-            < len(self._deterministic_probe_environment_steps)
-            and self._deterministic_probe_environment_steps[
-                self._next_deterministic_probe_step
-            ]
+            self._next_deterministic_probe_step < len(self._deterministic_probe_environment_steps)
+            and self._deterministic_probe_environment_steps[self._next_deterministic_probe_step]
             <= starting_environment_steps
         ):
             self._next_deterministic_probe_step += 1
-        self._episodes: queue.Queue[
-            CollectedEpisode | RecoverableActorIncident | BaseException
-        ] = queue.Queue()
+        self._episodes: queue.Queue[CollectedEpisode | RecoverableActorIncident | BaseException] = queue.Queue()
+        # Detector-authoritative local incidents are intentionally transported
+        # independently of episode results.  A full run may stay alive for
+        # thousands of decisions after escaping a short semantic cycle; making
+        # the actor wait for that boundary would stale or lose the policy
+        # evidence that explains the loop.
+        self._failure_evidence: queue.Queue[tuple[EvidenceRecord, ...]] = queue.Queue()
         self._stop = Event()
         self._pause_requested = Event()
         self._paused = Event()
@@ -156,12 +146,8 @@ class ActorLearnerPipeline:
         self._pending_publication: tuple[int, Mapping[str, Any]] | None = None
         self._episode_attempts = supervisor_state.episode_attempts
         self._consecutive_incidents = supervisor_state.consecutive_incidents
-        self._incident_fingerprints: Counter[str] = Counter(
-            dict(supervisor_state.incident_fingerprints)
-        )
-        self._recent_incident_attempts: deque[int] = deque(
-            supervisor_state.recent_incident_attempts
-        )
+        self._incident_fingerprints: Counter[str] = Counter(dict(supervisor_state.incident_fingerprints))
+        self._recent_incident_attempts: deque[int] = deque(supervisor_state.recent_incident_attempts)
         self._thread = Thread(
             target=self._run,
             name="sts2-v2-actor",
@@ -201,12 +187,8 @@ class ActorLearnerPipeline:
     def supervisor_state(self) -> ActorSupervisorState:
         """Return a checkpoint-safe snapshot at an actor quiescence boundary."""
 
-        if self.alive and not (
-            self.paused or self.at_episode_boundary or self.at_incident_boundary
-        ):
-            raise RuntimeError(
-                "actor supervisor state can only be checkpointed while the actor is quiescent"
-            )
+        if self.alive and not (self.paused or self.at_episode_boundary or self.at_incident_boundary):
+            raise RuntimeError("actor supervisor state can only be checkpointed while the actor is quiescent")
         return ActorSupervisorState(
             episode_attempts=self._episode_attempts,
             consecutive_incidents=self._consecutive_incidents,
@@ -227,10 +209,7 @@ class ActorLearnerPipeline:
         learner_device = next(self.resources.model.parameters()).device
         if learner_device.type == "cuda":
             torch.cuda.synchronize(learner_device)
-        state = {
-            key: value.detach().cpu().clone()
-            for key, value in self.resources.model.state_dict().items()
-        }
+        state = {key: value.detach().cpu().clone() for key, value in self.resources.model.state_dict().items()}
         with self._publication_lock:
             pending = self._pending_publication
             if pending is None or policy_version >= pending[0]:
@@ -290,6 +269,24 @@ class ActorLearnerPipeline:
             raise result
         return result
 
+    def next_failure_evidence(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[EvidenceRecord, ...] | None:
+        """Return one atomically published detector-evidence batch."""
+
+        try:
+            return self._failure_evidence.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    @property
+    def pending_failure_evidence_batches(self) -> int:
+        """Best-effort telemetry; correctness never depends on ``qsize``."""
+
+        return self._failure_evidence.qsize()
+
     def release_episode_boundary(self) -> None:
         """Acknowledge that the main thread committed one episode result."""
 
@@ -338,6 +335,11 @@ class ActorLearnerPipeline:
         self._adopt_publication()
         return self._actor_policy_version
 
+    def _put_failure_evidence(self, records: tuple[EvidenceRecord, ...]) -> None:
+        if not records:
+            raise ValueError("failure-evidence publication must not be empty")
+        self._failure_evidence.put(records)
+
     def _record_progress(self, progress: EpisodeProgress) -> None:
         with self._progress_lock:
             self._actor_progress = progress
@@ -352,16 +354,11 @@ class ActorLearnerPipeline:
         if (
             isinstance(maximum_observed_candidates, bool)
             or not isinstance(maximum_observed_candidates, int)
-            or maximum_observed_candidates
-            < self._validated_episode_maximum_observed_candidates
+            or maximum_observed_candidates < self._validated_episode_maximum_observed_candidates
         ):
-            raise RuntimeError(
-                "collector accepted-step candidate maximum must be a monotonic integer"
-            )
+            raise RuntimeError("collector accepted-step candidate maximum must be a monotonic integer")
         self._validated_episode_steps = episode_steps
-        self._validated_episode_maximum_observed_candidates = (
-            maximum_observed_candidates
-        )
+        self._validated_episode_maximum_observed_candidates = maximum_observed_candidates
 
     def _wait_if_paused(self) -> None:
         if not self._pause_requested.is_set():
@@ -422,9 +419,7 @@ class ActorLearnerPipeline:
             value = getattr(exc, attribute, None)
             if value is not None and attribute not in details:
                 details[attribute] = value
-        quarantine = getattr(exc, "quarantine_path", None) or details.get(
-            "quarantine_path"
-        )
+        quarantine = getattr(exc, "quarantine_path", None) or details.get("quarantine_path")
         progress = self.actor_progress
         validated = self._validated_episode_steps
         lost = max(0, validated - emitted_environment_steps)
@@ -436,11 +431,7 @@ class ActorLearnerPipeline:
             self._recent_incident_attempts.popleft()
         occurrences = self._incident_fingerprints[fingerprint]
         recent = len(self._recent_incident_attempts)
-        circuit_open = (
-            occurrences >= 2
-            or self._consecutive_incidents >= 2
-            or recent >= 3
-        )
+        circuit_open = occurrences >= 2 or self._consecutive_incidents >= 2 or recent >= 3
         return RecoverableActorIncident(
             incident_id=str(uuid4()),
             category=category,
@@ -469,10 +460,7 @@ class ActorLearnerPipeline:
 
     def _run(self) -> None:
         try:
-            while (
-                not self._stop.is_set()
-                and self._environment_steps < self.total_environment_steps
-            ):
+            while not self._stop.is_set() and self._environment_steps < self.total_environment_steps:
                 self._episode_attempts += 1
                 self._adopt_publication()
                 remaining = self.total_environment_steps - self._environment_steps
@@ -484,11 +472,7 @@ class ActorLearnerPipeline:
                 try:
                     episode_probe_due = bool(
                         self._deterministic_probe_interval_episodes > 0
-                        and (
-                            (self._completed_training_episodes + 1)
-                            % self._deterministic_probe_interval_episodes
-                            == 0
-                        )
+                        and ((self._completed_training_episodes + 1) % self._deterministic_probe_interval_episodes == 0)
                     )
                     # Collection can cross multiple early milestones before an
                     # episode boundary. Coalesce every currently overdue
@@ -498,17 +482,11 @@ class ActorLearnerPipeline:
                     # retries the probe on the replacement session.
                     next_probe_step = self._next_deterministic_probe_step
                     while (
-                        next_probe_step
-                        < len(self._deterministic_probe_environment_steps)
-                        and self._deterministic_probe_environment_steps[
-                            next_probe_step
-                        ]
-                        <= self._environment_steps
+                        next_probe_step < len(self._deterministic_probe_environment_steps)
+                        and self._deterministic_probe_environment_steps[next_probe_step] <= self._environment_steps
                     ):
                         next_probe_step += 1
-                    step_probe_due = (
-                        next_probe_step > self._next_deterministic_probe_step
-                    )
+                    step_probe_due = next_probe_step > self._next_deterministic_probe_step
                     liveness_probe = episode_probe_due or step_probe_due
                     episode = self.resources.collector.collect_episode(
                         epsilon=self._epsilon(self._environment_steps),
@@ -517,6 +495,9 @@ class ActorLearnerPipeline:
                         policy_version=self._actor_policy_version,
                         maximum_steps=remaining,
                         unroll_sink=self._put_unroll,
+                        failure_credit_sink=(
+                            self._put_failure_evidence if self.resources.failure_credit_replay is not None else None
+                        ),
                         progress_sink=self._record_progress,
                         accepted_step_sink=self._record_accepted_step,
                         liveness_probe=liveness_probe,
@@ -526,9 +507,7 @@ class ActorLearnerPipeline:
                         raise
                     incident = self._incident_from_exception(
                         exc,
-                        emitted_environment_steps=(
-                            self._environment_steps - emitted_before
-                        ),
+                        emitted_environment_steps=(self._environment_steps - emitted_before),
                     )
                     self._adopt_publication()
                     self._incident_boundary_release.clear()

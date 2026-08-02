@@ -11,6 +11,7 @@ from sts2_rl.encoding.snapshot import sparse_token_table
 from sts2_rl.semantics import SemanticCollisionError
 from sts2_rl.training.failure_credit import (
     FAILURE_EVIDENCE_REPLAY_VERSION,
+    BoundedFailureCreditReplay,
     CreditCompilationError,
     CreditCompiler,
     CreditProvenance,
@@ -26,6 +27,7 @@ from sts2_rl.training.failure_credit import (
     LoopEdgeEvidence,
     MatchedOutcomePair,
     OutcomeArm,
+    OutcomePairMatcher,
     PolicyWitness,
     SemanticKey,
     StratumQuota,
@@ -226,6 +228,58 @@ def _completed_incident(
         detector_window_steps=64,
         progress_epoch=3,
         provenance=_provenance(),
+    )
+
+
+def _direct_failure_record(
+    context: LearningContext,
+    *,
+    incident_id: str,
+) -> EvidenceRecord:
+    step = context.steps[context.burn_in_steps]
+    witness = PolicyWitness(
+        witness_id=f"direct-{incident_id}",
+        kind=WitnessKind.DIRECT_WITNESS,
+        attributed_step_indices=(context.burn_in_steps,),
+        supporting_episode_steps=(step.episode_step, step.episode_step + 1),
+        occurrences=2,
+        cycle_span=1,
+        successor_confirmed=True,
+        loop_edges=(
+            _loop_edge(
+                context,
+                step_index=context.burn_in_steps,
+                supporting_episode_steps=(
+                    step.episode_step,
+                    step.episode_step + 1,
+                ),
+            ),
+        ),
+    )
+    incident = _failed_incident(
+        context,
+        incident_id=incident_id,
+        witnesses=(witness,),
+    )
+    return EvidenceRecord(
+        incident=incident,
+        plan=CreditCompiler().compile(incident),
+    )
+
+
+def _completion_record(
+    context: LearningContext,
+    *,
+    incident_id: str,
+) -> EvidenceRecord:
+    incident = _completed_incident(
+        context,
+        incident_id=incident_id,
+        witnesses=(),
+    )
+    return EvidenceRecord(
+        incident=incident,
+        plan=CreditCompiler().compile(incident),
     )
 
 
@@ -485,6 +539,110 @@ def test_atomic_outcome_pair_compiles_contrast_and_indexes_as_one_record() -> No
     assert tuple(corpus.outcome_pairs) == ("pair-1",)
     assert corpus.outcome_pairs["pair-1"].better.step.selected_action.comparison.payload == {"identity": "action-0"}
     assert corpus.outcome_pairs["pair-1"].worse.step.selected_action.comparison.payload == {"identity": "action-1"}
+
+
+def test_outcome_matcher_enriches_an_incoming_attributed_failure() -> None:
+    completion = _completion_record(
+        _context(context_id="match-completion", action_index=0),
+        incident_id="completion-source",
+    )
+    failure = _direct_failure_record(
+        _context(context_id="match-failure", action_index=1),
+        incident_id="failure-source",
+    )
+    matcher = OutcomePairMatcher(maximum_pairs_per_publication=4)
+
+    publication = matcher.match(
+        (failure,),
+        retained_records=(completion,),
+    )
+
+    assert publication.matched_pair_count == 1
+    assert publication.replacements == ()
+    assert len(publication.records) == 1
+    enriched = publication.records[0]
+    assert enriched.incident.incident_id == failure.incident.incident_id
+    assert enriched.incident.context is failure.incident.context
+    assert {witness.witness_id for witness in failure.incident.witnesses} < {
+        witness.witness_id for witness in enriched.incident.witnesses
+    }
+    assert EvidenceStratum.DIRECT_WITNESS in enriched.plan.strata
+    assert EvidenceStratum.MATCHED_OUTCOME_PAIR in enriched.plan.strata
+    pair = enriched.plan.contrast_policy_targets[0].pair
+    assert pair.better.incident_id == completion.incident.incident_id
+    assert pair.worse.incident_id == failure.incident.incident_id
+    assert pair.better.step.selected_action.comparison != (pair.worse.step.selected_action.comparison)
+
+
+def test_outcome_matcher_replaces_a_retained_failure_atomically() -> None:
+    failure = _direct_failure_record(
+        _context(context_id="retained-failure", action_index=1),
+        incident_id="retained-failure-source",
+    )
+    completion = _completion_record(
+        _context(context_id="new-completion", action_index=0),
+        incident_id="new-completion-source",
+    )
+    replay = BoundedFailureCreditReplay(
+        capacity=4,
+        byte_capacity=100_000_000,
+        seed=9,
+    )
+    assert replay.put(failure)
+    matcher = OutcomePairMatcher(maximum_pairs_per_publication=4)
+
+    publication = matcher.match(
+        (completion,),
+        retained_records=replay.snapshot().records,
+    )
+    assert publication.records == (completion,)
+    assert publication.matched_pair_count == 1
+    assert len(publication.replacements) == 1
+    assert replay.replace_many(publication.replacements) == 1
+    assert replay.put_many(publication.records) == 1
+
+    corpus = replay.snapshot()
+    replaced = corpus.record(failure.incident.incident_id)
+    assert replaced.incident.context is failure.incident.context
+    assert EvidenceStratum.DIRECT_WITNESS in replaced.plan.strata
+    assert EvidenceStratum.MATCHED_OUTCOME_PAIR in replaced.plan.strata
+    assert corpus.metrics().outcome_pair_count == 1
+    assert replay.metrics()["put_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("completion_action", "comparison_node", "expected_pairs"),
+    (
+        (1, "comparable", 0),
+        (0, "different-node", 0),
+        (0, "comparable", 1),
+    ),
+)
+def test_outcome_matcher_requires_same_decision_and_different_action(
+    completion_action: int,
+    comparison_node: str,
+    expected_pairs: int,
+) -> None:
+    failure = _direct_failure_record(
+        _context(context_id="strict-failure", action_index=1),
+        incident_id="strict-failure-source",
+    )
+    completion = _completion_record(
+        _context(
+            context_id="strict-completion",
+            action_index=completion_action,
+            node_comparison=comparison_node,
+        ),
+        incident_id=f"strict-completion-{completion_action}-{comparison_node}",
+    )
+
+    publication = OutcomePairMatcher(maximum_pairs_per_publication=1).match(
+        (completion,),
+        retained_records=(failure,),
+    )
+
+    assert publication.matched_pair_count == expected_pairs
+    assert len(publication.replacements) == expected_pairs
 
 
 def test_matched_outcome_worse_arm_must_alias_incident_context() -> None:

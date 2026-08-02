@@ -1,9 +1,10 @@
-"""Collector-side evidence pipeline for failure-credit v4.
+"""Collector-side evidence pipeline for failure-credit v5.
 
 This module is intentionally separate from the legacy transaction-v3 replay
 path.  It consumes the reviewed decision-semantics kernel online, while the
-transition is still available, and emits immutable :class:`EvidenceRecord`
-objects only at the episode boundary.
+transition is still available.  Detector-confirmed cycle records are drainable
+as soon as their complete repeated period is observed; terminal/censored and
+completion records remain owned by the episode boundary.
 
 The important causality rule is structural rather than heuristic:
 
@@ -56,8 +57,8 @@ from .contracts import (
 )
 from .corpus import EvidenceRecord, evidence_record_storage_nbytes
 
-FAILURE_CREDIT_DETECTOR_VERSION: Final = "sts2-semantic-macro-cycle-detector-v3"
-FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v3"
+FAILURE_CREDIT_DETECTOR_VERSION: Final = "sts2-semantic-macro-cycle-detector-v4"
+FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v4"
 
 
 def _positive_integer(value: object, *, label: str) -> int:
@@ -178,6 +179,8 @@ class FailureCreditShadowMetrics:
     records: int
     actor_actionable_records: int
     censored_semantic_transitions: int
+    streamed_records: int = 0
+    streamed_actor_actionable_records: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +297,11 @@ class FailureCreditEpisodePipeline:
         self._latest_cycle: _DetectedCycle | None = None
         self._terminal_macro: _ClosedMacro | None = None
         self._completion_records: list[_StagedCompletion] = []
+        self._ready_records: list[EvidenceRecord] = []
+        self._streamed_records = 0
+        self._streamed_actor_actionable_records = 0
+        self._emitted_cycle_keys: set[str] = set()
+        self._emitted_cycle_supports: set[tuple[int, ...]] = set()
         self._completion_controls_observed = 0
         self._receipt_counts: dict[ProgressKind, int] = {}
         self._decision_count = 0
@@ -411,6 +419,7 @@ class FailureCreditEpisodePipeline:
             self._progress_epoch += 1
             self._macro_history.clear()
             self._latest_cycle = None
+            self._emitted_cycle_keys.clear()
         elif receipt.kind is ProgressKind.UNKNOWN:
             # An unreviewed mutation is neither progress nor proof of a loop.
             # Split the evidence epoch and fail closed on direct attribution.
@@ -418,6 +427,7 @@ class FailureCreditEpisodePipeline:
             self._progress_epoch += 1
             self._macro_history.clear()
             self._latest_cycle = None
+            self._emitted_cycle_keys.clear()
         self._current_semantics = after
         return receipt
 
@@ -588,7 +598,40 @@ class FailureCreditEpisodePipeline:
                 progress_epoch=self._progress_epoch,
             )
             self._detected_cycles += 1
+            cycle_key = _stable_id(
+                "stream-cycle",
+                self.episode_id,
+                self._progress_epoch,
+                witness_kind.value,
+                *(item.signature for item in current),
+            )
+            if cycle_key not in self._emitted_cycle_keys:
+                # The two complete, suffix-ending periods are already
+                # detector-authoritative local evidence.  Publishing this
+                # record must not wait for a later 256-step/episode boundary:
+                # exploration may escape the loop and a long full run would
+                # otherwise make the factual behavior policy stale.
+                self._ready_records.append(self._failure_record("detector_confirmed_semantic_cycle"))
+                self._emitted_cycle_keys.add(cycle_key)
+                self._emitted_cycle_supports.add(supporting_steps)
             return
+
+    def drain_ready_records(self) -> tuple[EvidenceRecord, ...]:
+        """Drain fresh detector-authoritative records exactly once.
+
+        The method is actor-local and non-blocking.  A caller may forward the
+        returned immutable values to replay between recurrent unrolls.  When no
+        streaming sink is installed, ``finalize`` retains and returns the same
+        records, preserving shadow/offline behavior.
+        """
+
+        if self._finalized:
+            raise RuntimeError("cannot drain failure-credit records after finalization")
+        records = tuple(self._ready_records)
+        self._ready_records.clear()
+        self._streamed_records += len(records)
+        self._streamed_actor_actionable_records += sum(int(record.plan.actor_label_count > 0) for record in records)
+        return records
 
     def _captured_step(self, episode_step: int) -> _CapturedDecision:
         for captured in self._captured:
@@ -662,9 +705,7 @@ class FailureCreditEpisodePipeline:
         positions = {item.step.episode_step: index for index, item in enumerate(captured)}
         target = positions.get(policy_episode_step)
         if target is None:
-            raise _StaleEvidenceWindow(
-                "completion initiator fell outside retained recurrent context"
-            )
+            raise _StaleEvidenceWindow("completion initiator fell outside retained recurrent context")
         start = max(0, target - self.config.context_burn_in_steps)
         selected = captured[start : target + 1]
         first = selected[0]
@@ -709,9 +750,7 @@ class FailureCreditEpisodePipeline:
             witness=None,
             scope_key=self._scope_key(macro.edge.anchor),
             failure_kind=(
-                "verified_flow_completion"
-                if receipt.kind is ProgressKind.FLOW_ADVANCE
-                else "verified_durable_commit"
+                "verified_flow_completion" if receipt.kind is ProgressKind.FLOW_ADVANCE else "verified_durable_commit"
             ),
             progress_epoch=self._progress_epoch,
         )
@@ -764,18 +803,13 @@ class FailureCreditEpisodePipeline:
         # Reserve one representative of each kind when it fits.
         for kind in ("verified_flow_completion", "verified_durable_commit"):
             representative = next(
-                (
-                    item
-                    for item in candidates
-                    if item.record.incident.failure_kind == kind
-                ),
+                (item for item in candidates if item.record.incident.failure_kind == kind),
                 None,
             )
             if (
                 representative is not None
                 and len(selected) < self.config.maximum_completion_controls
-                and storage_nbytes + representative.storage_nbytes
-                <= self.config.maximum_completion_bytes
+                and storage_nbytes + representative.storage_nbytes <= self.config.maximum_completion_bytes
             ):
                 selected.append(representative)
                 selected_ids.add(representative.record.incident.incident_id)
@@ -1016,12 +1050,25 @@ class FailureCreditEpisodePipeline:
             self._capture_terminal_completion()
 
         records = [completion.record for completion in self._completion_records]
+        # Shadow/offline callers do not install a streaming sink.  Preserve all
+        # detector-authoritative records at the boundary in that mode.
+        records.extend(self._ready_records)
+        self._ready_records.clear()
         if local_failure:
-            records.append(
-                self._failure_record(
-                    failure_kind or "detector_confirmed_liveness_failure",
-                )
+            already_streamed = bool(
+                self._latest_cycle is not None
+                and self._latest_cycle.supporting_episode_steps in self._emitted_cycle_supports
             )
+            # A streamed exact cycle already owns the causal local failure.
+            # Do not duplicate it at the terminal boundary.  A unique stall,
+            # or a cycle that could not fit the streaming context, still emits
+            # the ordinary terminal record.
+            if not already_streamed:
+                records.append(
+                    self._failure_record(
+                        failure_kind or "detector_confirmed_liveness_failure",
+                    )
+                )
         elif not terminal_succeeded:
             records.append(self._censored_record(failure_kind or censored_reason))
         result = tuple(records)
@@ -1037,15 +1084,13 @@ class FailureCreditEpisodePipeline:
                 detected_cycles=self._detected_cycles,
                 completion_controls=len(self._completion_records),
                 completion_controls_observed=self._completion_controls_observed,
-                completion_controls_dropped=(
-                    self._completion_controls_observed - len(self._completion_records)
-                ),
-                completion_storage_nbytes=sum(
-                    item.storage_nbytes for item in self._completion_records
-                ),
+                completion_controls_dropped=(self._completion_controls_observed - len(self._completion_records)),
+                completion_storage_nbytes=sum(item.storage_nbytes for item in self._completion_records),
                 records=len(result),
                 actor_actionable_records=sum(int(record.plan.actor_label_count > 0) for record in result),
                 censored_semantic_transitions=self._semantic_censored_transitions,
+                streamed_records=self._streamed_records,
+                streamed_actor_actionable_records=(self._streamed_actor_actionable_records),
             ),
         )
 

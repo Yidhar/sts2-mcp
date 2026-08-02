@@ -154,7 +154,7 @@ class CollectedEpisode:
     liveness_probe: bool = False
     # Formal v4 evidence is kept separate from legacy transaction-v3 traces.
     # In shadow mode these immutable records are audited but never sampled by
-    # the learner; learning mode may insert exactly this tuple into replay-v4.
+    # the learner; learning mode may insert exactly this tuple into replay-v5.
     failure_credit_records: tuple[EvidenceRecord, ...] = ()
     failure_credit_shadow_metrics: FailureCreditShadowMetrics | None = None
 
@@ -2914,6 +2914,7 @@ class GroundedCollector:
         trajectory_journal: TrajectoryJournal | None = None,
         maximum_steps: int | None = None,
         unroll_sink: Callable[[SequenceUnroll], int | None] | None = None,
+        failure_credit_sink: Callable[[tuple[EvidenceRecord, ...]], None] | None = None,
         progress_sink: Callable[[EpisodeProgress], None] | None = None,
         accepted_step_sink: Callable[[int, int], None] | None = None,
         journal_episode_id_prefix: str = "",
@@ -3245,6 +3246,10 @@ class GroundedCollector:
                     pre_recurrent_state=failure_credit_pre_recurrent_state,
                     terminal=result_terminal,
                 )
+                if failure_credit_sink is not None:
+                    ready_failure_credit = failure_credit_pipeline.drain_ready_records()
+                    if ready_failure_credit:
+                        failure_credit_sink(ready_failure_credit)
                 timings.record(
                     "failure_credit_shadow",
                     failure_credit_started_ns,

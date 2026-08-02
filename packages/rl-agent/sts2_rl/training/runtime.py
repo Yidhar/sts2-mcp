@@ -49,7 +49,13 @@ from .factory import (
     build_training_resources,
     resolve_device,
 )
-from .failure_credit import EvidenceStratum, StratumQuota
+from .failure_credit import (
+    EvidenceRecord,
+    EvidenceStratum,
+    OutcomeMatchPublication,
+    OutcomePairMatcher,
+    StratumQuota,
+)
 from .launch_contract import (
     SupervisedLaunchContract,
     checkpoint_source_identity,
@@ -67,7 +73,7 @@ from .trajectory import TrajectoryJournal
 # telemetry.  Exact-resume safety is enforced independently by the config,
 # encoding, replay and objective checkpoint contracts; this marker makes the
 # failure-credit-v4 publication/sampling order distinguishable in metrics.
-_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v4-v7"
+_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v5-v8"
 
 
 def _failure_credit_quotas(
@@ -1112,6 +1118,100 @@ def run_training(
         ) * config.runtime.checkpoint_interval_steps
         unrolls_since_publication = 0
         maintenance_requested = False
+        outcome_pair_matcher = (
+            OutcomePairMatcher(
+                maximum_pairs_per_publication=(config.failure_credit.maximum_matched_pairs_per_publication),
+                contrast_margin=config.failure_credit.liveness_contrast_margin,
+            )
+            if resources.failure_credit_replay is not None
+            else None
+        )
+
+        def publish_failure_credit_records(
+            records: tuple[EvidenceRecord, ...],
+        ) -> tuple[int, int, OutcomeMatchPublication | None]:
+            """Match, enrich and publish one immutable evidence transaction."""
+
+            if resources.failure_credit_replay is None:
+                if records:
+                    raise RuntimeError("failure-credit records reached a disabled replay")
+                return 0, 0, None
+            if outcome_pair_matcher is None:  # pragma: no cover - paired above
+                raise RuntimeError("failure-credit replay lost its outcome matcher")
+            publication = outcome_pair_matcher.match(
+                records,
+                retained_records=(resources.failure_credit_replay.snapshot().records),
+            )
+            replaced = resources.failure_credit_replay.replace_many(publication.replacements)
+            if replaced != len(publication.replacements):
+                raise RuntimeError(
+                    "matched outcome evidence could not replace its live failure "
+                    "record within the configured replay bounds"
+                )
+            stored = resources.failure_credit_replay.put_many(publication.records)
+            return stored, replaced, publication
+
+        def commit_streamed_failure_evidence() -> int:
+            """Commit every actor-published local incident before sampling.
+
+            The detector queue is independent from the rollout and terminal
+            queues.  Draining it at each learner/runtime boundary makes a
+            confirmed cycle available in the same episode while preserving
+            each publication batch as one replay transaction.
+            """
+
+            stored_total = 0
+            while True:
+                records = pipeline.next_failure_evidence(timeout=0.0)
+                if records is None:
+                    break
+                if resources.failure_credit_replay is None:
+                    raise RuntimeError("actor streamed failure evidence while formal replay is disabled")
+                stored, replaced, publication = publish_failure_credit_records(records)
+                if publication is None:  # pragma: no cover - replay checked above
+                    raise RuntimeError("failure-credit matcher was not available")
+                stored_total += stored
+                metrics.write(
+                    "failure_credit_stream_commit",
+                    {
+                        "environment_steps": state.environment_steps,
+                        "actor_environment_steps": pipeline.environment_steps,
+                        "learner_updates": state.learner_updates,
+                        "policy_version": state.policy_version,
+                        "records": len(records),
+                        "records_stored": stored,
+                        "records_replaced": replaced,
+                        "matched_pairs_derived": (publication.matched_pair_count),
+                        "actor_labels": sum(
+                            record.plan.actor_label_count
+                            for record in (
+                                *publication.records,
+                                *publication.replacements,
+                            )
+                        ),
+                        "behavior_policy_versions": sorted(
+                            {
+                                record.incident.provenance.policy_version
+                                for record in (
+                                    *publication.records,
+                                    *publication.replacements,
+                                )
+                            }
+                        ),
+                        "strata": {
+                            stratum.value: sum(
+                                stratum in record.plan.strata
+                                for record in (
+                                    *publication.records,
+                                    *publication.replacements,
+                                )
+                            )
+                            for stratum in EvidenceStratum
+                        },
+                        "failure_credit_replay": (resources.failure_credit_replay.metrics()),
+                    },
+                )
+            return stored_total
 
         def handle_actor_incident(
             incident: RecoverableActorIncident,
@@ -1211,6 +1311,9 @@ def run_training(
             nonlocal state, unrolls_since_publication
             if not batch:
                 raise ValueError("runtime cannot learn an empty rollout batch")
+            # Close the actor/learner race immediately before replay sampling.
+            # A cycle may have been confirmed while this batch was fetched.
+            commit_streamed_failure_evidence()
             update_number = state.learner_updates + 1
             policy_version_before_update = state.policy_version
             batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
@@ -1427,6 +1530,8 @@ def run_training(
             except TimeoutError:
                 fetched_batch = ()
 
+            commit_streamed_failure_evidence()
+
             batch_to_learn: tuple[SequenceUnroll, ...] = ()
             if resources.episodic_replay is None and resources.failure_credit_replay is None:
                 batch_to_learn = fetched_batch
@@ -1464,11 +1569,16 @@ def run_training(
                             )
                         break
                 if isinstance(actor_result, RecoverableActorIncident):
+                    commit_streamed_failure_evidence()
                     handle_actor_incident(actor_result, release_boundary=False)
                     boundary_committed = True
                     boundary_release_kind = "incident"
                     break
                 episode = actor_result
+                # The actor is quiescent at this boundary, so this drain is a
+                # complete prefix and the subsequent checkpoint cannot strand
+                # an unpersisted detector record in the transport queue.
+                commit_streamed_failure_evidence()
                 transaction_traces_stored = 0
                 if resources.transaction_replay is not None:
                     transaction_traces_stored = sum(
@@ -1477,14 +1587,18 @@ def run_training(
                 elif episode.transaction_traces:
                     raise RuntimeError("collector emitted transaction traces while replay is disabled")
                 failure_credit_records_stored = 0
+                failure_credit_records_replaced = 0
+                failure_credit_publication: OutcomeMatchPublication | None = None
                 if resources.failure_credit_replay is not None:
                     # An episode's evidence is one publication transaction.
                     # This preserves matched-pair atomicity and prevents the
                     # learner from observing a partially published terminal
                     # boundary while the remainder is still being indexed.
-                    failure_credit_records_stored = resources.failure_credit_replay.put_many(
-                        episode.failure_credit_records
-                    )
+                    (
+                        failure_credit_records_stored,
+                        failure_credit_records_replaced,
+                        failure_credit_publication,
+                    ) = publish_failure_credit_records(episode.failure_credit_records)
                 elif episode.failure_credit_records and not config.failure_credit.shadow_enabled:
                     raise RuntimeError(
                         "collector emitted failure-credit records while the " "formal pipeline is disabled"
@@ -1542,6 +1656,12 @@ def run_training(
                         "failure_credit_mode": config.failure_credit.mode,
                         "failure_credit_records_emitted": len(episode.failure_credit_records),
                         "failure_credit_records_stored": (failure_credit_records_stored),
+                        "failure_credit_records_replaced": (failure_credit_records_replaced),
+                        "failure_credit_matched_pairs_derived": (
+                            failure_credit_publication.matched_pair_count
+                            if failure_credit_publication is not None
+                            else 0
+                        ),
                         "failure_credit_actor_labels": sum(
                             record.plan.actor_label_count for record in episode.failure_credit_records
                         ),
@@ -1632,6 +1752,9 @@ def run_training(
 
             actor_idle = not pipeline.alive or pipeline.paused
             if maintenance_requested and actor_idle:
+                commit_streamed_failure_evidence()
+                if pipeline.pending_failure_evidence_batches:
+                    raise RuntimeError("failure-evidence transport was not empty at maintenance boundary")
                 resources.publish_collector_policy()
                 pipeline.set_paused_policy_version(state.policy_version)
                 state = replace(state, actor_policy_version=state.policy_version)
@@ -1688,6 +1811,9 @@ def run_training(
                     pipeline.resume()
 
         pipeline.join(timeout=30.0)
+        commit_streamed_failure_evidence()
+        if pipeline.pending_failure_evidence_batches:
+            raise RuntimeError("failure-evidence transport was not empty after actor join")
         # Episode messages can arrive immediately before the actor exits.
         while True:
             actor_result = pipeline.next_episode(timeout=0.0)
@@ -1702,7 +1828,7 @@ def run_training(
             elif episode.transaction_traces:
                 raise RuntimeError("collector emitted transaction traces while replay is disabled")
             if resources.failure_credit_replay is not None:
-                resources.failure_credit_replay.put_many(episode.failure_credit_records)
+                publish_failure_credit_records(episode.failure_credit_records)
             elif episode.failure_credit_records and not config.failure_credit.shadow_enabled:
                 raise RuntimeError("collector emitted failure-credit records while the " "formal pipeline is disabled")
             if resources.episodic_replay is not None:

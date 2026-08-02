@@ -55,6 +55,7 @@ from .corpus import (
     evidence_actor_policy_versions,
     evidence_record_storage_nbytes,
 )
+from .matcher import OutcomeMatchPublication, OutcomePairMatcher
 from .pipeline import (
     FAILURE_CREDIT_COLLECTOR_VERSION,
     FAILURE_CREDIT_DETECTOR_VERSION,
@@ -100,6 +101,8 @@ __all__ = [
     "LoopEdgeEvidence",
     "MatchedOutcomePair",
     "OutcomeArm",
+    "OutcomeMatchPublication",
+    "OutcomePairMatcher",
     "PolicyWitness",
     "QuotaDiagnostics",
     "RiskSequenceCredit",
