@@ -1003,14 +1003,23 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
         "credit_plan_liveness_losses",
         observe_microbatch,
     )
+    progress: list[tuple[str, dict[str, int | float]]] = []
     metrics = learner.update(
         (unroll,),
         current_policy_version=3,
         current_learner_update=0,
         credit_plans=plans,
+        progress=lambda stage, payload: progress.append((stage, payload)),
     )
 
     assert calls == [1, 1]
+    record_starts = [payload for stage, payload in progress if stage == "liveness_record_start"]
+    assert [payload["liveness_record_index"] for payload in record_starts] == [
+        0,
+        1,
+    ]
+    assert all(payload["liveness_record_steps"] == 1 for payload in record_starts)
+    assert all(payload["liveness_record_candidates"] == 3 for payload in record_starts)
     assert metrics.liveness_autograd_microbatches == 2
     assert metrics.liveness_credit_plans == 2
     assert metrics.liveness_replayed_contexts == 2

@@ -499,8 +499,12 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
             early_evaluation_steps=(10,),
             early_evaluation_episodes=2,
         )
+    RuntimeConfig(evaluation_liveness_guard_enabled=True)
     with pytest.raises(ValueError, match="requires early evaluation"):
-        RuntimeConfig(evaluation_liveness_guard_enabled=True)
+        RuntimeConfig(
+            evaluation_steps=(),
+            evaluation_liveness_guard_enabled=True,
+        )
     with pytest.raises(ValueError, match="entropy_weight_end"):
         OptimizationConfig(entropy_weight=0.01, entropy_weight_end=0.02)
 

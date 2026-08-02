@@ -1579,6 +1579,7 @@ class VTraceLearner:
             raise ValueError("credit plans require formal liveness learning to be enabled")
         if len(credit_plans) > self.failure_credit_config.sample_records:
             raise ValueError("credit plan batch exceeds failure_credit.sample_records")
+        admitted_manifests: tuple[LivenessLabelManifest, ...] = ()
         if credit_plans:
             # Admit the complete sampled set before any model forward.  The
             # production gradient path below is intentionally one record per
@@ -1860,11 +1861,25 @@ class VTraceLearner:
         critic_gradients_before_liveness = _parameter_gradient_snapshot(liveness_head_parameters)
         liveness_started_ns = time.perf_counter_ns()
         per_record_liveness_losses: list[LivenessCreditLosses] = []
-        for credit_plan in credit_plans:
+        for record_index, (credit_plan, admitted_manifest) in enumerate(
+            zip(credit_plans, admitted_manifests, strict=True)
+        ):
             # The reviewed v1 objective is an equal-weight mean over sampled
             # evidence records.  Replaying and backpropagating one record at a
             # time frees its graph before the next record and makes activation
             # memory independent of ``sample_records``.
+            # Report the bounded microbatch before entering model forward.  A
+            # native GPU stall can then be attributed to one replay slot and
+            # workload without serializing the evidence record itself.
+            report(
+                "liveness_record_start",
+                liveness_record_index=record_index,
+                liveness_records=len(credit_plans),
+                liveness_record_contexts=admitted_manifest.work.contexts,
+                liveness_record_steps=admitted_manifest.work.steps,
+                liveness_record_candidates=admitted_manifest.work.candidates,
+                liveness_record_autograd_segments=(admitted_manifest.work.autograd_segments),
+            )
             record_losses = self.credit_plan_liveness_losses(
                 (credit_plan,),
                 current_policy_version=current_policy_version,

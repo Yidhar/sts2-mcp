@@ -959,14 +959,14 @@ def run_training(
                     summary["greedy_liveness"],
                     config.runtime,
                 )
-                if gate_kind == "early_validation"
+                if gate_kind in {"early_validation", "validation"}
                 else {
                     "schema_version": "sts2-greedy-liveness-guard-v1",
                     "enabled": False,
                     "passed": True,
                     "stop_requested": False,
                     "violations": [],
-                    "reason": "guard_applies_only_to_early_validation",
+                    "reason": "guard_applies_only_to_repeated_validation",
                 }
             )
             metrics.write(

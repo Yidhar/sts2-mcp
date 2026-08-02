@@ -74,7 +74,10 @@ checkpoint_interval_steps = 10000
 # Completed gates remain in the schedule because their restored evaluation
 # state is part of exact resume.  Removing them would make the next checkpoint
 # unable to validate the inherited evaluation journal.
-evaluation_steps = [0, 25000, 50000, 75000, 125000, 150000, 200000, 250000, 300000, 325000]
+# 175k is a recovery-only observation gate.  It re-checks the 150k liveness
+# regression five thousand steps after the 170119 atomic resume instead of
+# allowing a degraded policy to run blind until 200k.
+evaluation_steps = [0, 25000, 50000, 75000, 125000, 150000, 175000, 200000, 250000, 300000, 325000]
 evaluation_episodes = 16
 early_evaluation_steps = [5000, 10000, 110000]
 early_evaluation_episodes = 8

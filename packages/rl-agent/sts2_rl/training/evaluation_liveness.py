@@ -184,6 +184,9 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
             )
 
     selection_cycle_episodes = 0
+    cycle_episodes = 0
+    liveness_failure_episodes = 0
+    card_removal_cancel_cycle_episodes = 0
     combat_stall_episodes = 0
     noncombat_stall_episodes = 0
     for episode_records in by_episode.values():
@@ -192,6 +195,8 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         last = episode_records[-1]
         deadlock_value = last.get("deadlock")
         deadlock = deadlock_value if isinstance(deadlock_value, Mapping) else {}
+        if deadlock:
+            liveness_failure_episodes += 1
         deadlock_kind = str(deadlock.get("kind", "")).strip().lower()
         if deadlock_kind == "combat_no_net_progress":
             combat_stall_episodes += 1
@@ -199,10 +204,32 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
             noncombat_stall_episodes += 1
 
         cycle_span = _integer(deadlock.get("cycle_span"))
+        if cycle_span is not None and cycle_span > 0:
+            cycle_episodes += 1
         tail_kinds = tuple(
             _kind(record.get("selected_action"))
             for record in episode_records[-16:]
         )
+        tail_actions = tuple(
+            record.get("selected_action")
+            if isinstance(record.get("selected_action"), Mapping)
+            else {}
+            for record in episode_records[-16:]
+        )
+        has_card_removal_purchase = any(
+            _kind(action) == "shop_purchase"
+            and isinstance(action.get("item"), Mapping)
+            and str(action["item"].get("category", "")).strip().lower()
+            == "card_removal"
+            for action in tail_actions
+        )
+        if (
+            cycle_span is not None
+            and cycle_span > 0
+            and has_card_removal_purchase
+            and "cancel_selection" in tail_kinds
+        ):
+            card_removal_cancel_cycle_episodes += 1
         alternating_selection_tail = (
             len(tail_kinds) >= 8
             and set(tail_kinds).issubset({"select_card", "deselect_card"})
@@ -272,6 +299,17 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         "selection_cycle_episode_count": selection_cycle_episodes,
         "selection_cycle_episode_rate": (
             selection_cycle_episodes / episode_count if episode_count else 0.0
+        ),
+        "cycle_episode_count": cycle_episodes,
+        "cycle_episode_rate": (
+            cycle_episodes / episode_count if episode_count else 0.0
+        ),
+        "liveness_failure_episode_count": liveness_failure_episodes,
+        "liveness_failure_episode_rate": (
+            liveness_failure_episodes / episode_count if episode_count else 0.0
+        ),
+        "card_removal_cancel_cycle_episode_count": (
+            card_removal_cancel_cycle_episodes
         ),
         "combat_progress_stall_episode_count": combat_stall_episodes,
         "noncombat_progress_stall_episode_count": noncombat_stall_episodes,
@@ -355,6 +393,31 @@ def evaluate_liveness_guard(
             }
         )
 
+    episode_count = _integer(telemetry.get("episode_count")) or 0
+    liveness_failure_rate = telemetry.get("liveness_failure_episode_rate")
+    if (
+        episode_count >= config.evaluation_guard_min_liveness_episodes
+        and isinstance(liveness_failure_rate, int | float)
+        and float(liveness_failure_rate)
+        >= config.evaluation_guard_max_liveness_failure_episode_rate
+    ):
+        violations.append(
+            {
+                "kind": "liveness_failure_collapse",
+                "observed": float(liveness_failure_rate),
+                "threshold": (
+                    config.evaluation_guard_max_liveness_failure_episode_rate
+                ),
+                "episodes": episode_count,
+                "failures": (
+                    _integer(
+                        telemetry.get("liveness_failure_episode_count")
+                    )
+                    or 0
+                ),
+            }
+        )
+
     enabled = config.evaluation_liveness_guard_enabled
     return {
         "schema_version": LIVENESS_GUARD_SCHEMA,
@@ -378,6 +441,12 @@ def evaluate_liveness_guard(
             ),
             "maximum_selection_cycle_episode_rate": (
                 config.evaluation_guard_max_selection_cycle_episode_rate
+            ),
+            "minimum_liveness_episodes": (
+                config.evaluation_guard_min_liveness_episodes
+            ),
+            "maximum_liveness_failure_episode_rate": (
+                config.evaluation_guard_max_liveness_failure_episode_rate
             ),
         },
     }

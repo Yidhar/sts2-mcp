@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact-resume recovery launcher for the v29 120256 checkpoint.
+"""Exact-resume recovery launcher for the v29 170119 checkpoint.
 
 This is intentionally a thin adapter over the audited v29 continuation
 control plane.  It changes only the immutable resume source to the latest
@@ -18,11 +18,18 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _base = None
-RECOVERY_SOURCE_RUN_ID = "d55c6f9a-c4d1-4b3f-95aa-e3cd75c25ce4"
-RECOVERY_SOURCE_ENVIRONMENT_STEPS = 120_256
-RECOVERY_SOURCE_CHECKPOINT_ID = "94b3ef10-a3d4-4618-b010-f6f91c60e8fd"
-RECOVERY_SOURCE_POLICY_VERSION = 1903
-RECOVERY_SOURCE_LEARNER_UPDATES = 1903
+RECOVERY_RUN_NAME = (
+    "full-run-revival-v29-failure-credit-v4-exact-continuation-350k-"
+    "recovery-170119"
+)
+RECOVERY_SUCCESSOR_LOG_NAME = (
+    "full-run-revival-v29-failure-credit-v4-exact-continuation-350k"
+)
+RECOVERY_SOURCE_RUN_ID = "188abedf-5ec4-4521-84f7-af01ab1fcd66"
+RECOVERY_SOURCE_ENVIRONMENT_STEPS = 170_119
+RECOVERY_SOURCE_CHECKPOINT_ID = "d7a8113e-087d-43c4-b1af-e9253e66f09a"
+RECOVERY_SOURCE_POLICY_VERSION = 2707
+RECOVERY_SOURCE_LEARNER_UPDATES = 2707
 RECOVERY_LEARNER_STALL_TIMEOUT_SECONDS = 1800.0
 
 
@@ -36,6 +43,16 @@ def _build_supervisor_command(paths: object, *, manifest_path: Path) -> tuple[st
         "--manifest",
         str(manifest_path),
     )
+
+
+def _recovery_successor_log_root(paths: object) -> Path:
+    """Keep durable supervisor state separate from the trainer's run root."""
+
+    return (
+        paths.artifact_root  # type: ignore[attr-defined]
+        / "runs"
+        / RECOVERY_SUCCESSOR_LOG_NAME
+    ).resolve(strict=False)
 
 
 def _validate_recovery_checkpoint_summary(
@@ -84,12 +101,15 @@ def _configure_recovery() -> None:
 
     # The run lineage and target remain the same.  Only this exact checkpoint
     # is a permitted recovery source for the stalled process.
+    # Use a new supervisor identity so the durable terminal manifest of the
+    # previous 120256 recovery cannot be mistaken for this launch.
+    _base.RUN_NAME = RECOVERY_RUN_NAME
     _base.SOURCE_RUN_ID = RECOVERY_SOURCE_RUN_ID
     _base.SOURCE_ENVIRONMENT_STEPS = RECOVERY_SOURCE_ENVIRONMENT_STEPS
     _base.ADDITIONAL_ENVIRONMENT_STEPS = _base.TARGET_ENVIRONMENT_STEPS - _base.SOURCE_ENVIRONMENT_STEPS
     _base.SOURCE_CHECKPOINT_ID = RECOVERY_SOURCE_CHECKPOINT_ID
-    _base.SOURCE_MANIFEST_SHA256 = "dbbd56525d5068ed5e1938a1108a3614375344071557d98ab206b5dfe4a4b642"
-    _base.SOURCE_METADATA_SHA256 = "7807e8e7102a2a48b18fc6347f6d9a54672976cfd9bee853943f2456ab2c49c8"
+    _base.SOURCE_MANIFEST_SHA256 = "48d4163a1fbae3048c18a7083499213de37bcca2708984b0765ed8b5cca7e7ba"
+    _base.SOURCE_METADATA_SHA256 = "254129733d16dc31211fd00cbb801fa4755ee837dfb250765f9e5d82e988e141"
     _base.SOURCE_POLICY_VERSION = RECOVERY_SOURCE_POLICY_VERSION
     _base.SOURCE_LEARNER_UPDATES = RECOVERY_SOURCE_LEARNER_UPDATES
     _base.SOURCE_CHECKPOINT_RELATIVE = Path(
@@ -100,6 +120,7 @@ def _configure_recovery() -> None:
     _base._validate_checkpoint_summary = _validate_recovery_checkpoint_summary
     _base.build_supervisor_command = _build_supervisor_command
     _base._configure_supervisor_core()
+    _base._core._successor_log_root = _recovery_successor_log_root
 
 
 def main(argv: Sequence[str] | None = None) -> int:

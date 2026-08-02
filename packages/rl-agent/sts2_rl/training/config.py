@@ -797,9 +797,11 @@ class RuntimeConfig:
     evaluation_liveness_guard_enabled: bool = False
     evaluation_guard_min_confirm_ready: int = 8
     evaluation_guard_min_multi_action_end_turn: int = 32
+    evaluation_guard_min_liveness_episodes: int = 8
     evaluation_guard_max_confirm_failure_rate: float = 0.95
     evaluation_guard_max_multi_action_end_turn_rate: float = 0.75
     evaluation_guard_max_selection_cycle_episode_rate: float = 0.75
+    evaluation_guard_max_liveness_failure_episode_rate: float = 0.50
 
     def __post_init__(self) -> None:
         for name in (
@@ -826,6 +828,7 @@ class RuntimeConfig:
             "final_audit_episodes",
             "evaluation_guard_min_confirm_ready",
             "evaluation_guard_min_multi_action_end_turn",
+            "evaluation_guard_min_liveness_episodes",
         ):
             _require_int(
                 getattr(self, name),
@@ -861,12 +864,15 @@ class RuntimeConfig:
             raise ValueError("runtime early_evaluation_steps require early_evaluation_episodes")
         if self.final_audit_steps and self.final_audit_episodes <= 0:
             raise ValueError("runtime final_audit_steps require final_audit_episodes")
-        if self.evaluation_liveness_guard_enabled and not self.early_evaluation_steps:
-            raise ValueError("runtime evaluation liveness guard requires early evaluation gates")
+        if self.evaluation_liveness_guard_enabled and not self.early_evaluation_steps and not self.evaluation_steps:
+            raise ValueError(
+                "runtime evaluation liveness guard requires early evaluation or " "scheduled validation gates"
+            )
         for name in (
             "evaluation_guard_max_confirm_failure_rate",
             "evaluation_guard_max_multi_action_end_turn_rate",
             "evaluation_guard_max_selection_cycle_episode_rate",
+            "evaluation_guard_max_liveness_failure_episode_rate",
         ):
             _require_finite_number(
                 getattr(self, name),
@@ -1105,9 +1111,11 @@ class TrainingConfig:
             "evaluation_liveness_guard_enabled",
             "evaluation_guard_min_confirm_ready",
             "evaluation_guard_min_multi_action_end_turn",
+            "evaluation_guard_min_liveness_episodes",
             "evaluation_guard_max_confirm_failure_rate",
             "evaluation_guard_max_multi_action_end_turn_rate",
             "evaluation_guard_max_selection_cycle_episode_rate",
+            "evaluation_guard_max_liveness_failure_episode_rate",
         ):
             runtime.pop(key)
         return payload

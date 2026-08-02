@@ -50,6 +50,7 @@ def test_v29_350k_recipe_preserves_completed_evaluation_state() -> None:
         75_000,
         125_000,
         150_000,
+        175_000,
         200_000,
         250_000,
         300_000,
