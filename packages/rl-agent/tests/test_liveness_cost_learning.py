@@ -1008,6 +1008,8 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
         (unroll,),
         current_policy_version=3,
         current_learner_update=0,
+        schedule_policy_version=515,
+        schedule_learner_update=512,
         credit_plans=plans,
         progress=lambda stage, payload: progress.append((stage, payload)),
     )
@@ -1021,6 +1023,8 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
     assert all(payload["liveness_record_steps"] == 1 for payload in record_starts)
     assert all(payload["liveness_record_candidates"] == 3 for payload in record_starts)
     assert metrics.liveness_autograd_microbatches == 2
+    assert metrics.liveness_head_calibration_active == 0
+    assert metrics.liveness_risk_actor_enabled == 1
     assert metrics.liveness_credit_plans == 2
     assert metrics.liveness_replayed_contexts == 2
 

@@ -52,10 +52,16 @@ class RevivalEfficiencyRewardSpec:
     fewer training revivals, and fewer decisions; it does not reward damage.
     """
 
-    version: str = field(default="sts2-run-survival-efficiency-v4", init=False)
+    version: str = field(default="sts2-run-survival-efficiency-v5", init=False)
     required_discount: float = field(default=1.0, init=False)
     hp_loss_weight: float = field(default=0.55, init=False)
-    revival_weight: float = field(default=0.20, init=False)
+    # v4 used ``0.20 * k / (k + 1)``. Its marginal cost fell below 2.2e-4
+    # by revival 30, making 34- and 160-revival victories nearly
+    # indistinguishable. v5 keeps the primary-success ordering contract while
+    # retaining useful resolution throughout the unlimited-revival preheat
+    # regime and the following finite-budget curriculum.
+    revival_linear_weight: float = field(default=0.005, init=False)
+    revival_cost_cap: float = field(default=0.35, init=False)
     pace_budget: float = field(default=0.05, init=False)
     hp_loss_scale: float = field(default=80.0, init=False)
 
@@ -139,6 +145,23 @@ def _bounded_resource_score(amount: float, scale: float) -> float:
     normalized_amount = max(0.0, float(amount))
     normalized_scale = max(1.0, float(scale))
     return normalized_amount / (normalized_amount + normalized_scale)
+
+
+def _revival_efficiency_cost(amount: float) -> float:
+    """Return the versioned, bounded cumulative v5 revival cost.
+
+    Every revival in the 64-revival curriculum carries the same 0.005
+    marginal cost. The 0.35 cap is reached only after 70 revivals, so no
+    in-curriculum revival loses resolution. Together with the 0.55 HP-loss and
+    0.05 pace budgets the maximum efficiency cost is 0.95, so terminal success
+    remains lexicographically ahead of terminal failure.
+    """
+
+    normalized_amount = max(0.0, float(amount))
+    raw_cost = (
+        REVIVAL_EFFICIENCY_REWARD_SPEC.revival_linear_weight * normalized_amount
+    )
+    return min(REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap, raw_cost)
 
 
 def _typed_terminal_result(result: EnvironmentResult, *, objective: TaskObjective) -> str:
@@ -311,9 +334,9 @@ class RevivalEfficiencyRewardCalculator:
                 REVIVAL_EFFICIENCY_REWARD_SPEC.hp_loss_scale,
             )
         )
-        revival_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.revival_weight * (
-            _bounded_resource_score(after_revivals, 1.0)
-            - _bounded_resource_score(before_revivals, 1.0)
+        revival_penalty = -(
+            _revival_efficiency_cost(after_revivals)
+            - _revival_efficiency_cost(before_revivals)
         )
         pace_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.pace_budget / float(
             self.maximum_episode_steps

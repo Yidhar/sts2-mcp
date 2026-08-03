@@ -209,7 +209,7 @@ def test_run_objective_fails_closed_without_typed_run_result() -> None:
 
 def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
-    assert identity["version"] == "sts2-run-survival-efficiency-v4"
+    assert identity["version"] == "sts2-run-survival-efficiency-v5"
     calculator = RevivalEfficiencyRewardCalculator(
         maximum_episode_steps=512,
     )
@@ -398,3 +398,29 @@ def test_explicit_combat_victory_reason_precedes_missing_terminal_player_hp() ->
         terminal_reason="combat_victory",
     )
     assert facts.combat_result == "victory"
+
+
+def test_v5_revival_cost_keeps_long_tail_resolution() -> None:
+    calculator = RevivalEfficiencyRewardCalculator(maximum_episode_steps=512)
+
+    first = calculator.evaluate(
+        _result(step=0, revivals_used=0),
+        _result(step=1, revivals_used=1, revivals_used_delta=1),
+    )
+    tail = calculator.evaluate(
+        _result(step=0, revivals_used=20),
+        _result(step=1, revivals_used=21, revivals_used_delta=1),
+    )
+    distant = calculator.evaluate(
+        _result(step=0, revivals_used=34),
+        _result(step=1, revivals_used=160, revivals_used_delta=126),
+    )
+    capped = calculator.evaluate(
+        _result(step=0, revivals_used=170),
+        _result(step=1, revivals_used=1_000_000, revivals_used_delta=999_830),
+    )
+
+    assert first.revival_penalty == pytest.approx(-0.005)
+    assert tail.revival_penalty == pytest.approx(-0.005)
+    assert distant.revival_penalty == pytest.approx(-0.18)
+    assert capped.revival_penalty == pytest.approx(0.0)

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from sts2_rl.checkpoints import V28_100K_FROZEN
+from sts2_rl.checkpoints import CheckpointIntegrityError, V28_100K_FROZEN
 from sts2_rl.models import RecurrentCandidateModel
 from sts2_rl.training import (
     TrainingState,
@@ -460,9 +460,13 @@ def test_frozen_v28_artifact_is_rejected_for_exact_resume_but_preflights_init() 
         ),
     )
 
+    # Reward-v5 now rejects this reward-v4 ancestor at the outer exact-resume
+    # identity boundary. On a runtime with the historical catalog the frozen
+    # ancestor guard remains the later failure. Both are exact-resume rejection;
+    # model-only preflight below is the reviewed migration path.
     with pytest.raises(
-        ValueError,
-        match="model-initialization-only; exact resume is forbidden",
+        (ValueError, CheckpointIntegrityError),
+        match="reward identity mismatch|model-initialization-only; exact resume is forbidden",
     ):
         preflight_training_checkpoint(
             checkpoint,

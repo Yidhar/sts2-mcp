@@ -28,6 +28,7 @@ from sts2_rl.models import RecurrentCandidateModel
 from .checkpointing import (
     ActorSupervisorState,
     EvaluationGateState,
+    TrainingScheduleState,
     TrainingState,
     actor_supervisor_state_from_metadata,
     evaluation_gate_state_from_metadata,
@@ -36,6 +37,8 @@ from .checkpointing import (
     preflight_model_initialization,
     preflight_training_checkpoint,
     save_training_checkpoint,
+    training_schedule_state_from_metadata,
+    training_state_from_metadata,
 )
 from .collector import EpisodeMetrics
 from .config import TrainingConfig, engine_revival_identity
@@ -648,6 +651,7 @@ def _evaluation_context(
     *,
     config: TrainingConfig,
     state: TrainingState,
+    schedule_state: TrainingScheduleState | None = None,
     evaluation_gate: int,
     gate_kind: str,
     parent_checkpoint: Path | None,
@@ -655,6 +659,9 @@ def _evaluation_context(
     runtime_provenance: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Describe the exact in-memory policy and runtime evaluated at one gate."""
+
+    if schedule_state is None:
+        schedule_state = TrainingScheduleState()
 
     if load_mode == "model_initialization" and state.environment_steps == 0 and state.policy_version == 0:
         checkpoint_relation = "model_parameter_initialization"
@@ -669,6 +676,12 @@ def _evaluation_context(
         "actual_environment_steps": state.environment_steps,
         "policy_version": state.policy_version,
         "actor_policy_version": state.actor_policy_version,
+        "training_schedule_state": schedule_state.to_mapping(),
+        "effective_schedule": {
+            "environment_steps": schedule_state.effective_environment_steps(state),
+            "learner_updates": schedule_state.effective_learner_updates(state),
+            "policy_version": schedule_state.effective_policy_version(state),
+        },
         "policy_model_state_sha256": _model_state_sha256(resources.collector_model),
         "checkpoint_association": {
             "relation": checkpoint_relation,
@@ -692,6 +705,7 @@ def _save(
     *,
     config: TrainingConfig,
     state: TrainingState,
+    schedule_state: TrainingScheduleState,
     checkpoint_root: Path,
     prefix: str,
     parent_checkpoint: Path | None,
@@ -706,6 +720,7 @@ def _save(
         config=config,
         resources=resources,
         state=state,
+        schedule_state=schedule_state,
         parent_checkpoint=parent_checkpoint,
         run_id=run_id,
         checkpoint_load_mode=load_mode,
@@ -786,6 +801,7 @@ def run_training(
     parent_checkpoint: Path | None = None
     load_mode = "fresh"
     state = TrainingState()
+    schedule_state = TrainingScheduleState()
     actor_supervisor_state = ActorSupervisorState()
     try:
         if prevalidated_resume is not None:
@@ -796,6 +812,7 @@ def run_training(
                 config=config,
                 resources=resources,
             )
+            schedule_state = training_schedule_state_from_metadata(prevalidated_resume.metadata)
             actor_supervisor_state = actor_supervisor_state_from_metadata(prevalidated_resume.metadata)
         elif prevalidated_initialization is not None:
             parent_checkpoint = initialize_model_from_checkpoint(
@@ -804,6 +821,10 @@ def run_training(
                 resources=resources,
             )
             load_mode = "model_initialization"
+            if config.runtime.model_initialization_schedule_mode == "inherit":
+                source_state = training_state_from_metadata(prevalidated_initialization.metadata)
+                source_schedule = training_schedule_state_from_metadata(prevalidated_initialization.metadata)
+                schedule_state = source_schedule.inherited_after(source_state)
 
         previous_sdpa = prevalidated_resume.metadata.get("sdpa_backend") if prevalidated_resume is not None else None
         resources.sdpa_backend_transition = sdpa_transition_provenance(
@@ -835,6 +856,12 @@ def run_training(
             {
                 "run_id": run_id,
                 "state": asdict(state),
+                "training_schedule_state": schedule_state.to_mapping(),
+                "effective_schedule": {
+                    "environment_steps": schedule_state.effective_environment_steps(state),
+                    "learner_updates": schedule_state.effective_learner_updates(state),
+                    "policy_version": schedule_state.effective_policy_version(state),
+                },
                 "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
                 "config_fingerprint_sha256": config.fingerprint_sha256(),
@@ -851,6 +878,11 @@ def run_training(
                     "source_checkpoint": source_checkpoint,
                     "network_parameters_initialized": (load_mode == "model_initialization"),
                     "optimizer_rollouts_rng_and_counters_reset": (load_mode == "model_initialization"),
+                    "schedule_mode": config.runtime.model_initialization_schedule_mode,
+                    "schedule_inherited": (
+                        load_mode == "model_initialization"
+                        and config.runtime.model_initialization_schedule_mode == "inherit"
+                    ),
                 },
             },
         )
@@ -937,6 +969,7 @@ def run_training(
                 resources,
                 config=config,
                 state=state,
+                schedule_state=schedule_state,
                 evaluation_gate=evaluation_step,
                 gate_kind=gate_kind,
                 parent_checkpoint=parent_checkpoint,
@@ -1015,23 +1048,42 @@ def run_training(
             )
             completed_evaluations.add(0)
 
-        def has_due_final_audit() -> bool:
+        def has_due_final_audit(*, observed_environment_steps: int | None = None) -> bool:
+            effective_steps = (
+                state.environment_steps
+                if observed_environment_steps is None
+                else observed_environment_steps
+            )
             return any(
-                step <= state.environment_steps and step not in completed_final_audits
+                step <= effective_steps and step not in completed_final_audits
                 for step in config.runtime.final_audit_steps
             )
 
-        def has_due_evaluation(*, include_final_audits: bool = False) -> bool:
+        def has_due_evaluation(
+            *,
+            include_final_audits: bool = False,
+            observed_environment_steps: int | None = None,
+        ) -> bool:
+            effective_steps = (
+                state.environment_steps
+                if observed_environment_steps is None
+                else observed_environment_steps
+            )
             return (
                 any(
-                    step <= state.environment_steps and step not in completed_evaluations
+                    step <= effective_steps and step not in completed_evaluations
                     for step in config.runtime.evaluation_steps
                 )
                 or any(
-                    step <= state.environment_steps and step not in completed_early_evaluations
+                    step <= effective_steps and step not in completed_early_evaluations
                     for step in config.runtime.early_evaluation_steps
                 )
-                or (include_final_audits and has_due_final_audit())
+                or (
+                    include_final_audits
+                    and has_due_final_audit(
+                        observed_environment_steps=effective_steps,
+                    )
+                )
             )
 
         def run_due_evaluations(
@@ -1102,12 +1154,15 @@ def run_training(
                     return stop
             return None
 
+        schedule_environment_steps_offset = schedule_state.environment_steps_offset
         pipeline = ActorLearnerPipeline(
             resources,
             total_environment_steps=config.runtime.total_environment_steps,
             starting_environment_steps=state.environment_steps,
             starting_policy_version=state.actor_policy_version,
-            epsilon=lambda steps: exploration_epsilon(config, steps),
+            epsilon=lambda steps, _offset=schedule_environment_steps_offset: exploration_epsilon(
+                config, _offset + steps
+            ),
             starting_episode_count=state.episodes,
             deterministic_probe_interval_episodes=(config.rollout.deterministic_probe_interval_episodes),
             deterministic_probe_environment_steps=(config.rollout.deterministic_probe_environment_steps),
@@ -1327,12 +1382,13 @@ def run_training(
                     config.failure_credit.sample_records,
                     quotas=_failure_credit_quotas(
                         config,
-                        learner_updates=state.learner_updates,
+                        learner_updates=schedule_state.effective_learner_updates(state),
                     ),
                     current_policy_version=policy_version_before_update,
                     policy_gradient_max_lag=(config.failure_credit.policy_gradient_max_lag),
                     risk_actor_enabled=(
-                        state.learner_updates >= config.failure_credit.liveness_risk_actor_start_update
+                        schedule_state.effective_learner_updates(state)
+                        >= config.failure_credit.liveness_risk_actor_start_update
                     ),
                 )
                 if resources.failure_credit_replay is not None
@@ -1434,6 +1490,8 @@ def run_training(
                 batch,
                 current_policy_version=policy_version_before_update,
                 current_learner_update=state.learner_updates,
+                schedule_policy_version=schedule_state.effective_policy_version(state),
+                schedule_learner_update=schedule_state.effective_learner_updates(state),
                 transaction_traces=transaction_traces,
                 credit_plans=credit_plans,
                 episodic_sequences=episodic_sequences,
@@ -1453,6 +1511,9 @@ def run_training(
                     "policy_version": state.policy_version,
                     "policy_version_before_update": policy_version_before_update,
                     "policy_version_after_update": state.policy_version,
+                    "schedule_environment_steps": schedule_state.effective_environment_steps(state),
+                    "schedule_learner_updates": schedule_state.effective_learner_updates(state),
+                    "schedule_policy_version": schedule_state.effective_policy_version(state),
                     "actor_progress": (
                         asdict(pipeline.actor_progress) if pipeline.actor_progress is not None else None
                     ),
@@ -1637,11 +1698,13 @@ def run_training(
                             if episode.liveness_probe
                             else exploration_epsilon(
                                 config,
-                                state.environment_steps,
+                                schedule_state.effective_environment_steps(state),
                             )
                         ),
                         "run_maximum_observed_candidates": (state.maximum_observed_candidates),
-                        "epsilon": exploration_epsilon(config, state.environment_steps),
+                        "epsilon": exploration_epsilon(
+                            config, schedule_state.effective_environment_steps(state)
+                        ),
                         "collector_timings": (episode.timings.to_mapping() if episode.timings is not None else None),
                         "rollout_queue": resources.rollout_queue.metrics(),
                         "transaction_traces_emitted": len(episode.transaction_traces),
@@ -1691,8 +1754,10 @@ def run_training(
                         ),
                     },
                 )
-                crossed_evaluation = has_due_evaluation()
-                crossed_checkpoint = state.environment_steps >= next_checkpoint
+                crossed_evaluation = has_due_evaluation(
+                    observed_environment_steps=pipeline.environment_steps,
+                )
+                crossed_checkpoint = pipeline.environment_steps >= next_checkpoint
                 if crossed_evaluation or crossed_checkpoint:
                     maintenance_requested = True
                     if pipeline.alive:
@@ -1764,6 +1829,7 @@ def run_training(
                         resources,
                         config=config,
                         state=state,
+                        schedule_state=schedule_state,
                         checkpoint_root=checkpoint_root / f"run-{run_id}",
                         prefix="guard-stop",
                         parent_checkpoint=parent_checkpoint,
@@ -1792,6 +1858,7 @@ def run_training(
                         resources,
                         config=config,
                         state=state,
+                        schedule_state=schedule_state,
                         checkpoint_root=checkpoint_root / f"run-{run_id}",
                         prefix="periodic",
                         parent_checkpoint=parent_checkpoint,
@@ -1858,6 +1925,7 @@ def run_training(
             resources,
             config=config,
             state=state,
+            schedule_state=schedule_state,
             checkpoint_root=checkpoint_root / f"run-{run_id}",
             prefix="final",
             parent_checkpoint=parent_checkpoint,

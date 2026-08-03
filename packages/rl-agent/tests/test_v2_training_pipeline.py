@@ -2275,12 +2275,19 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
             (unroll,),
             current_policy_version=0,
             current_learner_update=0,
+            schedule_policy_version=(
+                resources.learner.config.entropy_decay_updates
+            ),
+            schedule_learner_update=0,
             progress=lambda stage, payload: progress.append((stage, payload)),
         )
         assert metrics.environment_steps == 2
         assert metrics.to_mapping()["batch_environment_steps"] == 2
         assert "environment_steps" not in metrics.to_mapping()
         assert metrics.unrolls == 1
+        assert metrics.entropy_weight == pytest.approx(
+            resources.learner.config.entropy_weight_end
+        )
         assert torch.isfinite(torch.tensor(metrics.loss))
         assert metrics.importance_ratio_mean > 0.0
         assert progress[0][0] == "validation_complete"
@@ -3955,6 +3962,45 @@ def test_exact_resume_accepts_legacy_checkpoint_without_candidate_diagnostic() -
     assert migrated.learner_updates == 7
     assert migrated.episodes == 3
     assert migrated.maximum_observed_candidates == 0
+
+
+def test_training_schedule_state_inherits_effective_clocks_without_counter_resume() -> None:
+    source_state = TrainingState(
+        environment_steps=80_000,
+        learner_updates=1_250,
+        policy_version=1_250,
+        actor_policy_version=1_250,
+    )
+    source_schedule = checkpointing_module.TrainingScheduleState(
+        environment_steps_offset=250_000,
+        learner_updates_offset=3_900,
+        policy_version_offset=3_900,
+    )
+
+    inherited = source_schedule.inherited_after(source_state)
+    fresh_lineage = TrainingState()
+
+    assert inherited.effective_environment_steps(fresh_lineage) == 330_000
+    assert inherited.effective_learner_updates(fresh_lineage) == 5_150
+    assert inherited.effective_policy_version(fresh_lineage) == 5_150
+    assert checkpointing_module.training_schedule_state_from_metadata({}) == (
+        checkpointing_module.TrainingScheduleState()
+    )
+    assert checkpointing_module.training_schedule_state_from_metadata(
+        {"training_schedule_state": inherited.to_mapping()}
+    ) == inherited
+
+
+def test_training_schedule_state_rejects_partial_metadata() -> None:
+    with pytest.raises(ValueError, match="training_schedule_state keys mismatch"):
+        checkpointing_module.training_schedule_state_from_metadata(
+            {
+                "training_schedule_state": {
+                    "version": "sts2-training-schedule-state-v1",
+                    "environment_steps_offset": 1,
+                }
+            }
+        )
 
 
 def test_actor_supervisor_metadata_has_strict_legacy_compatibility() -> None:

@@ -3,6 +3,7 @@
 from .checkpointing import (
     ActorSupervisorState,
     EvaluationGateState,
+    TrainingScheduleState,
     TrainingState,
     actor_supervisor_state_from_metadata,
     checkpoint_summary,
@@ -12,6 +13,7 @@ from .checkpointing import (
     preflight_model_initialization,
     preflight_training_checkpoint,
     save_training_checkpoint,
+    training_schedule_state_from_metadata,
 )
 from .collector import (
     CollectedEpisode,
@@ -126,6 +128,7 @@ __all__ = [
     "RuntimeConfig",
     "TrainingConfig",
     "TrainingResources",
+    "TrainingScheduleState",
     "TrainingState",
     "TransactionEffect",
     "TransactionLearningConfig",
@@ -160,4 +163,5 @@ __all__ = [
     "seed_everything",
     "summarize_evaluation",
     "training_config_from_mapping",
+    "training_schedule_state_from_metadata",
 ]

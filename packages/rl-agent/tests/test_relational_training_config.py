@@ -568,6 +568,39 @@ def test_preheat_and_standard_discount_contracts_fail_closed() -> None:
         )
 
 
+def test_v32_budget64_inherits_mature_schedules_without_changing_model_shape() -> None:
+    experiment_root = Path(__file__).parents[1] / "config" / "experiments"
+    v31 = load_training_config(
+        profile="preheat",
+        config_path=(
+            experiment_root
+            / "full_run_revival_v31_failure_credit_capacity_model_init.toml"
+        ),
+    )
+    v32 = load_training_config(
+        profile="preheat",
+        config_path=(
+            experiment_root / "full_run_revival_v32_budget64_mature_model_init.toml"
+        ),
+    )
+
+    assert v32.model == v31.model
+    assert v32.curriculum.revival_budget == 64
+    assert v31.curriculum.revival_budget == -1
+    assert v32.runtime.model_initialization_schedule_mode == "inherit"
+    assert v32.failure_credit.sample_records == 4
+    assert v32.failure_credit.direct_witness_quota == 0
+    assert v32.failure_credit.multi_edge_cycle_quota == 0
+    assert v32.failure_credit.risk_sequence_quota == 1
+    assert v32.failure_credit.unresolved_stall_quota == 1
+    assert v32.failure_credit.completion_control_quota == 1
+    assert v32.failure_credit.matched_outcome_pair_quota == 1
+    assert v32.runtime.seed == v31.runtime.seed == 5_000_000
+    assert v32.runtime.evaluation_guard_min_liveness_episodes == 16
+    assert v32.runtime.evaluation_guard_liveness_baseline_failures == 2
+    assert v32.runtime.evaluation_guard_liveness_baseline_episodes == 16
+
+
 def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> None:
     base = TrainingConfig()
     moved_outputs = replace(
@@ -580,6 +613,14 @@ def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> Non
         ),
     )
     assert moved_outputs.lineage_mapping() == base.lineage_mapping()
+    inherited_schedule = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            model_initialization_schedule_mode="inherit",
+        ),
+    )
+    assert inherited_schedule.lineage_mapping() == base.lineage_mapping()
     changed_unroll = replace(
         base,
         rollout=replace(base.rollout, unroll_length=32),

@@ -43,6 +43,7 @@ from .failure_credit import (
     FAILURE_CREDIT_COLLECTOR_VERSION,
     FAILURE_CREDIT_COMPILER_VERSION,
     FAILURE_CREDIT_DETECTOR_VERSION,
+    FAILURE_CREDIT_MATCHER_VERSION,
     FAILURE_CREDIT_SCHEMA_VERSION,
     FAILURE_EVIDENCE_REPLAY_VERSION,
     BoundedFailureCreditReplay,
@@ -127,6 +128,7 @@ def _failure_credit_abi() -> dict[str, str]:
         "schema": FAILURE_CREDIT_SCHEMA_VERSION,
         "collector": FAILURE_CREDIT_COLLECTOR_VERSION,
         "detector": FAILURE_CREDIT_DETECTOR_VERSION,
+        "matcher": FAILURE_CREDIT_MATCHER_VERSION,
         "compiler": FAILURE_CREDIT_COMPILER_VERSION,
         "replay": FAILURE_EVIDENCE_REPLAY_VERSION,
         "liveness_heads": _LIVENESS_COST_HEAD_ABI,
@@ -214,6 +216,57 @@ class TrainingState:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.policy_version < self.actor_policy_version:
             raise ValueError("actor policy version cannot be newer than learner policy")
+
+
+_TRAINING_SCHEDULE_STATE_VERSION = "sts2-training-schedule-state-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingScheduleState:
+    """Independent optimization/exploration clocks for a training lineage.
+
+    Model-parameter initialization intentionally resets optimizer, replay,
+    rollout, RNG, and lineage counters. It must not silently restart mature
+    entropy, epsilon, calibration, and risk-actor schedules, however. These
+    offsets preserve that maturity without pretending the new run is an exact
+    continuation of the source checkpoint.
+    """
+
+    environment_steps_offset: int = 0
+    learner_updates_offset: int = 0
+    policy_version_offset: int = 0
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+
+    def effective_environment_steps(self, state: TrainingState) -> int:
+        return self.environment_steps_offset + state.environment_steps
+
+    def effective_learner_updates(self, state: TrainingState) -> int:
+        return self.learner_updates_offset + state.learner_updates
+
+    def effective_policy_version(self, state: TrainingState) -> int:
+        return self.policy_version_offset + state.policy_version
+
+    def inherited_after(self, state: TrainingState) -> TrainingScheduleState:
+        """Freeze this source lineage's effective clocks as new offsets."""
+
+        return TrainingScheduleState(
+            environment_steps_offset=self.effective_environment_steps(state),
+            learner_updates_offset=self.effective_learner_updates(state),
+            policy_version_offset=self.effective_policy_version(state),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "version": _TRAINING_SCHEDULE_STATE_VERSION,
+            "environment_steps_offset": self.environment_steps_offset,
+            "learner_updates_offset": self.learner_updates_offset,
+            "policy_version_offset": self.policy_version_offset,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +787,36 @@ def training_state_from_metadata(metadata: dict[str, Any]) -> TrainingState:
     return TrainingState(**raw)
 
 
+def training_schedule_state_from_metadata(metadata: Mapping[str, Any]) -> TrainingScheduleState:
+    """Load schedule offsets, deriving the legacy zero-offset contract.
+
+    A checkpoint without this field predates schedule inheritance. Its own
+    counters remain the complete effective clocks, represented by zero offsets.
+    Present payloads are strict and never partially repaired.
+    """
+
+    raw = metadata.get("training_schedule_state")
+    if raw is None:
+        return TrainingScheduleState()
+    if not isinstance(raw, Mapping):
+        raise TypeError("checkpoint training_schedule_state must be an object")
+    expected = {
+        "version",
+        "environment_steps_offset",
+        "learner_updates_offset",
+        "policy_version_offset",
+    }
+    if set(raw) != expected:
+        raise ValueError("checkpoint training_schedule_state keys mismatch")
+    if raw.get("version") != _TRAINING_SCHEDULE_STATE_VERSION:
+        raise ValueError("unsupported checkpoint training_schedule_state version")
+    return TrainingScheduleState(
+        environment_steps_offset=raw["environment_steps_offset"],
+        learner_updates_offset=raw["learner_updates_offset"],
+        policy_version_offset=raw["policy_version_offset"],
+    )
+
+
 def actor_supervisor_state_from_metadata(
     metadata: Mapping[str, Any],
 ) -> ActorSupervisorState:
@@ -873,6 +956,7 @@ def _validate_metadata(
     elif isinstance(execution_provenance, Mapping) and ("sdpa_backend" in execution_provenance):
         raise ValueError("checkpoint SDPA transition has no recorded current execution state")
     training_state = training_state_from_metadata(metadata)
+    training_schedule_state_from_metadata(metadata)
     actor_supervisor_state_from_metadata(metadata)
     evaluation_state = evaluation_gate_state_from_metadata(metadata)
     _validate_evaluation_gate_state_horizon(evaluation_state, training_state)
@@ -1025,6 +1109,7 @@ def save_training_checkpoint(
     config: TrainingConfig,
     resources: TrainingResources,
     state: TrainingState,
+    schedule_state: TrainingScheduleState | None = None,
     parent_checkpoint: str | Path | None = None,
     run_id: str | None = None,
     checkpoint_load_mode: str | None = None,
@@ -1035,6 +1120,10 @@ def save_training_checkpoint(
 ) -> Path:
     """Publish a checkpoint while the actor is quiescent between episodes."""
 
+    if schedule_state is None:
+        schedule_state = TrainingScheduleState()
+    elif not isinstance(schedule_state, TrainingScheduleState):
+        raise TypeError("schedule_state must be TrainingScheduleState")
     if actor_supervisor_state is None:
         actor_supervisor_state = ActorSupervisorState()
     elif not isinstance(actor_supervisor_state, ActorSupervisorState):
@@ -1140,6 +1229,7 @@ def save_training_checkpoint(
             "contract": contract_metadata(),
             "provenance": provenance,
             "training_state": asdict(state),
+            "training_schedule_state": schedule_state.to_mapping(),
             "actor_supervisor_state": actor_supervisor_state.to_mapping(),
             "training_config": config.to_mapping(),
             "lineage_config": config.lineage_mapping(),
@@ -1511,6 +1601,7 @@ def checkpoint_summary(checkpoint: str | Path) -> dict[str, Any]:
         "root": str(validated.root),
         "checkpoint_id": validated.manifest.get("checkpoint_id"),
         "training_state": validated.metadata.get("training_state"),
+        "training_schedule_state": training_schedule_state_from_metadata(validated.metadata).to_mapping(),
         "actor_supervisor_state": actor_supervisor_state_from_metadata(validated.metadata).to_mapping(),
         "evaluation_state": (evaluation_state.to_mapping() if evaluation_state is not None else None),
         "format": validated.metadata.get("format"),
@@ -1521,6 +1612,7 @@ def checkpoint_summary(checkpoint: str | Path) -> dict[str, Any]:
 __all__ = [
     "ActorSupervisorState",
     "EvaluationGateState",
+    "TrainingScheduleState",
     "TrainingState",
     "actor_supervisor_state_from_metadata",
     "checkpoint_summary",
@@ -1530,5 +1622,6 @@ __all__ = [
     "preflight_model_initialization",
     "preflight_training_checkpoint",
     "save_training_checkpoint",
+    "training_schedule_state_from_metadata",
     "training_state_from_metadata",
 ]

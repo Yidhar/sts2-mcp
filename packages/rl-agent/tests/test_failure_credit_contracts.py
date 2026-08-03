@@ -574,6 +574,56 @@ def test_outcome_matcher_enriches_an_incoming_attributed_failure() -> None:
     assert pair.better.step.selected_action.comparison != (pair.worse.step.selected_action.comparison)
 
 
+def test_outcome_matcher_uses_unresolved_stall_only_with_exact_completion_contrast() -> None:
+    failure_context = _context(
+        context_id="stall-match-failure",
+        count=3,
+        action_index=1,
+    )
+    failure_incident = _failed_incident(
+        failure_context,
+        incident_id="stall-match-failure-source",
+        outcome=FailureOutcome.DEADLOCK_STALL,
+        witnesses=(),
+        detector_window_steps=256,
+    )
+    failure = EvidenceRecord(
+        incident=failure_incident,
+        plan=CreditCompiler().compile(failure_incident),
+    )
+    completion = _completion_record(
+        _context(
+            context_id="stall-match-completion",
+            count=3,
+            action_index=0,
+        ),
+        incident_id="stall-match-completion-source",
+    )
+
+    assert EvidenceStratum.UNRESOLVED_STALL in failure.plan.strata
+    assert failure.plan.direct_policy_targets == ()
+    publication = OutcomePairMatcher(maximum_pairs_per_publication=1).match(
+        (failure,),
+        retained_records=(completion,),
+    )
+
+    assert publication.matched_pair_count == 1
+    enriched = publication.records[0]
+    # Once an exact completion contrast is attached the formerly unresolved
+    # local stall becomes resolved contrast evidence; the risk sequence remains
+    # as its encounter-level provenance.
+    assert EvidenceStratum.RISK_SEQUENCE in enriched.plan.strata
+    assert EvidenceStratum.UNRESOLVED_STALL not in enriched.plan.strata
+    assert EvidenceStratum.MATCHED_OUTCOME_PAIR in enriched.plan.strata
+    pair = enriched.plan.contrast_policy_targets[0].pair
+    assert pair.worse.incident_id == failure.incident.incident_id
+    assert pair.better.incident_id == completion.incident.incident_id
+    assert pair.worse.step.node.comparison == pair.better.step.node.comparison
+    assert pair.worse.step.selected_action.comparison != (
+        pair.better.step.selected_action.comparison
+    )
+
+
 def test_outcome_matcher_replaces_a_retained_failure_atomically() -> None:
     failure = _direct_failure_record(
         _context(context_id="retained-failure", action_index=1),

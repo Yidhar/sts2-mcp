@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, replace
+from typing import Final
 
 from .compiler import CreditCompiler, CreditCompilerConfig
 from .contracts import (
@@ -34,6 +35,8 @@ from .contracts import (
     WitnessKind,
 )
 from .corpus import EvidenceRecord
+
+FAILURE_CREDIT_MATCHER_VERSION: Final = "sts2-outcome-pair-matcher-v2"
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -106,7 +109,15 @@ def _completion_step_indices(record: EvidenceRecord) -> tuple[int, ...]:
 
 
 def _attributed_failure_step_indices(record: EvidenceRecord) -> tuple[int, ...]:
-    """Return only detector-attributed policy decisions, never a risk tail."""
+    """Return failure-arm decisions eligible for an exact outcome contrast.
+
+    Direct and cycle witnesses remain the strongest local attribution. A
+    detector-confirmed unresolved stall has no defensible single-step AVOID
+    target, but its immutable risk sequence may still be used as the *worse*
+    arm when another episode demonstrates a different action from the exact
+    same comparison node and candidate multiset completing the scope. The
+    matcher therefore adds information rather than inventing escape credit.
+    """
 
     incident = record.incident
     if (
@@ -119,8 +130,22 @@ def _attributed_failure_step_indices(record: EvidenceRecord) -> tuple[int, ...]:
     ):
         return ()
     candidates = {target.step_index for target in record.plan.direct_policy_targets}
-    candidates.update(step_index for target in record.plan.cycle_policy_targets for step_index in target.step_indices)
-    return tuple(index for index in sorted(candidates) if incident.context.steps[index].actor_eligible)
+    candidates.update(
+        step_index
+        for target in record.plan.cycle_policy_targets
+        for step_index in target.step_indices
+    )
+    if not candidates and EvidenceStratum.UNRESOLVED_STALL in record.plan.strata:
+        candidates.update(
+            step_index
+            for sequence in record.plan.risk_sequences
+            for step_index in sequence.step_indices
+        )
+    return tuple(
+        index
+        for index in sorted(candidates)
+        if incident.context.steps[index].actor_eligible
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,6 +368,7 @@ class OutcomePairMatcher:
 
 
 __all__ = [
+    "FAILURE_CREDIT_MATCHER_VERSION",
     "OutcomeMatchPublication",
     "OutcomePairMatcher",
 ]

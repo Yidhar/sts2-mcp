@@ -796,6 +796,10 @@ class RuntimeConfig:
     # an exact resume still restores model/optimizer/replay/RNG/counters while
     # allowing a reviewed ROCm kernel hardening transition.
     rocm_sdpa_backend: Literal["auto", "math"] = "auto"
+    # Model initialization always starts a new lineage. This execution-time
+    # migration choice controls only whether mature schedule clocks are carried
+    # across that explicit boundary; optimizer/replay/RNG/counters still reset.
+    model_initialization_schedule_mode: Literal["reset", "inherit"] = "reset"
     total_environment_steps: int = 1_000_000
     seed: int = 0
     log_dir: str = "runs/recurrent-vtrace"
@@ -919,6 +923,10 @@ class RuntimeConfig:
             raise TypeError("runtime.collector_device must be a non-empty string")
         if self.rocm_sdpa_backend not in ("auto", "math"):
             raise ValueError("runtime.rocm_sdpa_backend must be 'auto' or 'math'")
+        if self.model_initialization_schedule_mode not in ("reset", "inherit"):
+            raise ValueError(
+                "runtime.model_initialization_schedule_mode must be 'reset' or 'inherit'"
+            )
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -1131,6 +1139,7 @@ class TrainingConfig:
             # Kernel backend selection is execution provenance like the
             # resolved device/driver, not optimizer or task semantics.
             "rocm_sdpa_backend",
+            "model_initialization_schedule_mode",
             "total_environment_steps",
             "log_dir",
             "checkpoint_dir",

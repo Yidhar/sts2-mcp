@@ -55,7 +55,11 @@ from .corpus import (
     evidence_actor_policy_versions,
     evidence_record_storage_nbytes,
 )
-from .matcher import OutcomeMatchPublication, OutcomePairMatcher
+from .matcher import (
+    FAILURE_CREDIT_MATCHER_VERSION,
+    OutcomeMatchPublication,
+    OutcomePairMatcher,
+)
 from .pipeline import (
     FAILURE_CREDIT_COLLECTOR_VERSION,
     FAILURE_CREDIT_DETECTOR_VERSION,
@@ -72,6 +76,7 @@ __all__ = [
     "FAILURE_CREDIT_COLLECTOR_VERSION",
     "FAILURE_CREDIT_COMPILER_VERSION",
     "FAILURE_CREDIT_DETECTOR_VERSION",
+    "FAILURE_CREDIT_MATCHER_VERSION",
     "FAILURE_CREDIT_SCHEMA_VERSION",
     "FAILURE_EVIDENCE_REPLAY_VERSION",
     "BoundedFailureCreditReplay",

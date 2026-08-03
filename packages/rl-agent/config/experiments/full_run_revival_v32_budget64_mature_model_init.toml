@@ -1,0 +1,94 @@
+# Finite-revival successor to the verified v31 post-75k breakthrough policy.
+# This is an explicit model-initialization lineage: network parameters and
+# mature entropy/exploration/liveness schedule clocks are inherited, while
+# optimizer, replay, RNG, rollout queues, counters and journals reset. Reward
+# contract v5 restores long-tail revival-cost resolution and the engine-native
+# revival budget is capped at 64.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.002
+entropy_decay_updates = 3000
+
+[rollout]
+queue_capacity = 24
+
+[transaction_learning]
+# Failure-credit v5 is the sole transaction/deadlock learning plane.
+enabled = false
+
+[failure_credit]
+mode = "learning"
+replay_capacity = 4096
+replay_byte_capacity = 2147483648
+# Keep the reviewed 256-step semantic evidence horizon. Online v30 records
+# reached about 89 MiB because collision-auditable node identities dominate
+# storage; truncating the context would discard causal evidence. The 2 GiB
+# host-memory budget matches episodic replay and prevents 512 MiB churn.
+# Learner backward, not collection, is the measured bottleneck. Four formal
+# records retain risk/stall/completion/matched coverage while removing the two
+# structurally sparse quota reservations and halving worst-case liveness replay.
+sample_records = 4
+burn_in_steps = 32
+maximum_context_steps = 256
+maximum_episode_completion_controls = 32
+maximum_episode_completion_bytes = 134217728
+direct_witness_quota = 0
+multi_edge_cycle_quota = 0
+risk_sequence_quota = 1
+unresolved_stall_quota = 1
+completion_control_quota = 1
+matched_outcome_pair_quota = 1
+maximum_matched_pairs_per_publication = 8
+policy_gradient_max_lag = 128
+liveness_head_calibration_updates = 256
+liveness_risk_actor_start_update = 512
+liveness_records_per_autograd_batch = 1
+liveness_tbptt_window_steps = 16
+liveness_maximum_contexts_per_record = 2
+liveness_maximum_replayed_steps_per_update = 4096
+liveness_maximum_replayed_candidates_per_update = 1048576
+liveness_value_critic_weight = 0.10
+liveness_cost_critic_weight = 0.25
+liveness_cost_actor_weight = 0.10
+liveness_direct_policy_weight = 0.25
+liveness_cycle_policy_weight = 0.10
+liveness_contrast_policy_weight = 0.10
+liveness_completion_policy_weight = 0.0
+liveness_risk_advantage_clip = 0.25
+liveness_contrast_margin = 0.10
+
+[episodic_learning]
+fresh_policy_sequences = 1
+
+[curriculum]
+# Complete-run coverage remains the primary objective. The environment may
+# revive at most 64 times, while reward v5 keeps every revival through the
+# useful long tail visible to credit assignment.
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+
+[runtime]
+rocm_sdpa_backend = "math"
+model_initialization_schedule_mode = "inherit"
+total_environment_steps = 250000
+seed = 5000000
+log_dir = "runs/full-run-revival-v32-budget64-mature-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v32-budget64-mature-model-init"
+checkpoint_interval_steps = 10000
+evaluation_steps = [0, 25000, 50000, 75000, 100000, 150000, 200000]
+evaluation_episodes = 16
+early_evaluation_steps = [5000, 10000]
+early_evaluation_episodes = 16
+final_audit_steps = [250000]
+final_audit_episodes = 64
+evaluation_liveness_guard_enabled = true
+# The verified v31 post-75k control has 2/16 held-out liveness failures on this
+# unchanged seed namespace. Never stop from fewer than 16 evaluation episodes.
+evaluation_guard_min_liveness_episodes = 16
+evaluation_guard_liveness_baseline_failures = 2
+evaluation_guard_liveness_baseline_episodes = 16
+evaluation_guard_min_liveness_regression_rate = 0.20

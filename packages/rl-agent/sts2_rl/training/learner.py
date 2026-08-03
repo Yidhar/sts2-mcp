@@ -1543,6 +1543,8 @@ class VTraceLearner:
         *,
         current_policy_version: int,
         current_learner_update: int,
+        schedule_policy_version: int | None = None,
+        schedule_learner_update: int | None = None,
         transaction_traces: tuple[TransactionTrace, ...] = (),
         credit_plans: tuple[CreditPlan, ...] = (),
         episodic_sequences: tuple[ReplaySequence, ...] = (),
@@ -1567,6 +1569,16 @@ class VTraceLearner:
             raise TypeError("current_learner_update must be an integer")
         if current_learner_update < 0:
             raise ValueError("current_learner_update must be non-negative")
+        if schedule_policy_version is None:
+            schedule_policy_version = current_policy_version
+        if schedule_learner_update is None:
+            schedule_learner_update = current_learner_update
+        for label, value in (
+            ("schedule_policy_version", schedule_policy_version),
+            ("schedule_learner_update", schedule_learner_update),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{label} must be a non-negative integer")
         if not isinstance(transaction_traces, tuple) or not all(
             isinstance(trace, TransactionTrace) for trace in transaction_traces
         ):
@@ -1590,7 +1602,7 @@ class VTraceLearner:
                     (credit_plan,),
                     config=self.failure_credit_config,
                     current_policy_version=current_policy_version,
-                    current_learner_update=current_learner_update,
+                    current_learner_update=schedule_learner_update,
                 )
                 for credit_plan in credit_plans
             )
@@ -1803,7 +1815,7 @@ class VTraceLearner:
         entropy = (entropies * policy_float).sum() / policy_denominator
         entropy_weight = _annealed_entropy_weight(
             self.config,
-            policy_version=current_policy_version,
+            policy_version=schedule_policy_version,
         )
         total_loss = (
             self.config.policy_weight * policy_loss + self.config.value_weight * value_loss - entropy_weight * entropy
@@ -1883,7 +1895,7 @@ class VTraceLearner:
             record_losses = self.credit_plan_liveness_losses(
                 (credit_plan,),
                 current_policy_version=current_policy_version,
-                current_learner_update=current_learner_update,
+                current_learner_update=schedule_learner_update,
             )
             record_critic_objective = (
                 self.failure_credit_config.liveness_value_critic_weight * record_losses.value_critic_loss
@@ -1965,10 +1977,10 @@ class VTraceLearner:
             liveness_replayed_candidates=liveness_losses.replayed_candidates,
             liveness_autograd_segments=liveness_losses.autograd_segments,
             liveness_head_calibration_active=int(
-                current_learner_update < self.failure_credit_config.liveness_head_calibration_updates
+                schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
             ),
             liveness_risk_actor_enabled=int(
-                current_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
+                schedule_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
             ),
         )
         episodic_started_ns = time.perf_counter_ns()
@@ -2106,10 +2118,10 @@ class VTraceLearner:
             liveness_policy_gradient_norm=liveness_policy_gradient_norm,
             liveness_critic_gradient_norm=liveness_critic_gradient_norm,
             liveness_head_calibration_active=int(
-                current_learner_update < self.failure_credit_config.liveness_head_calibration_updates
+                schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
             ),
             liveness_risk_actor_enabled=int(
-                current_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
+                schedule_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
             ),
             liveness_replayed_contexts=liveness_losses.replayed_contexts,
             liveness_replayed_steps=liveness_losses.replayed_steps,
