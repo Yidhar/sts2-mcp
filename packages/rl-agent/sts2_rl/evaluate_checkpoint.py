@@ -26,7 +26,7 @@ from sts2_env.headless_sim_bridge_client import (
 )
 
 from .artifacts import resolve_artifact_path, resolve_external_input_path
-from .checkpoints import validate_resume_checkpoint
+from .checkpoints import dependency_lock_metadata, validate_resume_checkpoint
 from .runtime_mechanics import (
     RuntimeMechanicsAuditError,
     run_runtime_mechanics_preflight,
@@ -128,29 +128,14 @@ def _evaluation_implementation_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _dependency_lock_fingerprints() -> dict[str, dict[str, object]]:
-    """Fingerprint the dependency inputs which define the evaluator runtime."""
-
-    package_root = Path(__file__).resolve().parent.parent
-    lock_files = sorted(
-        {
-            *package_root.glob("requirements*.lock"),
-            *package_root.glob("requirements*.txt"),
-        }
-    )
-    if not lock_files:
-        raise RuntimeError("evaluation dependency fingerprint found no requirements lock inputs")
-    return {
-        path.name: {
-            "size_bytes": path.stat().st_size,
-            "sha256": _sha256(path),
-        }
-        for path in lock_files
-    }
-
-
 def _runtime_environment_contract() -> dict[str, object]:
-    """Return stable process/runtime facts which can change deterministic policy traces."""
+    """Return stable process/runtime facts which can change deterministic policy traces.
+
+    Dependency drift is defined once, by the committed-lock identity in
+    ``sts2_rl.checkpoints.atomic.dependency_lock_metadata``, so evaluation
+    caching and checkpoint provenance cannot disagree about what counts as a
+    dependency change.
+    """
 
     return {
         "python_version": sys.version,
@@ -161,7 +146,7 @@ def _runtime_environment_contract() -> dict[str, object]:
         "numpy_version": str(np.__version__),
         "torch_num_threads": torch.get_num_threads(),
         "torch_num_interop_threads": torch.get_num_interop_threads(),
-        "dependency_locks": _dependency_lock_fingerprints(),
+        "dependency_locks": dependency_lock_metadata(),
     }
 
 

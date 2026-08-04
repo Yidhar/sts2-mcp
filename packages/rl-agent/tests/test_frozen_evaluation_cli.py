@@ -12,6 +12,9 @@ from typing import Any
 import pytest
 
 from sts2_rl import evaluate_checkpoint as cli
+from sts2_rl.checkpoints import (
+    dependency_lock_metadata as checkpoints_dependency_lock_metadata,
+)
 from sts2_rl.training import checkpoint_evaluation as checkpoint_evaluation_module
 from sts2_rl.training.checkpoint_evaluation import FrozenEvaluationResult
 
@@ -592,13 +595,14 @@ def test_runtime_environment_contract_binds_dependency_locks() -> None:
     assert isinstance(contract["torch_num_threads"], int)
     assert isinstance(contract["torch_num_interop_threads"], int)
     locks = contract["dependency_locks"]
-    assert isinstance(locks, dict)
-    assert {
+    assert locks == checkpoints_dependency_lock_metadata()
+    assert isinstance(locks, list)
+    assert {Path(str(record["path"])).name for record in locks} == {
         "requirements.lock",
         "requirements-dev.lock",
         "requirements-wsl-rocm.txt",
-    } <= set(locks)
+    }
     assert all(
         isinstance(record, dict) and isinstance(record.get("size_bytes"), int) and len(str(record.get("sha256"))) == 64
-        for record in locks.values()
+        for record in locks
     )
