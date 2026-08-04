@@ -107,37 +107,6 @@ def _dependency_lock_identity(value: Any, *, label: str) -> list[dict[str, Any]]
     return result
 
 
-def _game_data_identity(value: Any, *, label: str) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    payload = _object(value, label=label)
-    identity_keys = (
-        "sha256",
-        "size_bytes",
-        "schema_version",
-        "upstream_sts2_ai_commit",
-        "generator",
-        "generator_version",
-    )
-    missing = [key for key in identity_keys if key not in payload]
-    if missing:
-        raise CheckpointIntegrityError(f"{label} is missing identity fields: {missing}")
-    sha256 = payload["sha256"]
-    if (
-        not isinstance(sha256, str)
-        or len(sha256) != 64
-        or any(character not in "0123456789abcdef" for character in sha256)
-    ):
-        raise CheckpointIntegrityError(f"{label}.sha256 must be a lowercase SHA-256 digest")
-    size_bytes = payload["size_bytes"]
-    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
-        raise CheckpointIntegrityError(f"{label}.size_bytes must be non-negative")
-    for key in identity_keys[2:]:
-        if not isinstance(payload[key], str) or not payload[key].strip():
-            raise CheckpointIntegrityError(f"{label}.{key} must be non-empty text")
-    return {key: payload[key] for key in identity_keys}
-
-
 def _validate_semantic_identity(
     *,
     manifest: dict[str, Any],
@@ -188,14 +157,6 @@ def _validate_semantic_identity(
         )
     if require_current_runtime_identity:
         _require_equal(manifest_reward, expected_reward, label="reward identity")
-    # Static catalog facts are recorded for provenance, but the grounded model
-    # never reads them.  They therefore must not create false exact-resume
-    # incompatibilities.  Validate their shape only; encoder semantics have a
-    # dedicated fingerprint in training metadata.
-    _game_data_identity(
-        manifest_provenance.get("game_data_manifest"),
-        label="manifest.provenance.game_data_manifest",
-    )
     manifest_locks = _dependency_lock_identity(
         manifest_provenance.get("dependency_locks"),
         label="manifest.provenance.dependency_locks",
@@ -278,7 +239,7 @@ def validate_resume_checkpoint(
 
     Exact resume requires an atomic completion manifest, a valid SHA-256 for
     every payload file, no unlisted payload, and exact contract/reward/dependency
-    identity. Optional static game-data provenance is shape-validated only.
+    identity.
     """
 
     return _validate_checkpoint(

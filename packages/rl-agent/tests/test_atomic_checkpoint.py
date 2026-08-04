@@ -65,14 +65,6 @@ def test_missing_dependency_lock_fails_checkpoint_identity_closed(
         atomic_module.dependency_lock_metadata()
 
 
-def test_static_game_data_provenance_is_optional_for_installed_package(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(atomic_module, "_repository_root", lambda: tmp_path)
-    assert atomic_module.game_data_manifest_metadata() is None
-
-
 def test_atomic_checkpoint_is_invisible_until_commit(tmp_path: Path) -> None:
     target = tmp_path / "checkpoint-1"
     transaction = AtomicCheckpointDirectory(target, hash_files=True)
@@ -164,10 +156,7 @@ def test_checkpoint_provenance_captures_reproducibility_and_parent_lineage(
     assert reward["version"]
     assert reward["fingerprint"]
     assert len(reward["fingerprint_sha256"]) == 64
-    game_data = provenance["game_data_manifest"]
-    assert game_data["schema_version"] == "2.0.0"
-    assert game_data["upstream_sts2_ai_commit"]
-    assert len(game_data["sha256"]) == 64
+    assert "game_data_manifest" not in provenance
     lock_names = {Path(item["path"]).name for item in provenance["dependency_locks"]}
     assert {
         "requirements.lock",
@@ -287,7 +276,6 @@ def test_checkpoint_provenance_accepts_and_normalizes_legal_combinations(
             ).hexdigest(),
         },
     )
-    monkeypatch.setattr(atomic_module, "game_data_manifest_metadata", lambda: None)
     monkeypatch.setattr(
         atomic_module,
         "dependency_lock_metadata",

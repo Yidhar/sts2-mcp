@@ -7,7 +7,6 @@ from .atomic import (
     checkpoint_runtime_identity,
     contract_metadata,
     dependency_lock_metadata,
-    game_data_manifest_metadata,
     reward_spec_metadata,
     verify_checkpoint_directory,
 )
@@ -41,7 +40,6 @@ __all__ = [
     "checkpoint_runtime_identity",
     "contract_metadata",
     "dependency_lock_metadata",
-    "game_data_manifest_metadata",
     "reject_frozen_exact_resume",
     "reward_spec_metadata",
     "validate_frozen_checkpoint",

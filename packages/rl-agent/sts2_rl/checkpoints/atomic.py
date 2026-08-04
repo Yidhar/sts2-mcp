@@ -139,45 +139,6 @@ def _json_object(path: Path) -> dict[str, Any] | None:
     return {str(key): item for key, item in value.items()}
 
 
-def game_data_manifest_metadata() -> dict[str, Any] | None:
-    """Return optional audit provenance for the static game-data manifest.
-
-    The grounded trainer does not read this catalog, so absence (for example in
-    an installed wheel) must not become a delayed checkpoint failure. When a
-    valid repository manifest is available, its checkout-independent identity is
-    recorded for audit only.
-    """
-
-    manifest_path = _repository_root() / "game-data" / "manifest.json"
-    descriptor = _hashed_file(manifest_path)
-    if descriptor is None:
-        return None
-    payload = _json_object(manifest_path)
-    if payload is None:
-        return None
-    identity_fields = (
-        "schema_version",
-        "upstream_sts2_ai_commit",
-        "generator",
-        "generator_version",
-    )
-    missing_identity = [
-        key
-        for key in identity_fields
-        if not isinstance(payload.get(key), str) or not str(payload[key]).strip()
-    ]
-    if missing_identity:
-        return None
-    return {
-        "sha256": descriptor["sha256"],
-        "size_bytes": descriptor["size_bytes"],
-        "schema_version": payload.get("schema_version"),
-        "upstream_sts2_ai_commit": payload.get("upstream_sts2_ai_commit"),
-        "generator": payload.get("generator"),
-        "generator_version": payload.get("generator_version"),
-    }
-
-
 def dependency_lock_metadata() -> list[dict[str, Any]]:
     """Return checkout-independent identities for every committed RL lock."""
 
@@ -496,13 +457,6 @@ def build_checkpoint_provenance(
             )
     root = _repository_root()
     reward_payload = reward_spec_metadata()
-    game_manifest_path = root / "game-data" / "manifest.json"
-    game_identity = game_data_manifest_metadata()
-    game_manifest = (
-        None
-        if game_identity is None
-        else {"path": game_manifest_path.as_posix(), **game_identity}
-    )
     locks = dependency_lock_metadata()
     parent: dict[str, Any] | None = None
     if parent_checkpoint is not None:
@@ -524,7 +478,6 @@ def build_checkpoint_provenance(
             "platform": platform.platform(),
         },
         "reward_spec": reward_payload,
-        "game_data_manifest": game_manifest,
         "dependency_locks": locks,
         "git": _git_metadata(root),
         "experiment_run_id": experiment_run_id,
