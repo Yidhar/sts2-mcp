@@ -191,6 +191,26 @@ def _validate_semantic_identity(
     )
 
 
+def _require_manifest_entries(
+    manifest: dict[str, Any],
+    *,
+    required_files: Collection[str],
+    operation: str,
+) -> None:
+    raw_entries = manifest.get("files")
+    entries = raw_entries if isinstance(raw_entries, list) else []
+    listed = {
+        str(entry.get("path"))
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    missing = sorted(set(required_files) - listed)
+    if missing:
+        raise CheckpointIntegrityError(
+            f"{operation} checkpoint is missing required manifest entries: {missing}"
+        )
+
+
 def _validate_checkpoint(
     checkpoint: str | Path,
     *,
@@ -208,18 +228,11 @@ def _validate_checkpoint(
     if manifest is None:  # pragma: no cover - strict verifier cannot return None
         raise CheckpointIntegrityError(f"atomic checkpoint manifest is required: {root}")
 
-    raw_entries = manifest.get("files")
-    entries = raw_entries if isinstance(raw_entries, list) else []
-    listed = {
-        str(entry.get("path"))
-        for entry in entries
-        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
-    }
-    missing = sorted(set(required_files) - listed)
-    if missing:
-        raise CheckpointIntegrityError(
-            f"{operation} checkpoint is missing required manifest entries: {missing}"
-        )
+    _require_manifest_entries(
+        manifest,
+        required_files=required_files,
+        operation=operation,
+    )
 
     metadata = _read_json_object(root / "metadata.json", label="checkpoint metadata")
     _validate_semantic_identity(
@@ -270,3 +283,39 @@ def validate_model_initialization_checkpoint(
         require_current_runtime_identity=False,
         operation="model initialization",
     )
+
+
+def revalidate_checkpoint_identity(
+    validated: ValidatedResumeCheckpoint,
+    *,
+    required_files: Collection[str] = EXACT_RESUME_REQUIRED_FILES,
+    require_current_runtime_identity: bool,
+    operation: str,
+) -> ValidatedResumeCheckpoint:
+    """Re-run every cheap identity check on an already byte-validated handle.
+
+    Same-process reuse only: the handle must come from
+    :func:`validate_resume_checkpoint` or
+    :func:`validate_model_initialization_checkpoint` executed earlier in the
+    same process against the same immutable atomic directory.  Only the
+    per-file SHA-256 pass of ``verify_checkpoint_directory`` is skipped; the
+    required-file listing and the complete manifest/metadata semantic
+    identity (including the strict current-runtime equality when requested)
+    are executed again, so a handle validated for a weaker operation can
+    never satisfy a stronger one.  Never reuse a handle across a process
+    boundary — each process performs its own full byte validation.
+    """
+
+    if not isinstance(validated, ValidatedResumeCheckpoint):
+        raise TypeError("prevalidated checkpoint must be a ValidatedResumeCheckpoint")
+    _require_manifest_entries(
+        validated.manifest,
+        required_files=required_files,
+        operation=operation,
+    )
+    _validate_semantic_identity(
+        manifest=validated.manifest,
+        metadata=validated.metadata,
+        require_current_runtime_identity=require_current_runtime_identity,
+    )
+    return validated

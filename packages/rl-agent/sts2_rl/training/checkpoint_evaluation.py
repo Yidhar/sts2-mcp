@@ -192,8 +192,10 @@ def _evaluate_checkpoint_policy_unprotected(
     config = replace(config, runtime=runtime, environment=environment)
 
     # This second preflight validates the model/encoding ABI against the
-    # reconstructed config in addition to the directory/hash validation above.
-    validated = preflight_model_initialization(root, config=config)
+    # reconstructed config; the directory bytes were already hashed by the
+    # strictly stronger ``validate_resume_checkpoint`` call above, so only the
+    # cheap semantic identity checks run again here.
+    validated = preflight_model_initialization(root, config=config, prevalidated=validated)
     training_state = validated.metadata.get("training_state")
     if not isinstance(training_state, dict):
         raise ValueError("checkpoint metadata has no training_state object")
@@ -235,6 +237,7 @@ def _evaluate_checkpoint_policy_unprotected(
                 validated.root,
                 config=config,
                 resources=resources,
+                prevalidated=validated,
             )
             if initialized_from != validated.root:
                 raise RuntimeError("model initialization resolved a different checkpoint")

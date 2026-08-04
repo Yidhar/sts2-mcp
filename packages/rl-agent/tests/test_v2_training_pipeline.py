@@ -4242,6 +4242,111 @@ def test_model_initialization_migrates_only_parameters_across_runtime_identities
         target.close()
 
 
+def test_prevalidated_exact_resume_skips_only_the_duplicate_directory_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        source.rollout_queue.put(source.collector.collect_episode(record=True).unrolls[0])
+        checkpoint = save_training_checkpoint(
+            tmp_path / "prevalidated-source",
+            config=config,
+            resources=source,
+            state=TrainingState(
+                environment_steps=2,
+                episodes=1,
+                maximum_observed_candidates=2,
+            ),
+            run_id="prevalidated-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    validated = preflight_training_checkpoint(
+        checkpoint,
+        config=config,
+        resolved_device="cpu",
+        resolved_collector_device="cpu",
+    )
+
+    from sts2_rl.checkpoints import resume as resume_module
+
+    hash_passes: list[Path] = []
+    real_verify = resume_module.verify_checkpoint_directory
+
+    def counting_verify(root: Path, **kwargs: Any) -> Any:
+        hash_passes.append(root)
+        return real_verify(root, **kwargs)
+
+    monkeypatch.setattr(resume_module, "verify_checkpoint_directory", counting_verify)
+
+    target = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        # A same-process handle must not repeat the whole-directory hash pass.
+        state = load_training_checkpoint(
+            checkpoint,
+            config=config,
+            resources=target,
+            prevalidated=validated,
+        )
+        assert state.environment_steps == 2
+        assert hash_passes == []
+
+        # The handle only stands in for exactly its own validated path.
+        with pytest.raises(ValueError, match="does not match the requested checkpoint path"):
+            load_training_checkpoint(
+                tmp_path / "some-other-checkpoint",
+                config=config,
+                resources=target,
+                prevalidated=validated,
+            )
+    finally:
+        target.close()
+
+    # An independent call without the handle still performs the complete
+    # byte validation of the atomic directory.
+    independent = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        load_training_checkpoint(checkpoint, config=config, resources=independent)
+        assert hash_passes == [checkpoint.resolve()]
+    finally:
+        independent.close()
+
+
+def test_prevalidated_handle_cannot_weaken_exact_resume_identity(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        checkpoint = save_training_checkpoint(
+            tmp_path / "archived-runtime-identity",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=2, policy_version=1, actor_policy_version=1),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    _rewrite_checkpoint_runtime_identity(checkpoint, mismatch="contract")
+    # The weaker model-initialization validation accepts the archived identity.
+    weak = preflight_model_initialization(checkpoint, config=config)
+    # Reusing that weaker handle for exact resume must still fail closed on
+    # the strict current-runtime identity, which is re-checked in full.
+    with pytest.raises(CheckpointIntegrityError, match="contract identity"):
+        preflight_training_checkpoint(
+            checkpoint,
+            config=config,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+            prevalidated=weak,
+        )
+
+
 def test_previous_selection_abi_checkpoint_is_rejected_before_tensor_load(
     tmp_path: Path,
 ) -> None:

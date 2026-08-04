@@ -22,6 +22,7 @@ from .frozen import (
 from .resume import (
     EXACT_RESUME_REQUIRED_FILES,
     ValidatedResumeCheckpoint,
+    revalidate_checkpoint_identity,
     validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "contract_metadata",
     "dependency_lock_metadata",
     "reject_frozen_exact_resume",
+    "revalidate_checkpoint_identity",
     "reward_spec_metadata",
     "validate_frozen_checkpoint",
     "validate_model_initialization_checkpoint",

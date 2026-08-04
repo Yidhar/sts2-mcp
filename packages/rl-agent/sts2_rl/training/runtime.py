@@ -958,6 +958,7 @@ def run_training(
                 prevalidated_resume.root,
                 config=config,
                 resources=resources,
+                prevalidated=prevalidated_resume,
             )
             schedule_state = training_schedule_state_from_metadata(prevalidated_resume.metadata)
             actor_supervisor_state = actor_supervisor_state_from_metadata(prevalidated_resume.metadata)
@@ -966,6 +967,7 @@ def run_training(
                 prevalidated_initialization.root,
                 config=config,
                 resources=resources,
+                prevalidated=prevalidated_initialization,
             )
             load_mode = "model_initialization"
             if config.runtime.model_initialization_schedule_mode == "inherit":
@@ -2162,10 +2164,14 @@ def run_training(
                             resolved_device=resolved_device,
                             resolved_collector_device=resolved_actor_device,
                         )
+                        # The full byte validation of the healthy anchor still
+                        # happens at rollback time, in the preflight directly
+                        # above; only its same-process repetition is skipped.
                         restored_state = load_training_checkpoint(
                             validated_healthy.root,
                             config=config,
                             resources=resources,
+                            prevalidated=validated_healthy,
                         )
                         restored_schedule_state = training_schedule_state_from_metadata(
                             validated_healthy.metadata

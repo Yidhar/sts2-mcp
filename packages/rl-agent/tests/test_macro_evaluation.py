@@ -411,7 +411,7 @@ def test_checkpoint_probe_reconstructs_the_enabled_liveness_head(
     monkeypatch.setattr(
         macro_evaluation_module,
         "preflight_model_initialization",
-        lambda _root, *, config: validated,
+        lambda _root, *, config, prevalidated=None: validated,
     )
     monkeypatch.setattr(
         macro_evaluation_module,

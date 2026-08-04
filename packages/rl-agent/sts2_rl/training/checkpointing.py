@@ -23,6 +23,7 @@ from sts2_rl.checkpoints import (
     build_checkpoint_provenance,
     contract_metadata,
     reject_frozen_exact_resume,
+    revalidate_checkpoint_identity,
     validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
@@ -1067,20 +1068,59 @@ def _exact_resume_required_files(config: TrainingConfig) -> frozenset[str]:
     return frozenset(required)
 
 
+def _reuse_prevalidated_checkpoint(
+    prevalidated: ValidatedResumeCheckpoint,
+    checkpoint: str | Path,
+    *,
+    require_current_runtime_identity: bool,
+    operation: str,
+) -> ValidatedResumeCheckpoint:
+    """Accept a same-process handle whose directory bytes were already hashed.
+
+    Every cheap manifest/metadata identity check is re-executed at the strength
+    the requested operation needs; only the redundant whole-directory SHA-256
+    pass over the immutable atomic directory is skipped.  The handle must
+    denote exactly the requested checkpoint path, and it must never cross a
+    process boundary: launcher and trainer each perform their own full byte
+    validation.
+    """
+
+    validated = revalidate_checkpoint_identity(
+        prevalidated,
+        require_current_runtime_identity=require_current_runtime_identity,
+        operation=operation,
+    )
+    root = Path(checkpoint).expanduser().resolve(strict=False)
+    if validated.root != root:
+        raise ValueError("prevalidated checkpoint does not match the requested checkpoint path")
+    return validated
+
+
 def preflight_training_checkpoint(
     checkpoint: str | Path,
     *,
     config: TrainingConfig,
     resolved_device: str,
     resolved_collector_device: str,
+    prevalidated: ValidatedResumeCheckpoint | None = None,
 ) -> ValidatedResumeCheckpoint:
     # Validate and hash the complete atomic directory using only the stable base
     # payload set first.  This lets the metadata format gate reject a v3 source
     # explicitly as model-initialization-only instead of misreporting the new
     # v4 episodic sidecar as missing. ``validate_resume_checkpoint`` already
     # hashes every manifest-listed file, including optional sidecars, so the
-    # second phase only needs to require their manifest entries.
-    validated = validate_resume_checkpoint(checkpoint)
+    # second phase only needs to require their manifest entries.  A caller in
+    # the same process may pass its already byte-validated handle back in; the
+    # semantic identity checks below still run in full against that handle.
+    if prevalidated is None:
+        validated = validate_resume_checkpoint(checkpoint)
+    else:
+        validated = _reuse_prevalidated_checkpoint(
+            prevalidated,
+            checkpoint,
+            require_current_runtime_identity=True,
+            operation="exact resume",
+        )
     reject_frozen_exact_resume(validated)
     _validate_metadata(
         validated,
@@ -1104,8 +1144,17 @@ def preflight_model_initialization(
     checkpoint: str | Path,
     *,
     config: TrainingConfig,
+    prevalidated: ValidatedResumeCheckpoint | None = None,
 ) -> ValidatedResumeCheckpoint:
-    validated = validate_model_initialization_checkpoint(checkpoint)
+    if prevalidated is None:
+        validated = validate_model_initialization_checkpoint(checkpoint)
+    else:
+        validated = _reuse_prevalidated_checkpoint(
+            prevalidated,
+            checkpoint,
+            require_current_runtime_identity=False,
+            operation="model initialization",
+        )
     _validate_metadata(
         validated,
         config=config,
@@ -1298,6 +1347,7 @@ def load_training_checkpoint(
     *,
     config: TrainingConfig,
     resources: TrainingResources,
+    prevalidated: ValidatedResumeCheckpoint | None = None,
 ) -> TrainingState:
     """Restore an exact continuation only after every payload probes cleanly.
 
@@ -1306,6 +1356,12 @@ def load_training_checkpoint(
     or process RNG state is touched.  A missing, corrupt, over-capacity, or
     otherwise incompatible sidecar therefore cannot leave a partially restored
     live learner.
+
+    ``prevalidated`` may carry the handle returned by
+    :func:`preflight_training_checkpoint` earlier in this same process so the
+    immutable atomic directory is not byte-hashed a second time; every
+    semantic identity check still runs in full, and an independent call
+    (``prevalidated=None``) performs its own complete validation.
     """
 
     if config.transaction_learning.enabled and resources.transaction_replay is None:
@@ -1320,6 +1376,7 @@ def load_training_checkpoint(
         config=config,
         resolved_device=str(resources.device),
         resolved_collector_device=str(next(resources.collector_model.parameters()).device),
+        prevalidated=prevalidated,
     )
     network_state = torch.load(
         validated.root / "network.pt",
@@ -1445,6 +1502,7 @@ def initialize_model_from_checkpoint(
     *,
     config: TrainingConfig,
     resources: TrainingResources,
+    prevalidated: ValidatedResumeCheckpoint | None = None,
 ) -> Path:
     """Migrate only network parameters into a fresh training lineage.
 
@@ -1455,9 +1513,19 @@ def initialize_model_from_checkpoint(
     long-horizon heads and the two-part liveness-cost head group can remain
     freshly initialized only through their explicit, all-or-none migration
     gates. Exact resume never uses these gates.
+
+    ``prevalidated`` may carry the handle returned by
+    :func:`preflight_model_initialization` earlier in this same process so
+    the immutable atomic directory is not byte-hashed a second time; every
+    semantic identity check still runs in full, and an independent call
+    (``prevalidated=None``) performs its own complete validation.
     """
 
-    validated = preflight_model_initialization(checkpoint, config=config)
+    validated = preflight_model_initialization(
+        checkpoint,
+        config=config,
+        prevalidated=prevalidated,
+    )
     state = torch.load(
         validated.root / "network.pt",
         map_location=resources.device,

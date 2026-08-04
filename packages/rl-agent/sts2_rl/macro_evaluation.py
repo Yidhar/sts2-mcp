@@ -1007,7 +1007,10 @@ def evaluate_checkpoint_macro_sensitivity(
         raise ValueError("checkpoint metadata has no training_config object")
     source_config_version = config_payload.get("version")
     config = _diagnostic_model_initialization_config(config_payload)
-    validated = preflight_model_initialization(root, config=config)
+    # ``initial_validation`` already byte-hashed the immutable directory with
+    # the strictly stronger exact-resume identity; only the cheap semantic
+    # checks run again for the model-initialization view.
+    validated = preflight_model_initialization(root, config=config, prevalidated=initial_validation)
     checkpoint_id = validated.manifest.get("checkpoint_id")
     if not isinstance(checkpoint_id, str) or not checkpoint_id:
         raise ValueError("checkpoint manifest has no checkpoint_id")
