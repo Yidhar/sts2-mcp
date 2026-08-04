@@ -4,6 +4,8 @@
 # optimizer, replay, RNG, rollout queues and lineage-local counters reset.
 # Liveness calibration/risk-actor clocks intentionally restart from update 0.
 # Reward v5 and the engine-native revival budget of 64 remain unchanged.
+# Failure-credit executor v2 packs the four sampled records into one shared
+# replay graph while retaining an explicit equal-record loss reduction.
 
 [optimization]
 learning_rate = 0.0001
@@ -38,7 +40,7 @@ maximum_matched_pairs_per_publication = 8
 policy_gradient_max_lag = 128
 liveness_head_calibration_updates = 256
 liveness_risk_actor_start_update = 512
-liveness_records_per_autograd_batch = 1
+liveness_records_per_autograd_batch = 4
 liveness_tbptt_window_steps = 16
 liveness_maximum_contexts_per_record = 2
 liveness_maximum_replayed_steps_per_update = 4096

@@ -10,17 +10,8 @@ import pytest
 from sts2_rl.training import CONFIG_VERSION, load_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = (
-    PACKAGE_ROOT
-    / "scripts"
-    / "launch_v33_stability_recovery_model_init.py"
-)
-CONFIG = (
-    PACKAGE_ROOT
-    / "config"
-    / "experiments"
-    / "full_run_revival_v33_stability_recovery_model_init.toml"
-)
+SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v33_stability_recovery_model_init.py"
+CONFIG = PACKAGE_ROOT / "config" / "experiments" / "full_run_revival_v33_stability_recovery_model_init.toml"
 SPEC = importlib.util.spec_from_file_location("v33_stability_recovery_launcher", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 launcher = importlib.util.module_from_spec(SPEC)
@@ -71,13 +62,11 @@ def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
     assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)
     assert config.optimization.entropy_weight_end == pytest.approx(0.004)
     assert config.optimization.entropy_breaker == "one-hot-v1"
-    assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(
-        0.15
-    )
+    assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)
     assert config.failure_credit.liveness_gradient_clip_norm == pytest.approx(0.50)
-    assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(
-        0.20
-    )
+    assert config.failure_credit.sample_records == 4
+    assert config.failure_credit.liveness_records_per_autograd_batch == 4
+    assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(0.20)
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "reset"
     assert config.runtime.total_environment_steps == 100_000
@@ -99,9 +88,7 @@ def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
     command = launcher.build_resume_trainer_command(paths)
 
     assert command.count("--initialize-from") == 1
-    assert command[command.index("--initialize-from") + 1] == str(
-        launcher.source_checkpoint_path(paths)
-    )
+    assert command[command.index("--initialize-from") + 1] == str(launcher.source_checkpoint_path(paths))
     assert "--resume" not in command
     assert launcher.SOURCE_RUN_ID == "481995a5-0221-4f59-9293-9105cd336068"
     assert launcher.SOURCE_ENVIRONMENT_STEPS == 90_152

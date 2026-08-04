@@ -1008,11 +1008,14 @@ def _safe_valid_mask(mask: Tensor) -> Tensor:
     """Ensure attention has at least one valid key without changing outputs' mask."""
 
     valid = mask.bool()
-    missing = ~valid.any(dim=-1)
-    if missing.any():
-        valid = valid.clone()
-        valid[missing, 0] = True
-    return valid
+    # Do not branch on ``missing.any()`` here. Turning a device tensor into a
+    # Python boolean synchronizes the host on every world/local/candidate
+    # attention call; recurrent replay invokes this path hundreds of times per
+    # learner update. The broadcast fallback is identical: only column zero is
+    # enabled, and only for rows that were entirely invalid.
+    missing = ~valid.any(dim=-1, keepdim=True)
+    first_column = torch.arange(valid.shape[-1], device=valid.device).eq(0)
+    return valid | (missing & first_column)
 
 
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:

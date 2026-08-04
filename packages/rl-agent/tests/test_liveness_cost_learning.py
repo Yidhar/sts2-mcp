@@ -260,17 +260,12 @@ def test_candidate_liveness_cost_head_is_bounded_masked_and_active_shape() -> No
     output.validate(model_config)
 
 
-def test_homogeneous_failure_records_can_share_one_vectorized_replay_without_changing_gradients() -> None:
-    """Prove the narrow semantic equivalence needed by a packing prototype.
+def test_heterogeneous_failure_records_share_replay_without_changing_equal_record_gradients() -> None:
+    """Packed execution preserves equal-record reduction across label shapes.
 
-    Production currently replays and backpropagates every failure record on
-    its own.  ``credit_plan_liveness_losses`` already supports multiple
-    contexts and batches them by recurrent timestep.  For records with the
-    same label topology, its reductions are exactly the equal-record mean, so
-    packing those records removes redundant model invocations without changing
-    the objective or gradients.  Heterogeneous label topologies are
-    intentionally outside this test: a production packer must bucket them or
-    retain explicit per-record reduction weights.
+    Candidate counts and actor-label topology deliberately differ. A global
+    label mean would make the direct/risk-bearing records overweighted; the
+    packed implementation must first reduce each record and only then average.
     """
 
     torch.manual_seed(7)
@@ -293,13 +288,22 @@ def test_homogeneous_failure_records_can_share_one_vectorized_replay_without_cha
         liveness_head_calibration_updates=0,
         liveness_risk_actor_start_update=0,
     )
+    plan_specs = (
+        (3, True, True),
+        (7, False, True),
+        (5, True, False),
+        (111, False, False),
+    )
     plans = tuple(
         _one_step_credit_plan(
             encoding_config,
             model_config,
             suffix=f"packed-{index}",
+            candidate_count=candidate_count,
+            include_direct=include_direct,
+            include_risk=include_risk,
         )
-        for index in range(4)
+        for index, (candidate_count, include_direct, include_risk) in enumerate(plan_specs)
     )
 
     sequential_model = RecurrentCandidateModel(
@@ -407,6 +411,162 @@ def test_homogeneous_failure_records_can_share_one_vectorized_replay_without_cha
             ), name
 
 
+def test_long_and_short_failure_records_share_recurrent_replay_across_tbptt_windows() -> None:
+    """Packing shares local timesteps without joining recurrent graph windows."""
+
+    torch.manual_seed(11)
+    model_config = _model_config()
+    encoding_config = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=32,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+
+    def extended_plan(*, suffix: str, steps: int, burn_in: int, candidate_count: int) -> CreditPlan:
+        base = _one_step_credit_plan(
+            encoding_config,
+            model_config,
+            suffix=suffix,
+            candidate_count=candidate_count,
+        )
+        source = base.context.steps[0]
+        context_steps = tuple(
+            replace(
+                source,
+                decision_id=f"decision-{suffix}-{index}",
+                episode_step=12 + index,
+                node=_identity(f"node-{suffix}-{index}"),
+                anchor=_semantic_key("anchor", f"anchor-{suffix}-{index}"),
+                candidate_actions=tuple(
+                    _identity(f"action-{suffix}-{index}-{candidate}")
+                    for candidate in range(source.snapshot.candidate_count)
+                ),
+            )
+            for index in range(steps)
+        )
+        context = replace(
+            base.context,
+            context_id=f"context-{suffix}-extended",
+            steps=context_steps,
+            burn_in_steps=burn_in,
+        )
+        final_index = steps - 1
+        scalar = ScalarCredit(step_index=final_index, target=1.0, horizon=1)
+        return replace(
+            base,
+            context=context,
+            liveness_value_targets=(scalar,),
+            liveness_q_targets=(scalar,),
+            direct_policy_targets=(replace(base.direct_policy_targets[0], step_index=final_index),),
+            risk_sequences=(
+                replace(
+                    base.risk_sequences[0],
+                    step_indices=tuple(range(burn_in, steps)),
+                ),
+            ),
+        )
+
+    plans = (
+        extended_plan(suffix="long", steps=6, burn_in=1, candidate_count=7),
+        extended_plan(suffix="short", steps=3, burn_in=0, candidate_count=3),
+    )
+    config = FailureCreditConfig(
+        mode="learning",
+        sample_records=2,
+        direct_witness_quota=0,
+        multi_edge_cycle_quota=0,
+        risk_sequence_quota=0,
+        unresolved_stall_quota=0,
+        completion_control_quota=0,
+        matched_outcome_pair_quota=0,
+        liveness_head_calibration_updates=0,
+        liveness_risk_actor_start_update=0,
+        liveness_records_per_autograd_batch=2,
+        liveness_tbptt_window_steps=2,
+    )
+    sequential_model = RecurrentCandidateModel(model_config, enable_liveness_head=True)
+    packed_model = RecurrentCandidateModel(model_config, enable_liveness_head=True)
+    packed_model.load_state_dict(sequential_model.state_dict())
+
+    def learner(model: RecurrentCandidateModel) -> VTraceLearner:
+        return VTraceLearner(
+            model=model,
+            encoder=GroundedObservationEncoder(encoding_config),
+            optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+            config=OptimizationConfig(),
+            maximum_unroll_length=16,
+            maximum_policy_lag=64,
+            failure_credit_config=config,
+        )
+
+    def objective(losses: LivenessCreditLosses) -> torch.Tensor:
+        return (
+            config.liveness_value_critic_weight * losses.value_critic_loss
+            + config.liveness_cost_critic_weight * losses.critic_loss
+            + config.liveness_cost_actor_weight * losses.risk_actor_loss
+            + config.liveness_direct_policy_weight * losses.direct_avoid_loss
+        )
+
+    sequential_learner = learner(sequential_model)
+    packed_learner = learner(packed_model)
+    sequential_calls = 0
+    packed_calls = 0
+
+    def count_sequential(_module: torch.nn.Module, _args: tuple[object, ...]) -> None:
+        nonlocal sequential_calls
+        sequential_calls += 1
+
+    def count_packed(_module: torch.nn.Module, _args: tuple[object, ...]) -> None:
+        nonlocal packed_calls
+        packed_calls += 1
+
+    sequential_handle = sequential_model.register_forward_pre_hook(count_sequential)
+    packed_handle = packed_model.register_forward_pre_hook(count_packed)
+    try:
+        sequential_model.zero_grad(set_to_none=True)
+        sequential_value = torch.zeros((), dtype=next(sequential_model.parameters()).dtype)
+        for plan in plans:
+            loss = objective(
+                sequential_learner.credit_plan_liveness_losses(
+                    (plan,),
+                    current_policy_version=3,
+                    current_learner_update=513,
+                )
+            )
+            sequential_value = sequential_value + loss.detach() / len(plans)
+            (loss / len(plans)).backward()
+
+        packed_model.zero_grad(set_to_none=True)
+        packed_value = objective(
+            packed_learner.credit_plan_liveness_losses(
+                plans,
+                current_policy_version=3,
+                current_learner_update=513,
+            )
+        )
+        packed_value.backward()
+    finally:
+        sequential_handle.remove()
+        packed_handle.remove()
+
+    assert sequential_calls == 9
+    assert packed_calls == 7
+    torch.testing.assert_close(packed_value.detach(), sequential_value, rtol=1e-6, atol=1e-7)
+    for name, sequential_parameter in sequential_model.named_parameters():
+        packed_parameter = dict(packed_model.named_parameters())[name]
+        assert (sequential_parameter.grad is None) is (packed_parameter.grad is None), name
+        if sequential_parameter.grad is not None:
+            assert packed_parameter.grad is not None
+            torch.testing.assert_close(
+                packed_parameter.grad,
+                sequential_parameter.grad,
+                rtol=3e-5,
+                atol=3e-6,
+                msg=name,
+            )
+
+
 def test_candidate_liveness_cost_head_is_candidate_equivariant() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
@@ -511,13 +671,8 @@ def test_cost_actor_policy_baseline_is_detached_from_policy_gradient() -> None:
     )[0]
 
     detached_probabilities = torch.softmax(policy_logits, dim=1).detach()
-    detached_centered_risk = (
-        costs[0, 0] - (detached_probabilities[0] * costs[0]).sum()
-    ).detach()
-    selected_only_objective = (
-        torch.log_softmax(policy_logits, dim=1)[0, 0]
-        * detached_centered_risk
-    )
+    detached_centered_risk = (costs[0, 0] - (detached_probabilities[0] * costs[0]).sum()).detach()
+    selected_only_objective = torch.log_softmax(policy_logits, dim=1)[0, 0] * detached_centered_risk
     expected = torch.autograd.grad(selected_only_objective, policy_logits)[0]
 
     torch.testing.assert_close(actual, expected)
@@ -675,8 +830,13 @@ def test_liveness_credit_configuration_is_bounded() -> None:
             liveness_head_calibration_updates=10,
             liveness_risk_actor_start_update=9,
         )
-    with pytest.raises(ValueError, match="must be 1"):
-        FailureCreditConfig(liveness_records_per_autograd_batch=2)
+    packed = FailureCreditConfig(liveness_records_per_autograd_batch=2)
+    assert packed.liveness_records_per_autograd_batch == 2
+    with pytest.raises(ValueError, match="cannot exceed"):
+        FailureCreditConfig(
+            sample_records=4,
+            liveness_records_per_autograd_batch=5,
+        )
 
     shadow = FailureCreditConfig(mode="shadow")
     assert shadow.shadow_enabled
@@ -1007,8 +1167,7 @@ def test_manifest_matches_rowwise_direct_risk_and_atomic_cycle_freshness() -> No
         node=_identity("node-mixed-age-fresh"),
         anchor=_semantic_key("anchor", "anchor-mixed-age-fresh"),
         candidate_actions=tuple(
-            _identity(f"action-mixed-age-fresh-{index}")
-            for index in range(first.snapshot.candidate_count)
+            _identity(f"action-mixed-age-fresh-{index}") for index in range(first.snapshot.candidate_count)
         ),
     )
     context = replace(base.context, steps=(first, second))
@@ -1168,7 +1327,7 @@ def test_liveness_recurrent_replay_detaches_each_tbptt_window() -> None:
     assert losses.autograd_segments == 3
 
 
-def test_update_backpropagates_failure_credit_one_record_at_a_time(
+def test_update_backpropagates_failure_credit_in_configured_record_packs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_config = _model_config()
@@ -1180,8 +1339,16 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
     )
     config = FailureCreditConfig(
         mode="learning",
+        sample_records=2,
+        direct_witness_quota=0,
+        multi_edge_cycle_quota=0,
+        risk_sequence_quota=0,
+        unresolved_stall_quota=0,
+        completion_control_quota=0,
+        matched_outcome_pair_quota=0,
         liveness_head_calibration_updates=0,
         liveness_risk_actor_start_update=0,
+        liveness_records_per_autograd_batch=2,
     )
     model = RecurrentCandidateModel(
         model_config,
@@ -1261,7 +1428,12 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
         progress=lambda stage, payload: progress.append((stage, payload)),
     )
 
-    assert calls == [1, 1]
+    assert calls == [2]
+    batch_starts = [payload for stage, payload in progress if stage == "liveness_autograd_batch_start"]
+    assert len(batch_starts) == 1
+    assert batch_starts[0]["liveness_batch_records"] == 2
+    assert batch_starts[0]["liveness_batch_steps"] == 2
+    assert batch_starts[0]["liveness_batch_candidates"] == 6
     record_starts = [payload for stage, payload in progress if stage == "liveness_record_start"]
     assert [payload["liveness_record_index"] for payload in record_starts] == [
         0,
@@ -1269,11 +1441,136 @@ def test_update_backpropagates_failure_credit_one_record_at_a_time(
     ]
     assert all(payload["liveness_record_steps"] == 1 for payload in record_starts)
     assert all(payload["liveness_record_candidates"] == 3 for payload in record_starts)
-    assert metrics.liveness_autograd_microbatches == 2
+    assert metrics.liveness_autograd_microbatches == 1
     assert metrics.liveness_head_calibration_active == 0
     assert metrics.liveness_risk_actor_enabled == 1
     assert metrics.liveness_credit_plans == 2
     assert metrics.liveness_replayed_contexts == 2
+
+
+def test_non_divisible_record_packs_match_record_at_a_time_optimizer_update() -> None:
+    """A short final pack cannot receive the same weight as a full pack."""
+
+    torch.manual_seed(19)
+    model_config = _model_config()
+    encoding_config = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=32,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    plans = tuple(
+        _one_step_credit_plan(
+            encoding_config,
+            model_config,
+            suffix=f"remainder-{index}",
+            candidate_count=candidate_count,
+            include_direct=include_direct,
+            include_risk=include_risk,
+        )
+        for index, (candidate_count, include_direct, include_risk) in enumerate(
+            (
+                (3, True, True),
+                (7, False, True),
+                (5, True, False),
+                (11, False, False),
+            )
+        )
+    )
+    snapshot = plans[0].context.steps[0].snapshot
+    unroll = SequenceUnroll(
+        episode_id="remainder-unroll",
+        start_step=0,
+        policy_version=3,
+        initial_recurrent_state=np.zeros(model_config.recurrent_hidden_dim, dtype=np.float32),
+        steps=(
+            RolloutStep(
+                snapshot=snapshot,
+                action_index=0,
+                behavior_log_probability=-0.5,
+                reward=-1.0,
+                discount=0.0,
+                policy_decision=True,
+            ),
+        ),
+        bootstrap_snapshot=None,
+    )
+
+    def failure_config(pack_size: int) -> FailureCreditConfig:
+        return FailureCreditConfig(
+            mode="learning",
+            sample_records=4,
+            direct_witness_quota=0,
+            multi_edge_cycle_quota=0,
+            risk_sequence_quota=0,
+            unresolved_stall_quota=0,
+            completion_control_quota=0,
+            matched_outcome_pair_quota=0,
+            liveness_head_calibration_updates=0,
+            liveness_risk_actor_start_update=0,
+            liveness_records_per_autograd_batch=pack_size,
+        )
+
+    sequential_model = RecurrentCandidateModel(model_config, enable_liveness_head=True)
+    packed_model = RecurrentCandidateModel(model_config, enable_liveness_head=True)
+    packed_model.load_state_dict(sequential_model.state_dict())
+
+    def learner(model: RecurrentCandidateModel, pack_size: int) -> VTraceLearner:
+        return VTraceLearner(
+            model=model,
+            encoder=GroundedObservationEncoder(encoding_config),
+            # SGD keeps this execution-equivalence assertion proportional to
+            # the gradient. Adam's first-step sign normalization can magnify
+            # harmless batched-matmul round-off into a full learning-rate step.
+            optimizer=torch.optim.SGD(model.parameters(), lr=1e-3),
+            config=OptimizationConfig(),
+            maximum_unroll_length=16,
+            maximum_policy_lag=64,
+            failure_credit_config=failure_config(pack_size),
+        )
+
+    sequential_metrics = learner(sequential_model, 1).update(
+        (unroll,),
+        current_policy_version=3,
+        current_learner_update=0,
+        schedule_policy_version=515,
+        schedule_learner_update=512,
+        credit_plans=plans,
+    )
+    packed_metrics = learner(packed_model, 3).update(
+        (unroll,),
+        current_policy_version=3,
+        current_learner_update=0,
+        schedule_policy_version=515,
+        schedule_learner_update=512,
+        credit_plans=plans,
+    )
+
+    assert sequential_metrics.liveness_autograd_microbatches == 4
+    assert packed_metrics.liveness_autograd_microbatches == 2
+    for field in (
+        "liveness_credit_loss",
+        "liveness_value_critic_loss",
+        "liveness_q_critic_loss",
+        "liveness_cost_actor_loss",
+        "liveness_direct_policy_loss",
+    ):
+        assert getattr(packed_metrics, field) == pytest.approx(
+            getattr(sequential_metrics, field),
+            rel=2e-5,
+            abs=2e-6,
+        )
+    sequential_parameters = dict(sequential_model.named_parameters())
+    packed_parameters = dict(packed_model.named_parameters())
+    assert sequential_parameters.keys() == packed_parameters.keys()
+    for name, sequential_parameter in sequential_parameters.items():
+        torch.testing.assert_close(
+            packed_parameters[name],
+            sequential_parameter,
+            rtol=3e-5,
+            atol=3e-6,
+            msg=name,
+        )
 
 
 def test_typed_credit_plan_replays_state_and_candidate_liveness_targets() -> None:

@@ -453,12 +453,13 @@ class FailureCreditConfig:
     # Direct/cycle/contrast witnesses do not depend on that head and remain
     # independently eligible throughout calibration.
     liveness_risk_actor_start_update: int = 512
-    # Failure-credit autograd is deliberately one evidence record at a time.
-    # This v1 execution contract makes objective normalization independent of
-    # incidental batch packing and prevents an 8 x 256 recurrent graph.
+    # Failure-credit records may share one recurrent replay/autograd graph.
+    # The learner still reduces losses per record before averaging, so this is
+    # an execution-only packing limit rather than a change to evidence weight.
+    # A value of one preserves the original bounded-memory execution ABI.
     liveness_records_per_autograd_batch: int = 1
-    # Detach recurrent state at each trainable window boundary.  Together with
-    # the one-record microbatch this bounds graph depth without discarding any
+    # Detach recurrent state at each trainable window boundary. Together with
+    # the bounded record pack this limits graph depth without discarding any
     # factual target or shortening the no-grad recurrent reconstruction.
     liveness_tbptt_window_steps: int = 16
     # Matched outcome evidence may add one comparison context to the incident
@@ -542,10 +543,9 @@ class FailureCreditConfig:
                 "failure_credit.liveness_risk_actor_start_update cannot precede "
                 "failure_credit.liveness_head_calibration_updates"
             )
-        if self.liveness_records_per_autograd_batch != 1:
+        if self.liveness_records_per_autograd_batch > self.sample_records:
             raise ValueError(
-                "failure_credit.liveness_records_per_autograd_batch must be 1 "
-                "for the reviewed per-record objective ABI"
+                "failure_credit.liveness_records_per_autograd_batch cannot exceed " "failure_credit.sample_records"
             )
         quota_total = 0
         for name in (
@@ -822,9 +822,7 @@ class CurriculumConfig:
             # the ordinary schedule.  Keep zero as the explicit disabled
             # value; positive values must actually define a floor.
             if selection_surface_epsilon_floor != 0.0:
-                raise ValueError(
-                    "curriculum.selection_surface_epsilon_floor must be zero or at least epsilon_end"
-                )
+                raise ValueError("curriculum.selection_surface_epsilon_floor must be zero or at least epsilon_end")
 
 
 @dataclass(frozen=True, slots=True)
@@ -973,17 +971,11 @@ class RuntimeConfig:
         if self.rocm_sdpa_backend not in ("auto", "math"):
             raise ValueError("runtime.rocm_sdpa_backend must be 'auto' or 'math'")
         if self.model_initialization_schedule_mode not in ("reset", "inherit"):
-            raise ValueError(
-                "runtime.model_initialization_schedule_mode must be 'reset' or 'inherit'"
-            )
+            raise ValueError("runtime.model_initialization_schedule_mode must be 'reset' or 'inherit'")
         if self.model_initialization_liveness_schedule_mode not in ("reset", "inherit"):
-            raise ValueError(
-                "runtime.model_initialization_liveness_schedule_mode must be 'reset' or 'inherit'"
-            )
+            raise ValueError("runtime.model_initialization_liveness_schedule_mode must be 'reset' or 'inherit'")
         if self.evaluation_guard_failure_action not in {"stop", "rollback_continue"}:
-            raise ValueError(
-                "runtime.evaluation_guard_failure_action must be 'stop' or 'rollback_continue'"
-            )
+            raise ValueError("runtime.evaluation_guard_failure_action must be 'stop' or 'rollback_continue'")
         if self.evaluation_guard_failure_action == "rollback_continue":
             if not self.evaluation_liveness_guard_enabled:
                 raise ValueError("rollback_continue requires the evaluation liveness guard")

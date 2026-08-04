@@ -1023,15 +1023,37 @@ def _mean_liveness_credit_losses(
     batches: tuple[LivenessCreditLosses, ...],
     *,
     reference: Tensor,
+    weights: tuple[int, ...] | None = None,
+    retain_graph: bool = False,
 ) -> LivenessCreditLosses:
-    """Aggregate the formal per-record objective without retaining graphs."""
+    """Aggregate formal record means and additive telemetry.
+
+    ``weights`` describes how many equally weighted evidence records each
+    input already represents.  Loss tensors are therefore weighted means,
+    while label/work counters remain additive.  Production metric aggregation
+    detaches tensors by default; the recurrent packer opts into
+    ``retain_graph`` so one packed replay can backpropagate the exact same
+    equal-record objective as the original record-at-a-time executor.
+    """
 
     if not batches:
         return _empty_liveness_credit_losses(reference)
-    count = float(len(batches))
+    if weights is None:
+        weights = (1,) * len(batches)
+    if len(weights) != len(batches):
+        raise ValueError("liveness aggregation weights must align with batches")
+    if any(isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0 for weight in weights):
+        raise ValueError("liveness aggregation weights must be positive integers")
+    total_weight = float(sum(weights))
 
     def mean_tensor(name: str) -> Tensor:
-        return torch.stack(tuple(getattr(batch, name).detach() for batch in batches)).sum() / count
+        values = tuple(getattr(batch, name) for batch in batches)
+        if not retain_graph:
+            values = tuple(value.detach() for value in values)
+        return (
+            torch.stack(tuple(value * float(weight) for value, weight in zip(values, weights, strict=True))).sum()
+            / total_weight
+        )
 
     risk_labels = sum(batch.risk_actor_labels for batch in batches)
     centered_risk_mean = (
@@ -1254,9 +1276,7 @@ class VTraceLearner:
     def load_dynamics_state_dict(self, payload: object) -> None:
         validated = self.validate_dynamics_state_dict(payload)
         self._one_hot_batch_streak = int(validated["one_hot_batch_streak"])
-        self._entropy_breaker_remaining_updates = int(
-            validated["entropy_breaker_remaining_updates"]
-        )
+        self._entropy_breaker_remaining_updates = int(validated["entropy_breaker_remaining_updates"])
         self._entropy_breaker_triggers = int(validated["entropy_breaker_triggers"])
 
     def _entropy_weight_for_batch(
@@ -1338,18 +1358,34 @@ class VTraceLearner:
             raise ValueError("current_learner_update must be a non-negative integer")
         if credit_plans and not self.failure_credit_config.learning_enabled:
             raise ValueError("credit plans require formal liveness learning to be enabled")
+        if len(credit_plans) > self.failure_credit_config.sample_records:
+            raise ValueError("credit plan batch exceeds failure_credit.sample_records")
         reference = next(self.model.parameters())
         if not credit_plans:
             return _empty_liveness_credit_losses(reference)
         if self.model.candidate_liveness_cost_head is None:
             raise RuntimeError("enabled liveness learning has no model cost head")
-        label_manifest = compile_liveness_label_manifest(
-            credit_plans,
-            config=self.failure_credit_config,
-            current_policy_version=current_policy_version,
-            current_learner_update=current_learner_update,
+        # Compile one manifest per evidence record. Model execution may be
+        # shared across records, but target reduction remains local to each
+        # record before the formal equal-record mean is taken.
+        label_manifests = tuple(
+            compile_liveness_label_manifest(
+                (credit_plan,),
+                config=self.failure_credit_config,
+                current_policy_version=current_policy_version,
+                current_learner_update=current_learner_update,
+            )
+            for credit_plan in credit_plans
         )
-        manifest_rows = label_manifest.row_map()
+        admitted_steps = sum(manifest.work.steps for manifest in label_manifests)
+        admitted_candidates = sum(manifest.work.candidates for manifest in label_manifests)
+        if admitted_steps > self.failure_credit_config.liveness_maximum_replayed_steps_per_update:
+            raise ValueError("failure-credit replay exceeds " "liveness_maximum_replayed_steps_per_update")
+        if admitted_candidates > self.failure_credit_config.liveness_maximum_replayed_candidates_per_update:
+            raise ValueError("failure-credit replay exceeds " "liveness_maximum_replayed_candidates_per_update")
+        calibration_active = label_manifests[0].calibration_active
+        if any(manifest.calibration_active is not calibration_active for manifest in label_manifests):
+            raise RuntimeError("one liveness autograd batch crossed a calibration phase boundary")
 
         contexts: dict[int, LearningContext] = {}
         context_ids: dict[str, int] = {}
@@ -1370,8 +1406,6 @@ class VTraceLearner:
             needed_steps.setdefault(identity, set()).add(step_index)
             return identity, step_index
 
-        cycle_manifest_index = 0
-        contrast_manifest_index = 0
         for plan in credit_plans:
             if plan.provenance.policy_version > current_policy_version:
                 raise ValueError("credit-plan policy version is newer than the learner")
@@ -1452,7 +1486,7 @@ class VTraceLearner:
                         encoded,
                         hidden,
                         validate=False,
-                        detach_liveness_shared_features=(label_manifest.calibration_active),
+                        detach_liveness_shared_features=calibration_active,
                     )
                 else:
                     with torch.no_grad():
@@ -1460,7 +1494,7 @@ class VTraceLearner:
                             encoded,
                             hidden,
                             validate=False,
-                            detach_liveness_shared_features=(label_manifest.calibration_active),
+                            detach_liveness_shared_features=calibration_active,
                         )
                 if output.recurrent_state.shape != (
                     len(identities),
@@ -1513,129 +1547,130 @@ class VTraceLearner:
         finally:
             self.model.train(was_training)
 
-        ordered_keys = tuple(
-            (identity, step_index) for identity in contexts for step_index in sorted(needed_steps.get(identity, ()))
-        )
-        if set(ordered_keys) != set(replayed):
+        expected_keys = {
+            (identity, step_index) for identity in contexts for step_index in needed_steps.get(identity, ())
+        }
+        if expected_keys != set(replayed):
             raise RuntimeError("liveness recurrent replay lost a referenced decision")
-        row_index = {key: index for index, key in enumerate(ordered_keys)}
-        decisions = tuple(replayed[key] for key in ordered_keys)
-        maximum_candidates = max(decision.policy_log_probabilities.shape[0] for decision in decisions)
 
-        def padded(
-            value: Tensor,
-            *,
-            fill: float,
-        ) -> Tensor:
-            missing = maximum_candidates - value.shape[0]
-            return F.pad(value, (0, missing), value=fill) if missing else value
+        def record_losses(
+            plan: CreditPlan,
+            manifest: LivenessLabelManifest,
+        ) -> LivenessCreditLosses:
+            """Reduce one record over outputs produced by the shared replay."""
 
-        policy_log_probabilities = torch.stack(
-            tuple(padded(decision.policy_log_probabilities, fill=-torch.inf) for decision in decisions)
-        )
-        candidate_cost_values = torch.stack(
-            tuple(padded(decision.candidate_cost_values, fill=0.0) for decision in decisions)
-        )
-        state_cost_values = torch.stack(tuple(decision.state_cost_value for decision in decisions))
-        action_mask = torch.stack(
-            tuple(
-                F.pad(
-                    decision.action_mask,
-                    (0, maximum_candidates - decision.action_mask.shape[0]),
-                    value=False,
+            if not manifest.rows:
+                return replace(
+                    _empty_liveness_credit_losses(reference),
+                    policy_lag_suppressed_labels=manifest.policy_lag_suppressed_labels,
+                    risk_actor_phase_suppressed_labels=(manifest.risk_actor_phase_suppressed_labels),
+                    replayed_contexts=manifest.work.contexts,
+                    replayed_steps=manifest.work.steps,
+                    replayed_candidates=manifest.work.candidates,
+                    autograd_segments=manifest.work.autograd_segments,
                 )
-                for decision in decisions
+            record_keys: list[tuple[int, int]] = []
+            for manifest_row in manifest.rows:
+                identity = context_ids.get(manifest_row.context_id)
+                if identity is None:  # pragma: no cover - compiler/replay invariant
+                    raise RuntimeError("compiled liveness context was not registered for replay")
+                record_keys.append((identity, manifest_row.step_index))
+            decisions = tuple(replayed[key] for key in record_keys)
+            maximum_candidates = max(decision.policy_log_probabilities.shape[0] for decision in decisions)
+
+            def padded(value: Tensor, *, fill: float) -> Tensor:
+                missing = maximum_candidates - value.shape[0]
+                return F.pad(value, (0, missing), value=fill) if missing else value
+
+            policy_log_probabilities = torch.stack(
+                tuple(padded(decision.policy_log_probabilities, fill=-torch.inf) for decision in decisions)
             )
-        )
-        selected_action_indices = torch.tensor(
-            tuple(decision.selected_action_index for decision in decisions),
-            device=self.device,
-            dtype=torch.long,
-        )
-        forced_mask = torch.tensor(
-            tuple(decision.forced for decision in decisions),
-            device=self.device,
-            dtype=torch.bool,
-        )
-        censored_mask = torch.zeros(
-            len(decisions),
-            device=self.device,
-            dtype=torch.bool,
-        )
-        risk_targets = torch.zeros(
-            len(decisions),
-            device=self.device,
-            dtype=candidate_cost_values.dtype,
-        )
-        value_targets = torch.zeros_like(risk_targets)
-        value_critic_mask = torch.zeros_like(censored_mask)
-        risk_critic_mask = torch.zeros_like(censored_mask)
-        risk_actor_mask = torch.zeros_like(censored_mask)
-        direct_avoid_mask = torch.zeros_like(censored_mask)
-        completion_mask = torch.zeros_like(censored_mask)
-        direct_targets: dict[int, DirectPolicyTarget] = {}
-        cycle_groups: list[tuple[int, ...]] = []
-        cycle_behavior: list[float] = []
-        cycle_margins: list[float] = []
-        contrast_pairs: list[tuple[int, int]] = []
-        contrast_margins: list[float] = []
-        policy_lag_suppressed_labels = label_manifest.policy_lag_suppressed_labels
+            candidate_cost_values = torch.stack(
+                tuple(padded(decision.candidate_cost_values, fill=0.0) for decision in decisions)
+            )
+            state_cost_values = torch.stack(tuple(decision.state_cost_value for decision in decisions))
+            action_mask = torch.stack(
+                tuple(
+                    F.pad(
+                        decision.action_mask,
+                        (0, maximum_candidates - decision.action_mask.shape[0]),
+                        value=False,
+                    )
+                    for decision in decisions
+                )
+            )
+            selected_action_indices = torch.tensor(
+                tuple(decision.selected_action_index for decision in decisions),
+                device=self.device,
+                dtype=torch.long,
+            )
+            forced_mask = torch.tensor(
+                tuple(decision.forced for decision in decisions),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            rows = len(decisions)
+            # Targets and masks are immutable compiler facts. Assemble them on
+            # the host and transfer each vector once; probing GPU tensors with
+            # ``.item()`` inside a 256-step Python loop serialized ROCm replay.
+            censored_values = [False] * rows
+            risk_target_values = [0.0] * rows
+            value_target_values = [0.0] * rows
+            value_critic_values = [False] * rows
+            risk_critic_values = [False] * rows
+            risk_actor_values = [False] * rows
+            direct_avoid_values = [False] * rows
+            completion_values = [False] * rows
+            direct_targets: dict[int, DirectPolicyTarget] = {}
+            cycle_groups: list[tuple[int, ...]] = []
+            cycle_behavior: list[float] = []
+            cycle_margins: list[float] = []
+            contrast_pairs: list[tuple[int, int]] = []
+            contrast_margins: list[float] = []
+            manifest_rows = manifest.row_map()
+            row_index = {row.key: index for index, row in enumerate(manifest.rows)}
 
-        def decision_row(
-            context: LearningContext,
-            step_index: int,
-        ) -> int:
-            try:
-                return row_index[(id(context), step_index)]
-            except KeyError as error:  # pragma: no cover - internal invariant
-                raise RuntimeError("compiled liveness target was not recurrently replayed") from error
+            def decision_row(context: LearningContext, step_index: int) -> int:
+                try:
+                    return row_index[(context.context_id, step_index)]
+                except KeyError as error:  # pragma: no cover - internal invariant
+                    raise RuntimeError("compiled liveness target was not recurrently replayed") from error
 
-        def merge_risk_target(row: int, target: float) -> None:
-            value = float(target)
-            if not 0.0 <= value <= 1.0 or not math.isfinite(value):
-                raise ValueError("compiled liveness target must be in [0, 1]")
-            if bool(risk_critic_mask[row].item()):
-                previous = float(risk_targets[row].item())
-                if not math.isclose(
-                    previous,
-                    value,
-                    rel_tol=1e-6,
-                    abs_tol=1e-6,
-                ):
-                    raise ValueError("conflicting liveness targets reference one decision")
-                return
-            risk_targets[row] = value
-            risk_critic_mask[row] = True
+            def merge_risk_target(row: int, target: float) -> None:
+                value = float(target)
+                if not 0.0 <= value <= 1.0 or not math.isfinite(value):
+                    raise ValueError("compiled liveness target must be in [0, 1]")
+                if risk_critic_values[row]:
+                    previous = risk_target_values[row]
+                    if not math.isclose(previous, value, rel_tol=1e-6, abs_tol=1e-6):
+                        raise ValueError("conflicting liveness targets reference one decision")
+                    return
+                risk_target_values[row] = value
+                risk_critic_values[row] = True
 
-        def merge_value_target(row: int, target: float) -> None:
-            value = float(target)
-            if not 0.0 <= value <= 1.0 or not math.isfinite(value):
-                raise ValueError("compiled liveness value target must be in [0, 1]")
-            if bool(value_critic_mask[row].item()):
-                previous = float(value_targets[row].item())
-                if not math.isclose(
-                    previous,
-                    value,
-                    rel_tol=1e-6,
-                    abs_tol=1e-6,
-                ):
-                    raise ValueError("conflicting liveness value targets reference one decision")
-                return
-            value_targets[row] = value
-            value_critic_mask[row] = True
+            def merge_value_target(row: int, target: float) -> None:
+                value = float(target)
+                if not 0.0 <= value <= 1.0 or not math.isfinite(value):
+                    raise ValueError("compiled liveness value target must be in [0, 1]")
+                if value_critic_values[row]:
+                    previous = value_target_values[row]
+                    if not math.isclose(previous, value, rel_tol=1e-6, abs_tol=1e-6):
+                        raise ValueError("conflicting liveness value targets reference one decision")
+                    return
+                value_target_values[row] = value
+                value_critic_values[row] = True
 
-        for plan in credit_plans:
             plan_censored = EvidenceStratum.CENSORED in plan.strata
             for value_target in plan.liveness_value_targets:
                 row = decision_row(plan.context, value_target.step_index)
                 merge_value_target(row, value_target.target)
                 if plan_censored:
-                    censored_mask[row] = True
+                    censored_values[row] = True
             for q_target in plan.liveness_q_targets:
                 row = decision_row(plan.context, q_target.step_index)
                 merge_risk_target(row, q_target.target)
                 if plan_censored:
-                    censored_mask[row] = True
+                    censored_values[row] = True
             for sequence in plan.risk_sequences:
                 sequence_length = len(sequence.step_indices)
                 for ordinal, step_index in enumerate(sequence.step_indices):
@@ -1647,9 +1682,9 @@ class VTraceLearner:
                     )
                     manifest_row = manifest_rows[(plan.context.context_id, step_index)]
                     if manifest_row.risk_actor_mask:
-                        risk_actor_mask[row] = True
+                        risk_actor_values[row] = True
                     if plan_censored:
-                        censored_mask[row] = True
+                        censored_values[row] = True
             for direct_target in plan.direct_policy_targets:
                 row = decision_row(plan.context, direct_target.step_index)
                 manifest_row = manifest_rows[(plan.context.context_id, direct_target.step_index)]
@@ -1660,27 +1695,23 @@ class VTraceLearner:
                     raise ValueError("conflicting direct policy targets reference one decision")
                 direct_targets[row] = direct_target.target
                 if direct_target.target is DirectPolicyTarget.AVOID:
-                    direct_avoid_mask[row] = True
+                    direct_avoid_values[row] = True
                 elif direct_target.target is DirectPolicyTarget.PREFER:
-                    completion_mask[row] = True
+                    completion_values[row] = True
                 else:  # pragma: no cover - enum exhaustiveness
                     raise RuntimeError("unsupported direct liveness target")
                 if plan_censored:
-                    censored_mask[row] = True
-            for cycle_target in plan.cycle_policy_targets:
-                manifest_group = label_manifest.cycle_groups[cycle_manifest_index]
-                cycle_manifest_index += 1
-                if not manifest_group.effective:
+                    censored_values[row] = True
+            for group_index, cycle_target in enumerate(plan.cycle_policy_targets):
+                if not manifest.cycle_groups[group_index].effective:
                     continue
                 cycle_groups.append(
                     tuple(decision_row(plan.context, step_index) for step_index in cycle_target.step_indices)
                 )
                 cycle_behavior.append(cycle_target.behavior_mean_log_probability)
                 cycle_margins.append(cycle_target.margin)
-            for contrast_target in plan.contrast_policy_targets:
-                manifest_group = label_manifest.contrast_groups[contrast_manifest_index]
-                contrast_manifest_index += 1
-                if not manifest_group.effective:
+            for group_index, contrast_target in enumerate(plan.contrast_policy_targets):
+                if not manifest.contrast_groups[group_index].effective:
                     continue
                 contrast_pairs.append(
                     (
@@ -1696,37 +1727,57 @@ class VTraceLearner:
                 )
                 contrast_margins.append(contrast_target.margin)
 
-        losses = liveness_credit_losses(
-            policy_log_probabilities=policy_log_probabilities,
-            candidate_liveness_cost_values=candidate_cost_values,
-            liveness_cost_values=state_cost_values,
-            action_mask=action_mask,
-            selected_action_indices=selected_action_indices,
-            value_targets=value_targets,
-            value_critic_mask=value_critic_mask,
-            risk_targets=risk_targets,
-            risk_critic_mask=risk_critic_mask,
-            risk_actor_mask=risk_actor_mask,
-            forced_mask=forced_mask,
-            censored_mask=censored_mask,
-            direct_avoid_mask=direct_avoid_mask,
-            completion_mask=completion_mask,
-            cycle_groups=tuple(cycle_groups),
-            cycle_behavior_mean_log_probabilities=tuple(cycle_behavior),
-            cycle_margins=tuple(cycle_margins),
-            contrast_pairs=tuple(contrast_pairs),
-            contrast_margins=tuple(contrast_margins),
-            risk_advantage_clip=(self.failure_credit_config.liveness_risk_advantage_clip),
-            contrast_margin=self.failure_credit_config.liveness_contrast_margin,
+            def bool_tensor(values: list[bool]) -> Tensor:
+                return torch.tensor(values, device=self.device, dtype=torch.bool)
+
+            losses = liveness_credit_losses(
+                policy_log_probabilities=policy_log_probabilities,
+                candidate_liveness_cost_values=candidate_cost_values,
+                liveness_cost_values=state_cost_values,
+                action_mask=action_mask,
+                selected_action_indices=selected_action_indices,
+                value_targets=torch.tensor(
+                    value_target_values,
+                    device=self.device,
+                    dtype=candidate_cost_values.dtype,
+                ),
+                value_critic_mask=bool_tensor(value_critic_values),
+                risk_targets=torch.tensor(
+                    risk_target_values,
+                    device=self.device,
+                    dtype=candidate_cost_values.dtype,
+                ),
+                risk_critic_mask=bool_tensor(risk_critic_values),
+                risk_actor_mask=bool_tensor(risk_actor_values),
+                forced_mask=forced_mask,
+                censored_mask=bool_tensor(censored_values),
+                direct_avoid_mask=bool_tensor(direct_avoid_values),
+                completion_mask=bool_tensor(completion_values),
+                cycle_groups=tuple(cycle_groups),
+                cycle_behavior_mean_log_probabilities=tuple(cycle_behavior),
+                cycle_margins=tuple(cycle_margins),
+                contrast_pairs=tuple(contrast_pairs),
+                contrast_margins=tuple(contrast_margins),
+                risk_advantage_clip=(self.failure_credit_config.liveness_risk_advantage_clip),
+                contrast_margin=self.failure_credit_config.liveness_contrast_margin,
+            )
+            return replace(
+                losses,
+                policy_lag_suppressed_labels=manifest.policy_lag_suppressed_labels,
+                risk_actor_phase_suppressed_labels=(manifest.risk_actor_phase_suppressed_labels),
+                replayed_contexts=manifest.work.contexts,
+                replayed_steps=manifest.work.steps,
+                replayed_candidates=manifest.work.candidates,
+                autograd_segments=manifest.work.autograd_segments,
+            )
+
+        per_record_losses = tuple(
+            record_losses(plan, manifest) for plan, manifest in zip(credit_plans, label_manifests, strict=True)
         )
-        return replace(
-            losses,
-            policy_lag_suppressed_labels=(policy_lag_suppressed_labels),
-            risk_actor_phase_suppressed_labels=(label_manifest.risk_actor_phase_suppressed_labels),
-            replayed_contexts=label_manifest.work.contexts,
-            replayed_steps=label_manifest.work.steps,
-            replayed_candidates=label_manifest.work.candidates,
-            autograd_segments=label_manifest.work.autograd_segments,
+        return _mean_liveness_credit_losses(
+            per_record_losses,
+            reference=reference,
+            retain_graph=True,
         )
 
     def update(
@@ -1786,9 +1837,9 @@ class VTraceLearner:
         admitted_manifests: tuple[LivenessLabelManifest, ...] = ()
         if credit_plans:
             # Admit the complete sampled set before any model forward.  The
-            # production gradient path below is intentionally one record per
-            # autograd microbatch, but aggregate hard budgets apply to the
-            # update as a whole and may never be bypassed by that packing.
+            # production gradient path below may pack several records into one
+            # graph, but aggregate hard budgets apply to the update as a whole
+            # and may never be bypassed by execution packing.
             admitted_manifests = tuple(
                 compile_liveness_label_manifest(
                     (credit_plan,),
@@ -2080,79 +2131,108 @@ class VTraceLearner:
         policy_gradients_before_liveness = _parameter_gradient_snapshot(policy_head_parameters)
         critic_gradients_before_liveness = _parameter_gradient_snapshot(liveness_head_parameters)
         liveness_started_ns = time.perf_counter_ns()
-        per_record_liveness_losses: list[LivenessCreditLosses] = []
-        for record_index, (credit_plan, admitted_manifest) in enumerate(
-            zip(credit_plans, admitted_manifests, strict=True)
-        ):
-            # The reviewed v1 objective is an equal-weight mean over sampled
-            # evidence records.  Replaying and backpropagating one record at a
-            # time frees its graph before the next record and makes activation
-            # memory independent of ``sample_records``.
-            # Report the bounded microbatch before entering model forward.  A
-            # native GPU stall can then be attributed to one replay slot and
-            # workload without serializing the evidence record itself.
+        packed_liveness_losses: list[LivenessCreditLosses] = []
+        packed_record_counts: list[int] = []
+        liveness_pack_size = self.failure_credit_config.liveness_records_per_autograd_batch
+        liveness_autograd_microbatches = math.ceil(len(credit_plans) / liveness_pack_size) if credit_plans else 0
+        for pack_index, pack_start in enumerate(range(0, len(credit_plans), liveness_pack_size)):
+            pack_end = min(pack_start + liveness_pack_size, len(credit_plans))
+            plan_pack = credit_plans[pack_start:pack_end]
+            manifest_pack = admitted_manifests[pack_start:pack_end]
+            pack_record_count = len(plan_pack)
+            pack_contexts = sum(manifest.work.contexts for manifest in manifest_pack)
+            pack_steps = sum(manifest.work.steps for manifest in manifest_pack)
+            pack_candidates = sum(manifest.work.candidates for manifest in manifest_pack)
+            pack_segments = sum(manifest.work.autograd_segments for manifest in manifest_pack)
+            # Report the complete active-shape pack before model forward. A
+            # native GPU stall can then be attributed to one bounded graph and
+            # its workload. Per-record events remain for monitor compatibility.
             report(
-                "liveness_record_start",
-                liveness_record_index=record_index,
+                "liveness_autograd_batch_start",
+                liveness_autograd_batch_index=pack_index,
+                liveness_autograd_batches=liveness_autograd_microbatches,
+                liveness_batch_first_record=pack_start,
+                liveness_batch_records=pack_record_count,
                 liveness_records=len(credit_plans),
-                liveness_record_contexts=admitted_manifest.work.contexts,
-                liveness_record_steps=admitted_manifest.work.steps,
-                liveness_record_candidates=admitted_manifest.work.candidates,
-                liveness_record_autograd_segments=(admitted_manifest.work.autograd_segments),
+                liveness_batch_contexts=pack_contexts,
+                liveness_batch_steps=pack_steps,
+                liveness_batch_candidates=pack_candidates,
+                liveness_batch_autograd_segments=pack_segments,
             )
-            record_losses = self.credit_plan_liveness_losses(
-                (credit_plan,),
+            for offset, admitted_manifest in enumerate(manifest_pack):
+                report(
+                    "liveness_record_start",
+                    liveness_record_index=pack_start + offset,
+                    liveness_records=len(credit_plans),
+                    liveness_autograd_batch_index=pack_index,
+                    liveness_record_contexts=admitted_manifest.work.contexts,
+                    liveness_record_steps=admitted_manifest.work.steps,
+                    liveness_record_candidates=admitted_manifest.work.candidates,
+                    liveness_record_autograd_segments=(admitted_manifest.work.autograd_segments),
+                )
+            pack_losses = self.credit_plan_liveness_losses(
+                plan_pack,
                 current_policy_version=current_policy_version,
                 current_learner_update=schedule_learner_update,
             )
-            record_critic_objective = (
-                self.failure_credit_config.liveness_value_critic_weight * record_losses.value_critic_loss
-                + self.failure_credit_config.liveness_cost_critic_weight * record_losses.critic_loss
+            pack_critic_objective = (
+                self.failure_credit_config.liveness_value_critic_weight * pack_losses.value_critic_loss
+                + self.failure_credit_config.liveness_cost_critic_weight * pack_losses.critic_loss
             )
-            record_policy_objective = (
-                self.failure_credit_config.liveness_cost_actor_weight * record_losses.risk_actor_loss
-                + self.failure_credit_config.liveness_direct_policy_weight * record_losses.direct_avoid_loss
-                + self.failure_credit_config.liveness_cycle_policy_weight * record_losses.cycle_likelihood_loss
-                + self.failure_credit_config.liveness_contrast_policy_weight * record_losses.contrast_loss
-                + self.failure_credit_config.liveness_completion_policy_weight * record_losses.completion_loss
+            pack_policy_objective = (
+                self.failure_credit_config.liveness_cost_actor_weight * pack_losses.risk_actor_loss
+                + self.failure_credit_config.liveness_direct_policy_weight * pack_losses.direct_avoid_loss
+                + self.failure_credit_config.liveness_cycle_policy_weight * pack_losses.cycle_likelihood_loss
+                + self.failure_credit_config.liveness_contrast_policy_weight * pack_losses.contrast_loss
+                + self.failure_credit_config.liveness_completion_policy_weight * pack_losses.completion_loss
             )
-            record_objective = record_critic_objective + record_policy_objective
+            pack_objective = pack_critic_objective + pack_policy_objective
             _require_finite(
                 "liveness targets/loss",
                 (
                     (
                         "liveness_value_critic_loss",
-                        record_losses.value_critic_loss,
+                        pack_losses.value_critic_loss,
                     ),
-                    ("liveness_q_critic_loss", record_losses.critic_loss),
+                    ("liveness_q_critic_loss", pack_losses.critic_loss),
                     (
                         "liveness_cost_actor_loss",
-                        record_losses.risk_actor_loss,
+                        pack_losses.risk_actor_loss,
                     ),
                     (
                         "liveness_direct_policy_loss",
-                        record_losses.direct_avoid_loss,
+                        pack_losses.direct_avoid_loss,
                     ),
                     (
                         "liveness_cycle_policy_loss",
-                        record_losses.cycle_likelihood_loss,
+                        pack_losses.cycle_likelihood_loss,
                     ),
                     (
                         "liveness_contrast_policy_loss",
-                        record_losses.contrast_loss,
+                        pack_losses.contrast_loss,
                     ),
                     (
                         "liveness_completion_policy_loss",
-                        record_losses.completion_loss,
+                        pack_losses.completion_loss,
                     ),
-                    ("liveness_record_objective", record_objective),
+                    ("liveness_autograd_batch_objective", pack_objective),
                 ),
             )
-            (record_objective / float(len(credit_plans))).backward()  # type: ignore[no-untyped-call]
-            per_record_liveness_losses.append(record_losses)
+            # ``pack_losses`` is the equal-record mean inside this pack. Scale
+            # by its fraction of the full sample so arbitrary final-pack sizes
+            # preserve the exact global equal-record objective.
+            (pack_objective * (pack_record_count / float(len(credit_plans)))).backward()  # type: ignore[no-untyped-call]
+            packed_liveness_losses.append(
+                _mean_liveness_credit_losses(
+                    (pack_losses,),
+                    reference=next(self.model.parameters()),
+                )
+            )
+            packed_record_counts.append(pack_record_count)
         liveness_losses = _mean_liveness_credit_losses(
-            tuple(per_record_liveness_losses),
+            tuple(packed_liveness_losses),
             reference=next(self.model.parameters()),
+            weights=tuple(packed_record_counts),
         )
         liveness_critic_objective = (
             self.failure_credit_config.liveness_value_critic_weight * liveness_losses.value_critic_loss
@@ -2193,6 +2273,7 @@ class VTraceLearner:
             "liveness_replay_complete",
             liveness_replay_ms=liveness_replay_ms,
             liveness_records=len(credit_plans),
+            liveness_autograd_batches=liveness_autograd_microbatches,
             liveness_replayed_contexts=liveness_losses.replayed_contexts,
             liveness_replayed_steps=liveness_losses.replayed_steps,
             liveness_replayed_candidates=liveness_losses.replayed_candidates,
@@ -2309,31 +2390,15 @@ class VTraceLearner:
             entropy=float(entropy.detach().item()),
             entropy_weight=entropy_weight,
             entropy_breaker_active=int(entropy_breaker_active),
-            entropy_breaker_one_hot_condition=int(
-                entropy_breaker_one_hot_condition
-            ),
+            entropy_breaker_one_hot_condition=int(entropy_breaker_one_hot_condition),
             entropy_breaker_consecutive_batches=self._one_hot_batch_streak,
-            entropy_breaker_remaining_updates=(
-                self._entropy_breaker_remaining_updates
-            ),
+            entropy_breaker_remaining_updates=(self._entropy_breaker_remaining_updates),
             entropy_breaker_triggers=self._entropy_breaker_triggers,
             advantage_mean=(float(active_advantages.detach().mean().item()) if active_advantages.numel() else 0.0),
             value_target_mean=float(active_targets.detach().mean().item()),
-            importance_ratio_mean=(
-                float(active_ratios.detach().mean().item())
-                if active_ratios.numel()
-                else 0.0
-            ),
-            importance_ratio_max=(
-                float(active_ratios.detach().max().item())
-                if active_ratios.numel()
-                else 0.0
-            ),
-            importance_clip_fraction=(
-                float(clipped.detach().mean().item())
-                if clipped.numel()
-                else 0.0
-            ),
+            importance_ratio_mean=(float(active_ratios.detach().mean().item()) if active_ratios.numel() else 0.0),
+            importance_ratio_max=(float(active_ratios.detach().max().item()) if active_ratios.numel() else 0.0),
+            importance_clip_fraction=(float(clipped.detach().mean().item()) if clipped.numel() else 0.0),
             gradient_norm=gradient_norm,
             unrolls=len(unrolls),
             environment_steps=int(valid.sum().item()),
@@ -2379,12 +2444,8 @@ class VTraceLearner:
             liveness_centered_risk_max_abs=(liveness_losses.centered_risk_max_abs),
             liveness_policy_gradient_norm=liveness_policy_gradient_norm,
             liveness_critic_gradient_norm=liveness_critic_gradient_norm,
-            liveness_gradient_norm_before_clip=(
-                liveness_gradient_norm_before_clip
-            ),
-            liveness_gradient_norm_after_clip=(
-                liveness_gradient_norm_after_clip
-            ),
+            liveness_gradient_norm_before_clip=(liveness_gradient_norm_before_clip),
+            liveness_gradient_norm_after_clip=(liveness_gradient_norm_after_clip),
             liveness_gradient_clip_scale=liveness_gradient_clip_scale,
             liveness_head_calibration_active=int(
                 schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
@@ -2395,7 +2456,7 @@ class VTraceLearner:
             liveness_replayed_contexts=liveness_losses.replayed_contexts,
             liveness_replayed_steps=liveness_losses.replayed_steps,
             liveness_replayed_candidates=(liveness_losses.replayed_candidates),
-            liveness_autograd_microbatches=len(credit_plans),
+            liveness_autograd_microbatches=liveness_autograd_microbatches,
             liveness_autograd_segments=liveness_losses.autograd_segments,
             episodic_loss=float(episodic_losses.total_loss.detach().item()),
             episodic_primary_policy_loss=float(episodic_losses.primary_policy_loss.detach().item()),
@@ -2410,9 +2471,7 @@ class VTraceLearner:
             episodic_policy_active_sequences=(episodic_losses.policy_active_sequences),
             episodic_failure_policy_suppressed_labels=(episodic_losses.failure_policy_suppressed_labels),
             episodic_policy_lag_suppressed_labels=(episodic_losses.policy_lag_suppressed_labels),
-            episodic_success_trust_region_suppressed_labels=(
-                episodic_losses.success_trust_region_suppressed_labels
-            ),
+            episodic_success_trust_region_suppressed_labels=(episodic_losses.success_trust_region_suppressed_labels),
             episodic_task_value_labels=episodic_losses.task_value_labels,
             episodic_revival_value_labels=(episodic_losses.revival_value_labels),
             episodic_efficiency_policy_labels=(episodic_losses.efficiency_policy_labels),
@@ -2746,10 +2805,7 @@ class VTraceLearner:
                 if bool(
                     (
                         (primary_advantage.detach() > 0.0)
-                        & (
-                            detached_ratio
-                            > 1.0 + self.episodic_config.success_policy_trust_region_epsilon
-                        )
+                        & (detached_ratio > 1.0 + self.episodic_config.success_policy_trust_region_epsilon)
                     ).item()
                 ):
                     # The selected successful action is already materially
@@ -2863,9 +2919,7 @@ class VTraceLearner:
             policy_active_sequences=len(policy_active_sequence_indexes),
             failure_policy_suppressed_labels=failure_policy_suppressed_labels,
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
-            success_trust_region_suppressed_labels=(
-                success_trust_region_suppressed_labels
-            ),
+            success_trust_region_suppressed_labels=(success_trust_region_suppressed_labels),
             task_value_labels=len(task_predictions),
             revival_value_labels=len(revival_predictions),
             efficiency_policy_labels=efficiency_policy_labels,

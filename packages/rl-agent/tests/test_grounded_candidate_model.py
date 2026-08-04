@@ -13,6 +13,7 @@ from sts2_rl.models import (
     WorldEncoding,
     WorldTokenBatch,
 )
+from sts2_rl.models.grounded_candidate import _safe_valid_mask
 
 MULTISCALE_STATE_VALUE_FIELDS = (
     "combat_task_value",
@@ -49,6 +50,51 @@ def config() -> GroundedCandidateConfig:
 
 def _ids(shape: tuple[int, ...], size: int) -> torch.Tensor:
     return torch.randint(0, size, shape, dtype=torch.long)
+
+
+def test_safe_valid_mask_only_opens_first_column_for_empty_rows() -> None:
+    mask = torch.tensor(
+        [
+            [False, False, False, False],
+            [False, True, False, False],
+            [True, False, True, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    safe = _safe_valid_mask(mask)
+
+    assert torch.equal(
+        safe,
+        torch.tensor(
+            [
+                [True, False, False, False],
+                [False, True, False, False],
+                [True, False, True, False],
+            ],
+            dtype=torch.bool,
+        ),
+    )
+    assert torch.equal(mask[1:], safe[1:])
+
+
+def test_safe_valid_mask_supports_leading_attention_dimensions() -> None:
+    mask = torch.tensor(
+        [
+            [[False, False, False], [False, True, False]],
+            [[True, False, False], [False, False, False]],
+        ],
+        dtype=torch.bool,
+    )
+
+    safe = _safe_valid_mask(mask)
+
+    assert safe.shape == mask.shape
+    assert bool(safe.any(dim=-1).all().item())
+    assert torch.equal(safe[0, 1], mask[0, 1])
+    assert torch.equal(safe[1, 0], mask[1, 0])
+    assert torch.equal(safe[0, 0], torch.tensor([True, False, False]))
+    assert torch.equal(safe[1, 1], torch.tensor([True, False, False]))
 
 
 def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
@@ -320,10 +366,7 @@ def test_hierarchical_policy_adds_no_checkpoint_parameters(
     config: GroundedCandidateConfig,
 ) -> None:
     model = RecurrentCandidateModel(config).eval()
-    before = {
-        key: value.detach().clone()
-        for key, value in model.state_dict().items()
-    }
+    before = {key: value.detach().clone() for key, value in model.state_dict().items()}
 
     output = model(_make_batch(config))
     output.policy_probabilities()
@@ -599,20 +642,14 @@ def test_tensor_contract_rejects_zero_sized_batch(
             owner_ids=batch.candidates.owner_ids[:0],
             entity_ids=batch.candidates.entity_ids[:0],
             entity_aux_ids=batch.candidates.entity_aux_ids[:0],
-            definition_binding_ids=(
-                batch.candidates.definition_binding_ids[:0]
-            ),
+            definition_binding_ids=(batch.candidates.definition_binding_ids[:0]),
             relation_binding_ids=batch.candidates.relation_binding_ids[:0],
             zone_ids=batch.candidates.zone_ids[:0],
             target_owner_ids=batch.candidates.target_owner_ids[:0],
             target_entity_ids=batch.candidates.target_entity_ids[:0],
             target_entity_aux_ids=batch.candidates.target_entity_aux_ids[:0],
-            target_definition_binding_ids=(
-                batch.candidates.target_definition_binding_ids[:0]
-            ),
-            target_relation_binding_ids=(
-                batch.candidates.target_relation_binding_ids[:0]
-            ),
+            target_definition_binding_ids=(batch.candidates.target_definition_binding_ids[:0]),
+            target_relation_binding_ids=(batch.candidates.target_relation_binding_ids[:0]),
             local_features=batch.candidates.local_features[:0],
             local_mask=batch.candidates.local_mask[:0],
             local_type_ids=batch.candidates.local_type_ids[:0],
@@ -620,12 +657,8 @@ def test_tensor_contract_rejects_zero_sized_batch(
             local_owner_ids=batch.candidates.local_owner_ids[:0],
             local_entity_ids=batch.candidates.local_entity_ids[:0],
             local_entity_aux_ids=batch.candidates.local_entity_aux_ids[:0],
-            local_definition_binding_ids=(
-                batch.candidates.local_definition_binding_ids[:0]
-            ),
-            local_relation_binding_ids=(
-                batch.candidates.local_relation_binding_ids[:0]
-            ),
+            local_definition_binding_ids=(batch.candidates.local_definition_binding_ids[:0]),
+            local_relation_binding_ids=(batch.candidates.local_relation_binding_ids[:0]),
             local_zone_ids=batch.candidates.local_zone_ids[:0],
             local_order_ids=batch.candidates.local_order_ids[:0],
             action_mask=batch.candidates.action_mask[:0],

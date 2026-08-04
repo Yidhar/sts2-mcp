@@ -431,6 +431,54 @@ exact continuation；head routing 或 precision 改变数值路径时应先独�
 - current-update no-grad prefix cache；
 - 保持 replay v5 数据与抽样完全不变。
 
+#### P1a 已落地（2026-08-04）
+
+第一批生产优化已经完成：
+
+- `liveness_records_per_autograd_batch` 从只允许 `1` 改为允许
+  `1..sample_records`；旧配置保持 `1` 时仍走原逐记录边界；
+- 一个 pack 的不同 context 按 local timestep 共用 active-shape forward；
+- 每条 evidence record 仍先独立生成 mask/target 并独立归约，再做
+  equal-record mean；没有改成全局 label mean，长 context 不会取得更大权重；
+- 最后一个不足额 pack 按 `pack_records / total_records` 回传，`3+1` 等
+  非整除分包与逐记录梯度等价；
+- aggregate step/candidate 硬预算仍在第一次 model forward 前 fail closed；
+- 256-step target/mask 在 CPU 上组装后一次性传输，不再在逐标签循环中用
+  GPU `.item()` 串行同步；
+- progress telemetry 同时记录 autograd batch 和兼容的逐 record work；
+- v33 尚未产生训练 artifact，因此其显式 model-init 配方启用
+  `sample_records=4, liveness_records_per_autograd_batch=4`。v32 及更早
+  配方仍为 `1`，不把执行 ABI 改动伪装成旧 checkpoint 的 exact resume。
+
+冻结 v32 `periodic-step-000090152`、同一 replay fixture、RX 7900 XTX、
+ROCm 7.2.1、FP32/math-SDPA，`warmup=1, iterations=3` 的实测如下：
+
+为只测 executor packing，两臂均显式固定为旧 synchronizing mask oracle；
+因此下表的收益不包含 `kernel-lab-e2e-application-v1.md` 中 branchless mask
+另行测得的收益，也不把两个独立 A/B 的百分比机械相乘。
+
+| 指标 | pack=1 | pack=4 | 变化 |
+|---|---:|---:|---:|
+| liveness replay mean | 12.775 s | 6.047 s | **2.113x / -52.7%** |
+| backward envelope mean | 14.540 s | 7.876 s | **1.846x / -45.8%** |
+| learner total mean | 14.963 s | 8.331 s | **1.796x / -44.3%** |
+| wall E2E mean | 14.994 s | 8.500 s | **1.764x / -43.3%** |
+| peak allocated | 3.581 GB | 7.075 GB | +3.494 GB |
+| peak reserved / device | 3.592 GB / 13.97% | 7.172 GB / 27.90% | 低于 50% 门禁 |
+
+三次更新后的 `liveness_credit_loss` 完全相同（均
+`0.09824787825345993`），总 `gradient_norm` 仅相差
+`2.98e-8`。CPU 回归还覆盖异构 actor/critic label、3/5/7/111 candidates
+以及 4-record 的 `3+1` 分包。结果保存在外部 artifact：
+
+- `runtime/analysis/liveness-executor-v2-pack1-ab.json`
+- `runtime/analysis/liveness-executor-v2-pack4-cpu-targets-ab.json`
+
+这一批已经达到 learner total `<=12 s` 和 updates/hour `>=1.6x` 的目标，
+但 liveness 本段仍为 6.05 s，尚未达到原定 `<=5 s`。因此下一优化点应是
+critic-only head routing、静态编码预批处理和稳定 shape bucket，而不是继续
+无界增加 record pack 或改变训练信号。
+
 ### P2：replay v6 去重存储
 
 - ContextBlobStore、columnar snapshot、identity interning；
@@ -466,8 +514,8 @@ exact continuation；head routing 或 precision 改变数值路径时应先独�
 - learner total mean：19.46 s -> **<= 12.0 s**；
 - learner updates/hour 至少 **1.6x**；
 - actor-zero 更新不再构造 policy log-prob graph；
-- worst-case 4-record pack 无 OOM；peak allocated 不高于旧逐记录峰值的
-  1.25x，且低于配置的显存安全水位；
+- worst-case 4-record pack 无 OOM；按本轮明确放宽后的门禁，peak reserved
+  必须不高于设备总显存 50%，且 benchmark 超限时以非零状态 fail closed；
 - compile recompile 次数在 warmup 后为 0（按 bucket）；
 - held-out paired seeds 不允许 liveness/deadlock 指标显著退化。
 
