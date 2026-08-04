@@ -40,9 +40,6 @@ def engine_revival_identity() -> dict[str, Any]:
         "telemetry": ("observation._training.revival_budget+revivals_used+player_hp_lost"),
         "model_input_policy": "underscore training telemetry excluded",
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    payload["fingerprint"] = serialized
-    payload["fingerprint_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return payload
 
 

@@ -540,7 +540,8 @@ def test_engine_revival_identity_is_explicit_and_fail_closed() -> None:
     assert identity["model_visible_game_entity"] is None
     assert identity["forced_kill_policy"] == "not intercepted"
     assert identity["native_death_prevention_order"] == ("native hooks before training bailout")
-    assert len(identity["fingerprint_sha256"]) == 64
+    assert "fingerprint" not in identity
+    assert "fingerprint_sha256" not in identity
 
     with pytest.raises(ValueError, match="engine revival mechanism"):
         CurriculumConfig(revival_mechanism=ENGINE_REVIVAL_MECHANISM)
