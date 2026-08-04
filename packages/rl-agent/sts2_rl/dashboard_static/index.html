@@ -516,6 +516,554 @@
       font-size: 0.9rem;
     }
 
+    .drill-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+      margin-bottom: 14px;
+    }
+
+    .drill-controls label {
+      display: grid;
+      gap: 5px;
+      min-width: min(100%, 260px);
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+    }
+
+    .drill-controls select {
+      min-width: min(100%, 260px);
+    }
+
+    .detail-timeline {
+      display: grid;
+      gap: 10px;
+    }
+
+    .detail-timeline details {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-raised);
+      padding: 10px 12px;
+    }
+
+    .detail-timeline summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .detail-lines {
+      display: grid;
+      gap: 6px;
+      margin: 10px 0 0;
+      color: var(--muted-foreground);
+      font-size: 0.84rem;
+    }
+
+    .detail-lines strong {
+      color: var(--foreground);
+    }
+
+    .run-replay {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .replay-hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(220px, 0.85fr) minmax(0, 1.8fr);
+      gap: 20px;
+      overflow: hidden;
+      border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
+      background:
+        radial-gradient(circle at 88% 18%, color-mix(in srgb, var(--info) 18%, transparent), transparent 38%),
+        linear-gradient(125deg, color-mix(in srgb, var(--accent) 72%, var(--surface)), var(--surface) 55%);
+    }
+
+    .replay-hero::after {
+      position: absolute;
+      right: -45px;
+      bottom: -95px;
+      width: 240px;
+      height: 240px;
+      border: 1px solid color-mix(in srgb, var(--primary) 18%, transparent);
+      border-radius: 50%;
+      content: "";
+      pointer-events: none;
+    }
+
+    .replay-eyebrow {
+      color: var(--primary);
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+
+    .replay-hero h3 {
+      margin: 5px 0 4px;
+      font-size: clamp(1.25rem, 2.2vw, 1.85rem);
+      line-height: 1.15;
+    }
+
+    .replay-hero p {
+      margin: 0;
+      color: var(--muted-foreground);
+      overflow-wrap: anywhere;
+    }
+
+    .replay-stats {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(82px, 1fr));
+      gap: 8px;
+    }
+
+    .replay-stat {
+      min-width: 0;
+      padding: 10px 11px;
+      border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+      border-radius: 11px;
+      background: color-mix(in srgb, var(--surface) 82%, transparent);
+      backdrop-filter: blur(8px);
+    }
+
+    .replay-stat span {
+      display: block;
+      color: var(--muted-foreground);
+      font-size: 0.72rem;
+      white-space: nowrap;
+    }
+
+    .replay-stat strong {
+      display: block;
+      margin-top: 3px;
+      font-size: 1.05rem;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+
+    .replay-stat[data-tone="danger"] strong {
+      color: var(--danger);
+    }
+
+    .replay-stat[data-tone="success"] strong {
+      color: var(--success);
+    }
+
+    .loadout-panel {
+      display: grid;
+      gap: 13px;
+    }
+
+    .loadout-row {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .loadout-label {
+      padding-top: 5px;
+      color: var(--muted-foreground);
+      font-size: 0.82rem;
+      font-weight: 600;
+    }
+
+    .loadout-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .loadout-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 100%;
+      min-height: 30px;
+      padding: 5px 9px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-alt);
+      color: var(--foreground);
+      font-size: 0.8rem;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+
+    .loadout-chip::before {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--border-strong);
+      content: "";
+    }
+
+    .loadout-chip[data-kind="attack"]::before { background: var(--danger); }
+    .loadout-chip[data-kind="skill"]::before { background: var(--primary); }
+    .loadout-chip[data-kind="power"]::before { background: var(--warning); }
+    .loadout-chip[data-kind="status"]::before,
+    .loadout-chip[data-kind="curse"]::before { background: var(--info); }
+    .loadout-chip[data-kind="relic"]::before { background: #c89020; }
+    .loadout-chip[data-kind="potion"]::before { background: #36a5a5; }
+
+    .loadout-chip .chip-quantity {
+      color: var(--muted-foreground);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .loadout-note {
+      color: var(--muted-foreground);
+      font-size: 0.78rem;
+    }
+
+    .replay-explorer {
+      display: grid;
+      grid-template-columns: minmax(340px, 0.82fr) minmax(440px, 1.18fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .map-panel,
+    .floor-panel {
+      min-width: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    .replay-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 15px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .replay-panel-header h3 {
+      margin: 0;
+      font-size: 1rem;
+    }
+
+    .act-tabs {
+      display: inline-flex;
+      gap: 4px;
+      padding: 3px;
+      border-radius: 10px;
+      background: var(--surface-alt);
+    }
+
+    .act-tab {
+      min-height: 30px;
+      padding: 4px 9px;
+      border-color: transparent;
+      background: transparent;
+      font-size: 0.76rem;
+    }
+
+    .act-tab[aria-pressed="true"] {
+      border-color: var(--border);
+      background: var(--surface);
+      color: var(--primary);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+    }
+
+    .map-coverage {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 9px 15px;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted-foreground);
+      font-size: 0.78rem;
+    }
+
+    .map-coverage::before {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--warning);
+      content: "";
+    }
+
+    .map-coverage[data-complete="true"]::before {
+      background: var(--success);
+    }
+
+    .run-map-canvas {
+      min-height: 650px;
+      padding: 12px;
+      background:
+        radial-gradient(circle at 50% 24%, color-mix(in srgb, var(--primary) 10%, transparent), transparent 36%),
+        linear-gradient(180deg, color-mix(in srgb, var(--surface-alt) 42%, transparent), transparent);
+    }
+
+    .run-map-canvas svg {
+      display: block;
+      width: 100%;
+      min-height: 620px;
+      overflow: visible;
+    }
+
+    .map-edge {
+      fill: none;
+      stroke: var(--border-strong);
+      stroke-width: 1.2;
+      stroke-dasharray: 4 5;
+      opacity: 0.48;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .map-edge.selected {
+      stroke: var(--series-5);
+      stroke-width: 3.2;
+      stroke-dasharray: none;
+      opacity: 1;
+      filter: drop-shadow(0 0 3px color-mix(in srgb, var(--series-5) 55%, transparent));
+    }
+
+    .map-edge.candidate {
+      stroke: var(--info);
+      stroke-dasharray: 2 5;
+      opacity: 0.34;
+    }
+
+    .map-node .node-ring {
+      fill: var(--surface);
+      stroke: var(--border-strong);
+      stroke-width: 1.4;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .map-node.selected .node-ring {
+      stroke: var(--series-5);
+      stroke-width: 3;
+      filter: drop-shadow(0 0 3px color-mix(in srgb, var(--series-5) 45%, transparent));
+    }
+
+    .map-node.candidate .node-ring {
+      stroke: var(--info);
+      opacity: 0.65;
+    }
+
+    .map-node .node-core {
+      fill: var(--surface-alt);
+    }
+
+    .map-node text {
+      fill: var(--foreground);
+      font-family: inherit;
+      font-size: 10px;
+      font-weight: 700;
+      text-anchor: middle;
+      dominant-baseline: central;
+      pointer-events: none;
+    }
+
+    .map-node .floor-label {
+      fill: var(--muted-foreground);
+      font-size: 8px;
+      font-weight: 500;
+    }
+
+    .floor-visual-list {
+      max-height: 742px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
+
+    .floor-visual-row {
+      border-bottom: 1px solid var(--border);
+    }
+
+    .floor-visual-row:last-child {
+      border-bottom: 0;
+    }
+
+    .floor-visual-row summary {
+      display: grid;
+      grid-template-columns: 38px minmax(135px, 1.25fr) minmax(160px, 1fr) minmax(90px, 0.65fr) 20px;
+      gap: 9px;
+      align-items: center;
+      padding: 10px 14px;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .floor-visual-row summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .floor-visual-row[open] {
+      background: color-mix(in srgb, var(--accent) 32%, transparent);
+    }
+
+    .floor-number {
+      display: grid;
+      width: 30px;
+      height: 30px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--surface-alt);
+      color: var(--muted-foreground);
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .floor-number[data-room="monster"],
+    .floor-number[data-room="elite"],
+    .floor-number[data-room="boss"] {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .floor-number[data-room="event"] {
+      background: var(--info-soft);
+      color: var(--info);
+    }
+
+    .floor-number[data-room="shop"] {
+      background: var(--success-soft);
+      color: var(--success);
+    }
+
+    .floor-number[data-room="restsite"] {
+      background: var(--warning-soft);
+      color: var(--warning);
+    }
+
+    .floor-room {
+      min-width: 0;
+    }
+
+    .floor-room strong,
+    .floor-room small {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .floor-room small,
+    .floor-economy small {
+      color: var(--muted-foreground);
+      font-size: 0.72rem;
+    }
+
+    .floor-economy small {
+      display: block;
+    }
+
+    .floor-hp {
+      min-width: 0;
+    }
+
+    .floor-hp-line {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.78rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .floor-hp-bar {
+      flex: 1;
+      height: 7px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--surface-alt);
+    }
+
+    .floor-hp-bar span {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--success);
+    }
+
+    .floor-hp-loss {
+      margin-top: 3px;
+      color: var(--danger);
+      font-size: 0.72rem;
+    }
+
+    .floor-economy {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .floor-chevron {
+      color: var(--muted-foreground);
+      text-align: center;
+      transition: transform 120ms ease;
+    }
+
+    .floor-visual-row[open] .floor-chevron {
+      transform: rotate(90deg);
+    }
+
+    .floor-visual-detail {
+      display: grid;
+      gap: 6px;
+      padding: 0 14px 13px 61px;
+      color: var(--muted-foreground);
+      font-size: 0.8rem;
+    }
+
+    .decision-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+
+    .decision-chip {
+      padding: 4px 7px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      background: var(--surface);
+      color: var(--foreground);
+      font-size: 0.74rem;
+    }
+
+    .decision-chip[data-repeated="true"] {
+      border-color: color-mix(in srgb, var(--warning) 52%, var(--border));
+      background: var(--warning-soft);
+      color: var(--warning);
+    }
+
+    .raw-replay-details {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .raw-replay-details > summary {
+      padding: 13px 15px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .raw-replay-body {
+      display: grid;
+      gap: 18px;
+      padding: 0 15px 15px;
+    }
+
+    .compact-button {
+      padding: 5px 9px;
+      font-size: 0.78rem;
+    }
+
     .metric-group {
       margin: 18px 0;
     }
@@ -671,6 +1219,23 @@
       .metric-grid.compact {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
+
+      .replay-hero,
+      .replay-explorer {
+        grid-template-columns: 1fr;
+      }
+
+      .replay-stats {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+
+      .run-map-canvas {
+        min-height: 520px;
+      }
+
+      .run-map-canvas svg {
+        min-height: 490px;
+      }
     }
 
     @media (max-width: 780px) {
@@ -708,6 +1273,18 @@
       .heldout-zone {
         padding: 14px;
       }
+
+      .replay-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .floor-visual-row summary {
+        grid-template-columns: 36px minmax(120px, 1fr) minmax(130px, 0.9fr) 18px;
+      }
+
+      .floor-economy {
+        display: none;
+      }
     }
 
     @media (max-width: 520px) {
@@ -744,6 +1321,28 @@
       .kv-list dd {
         text-align: left;
         padding-top: 2px;
+      }
+
+      .loadout-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+      }
+
+      .floor-visual-row summary {
+        grid-template-columns: 34px minmax(0, 1fr) 18px;
+      }
+
+      .floor-hp {
+        grid-column: 2;
+      }
+
+      .floor-chevron {
+        grid-column: 3;
+        grid-row: 1 / span 2;
+      }
+
+      .floor-visual-detail {
+        padding-left: 51px;
       }
     }
   </style>
@@ -985,11 +1584,155 @@
                   <th class="numeric">平均失血</th>
                   <th class="numeric">Deadlock / 停滞（各自独立）</th>
                   <th class="numeric">基础设施重试</th>
+                  <th>对局</th>
                 </tr>
               </thead>
               <tbody id="evaluations-body"></tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="episode-drill-title">
+        <div class="section-header">
+          <div>
+            <h2 id="episode-drill-title">Held-out 对局下钻</h2>
+            <p>
+          仅在选择具体 journal 时懒加载 compact decision 与有界快照投影；具体 episode 的完整地图由
+          seed、匹配 simulator 与已记录动作按需复现。15 秒聚合刷新不会重扫 60MB 级轨迹。
+          卡牌候选来自 policy_topk，楼层失血和复活来自权威单调计数器差分。
+            </p>
+          </div>
+          <span id="heldout-detail-status" class="pill" data-state="waiting">按需加载</span>
+        </div>
+        <div class="drill-controls">
+          <button id="heldout-journals-button" type="button">读取当前运行的评估目录</button>
+          <label for="heldout-journal-select">
+            评估 journal
+            <select id="heldout-journal-select" disabled>
+              <option value="">先读取目录</option>
+            </select>
+          </label>
+          <label for="heldout-episode-select">
+            Held-out episode
+            <select id="heldout-episode-select" disabled>
+              <option value="">先选择 journal</option>
+            </select>
+          </label>
+        </div>
+        <p class="scope-note">
+          这是只读事实投影。缺少游戏版本、事件选项文案或完整候选时会明确显示“未记录”，不会从索引猜测。
+        </p>
+        <details class="raw-replay-details subsection">
+          <summary>Episode 索引（选择其它 seed）</summary>
+          <div class="raw-replay-body">
+            <div class="table-wrap">
+              <table aria-label="Held-out episode 索引">
+                <thead>
+                  <tr>
+                    <th>Seed / 结果</th>
+                    <th>最远 Act / Floor</th>
+                    <th>复活</th>
+                    <th>失血</th>
+                    <th>战斗胜 / 负</th>
+                    <th>异常</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody id="heldout-episodes-body">
+                  <tr><td colspan="7">尚未加载具体 journal</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+
+        <div id="heldout-run-replay" class="run-replay">
+          <article class="card replay-hero">
+            <div>
+              <div class="replay-eyebrow">Held-out run replay</div>
+              <h3 id="heldout-run-title">选择一局对局</h3>
+              <p id="heldout-run-subtitle">地图、楼层战损和构筑决策会在这里组合展示。</p>
+              <span id="heldout-episode-id" class="sr-only">—</span>
+            </div>
+            <div id="heldout-run-stats" class="replay-stats" aria-label="对局核心统计"></div>
+          </article>
+
+          <article class="card loadout-panel">
+            <div class="chart-heading">
+              <h3>最终构筑</h3>
+              <span id="heldout-loadout-source">等待 episode_last 快照</span>
+            </div>
+            <div class="loadout-row">
+              <div class="loadout-label">最终牌组</div>
+              <div id="heldout-final-deck" class="loadout-chips"><span class="loadout-note">选择一个 episode</span></div>
+            </div>
+            <div class="loadout-row">
+              <div class="loadout-label">最终遗物</div>
+              <div id="heldout-final-relics" class="loadout-chips"><span class="loadout-note">选择一个 episode</span></div>
+            </div>
+            <div class="loadout-row">
+              <div class="loadout-label">最终药水</div>
+              <div id="heldout-final-potions" class="loadout-chips"><span class="loadout-note">选择一个 episode</span></div>
+            </div>
+          </article>
+
+          <div class="replay-explorer">
+            <article class="card map-panel">
+              <div class="replay-panel-header">
+                <h3>地图路线</h3>
+                <div id="heldout-act-tabs" class="act-tabs" aria-label="选择 Act"></div>
+              </div>
+              <div id="heldout-map-coverage" class="map-coverage" data-complete="false">
+                选择 episode 后，将由 seed 与已记录动作在后台复现完整地图。
+              </div>
+              <div id="heldout-map-visual" class="run-map-canvas">
+                <div class="empty">选择一个 episode</div>
+              </div>
+            </article>
+
+            <article class="card floor-panel">
+              <div class="replay-panel-header">
+                <h3>楼层时间线</h3>
+                <span id="heldout-floor-summary" class="loadout-note">战损、复活、金币与决策</span>
+              </div>
+              <div id="heldout-floor-visual" class="floor-visual-list">
+                <div class="empty">选择一个 episode</div>
+              </div>
+            </article>
+          </div>
+
+          <details class="raw-replay-details">
+            <summary>事实明细与来源（路线候选、拿牌概率、异常、provenance）</summary>
+            <div class="raw-replay-body">
+              <div class="two-column">
+                <article>
+                  <div class="chart-heading"><h3>对局概要</h3><span>原始投影</span></div>
+                  <dl id="heldout-episode-kv" class="kv-list"></dl>
+                </article>
+                <article>
+                  <div class="chart-heading"><h3>策略与环境来源</h3><span>checkpoint / policy / seed / simulator</span></div>
+                  <dl id="heldout-provenance-kv" class="kv-list"></dl>
+                </article>
+              </div>
+              <div>
+                <h3>路线选择</h3>
+                <div id="heldout-route" class="detail-timeline"><div class="empty">选择一个 episode</div></div>
+              </div>
+              <div>
+                <h3>拿牌记录</h3>
+                <div id="heldout-card-rewards" class="detail-timeline"><div class="empty">选择一个 episode</div></div>
+              </div>
+              <div>
+                <h3>逐层原始详情</h3>
+                <div id="heldout-floor-timeline" class="detail-timeline"><div class="empty">选择一个 episode</div></div>
+              </div>
+              <div>
+                <h3>Deadlock / 最终原因</h3>
+                <div id="heldout-anomalies" class="detail-timeline"><div class="empty">选择一个 episode</div></div>
+              </div>
+            </div>
+          </details>
         </div>
       </section>
 
@@ -1052,6 +1795,7 @@
                     <th>环境步</th>
                     <th>名称 / 路径</th>
                     <th>时间</th>
+                    <th>对局</th>
                   </tr>
                 </thead>
                 <tbody id="checkpoints-body"></tbody>
@@ -1090,6 +1834,10 @@
 
       const API_RUNS = "/api/v1/runs";
       const API_SNAPSHOT = "/api/v1/snapshot";
+      const API_HELDOUT_JOURNALS = "/api/v1/heldout-journals";
+      const API_HELDOUT_EPISODES = "/api/v1/heldout-episodes";
+      const API_HELDOUT_EPISODE = "/api/v1/heldout-episode";
+      const API_HELDOUT_REPLAY_MAP = "/api/v1/heldout-replay-map";
       const SVG_NS = "http://www.w3.org/2000/svg";
       const initialRunKey = new URLSearchParams(location.search).get("run") || "";
       const state = {
@@ -1098,6 +1846,15 @@
         latestRunKey: "",
         followLatest: !initialRunKey,
         snapshot: null,
+        heldoutJournals: [],
+        heldoutEpisodes: [],
+        heldoutRunKey: "",
+        selectedJournal: "",
+        selectedEpisode: "",
+        selectedEpisodeDetail: null,
+        selectedReplayAct: 1,
+        mapReplayToken: 0,
+        detailLoading: false,
         timer: 0,
         loading: false,
         refreshMs: 15000,
@@ -1132,6 +1889,9 @@
         episode_steps: "动作步",
         decisions: "决策数",
         outcome: "结果",
+        success: "通关",
+        victory: "胜",
+        failure: "败",
         termination_reason: "终止原因",
         reason: "原因",
         deadlock: "Deadlock",
@@ -1648,6 +2408,980 @@
         );
       }
 
+      function detailButton(label, handler, disabled = false) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "compact-button";
+        button.textContent = label;
+        button.disabled = disabled;
+        button.addEventListener("click", handler);
+        return button;
+      }
+
+      function detailCell(button) {
+        const cell = document.createElement("td");
+        cell.append(button);
+        return cell;
+      }
+
+      function setDetailStatus(text, status = "waiting") {
+        const badge = element("heldout-detail-status");
+        badge.textContent = text;
+        badge.dataset.state = status;
+      }
+
+      function clearEpisodeDetail(message = "选择一个 episode") {
+        state.mapReplayToken += 1;
+        state.selectedEpisode = "";
+        state.selectedEpisodeDetail = null;
+        state.selectedReplayAct = 1;
+        setText("heldout-episode-id", "—");
+        setText("heldout-run-title", "选择一局对局");
+        setText("heldout-run-subtitle", "地图、楼层战损和构筑决策会在这里组合展示。");
+        setText("heldout-loadout-source", "等待 episode_last 快照");
+        setText("heldout-floor-summary", "战损、复活、金币与决策");
+        element("heldout-run-stats").replaceChildren();
+        element("heldout-act-tabs").replaceChildren();
+        renderKeyValues("heldout-episode-kv", null);
+        renderKeyValues("heldout-provenance-kv", null);
+        for (const id of [
+          "heldout-map-visual", "heldout-floor-visual", "heldout-route", "heldout-card-rewards",
+          "heldout-floor-timeline", "heldout-anomalies"
+        ]) {
+          const target = element(id);
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = message;
+          target.replaceChildren(empty);
+        }
+        for (const id of ["heldout-final-deck", "heldout-final-relics", "heldout-final-potions"]) {
+          const target = element(id);
+          const note = document.createElement("span");
+          note.className = "loadout-note";
+          note.textContent = message;
+          target.replaceChildren(note);
+        }
+        const coverage = element("heldout-map-coverage");
+        coverage.dataset.complete = "false";
+        coverage.textContent = "选择 episode 后，将由 seed 与已记录动作在后台复现完整地图。";
+      }
+
+      function resetHeldoutBrowser() {
+        state.heldoutJournals = [];
+        state.heldoutEpisodes = [];
+        state.heldoutRunKey = "";
+        state.selectedJournal = "";
+        populateJournalSelect([]);
+        const episodeSelect = element("heldout-episode-select");
+        episodeSelect.replaceChildren();
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "先选择 journal";
+        episodeSelect.append(option);
+        episodeSelect.disabled = true;
+        renderHeldoutEpisodeIndex([]);
+        clearEpisodeDetail();
+        setDetailStatus("按需加载", "waiting");
+      }
+
+      function journalLabel(journal) {
+        const gate = int(journal.evaluation_gate);
+        const kindKey = journal.gate_kind || journal.journal_kind || "validation";
+        const kind = labels[kindKey] || humanKey(kindKey);
+        const complete = journal.complete === true ? "完成" : journal.complete === false ? "写入中" : "未知";
+        return `${kind} ${gate} · ${int(journal.episode_count)} 局 · ${complete} · ${decimal((journal.size_bytes || 0) / 1048576, 1)}MB`;
+      }
+
+      function populateJournalSelect(journals) {
+        const select = element("heldout-journal-select");
+        select.replaceChildren();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = journals.length ? "选择一个评估 journal" : "当前运行没有可读评估 journal";
+        select.append(placeholder);
+        journals.forEach((journal) => {
+          const option = document.createElement("option");
+          option.value = journal.key;
+          option.textContent = journalLabel(journal);
+          select.append(option);
+        });
+        select.disabled = journals.length === 0;
+      }
+
+      function renderHeldoutEpisodeIndex(episodes) {
+        const body = element("heldout-episodes-body");
+        body.replaceChildren();
+        if (!episodes.length) {
+          const row = document.createElement("tr");
+          const cell = createCell("这个 journal 没有可用 episode", "wrap");
+          cell.colSpan = 7;
+          row.append(cell);
+          body.append(row);
+          return;
+        }
+        episodes.forEach((episode) => {
+          const row = document.createElement("tr");
+          row.append(
+            createCell(`${int(episode.seed)} · ${scalar(episode.outcome)}`, "wrap"),
+            createCell(`${int(episode.max_act)} / ${int(episode.max_floor)}`),
+            createCell(int(episode.revivals)),
+            createCell(int(episode.player_hp_lost)),
+            createCell(`${int(episode.combat_victories)} / ${int(episode.combat_failures)}`),
+            createCell(`${int(episode.anomaly_count)} · ${scalar(episode.termination_reason)}`, "wrap"),
+            detailCell(detailButton("查看", () => loadHeldoutEpisode(String(episode.episode_id))))
+          );
+          body.append(row);
+        });
+      }
+
+      function actionDescription(action) {
+        if (!action || typeof action !== "object") return "未记录";
+        const selected = action.selected && typeof action.selected === "object" ? action.selected : action;
+        const location = selected.column != null ? ` · 列 ${int(selected.column)}` : "";
+        const forced = action.forced === true ? " · forced" : "";
+        return `${scalar(selected.kind)} · ${scalar(selected.label)}${location}${forced}`;
+      }
+
+      function candidateDescription(candidate) {
+        const probability = finite(candidate && candidate.probability);
+        return `${scalar(first(candidate || {}, ["card_id", "label", "kind"], "未记录"))}` +
+          `${candidate && candidate.column != null ? `@列${int(candidate.column)}` : ""}` +
+          `${probability == null ? "" : ` ${(probability * 100).toFixed(1)}%`}` +
+          `${candidate && candidate.selected ? " ✓" : ""}`;
+      }
+
+      function detailLine(label, value) {
+        const line = document.createElement("div");
+        const strong = document.createElement("strong");
+        strong.textContent = label;
+        line.append(strong, document.createTextNode(` ${value}`));
+        return line;
+      }
+
+      function normalizedRoomType(value) {
+        const raw = String(value || "unknown").toLowerCase();
+        if (raw.includes("boss")) return "boss";
+        if (raw.includes("elite")) return "elite";
+        if (raw.includes("monster") || raw.includes("combat")) return "monster";
+        if (raw.includes("shop") || raw.includes("merchant")) return "shop";
+        if (raw.includes("rest") || raw.includes("camp")) return "restsite";
+        if (raw.includes("treasure") || raw.includes("chest")) return "treasure";
+        if (raw.includes("ancient")) return "ancient";
+        if (raw.includes("event") || raw.includes("unknown")) return "event";
+        return raw || "unknown";
+      }
+
+      function roomPresentation(value) {
+        const type = normalizedRoomType(value);
+        const presentations = {
+          monster: ["战斗", "M"],
+          elite: ["精英", "E"],
+          boss: ["Boss", "B"],
+          event: ["事件", "?"],
+          shop: ["商店", "$"],
+          restsite: ["休息", "R"],
+          treasure: ["宝箱", "T"],
+          ancient: ["远古", "A"],
+          unknown: ["未知", "·"]
+        };
+        const resolved = presentations[type] || [humanKey(type), type.slice(0, 1).toUpperCase() || "·"];
+        return { type, label: resolved[0], glyph: resolved[1] };
+      }
+
+      function entityDisplayName(value, fallback = "未记录") {
+        const raw = String(value || "").trim();
+        if (!raw) return fallback;
+        const short = raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw;
+        return short.replaceAll("_", " ");
+      }
+
+      function replayStat(label, value, tone = "") {
+        const card = document.createElement("div");
+        card.className = "replay-stat";
+        if (tone) card.dataset.tone = tone;
+        const caption = document.createElement("span");
+        caption.textContent = label;
+        const strong = document.createElement("strong");
+        strong.textContent = value;
+        card.append(caption, strong);
+        return card;
+      }
+
+      function renderReplayHero(episode) {
+        const outcome = String(episode.outcome || episode.termination_reason || "unknown");
+        const success = outcome.includes("success") || outcome.includes("victory") || outcome.includes("completed");
+        setText(
+          "heldout-run-title",
+          `${entityDisplayName(episode.character, "角色未记录")} · Seed ${int(episode.seed)}`
+        );
+        const provenance = episode.provenance || {};
+        const checkpoint = provenance.checkpoint || {};
+        const outcomeLabel = humanKey(outcome);
+        const terminationLabel = humanKey(episode.termination_reason || "终止原因未记录");
+        const replaySubtitle = [outcomeLabel, terminationLabel, checkpoint.name || `Policy ${int(provenance.policy_version)}`]
+          .filter((value, index, values) => value && values.indexOf(value) === index)
+          .join(" · ");
+        setText(
+          "heldout-run-subtitle",
+          replaySubtitle
+        );
+        const loadout = episode.final_loadout && typeof episode.final_loadout === "object"
+          ? episode.final_loadout
+          : {};
+        const stats = element("heldout-run-stats");
+        stats.replaceChildren(
+          replayStat("最远楼层", int(episode.max_floor), success ? "success" : ""),
+          replayStat("累计失血", int(episode.player_hp_lost), finite(episode.player_hp_lost) > 0 ? "danger" : ""),
+          replayStat("复活次数", int(episode.revivals), finite(episode.revivals) > 0 ? "danger" : "success"),
+          replayStat("最终 HP", `${int(first(loadout, ["hp", "current_hp"], episode.final_hp))}/${int(first(loadout, ["max_hp"], null))}`),
+          replayStat("最终金币", int(first(loadout, ["gold"], null)))
+        );
+      }
+
+      function loadoutArray(loadout, keys) {
+        const value = first(loadout || {}, keys, []);
+        return Array.isArray(value) ? value : [];
+      }
+
+      function loadoutChip(item, kind) {
+        const chip = document.createElement("span");
+        chip.className = "loadout-chip";
+        const itemKind = String(first(item || {}, ["type", "card_type", "kind"], kind) || kind).toLowerCase();
+        chip.dataset.kind = kind === "card" ? itemKind : kind;
+        const id = first(item || {}, ["card_id", "relic_id", "potion_id", "id", "name", "title"], null);
+        const upgraded = item && (
+          item.upgraded === true || item.is_upgraded === true ||
+          finite(item.upgrade_count) > 0 || finite(item.upgrade_level) > 0
+        );
+        const quantity = Math.max(1, Math.round(finite(first(item || {}, ["quantity", "count", "stack_count"], 1)) || 1));
+        const label = document.createElement("span");
+        label.textContent = `${entityDisplayName(id)}${upgraded ? "+" : ""}`;
+        chip.append(label);
+        if (quantity > 1) {
+          const count = document.createElement("span");
+          count.className = "chip-quantity";
+          count.textContent = `×${quantity}`;
+          chip.append(count);
+        }
+        const enchantments = loadoutArray(item, ["enchantments"]);
+        const afflictions = loadoutArray(item, ["afflictions"]);
+        const modifiers = [...enchantments, ...afflictions]
+          .map((entry) => entityDisplayName(first(entry || {}, ["name", "id", "type"], entry), ""))
+          .filter(Boolean);
+        const rarity = first(item || {}, ["rarity"], null);
+        chip.title = [
+          rarity ? `稀有度 ${rarity}` : "",
+          modifiers.length ? `附魔/词缀 ${modifiers.join(", ")}` : "",
+          item && item.floor_added_to_deck != null ? `加入楼层 ${item.floor_added_to_deck}` : ""
+        ].filter(Boolean).join(" · ");
+        return chip;
+      }
+
+      function renderLoadoutCollection(targetId, items, kind, missingText) {
+        const target = element(targetId);
+        target.replaceChildren();
+        if (!items.length) {
+          const note = document.createElement("span");
+          note.className = "loadout-note";
+          note.textContent = missingText;
+          target.append(note);
+          return;
+        }
+        items.forEach((item) => target.append(loadoutChip(item, kind)));
+      }
+
+      function renderFinalLoadout(episode) {
+        const loadout = episode.final_loadout && typeof episode.final_loadout === "object"
+          ? episode.final_loadout
+          : null;
+        const deck = loadout ? loadoutArray(loadout, ["deck", "cards"]) : [];
+        const relics = loadout ? loadoutArray(loadout, ["relics"]) : [];
+        const potions = loadout ? loadoutArray(loadout, ["potions"]) : [];
+        const coverage = loadout && loadout.coverage && typeof loadout.coverage === "object"
+          ? loadout.coverage
+          : {};
+        const fieldsPresent = coverage.fields_present && typeof coverage.fields_present === "object"
+          ? coverage.fields_present
+          : {};
+        renderLoadoutCollection(
+          "heldout-final-deck",
+          deck,
+          "card",
+          "该历史 journal 没有可用的最终牌组快照；不会从拿牌记录反推。"
+        );
+        renderLoadoutCollection(
+          "heldout-final-relics",
+          relics,
+          "relic",
+          "该历史 journal 没有可用的最终遗物快照。"
+        );
+        renderLoadoutCollection(
+          "heldout-final-potions",
+          potions,
+          "potion",
+          fieldsPresent.potions === true ? "最终药水栏为空。" : "该历史 journal 未记录最终药水栏。"
+        );
+        const source = loadout && first(loadout, ["source_snapshot_reason", "source", "coverage"], null);
+        setText(
+          "heldout-loadout-source",
+          loadout ? `来源：${scalar(source || "decision_snapshot")}` : "历史日志未覆盖最终构筑"
+        );
+      }
+
+      function coordinate(value) {
+        if (!value || typeof value !== "object") return null;
+        const source = value.coord && typeof value.coord === "object" ? value.coord : value;
+        const x = finite(first(source, ["x", "col", "column"], null));
+        const y = finite(first(source, ["y", "row"], null));
+        return x == null || y == null ? null : { x: Math.round(x), y: Math.round(y) };
+      }
+
+      function coordinateKey(coord) {
+        return coord ? `${coord.x}:${coord.y}` : "";
+      }
+
+      function routeTargetCoordinate(choice) {
+        const current = coordinate(choice && choice.current_coord);
+        const selected = choice && choice.selected && typeof choice.selected === "object" ? choice.selected : {};
+        const explicit = coordinate(first(selected, ["coord", "map_node", "target_coord"], null));
+        if (explicit) return explicit;
+        const x = finite(first(selected, ["column", "col"], null));
+        const row = finite(first(selected, ["row"], null));
+        if (x == null || !current) return null;
+        return { x: Math.round(x), y: row == null ? current.y + 1 : Math.round(row) };
+      }
+
+      function topologyForAct(episode, act) {
+        const topologies = Array.isArray(episode.map_topologies) ? episode.map_topologies : [];
+        return topologies.find((item) => int(item.act) === int(act)) || null;
+      }
+
+      function candidateTargetCoordinates(choice) {
+        const current = coordinate(choice && choice.current_coord);
+        if (!current) return [];
+        const candidates = Array.isArray(choice.candidates) ? choice.candidates : [];
+        return candidates.map((candidate) => {
+          const explicit = coordinate(first(candidate || {}, ["coord", "map_node", "target_coord"], null));
+          if (explicit) return { coord: explicit, selected: candidate.selected === true, probability: finite(candidate.probability) };
+          const x = finite(first(candidate || {}, ["column", "col"], null));
+          const row = finite(first(candidate || {}, ["row"], null));
+          if (x == null) return null;
+          return {
+            coord: { x: Math.round(x), y: row == null ? current.y + 1 : Math.round(row) },
+            selected: candidate.selected === true,
+            probability: finite(candidate.probability)
+          };
+        }).filter(Boolean);
+      }
+
+      function svgNode(tag, attributes = {}) {
+        const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+        Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        return node;
+      }
+
+      function buildMapProjection(episode, act) {
+        const route = (Array.isArray(episode.route) ? episode.route : []).filter((choice) => int(choice.act) === int(act));
+        const floors = (Array.isArray(episode.floors) ? episode.floors : []).filter((floor) => int(floor.act) === int(act));
+        const topology = topologyForAct(episode, act);
+        const nodes = new Map();
+        const edges = new Map();
+        const selectedEdges = new Set();
+        const candidateEdges = new Set();
+
+        function addNode(coord, roomType = "unknown", floor = null, status = "") {
+          if (!coord) return null;
+          const key = coordinateKey(coord);
+          const previous = nodes.get(key) || {};
+          const normalizedRoom = normalizedRoomType(roomType);
+          nodes.set(key, {
+            coord,
+            room_type: normalizedRoom === "unknown" && previous.room_type ? previous.room_type : normalizedRoom,
+            floor: floor == null ? previous.floor : floor,
+            status: previous.status === "selected" || status === "selected"
+              ? "selected"
+              : status || previous.status || ""
+          });
+          return key;
+        }
+
+        function addEdge(from, to, kind = "") {
+          if (!from || !to) return;
+          const key = `${coordinateKey(from)}>${coordinateKey(to)}`;
+          edges.set(key, { from, to });
+          if (kind === "selected") selectedEdges.add(key);
+          if (kind === "candidate") candidateEdges.add(key);
+        }
+
+        const topologyNodes = topology && Array.isArray(topology.nodes) ? topology.nodes : [];
+        topologyNodes.forEach((item) => {
+          const coord = coordinate(item);
+          if (!coord) return;
+          addNode(coord, first(item, ["point_type", "room_type", "type"], "unknown"), first(item, ["floor"], null));
+          const children = Array.isArray(item.children) ? item.children : [];
+          children.forEach((child) => {
+            const target = coordinate(child);
+            if (target) {
+              addNode(target);
+              addEdge(coord, target);
+            }
+          });
+        });
+
+        route.forEach((choice) => {
+          const current = coordinate(choice.current_coord);
+          const target = routeTargetCoordinate(choice);
+          const currentFloor = floors.find((floor) => int(floor.floor) === int(choice.floor));
+          const destination = choice.destination || {};
+          addNode(current, currentFloor && currentFloor.room_type, choice.floor, "selected");
+          addNode(target, destination.room_type, destination.floor, "selected");
+          addEdge(current, target, "selected");
+          candidateTargetCoordinates(choice).forEach((candidate) => {
+            if (!candidate.selected) {
+              addNode(candidate.coord, "unknown", null, "candidate");
+              addEdge(current, candidate.coord, "candidate");
+            }
+          });
+        });
+
+        return {
+          route,
+          floors,
+          topology,
+          nodes: [...nodes.values()],
+          edges: [...edges.entries()].map(([key, value]) => ({ ...value, key })),
+          selectedEdges,
+          candidateEdges,
+          complete: topologyNodes.length > 0
+        };
+      }
+
+      function renderActTabs(episode, selectedAct) {
+        const acts = new Set();
+        (Array.isArray(episode.floors) ? episode.floors : []).forEach((floor) => {
+          const act = finite(floor.act);
+          if (act != null) acts.add(Math.round(act));
+        });
+        (Array.isArray(episode.route) ? episode.route : []).forEach((choice) => {
+          const act = finite(choice.act);
+          if (act != null) acts.add(Math.round(act));
+        });
+        const ordered = [...acts].sort((a, b) => a - b);
+        const tabs = element("heldout-act-tabs");
+        tabs.replaceChildren();
+        ordered.forEach((act) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "act-tab";
+          button.textContent = `第 ${act} 幕`;
+          button.setAttribute("aria-pressed", act === selectedAct ? "true" : "false");
+          button.addEventListener("click", () => {
+            state.selectedReplayAct = act;
+            renderReplayAct(episode, act);
+          });
+          tabs.append(button);
+        });
+        return ordered;
+      }
+
+      function renderMapVisual(episode, act) {
+        const projection = buildMapProjection(episode, act);
+        const target = element("heldout-map-visual");
+        target.replaceChildren();
+        const coverage = element("heldout-map-coverage");
+        coverage.dataset.complete = projection.complete ? "true" : "false";
+        const seed = finite(episode.seed);
+        const reproduction = episode.map_reproduction || {};
+        const replayState = episode.map_replay_state || "pending";
+        if (projection.complete) {
+          const elapsed = finite(reproduction.elapsed_seconds);
+          coverage.textContent = `Act ${act}：已由 seed ${int(seed)} + 已记录动作在匹配 simulator 中精确复现完整地图` +
+            `${elapsed == null ? "" : `（冷复现 ${decimal(elapsed, 1)} 秒）`}；橙色为实际路线。`;
+        } else if (replayState === "failed") {
+          coverage.textContent = `Act ${act}：地图复现未完成：${scalar(episode.map_replay_error)}。已记录实际路线仍保持显示。`;
+        } else if (seed == null) {
+          coverage.textContent = `Act ${act}：该 episode 的复现契约缺少 seed；已记录实际路线仍保持显示。`;
+        } else {
+          coverage.textContent = `Act ${act}：正在用 seed ${int(seed)}、匹配 simulator 与已记录动作重放到地图边界；实际路线先行显示。`;
+        }
+        if (!projection.nodes.length) {
+          target.append(emptyNode(`Act ${act} 没有可绘制的地图事实`));
+          return;
+        }
+
+        const xs = projection.nodes.map((node) => node.coord.x);
+        const ys = projection.nodes.map((node) => node.coord.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const xSpan = Math.max(1, maxX - minX);
+        const ySpan = Math.max(1, maxY - minY);
+        const width = 440;
+        const height = Math.max(620, 88 + ySpan * 46);
+        const padX = 38;
+        const padY = 35;
+        const xAt = (x) => padX + ((x - minX) / xSpan) * (width - padX * 2);
+        const yAt = (y) => padY + ((maxY - y) / ySpan) * (height - padY * 2);
+        const svg = svgNode("svg", {
+          viewBox: `0 0 ${width} ${height}`,
+          role: "img",
+          "aria-label": `Act ${act} 地图路线`
+        });
+
+        projection.edges.forEach((edge) => {
+          const selected = projection.selectedEdges.has(edge.key);
+          const candidate = projection.candidateEdges.has(edge.key) && !selected;
+          const line = svgNode("path", {
+            d: `M ${xAt(edge.from.x)} ${yAt(edge.from.y)} L ${xAt(edge.to.x)} ${yAt(edge.to.y)}`,
+            class: `map-edge${selected ? " selected" : candidate ? " candidate" : ""}`
+          });
+          svg.append(line);
+        });
+
+        projection.nodes
+          .sort((a, b) => a.coord.y - b.coord.y || a.coord.x - b.coord.x)
+          .forEach((node) => {
+            const presentation = roomPresentation(node.room_type);
+            const group = svgNode("g", {
+              class: `map-node${node.status ? ` ${node.status}` : ""}`,
+              transform: `translate(${xAt(node.coord.x)} ${yAt(node.coord.y)})`
+            });
+            const title = svgNode("title");
+            title.textContent = `${presentation.label} · 坐标 (${node.coord.x}, ${node.coord.y})` +
+              `${node.floor == null ? "" : ` · Floor ${node.floor}`}`;
+            const ring = svgNode("circle", { class: "node-ring", r: 14 });
+            const core = svgNode("circle", { class: "node-core", r: 9 });
+            const glyph = svgNode("text", { x: 0, y: 0 });
+            glyph.textContent = presentation.glyph;
+            group.append(title, ring, core, glyph);
+            if (node.floor != null) {
+              const floorLabel = svgNode("text", { class: "floor-label", x: 0, y: 24 });
+              floorLabel.textContent = `F${node.floor}`;
+              group.append(floorLabel);
+            }
+            svg.append(group);
+          });
+        target.append(svg);
+      }
+
+      function macroDecisionChip(action) {
+        const chip = document.createElement("span");
+        chip.className = "decision-chip";
+        chip.textContent = actionDescription(action);
+        return chip;
+      }
+
+      function renderFloorVisual(episode, act) {
+        const target = element("heldout-floor-visual");
+        const floors = (Array.isArray(episode.floors) ? episode.floors : []).filter((floor) => int(floor.act) === int(act));
+        const cardRewards = (Array.isArray(episode.card_rewards) ? episode.card_rewards : []).filter(
+          (reward) => int(reward.act) === int(act)
+        );
+        target.replaceChildren();
+        setText(
+          "heldout-floor-summary",
+          `Act ${act} · ${floors.length} 层 · 失血 ${int(floors.reduce((sum, floor) => sum + (finite(floor.hp_loss_delta) || 0), 0))} · ` +
+            `复活 ${int(floors.reduce((sum, floor) => sum + (finite(floor.revivals_delta) || 0), 0))}`
+        );
+        if (!floors.length) {
+          target.append(emptyNode(`Act ${act} 没有可聚合的楼层事实`));
+          return;
+        }
+        floors.forEach((floor, index) => {
+          const details = document.createElement("details");
+          details.className = "floor-visual-row";
+          if (index === floors.length - 1) details.open = true;
+          const summary = document.createElement("summary");
+          const room = roomPresentation(floor.room_type);
+          const number = document.createElement("span");
+          number.className = "floor-number";
+          number.dataset.room = room.type;
+          number.textContent = int(floor.floor);
+          const roomBlock = document.createElement("span");
+          roomBlock.className = "floor-room";
+          const roomName = document.createElement("strong");
+          roomName.textContent = `${room.glyph} ${entityDisplayName(floor.room_model_id, room.label)}`;
+          const combat = document.createElement("small");
+          const combatResult = floor.combat_result ? humanKey(floor.combat_result) : room.label;
+          combat.textContent = `${combatResult}${floor.combat_rounds == null ? "" : ` · ${int(floor.combat_rounds)} 回合`}`;
+          roomBlock.append(roomName, combat);
+          const hp = document.createElement("span");
+          hp.className = "floor-hp";
+          const hpLine = document.createElement("span");
+          hpLine.className = "floor-hp-line";
+          const hpBar = document.createElement("span");
+          hpBar.className = "floor-hp-bar";
+          const hpFill = document.createElement("span");
+          const maxHp = Math.max(1, finite(floor.max_hp) || finite(floor.entry_hp) || 1);
+          const exitHp = Math.max(0, finite(floor.exit_hp) || 0);
+          hpFill.style.width = `${Math.max(0, Math.min(100, (exitHp / maxHp) * 100))}%`;
+          hpBar.append(hpFill);
+          const hpText = document.createElement("span");
+          hpText.textContent = `${int(floor.exit_hp)}/${int(floor.max_hp)}`;
+          hpLine.append(hpBar, hpText);
+          const loss = document.createElement("span");
+          loss.className = "floor-hp-loss";
+          loss.textContent = `权威失血 ${finite(floor.hp_loss_delta) > 0 ? "−" : ""}${int(floor.hp_loss_delta)}` +
+            `${finite(floor.revivals_delta) > 0 ? ` · 复活 +${int(floor.revivals_delta)}` : ""}`;
+          hp.append(hpLine, loss);
+          const economy = document.createElement("span");
+          economy.className = "floor-economy";
+          const goldDelta = (finite(floor.exit_gold) || 0) - (finite(floor.entry_gold) || 0);
+          economy.textContent = `${int(floor.exit_gold)}g`;
+          const goldSmall = document.createElement("small");
+          goldSmall.textContent = goldDelta === 0 ? "±0g" : `${goldDelta > 0 ? "+" : ""}${int(goldDelta)}g`;
+          economy.append(goldSmall);
+          const chevron = document.createElement("span");
+          chevron.className = "floor-chevron";
+          chevron.textContent = "›";
+          summary.append(number, roomBlock, hp, economy, chevron);
+
+          const detail = document.createElement("div");
+          detail.className = "floor-visual-detail";
+          detail.append(
+            detailLine(
+              "资源",
+              `HP ${int(floor.entry_hp)} → ${int(floor.exit_hp)} · 金币 ${int(floor.entry_gold)} → ${int(floor.exit_gold)} · ` +
+                `复活 ${int(floor.entry_revivals)} → ${int(floor.exit_revivals)}`
+            ),
+            detailLine(
+              "战斗",
+              `${scalar(floor.encounter_class)} · ${scalar(floor.combat_result)} · ` +
+                `${int(floor.combat_rounds)} 回合 · ${int(floor.combat_decisions)} 个战斗决策`
+            )
+          );
+          const macros = Array.isArray(floor.macro_decisions) ? floor.macro_decisions : [];
+          const rewards = cardRewards.filter((reward) => int(reward.floor) === int(floor.floor));
+          if (macros.length || rewards.length) {
+            const heading = document.createElement("strong");
+            heading.textContent = "宏观决策与奖励";
+            const chips = document.createElement("div");
+            chips.className = "decision-chip-row";
+            const macroGroups = new Map();
+            macros.forEach((action) => {
+              const key = actionDescription(action);
+              const group = macroGroups.get(key);
+              if (group) {
+                group.count += 1;
+              } else {
+                macroGroups.set(key, { action, count: 1 });
+              }
+            });
+            macroGroups.forEach((group) => {
+              const chip = macroDecisionChip(group.action);
+              if (group.count > 1) {
+                chip.dataset.repeated = "true";
+                chip.append(document.createTextNode(` ×${group.count}`));
+              }
+              chips.append(chip);
+            });
+            rewards.forEach((reward) => {
+              const chip = document.createElement("span");
+              chip.className = "decision-chip";
+              chip.textContent = reward.skipped ? "跳过卡牌奖励" : `拿牌 ${actionDescription(reward)}`;
+              chips.append(chip);
+            });
+            detail.append(heading, chips);
+          }
+          details.append(summary, detail);
+          target.append(details);
+        });
+      }
+
+      function renderReplayAct(episode, act) {
+        state.selectedReplayAct = act;
+        renderActTabs(episode, act);
+        renderMapVisual(episode, act);
+        renderFloorVisual(episode, act);
+      }
+
+      function renderHeldoutEpisodeDetail(detail) {
+        const episode = detail && detail.episode ? detail.episode : null;
+        if (!episode) {
+          clearEpisodeDetail("详情响应缺少 episode");
+          return;
+        }
+        state.selectedEpisode = String(episode.episode_id || "");
+        state.selectedEpisodeDetail = episode;
+        setText("heldout-episode-id", state.selectedEpisode);
+        renderReplayHero(episode);
+        renderFinalLoadout(episode);
+        const replayActs = [...new Set(
+          (Array.isArray(episode.floors) ? episode.floors : [])
+            .map((floor) => finite(floor.act))
+            .filter((act) => act != null)
+            .map((act) => Math.round(act))
+        )].sort((a, b) => a - b);
+        renderReplayAct(episode, replayActs[0] || 1);
+        renderKeyValues("heldout-episode-kv", episode, [
+          "seed", "character", "ascension", "outcome", "termination_reason", "max_act", "max_floor",
+          "steps", "revivals", "player_hp_lost", "final_hp"
+        ]);
+        const provenance = episode.provenance || {};
+        const checkpoint = provenance.checkpoint || {};
+        const simulator = provenance.simulator || {};
+        renderKeyValues("heldout-provenance-kv", {
+          seed: provenance.seed,
+          policy_version: provenance.policy_version,
+          policy_model_state_sha256: provenance.policy_model_state_sha256,
+          checkpoint: checkpoint.name || "未记录",
+          checkpoint_id: checkpoint.checkpoint_id || "未记录",
+          checkpoint_relation: checkpoint.relation || "未记录",
+          game_version: provenance.game_version || "未记录",
+          simulator_schema: simulator.schema_version || "未记录",
+          simulator_source_commit: simulator.source_commit || "未记录",
+          config_version: provenance.config_version || "未记录",
+          encoding_version: provenance.encoding_version || "未记录"
+        });
+
+        const routeTarget = element("heldout-route");
+        const route = Array.isArray(episode.route) ? episode.route : [];
+        routeTarget.replaceChildren();
+        if (!route.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "这局没有记录到 choose_map_node";
+          routeTarget.append(empty);
+        } else {
+          route.forEach((choice) => {
+            const line = document.createElement("div");
+            line.className = "card";
+            const destination = choice.destination || {};
+            const candidates = Array.isArray(choice.candidates) ? choice.candidates.map(candidateDescription).join(" · ") : "未记录";
+            line.textContent = `Act ${int(choice.act)} Floor ${int(choice.floor)}：${actionDescription(choice)} → ` +
+              `${scalar(destination.room_type)} ${scalar(destination.room_model_id)}（Floor ${int(destination.floor)}）` +
+              `；候选 ${candidates}`;
+            routeTarget.append(line);
+          });
+        }
+
+        const rewardTarget = element("heldout-card-rewards");
+        const cardRewards = Array.isArray(episode.card_rewards) ? episode.card_rewards : [];
+        rewardTarget.replaceChildren();
+        if (!cardRewards.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "这局没有记录到卡牌奖励选择";
+          rewardTarget.append(empty);
+        } else {
+          cardRewards.forEach((reward) => {
+            const line = document.createElement("div");
+            line.className = "card";
+            const candidates = Array.isArray(reward.candidates)
+              ? reward.candidates.map(candidateDescription).join(" · ")
+              : "未记录";
+            line.textContent = `Act ${int(reward.act)} Floor ${int(reward.floor)} · ` +
+              `${reward.skipped ? "跳过" : `选择 ${actionDescription(reward)}`} · 候选 ${candidates}` +
+              ` · 候选覆盖 ${scalar(reward.candidate_coverage)}`;
+            rewardTarget.append(line);
+          });
+        }
+
+        const floorTarget = element("heldout-floor-timeline");
+        const floors = Array.isArray(episode.floors) ? episode.floors : [];
+        floorTarget.replaceChildren();
+        if (!floors.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "没有可聚合的楼层事实";
+          floorTarget.append(empty);
+        } else {
+          floors.forEach((floor, index) => {
+            const details = document.createElement("details");
+            if (index === floors.length - 1) details.open = true;
+            const summary = document.createElement("summary");
+            summary.textContent = `Act ${int(floor.act)} Floor ${int(floor.floor)} · ${scalar(floor.room_type)} ` +
+              `${scalar(floor.room_model_id)} · 失血 ${int(floor.hp_loss_delta)} · 复活 +${int(floor.revivals_delta)}`;
+            const lines = document.createElement("div");
+            lines.className = "detail-lines";
+            const combat = detailLine(
+              "战斗",
+              `${scalar(floor.encounter_class)} · ${scalar(floor.combat_result)} · ` +
+                `${int(floor.combat_rounds)} 回合 · ${int(floor.combat_decisions)} 决策`
+            );
+            const hp = detailLine(
+              "资源",
+              `HP ${int(floor.entry_hp)} → ${int(floor.exit_hp)}（净变化 ${int(floor.hp_net_change)}）` +
+                ` · 权威累计失血差 ${int(floor.hp_loss_delta)} · 复活 ${int(floor.entry_revivals)} → ${int(floor.exit_revivals)}`
+            );
+            lines.append(combat, hp);
+            const macros = Array.isArray(floor.macro_decisions) ? floor.macro_decisions : [];
+            if (macros.length) {
+              const macro = detailLine("宏观选择", macros.map(actionDescription).join(" ｜ "));
+              lines.append(macro);
+            }
+            cardRewards
+              .filter((reward) => int(reward.act) === int(floor.act) && int(reward.floor) === int(floor.floor))
+              .forEach((reward) => {
+                const candidates = Array.isArray(reward.candidates) ? reward.candidates.map(candidateDescription).join(" · ") : "未记录";
+                const rewardLine = detailLine(
+                  "卡牌奖励",
+                  `${reward.skipped ? "跳过" : actionDescription(reward)} · 候选 ${candidates}` +
+                    ` · 覆盖 ${scalar(reward.candidate_coverage)}`
+                );
+                lines.append(rewardLine);
+              });
+            details.append(summary, lines);
+            floorTarget.append(details);
+          });
+        }
+
+        const anomalyTarget = element("heldout-anomalies");
+        const anomalies = Array.isArray(episode.anomalies) ? episode.anomalies : [];
+        anomalyTarget.replaceChildren();
+        if (!anomalies.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = `终止原因：${scalar(episode.termination_reason)}；未记录 deadlock cycle`;
+          anomalyTarget.append(empty);
+        } else {
+          anomalies.forEach((anomaly) => {
+            const line = document.createElement("div");
+            line.className = "card";
+            const actions = Array.isArray(anomaly.cycle_actions)
+              ? anomaly.cycle_actions.map((action) => `${scalar(action.kind)}:${scalar(action.label)}`).join(" → ")
+              : "未记录";
+            line.textContent = `${scalar(anomaly.kind)} · step ${int(anomaly.step)} · span ${int(anomaly.cycle_span)} · ` +
+              `重复 ${int(anomaly.occurrences)} · ${actions}`;
+            anomalyTarget.append(line);
+          });
+        }
+      }
+
+      async function loadHeldoutJournals(preferred = null) {
+        if (!state.selectedRun || state.detailLoading) return;
+        state.detailLoading = true;
+        setDetailStatus("读取目录中…", "running");
+        try {
+          const runKey = state.selectedRun;
+          const payload = await fetchJson(`${API_HELDOUT_JOURNALS}?run=${encodeURIComponent(runKey)}`);
+          if (runKey !== state.selectedRun) return;
+          state.heldoutRunKey = runKey;
+          state.heldoutJournals = Array.isArray(payload.journals) ? payload.journals : [];
+          populateJournalSelect(state.heldoutJournals);
+          setDetailStatus(`发现 ${state.heldoutJournals.length} 个 journal`, "completed");
+          if (preferred) {
+            const match = state.heldoutJournals.find((journal) =>
+              (preferred.journal && journal.key === preferred.journal) ||
+              (preferred.checkpoint && journal.checkpoint && journal.checkpoint.name === preferred.checkpoint) ||
+              (preferred.gate != null && int(journal.evaluation_gate) === int(preferred.gate) &&
+                (!preferred.gateKind || journal.gate_kind === preferred.gateKind))
+            );
+            if (match) {
+              element("heldout-journal-select").value = match.key;
+              await loadHeldoutEpisodes(match.key, true);
+            } else {
+              setDetailStatus("未找到对应 journal", "failed");
+            }
+          }
+        } catch (error) {
+          setDetailStatus("目录读取失败", "failed");
+          showError(`读取 held-out journal 目录失败：${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          state.detailLoading = false;
+        }
+      }
+
+      async function loadHeldoutEpisodes(journalKey, nested = false) {
+        if (!state.selectedRun || !journalKey || (state.detailLoading && !nested)) return;
+        if (!nested) state.detailLoading = true;
+        state.selectedJournal = journalKey;
+        const runKey = state.selectedRun;
+        clearEpisodeDetail("已选择 journal；正在构建 compact episode 索引");
+        setDetailStatus("解析所选 journal…", "running");
+        try {
+          const payload = await fetchJson(
+            `${API_HELDOUT_EPISODES}?run=${encodeURIComponent(runKey)}&journal=${encodeURIComponent(journalKey)}`
+          );
+          if (runKey !== state.selectedRun || journalKey !== state.selectedJournal) return;
+          state.heldoutEpisodes = Array.isArray(payload.episodes) ? payload.episodes : [];
+          renderHeldoutEpisodeIndex(state.heldoutEpisodes);
+          const select = element("heldout-episode-select");
+          select.replaceChildren();
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = state.heldoutEpisodes.length ? "选择一个 held-out episode" : "没有 episode";
+          select.append(placeholder);
+          state.heldoutEpisodes.forEach((episode) => {
+            const option = document.createElement("option");
+            option.value = String(episode.episode_id);
+            option.textContent = `seed ${int(episode.seed)} · ${scalar(episode.outcome)} · Floor ${int(episode.max_floor)} · 复活 ${int(episode.revivals)}`;
+            select.append(option);
+          });
+          select.disabled = state.heldoutEpisodes.length === 0;
+          setDetailStatus(`索引 ${state.heldoutEpisodes.length} 局`, "completed");
+        } catch (error) {
+          setDetailStatus("Journal 解析失败", "failed");
+          showError(`读取 held-out episode 索引失败：${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          if (!nested) state.detailLoading = false;
+        }
+      }
+
+      async function loadHeldoutEpisode(episodeId) {
+        if (!state.selectedRun || !state.selectedJournal || !episodeId || state.detailLoading) return;
+        const replayToken = ++state.mapReplayToken;
+        state.detailLoading = true;
+        const runKey = state.selectedRun;
+        const journalKey = state.selectedJournal;
+        setDetailStatus("读取单局详情…", "running");
+        try {
+          const payload = await fetchJson(
+            `${API_HELDOUT_EPISODE}?run=${encodeURIComponent(runKey)}` +
+            `&journal=${encodeURIComponent(journalKey)}&episode=${encodeURIComponent(episodeId)}`
+          );
+          if (
+            replayToken !== state.mapReplayToken || runKey !== state.selectedRun ||
+            journalKey !== state.selectedJournal
+          ) return;
+          element("heldout-episode-select").value = episodeId;
+          renderHeldoutEpisodeDetail(payload);
+          setDetailStatus("单局详情已加载 · 正在复现地图", "running");
+          void loadHeldoutReplayMap(runKey, journalKey, episodeId, replayToken);
+        } catch (error) {
+          setDetailStatus("单局详情失败", "failed");
+          showError(`读取 held-out episode 详情失败：${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          state.detailLoading = false;
+        }
+      }
+
+      async function loadHeldoutReplayMap(runKey, journalKey, episodeId, replayToken) {
+        const episode = state.selectedEpisodeDetail;
+        if (!episode || replayToken !== state.mapReplayToken) return;
+        episode.map_replay_state = "running";
+        renderMapVisual(episode, state.selectedReplayAct);
+        try {
+          const payload = await fetchJson(
+            `${API_HELDOUT_REPLAY_MAP}?run=${encodeURIComponent(runKey)}` +
+            `&journal=${encodeURIComponent(journalKey)}&episode=${encodeURIComponent(episodeId)}`
+          );
+          if (
+            replayToken !== state.mapReplayToken || runKey !== state.selectedRun ||
+            journalKey !== state.selectedJournal || episodeId !== state.selectedEpisode ||
+            state.selectedEpisodeDetail !== episode
+          ) return;
+          episode.map_topologies = Array.isArray(payload.map_topologies) ? payload.map_topologies : [];
+          episode.map_reproduction = payload.reproduction || {};
+          episode.map_replay_state = "completed";
+          delete episode.map_replay_error;
+          renderReplayAct(episode, state.selectedReplayAct);
+          const cached = payload.cache_hit === true ? " · 缓存命中" : "";
+          setDetailStatus(`单局详情与完整地图已加载${cached}`, "completed");
+        } catch (error) {
+          if (
+            replayToken !== state.mapReplayToken || runKey !== state.selectedRun ||
+            journalKey !== state.selectedJournal || episodeId !== state.selectedEpisode ||
+            state.selectedEpisodeDetail !== episode
+          ) return;
+          episode.map_replay_state = "failed";
+          episode.map_replay_error = error instanceof Error ? error.message : String(error);
+          renderMapVisual(episode, state.selectedReplayAct);
+          setDetailStatus("单局详情已加载 · 地图复现失败", "failed");
+        }
+      }
+
       function renderEvaluations(snapshot) {
         const evaluations = Array.isArray(snapshot.evaluations) ? snapshot.evaluations : [];
         renderLatestEvaluation(snapshot);
@@ -1694,7 +3428,7 @@
         if (!evaluations.length) {
           const row = document.createElement("tr");
           const cell = createCell("尚无 held-out 评估记录", "wrap");
-          cell.colSpan = 10;
+          cell.colSpan = 11;
           row.append(cell);
           body.append(row);
           return;
@@ -1722,7 +3456,11 @@
                 ` · 策略失败 ${int(policyFailures)}（可重叠）`,
               "numeric"
             ),
-            createCell(int(evaluation.infrastructure_retries), "numeric")
+            createCell(int(evaluation.infrastructure_retries), "numeric"),
+            detailCell(detailButton("对局", () => loadHeldoutJournals({
+              gate,
+              gateKind: evaluation.gate_kind || "validation"
+            })))
           );
           body.append(row);
         });
@@ -1811,7 +3549,7 @@
         if (!entries.length) {
           const row = document.createElement("tr");
           const cell = createCell("尚未发现检查点", "wrap");
-          cell.colSpan = 4;
+          cell.colSpan = 5;
           row.append(cell);
           body.append(row);
           return;
@@ -1822,7 +3560,12 @@
             createCell(checkpointVerification(item, isPublishing), "wrap"),
             createCell(int(checkpointValue(item, ["environment_steps", "step", "env_step"], null))),
             createCell(checkpointName(item), "wrap"),
-            createCell(dateTime(checkpointValue(item, ["created_at", "timestamp", "time", "modified_at"], null)))
+            createCell(dateTime(checkpointValue(item, ["created_at", "timestamp", "time", "modified_at"], null))),
+            detailCell(detailButton(
+              "对局",
+              () => loadHeldoutJournals({ checkpoint: checkpointName(item) }),
+              isPublishing
+            ))
           );
           body.append(row);
         });
@@ -2241,6 +3984,7 @@
             element("main-content").setAttribute("aria-busy", "false");
             return;
           }
+          if (state.heldoutRunKey && state.heldoutRunKey !== selected) resetHeldoutBrowser();
           updateUrl(state.followLatest ? "" : selected);
           const snapshot = await fetchJson(`${API_SNAPSHOT}?run=${encodeURIComponent(selected)}`);
           clearError();
@@ -2262,6 +4006,7 @@
         if (!next || next === state.selectedRun) return;
         state.followLatest = next === state.latestRunKey;
         state.selectedRun = next;
+        resetHeldoutBrowser();
         updateUrl(state.followLatest ? "" : next);
         refresh(true);
       });
@@ -2276,6 +4021,16 @@
       });
 
       element("refresh-button").addEventListener("click", () => refresh(true));
+
+      element("heldout-journals-button").addEventListener("click", () => loadHeldoutJournals());
+      element("heldout-journal-select").addEventListener("change", (event) => {
+        const journal = event.target.value;
+        if (journal) loadHeldoutEpisodes(journal);
+      });
+      element("heldout-episode-select").addEventListener("change", (event) => {
+        const episode = event.target.value;
+        if (episode) loadHeldoutEpisode(episode);
+      });
 
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") {

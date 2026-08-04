@@ -15,7 +15,7 @@ import torch
 from sts2_baseline import RolloutQueueClosed, SequenceUnroll
 from sts2_rl.contracts import EnvironmentBackend
 
-from .checkpointing import ActorSupervisorState
+from .checkpointing import ActorSupervisorState, TrainingState
 from .collector import CollectedEpisode, EpisodeProgress
 from .factory import TrainingResources
 from .failure_credit import EvidenceRecord
@@ -243,6 +243,61 @@ class ActorLearnerPipeline:
         with self._publication_lock:
             self._pending_publication = None
         self._actor_policy_version = policy_version
+
+    def restore_paused_checkpoint_state(
+        self,
+        state: TrainingState,
+        *,
+        supervisor_state: ActorSupervisorState,
+    ) -> None:
+        """Rewind actor-side counters after a validated in-process rollback.
+
+        The checkpoint loader owns model, optimizer, replay, collector RNG and
+        stochastic restoration.  This method owns the actor thread's private
+        counters.  It is intentionally legal only at an empty, paused episode
+        boundary; no partially collected trajectory can survive the rewind.
+        """
+
+        if not isinstance(state, TrainingState):
+            raise TypeError("state must be TrainingState")
+        if not isinstance(supervisor_state, ActorSupervisorState):
+            raise TypeError("supervisor_state must be ActorSupervisorState")
+        if not self.alive or not self.paused:
+            raise RuntimeError("in-process rollback requires a live paused actor")
+        if self.at_episode_boundary or self.at_incident_boundary:
+            raise RuntimeError("in-process rollback requires an acknowledged boundary")
+        if not self._episodes.empty() or not self._failure_evidence.empty():
+            raise RuntimeError("in-process rollback requires empty actor side channels")
+        if len(self.resources.rollout_queue) != 0:
+            raise RuntimeError("in-process rollback requires an empty restored rollout queue")
+
+        self._environment_steps = state.environment_steps
+        self._actor_policy_version = state.actor_policy_version
+        self._completed_training_episodes = state.episodes
+        self._next_deterministic_probe_step = 0
+        while (
+            self._next_deterministic_probe_step
+            < len(self._deterministic_probe_environment_steps)
+            and self._deterministic_probe_environment_steps[
+                self._next_deterministic_probe_step
+            ]
+            <= state.environment_steps
+        ):
+            self._next_deterministic_probe_step += 1
+        self._episode_attempts = supervisor_state.episode_attempts
+        self._consecutive_incidents = supervisor_state.consecutive_incidents
+        self._incident_fingerprints = Counter(
+            dict(supervisor_state.incident_fingerprints)
+        )
+        self._recent_incident_attempts = deque(
+            supervisor_state.recent_incident_attempts
+        )
+        self._validated_episode_steps = 0
+        self._validated_episode_maximum_observed_candidates = 0
+        with self._progress_lock:
+            self._actor_progress = None
+        with self._publication_lock:
+            self._pending_publication = None
 
     def stop(self) -> None:
         self._stop.set()

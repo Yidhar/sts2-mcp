@@ -18,20 +18,35 @@ def test_package_exports_transport_clients_only() -> None:
 @pytest.mark.parametrize(
     ("sim_kind", "model_kind"),
     [
-        ("embark", "character_select"),
-        ("start_run", "main_menu"),
-        ("skip_rewards", "proceed"),
+        # Literal legal-action surface emitted by the audited full-run state
+        # builder (2026-08-04). Parameterized subtypes such as merchant card
+        # removal are covered by dedicated end-to-end tests below.
+        ("cancel_selection", "card_selection"),
+        ("choose_map_node", "map"),
+        ("choose_rest_option", "rest_site"),
         ("claim_reward", "reward"),
+        ("claim_treasure_relic", "treasure_relic"),
+        ("combat_confirm_selection", "card_selection"),
+        ("combat_select_card", "card_selection"),
+        ("confirm_selection", "card_selection"),
+        ("end_turn", "end_turn"),
+        ("play_card", "play_card"),
+        ("proceed", "proceed"),
+        ("select_card", "card_selection"),
         ("select_card_reward", "card_reward"),
+        ("select_relic", "treasure_relic"),
+        ("shop_purchase", "shop"),
+        ("skip_card_reward", "card_reward"),
+        ("skip_relic_selection", "treasure_relic"),
+        ("start_run", "main_menu"),
+        ("use_potion", "use_potion"),
+        # Compatibility aliases emitted by adjacent simulator/bridge modes.
+        ("embark", "character_select"),
+        ("skip_rewards", "proceed"),
         ("select_card_option", "card_selection"),
         ("deselect_card", "card_selection"),
         ("combat_deselect_card", "card_selection"),
         ("combat_cancel_selection", "card_selection"),
-        ("select_relic", "treasure_relic"),
-        ("skip_relic_selection", "treasure_relic"),
-        ("claim_treasure_relic", "treasure_relic"),
-        ("choose_map_node", "map"),
-        ("end_turn", "end_turn"),
     ],
 )
 def test_simulator_actions_use_closed_live_model_vocabulary(
@@ -485,6 +500,113 @@ def test_transport_rejects_invalid_card_multiplicity(quantity: object) -> None:
 
     with pytest.raises(ValueError, match="quantity"):
         translate_to_bridge_shape(sim_state, episode_id="ep-invalid-quantity")
+
+
+def test_shop_card_removal_round_trips_purchase_and_remove_selection() -> None:
+    shop_state = {
+        "state_type": "shop",
+        "shop": {
+            "player": _player(),
+            "items": [
+                {
+                    "index": 13,
+                    "category": "card_removal",
+                    "cost": 75,
+                    "can_afford": True,
+                    "is_stocked": True,
+                }
+            ],
+        },
+        "legal_actions": [
+            {"action": "shop_purchase", "index": 13},
+            {"action": "shop_skip"},
+        ],
+    }
+    translated = translate_to_bridge_shape(
+        shop_state,
+        episode_id="ep-shop-removal",
+    )
+    purchase = translated["available_actions"][0]
+    assert purchase["item"]["category"] == "card_removal"
+    assert purchase["_sim_raw"] == {"action": "shop_purchase", "index": 13}
+
+    client = HeadlessSimBridgeClient.__new__(HeadlessSimBridgeClient)
+    client._current_episode_id = "ep-shop-removal"
+    client._last_legal_actions = translated["available_actions"]
+    client._rpc = mock.Mock(
+        return_value={
+            "accepted": True,
+            "state": {
+                "state_type": "card_select",
+                "legal_actions": [{"action": "select_card", "index": 0}],
+            },
+        }
+    )
+    with mock.patch.object(
+        client_module,
+        "_build_bridge_step_response",
+        return_value={"episode_id": "ep-shop-removal"},
+    ):
+        client.step("ep-shop-removal", action_id=purchase["action_handle"])
+    client._rpc.assert_called_once_with(
+        "step",
+        {"action": "shop_purchase", "index": 13},
+        timeout_s=20.0,
+    )
+
+    selection_state = {
+        "state_type": "card_select",
+        "card_select": {
+            "player": _player(),
+            "cards": [{"index": 0, "id": "STRIKE"}],
+            "selected_cards": [],
+            "selected_count": 0,
+            "min_select": 1,
+            "max_select": 1,
+            "operation_type": "remove",
+            "source_zone": "Deck",
+            "can_confirm": False,
+            "can_cancel": True,
+        },
+        "legal_actions": [
+            {
+                "action": "select_card",
+                "selection_operation": "select",
+                "index": 0,
+            },
+            {"action": "cancel_selection"},
+        ],
+    }
+    translated_selection = translate_to_bridge_shape(
+        selection_state,
+        episode_id="ep-shop-removal",
+    )
+    assert translated_selection["card_selection"]["operation_type"] == "remove"
+    removal_selection = translated_selection["available_actions"][0]["selection"]
+    # The page operation is remove; the concrete candidate mutation is select.
+    assert removal_selection["operation_type"] == "select"
+    assert removal_selection["source_zone"] == "Deck"
+
+    selection_state["card_select"] = {
+        **selection_state["card_select"],
+        "selected_cards": [{"index": 0, "id": "STRIKE"}],
+        "selected_count": 1,
+        "can_confirm": True,
+    }
+    selection_state["legal_actions"] = [
+        {"action": "confirm_selection", "selection_operation": "confirm"},
+        {"action": "cancel_selection"},
+    ]
+    confirm_surface = translate_to_bridge_shape(
+        selection_state,
+        episode_id="ep-shop-removal",
+    )
+    assert confirm_surface["card_selection"]["operation_type"] == "remove"
+    assert confirm_surface["available_actions"][0]["_sim_raw"] == {
+        "action": "confirm_selection",
+        "selection_operation": "confirm",
+    }
+
 
 def test_opaque_handles_round_trip_sparse_shop_and_target_parameters_without_reindexing() -> None:
     shop_state = {

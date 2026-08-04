@@ -68,6 +68,94 @@ def _probability(value: object) -> float | None:
     return result
 
 
+def _shop_item_category(action: object) -> str | None:
+    """Return the authoritative nested subtype for a shop purchase."""
+
+    if _kind(action) != "shop_purchase" or not isinstance(action, Mapping):
+        return None
+    item_value = action.get("item")
+    if not isinstance(item_value, Mapping):
+        return None
+    for key in ("category", "type", "item_type", "item_kind", "kind"):
+        value = str(item_value.get(key, "")).strip().lower()
+        if value:
+            return value
+    return None
+
+
+def _deck_count(record: Mapping[str, Any]) -> int | None:
+    observation_value = record.get(
+        "observation_summary",
+        record.get("observation"),
+    )
+    if not isinstance(observation_value, Mapping):
+        return None
+    player_value = observation_value.get("player")
+    if not isinstance(player_value, Mapping):
+        return None
+    return _integer(player_value.get("deck_count"))
+
+
+def _card_removal_outcomes(
+    episode_records: Sequence[Mapping[str, Any]],
+) -> tuple[int, int, int, int]:
+    """Count attempted, observed-complete, cancelled and unresolved removals.
+
+    Completion is intentionally stricter than seeing ``confirm_selection``:
+    the next actionable state must show a smaller deck.  This makes the metric
+    an execution audit rather than a count of policy intentions.  Old compact
+    journals without deck counts remain readable; their confirmed operations
+    are conservatively classified as unresolved instead of being invented as
+    successes.
+    """
+
+    attempts = 0
+    completed = 0
+    cancelled = 0
+    pending_before_deck: int | None = None
+    pending = False
+    awaiting_post_confirm = False
+
+    for record in episode_records:
+        if awaiting_post_confirm:
+            after_deck = _deck_count(record)
+            if (
+                pending_before_deck is not None
+                and after_deck is not None
+                and after_deck < pending_before_deck
+            ):
+                completed += 1
+            pending = False
+            awaiting_post_confirm = False
+            pending_before_deck = None
+
+        action = record.get("selected_action")
+        if _shop_item_category(action) == "card_removal":
+            # A second purchase before the prior transaction settles leaves
+            # the prior attempt unresolved; the residual calculation below
+            # records it without guessing why the UI changed.
+            attempts += 1
+            pending = True
+            awaiting_post_confirm = False
+            pending_before_deck = _deck_count(record)
+            continue
+
+        if not pending:
+            continue
+        action_kind = _kind(action)
+        if action_kind == "cancel_selection":
+            cancelled += 1
+            pending = False
+            pending_before_deck = None
+        elif action_kind == "confirm_selection":
+            awaiting_post_confirm = True
+
+    unresolved = attempts - completed - cancelled
+    if unresolved < 0:  # pragma: no cover - guarded by the state machine
+        raise AssertionError("card-removal outcome counts became inconsistent")
+    return attempts, completed, cancelled, unresolved
+
+
 def _decision_records(path: str | Path) -> tuple[dict[str, Any], ...]:
     result: list[dict[str, Any]] = []
     with Path(path).expanduser().resolve().open("r", encoding="utf-8") as handle:
@@ -109,6 +197,8 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
     reward_claim_selected = 0
     reward_proceed_selected = 0
     reward_margins: list[float] = []
+    card_removal_legal_decisions = 0
+    card_removal_legal_candidates = 0
 
     for record in records:
         episode_id = str(record.get("episode_id", "")).strip()
@@ -117,6 +207,16 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         selected_kind = _kind(record.get("selected_action"))
         kinds_value = record.get("legal_action_kinds")
         kinds = kinds_value if isinstance(kinds_value, Mapping) else {}
+        semantics_value = record.get("legal_action_semantics")
+        semantics = (
+            semantics_value if isinstance(semantics_value, Mapping) else {}
+        )
+        removal_legal_count = _integer(
+            semantics.get("shop_purchase:card_removal")
+        )
+        if removal_legal_count is not None and removal_legal_count > 0:
+            card_removal_legal_decisions += 1
+            card_removal_legal_candidates += removal_legal_count
 
         observation_value = record.get(
             "observation_summary",
@@ -187,11 +287,25 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
     cycle_episodes = 0
     liveness_failure_episodes = 0
     card_removal_cancel_cycle_episodes = 0
+    card_removal_purchase_attempts = 0
+    card_removal_completed = 0
+    card_removal_cancelled = 0
+    card_removal_unresolved = 0
     combat_stall_episodes = 0
     noncombat_stall_episodes = 0
     for episode_records in by_episode.values():
         if not episode_records:
             continue
+        (
+            episode_removal_attempts,
+            episode_removal_completed,
+            episode_removal_cancelled,
+            episode_removal_unresolved,
+        ) = _card_removal_outcomes(episode_records)
+        card_removal_purchase_attempts += episode_removal_attempts
+        card_removal_completed += episode_removal_completed
+        card_removal_cancelled += episode_removal_cancelled
+        card_removal_unresolved += episode_removal_unresolved
         last = episode_records[-1]
         deadlock_value = last.get("deadlock")
         deadlock = deadlock_value if isinstance(deadlock_value, Mapping) else {}
@@ -217,10 +331,7 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
             for record in episode_records[-16:]
         )
         has_card_removal_purchase = any(
-            _kind(action) == "shop_purchase"
-            and isinstance(action.get("item"), Mapping)
-            and str(action["item"].get("category", "")).strip().lower()
-            == "card_removal"
+            _shop_item_category(action) == "card_removal"
             for action in tail_actions
         )
         if (
@@ -310,6 +421,22 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         ),
         "card_removal_cancel_cycle_episode_count": (
             card_removal_cancel_cycle_episodes
+        ),
+        "card_removal_legal_decision_count": card_removal_legal_decisions,
+        "card_removal_legal_candidate_count": card_removal_legal_candidates,
+        "card_removal_purchase_attempt_count": card_removal_purchase_attempts,
+        "card_removal_completed_count": card_removal_completed,
+        "card_removal_cancelled_count": card_removal_cancelled,
+        "card_removal_unresolved_count": card_removal_unresolved,
+        "card_removal_completion_rate": (
+            card_removal_completed / card_removal_purchase_attempts
+            if card_removal_purchase_attempts
+            else None
+        ),
+        "card_removal_cancel_rate": (
+            card_removal_cancelled / card_removal_purchase_attempts
+            if card_removal_purchase_attempts
+            else None
         ),
         "combat_progress_stall_episode_count": combat_stall_episodes,
         "noncombat_progress_stall_episode_count": noncombat_stall_episodes,

@@ -273,6 +273,7 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     assert ordinary["observation_summary"]["player"]["deck_count"] == 16
     assert ordinary["legal_action_count"] == 2
     assert ordinary["legal_action_kinds"] == {"event_option": 2}
+    assert "legal_action_semantics" not in ordinary
     assert ordinary["selected_action"]["label"] == "Hold on"
     assert ordinary["selected_action_fingerprint"]
     assert ordinary["policy_topk"][1]["action"]["label"] == "Overcome"
@@ -286,6 +287,54 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     assert last["snapshot_reasons"] == ["episode_last"]
     assert len(first["observation"]["player"]["deck"]) == 16
     assert "action_handle" not in first["selected_action"]
+
+
+def test_trajectory_summary_keeps_parameterized_shop_action_surface(
+    tmp_path: Path,
+) -> None:
+    event = _journal_decision(
+        episode_id="shop-surface",
+        step_index=0,
+        outcome="success",
+    )
+    legal_actions = [
+        {
+            "action": "shop_purchase",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "item": {"category": "card_removal", "slot_index": 13},
+        },
+        {
+            "action": "shop_purchase",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "item": {"category": "card", "slot_index": 2},
+        },
+        {
+            "action": "shop_skip",
+            "kind": "shop_skip",
+            "model_action_kind": "shop",
+        },
+    ]
+    event["legal_actions"] = legal_actions
+    event["selected_action"] = legal_actions[0]
+    event["policy_topk"] = [{"index": 0, "probability": 1.0}]
+
+    path = tmp_path / "shop-surface.jsonl"
+    with TrajectoryJournal(path) as journal:
+        journal.write(event)
+
+    summary = next(
+        item
+        for item in _read_jsonl(path)
+        if item["record_kind"] == "summary"
+    )
+    assert summary["legal_action_kinds"] == {"shop": 3}
+    assert summary["legal_action_semantics"] == {
+        "shop_purchase:card": 1,
+        "shop_purchase:card_removal": 1,
+    }
+    assert summary["selected_action"]["item"]["category"] == "card_removal"
 
 
 def test_trajectory_journal_separates_model_candidate_and_raw_dispatch_indexes(

@@ -1017,6 +1017,7 @@ def evaluate_checkpoint_macro_sensitivity(
     model = RecurrentCandidateModel(
         config.model.to_model_config(),
         enable_transaction_heads=config.transaction_learning.enabled,
+        enable_liveness_head=config.failure_credit.learning_enabled,
     ).to(resolved_device)
     state = torch.load(
         validated.root / "network.pt",

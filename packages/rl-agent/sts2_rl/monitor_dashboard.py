@@ -236,6 +236,119 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 include_body=include_body,
             )
             return
+        if parsed.path == "/api/v1/heldout-journals":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(query) != {"run"} or len(query["run"]) != 1 or not query["run"][0]:
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "heldout-journals requires one server-issued run key",
+                    include_body=include_body,
+                )
+                return
+            try:
+                payload = self.server.store.heldout_journals(query["run"][0])
+            except KeyError:
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "unknown run key; refresh /api/v1/runs",
+                    include_body=include_body,
+                )
+                return
+            self._send_json(HTTPStatus.OK, payload, include_body=include_body)
+            return
+        if parsed.path == "/api/v1/heldout-episodes":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(query) != {"run", "journal"} or any(
+                len(query[name]) != 1 or not query[name][0] for name in ("run", "journal")
+            ):
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "heldout-episodes requires one server-issued run key and journal key",
+                    include_body=include_body,
+                )
+                return
+            try:
+                payload = self.server.store.heldout_episodes(query["run"][0], query["journal"][0])
+            except KeyError:
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "unknown run or journal key; refresh the held-out journal list",
+                    include_body=include_body,
+                )
+                return
+            except ValueError as exc:
+                self._send_error_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    str(exc),
+                    include_body=include_body,
+                )
+                return
+            self._send_json(HTTPStatus.OK, payload, include_body=include_body)
+            return
+        if parsed.path == "/api/v1/heldout-episode":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            required = ("run", "journal", "episode")
+            if set(query) != set(required) or any(len(query[name]) != 1 or not query[name][0] for name in required):
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "heldout-episode requires one server-issued run, journal, and episode key",
+                    include_body=include_body,
+                )
+                return
+            try:
+                payload = self.server.store.heldout_episode(
+                    query["run"][0],
+                    query["journal"][0],
+                    query["episode"][0],
+                )
+            except KeyError:
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "unknown run, journal, or episode key; refresh the held-out episode index",
+                    include_body=include_body,
+                )
+                return
+            except ValueError as exc:
+                self._send_error_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    str(exc),
+                    include_body=include_body,
+                )
+                return
+            self._send_json(HTTPStatus.OK, payload, include_body=include_body)
+            return
+        if parsed.path == "/api/v1/heldout-replay-map":
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            required = ("run", "journal", "episode")
+            if set(query) != set(required) or any(len(query[name]) != 1 or not query[name][0] for name in required):
+                self._send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "heldout-replay-map requires one server-issued run, journal, and episode key",
+                    include_body=include_body,
+                )
+                return
+            try:
+                payload = self.server.store.heldout_replay_map(
+                    query["run"][0],
+                    query["journal"][0],
+                    query["episode"][0],
+                )
+            except KeyError:
+                self._send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "unknown run, journal, or episode key; refresh the held-out episode index",
+                    include_body=include_body,
+                )
+                return
+            except ValueError as exc:
+                self._send_error_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    str(exc),
+                    include_body=include_body,
+                )
+                return
+            self._send_json(HTTPStatus.OK, payload, include_body=include_body)
+            return
         if parsed.path == "/api/v1/snapshot":
             query = parse_qs(parsed.query, keep_blank_values=True)
             unknown_parameters = set(query).difference({"run"})

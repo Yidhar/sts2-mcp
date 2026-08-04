@@ -63,6 +63,57 @@ def test_entropy_weight_anneals_to_explicit_nonzero_floor() -> None:
     ) == pytest.approx(0.004)
 
 
+def test_one_hot_entropy_breaker_triggers_after_eight_batches_and_resumes_exactly() -> None:
+    learner, _ = _learner()
+    learner.config = OptimizationConfig(
+        entropy_weight=0.006,
+        entropy_weight_end=0.004,
+        entropy_decay_updates=3_000,
+        entropy_breaker="one-hot-v1",
+    )
+    ratios = torch.ones(5)
+    clipped = torch.zeros(5)
+    for expected_streak in range(1, 8):
+        weight, active, condition = learner._entropy_weight_for_batch(
+            base_weight=0.004,
+            active_ratios=ratios,
+            clipped=clipped,
+        )
+        assert condition is True
+        assert active is False
+        assert weight == pytest.approx(0.004)
+        assert learner.dynamics_state_dict()["one_hot_batch_streak"] == expected_streak
+
+    weight, active, condition = learner._entropy_weight_for_batch(
+        base_weight=0.004,
+        active_ratios=ratios,
+        clipped=clipped,
+    )
+    assert condition is True
+    assert active is True
+    assert weight == pytest.approx(0.012)
+    state = learner.dynamics_state_dict()
+    assert state == {
+        "version": "sts2-vtrace-learner-dynamics-v1",
+        "one_hot_batch_streak": 0,
+        "entropy_breaker_remaining_updates": 7,
+        "entropy_breaker_triggers": 1,
+    }
+
+    restored, _ = _learner()
+    restored.config = learner.config
+    restored.load_dynamics_state_dict(state)
+    weight, active, condition = restored._entropy_weight_for_batch(
+        base_weight=0.004,
+        active_ratios=torch.tensor([0.8, 0.9]),
+        clipped=torch.zeros(2),
+    )
+    assert condition is False
+    assert active is True
+    assert weight == pytest.approx(0.012)
+    assert restored.dynamics_state_dict()["entropy_breaker_remaining_updates"] == 6
+
+
 def _model_config(*, dropout: float = 0.0) -> GroundedCandidateConfig:
     return GroundedCandidateConfig(
         token_feature_dim=224,
@@ -228,6 +279,7 @@ def _learner(
     revival_value_weight: float = 0.10,
     revival_policy_weight: float = 0.05,
     secondary_advantage_fraction: float = 0.25,
+    success_policy_trust_region_epsilon: float = 0.20,
     dropout: float = 0.0,
 ) -> tuple[VTraceLearner, GroundedEncodingConfig]:
     torch.manual_seed(11)
@@ -250,6 +302,9 @@ def _learner(
             revival_value_weight=revival_value_weight,
             revival_policy_weight=revival_policy_weight,
             secondary_advantage_fraction=secondary_advantage_fraction,
+            success_policy_trust_region_epsilon=(
+                success_policy_trust_region_epsilon
+            ),
         ),
     )
     assert learner.device == CPU
@@ -900,3 +955,61 @@ def test_importance_ratio_is_detached_so_rare_good_action_is_encouraged() -> Non
         )
 
     assert after > before
+
+
+def test_success_imitation_stops_outside_the_positive_trust_region() -> None:
+    learner, encoding = _learner(
+        learn_steps=1,
+        primary_policy_weight=1.0,
+        task_value_weight=1.0,
+        revival_value_weight=0.0,
+        revival_policy_weight=0.0,
+        secondary_advantage_fraction=0.0,
+        success_policy_trust_region_epsilon=0.20,
+    )
+    snapshot = _snapshot(encoding, domain_id=0)
+    encoded = collate_encoded_snapshots(
+        (snapshot,),
+        expected_config=encoding,
+        expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
+        device=CPU,
+    )
+    preparation = torch.optim.Adam(learner.model.parameters(), lr=0.003)
+    for _ in range(120):
+        logits = learner.model(encoded).policy_logits
+        probability = float(torch.softmax(logits.detach(), dim=-1)[0, 0])
+        if probability > 0.75:
+            break
+        make_action_zero_likely = -F.log_softmax(logits, dim=-1)[0, 0]
+        preparation.zero_grad(set_to_none=True)
+        make_action_zero_likely.backward()
+        preparation.step()
+    with torch.no_grad():
+        probability = float(
+            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
+        )
+    assert probability > 0.60  # ratio > 1.2 against recorded behavior p=0.5
+
+    _zero_multiscale_heads(learner.model)
+    episode = _episode((snapshot,), episode_id="already-sharp-success", won=True)
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=0,
+    )
+
+    assert float(losses.importance_ratios[0]) > 1.20
+    assert losses.success_policy_candidate_labels == 1
+    assert losses.success_trust_region_suppressed_labels == 1
+    assert losses.policy_labels == 0
+    assert losses.policy_active_sequences == 0
+    assert losses.task_value_labels == 2
+    assert losses.task_value_loss.detach().item() > 0.0
+    assert losses.primary_policy_loss.detach().item() == 0.0
+
+    learner.model.zero_grad(set_to_none=True)
+    losses.total_loss.backward()
+    assert all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        for name, parameter in learner.model.named_parameters()
+        if name.startswith("policy_head.")
+    )

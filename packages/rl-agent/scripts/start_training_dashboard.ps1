@@ -53,10 +53,32 @@ function Test-DashboardHealthForArtifactRoot {
     }
 }
 
-$python = Join-Path $packageRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    $pythonCommand = Get-Command python -ErrorAction Stop
-    $python = $pythonCommand.Source
+function Test-DashboardPython {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+
+    if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
+        return $false
+    }
+    Push-Location $packageRoot
+    try {
+        & $Candidate -c "import sts2_rl.monitor_dashboard" 2>$null
+        return $LASTEXITCODE -eq 0
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+$venvPython = Join-Path $packageRoot ".venv\Scripts\python.exe"
+$systemPython = (Get-Command python -ErrorAction Stop).Source
+$python = if (Test-DashboardPython -Candidate $venvPython) {
+    $venvPython
+}
+elseif (Test-DashboardPython -Candidate $systemPython) {
+    $systemPython
+}
+else {
+    throw "Neither the package virtual environment nor system Python can import sts2_rl.monitor_dashboard."
 }
 
 $url = "http://127.0.0.1:$Port/"

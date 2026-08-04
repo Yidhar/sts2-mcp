@@ -74,6 +74,14 @@ _EVALUATION_GATE_STATE_VERSION = "sts2-evaluation-gate-state-v1"
 _LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
 _EPISODIC_TARGET_ABI = "sts2-episodic-task-targets-one-terminal-unit-v2"
 _LIVENESS_COST_HEAD_ABI = "sts2-liveness-cost-heads-v1"
+_CHECKPOINT_ROLES = frozenset(
+    {
+        "ordinary",
+        "healthy_evaluation_anchor",
+        "guard_failure_evidence",
+        "deadlock_alert_evidence",
+    }
+)
 
 _LONG_HORIZON_HEAD_PREFIXES = (
     "combat_task_value_head.",
@@ -208,6 +216,9 @@ class TrainingState:
     actor_policy_version: int = 0
     consumed_unrolls: int = 0
     maximum_observed_candidates: int = 0
+    training_deadlock_streak: int = 0
+    training_deadlock_alerts: int = 0
+    evaluation_guard_rollbacks: int = 0
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -675,12 +686,13 @@ def _stochastic_state(resources: TrainingResources) -> dict[str, Any]:
     )
     cuda_states = torch.cuda.get_rng_state_all() if cuda_rng_is_live and torch.cuda.is_available() else []
     return {
-        "version": "sts2-recurrent-stochastic-state-v2",
+        "version": "sts2-recurrent-stochastic-state-v3",
         "python_random": random.getstate(),
         "numpy_random": np.random.get_state(),
         "torch_cpu": torch.get_rng_state(),
         "torch_cuda": cuda_states,
         "collector": resources.collector.state_dict(),
+        "learner_dynamics": resources.learner.dynamics_state_dict(),
     }
 
 
@@ -694,10 +706,11 @@ def _validate_stochastic_state(payload: object) -> dict[str, Any]:
         "torch_cpu",
         "torch_cuda",
         "collector",
+        "learner_dynamics",
     }
     if set(payload) != expected:
         raise ValueError("checkpoint stochastic state keys mismatch")
-    if payload["version"] != "sts2-recurrent-stochastic-state-v2":
+    if payload["version"] != "sts2-recurrent-stochastic-state-v3":
         raise ValueError("unsupported checkpoint stochastic state")
     python_probe = random.Random()
     numpy_probe = np.random.RandomState()
@@ -750,6 +763,9 @@ def _validate_stochastic_state(payload: object) -> dict[str, Any]:
         generator_probe.bit_generator.state = dict(rng_state)
     except (TypeError, ValueError) as exc:
         raise ValueError("checkpoint collector RNG state is invalid") from exc
+    learner_dynamics = payload["learner_dynamics"]
+    if not isinstance(learner_dynamics, dict):
+        raise TypeError("checkpoint learner dynamics state must be an object")
     return payload
 
 
@@ -759,6 +775,7 @@ def _restore_stochastic_state(
     resources: TrainingResources,
 ) -> None:
     resources.collector.load_state_dict(payload["collector"])
+    resources.learner.load_dynamics_state_dict(payload["learner_dynamics"])
     random.setstate(payload["python_random"])
     np.random.set_state(payload["numpy_random"])
     torch.set_rng_state(payload["torch_cpu"].cpu())
@@ -779,9 +796,17 @@ def training_state_from_metadata(metadata: dict[str, Any]) -> TrainingState:
     # Existing exact-resume checkpoints therefore migrate this one absent
     # scalar to zero while every other missing or unknown key remains a hard
     # ABI failure.
-    legacy_missing = {"maximum_observed_candidates"}
-    if actual == expected - legacy_missing:
-        raw = {**raw, "maximum_observed_candidates": 0}
+    legacy_missing = {
+        "maximum_observed_candidates",
+        "training_deadlock_streak",
+        "training_deadlock_alerts",
+        "evaluation_guard_rollbacks",
+    }
+    if actual <= expected and expected - actual <= legacy_missing:
+        raw = {
+            **raw,
+            **{name: 0 for name in expected - actual},
+        }
     elif actual != expected:
         raise ValueError("checkpoint training_state keys mismatch")
     return TrainingState(**raw)
@@ -943,6 +968,9 @@ def _validate_metadata(
         raise ValueError("checkpoint has no model tensor specification")
     if model_only:
         return
+    checkpoint_role = metadata.get("checkpoint_role")
+    if checkpoint_role is not None and checkpoint_role not in _CHECKPOINT_ROLES:
+        raise ValueError("exact-resume checkpoint has an invalid checkpoint role")
     recorded_sdpa = metadata.get("sdpa_backend")
     execution_provenance = metadata.get("execution_provenance")
     if recorded_sdpa is not None:
@@ -1117,6 +1145,7 @@ def save_training_checkpoint(
     actor_supervisor_state: ActorSupervisorState | None = None,
     evaluation_state: EvaluationGateState | None = None,
     execution_provenance: Mapping[str, Any] | None = None,
+    checkpoint_role: str = "ordinary",
 ) -> Path:
     """Publish a checkpoint while the actor is quiescent between episodes."""
 
@@ -1140,6 +1169,11 @@ def save_training_checkpoint(
         Mapping,
     ):
         raise TypeError("execution_provenance must be a mapping or None")
+    if checkpoint_role not in _CHECKPOINT_ROLES:
+        raise ValueError(
+            "checkpoint_role must be one of "
+            f"{sorted(_CHECKPOINT_ROLES)!r}"
+        )
     provenance = build_checkpoint_provenance(
         parent_checkpoint=parent_checkpoint,
         experiment_run_id=run_id,
@@ -1226,6 +1260,7 @@ def save_training_checkpoint(
         metadata = {
             "format": _CHECKPOINT_FORMAT,
             "checkpoint_id": publisher.checkpoint_id,
+            "checkpoint_role": checkpoint_role,
             "contract": contract_metadata(),
             "provenance": provenance,
             "training_state": asdict(state),
@@ -1361,6 +1396,7 @@ def load_training_checkpoint(
         raise ValueError("checkpoint rollout queue metadata differs from payload")
 
     stochastic = _validate_stochastic_state(stochastic)
+    resources.learner.validate_dynamics_state_dict(stochastic["learner_dynamics"])
     if config.transaction_learning.enabled:
         transaction_replay_payload = _validated_transaction_replay_payload(
             transaction_replay_payload,

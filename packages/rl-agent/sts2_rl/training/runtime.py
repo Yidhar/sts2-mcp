@@ -144,6 +144,24 @@ def exploration_epsilon(config: TrainingConfig, environment_steps: int) -> float
     return float(curriculum.epsilon_start + progress * (curriculum.epsilon_end - curriculum.epsilon_start))
 
 
+def liveness_schedule_learner_update(
+    config: TrainingConfig,
+    state: TrainingState,
+    schedule_state: TrainingScheduleState,
+) -> int:
+    """Return the versioned liveness-head clock for this lineage.
+
+    A model-init may inherit mature entropy/epsilon clocks while deliberately
+    recalibrating newly changed liveness heads from update zero. Exact resumes
+    preserve ``state.learner_updates`` and therefore remain exact in either
+    mode.
+    """
+
+    if config.runtime.model_initialization_liveness_schedule_mode == "reset":
+        return state.learner_updates
+    return schedule_state.effective_learner_updates(state)
+
+
 class JsonlMetrics:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -240,6 +258,19 @@ def summarize_evaluation(
             "act1_boundary_count": 0,
             "act1_boundary_mean_revivals": 0.0,
             "act1_boundary_mean_hp_lost": 0.0,
+            "selection_transactions_started": 0,
+            "selection_transactions_completed": 0,
+            "selection_transaction_completion_rate": 0.0,
+            "rest_site_or_forge_transactions_started": 0,
+            "rest_site_or_forge_transactions_completed": 0,
+            "rest_site_or_forge_transaction_completion_rate": 0.0,
+            "forge_transactions_started": 0,
+            "forge_transactions_completed": 0,
+            "forge_transaction_completion_rate": 0.0,
+            "mean_policy_top1_top2_logit_margin": 0.0,
+            "maximum_policy_top1_top2_logit_margin": 0.0,
+            "mean_shaping_reward_per_max_floor": 0.0,
+            "boss_first_kill_rate_by_act": {"1": 0.0, "2": 0.0, "3": 0.0},
         }
     count = len(episodes)
     successful_runs = [item for item in episodes if item.run_won]
@@ -248,6 +279,24 @@ def summarize_evaluation(
         for item in episodes
         if item.act_revival_counts and item.act_hp_loss_counts
     ]
+    selection_transactions_started = sum(
+        item.selection_transactions_started for item in episodes
+    )
+    selection_transactions_completed = sum(
+        item.selection_transactions_completed for item in episodes
+    )
+    rest_site_transactions_started = sum(
+        item.rest_site_selection_transactions_started for item in episodes
+    )
+    rest_site_transactions_completed = sum(
+        item.rest_site_selection_transactions_completed for item in episodes
+    )
+    forge_transactions_started = sum(
+        item.forge_selection_transactions_started for item in episodes
+    )
+    forge_transactions_completed = sum(
+        item.forge_selection_transactions_completed for item in episodes
+    )
     return {
         "evaluation_objective": evaluation_objective,
         "combat_win_rate_applicable": combat_win_rate_applicable,
@@ -317,6 +366,40 @@ def summarize_evaluation(
         "act1_boundary_mean_hp_lost": (
             statistics.fmean(item[1] for item in act1_boundaries) if act1_boundaries else 0.0
         ),
+        "selection_transactions_started": selection_transactions_started,
+        "selection_transactions_completed": selection_transactions_completed,
+        "selection_transaction_completion_rate": (
+            selection_transactions_completed / selection_transactions_started
+            if selection_transactions_started
+            else 0.0
+        ),
+        "rest_site_or_forge_transactions_started": rest_site_transactions_started,
+        "rest_site_or_forge_transactions_completed": rest_site_transactions_completed,
+        "rest_site_or_forge_transaction_completion_rate": (
+            rest_site_transactions_completed / rest_site_transactions_started
+            if rest_site_transactions_started
+            else 0.0
+        ),
+        "forge_transactions_started": forge_transactions_started,
+        "forge_transactions_completed": forge_transactions_completed,
+        "forge_transaction_completion_rate": (
+            forge_transactions_completed / forge_transactions_started
+            if forge_transactions_started
+            else 0.0
+        ),
+        "mean_policy_top1_top2_logit_margin": statistics.fmean(
+            item.policy_top1_top2_logit_margin_mean for item in episodes
+        ),
+        "maximum_policy_top1_top2_logit_margin": max(
+            item.policy_top1_top2_logit_margin_max for item in episodes
+        ),
+        "mean_shaping_reward_per_max_floor": statistics.fmean(
+            item.shaping_reward_per_max_floor for item in episodes
+        ),
+        "boss_first_kill_rate_by_act": {
+            str(act): sum(act in item.boss_victory_acts for item in episodes) / count
+            for act in (1, 2, 3)
+        },
     }
 
 
@@ -625,6 +708,62 @@ def _checkpoint_path(root: Path, state: TrainingState, *, prefix: str) -> Path:
     return root / f"{prefix}-step-{state.environment_steps:09d}"
 
 
+def _checkpoint_role_for_prefix(prefix: str) -> str:
+    if prefix in {
+        "healthy-gate-zero",
+        "healthy-validation",
+        "guard-rollback-restored",
+    }:
+        return "healthy_evaluation_anchor"
+    if prefix in {"guard-alert", "guard-stop", "guard-stop-gate-zero"}:
+        return "guard_failure_evidence"
+    if prefix == "deadlock-streak-alert":
+        return "deadlock_alert_evidence"
+    return "ordinary"
+
+
+def _is_healthy_rollback_checkpoint(
+    path: Path | None,
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether signed checkpoint metadata proves a passed guard.
+
+    A periodic checkpoint may contain a persisted list of *earlier* completed
+    evaluations while holding a later, regressed policy.  It is therefore not a
+    valid rollback anchor merely because the evaluation schedule is non-empty.
+    ``checkpoint_role`` is inside the atomically hashed metadata, so moving or
+    renaming a directory cannot promote an ordinary checkpoint into an anchor.
+    """
+
+    return bool(
+        path is not None
+        and isinstance(metadata, Mapping)
+        and metadata.get("checkpoint_role") == "healthy_evaluation_anchor"
+    )
+
+
+def _deadlock_streak_transition(
+    current: int,
+    *,
+    deadlocked: bool,
+    alert_threshold: int,
+) -> tuple[int, bool]:
+    """Advance the persisted training-deadlock streak fail-closed."""
+
+    if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+        raise ValueError("current deadlock streak must be a non-negative integer")
+    if (
+        isinstance(alert_threshold, bool)
+        or not isinstance(alert_threshold, int)
+        or alert_threshold < 0
+    ):
+        raise ValueError("deadlock alert threshold must be a non-negative integer")
+    next_streak = current + 1 if deadlocked else 0
+    return next_streak, bool(
+        alert_threshold > 0 and next_streak == alert_threshold
+    )
+
+
 def _checkpoint_reference(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
@@ -681,6 +820,11 @@ def _evaluation_context(
             "environment_steps": schedule_state.effective_environment_steps(state),
             "learner_updates": schedule_state.effective_learner_updates(state),
             "policy_version": schedule_state.effective_policy_version(state),
+            "liveness_learner_updates": liveness_schedule_learner_update(
+                config,
+                state,
+                schedule_state,
+            ),
         },
         "policy_model_state_sha256": _model_state_sha256(resources.collector_model),
         "checkpoint_association": {
@@ -727,11 +871,14 @@ def _save(
         actor_supervisor_state=actor_supervisor_state,
         evaluation_state=evaluation_state,
         execution_provenance=runtime_provenance,
+        checkpoint_role=_checkpoint_role_for_prefix(prefix),
         parent_relation=(
             "model_parameter_initialization"
             if parent_checkpoint is not None and load_mode == "model_initialization"
             else "in_process_successor"
             if parent_checkpoint is not None and load_mode == "in_process_successor"
+            else "in_process_rollback"
+            if parent_checkpoint is not None and load_mode == "in_process_rollback"
             else "loaded_parent"
             if parent_checkpoint is not None
             else None
@@ -861,6 +1008,11 @@ def run_training(
                     "environment_steps": schedule_state.effective_environment_steps(state),
                     "learner_updates": schedule_state.effective_learner_updates(state),
                     "policy_version": schedule_state.effective_policy_version(state),
+                    "liveness_learner_updates": liveness_schedule_learner_update(
+                        config,
+                        state,
+                        schedule_state,
+                    ),
                 },
                 "actor_supervisor_state": actor_supervisor_state.to_mapping(),
                 "config": config.to_mapping(),
@@ -882,6 +1034,9 @@ def run_training(
                     "schedule_inherited": (
                         load_mode == "model_initialization"
                         and config.runtime.model_initialization_schedule_mode == "inherit"
+                    ),
+                    "liveness_schedule_mode": (
+                        config.runtime.model_initialization_liveness_schedule_mode
                     ),
                 },
             },
@@ -939,6 +1094,7 @@ def run_training(
             completed_early_evaluations = set()
             completed_final_audits = set()
         evaluation_guard_stop: dict[str, Any] | None = None
+        last_healthy_checkpoint: Path | None = None
 
         def current_evaluation_state() -> EvaluationGateState:
             return EvaluationGateState(
@@ -1034,12 +1190,14 @@ def run_training(
                 return stop
             return None
 
+        gate_zero_ran = False
         if (
             0 in config.runtime.evaluation_steps
+            and 0 not in completed_evaluations
             and state.environment_steps == 0
             and config.runtime.evaluation_episodes > 0
         ):
-            run_one_evaluation(
+            evaluation_guard_stop = run_one_evaluation(
                 evaluation_step=0,
                 episodes=config.runtime.evaluation_episodes,
                 data_partition="validation",
@@ -1047,6 +1205,7 @@ def run_training(
                 journal_name="evaluation-step-000000000.jsonl",
             )
             completed_evaluations.add(0)
+            gate_zero_ran = True
 
         def has_due_final_audit(*, observed_environment_steps: int | None = None) -> bool:
             effective_steps = (
@@ -1089,10 +1248,11 @@ def run_training(
         def run_due_evaluations(
             *,
             include_final_audits: bool = False,
-        ) -> dict[str, Any] | None:
+        ) -> tuple[dict[str, Any] | None, bool]:
             """Run crossed gates in gate order and stop after first guard failure."""
 
             pending: list[tuple[int, str, str, int, set[int], str]] = []
+            guarded_evaluation_ran = False
             for step in config.runtime.evaluation_steps:
                 if step <= state.environment_steps and step not in completed_evaluations:
                     pending.append(
@@ -1149,20 +1309,89 @@ def run_training(
                     if episodes > 0
                     else None
                 )
+                guarded_evaluation_ran = guarded_evaluation_ran or (
+                    episodes > 0 and kind in {"validation", "early_validation"}
+                )
                 completed.add(step)
                 if stop is not None:
-                    return stop
-            return None
+                    return stop, guarded_evaluation_ran
+            return None, guarded_evaluation_ran
+
+        if gate_zero_ran:
+            gate_zero_prefix = (
+                "guard-stop-gate-zero"
+                if evaluation_guard_stop is not None
+                else "healthy-gate-zero"
+            )
+            gate_zero_checkpoint = _save(
+                resources,
+                config=config,
+                state=state,
+                schedule_state=schedule_state,
+                checkpoint_root=checkpoint_root / f"run-{run_id}",
+                prefix=gate_zero_prefix,
+                parent_checkpoint=parent_checkpoint,
+                run_id=run_id,
+                load_mode=load_mode,
+                actor_supervisor_state=actor_supervisor_state,
+                evaluation_state=current_evaluation_state(),
+                runtime_provenance=structured_runtime_provenance,
+            )
+            parent_checkpoint = gate_zero_checkpoint
+            load_mode = "in_process_successor"
+            if evaluation_guard_stop is None:
+                last_healthy_checkpoint = gate_zero_checkpoint
+                metrics.write(
+                    "evaluation_guard_healthy_checkpoint",
+                    {
+                        "evaluation_gate": 0,
+                        "checkpoint": str(gate_zero_checkpoint),
+                        "state": asdict(state),
+                    },
+                )
+            else:
+                metrics.write(
+                    "evaluation_guard_stopped",
+                    {
+                        **evaluation_guard_stop,
+                        "checkpoint": str(gate_zero_checkpoint),
+                        "state": asdict(state),
+                        "rollback_available": False,
+                    },
+                )
+                metrics.write(
+                    "run_complete",
+                    {
+                        "checkpoint": str(gate_zero_checkpoint),
+                        "completion_status": "evaluation_guard_stopped",
+                        "evaluation_guard_stop": evaluation_guard_stop,
+                        **asdict(state),
+                    },
+                )
+                return state
+        elif prevalidated_resume is not None and _is_healthy_rollback_checkpoint(
+            parent_checkpoint,
+            prevalidated_resume.metadata,
+        ):
+            # A named healthy checkpoint certifies the policy at that exact
+            # boundary.  An arbitrary later periodic checkpoint may merely
+            # remember an older completed gate and must not become an anchor.
+            last_healthy_checkpoint = parent_checkpoint
 
         schedule_environment_steps_offset = schedule_state.environment_steps_offset
+
+        def pipeline_epsilon(steps: int) -> float:
+            return exploration_epsilon(
+                config,
+                schedule_environment_steps_offset + steps,
+            )
+
         pipeline = ActorLearnerPipeline(
             resources,
             total_environment_steps=config.runtime.total_environment_steps,
             starting_environment_steps=state.environment_steps,
             starting_policy_version=state.actor_policy_version,
-            epsilon=lambda steps, _offset=schedule_environment_steps_offset: exploration_epsilon(
-                config, _offset + steps
-            ),
+            epsilon=pipeline_epsilon,
             starting_episode_count=state.episodes,
             deterministic_probe_interval_episodes=(config.rollout.deterministic_probe_interval_episodes),
             deterministic_probe_environment_steps=(config.rollout.deterministic_probe_environment_steps),
@@ -1173,6 +1402,7 @@ def run_training(
         ) * config.runtime.checkpoint_interval_steps
         unrolls_since_publication = 0
         maintenance_requested = False
+        deadlock_alert_pending: dict[str, Any] | None = None
         outcome_pair_matcher = (
             OutcomePairMatcher(
                 maximum_pairs_per_publication=(config.failure_credit.maximum_matched_pairs_per_publication),
@@ -1371,6 +1601,11 @@ def run_training(
             commit_streamed_failure_evidence()
             update_number = state.learner_updates + 1
             policy_version_before_update = state.policy_version
+            liveness_learner_update = liveness_schedule_learner_update(
+                config,
+                state,
+                schedule_state,
+            )
             batch_environment_steps = sum(len(unroll.steps) for unroll in batch)
             transaction_traces = (
                 resources.transaction_replay.sample(config.transaction_learning.sample_traces)
@@ -1382,12 +1617,12 @@ def run_training(
                     config.failure_credit.sample_records,
                     quotas=_failure_credit_quotas(
                         config,
-                        learner_updates=schedule_state.effective_learner_updates(state),
+                        learner_updates=liveness_learner_update,
                     ),
                     current_policy_version=policy_version_before_update,
                     policy_gradient_max_lag=(config.failure_credit.policy_gradient_max_lag),
                     risk_actor_enabled=(
-                        schedule_state.effective_learner_updates(state)
+                        liveness_learner_update
                         >= config.failure_credit.liveness_risk_actor_start_update
                     ),
                 )
@@ -1445,11 +1680,14 @@ def run_training(
                     "policy_version_before_update": policy_version_before_update,
                     "learner_updates_before_update": state.learner_updates,
                     "liveness_head_calibration_active": int(
-                        state.learner_updates < config.failure_credit.liveness_head_calibration_updates
+                        liveness_learner_update
+                        < config.failure_credit.liveness_head_calibration_updates
                     ),
                     "liveness_risk_actor_enabled": int(
-                        state.learner_updates >= config.failure_credit.liveness_risk_actor_start_update
+                        liveness_learner_update
+                        >= config.failure_credit.liveness_risk_actor_start_update
                     ),
+                    "liveness_schedule_learner_update": liveness_learner_update,
                     "unrolls": len(batch),
                     "batch_environment_steps": batch_environment_steps,
                     "transaction_traces": len(transaction_traces),
@@ -1491,7 +1729,7 @@ def run_training(
                 current_policy_version=policy_version_before_update,
                 current_learner_update=state.learner_updates,
                 schedule_policy_version=schedule_state.effective_policy_version(state),
-                schedule_learner_update=schedule_state.effective_learner_updates(state),
+                schedule_learner_update=liveness_learner_update,
                 transaction_traces=transaction_traces,
                 credit_plans=credit_plans,
                 episodic_sequences=episodic_sequences,
@@ -1671,6 +1909,16 @@ def run_training(
                             "episodic learning is enabled but the collector emitted no completed episode"
                         )
                     episodic_episode_stored = resources.episodic_replay.put(episode.completed_episode)
+                (
+                    next_deadlock_streak,
+                    deadlock_alert_triggered,
+                ) = _deadlock_streak_transition(
+                    state.training_deadlock_streak,
+                    deadlocked=episode.metrics.deadlocked,
+                    alert_threshold=(
+                        config.runtime.training_deadlock_streak_alert_episodes
+                    ),
+                )
                 state = replace(
                     state,
                     environment_steps=state.environment_steps + episode.metrics.steps,
@@ -1680,7 +1928,23 @@ def run_training(
                         state.maximum_observed_candidates,
                         episode.metrics.maximum_observed_candidates,
                     ),
+                    training_deadlock_streak=next_deadlock_streak,
+                    training_deadlock_alerts=(
+                        state.training_deadlock_alerts
+                        + int(deadlock_alert_triggered)
+                    ),
                 )
+                if deadlock_alert_triggered:
+                    deadlock_alert_pending = {
+                        "episode_id": episode.metrics.episode_id,
+                        "reset_seed": episode.metrics.reset_seed,
+                        "environment_steps": state.environment_steps,
+                        "policy_version": state.policy_version,
+                        "training_deadlock_streak": next_deadlock_streak,
+                        "configured_threshold": (
+                            config.runtime.training_deadlock_streak_alert_episodes
+                        ),
+                    }
                 metrics.write(
                     "train_episode",
                     {
@@ -1758,7 +2022,7 @@ def run_training(
                     observed_environment_steps=pipeline.environment_steps,
                 )
                 crossed_checkpoint = pipeline.environment_steps >= next_checkpoint
-                if crossed_evaluation or crossed_checkpoint:
+                if crossed_evaluation or crossed_checkpoint or deadlock_alert_pending is not None:
                     maintenance_requested = True
                     if pipeline.alive:
                         pipeline.request_pause()
@@ -1823,15 +2087,14 @@ def run_training(
                 resources.publish_collector_policy()
                 pipeline.set_paused_policy_version(state.policy_version)
                 state = replace(state, actor_policy_version=state.policy_version)
-                evaluation_guard_stop = run_due_evaluations()
-                if evaluation_guard_stop is not None:
-                    checkpoint = _save(
+                if deadlock_alert_pending is not None:
+                    alert_checkpoint = _save(
                         resources,
                         config=config,
                         state=state,
                         schedule_state=schedule_state,
                         checkpoint_root=checkpoint_root / f"run-{run_id}",
-                        prefix="guard-stop",
+                        prefix="deadlock-streak-alert",
                         parent_checkpoint=parent_checkpoint,
                         run_id=run_id,
                         load_mode=load_mode,
@@ -1839,20 +2102,186 @@ def run_training(
                         evaluation_state=current_evaluation_state(),
                         runtime_provenance=runtime_provenance,
                     )
-                    parent_checkpoint = checkpoint
+                    parent_checkpoint = alert_checkpoint
+                    load_mode = "in_process_successor"
+                    metrics.write(
+                        "training_deadlock_streak_alert",
+                        {
+                            **deadlock_alert_pending,
+                            "checkpoint": str(alert_checkpoint),
+                            "state": asdict(state),
+                        },
+                    )
+                    deadlock_alert_pending = None
+
+                evaluation_guard_stop, guarded_evaluation_ran = run_due_evaluations()
+                if evaluation_guard_stop is not None:
+                    guard_alert_checkpoint = _save(
+                        resources,
+                        config=config,
+                        state=state,
+                        schedule_state=schedule_state,
+                        checkpoint_root=checkpoint_root / f"run-{run_id}",
+                        prefix="guard-alert",
+                        parent_checkpoint=parent_checkpoint,
+                        run_id=run_id,
+                        load_mode=load_mode,
+                        actor_supervisor_state=pipeline.supervisor_state,
+                        evaluation_state=current_evaluation_state(),
+                        runtime_provenance=runtime_provenance,
+                    )
+                    rollback_available = bool(
+                        config.runtime.evaluation_guard_failure_action
+                        == "rollback_continue"
+                        and last_healthy_checkpoint is not None
+                        and state.evaluation_guard_rollbacks
+                        < config.runtime.evaluation_guard_max_rollbacks
+                    )
+                    metrics.write(
+                        "evaluation_guard_alert",
+                        {
+                            **evaluation_guard_stop,
+                            "checkpoint": str(guard_alert_checkpoint),
+                            "state": asdict(state),
+                            "rollback_available": rollback_available,
+                            "last_healthy_checkpoint": (
+                                str(last_healthy_checkpoint)
+                                if last_healthy_checkpoint is not None
+                                else None
+                            ),
+                        },
+                    )
+                    if rollback_available:
+                        if last_healthy_checkpoint is None:  # pragma: no cover - guarded above
+                            raise RuntimeError("evaluation rollback lost its healthy checkpoint")
+                        rollback_number = state.evaluation_guard_rollbacks + 1
+                        retained_deadlock_alerts = state.training_deadlock_alerts
+                        validated_healthy = preflight_training_checkpoint(
+                            last_healthy_checkpoint,
+                            config=config,
+                            resolved_device=resolved_device,
+                            resolved_collector_device=resolved_actor_device,
+                        )
+                        restored_state = load_training_checkpoint(
+                            validated_healthy.root,
+                            config=config,
+                            resources=resources,
+                        )
+                        restored_schedule_state = training_schedule_state_from_metadata(
+                            validated_healthy.metadata
+                        )
+                        restored_supervisor_state = actor_supervisor_state_from_metadata(
+                            validated_healthy.metadata
+                        )
+                        restored_evaluation_state = evaluation_gate_state_from_metadata(
+                            validated_healthy.metadata
+                        )
+                        if restored_evaluation_state is None:
+                            raise RuntimeError(
+                                "healthy rollback checkpoint has no evaluation gate state"
+                            )
+                        state = replace(
+                            restored_state,
+                            evaluation_guard_rollbacks=rollback_number,
+                            training_deadlock_alerts=max(
+                                restored_state.training_deadlock_alerts,
+                                retained_deadlock_alerts,
+                            ),
+                        )
+                        schedule_state = restored_schedule_state
+                        completed_evaluations = set(
+                            restored_evaluation_state.completed_validation_steps
+                        )
+                        completed_early_evaluations = set(
+                            restored_evaluation_state.completed_early_validation_steps
+                        )
+                        completed_final_audits = set(
+                            restored_evaluation_state.completed_final_audit_steps
+                        )
+                        pipeline.restore_paused_checkpoint_state(
+                            state,
+                            supervisor_state=restored_supervisor_state,
+                        )
+                        rollback_checkpoint = _save(
+                            resources,
+                            config=config,
+                            state=state,
+                            schedule_state=schedule_state,
+                            checkpoint_root=checkpoint_root / f"run-{run_id}",
+                            prefix="guard-rollback-restored",
+                            parent_checkpoint=validated_healthy.root,
+                            run_id=run_id,
+                            load_mode="in_process_rollback",
+                            actor_supervisor_state=restored_supervisor_state,
+                            evaluation_state=current_evaluation_state(),
+                            runtime_provenance=runtime_provenance,
+                        )
+                        parent_checkpoint = rollback_checkpoint
+                        load_mode = "in_process_successor"
+                        evaluation_guard_stop = None
+                        unrolls_since_publication = 0
+                        pending_batch = ()
+                        next_checkpoint = (
+                            (state.environment_steps // config.runtime.checkpoint_interval_steps)
+                            + 1
+                        ) * config.runtime.checkpoint_interval_steps
+                        metrics.write(
+                            "evaluation_guard_rollback",
+                            {
+                                "rollback_number": rollback_number,
+                                "failed_checkpoint": str(guard_alert_checkpoint),
+                                "healthy_checkpoint": str(validated_healthy.root),
+                                "restored_checkpoint": str(rollback_checkpoint),
+                                "state": asdict(state),
+                                "training_schedule_state": schedule_state.to_mapping(),
+                                "evaluation_state": current_evaluation_state().to_mapping(),
+                            },
+                        )
+                        maintenance_requested = False
+                        pipeline.resume()
+                        continue
+
+                    parent_checkpoint = guard_alert_checkpoint
                     load_mode = "in_process_successor"
                     metrics.write(
                         "evaluation_guard_stopped",
                         {
                             **evaluation_guard_stop,
-                            "checkpoint": str(checkpoint),
+                            "checkpoint": str(guard_alert_checkpoint),
                             "state": asdict(state),
+                            "rollback_available": False,
                         },
                     )
                     maintenance_requested = False
                     pipeline.stop()
                     pending_batch = ()
                     break
+                if guarded_evaluation_ran:
+                    healthy_checkpoint = _save(
+                        resources,
+                        config=config,
+                        state=state,
+                        schedule_state=schedule_state,
+                        checkpoint_root=checkpoint_root / f"run-{run_id}",
+                        prefix="healthy-validation",
+                        parent_checkpoint=parent_checkpoint,
+                        run_id=run_id,
+                        load_mode=load_mode,
+                        actor_supervisor_state=pipeline.supervisor_state,
+                        evaluation_state=current_evaluation_state(),
+                        runtime_provenance=runtime_provenance,
+                    )
+                    parent_checkpoint = healthy_checkpoint
+                    last_healthy_checkpoint = healthy_checkpoint
+                    load_mode = "in_process_successor"
+                    metrics.write(
+                        "evaluation_guard_healthy_checkpoint",
+                        {
+                            "checkpoint": str(healthy_checkpoint),
+                            "state": asdict(state),
+                            "evaluation_state": current_evaluation_state().to_mapping(),
+                        },
+                    )
                 if state.environment_steps >= next_checkpoint:
                     checkpoint = _save(
                         resources,
@@ -1904,6 +2333,16 @@ def run_training(
                         "episodic learning is enabled but the collector emitted no completed episode during drain"
                     )
                 resources.episodic_replay.put(episode.completed_episode)
+            (
+                next_deadlock_streak,
+                deadlock_alert_triggered,
+            ) = _deadlock_streak_transition(
+                state.training_deadlock_streak,
+                deadlocked=episode.metrics.deadlocked,
+                alert_threshold=(
+                    config.runtime.training_deadlock_streak_alert_episodes
+                ),
+            )
             state = replace(
                 state,
                 environment_steps=state.environment_steps + episode.metrics.steps,
@@ -1912,7 +2351,27 @@ def run_training(
                     state.maximum_observed_candidates,
                     episode.metrics.maximum_observed_candidates,
                 ),
+                training_deadlock_streak=next_deadlock_streak,
+                training_deadlock_alerts=(
+                    state.training_deadlock_alerts + int(deadlock_alert_triggered)
+                ),
             )
+            if deadlock_alert_triggered:
+                metrics.write(
+                    "training_deadlock_streak_alert",
+                    {
+                        "episode_id": episode.metrics.episode_id,
+                        "reset_seed": episode.metrics.reset_seed,
+                        "environment_steps": state.environment_steps,
+                        "policy_version": state.policy_version,
+                        "training_deadlock_streak": next_deadlock_streak,
+                        "configured_threshold": (
+                            config.runtime.training_deadlock_streak_alert_episodes
+                        ),
+                        "checkpoint": "final_checkpoint_pending",
+                        "state": asdict(state),
+                    },
+                )
             pipeline.release_episode_boundary()
         # Final audits describe the policy persisted below, not an intermediate
         # policy at the collection horizon.  The actor is joined and every
@@ -1920,7 +2379,9 @@ def run_training(
         resources.publish_collector_policy()
         state = replace(state, actor_policy_version=state.policy_version)
         if evaluation_guard_stop is None:
-            evaluation_guard_stop = run_due_evaluations(include_final_audits=True)
+            evaluation_guard_stop, _ = run_due_evaluations(
+                include_final_audits=True
+            )
         final_checkpoint = _save(
             resources,
             config=config,

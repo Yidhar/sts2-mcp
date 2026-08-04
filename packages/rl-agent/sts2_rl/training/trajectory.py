@@ -180,6 +180,37 @@ def _compact_kind(value: Any) -> str:
     return f"{prefix}#sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _parameterized_action_surface_kind(action: Mapping[str, Any]) -> str | None:
+    """Keep nested action subtypes visible without expanding ordinary logs.
+
+    A top-level action enum is not always the complete executable surface.
+    Merchant card removal, for example, is intentionally represented as a
+    normal ``shop_purchase`` whose item category is ``card_removal``.  Counting
+    only model/action kinds would silently report that service as absent even
+    when it was legal.  Ordinary actions already have ``legal_action_kinds``;
+    return a value only for a nested subtype so combat-heavy journals do not
+    pay for a second redundant action histogram on every decision.
+    """
+
+    raw_kind = _compact_kind(
+        action.get(
+            "action",
+            action.get("kind", action.get("model_action_kind", "unknown")),
+        )
+    )
+    if raw_kind != "shop_purchase":
+        return None
+
+    item_value = action.get("item")
+    if not isinstance(item_value, Mapping):
+        return f"{raw_kind}:unknown"
+    for key in ("category", "type", "item_type", "item_kind", "kind"):
+        subtype = str(item_value.get(key, "")).strip().lower()
+        if subtype:
+            return _compact_kind(f"{raw_kind}:{subtype}")
+    return f"{raw_kind}:unknown"
+
+
 def _bounded_compact_projection(
     value: Any,
     *,
@@ -822,6 +853,14 @@ class TrajectoryJournal:
             for action in legal_actions
             if isinstance(action, Mapping)
         )
+        action_surface_semantics = Counter(
+            semantic_kind
+            for action in legal_actions
+            if isinstance(action, Mapping)
+            if (
+                semantic_kind := _parameterized_action_surface_kind(action)
+            ) is not None
+        )
         policy_topk: list[dict[str, Any]] = []
         raw_topk = event.get("policy_topk")
         if isinstance(raw_topk, list | tuple):
@@ -884,6 +923,13 @@ class TrajectoryJournal:
             "selected_action_fingerprint": (semantic_action_fingerprint(selected_action) if selected_action else None),
             "policy_topk": policy_topk,
         }
+        if action_surface_semantics:
+            # This complements (rather than replaces) the stable model-kind
+            # counts above.  Emit only nested subtypes so ordinary combat
+            # decisions do not grow a redundant per-step mapping.
+            summary["legal_action_semantics"] = dict(
+                sorted(action_surface_semantics.items())
+            )
         for key in (
             "selected_action_multiplicity",
             "selected_action_equivalence_fingerprint",
@@ -892,6 +938,9 @@ class TrajectoryJournal:
                 summary[key] = _compact_scalar(event.get(key))
         for key in (
             "value",
+            "behavior_log_probability",
+            "effective_collection_epsilon",
+            "targeted_selection_exploration",
             "reward",
             "terminal_reward",
             "potential_reward",

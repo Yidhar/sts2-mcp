@@ -780,6 +780,19 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert "评估门禁提前停止" in html
     assert "采集目标未完成" in html
     assert "const latest = evaluations[evaluations.length - 1]" in html
+    assert "Held-out 对局下钻" in html
+    assert "拿牌记录" in html
+    assert "最终构筑" in html
+    assert 'id="heldout-map-visual"' in html
+    assert 'id="heldout-floor-visual"' in html
+    assert 'id="heldout-final-deck"' in html
+    assert "将由 seed 与已记录动作在后台复现完整地图" in html
+    assert "匹配 simulator 中精确复现完整地图" in html
+    assert "历史日志未记录完整拓扑时" not in html
+    assert 'const API_HELDOUT_JOURNALS = "/api/v1/heldout-journals"' in html
+    assert 'const API_HELDOUT_EPISODE = "/api/v1/heldout-episode"' in html
+    assert 'const API_HELDOUT_REPLAY_MAP = "/api/v1/heldout-replay-map"' in html
+    assert "innerHTML" not in html
 
 
 def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:
@@ -1094,3 +1107,115 @@ def test_http_dashboard_routes_are_read_only_loopback_scoped_and_hardened(tmp_pa
         )
         assert missing_status == 404
         assert json.loads(missing_body)["error"] == "Not Found"
+
+
+def test_http_heldout_drilldown_is_lazy_key_scoped_and_read_only(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 101.0,
+            "gate_kind": "validation",
+            "evaluation_gate": 75_000,
+            "environment_steps": 75_000,
+            "episodes": 1,
+        },
+    )
+    episode_id = "heldout-seed-7-attempt-1:episode"
+    journal_name = "evaluation-step-000075000.jsonl"
+    _append_jsonl(
+        run_directory / journal_name,
+        {
+            "event": "evaluation_started",
+            "evaluation_gate": 75_000,
+            "gate_kind": "validation",
+            "policy_version": 19,
+            "evaluation_seeds": [7],
+        },
+        {
+            "event": "decision",
+            "episode_id": episode_id,
+            "step_index": 0,
+            "reset_seed": 7,
+            "player_hp_lost": 0,
+            "revivals_used": 0,
+            "outcome": "success",
+            "selected_candidate_index": 0,
+            "selected_action": {"action": "choose_event_option", "index": 0},
+            "policy_topk": [],
+            "observation_summary": {
+                "screen": "EVENT",
+                "run": {"act": 1, "floor": 1, "room_type": "event"},
+                "player": {"character": "IRONCLAD", "hp": 80, "max_hp": 80, "gold": 99},
+                "combat": {"in_progress": False},
+            },
+        },
+        {
+            "event": "evaluation_attempt_completed",
+            "episode_id": episode_id,
+            "evaluation_seed": 7,
+            "attempt": 1,
+            "steps": 1,
+        },
+    )
+    replay_calls: list[tuple[Path, str, object]] = []
+
+    class FakeReplayCache:
+        def load(self, path: Path, *, episode_id: str, detail: object) -> dict[str, object]:
+            replay_calls.append((path, episode_id, detail))
+            return {
+                "schema": "sts2-heldout-map-replay-v1",
+                "episode_id": episode_id,
+                "map_topologies": [{"act": 1, "nodes": []}],
+                "reproduction": {"mode": "seed_and_recorded_action_replay"},
+                "cache_hit": False,
+            }
+
+    store = DashboardStore(root)
+    store._map_replay_cache = FakeReplayCache()  # type: ignore[assignment]
+    server = DashboardHTTPServer(("127.0.0.1", 0), store, _dashboard_html())
+    run_key = f"lineage/run-{RUN_A}"
+    with _running_server(server):
+        list_path = "/api/v1/heldout-journals?" + urlencode({"run": run_key})
+        status, _, body = _request(server, "GET", list_path)
+        assert status == 200
+        journals = json.loads(body)["journals"]
+        assert [journal["key"] for journal in journals] == [journal_name]
+        assert journals[0]["complete"] is True
+
+        index_path = "/api/v1/heldout-episodes?" + urlencode({"run": run_key, "journal": journal_name})
+        status, _, body = _request(server, "GET", index_path)
+        assert status == 200
+        episodes = json.loads(body)["episodes"]
+        assert episodes[0]["episode_id"] == episode_id
+
+        detail_path = "/api/v1/heldout-episode?" + urlencode(
+            {"run": run_key, "journal": journal_name, "episode": episode_id}
+        )
+        status, _, body = _request(server, "GET", detail_path)
+        assert status == 200
+        assert json.loads(body)["episode"]["provenance"]["game_version"] is None
+
+        replay_path = "/api/v1/heldout-replay-map?" + urlencode(
+            {"run": run_key, "journal": journal_name, "episode": episode_id}
+        )
+        status, _, body = _request(server, "GET", replay_path)
+        assert status == 200
+        replay = json.loads(body)
+        assert replay["schema"] == "sts2-heldout-map-replay-v1"
+        assert replay["reproduction"]["mode"] == "seed_and_recorded_action_replay"
+        assert replay["run"]["run_id"] == RUN_A
+        assert replay_calls[0][0] == run_directory / journal_name
+        assert replay_calls[0][1] == episode_id
+
+        unsafe_path = "/api/v1/heldout-episodes?" + urlencode(
+            {"run": run_key, "journal": "../evaluation-step-000075000.jsonl"}
+        )
+        status, _, _ = _request(server, "GET", unsafe_path)
+        assert status == 404
+        status, _, _ = _request(server, "GET", detail_path + "&extra=1")
+        assert status == 400
+        status, _, _ = _request(server, "GET", replay_path + "&extra=1")
+        assert status == 400

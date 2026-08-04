@@ -45,6 +45,12 @@ from .transaction import (
     selection_delta_index,
 )
 
+_LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v1"
+_ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1 = 8
+_ONE_HOT_BREAKER_DURATION_UPDATES_V1 = 8
+_ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1 = 0.012
+_ONE_HOT_BREAKER_RATIO_TOLERANCE_V1 = 1.0e-6
+
 
 @dataclass(frozen=True, slots=True)
 class LearnerTimings:
@@ -67,6 +73,11 @@ class LearnerMetrics:
     value_loss: float
     entropy: float
     entropy_weight: float
+    entropy_breaker_active: int
+    entropy_breaker_one_hot_condition: int
+    entropy_breaker_consecutive_batches: int
+    entropy_breaker_remaining_updates: int
+    entropy_breaker_triggers: int
     advantage_mean: float
     value_target_mean: float
     importance_ratio_mean: float
@@ -115,6 +126,9 @@ class LearnerMetrics:
     liveness_centered_risk_max_abs: float
     liveness_policy_gradient_norm: float
     liveness_critic_gradient_norm: float
+    liveness_gradient_norm_before_clip: float
+    liveness_gradient_norm_after_clip: float
+    liveness_gradient_clip_scale: float
     liveness_head_calibration_active: int
     liveness_risk_actor_enabled: int
     liveness_replayed_contexts: int
@@ -135,6 +149,7 @@ class LearnerMetrics:
     episodic_policy_active_sequences: int
     episodic_failure_policy_suppressed_labels: int
     episodic_policy_lag_suppressed_labels: int
+    episodic_success_trust_region_suppressed_labels: int
     episodic_task_value_labels: int
     episodic_revival_value_labels: int
     episodic_efficiency_policy_labels: int
@@ -777,7 +792,11 @@ def liveness_credit_losses(
 
     legal_probabilities = torch.where(
         action_mask,
-        policy_log_probabilities.exp(),
+        # The cost actor must use the current policy only as a detached
+        # baseline distribution.  Its policy gradient is owned exclusively by
+        # ``selected_log_probabilities`` below; otherwise the expectation term
+        # leaks a second, critic-shaped gradient through every legal action.
+        policy_log_probabilities.exp().detach(),
         torch.zeros_like(policy_log_probabilities),
     )
     centered_risk = (
@@ -800,12 +819,16 @@ def liveness_credit_losses(
     for row in torch.nonzero(direct_eligible, as_tuple=False).flatten().tolist():
         alternatives = action_mask[row].clone()
         alternatives[int(selected_action_indices[row].item())] = False
-        direct_losses.append(
-            -torch.logsumexp(
-                policy_log_probabilities[row].masked_select(alternatives),
-                dim=0,
-            )
+        alternative_log_mass = torch.logsumexp(
+            policy_log_probabilities[row].masked_select(alternatives),
+            dim=0,
         )
+        # Raw -log(1-p_selected) has an unbounded derivative as the selected
+        # action approaches probability one.  Weighting by the detached
+        # factual alternative mass preserves the AVOID direction while making
+        # a single sparse witness incapable of hijacking an update.
+        alternative_mass = alternative_log_mass.detach().exp()
+        direct_losses.append(-alternative_mass * alternative_log_mass)
     direct_avoid_loss = torch.stack(direct_losses).mean() if direct_losses else zero
     completion_loss = (
         -selected_log_probabilities[completion_eligible].mean() if bool(completion_eligible.any().item()) else zero
@@ -952,6 +975,7 @@ class _EpisodicLossBatch:
     policy_active_sequences: int
     failure_policy_suppressed_labels: int
     policy_lag_suppressed_labels: int
+    success_trust_region_suppressed_labels: int
     task_value_labels: int
     revival_value_labels: int
     efficiency_policy_labels: int
@@ -1069,6 +1093,86 @@ def _parameter_gradient_delta_norm(
     return float(squared_norm.sqrt().item())
 
 
+def _clip_parameter_gradient_delta_(
+    parameters: tuple[Tensor, ...],
+    before: tuple[Tensor | None, ...],
+    *,
+    maximum_norm: float,
+) -> tuple[float, float, float]:
+    """Clip only the gradient added since ``before`` and preserve base work.
+
+    Failure-credit replay is an auxiliary, sparse objective.  Applying only the
+    final global clip lets one unusually sharp witness scale down the unrelated
+    FIFO V-trace gradient.  This helper gives the complete liveness family its
+    own budget while leaving the already accumulated base gradient unchanged.
+    Callers must remove this already-clipped delta before clipping the base
+    objective, then add it back.  That keeps the two budgets independent.
+    """
+
+    if len(parameters) != len(before):
+        raise ValueError("gradient snapshot differs from parameter group")
+    if not math.isfinite(maximum_norm) or maximum_norm <= 0.0:
+        raise ValueError("maximum gradient-delta norm must be positive and finite")
+    raw_norm = _parameter_gradient_delta_norm(parameters, before)
+    scale = min(1.0, maximum_norm / max(raw_norm, 1.0e-12))
+    if scale < 1.0:
+        with torch.no_grad():
+            for parameter, previous in zip(parameters, before, strict=True):
+                current = parameter.grad
+                if current is None:
+                    if previous is not None:  # pragma: no cover - autograd cannot remove a gradient
+                        raise RuntimeError("gradient disappeared after auxiliary backward")
+                    continue
+                if previous is None:
+                    current.mul_(scale)
+                    continue
+                base = previous.to(device=current.device, dtype=current.dtype)
+                current.copy_(base + (current - base) * scale)
+    applied_norm = _parameter_gradient_delta_norm(parameters, before)
+    return raw_norm, applied_norm, scale
+
+
+def _parameter_gradient_delta_snapshot(
+    parameters: tuple[Tensor, ...],
+    before: tuple[Tensor | None, ...],
+) -> tuple[Tensor | None, ...]:
+    if len(parameters) != len(before):
+        raise ValueError("gradient snapshot differs from parameter group")
+    deltas: list[Tensor | None] = []
+    for parameter, previous in zip(parameters, before, strict=True):
+        current = parameter.grad
+        if current is None:
+            deltas.append(None)
+            continue
+        delta = current.detach().clone()
+        if previous is not None:
+            delta.sub_(previous.to(device=delta.device, dtype=delta.dtype))
+        deltas.append(delta)
+    return tuple(deltas)
+
+
+def _apply_parameter_gradient_delta_(
+    parameters: tuple[Tensor, ...],
+    deltas: tuple[Tensor | None, ...],
+    *,
+    sign: float,
+) -> None:
+    if len(parameters) != len(deltas):
+        raise ValueError("gradient delta differs from parameter group")
+    if sign not in {-1.0, 1.0}:
+        raise ValueError("gradient delta sign must be -1 or +1")
+    with torch.no_grad():
+        for parameter, delta in zip(parameters, deltas, strict=True):
+            if delta is None:
+                continue
+            if parameter.grad is None:
+                if sign < 0.0:  # pragma: no cover - autograd cannot remove it
+                    raise RuntimeError("gradient disappeared before delta removal")
+                parameter.grad = delta.clone()
+            else:
+                parameter.grad.add_(delta, alpha=sign)
+
+
 class VTraceLearner:
     """Consume main-policy unrolls FIFO with an optional factual transaction sidecar."""
 
@@ -1100,10 +1204,98 @@ class VTraceLearner:
             raise ValueError("transaction learner config and model-head configuration differ")
         if self.failure_credit_config.learning_enabled != self.model.liveness_head_enabled:
             raise ValueError("liveness-credit config and model-head configuration differ")
+        self._one_hot_batch_streak = 0
+        self._entropy_breaker_remaining_updates = 0
+        self._entropy_breaker_triggers = 0
 
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
+
+    def dynamics_state_dict(self) -> dict[str, int | str]:
+        """Return non-parameter learner dynamics required for exact resume."""
+
+        return {
+            "version": _LEARNER_DYNAMICS_STATE_VERSION,
+            "one_hot_batch_streak": self._one_hot_batch_streak,
+            "entropy_breaker_remaining_updates": self._entropy_breaker_remaining_updates,
+            "entropy_breaker_triggers": self._entropy_breaker_triggers,
+        }
+
+    @staticmethod
+    def validate_dynamics_state_dict(payload: object) -> dict[str, int | str]:
+        if not isinstance(payload, dict):
+            raise TypeError("learner dynamics state must be an object")
+        expected = {
+            "version",
+            "one_hot_batch_streak",
+            "entropy_breaker_remaining_updates",
+            "entropy_breaker_triggers",
+        }
+        if set(payload) != expected:
+            raise ValueError("learner dynamics state keys mismatch")
+        if payload["version"] != _LEARNER_DYNAMICS_STATE_VERSION:
+            raise ValueError("unsupported learner dynamics state")
+        values: dict[str, int] = {}
+        for key in expected - {"version"}:
+            value = payload[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"learner dynamics {key} must be a non-negative integer")
+            values[key] = value
+        if values["one_hot_batch_streak"] >= _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1:
+            raise ValueError("learner one-hot streak must be below its trigger threshold")
+        if values["entropy_breaker_remaining_updates"] > _ONE_HOT_BREAKER_DURATION_UPDATES_V1:
+            raise ValueError("learner entropy-breaker duration exceeds the source contract")
+        return {
+            "version": _LEARNER_DYNAMICS_STATE_VERSION,
+            **values,
+        }
+
+    def load_dynamics_state_dict(self, payload: object) -> None:
+        validated = self.validate_dynamics_state_dict(payload)
+        self._one_hot_batch_streak = int(validated["one_hot_batch_streak"])
+        self._entropy_breaker_remaining_updates = int(
+            validated["entropy_breaker_remaining_updates"]
+        )
+        self._entropy_breaker_triggers = int(validated["entropy_breaker_triggers"])
+
+    def _entropy_weight_for_batch(
+        self,
+        *,
+        base_weight: float,
+        active_ratios: Tensor,
+        clipped: Tensor,
+    ) -> tuple[float, bool, bool]:
+        """Apply the source-versioned v33 one-hot circuit breaker."""
+
+        if self.config.entropy_breaker == "disabled":
+            self._one_hot_batch_streak = 0
+            self._entropy_breaker_remaining_updates = 0
+            return base_weight, False, False
+        if self.config.entropy_breaker != "one-hot-v1":  # pragma: no cover - config validates
+            raise RuntimeError("unsupported entropy breaker")
+        maximum_ratio = float(active_ratios.detach().max().item()) if active_ratios.numel() else 0.0
+        clip_fraction = float(clipped.detach().mean().item()) if clipped.numel() else 0.0
+        one_hot_condition = bool(
+            active_ratios.numel()
+            and math.isclose(
+                maximum_ratio,
+                1.0,
+                rel_tol=0.0,
+                abs_tol=_ONE_HOT_BREAKER_RATIO_TOLERANCE_V1,
+            )
+            and clip_fraction == 0.0
+        )
+        self._one_hot_batch_streak = self._one_hot_batch_streak + 1 if one_hot_condition else 0
+        if self._one_hot_batch_streak >= _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1:
+            self._one_hot_batch_streak = 0
+            self._entropy_breaker_remaining_updates = _ONE_HOT_BREAKER_DURATION_UPDATES_V1
+            self._entropy_breaker_triggers += 1
+        active = self._entropy_breaker_remaining_updates > 0
+        effective = max(base_weight, _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1) if active else base_weight
+        if active:
+            self._entropy_breaker_remaining_updates -= 1
+        return effective, active, one_hot_condition
 
     def credit_plan_liveness_losses(
         self,
@@ -1813,9 +2005,23 @@ class VTraceLearner:
             * valid_float
         ).sum() / value_denominator
         entropy = (entropies * policy_float).sum() / policy_denominator
-        entropy_weight = _annealed_entropy_weight(
+        # Policy-health/importance telemetry excludes singleton forced steps.
+        # Their ratio is mechanically one and would otherwise manufacture the
+        # exact pattern used by the one-hot breaker.
+        active_ratios = ratios[policy_decisions]
+        clipped = (active_ratios > self.config.vtrace_rho_clip).float()
+        scheduled_entropy_weight = _annealed_entropy_weight(
             self.config,
             policy_version=schedule_policy_version,
+        )
+        (
+            entropy_weight,
+            entropy_breaker_active,
+            entropy_breaker_one_hot_condition,
+        ) = self._entropy_weight_for_batch(
+            base_weight=scheduled_entropy_weight,
+            active_ratios=active_ratios,
+            clipped=clipped,
         )
         total_loss = (
             self.config.policy_weight * policy_loss + self.config.value_weight * value_loss - entropy_weight * entropy
@@ -1862,6 +2068,8 @@ class VTraceLearner:
         backward_started_ns = time.perf_counter_ns()
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        all_model_parameters = tuple(self.model.parameters())
+        gradients_before_liveness = _parameter_gradient_snapshot(all_model_parameters)
         policy_head_parameters = tuple(self.model.policy_head.parameters())
         liveness_head_parameters = (
             tuple(self.model.candidate_liveness_cost_head.parameters())
@@ -1958,6 +2166,19 @@ class VTraceLearner:
             + self.failure_credit_config.liveness_completion_policy_weight * liveness_losses.completion_loss
         )
         liveness_credit_loss = liveness_critic_objective + liveness_policy_objective
+        (
+            liveness_gradient_norm_before_clip,
+            liveness_gradient_norm_after_clip,
+            liveness_gradient_clip_scale,
+        ) = _clip_parameter_gradient_delta_(
+            all_model_parameters,
+            gradients_before_liveness,
+            maximum_norm=self.failure_credit_config.liveness_gradient_clip_norm,
+        )
+        liveness_gradient_delta = _parameter_gradient_delta_snapshot(
+            all_model_parameters,
+            gradients_before_liveness,
+        )
         liveness_policy_gradient_norm = _parameter_gradient_delta_norm(
             policy_head_parameters,
             policy_gradients_before_liveness,
@@ -2021,10 +2242,32 @@ class VTraceLearner:
             (name, parameter.grad) for name, parameter in self.model.named_parameters() if parameter.grad is not None
         )
         _require_finite("gradients", gradients)
+        # The primary/episodic objective and liveness auxiliary own independent
+        # norm budgets. Temporarily remove the already-clipped liveness delta,
+        # clip the remaining gradient, then restore that auxiliary delta. This
+        # prevents one plane from consuming the other's clipping allowance.
+        _apply_parameter_gradient_delta_(
+            all_model_parameters,
+            liveness_gradient_delta,
+            sign=-1.0,
+        )
         gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),
             self.config.gradient_clip_norm,
             error_if_nonfinite=True,
+        )
+        _apply_parameter_gradient_delta_(
+            all_model_parameters,
+            liveness_gradient_delta,
+            sign=1.0,
+        )
+        _require_finite(
+            "independently clipped gradients",
+            tuple(
+                (name, parameter.grad)
+                for name, parameter in self.model.named_parameters()
+                if parameter.grad is not None
+            ),
         )
         gradient_norm = float(gradient_norm_tensor.item())
         backward_ms = _elapsed_ms(backward_started_ns)
@@ -2044,10 +2287,8 @@ class VTraceLearner:
             total_ms=total_ms,
         )
 
-        active_ratios = ratios[valid]
         active_advantages = advantages[policy_decisions]
         active_targets = value_targets[valid]
-        clipped = (ratios[valid] > self.config.vtrace_rho_clip).float()
         timings = LearnerTimings(
             validation_ms=validation_ms,
             recurrent_forward_ms=recurrent_forward_ms,
@@ -2067,11 +2308,32 @@ class VTraceLearner:
             value_loss=float(value_loss.detach().item()),
             entropy=float(entropy.detach().item()),
             entropy_weight=entropy_weight,
+            entropy_breaker_active=int(entropy_breaker_active),
+            entropy_breaker_one_hot_condition=int(
+                entropy_breaker_one_hot_condition
+            ),
+            entropy_breaker_consecutive_batches=self._one_hot_batch_streak,
+            entropy_breaker_remaining_updates=(
+                self._entropy_breaker_remaining_updates
+            ),
+            entropy_breaker_triggers=self._entropy_breaker_triggers,
             advantage_mean=(float(active_advantages.detach().mean().item()) if active_advantages.numel() else 0.0),
             value_target_mean=float(active_targets.detach().mean().item()),
-            importance_ratio_mean=float(active_ratios.detach().mean().item()),
-            importance_ratio_max=float(active_ratios.detach().max().item()),
-            importance_clip_fraction=float(clipped.detach().mean().item()),
+            importance_ratio_mean=(
+                float(active_ratios.detach().mean().item())
+                if active_ratios.numel()
+                else 0.0
+            ),
+            importance_ratio_max=(
+                float(active_ratios.detach().max().item())
+                if active_ratios.numel()
+                else 0.0
+            ),
+            importance_clip_fraction=(
+                float(clipped.detach().mean().item())
+                if clipped.numel()
+                else 0.0
+            ),
             gradient_norm=gradient_norm,
             unrolls=len(unrolls),
             environment_steps=int(valid.sum().item()),
@@ -2117,6 +2379,13 @@ class VTraceLearner:
             liveness_centered_risk_max_abs=(liveness_losses.centered_risk_max_abs),
             liveness_policy_gradient_norm=liveness_policy_gradient_norm,
             liveness_critic_gradient_norm=liveness_critic_gradient_norm,
+            liveness_gradient_norm_before_clip=(
+                liveness_gradient_norm_before_clip
+            ),
+            liveness_gradient_norm_after_clip=(
+                liveness_gradient_norm_after_clip
+            ),
+            liveness_gradient_clip_scale=liveness_gradient_clip_scale,
             liveness_head_calibration_active=int(
                 schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
             ),
@@ -2141,6 +2410,9 @@ class VTraceLearner:
             episodic_policy_active_sequences=(episodic_losses.policy_active_sequences),
             episodic_failure_policy_suppressed_labels=(episodic_losses.failure_policy_suppressed_labels),
             episodic_policy_lag_suppressed_labels=(episodic_losses.policy_lag_suppressed_labels),
+            episodic_success_trust_region_suppressed_labels=(
+                episodic_losses.success_trust_region_suppressed_labels
+            ),
             episodic_task_value_labels=episodic_losses.task_value_labels,
             episodic_revival_value_labels=(episodic_losses.revival_value_labels),
             episodic_efficiency_policy_labels=(episodic_losses.efficiency_policy_labels),
@@ -2307,6 +2579,7 @@ class VTraceLearner:
                 policy_active_sequences=0,
                 failure_policy_suppressed_labels=0,
                 policy_lag_suppressed_labels=0,
+                success_trust_region_suppressed_labels=0,
                 task_value_labels=0,
                 revival_value_labels=0,
                 efficiency_policy_labels=0,
@@ -2364,6 +2637,7 @@ class VTraceLearner:
         efficiency_policy_labels = 0
         failure_policy_suppressed_labels = 0
         policy_lag_suppressed_labels = 0
+        success_trust_region_suppressed_labels = 0
 
         for time_index in range(maximum_time):
             active = [index for index, sequence in enumerate(sequences) if time_index < len(sequence.learn_steps)]
@@ -2448,7 +2722,6 @@ class VTraceLearner:
                     # horizons are classified above and never pollute this counter.
                     policy_lag_suppressed_labels += 1
                     continue
-                policy_active_sequence_indexes.add(active[row])
                 raw_ratio = torch.exp(
                     (selected_log_probability - float(decision.behavior_log_probability)).clamp(-20.0, 20.0)
                 )
@@ -2470,6 +2743,23 @@ class VTraceLearner:
                     )
                     - primary_prediction
                 )
+                if bool(
+                    (
+                        (primary_advantage.detach() > 0.0)
+                        & (
+                            detached_ratio
+                            > 1.0 + self.episodic_config.success_policy_trust_region_epsilon
+                        )
+                    ).item()
+                ):
+                    # The selected successful action is already materially
+                    # more likely than under its factual behavior policy.
+                    # Preserve value supervision and importance telemetry, but
+                    # stop the positive imitation gradient instead of applying
+                    # an indefinitely repeated sharpening pressure.
+                    success_trust_region_suppressed_labels += 1
+                    continue
+                policy_active_sequence_indexes.add(active[row])
                 primary_signal = self.episodic_config.primary_policy_weight * primary_advantage.detach()
                 primary_policy_terms.append(-clipped_ratio * selected_log_probability * primary_advantage.detach())
 
@@ -2573,6 +2863,9 @@ class VTraceLearner:
             policy_active_sequences=len(policy_active_sequence_indexes),
             failure_policy_suppressed_labels=failure_policy_suppressed_labels,
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
+            success_trust_region_suppressed_labels=(
+                success_trust_region_suppressed_labels
+            ),
             task_value_labels=len(task_predictions),
             revival_value_labels=len(revival_predictions),
             efficiency_policy_labels=efficiency_policy_labels,

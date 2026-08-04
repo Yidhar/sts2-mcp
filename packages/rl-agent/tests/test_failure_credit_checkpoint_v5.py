@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from sts2_rl.checkpoints import CheckpointIntegrityError, V28_100K_FROZEN
+from sts2_rl.checkpoints import V28_100K_FROZEN, CheckpointIntegrityError
 from sts2_rl.models import RecurrentCandidateModel
 from sts2_rl.training import (
     TrainingState,

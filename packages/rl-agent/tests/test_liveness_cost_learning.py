@@ -39,7 +39,12 @@ from sts2_rl.training.failure_credit import (
     SemanticKey,
 )
 from sts2_rl.training.learner import (
+    LivenessCreditLosses,
     VTraceLearner,
+    _apply_parameter_gradient_delta_,
+    _clip_parameter_gradient_delta_,
+    _parameter_gradient_delta_snapshot,
+    _parameter_gradient_snapshot,
     compile_liveness_label_manifest,
     liveness_credit_losses,
 )
@@ -255,6 +260,153 @@ def test_candidate_liveness_cost_head_is_bounded_masked_and_active_shape() -> No
     output.validate(model_config)
 
 
+def test_homogeneous_failure_records_can_share_one_vectorized_replay_without_changing_gradients() -> None:
+    """Prove the narrow semantic equivalence needed by a packing prototype.
+
+    Production currently replays and backpropagates every failure record on
+    its own.  ``credit_plan_liveness_losses`` already supports multiple
+    contexts and batches them by recurrent timestep.  For records with the
+    same label topology, its reductions are exactly the equal-record mean, so
+    packing those records removes redundant model invocations without changing
+    the objective or gradients.  Heterogeneous label topologies are
+    intentionally outside this test: a production packer must bucket them or
+    retain explicit per-record reduction weights.
+    """
+
+    torch.manual_seed(7)
+    model_config = _model_config()
+    encoding_config = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=32,
+        max_candidates=256,
+        max_candidate_local_tokens=4,
+    )
+    failure_config = FailureCreditConfig(
+        mode="learning",
+        sample_records=4,
+        direct_witness_quota=0,
+        multi_edge_cycle_quota=0,
+        risk_sequence_quota=0,
+        unresolved_stall_quota=0,
+        completion_control_quota=0,
+        matched_outcome_pair_quota=0,
+        liveness_head_calibration_updates=0,
+        liveness_risk_actor_start_update=0,
+    )
+    plans = tuple(
+        _one_step_credit_plan(
+            encoding_config,
+            model_config,
+            suffix=f"packed-{index}",
+        )
+        for index in range(4)
+    )
+
+    sequential_model = RecurrentCandidateModel(
+        model_config,
+        enable_liveness_head=True,
+    )
+    packed_model = RecurrentCandidateModel(
+        model_config,
+        enable_liveness_head=True,
+    )
+    packed_model.load_state_dict(sequential_model.state_dict())
+
+    def make_learner(model: RecurrentCandidateModel) -> VTraceLearner:
+        return VTraceLearner(
+            model=model,
+            encoder=GroundedObservationEncoder(encoding_config),
+            optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+            config=OptimizationConfig(),
+            maximum_unroll_length=16,
+            maximum_policy_lag=64,
+            failure_credit_config=failure_config,
+        )
+
+    sequential_learner = make_learner(sequential_model)
+    packed_learner = make_learner(packed_model)
+
+    def objective(losses: LivenessCreditLosses) -> torch.Tensor:
+        return (
+            failure_config.liveness_value_critic_weight * losses.value_critic_loss
+            + failure_config.liveness_cost_critic_weight * losses.critic_loss
+            + failure_config.liveness_cost_actor_weight * losses.risk_actor_loss
+            + failure_config.liveness_direct_policy_weight * losses.direct_avoid_loss
+            + failure_config.liveness_cycle_policy_weight * losses.cycle_likelihood_loss
+            + failure_config.liveness_contrast_policy_weight * losses.contrast_loss
+            + failure_config.liveness_completion_policy_weight * losses.completion_loss
+        )
+
+    sequential_forward_calls = 0
+    packed_forward_calls = 0
+
+    def count_sequential(
+        _module: torch.nn.Module,
+        _args: tuple[object, ...],
+    ) -> None:
+        nonlocal sequential_forward_calls
+        sequential_forward_calls += 1
+
+    def count_packed(
+        _module: torch.nn.Module,
+        _args: tuple[object, ...],
+    ) -> None:
+        nonlocal packed_forward_calls
+        packed_forward_calls += 1
+
+    sequential_handle = sequential_model.register_forward_pre_hook(count_sequential)
+    packed_handle = packed_model.register_forward_pre_hook(count_packed)
+    try:
+        sequential_model.zero_grad(set_to_none=True)
+        sequential_objective = torch.zeros((), dtype=next(sequential_model.parameters()).dtype)
+        for plan in plans:
+            record_objective = objective(
+                sequential_learner.credit_plan_liveness_losses(
+                    (plan,),
+                    current_policy_version=3,
+                    current_learner_update=513,
+                )
+            )
+            sequential_objective = sequential_objective + record_objective.detach() / len(plans)
+            (record_objective / len(plans)).backward()  # type: ignore[no-untyped-call]
+
+        packed_model.zero_grad(set_to_none=True)
+        packed_objective = objective(
+            packed_learner.credit_plan_liveness_losses(
+                plans,
+                current_policy_version=3,
+                current_learner_update=513,
+            )
+        )
+        packed_objective.backward()  # type: ignore[no-untyped-call]
+    finally:
+        sequential_handle.remove()
+        packed_handle.remove()
+
+    assert packed_forward_calls == 1
+    assert sequential_forward_calls == len(plans)
+    assert torch.allclose(
+        sequential_objective,
+        packed_objective.detach(),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    sequential_gradients = dict(sequential_model.named_parameters())
+    packed_gradients = dict(packed_model.named_parameters())
+    assert sequential_gradients.keys() == packed_gradients.keys()
+    for name, sequential_parameter in sequential_gradients.items():
+        packed_parameter = packed_gradients[name]
+        assert (sequential_parameter.grad is None) is (packed_parameter.grad is None), name
+        if sequential_parameter.grad is not None:
+            assert packed_parameter.grad is not None
+            assert torch.allclose(
+                sequential_parameter.grad,
+                packed_parameter.grad,
+                rtol=2e-5,
+                atol=2e-6,
+            ), name
+
+
 def test_candidate_liveness_cost_head_is_candidate_equivariant() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
@@ -337,6 +489,101 @@ def test_centered_liveness_actor_survives_saturated_task_value() -> None:
     assert losses.forced_actor_suppressed_labels == 2
     assert losses.censored_suppressed_labels == 3
     assert 0.0 < losses.centered_risk_max_abs <= 0.25
+
+
+def test_cost_actor_policy_baseline_is_detached_from_policy_gradient() -> None:
+    policy_logits = torch.nn.Parameter(torch.tensor([[0.4, -0.2, 0.1]]))
+    costs = torch.tensor([[0.9, 0.1, 0.4]])
+    selected = torch.tensor([0], dtype=torch.long)
+    log_probabilities = torch.log_softmax(policy_logits, dim=1)
+    losses = liveness_credit_losses(
+        policy_log_probabilities=log_probabilities,
+        candidate_liveness_cost_values=costs,
+        action_mask=torch.ones((1, 3), dtype=torch.bool),
+        selected_action_indices=selected,
+        risk_actor_mask=torch.ones(1, dtype=torch.bool),
+        risk_advantage_clip=1.0,
+    )
+    actual = torch.autograd.grad(
+        losses.risk_actor_loss,
+        policy_logits,
+        retain_graph=True,
+    )[0]
+
+    detached_probabilities = torch.softmax(policy_logits, dim=1).detach()
+    detached_centered_risk = (
+        costs[0, 0] - (detached_probabilities[0] * costs[0]).sum()
+    ).detach()
+    selected_only_objective = (
+        torch.log_softmax(policy_logits, dim=1)[0, 0]
+        * detached_centered_risk
+    )
+    expected = torch.autograd.grad(selected_only_objective, policy_logits)[0]
+
+    torch.testing.assert_close(actual, expected)
+    assert torch.count_nonzero(actual) == 3
+
+
+def test_direct_avoid_softening_is_finite_and_bounded_near_one_hot_policy() -> None:
+    saturated_logits = torch.nn.Parameter(torch.tensor([[8.0, -8.0]]))
+    saturated = liveness_credit_losses(
+        policy_log_probabilities=torch.log_softmax(saturated_logits, dim=1),
+        candidate_liveness_cost_values=torch.full((1, 2), 0.5),
+        action_mask=torch.ones((1, 2), dtype=torch.bool),
+        selected_action_indices=torch.zeros(1, dtype=torch.long),
+        direct_avoid_mask=torch.ones(1, dtype=torch.bool),
+    )
+    saturated_gradient = torch.autograd.grad(
+        saturated.direct_avoid_loss,
+        saturated_logits,
+    )[0]
+    assert torch.isfinite(saturated.direct_avoid_loss)
+    assert torch.isfinite(saturated_gradient).all()
+    assert float(saturated_gradient.norm()) < 1.0e-4
+
+    moderate_logits = torch.nn.Parameter(torch.tensor([[2.0, -2.0]]))
+    moderate = liveness_credit_losses(
+        policy_log_probabilities=torch.log_softmax(moderate_logits, dim=1),
+        candidate_liveness_cost_values=torch.full((1, 2), 0.5),
+        action_mask=torch.ones((1, 2), dtype=torch.bool),
+        selected_action_indices=torch.zeros(1, dtype=torch.long),
+        direct_avoid_mask=torch.ones(1, dtype=torch.bool),
+    )
+    moderate_gradient = torch.autograd.grad(
+        moderate.direct_avoid_loss,
+        moderate_logits,
+    )[0]
+    # Gradient descent must still lower the failed selected action and raise
+    # its factual alternative after the saturation guard is applied.
+    assert moderate_gradient[0, 0] > 0.0
+    assert moderate_gradient[0, 1] < 0.0
+
+
+def test_liveness_gradient_delta_clip_preserves_the_primary_gradient() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
+    (parameter * torch.tensor([3.0, 4.0])).sum().backward()
+    parameters = (parameter,)
+    primary = _parameter_gradient_snapshot(parameters)
+    assert primary[0] is not None
+
+    (parameter * torch.tensor([60.0, 80.0])).sum().backward()
+    raw_norm, clipped_norm, scale = _clip_parameter_gradient_delta_(
+        parameters,
+        primary,
+        maximum_norm=10.0,
+    )
+    assert raw_norm == pytest.approx(100.0)
+    assert clipped_norm == pytest.approx(10.0)
+    assert scale == pytest.approx(0.1)
+    delta = _parameter_gradient_delta_snapshot(parameters, primary)
+
+    _apply_parameter_gradient_delta_(parameters, delta, sign=-1.0)
+    torch.testing.assert_close(parameter.grad, primary[0])
+    _apply_parameter_gradient_delta_(parameters, delta, sign=1.0)
+    torch.testing.assert_close(
+        parameter.grad,
+        torch.tensor([9.0, 12.0]),
+    )
 
 
 def test_liveness_critic_and_all_factual_policy_objectives_have_gradients() -> None:

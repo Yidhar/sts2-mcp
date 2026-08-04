@@ -47,11 +47,16 @@ def test_reset_forwards_seed_and_timeout() -> None:
     client = _bare_client()
     client._rpc = mock.Mock(return_value={"state_type": "map"})
     with mock.patch.object(module, "_build_bridge_step_response", return_value={"episode_id": "ep"}):
-        result = client.reset(character="CHARACTER.IRONCLAD", seed="ABC123", timeout_ms=12_000)
+        result = client.reset(
+            character="CHARACTER.IRONCLAD",
+            seed="ABC123",
+            ascension_level=7,
+            timeout_ms=12_000,
+        )
     assert result["episode_id"] == "ep"
     client._rpc.assert_called_once_with(
         "reset",
-        {"character_id": "IRONCLAD", "seed": "ABC123"},
+        {"character_id": "IRONCLAD", "seed": "ABC123", "ascension_level": 7},
         timeout_s=12.0,
     )
 

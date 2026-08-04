@@ -140,6 +140,19 @@ class EpisodeMetrics:
     maximum_relation_hash_collisions_per_decision: int = 0
     definition_hash_collisions_total: int = 0
     relation_hash_collisions_total: int = 0
+    targeted_selection_exploration_decisions: int = 0
+    maximum_effective_collection_epsilon: float = 0.0
+    policy_top1_top2_logit_margin_mean: float = 0.0
+    policy_top1_top2_logit_margin_max: float = 0.0
+    selection_transactions_started: int = 0
+    selection_transactions_completed: int = 0
+    rest_site_selection_transactions_started: int = 0
+    rest_site_selection_transactions_completed: int = 0
+    forge_selection_transactions_started: int = 0
+    forge_selection_transactions_completed: int = 0
+    shaping_reward_total: float = 0.0
+    shaping_reward_per_max_floor: float = 0.0
+    boss_victory_acts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +269,8 @@ class _ActionChoice:
     policy_forward_ms: float
     definition_hash_collisions: int
     relation_hash_collisions: int
+    effective_epsilon: float
+    targeted_selection_exploration: bool
 
 
 @dataclass(slots=True)
@@ -973,6 +988,72 @@ def _episodic_decision_surface(
         if normalized:
             return normalized
     return "noncombat"
+
+
+def _is_rest_site_decision_surface(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Recognize the generic rest-site decision surface, without option IDs."""
+
+    if _combat_in_progress(observation):
+        return False
+    surface = _episodic_decision_surface(
+        observation,
+        combat_in_progress=False,
+    )
+    if surface in {"rest_site", "restsite", "rest"}:
+        return True
+    for action in semantic_actions:
+        prototype = _semantic_action_prototype(action)
+        action_kind = str(prototype.get("action") or prototype.get("kind") or "").strip().lower()
+        model_kind = str(prototype.get("model_action_kind") or "").strip().lower()
+        if model_kind in {"rest_site", "restsite"} or action_kind == "choose_rest_option":
+            return True
+    return False
+
+
+def _uses_targeted_selection_exploration(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Return whether this generic decision surface owns the v33 ε floor."""
+
+    return bool(
+        _transaction_selection_context(observation, semantic_actions) is not None
+        or _is_rest_site_decision_surface(observation, semantic_actions)
+    )
+
+
+def _is_forge_selection_surface(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Recognize an authoritative upgrade/forge selection transaction.
+
+    This is a decision-surface classification used only for observability.  It
+    reads the generic selection operation contract and never names a card,
+    character, relic, room model, or encounter.
+    """
+
+    selection = _transaction_selection_context(observation, semantic_actions)
+    if selection is None:
+        return False
+    operation = "_".join(
+        str(selection.get("operation_type") or "")
+        .strip()
+        .lower()
+        .replace("-", " ")
+        .split()
+    )
+    return operation in {"upgrade", "forge"}
+
+
+def _room_type(observation: Mapping[str, object]) -> str:
+    raw_run = observation.get("run")
+    run = raw_run if isinstance(raw_run, Mapping) else {}
+    raw = run.get("room_type", observation.get("room_type", ""))
+    return "_".join(str(raw or "").strip().lower().replace("-", " ").split())
 
 
 def _episodic_combat_boundary(
@@ -2400,6 +2481,7 @@ class GroundedCollector:
         failure_credit_learning_enabled: bool = False,
         failure_credit_run_id: str | None = None,
         failure_credit_pipeline_config: FailureCreditPipelineConfig | None = None,
+        selection_surface_epsilon_floor: float = 0.0,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -2453,6 +2535,13 @@ class GroundedCollector:
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
             raise ValueError("journal_policy_topk must be positive")
+        if (
+            isinstance(selection_surface_epsilon_floor, bool)
+            or not isinstance(selection_surface_epsilon_floor, int | float)
+            or not math.isfinite(float(selection_surface_epsilon_floor))
+            or not 0.0 <= float(selection_surface_epsilon_floor) <= 1.0
+        ):
+            raise ValueError("selection_surface_epsilon_floor must be finite and in [0, 1]")
         if isinstance(combat_net_progress_window, bool) or not isinstance(combat_net_progress_window, int):
             raise TypeError("combat_net_progress_window must be an integer")
         if combat_net_progress_window <= 0:
@@ -2501,6 +2590,7 @@ class GroundedCollector:
         self.episodic_learning_enabled = episodic_learning_enabled
         self.failure_credit_shadow_enabled = failure_credit_shadow_enabled
         self.failure_credit_learning_enabled = failure_credit_learning_enabled
+        self.selection_surface_epsilon_floor = float(selection_surface_epsilon_floor)
         self.failure_credit_pipeline_config = failure_credit_pipeline_config or FailureCreditPipelineConfig(
             detector_window_steps=deadlock_window,
             context_burn_in_steps=transaction_burn_in_steps or 0,
@@ -2780,6 +2870,7 @@ class GroundedCollector:
             state.legal_actions,
             device=self.device,
         )
+        semantic_actions = _semantic_action_surface(encoded.semantic_groups)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         encoding_ms = (time.perf_counter_ns() - encoding_started_ns) / 1_000_000.0
@@ -2826,7 +2917,7 @@ class GroundedCollector:
                 equivalence_fingerprint=reference.equivalence_fingerprint,
                 multiplicity=reference.multiplicity,
                 action_references=encoded.actions,
-                semantic_actions=_semantic_action_surface(encoded.semantic_groups),
+                semantic_actions=semantic_actions,
                 # Deterministic collection samples from a delta behavior
                 # policy.  This is irrelevant to held-out evaluation, but a
                 # recorded training liveness probe must expose log(1)=0 to
@@ -2842,13 +2933,24 @@ class GroundedCollector:
                 policy_forward_ms=policy_forward_ms,
                 definition_hash_collisions=(encoded.definition_hash_collisions),
                 relation_hash_collisions=encoded.relation_hash_collisions,
+                effective_epsilon=0.0,
+                targeted_selection_exploration=False,
             )
 
+        targeted_surface = _uses_targeted_selection_exploration(
+            state.observation,
+            semantic_actions,
+        )
+        effective_epsilon = (
+            max(normalized_epsilon, self.selection_surface_epsilon_floor)
+            if targeted_surface
+            else normalized_epsilon
+        )
         behavior = _branch_balanced_epsilon_behavior(
             policy=policy,
             valid=valid,
             policy_branch_ids=policy_branch_ids,
-            epsilon=normalized_epsilon,
+            epsilon=effective_epsilon,
         )
         selected = int(self._rng.choice(len(behavior), p=behavior))
         reference = encoded.action(selected)
@@ -2859,7 +2961,7 @@ class GroundedCollector:
             equivalence_fingerprint=reference.equivalence_fingerprint,
             multiplicity=reference.multiplicity,
             action_references=encoded.actions,
-            semantic_actions=_semantic_action_surface(encoded.semantic_groups),
+            semantic_actions=semantic_actions,
             behavior_log_probability=float(math.log(max(float(behavior[selected]), 1e-30))),
             valid_count=valid_count,
             snapshot=encoded.snapshot,
@@ -2870,6 +2972,10 @@ class GroundedCollector:
             policy_forward_ms=policy_forward_ms,
             definition_hash_collisions=encoded.definition_hash_collisions,
             relation_hash_collisions=encoded.relation_hash_collisions,
+            effective_epsilon=effective_epsilon,
+            targeted_selection_exploration=bool(
+                targeted_surface and effective_epsilon > normalized_epsilon
+            ),
         )
 
     def _step(
@@ -2993,6 +3099,19 @@ class GroundedCollector:
         maximum_relation_hash_collisions_per_decision = 0
         definition_hash_collisions_total = 0
         relation_hash_collisions_total = 0
+        targeted_selection_exploration_decisions = 0
+        maximum_effective_collection_epsilon = 0.0
+        policy_logit_margin_total = 0.0
+        policy_logit_margin_count = 0
+        policy_top1_top2_logit_margin_max = 0.0
+        selection_transactions_started = 0
+        selection_transactions_completed = 0
+        rest_site_selection_transactions_started = 0
+        rest_site_selection_transactions_completed = 0
+        forge_selection_transactions_started = 0
+        forge_selection_transactions_completed = 0
+        shaping_reward_total = 0.0
+        boss_victory_acts: set[int] = set()
         steps_taken = 0
         final_outcome = "ongoing"
         deadlocked = False
@@ -3079,6 +3198,13 @@ class GroundedCollector:
         active_transaction_burn_in = 0
         active_transaction_policy_version = policy_version
         active_transaction_seen_nodes: set[str] = set()
+        observed_transaction_surface: str | None = None
+        observed_transaction_entry_episodic_index: int | None = None
+        observed_transaction_opened_from_rest_site = False
+        observed_transaction_is_forge = False
+        observed_transaction_has_policy_choice = False
+        pending_observed_transaction_entry_episodic_index: int | None = None
+        pending_observed_transaction_opened_from_rest_site = False
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
         # Complete-run replay is collected independently of fixed unroll
@@ -3142,6 +3268,28 @@ class GroundedCollector:
             )
             definition_hash_collisions_total += choice.definition_hash_collisions
             relation_hash_collisions_total += choice.relation_hash_collisions
+            targeted_selection_exploration_decisions += int(
+                choice.targeted_selection_exploration
+            )
+            maximum_effective_collection_epsilon = max(
+                maximum_effective_collection_epsilon,
+                choice.effective_epsilon,
+            )
+            valid_policy_indices = np.flatnonzero(choice.snapshot.action_mask)
+            if valid_policy_indices.size > 1:
+                ranked_probabilities = np.sort(
+                    choice.policy[valid_policy_indices].astype(np.float64, copy=False)
+                )
+                logit_margin = float(
+                    math.log(max(float(ranked_probabilities[-1]), 1e-30))
+                    - math.log(max(float(ranked_probabilities[-2]), 1e-30))
+                )
+                policy_logit_margin_total += logit_margin
+                policy_logit_margin_count += 1
+                policy_top1_top2_logit_margin_max = max(
+                    policy_top1_top2_logit_margin_max,
+                    logit_margin,
+                )
             policy_decisions += int(choice.valid_count > 1)
             forced_decisions += int(choice.valid_count == 1)
             selected_action = state.legal_actions[choice.dispatch_position]
@@ -3159,14 +3307,54 @@ class GroundedCollector:
             selected_action_kind_counts[last_selected_action_kind] = (
                 selected_action_kind_counts.get(last_selected_action_kind, 0) + 1
             )
-            current_transaction_surface = (
-                _transaction_surface_key(
-                    state.observation,
-                    choice.semantic_actions,
-                )
-                if transaction_enabled
-                else None
+            current_observed_transaction_surface = _transaction_surface_key(
+                state.observation,
+                choice.semantic_actions,
             )
+            current_transaction_surface = (
+                current_observed_transaction_surface if transaction_enabled else None
+            )
+            if (
+                current_observed_transaction_surface is not None
+                and observed_transaction_surface is None
+            ):
+                observed_transaction_surface = current_observed_transaction_surface
+                observed_transaction_entry_episodic_index = (
+                    pending_observed_transaction_entry_episodic_index
+                )
+                observed_transaction_opened_from_rest_site = (
+                    pending_observed_transaction_opened_from_rest_site
+                    or _is_rest_site_decision_surface(
+                        state.observation,
+                        choice.semantic_actions,
+                    )
+                )
+                observed_transaction_is_forge = bool(
+                    observed_transaction_opened_from_rest_site
+                    and _is_forge_selection_surface(
+                        state.observation,
+                        choice.semantic_actions,
+                    )
+                )
+                observed_transaction_has_policy_choice = choice.valid_count > 1
+                pending_observed_transaction_entry_episodic_index = None
+                pending_observed_transaction_opened_from_rest_site = False
+                selection_transactions_started += 1
+                rest_site_selection_transactions_started += int(
+                    observed_transaction_opened_from_rest_site
+                )
+                forge_selection_transactions_started += int(
+                    observed_transaction_is_forge
+                )
+            if (
+                current_observed_transaction_surface is not None
+                and current_observed_transaction_surface
+                == observed_transaction_surface
+            ):
+                observed_transaction_has_policy_choice = bool(
+                    observed_transaction_has_policy_choice
+                    or choice.valid_count > 1
+                )
             current_transaction_node = (
                 _transaction_node_key(
                     current_transaction_surface,
@@ -3219,6 +3407,17 @@ class GroundedCollector:
                 raise CollectionProtocolError("transport/outcome-unknown truncation discarded before rollout")
             next_action_groups = self.encoder.semantic_action_groups(next_state.legal_actions)
             next_semantic_actions = _semantic_action_surface(next_action_groups)
+            next_observed_transaction_surface = _transaction_surface_key(
+                next_state.observation,
+                next_semantic_actions,
+            )
+            next_transaction_surface = (
+                next_observed_transaction_surface if transaction_enabled else None
+            )
+            opens_selection_transaction = bool(
+                current_observed_transaction_surface is None
+                and next_observed_transaction_surface is not None
+            )
             result_terminal = next_state.terminated or next_state.truncated
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
             deadlock_evidence = self.deadlock_detector.confirm_after_step(
@@ -3390,8 +3589,11 @@ class GroundedCollector:
             )
             selection_action_cycle = bool(
                 effective_deadlock_evidence is not None
-                and current_transaction_surface is not None
-                and exact_cycle_has_policy_choice
+                and current_observed_transaction_surface is not None
+                and (
+                    observed_transaction_has_policy_choice
+                    or exact_cycle_has_policy_choice
+                )
                 and not forced_horizon
             )
             # Combat no-progress, a repeated factual event transition and a
@@ -3430,10 +3632,78 @@ class GroundedCollector:
                 horizon_exhausted=bool(curriculum_horizon and self.horizon_as_failure),
             )
             reward_total += breakdown.reward
+            shaping_reward_total += float(
+                breakdown.reward
+                - breakdown.terminal_reward
+                - breakdown.progress_reward
+            )
             revivals_used += breakdown.revivals_used_delta
             player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
             deadlocked = breakdown.outcome == "deadlock"
+            if opens_selection_transaction:
+                pending_observed_transaction_opened_from_rest_site = (
+                    _is_rest_site_decision_surface(
+                        state.observation,
+                        choice.semantic_actions,
+                    )
+                )
+            if (
+                observed_transaction_surface is not None
+                and (
+                    next_observed_transaction_surface != observed_transaction_surface
+                    or result_terminal
+                    or breakdown.task_terminal
+                    or forced_horizon
+                )
+            ):
+                completed_transaction = bool(
+                    next_observed_transaction_surface is None
+                    and (
+                        (
+                            not result_terminal
+                            and not breakdown.task_terminal
+                            and not forced_horizon
+                        )
+                        or (
+                            result_terminal
+                            and breakdown.outcome == "success"
+                        )
+                    )
+                )
+                if completed_transaction:
+                    selection_transactions_completed += 1
+                    rest_site_selection_transactions_completed += int(
+                        observed_transaction_opened_from_rest_site
+                    )
+                    forge_selection_transactions_completed += int(
+                        observed_transaction_is_forge
+                    )
+                if (
+                    breakdown.outcome == "deadlock"
+                    and trusted_policy_failure
+                    and observed_transaction_entry_episodic_index is not None
+                ):
+                    entry_index = observed_transaction_entry_episodic_index
+                    if not 0 <= entry_index < len(episodic_steps):
+                        raise RuntimeError(
+                            "selection transaction entrance episodic index escaped its episode"
+                        )
+                    # A delayed selection-cycle terminal is not a factual
+                    # one-step consequence of the action that opened the
+                    # surface.  Preserve its value target but do not turn
+                    # trying the multi-step transaction into an anti-policy
+                    # label.  This state machine is deliberately independent
+                    # of the retired transaction replay plane.
+                    episodic_steps[entry_index] = replace(
+                        episodic_steps[entry_index],
+                        policy_decision=False,
+                    )
+                observed_transaction_surface = None
+                observed_transaction_entry_episodic_index = None
+                observed_transaction_opened_from_rest_site = False
+                observed_transaction_is_forge = False
+                observed_transaction_has_policy_choice = False
             after_action_act, _ = _run_position(next_state.observation)
             transition_facts = next_state.transition.facts
             typed_run_result = transition_facts.get("run_result")
@@ -3475,20 +3745,34 @@ class GroundedCollector:
                             completed_act,
                             (revivals_used, player_hp_lost),
                         )
+            if (
+                combat_boundary is BoundaryOutcome.SUCCEEDED
+                and pre_action_act >= 1
+                and "boss" in _room_type(state.observation)
+            ):
+                boss_victory_acts.add(pre_action_act)
             # Synthetic liveness terminals summarize a delayed window, not a
             # one-step causal consequence of the action that happened to cross
             # its threshold. Keep the terminal reward/value target and the
             # bounded transaction trace, but do not assign that -1 directly to
             # the final selected action through FIFO or episodic policy loss.
-            one_step_policy_decision = bool(choice.valid_count > 1 and breakdown.outcome != "deadlock")
+            one_step_policy_decision = bool(
+                choice.valid_count > 1
+                and breakdown.outcome != "deadlock"
+                and not opens_selection_transaction
+            )
+            episodic_policy_decision = bool(
+                choice.valid_count > 1 and breakdown.outcome != "deadlock"
+            )
             if episodic_enabled:
+                episodic_step_index = len(episodic_steps)
                 episodic_steps.append(
                     EpisodeDecisionStep(
                         snapshot=choice.snapshot,
                         step_index=len(episodic_steps),
                         action_index=choice.candidate_index,
                         behavior_log_probability=choice.behavior_log_probability,
-                        policy_decision=one_step_policy_decision,
+                        policy_decision=episodic_policy_decision,
                         policy_version=segment_policy_version,
                         act=pre_action_act,
                         combat_id=step_combat_id,
@@ -3508,6 +3792,10 @@ class GroundedCollector:
                         ),
                     )
                 )
+                if opens_selection_transaction:
+                    pending_observed_transaction_entry_episodic_index = (
+                        episodic_step_index
+                    )
                 if pre_action_combat and not next_combat_in_progress:
                     active_combat_id = None
                 elif not pre_action_combat and next_combat_in_progress:
@@ -3527,10 +3815,6 @@ class GroundedCollector:
             if transaction_enabled:
                 episode_rewards.append(float(breakdown.reward))
                 episode_discounts.append(float(breakdown.discount))
-                next_transaction_surface = _transaction_surface_key(
-                    next_state.observation,
-                    next_semantic_actions,
-                )
                 next_transaction_node = _transaction_node_key(
                     next_transaction_surface,
                     next_state.observation,
@@ -3824,6 +4108,11 @@ class GroundedCollector:
                         for index in ranked
                     ],
                     "value": choice.value,
+                    "behavior_log_probability": choice.behavior_log_probability,
+                    "effective_collection_epsilon": choice.effective_epsilon,
+                    "targeted_selection_exploration": (
+                        choice.targeted_selection_exploration
+                    ),
                     "reward": breakdown.reward,
                     "terminal_reward": breakdown.terminal_reward,
                     "potential_reward": breakdown.potential_reward,
@@ -4101,6 +4390,39 @@ class GroundedCollector:
                 maximum_relation_hash_collisions_per_decision=(maximum_relation_hash_collisions_per_decision),
                 definition_hash_collisions_total=(definition_hash_collisions_total),
                 relation_hash_collisions_total=(relation_hash_collisions_total),
+                targeted_selection_exploration_decisions=(
+                    targeted_selection_exploration_decisions
+                ),
+                maximum_effective_collection_epsilon=(
+                    maximum_effective_collection_epsilon
+                ),
+                policy_top1_top2_logit_margin_mean=(
+                    policy_logit_margin_total / policy_logit_margin_count
+                    if policy_logit_margin_count
+                    else 0.0
+                ),
+                policy_top1_top2_logit_margin_max=(
+                    policy_top1_top2_logit_margin_max
+                ),
+                selection_transactions_started=selection_transactions_started,
+                selection_transactions_completed=selection_transactions_completed,
+                rest_site_selection_transactions_started=(
+                    rest_site_selection_transactions_started
+                ),
+                rest_site_selection_transactions_completed=(
+                    rest_site_selection_transactions_completed
+                ),
+                forge_selection_transactions_started=(
+                    forge_selection_transactions_started
+                ),
+                forge_selection_transactions_completed=(
+                    forge_selection_transactions_completed
+                ),
+                shaping_reward_total=shaping_reward_total,
+                shaping_reward_per_max_floor=(
+                    shaping_reward_total / max(1, max_floor)
+                ),
+                boss_victory_acts=tuple(sorted(boss_victory_acts)),
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,

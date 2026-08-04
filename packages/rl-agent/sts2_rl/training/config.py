@@ -17,9 +17,10 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v12"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v13"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -200,6 +201,10 @@ class OptimizationConfig:
     # policy margins to emerge as factual liveness supervision accumulates.
     entropy_weight_end: float = 0.01
     entropy_decay_updates: int = 2_000
+    # Source-versioned v33 circuit breaker.  Its thresholds and temporary
+    # weight are code constants rather than launch-time knobs, so an operator
+    # cannot silently change the learning recipe with a CLI override.
+    entropy_breaker: Literal["disabled", "one-hot-v1"] = "disabled"
 
     def __post_init__(self) -> None:
         learning_rate = _require_finite_number(
@@ -255,6 +260,8 @@ class OptimizationConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.entropy_weight_end > self.entropy_weight:
             raise ValueError("entropy_weight_end cannot exceed entropy_weight")
+        if self.entropy_breaker not in {"disabled", "one-hot-v1"}:
+            raise ValueError("optimization.entropy_breaker must be 'disabled' or 'one-hot-v1'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +486,11 @@ class FailureCreditConfig:
     liveness_completion_policy_weight: float = 0.0
     liveness_risk_advantage_clip: float = 0.25
     liveness_contrast_margin: float = 0.10
+    # The complete formal liveness objective receives this independent
+    # gradient-delta budget before episodic gradients and the global optimizer
+    # clip are applied.  This prevents one sparse witness from consuming the
+    # ordinary V-trace gradient budget.
+    liveness_gradient_clip_norm: float = 1.0
 
     def __post_init__(self) -> None:
         if self.mode not in {"disabled", "shadow", "learning"}:
@@ -564,6 +576,7 @@ class FailureCreditConfig:
             "liveness_completion_policy_weight",
             "liveness_risk_advantage_clip",
             "liveness_contrast_margin",
+            "liveness_gradient_clip_norm",
         ):
             _require_finite_number(
                 getattr(self, name),
@@ -572,6 +585,8 @@ class FailureCreditConfig:
             )
         if self.liveness_risk_advantage_clip > 1.0:
             raise ValueError("failure_credit.liveness_risk_advantage_clip must be in [0, 1]")
+        if self.liveness_gradient_clip_norm <= 0.0:
+            raise ValueError("failure_credit.liveness_gradient_clip_norm must be positive")
 
     @property
     def shadow_enabled(self) -> bool:
@@ -626,6 +641,10 @@ class EpisodicLearningConfig:
     secondary_advantage_fraction: float = 0.25
     primary_success_tie_tolerance: float = 0.05
     importance_ratio_clip: float = 1.0
+    # Positive-advantage success imitation stops once the current policy is
+    # already more than this multiplicative trust region above the factual
+    # behavior policy.  Value labels remain active.
+    success_policy_trust_region_epsilon: float = 0.20
     # Old complete episodes remain useful factual value targets, but their
     # selected-action likelihood must not continue moving a much newer policy.
     # The learner therefore keeps value supervision and suppresses only policy
@@ -698,6 +717,12 @@ class EpisodicLearningConfig:
         )
         if importance_ratio_clip <= 0.0:
             raise ValueError("episodic_learning.importance_ratio_clip must be positive")
+        _require_finite_number(
+            self.success_policy_trust_region_epsilon,
+            label="episodic_learning.success_policy_trust_region_epsilon",
+            minimum=0.0,
+            maximum=1.0,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,6 +769,10 @@ class CurriculumConfig:
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 250_000
+    # Generic exploration floor for multi-step selection surfaces.  It is
+    # keyed only by decision-surface semantics (card selection/rest site), not
+    # by any card, relic, event, encounter or option identifier.
+    selection_surface_epsilon_floor: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in {"standard", "native-revival-preheat"}:
@@ -785,6 +814,20 @@ class CurriculumConfig:
             label="curriculum.epsilon_decay_steps",
             minimum=1,
         )
+        selection_surface_epsilon_floor = _require_finite_number(
+            self.selection_surface_epsilon_floor,
+            label="curriculum.selection_surface_epsilon_floor",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if selection_surface_epsilon_floor < epsilon_end:
+            # A lower floor is legal but operationally indistinguishable from
+            # the ordinary schedule.  Keep zero as the explicit disabled
+            # value; positive values must actually define a floor.
+            if selection_surface_epsilon_floor != 0.0:
+                raise ValueError(
+                    "curriculum.selection_surface_epsilon_floor must be zero or at least epsilon_end"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,6 +843,10 @@ class RuntimeConfig:
     # migration choice controls only whether mature schedule clocks are carried
     # across that explicit boundary; optimizer/replay/RNG/counters still reset.
     model_initialization_schedule_mode: Literal["reset", "inherit"] = "reset"
+    # Entropy/epsilon clocks may inherit mature source progress while the new
+    # liveness heads deliberately replay their calibration and risk-actor
+    # phases from lineage-local learner update zero.
+    model_initialization_liveness_schedule_mode: Literal["reset", "inherit"] = "inherit"
     total_environment_steps: int = 1_000_000
     seed: int = 0
     log_dir: str = "runs/recurrent-vtrace"
@@ -829,6 +876,9 @@ class RuntimeConfig:
     evaluation_guard_liveness_baseline_failures: int = 0
     evaluation_guard_liveness_baseline_episodes: int = 0
     evaluation_guard_min_liveness_regression_rate: float = 0.0
+    training_deadlock_streak_alert_episodes: int = 0
+    evaluation_guard_failure_action: Literal["stop", "rollback_continue"] = "stop"
+    evaluation_guard_max_rollbacks: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -858,6 +908,8 @@ class RuntimeConfig:
             "evaluation_guard_min_liveness_episodes",
             "evaluation_guard_liveness_baseline_failures",
             "evaluation_guard_liveness_baseline_episodes",
+            "training_deadlock_streak_alert_episodes",
+            "evaluation_guard_max_rollbacks",
         ):
             _require_int(
                 getattr(self, name),
@@ -927,6 +979,19 @@ class RuntimeConfig:
             raise ValueError(
                 "runtime.model_initialization_schedule_mode must be 'reset' or 'inherit'"
             )
+        if self.model_initialization_liveness_schedule_mode not in ("reset", "inherit"):
+            raise ValueError(
+                "runtime.model_initialization_liveness_schedule_mode must be 'reset' or 'inherit'"
+            )
+        if self.evaluation_guard_failure_action not in {"stop", "rollback_continue"}:
+            raise ValueError(
+                "runtime.evaluation_guard_failure_action must be 'stop' or 'rollback_continue'"
+            )
+        if self.evaluation_guard_failure_action == "rollback_continue":
+            if not self.evaluation_liveness_guard_enabled:
+                raise ValueError("rollback_continue requires the evaluation liveness guard")
+            if self.evaluation_guard_max_rollbacks <= 0:
+                raise ValueError("rollback_continue requires evaluation_guard_max_rollbacks > 0")
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -1140,6 +1205,7 @@ class TrainingConfig:
             # resolved device/driver, not optimizer or task semantics.
             "rocm_sdpa_backend",
             "model_initialization_schedule_mode",
+            "model_initialization_liveness_schedule_mode",
             "total_environment_steps",
             "log_dir",
             "checkpoint_dir",
@@ -1161,6 +1227,9 @@ class TrainingConfig:
             "evaluation_guard_liveness_baseline_failures",
             "evaluation_guard_liveness_baseline_episodes",
             "evaluation_guard_min_liveness_regression_rate",
+            "training_deadlock_streak_alert_episodes",
+            "evaluation_guard_failure_action",
+            "evaluation_guard_max_rollbacks",
         ):
             runtime.pop(key)
         return payload
@@ -1264,7 +1333,9 @@ def model_initialization_config_from_mapping(
 ) -> TrainingConfig:
     """Interpret one reviewed source-config change for model-only use.
 
-    V12 adds the independent liveness-credit model/loss ABI.  V11 checkpoints
+    V12 adds the independent liveness-credit model/loss ABI.  V13 hardens its
+    optimization and runtime semantics without changing model parameter
+    shapes. V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
     head is freshly initialized by the reviewed checkpoint overlay.  V10 also
     predates ``fresh_policy_sequences``, so that field receives its
@@ -1282,6 +1353,7 @@ def model_initialization_config_from_mapping(
     if source_version not in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V10,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V12,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1300,13 +1372,15 @@ def model_initialization_config_from_mapping(
             **dict(raw_episodic),
             "fresh_policy_sequences": 0,
         }
-    if "failure_credit" in payload:
-        raise ValueError("pre-V12 model-initialization config unexpectedly contains a " "failure_credit table")
-    # A legacy checkpoint can provide compatible shared model parameters, but
-    # it cannot claim the new semantic/evidence/replay contract.  The target
-    # experiment may explicitly enable that contract after this migration;
-    # the migrated source identity itself remains disabled.
-    migrated["failure_credit"] = {"mode": "disabled"}
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V10,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
+    }:
+        if "failure_credit" in payload:
+            raise ValueError("pre-V12 model-initialization config unexpectedly contains a " "failure_credit table")
+        # A legacy checkpoint can provide compatible shared model parameters,
+        # but it cannot claim the new semantic/evidence/replay contract.
+        migrated["failure_credit"] = {"mode": "disabled"}
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 

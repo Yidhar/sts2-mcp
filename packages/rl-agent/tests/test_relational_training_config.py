@@ -30,7 +30,7 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v12"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v13"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"

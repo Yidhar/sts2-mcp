@@ -2485,6 +2485,60 @@ def test_actor_waits_for_main_thread_at_episode_boundary() -> None:
         resources.close()
 
 
+def test_paused_actor_can_rewind_private_checkpoint_counters() -> None:
+    backend = FakeCombatBackend()
+    resources = build_training_resources(_config(total_steps=4), backend=backend)
+    pipeline = ActorLearnerPipeline(
+        resources,
+        total_environment_steps=4,
+        starting_environment_steps=0,
+        starting_policy_version=3,
+        epsilon=lambda _: 0.1,
+    )
+    restored_supervisor = ActorSupervisorState(
+        episode_attempts=11,
+        consecutive_incidents=2,
+        incident_fingerprints=(("transport:reset", 3),),
+        recent_incident_attempts=(4, 8, 11),
+    )
+    restored_state = TrainingState(
+        environment_steps=1,
+        episodes=5,
+        policy_version=2,
+        actor_policy_version=2,
+    )
+    try:
+        pipeline.start()
+        episode = pipeline.next_episode(timeout=5.0)
+        assert episode is not None
+        queued = len(resources.rollout_queue)
+        assert queued > 0
+        resources.rollout_queue.get_batch(queued, minimum=queued, timeout=1.0)
+
+        pipeline.request_pause()
+        pipeline.release_episode_boundary()
+        deadline = time.monotonic() + 5.0
+        while not pipeline.paused and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pipeline.paused
+        assert not pipeline.at_episode_boundary
+        assert not pipeline.at_incident_boundary
+
+        pipeline.restore_paused_checkpoint_state(
+            restored_state,
+            supervisor_state=restored_supervisor,
+        )
+        assert pipeline.environment_steps == 1
+        assert pipeline.actor_policy_version == 2
+        assert pipeline.supervisor_state == restored_supervisor
+        assert pipeline.actor_progress is None
+    finally:
+        pipeline.stop()
+        if pipeline.alive:
+            pipeline.join(timeout=10.0)
+        resources.close()
+
+
 def test_actor_incident_preserves_emitted_prefix_and_replaces_backend() -> None:
     first_backend = RecoverableIncidentBackend(fail_step=4)
     replacement = FakeCombatBackend(terminal_step=2)

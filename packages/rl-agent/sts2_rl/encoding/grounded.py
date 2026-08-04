@@ -2547,7 +2547,12 @@ def _canonical_item(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, aliases in {
         "id": ("id", "model_id"),
-        "type": ("type", "item_type", "item_kind", "kind"),
+        # ``category`` is the native HeadlessSim field.  The maintained C#
+        # patch also mirrors it into ``type``, but accepting the authoritative
+        # source name here keeps merchant card removal visible across restored
+        # or independently built simulator binaries instead of silently
+        # degrading it to an anonymous shop item.
+        "type": ("type", "category", "item_type", "item_kind", "kind"),
         "price": ("price", "cost"),
         "rarity": ("rarity",),
         "slot_type": ("slot_type",),

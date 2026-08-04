@@ -13,12 +13,15 @@ import re
 import stat
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import islice, pairwise
 from pathlib import Path
 from typing import Any
 
 from sts2_rl.artifacts import validate_artifact_component
+from sts2_rl.episode_monitoring import HeldoutJournalCache, ParsedHeldoutJournal, journal_descriptor
+from sts2_rl.map_reproduction import SeedMapReplayCache
 
 JsonDict = dict[str, Any]
 
@@ -57,6 +60,9 @@ _MAX_PARSER_CACHE = 8
 _DISCOVERY_TTL_SECONDS = 3.0
 _CHECKPOINT_TTL_SECONDS = 4.0
 _DEFAULT_STALE_SECONDS = 15.0 * 60.0
+_HEADLESS_SIM_RELATIVE_PATH = Path(
+    "dependencies/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"
+)
 
 _LIFECYCLE_EVENTS = frozenset(
     {
@@ -930,6 +936,11 @@ class DashboardStore:
         self._last_discovery_monotonic = 0.0
         self._parsers: dict[Path, IncrementalMetrics] = {}
         self._checkpoint_cache: dict[Path, tuple[float, JsonDict]] = {}
+        self._heldout_cache = HeldoutJournalCache(maximum_entries=4)
+        self._map_replay_cache = SeedMapReplayCache(
+            self.artifact_root / _HEADLESS_SIM_RELATIVE_PATH,
+            maximum_entries=8,
+        )
 
     def discover(self, *, force: bool = False) -> list[DiscoveredRun]:
         with self._lock:
@@ -1128,6 +1139,168 @@ class DashboardStore:
                 for run in runs
             ]
             return {"runs": payload, "selected": runs[0].key if runs else None}
+
+    def _selected_run(self, run_key: str) -> DiscoveredRun:
+        self.discover()
+        selected = self._runs.get(run_key)
+        if selected is None:
+            raise KeyError(f"unknown run key: {run_key}")
+        return selected
+
+    @staticmethod
+    def _heldout_journal_path(run: DiscoveredRun, journal_key: str) -> tuple[Path, re.Match[str]]:
+        match = _EVALUATION_RE.fullmatch(journal_key)
+        if match is None:
+            raise KeyError(f"unknown held-out journal: {journal_key}")
+        path = run.run_directory / journal_key
+        if not path.is_file() or _is_link_or_reparse(path) or not _safe_resolved_child(path, run.run_directory):
+            raise KeyError(f"unknown held-out journal: {journal_key}")
+        return path, match
+
+    def _parsed_heldout_journal(
+        self,
+        run: DiscoveredRun,
+        path: Path,
+        match: re.Match[str],
+    ) -> tuple[ParsedHeldoutJournal, int]:
+        parsed = self._heldout_cache.load(path, parent=run.run_directory)
+        expected_gate = int(match.group("step"))
+        recorded_gate = _finite_number(parsed.provenance.get("evaluation_gate"))
+        expected_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[match.group("journal_kind")]
+        recorded_kind = _string(parsed.provenance.get("gate_kind"))
+        if recorded_gate is not None and int(recorded_gate) != expected_gate:
+            raise ValueError("held-out journal filename/header gate mismatch")
+        if recorded_kind and recorded_kind != expected_kind:
+            raise ValueError("held-out journal filename/header gate kind mismatch")
+        return parsed, expected_gate
+
+    def heldout_journals(self, run_key: str) -> JsonDict:
+        """List held-out journals without scanning their decision rows."""
+
+        with self._lock:
+            selected = self._selected_run(run_key)
+            parser = self._parser(selected)
+            completed_gates = {
+                (
+                    _evaluation_gate_kind(event),
+                    _integer(
+                        event.get("evaluation_gate")
+                        if _finite_number(event.get("evaluation_gate")) is not None
+                        else event.get("environment_steps")
+                    ),
+                )
+                for event in parser.evaluations
+            }
+            journals: list[JsonDict] = []
+            entries: Iterator[Path]
+            try:
+                entries = selected.run_directory.iterdir()
+            except OSError:
+                entries = iter(())
+            try:
+                for entry in islice(entries, _MAX_EVALUATION_JOURNAL_SCAN_ENTRIES):
+                    match = _EVALUATION_RE.fullmatch(entry.name)
+                    if match is None:
+                        continue
+                    journal_kind = match.group("journal_kind")
+                    gate = int(match.group("step"))
+                    gate_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[journal_kind]
+                    descriptor = journal_descriptor(
+                        entry,
+                        parent=selected.run_directory,
+                        journal_kind=journal_kind,
+                        gate=gate,
+                        complete=(gate_kind, gate) in completed_gates,
+                    )
+                    if descriptor is not None:
+                        journals.append(descriptor)
+            except OSError:
+                pass
+            journals.sort(
+                key=lambda item: (
+                    _integer(item.get("evaluation_gate")),
+                    _EVALUATION_GATE_KIND_ORDER.get(_string(item.get("gate_kind")), -1),
+                    _string(item.get("journal_name")),
+                ),
+                reverse=True,
+            )
+            return {
+                "schema": "sts2-heldout-journal-list-v1",
+                "run": {"key": selected.key, "run_id": selected.run_id, "lineage": selected.lineage},
+                "journals": journals,
+            }
+
+    def heldout_episodes(self, run_key: str, journal_key: str) -> JsonDict:
+        """Lazily parse one selected journal and return its bounded index."""
+
+        with self._lock:
+            selected = self._selected_run(run_key)
+            path, match = self._heldout_journal_path(selected, journal_key)
+        parsed, expected_gate = self._parsed_heldout_journal(selected, path, match)
+        return {
+            "schema": "sts2-heldout-episode-index-v1",
+            "run": {"key": selected.key, "run_id": selected.run_id, "lineage": selected.lineage},
+            "journal": {
+                "key": journal_key,
+                "journal_kind": match.group("journal_kind"),
+                "evaluation_gate": expected_gate,
+            },
+            "provenance": parsed.provenance,
+            "episodes": list(parsed.episodes),
+            "data_quality": {
+                "parsed_rows": parsed.parsed_rows,
+                "malformed_rows": parsed.malformed_rows,
+                "oversize_rows": parsed.oversize_rows,
+                "partial_line": parsed.partial_line,
+            },
+        }
+
+    def heldout_episode(self, run_key: str, journal_key: str, episode_id: str) -> JsonDict:
+        """Return one compact detailed episode from a lazily parsed journal."""
+
+        with self._lock:
+            selected = self._selected_run(run_key)
+            path, match = self._heldout_journal_path(selected, journal_key)
+        parsed, expected_gate = self._parsed_heldout_journal(selected, path, match)
+        detail = parsed.details.get(episode_id)
+        if detail is None:
+            raise KeyError(f"unknown episode id: {episode_id}")
+        return {
+            "schema": "sts2-heldout-episode-detail-v1",
+            "run": {"key": selected.key, "run_id": selected.run_id, "lineage": selected.lineage},
+            "journal": {
+                "key": journal_key,
+                "journal_kind": match.group("journal_kind"),
+                "evaluation_gate": expected_gate,
+            },
+            "episode": detail,
+        }
+
+    def heldout_replay_map(self, run_key: str, journal_key: str, episode_id: str) -> JsonDict:
+        """Reconstruct all visited Act maps from seed plus recorded actions.
+
+        This path is intentionally separate from aggregate refresh and compact
+        episode parsing because it launches a short-lived deterministic
+        HeadlessSim replay.  The result is cached only in process memory.
+        """
+
+        with self._lock:
+            selected = self._selected_run(run_key)
+            path, match = self._heldout_journal_path(selected, journal_key)
+        parsed, expected_gate = self._parsed_heldout_journal(selected, path, match)
+        detail = parsed.details.get(episode_id)
+        if detail is None:
+            raise KeyError(f"unknown episode id: {episode_id}")
+        payload = self._map_replay_cache.load(path, episode_id=episode_id, detail=detail)
+        return {
+            **payload,
+            "run": {"key": selected.key, "run_id": selected.run_id, "lineage": selected.lineage},
+            "journal": {
+                "key": journal_key,
+                "journal_kind": match.group("journal_kind"),
+                "evaluation_gate": expected_gate,
+            },
+        }
 
     def _checkpoint_directory(self, run: DiscoveredRun) -> Path | None:
         config = _mapping(run.start_event.get("config"))

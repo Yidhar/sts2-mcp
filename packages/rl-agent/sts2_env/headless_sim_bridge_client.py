@@ -583,6 +583,7 @@ class HeadlessSimBridgeClient:
         additional_relics: list[str] | None = None,
         training_revival_budget: int | None = None,
         seed: str | int | None = None,
+        ascension_level: int | None = None,
         timeout_ms: int = 45_000,
     ) -> dict[str, Any]:
         self._combat_episode_active = False
@@ -599,6 +600,8 @@ class HeadlessSimBridgeClient:
             params["character_id"] = _normalize_character(character)
         if seed is not None:
             params["seed"] = str(seed)
+        if ascension_level is not None:
+            params["ascension_level"] = int(ascension_level)
         if defensive_buffs:
             params["defensive_buffs"] = True
         build: dict[str, Any] = {}

@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v12"
+version = "sts2-relational-curriculum-config-v13"
 profile = "preheat"
 
 [model]

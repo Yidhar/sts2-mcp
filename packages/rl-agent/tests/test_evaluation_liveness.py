@@ -325,6 +325,72 @@ def test_guard_accepts_legacy_confirm_only_telemetry() -> None:
     ]
 
 
+def test_card_removal_telemetry_requires_observed_deck_mutation(
+    tmp_path: Path,
+) -> None:
+    records: list[dict[str, object]] = []
+
+    def append(
+        episode: int,
+        step: int,
+        action: dict[str, object],
+        *,
+        deck_count: int,
+        removal_is_legal: bool = False,
+    ) -> None:
+        record = _decision(
+            episode,
+            step,
+            selected=str(action["action"]),
+        )
+        record["selected_action"] = action
+        record["observation_summary"] = {
+            "player": {"deck_count": deck_count},
+            "card_selection": {},
+        }
+        record["legal_action_semantics"] = (
+            {"shop_purchase:card_removal": 1}
+            if removal_is_legal
+            else {}
+        )
+        records.append(record)
+
+    purchase = {
+        "action": "shop_purchase",
+        "item": {"category": "card_removal"},
+    }
+    # Completed: confirmation is followed by an authoritative deck decrement.
+    append(0, 0, purchase, deck_count=37, removal_is_legal=True)
+    append(0, 1, {"action": "select_card"}, deck_count=37)
+    append(0, 2, {"action": "confirm_selection"}, deck_count=37)
+    append(0, 3, {"action": "proceed"}, deck_count=36)
+
+    # Cancelled: it is not allowed to count as completion.
+    append(1, 0, purchase, deck_count=30, removal_is_legal=True)
+    append(1, 1, {"action": "select_card"}, deck_count=30)
+    append(1, 2, {"action": "cancel_selection"}, deck_count=30)
+
+    # Unresolved: merely entering the selection surface is not success.
+    append(2, 0, purchase, deck_count=25, removal_is_legal=True)
+    append(2, 1, {"action": "select_card"}, deck_count=25)
+
+    journal = tmp_path / "shop-removal-outcomes.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    assert summary["card_removal_legal_decision_count"] == 3
+    assert summary["card_removal_legal_candidate_count"] == 3
+    assert summary["card_removal_purchase_attempt_count"] == 3
+    assert summary["card_removal_completed_count"] == 1
+    assert summary["card_removal_cancelled_count"] == 1
+    assert summary["card_removal_unresolved_count"] == 1
+    assert summary["card_removal_completion_rate"] == 1 / 3
+    assert summary["card_removal_cancel_rate"] == 1 / 3
+
+
 def test_three_step_shop_removal_cancel_cycle_is_a_liveness_failure(
     tmp_path: Path,
 ) -> None:

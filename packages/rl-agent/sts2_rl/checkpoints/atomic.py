@@ -53,6 +53,7 @@ _PARENT_RELATION_BY_LOAD_MODE: dict[str, str | None] = {
     "exact_resume": "loaded_parent",
     "model_initialization": "model_parameter_initialization",
     "in_process_successor": "in_process_successor",
+    "in_process_rollback": "in_process_rollback",
 }
 
 

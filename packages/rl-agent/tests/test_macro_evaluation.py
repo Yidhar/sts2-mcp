@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sts2_rl.macro_evaluation as macro_evaluation_module
 from sts2_rl.encoding import GroundedEncodingConfig, GroundedObservationEncoder
 from sts2_rl.macro_evaluation import (
     MACRO_SENSITIVITY_SCHEMA,
@@ -368,3 +370,59 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     }
     with pytest.raises(ValueError, match="unexpectedly contains"):
         _diagnostic_model_initialization_config(unexpected)
+
+
+def test_checkpoint_probe_reconstructs_the_enabled_liveness_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure-credit checkpoint must be loaded with its complete model ABI."""
+
+    config = load_training_config(
+        profile="preheat",
+        config_path=(
+            Path(__file__).parents[1]
+            / "config"
+            / "experiments"
+            / "full_run_revival_v32_budget64_mature_model_init.toml"
+        ),
+    )
+    assert config.failure_credit.learning_enabled is True
+    source = RecurrentCandidateModel(
+        config.model.to_model_config(),
+        enable_transaction_heads=config.transaction_learning.enabled,
+        enable_liveness_head=True,
+    )
+    torch.save(source.state_dict(), tmp_path / "network.pt")
+
+    validated = SimpleNamespace(
+        root=tmp_path,
+        metadata={
+            "training_config": config.to_mapping(),
+            "training_state": {"environment_steps": 17},
+        },
+        manifest={"checkpoint_id": "test-liveness-checkpoint"},
+    )
+    monkeypatch.setattr(
+        macro_evaluation_module,
+        "validate_resume_checkpoint",
+        lambda _root: validated,
+    )
+    monkeypatch.setattr(
+        macro_evaluation_module,
+        "preflight_model_initialization",
+        lambda _root, *, config: validated,
+    )
+    monkeypatch.setattr(
+        macro_evaluation_module,
+        "evaluate_macro_sensitivity",
+        lambda model, _encoder: {
+            "liveness_head_enabled": model.liveness_head_enabled,
+        },
+    )
+
+    result = macro_evaluation_module.evaluate_checkpoint_macro_sensitivity(tmp_path)
+
+    assert result["liveness_head_enabled"] is True
+    assert result["checkpoint_id"] == "test-liveness-checkpoint"
+    assert result["training_state"] == {"environment_steps": 17}

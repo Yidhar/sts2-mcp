@@ -11,6 +11,7 @@ from sts2_rl.encoding import GroundedEncodingConfig, GroundedObservationEncoder
 from sts2_rl.encoding.grounded import (
     _NUMERIC_SLOT_BY_KEY,
     _bounded_number,
+    _candidate_local_roots,
     _canonical_model_observation,
     _hash_id,
 )
@@ -415,6 +416,63 @@ def test_canonical_shop_items_keep_sparse_slots_and_nested_runtime_facts() -> No
         GroundedObservationEncoder(
             replace(encoder.config, max_candidates=3)
         ).encode(translated, translated["available_actions"])
+
+
+def test_native_shop_card_removal_category_reaches_purchase_and_selection_semantics() -> None:
+    """Merchant removal is a normal indexed purchase, not a hidden special case."""
+
+    translated = translate_to_bridge_shape(
+        {
+            "state_type": "shop",
+            "run": {"active": True, "act": 1, "floor": 4, "room_type": "shop"},
+            "shop": {
+                "player": _player(gold=120),
+                "is_open": True,
+                "items": [
+                    {
+                        "index": 12,
+                        # This is the authoritative unpatched HeadlessSim field.
+                        "category": "card_removal",
+                        "cost": 75,
+                        "can_afford": True,
+                        "is_stocked": True,
+                    }
+                ],
+            },
+            "legal_actions": [
+                {"action": "shop_purchase", "index": 12},
+                {"action": "shop_skip"},
+            ],
+        },
+        episode_id="shop-card-removal-coverage",
+    )
+
+    assert translated["shop"]["items"][0]["category"] == "card_removal"
+    purchase = translated["available_actions"][0]
+    assert purchase["item"]["category"] == "card_removal"
+    assert purchase["action_handle"] == "sim:0:shop_purchase"
+    assert purchase["_sim_raw"] == {"action": "shop_purchase", "index": 12}
+    roots = _candidate_local_roots(
+        purchase,
+        model_kind="shop",
+        target_lookup={},
+    )
+    assert roots["item"]["type"] == "card_removal"
+    assert roots["transaction"] == {
+        "type": "transaction",
+        "operation_type": "purchase_card_removal",
+        "resource": "gold",
+        "source_zone": "Shop",
+        "destination_zone": "Selection",
+        "price": 75,
+        "amount": -75.0,
+    }
+
+    encoded = _encoder(max_candidates=2).encode(
+        translated,
+        translated["available_actions"],
+    )
+    assert encoded.snapshot.candidate_count == 2
 
 
 def test_malformed_observation_v2_coordinates_and_shop_slots_fail_closed() -> None:

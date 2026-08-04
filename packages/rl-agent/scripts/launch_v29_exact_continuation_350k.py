@@ -74,7 +74,11 @@ def _load_supervisor_core() -> Any:
     """Load the tested exact-resume supervisor as a private implementation."""
 
     path = Path(__file__).resolve().with_name("launch_v27_infinite_random_init.py")
-    module_name = "_sts2_exact_resume_supervisor_core"
+    # Every adapter gets a private mutable supervisor module.  Recovery
+    # adapters rebind the core's pins at import time; sharing one fixed module
+    # name would let importing a later lineage silently rewrite this launcher's
+    # RUN_NAME/checkpoint identity in the same process.
+    module_name = f"_{__name__.replace('.', '_')}_supervisor_core"
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing

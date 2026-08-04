@@ -253,6 +253,9 @@ def build_training_resources(
             episodic_learning_enabled=config.episodic_learning.enabled,
             failure_credit_shadow_enabled=(config.failure_credit.mode == "shadow"),
             failure_credit_learning_enabled=(config.failure_credit.learning_enabled),
+            selection_surface_epsilon_floor=(
+                config.curriculum.selection_surface_epsilon_floor
+            ),
             failure_credit_pipeline_config=FailureCreditPipelineConfig(
                 detector_window_steps=max(
                     config.diagnostics.deadlock_window,
