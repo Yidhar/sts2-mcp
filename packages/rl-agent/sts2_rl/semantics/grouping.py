@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Final
 
 from .identity import SemanticContractError, canonical_payload_bytes
@@ -186,12 +188,14 @@ def strict_action_groups(
     return tuple(groups)
 
 
-def strict_action_grouping_contract() -> Mapping[str, Any]:
-    """Return the frozen contract consumed by both semantics and encoding.
+@lru_cache(maxsize=1)
+def _strict_action_grouping_contract_json() -> str:
+    """Serialize the contract exactly once per process.
 
-    The encoder used to maintain a second implementation of this projection.
-    A shared versioned manifest makes the grouping authority singular and
-    ensures its exact rules participate in the model encoding ABI.
+    Every input is a module-level ``Final`` constant fixed at import time, so
+    the contract payload and its fingerprint are process constants.  The cache
+    holds an immutable JSON string; callers always receive freshly decoded
+    mappings and cannot mutate shared state.
     """
 
     payload = {
@@ -204,12 +208,25 @@ def strict_action_grouping_contract() -> Mapping[str, Any]:
         "canonicalization": "canonical_payload_bytes",
         "unknown_field_policy": "retain-or-singleton-fail-closed",
     }
-    return {
+    contract = {
         **payload,
         "fingerprint_sha256": hashlib.sha256(
             canonical_payload_bytes(payload)
         ).hexdigest(),
     }
+    return json.dumps(contract)
+
+
+def strict_action_grouping_contract() -> Mapping[str, Any]:
+    """Return the frozen contract consumed by both semantics and encoding.
+
+    The encoder used to maintain a second implementation of this projection.
+    A shared versioned manifest makes the grouping authority singular and
+    ensures its exact rules participate in the model encoding ABI.
+    """
+
+    contract: dict[str, Any] = json.loads(_strict_action_grouping_contract_json())
+    return contract
 
 
 __all__ = [

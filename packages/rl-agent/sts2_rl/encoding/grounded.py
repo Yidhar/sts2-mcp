@@ -709,15 +709,14 @@ if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invari
     )
 
 
-def grounding_encoding_identity() -> dict[str, Any]:
-    """Return the compact semantic identity persisted in every checkpoint.
+@lru_cache(maxsize=1)
+def _grounding_encoding_identity_fingerprint() -> str:
+    """Hash the reviewed encoder contract exactly once per process.
 
-    Config dimensions alone cannot detect a changed allowlist, exclusion
-    firewall, domain vocabulary, or feature-slot layout.  Hash those reviewed
-    contracts so exact resume and cross-curriculum model initialization fail
-    closed after an encoder change, even when tensor shapes still match.
-    Algorithm changes that do not alter this payload must bump
-    :data:`GROUNDING_ENCODING_VERSION`.
+    Every input below is a module-level ``Final`` constant fixed at import
+    time, so the serialized contract and its digest are process constants.
+    Callers receive a fresh dict built from immutable scalars; the cached
+    value can never be mutated through a returned mapping.
     """
 
     contract = {
@@ -764,11 +763,25 @@ def grounding_encoding_identity() -> dict[str, Any]:
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def grounding_encoding_identity() -> dict[str, Any]:
+    """Return the compact semantic identity persisted in every checkpoint.
+
+    Config dimensions alone cannot detect a changed allowlist, exclusion
+    firewall, domain vocabulary, or feature-slot layout.  Hash those reviewed
+    contracts so exact resume and cross-curriculum model initialization fail
+    closed after an encoder change, even when tensor shapes still match.
+    Algorithm changes that do not alter this payload must bump
+    :data:`GROUNDING_ENCODING_VERSION`.
+    """
+
     return {
         "version": GROUNDING_ENCODING_VERSION,
         "min_token_feature_dim": MIN_TOKEN_FEATURE_DIM,
         "feature_abi_end": _FEATURE_ABI_END,
-        "fingerprint_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+        "fingerprint_sha256": _grounding_encoding_identity_fingerprint(),
     }
 
 

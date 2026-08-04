@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
@@ -40,6 +42,14 @@ class SurfaceRegistry:
         self._phase_roots: dict[str, SurfaceAdapter] = {}
         self._state_type_roots: dict[str, SurfaceAdapter] = {}
         self._action_kind_roots: dict[str, SurfaceAdapter] = {}
+        # Manifest caches.  The adapter set only changes through ``register``,
+        # which invalidates all three, so cached values always describe the
+        # current registry.  The JSON string is immutable and re-decoded per
+        # call; the interned-index set records which ``SemanticKeyIndex``
+        # instances already hold this manifest payload for collision auditing.
+        self._manifest_json: str | None = None
+        self._manifest_key: SemanticKey | None = None
+        self._manifest_interned: weakref.WeakSet[SemanticKeyIndex] = weakref.WeakSet()
         for adapter in adapters:
             self.register(adapter)
 
@@ -52,6 +62,9 @@ class SurfaceRegistry:
         self._adapters[adapter.spec.spec_id] = adapter
         if adapter.spec.role is SurfaceRole.ROOT:
             self._index_authoritative_claims(adapter)
+        self._manifest_json = None
+        self._manifest_key = None
+        self._manifest_interned.clear()
 
     def _validate_authoritative_claims(self, adapter: SurfaceAdapter) -> None:
         claims = (
@@ -152,23 +165,37 @@ class SurfaceRegistry:
         )
 
     def manifest_payload(self) -> dict[str, Any]:
-        return {
-            "contract_version": SURFACE_REGISTRY_CONTRACT_VERSION,
-            "adapters": [
-                adapter.spec.to_manifest()
-                for adapter in sorted(
-                    self._adapters.values(),
-                    key=lambda item: item.spec.spec_id,
-                )
-            ],
-        }
+        if self._manifest_json is None:
+            self._manifest_json = json.dumps(
+                {
+                    "contract_version": SURFACE_REGISTRY_CONTRACT_VERSION,
+                    "adapters": [
+                        adapter.spec.to_manifest()
+                        for adapter in sorted(
+                            self._adapters.values(),
+                            key=lambda item: item.spec.spec_id,
+                        )
+                    ],
+                }
+            )
+        payload: dict[str, Any] = json.loads(self._manifest_json)
+        return payload
 
     def manifest_key(self, key_index: SemanticKeyIndex) -> SemanticKey:
-        return key_index.intern(
+        cached = self._manifest_key
+        if cached is not None and key_index in self._manifest_interned:
+            # ``key_index`` already interned exactly this canonical payload,
+            # so repeating ``intern`` would re-store identical bytes and
+            # return an equal key.  Skipping it loses no collision audit.
+            return cached
+        key = key_index.intern(
             namespace="surface_registry_manifest",
             schema_version=SURFACE_REGISTRY_CONTRACT_VERSION,
             payload=self.manifest_payload(),
         )
+        self._manifest_key = key
+        self._manifest_interned.add(key_index)
+        return key
 
 
 def default_surface_registry() -> SurfaceRegistry:
