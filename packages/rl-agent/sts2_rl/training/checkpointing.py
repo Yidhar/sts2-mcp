@@ -605,13 +605,15 @@ def _validated_episodic_replay_payload(
     payload: object,
     *,
     config: TrainingConfig,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, int | str]]:
     """Validate a detached episodic replay in a fresh probe.
 
     Exact resume must prove the complete byte-bounded corpus, accounting
     counters, and sampler RNG are loadable before any live learner resource is
     mutated.  The probe has the exact active capacities but is otherwise
-    independent of the runtime replay.
+    independent of the runtime replay.  The metadata spec is read from the
+    same loaded probe (``metrics`` is a pure read), so the payload is
+    deserialized exactly once per validation site.
     """
 
     if not isinstance(payload, dict):
@@ -626,17 +628,7 @@ def _validated_episodic_replay_payload(
                 expected_config=expected_config,
                 expected_fingerprint=expected_fingerprint,
             )
-    return payload
-
-
-def _episodic_replay_spec(
-    payload: dict[str, Any],
-    *,
-    config: TrainingConfig,
-) -> dict[str, int | str]:
-    probe = _new_episodic_replay(config=config)
-    probe.load_state_dict(payload)
-    return dict(probe.metrics())
+    return payload, dict(probe.metrics())
 
 
 def _new_failure_credit_replay(
@@ -654,29 +646,22 @@ def _validated_failure_credit_replay_payload(
     payload: object,
     *,
     config: TrainingConfig,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[str, int | str]]:
     """Validate an exact replay-v5 continuation in a detached owner.
 
     The typed corpus, atomic matched pairs, capacity/byte accounting, owned RNG,
     and all replay counters are validated before any live resource is mutated.
     A v3 transaction sidecar is never accepted under this filename or ABI.
+    The metadata spec is read from the same loaded probe (``metrics`` is a
+    pure read), so the payload is deserialized exactly once per validation
+    site.
     """
 
     if not isinstance(payload, dict):
         raise TypeError("failure-credit replay checkpoint must be an object")
     probe = _new_failure_credit_replay(config=config)
     probe.load_state_dict(payload)
-    return payload
-
-
-def _failure_credit_replay_spec(
-    payload: dict[str, object],
-    *,
-    config: TrainingConfig,
-) -> dict[str, int | str]:
-    probe = _new_failure_credit_replay(config=config)
-    probe.load_state_dict(payload)
-    return dict(probe.metrics())
+    return payload, dict(probe.metrics())
 
 
 def _stochastic_state(resources: TrainingResources) -> dict[str, Any]:
@@ -1199,20 +1184,22 @@ def save_training_checkpoint(
                 config=config,
             )
         episodic_replay_payload = None
+        episodic_replay_spec = None
         if config.episodic_learning.enabled:
             if resources.episodic_replay is None:
                 raise RuntimeError("episodic-learning resources have no replay sidecar")
             episodic_replay_payload = resources.episodic_replay.state_dict()
-            _validated_episodic_replay_payload(
+            episodic_replay_payload, episodic_replay_spec = _validated_episodic_replay_payload(
                 episodic_replay_payload,
                 config=config,
             )
         failure_credit_replay_payload = None
+        failure_credit_replay_spec = None
         if config.failure_credit.learning_enabled:
             if resources.failure_credit_replay is None:
                 raise RuntimeError("failure-credit learning resources have no replay-v5 sidecar")
             failure_credit_replay_payload = resources.failure_credit_replay.state_dict()
-            _validated_failure_credit_replay_payload(
+            failure_credit_replay_payload, failure_credit_replay_spec = _validated_failure_credit_replay_payload(
                 failure_credit_replay_payload,
                 config=config,
             )
@@ -1279,14 +1266,7 @@ def save_training_checkpoint(
             "failure_credit_mode": config.failure_credit.mode,
             "liveness_cost_heads_enabled": (config.failure_credit.learning_enabled),
             "failure_credit_replay_enabled": (config.failure_credit.learning_enabled),
-            "failure_credit_replay_spec": (
-                _failure_credit_replay_spec(
-                    failure_credit_replay_payload,
-                    config=config,
-                )
-                if failure_credit_replay_payload is not None
-                else None
-            ),
+            "failure_credit_replay_spec": failure_credit_replay_spec,
             "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
             "episodic_target_abi": _EPISODIC_TARGET_ABI,
             "sdpa_backend": recorded_sdpa,
@@ -1296,11 +1276,7 @@ def save_training_checkpoint(
                 _transaction_replay_spec(transaction_replay_payload) if transaction_replay_payload is not None else None
             ),
             "episodic_replay_enabled": config.episodic_learning.enabled,
-            "episodic_replay_spec": (
-                _episodic_replay_spec(episodic_replay_payload, config=config)
-                if episodic_replay_payload is not None
-                else None
-            ),
+            "episodic_replay_spec": episodic_replay_spec,
             "resolved_device": str(resources.device),
             "resolved_collector_device": str(next(resources.collector_model.parameters()).device),
             "total_steps": state.environment_steps,
@@ -1405,24 +1381,18 @@ def load_training_checkpoint(
         if validated.metadata.get("transaction_replay_spec") != _transaction_replay_spec(transaction_replay_payload):
             raise ValueError("checkpoint transaction replay metadata differs from payload")
     if config.episodic_learning.enabled:
-        episodic_replay_payload = _validated_episodic_replay_payload(
+        episodic_replay_payload, episodic_replay_spec = _validated_episodic_replay_payload(
             episodic_replay_payload,
             config=config,
         )
-        if validated.metadata.get("episodic_replay_spec") != _episodic_replay_spec(
-            episodic_replay_payload,
-            config=config,
-        ):
+        if validated.metadata.get("episodic_replay_spec") != episodic_replay_spec:
             raise ValueError("checkpoint episodic replay metadata differs from payload")
     if config.failure_credit.learning_enabled:
-        failure_credit_replay_payload = _validated_failure_credit_replay_payload(
+        failure_credit_replay_payload, failure_credit_replay_spec = _validated_failure_credit_replay_payload(
             failure_credit_replay_payload,
             config=config,
         )
-        if validated.metadata.get("failure_credit_replay_spec") != _failure_credit_replay_spec(
-            failure_credit_replay_payload,
-            config=config,
-        ):
+        if validated.metadata.get("failure_credit_replay_spec") != failure_credit_replay_spec:
             raise ValueError("checkpoint failure-credit replay metadata differs from payload")
     state = training_state_from_metadata(validated.metadata)
 
@@ -1509,8 +1479,11 @@ def initialize_model_from_checkpoint(
     # Preserve the freshly constructed target-only parameters and RNG lineage;
     # the migration overlays compatible learned tensors onto that exact model
     # rather than constructing a second set of randomly initialized heads.
-    probe = deepcopy(resources.model)
-    probe.load_state_dict(migrated, strict=True)
+    # No probe dry-run is needed here: ``migrated`` starts as an exact copy of
+    # the live model's own state dict, every overlaid tensor was validated
+    # above by exact name, shape, and dtype against that state dict, and the
+    # key sets are therefore identical, so the strict load below cannot fail
+    # or partially mutate the model.
     resources.model.load_state_dict(migrated, strict=True)
     resources.publish_collector_policy()
     return validated.root
