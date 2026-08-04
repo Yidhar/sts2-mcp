@@ -438,6 +438,76 @@ def test_flow_completion_is_zero_liveness_control_without_generic_prefer() -> No
     assert completion.plan.actor_label_count == 0
 
 
+def test_selection_clean_exit_keeps_completion_prefer_credit() -> None:
+    pipeline, encoder = _pipeline()
+    selection = _event("SELECT", selected_count=1)
+    selection_actions = (
+        {
+            "action_handle": "confirm-selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+            "selection_operation": "confirm",
+            "kind": "confirm_selection",
+        },
+        {
+            "action_handle": "deselect-strike",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "deselect",
+            "selection_operation": "deselect",
+            "kind": "deselect_card",
+            "card": {
+                "card_id": "CARD.STRIKE",
+                "card_instance_id": "strike-instance",
+                "upgrade_level": 0,
+            },
+        },
+    )
+    map_observation = {
+        "phase": "map",
+        "decision_domain": "map",
+        "run": {"act": 1, "floor": 9},
+        "map": {"current_coordinate": {"x": 1, "y": 9}},
+        "player": {"hp": 60, "max_hp": 80},
+    }
+    map_actions = (
+        {
+            "action_handle": "map-next",
+            "model_action_kind": "map_node",
+            "kind": "map_node",
+            "coordinate": {"x": 2, "y": 10},
+        },
+    )
+
+    kind = _observe(
+        pipeline,
+        encoder,
+        step=0,
+        before=selection,
+        actions=selection_actions,
+        selected=0,
+        after=map_observation,
+        after_actions=map_actions,
+    )
+    result = pipeline.finalize(
+        failure_kind=None,
+        local_failure=False,
+        terminal_succeeded=True,
+    )
+    completion = result.records[0]
+
+    assert kind is ProgressKind.FLOW_ADVANCE
+    assert completion.incident.outcome is FailureOutcome.COMPLETED
+    assert completion.plan.strata == (EvidenceStratum.COMPLETION_CONTROL,)
+    assert completion.plan.liveness_q_targets
+    assert len(completion.plan.direct_policy_targets) == 1
+    preferred = completion.plan.direct_policy_targets[0]
+    assert preferred.target is DirectPolicyTarget.PREFER
+    assert completion.plan.context.steps[preferred.step_index].selected_action == (
+        completion.plan.context.steps[preferred.step_index].candidate_actions[0]
+    )
+    assert completion.plan.actor_label_count == 1
+
+
 def test_combat_net_damage_resets_stall_epoch_without_completion_or_prefer() -> None:
     pipeline, encoder = _pipeline()
     before = {

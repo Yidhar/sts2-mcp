@@ -58,7 +58,16 @@ from .contracts import (
 from .corpus import EvidenceRecord, evidence_record_storage_nbytes
 
 FAILURE_CREDIT_DETECTOR_VERSION: Final = "sts2-semantic-macro-cycle-detector-v4"
-FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v4"
+FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v5"
+
+# Completion is not generic strategic approval. Only the two transactional
+# surfaces whose local objective is to finish a multi-step selection receive
+# direct PREFER credit when the semantic kernel verifies their clean exit.
+# Event, map, shop and combat progress remain critic-only unless an atomic
+# matched-outcome witness supplies stronger evidence.
+_COMPLETION_PREFER_SURFACE_IDS: Final[frozenset[str]] = frozenset(
+    {"rest", "selection"}
+)
 
 
 def _positive_integer(value: object, *, label: str) -> int:
@@ -204,6 +213,7 @@ class _CapturedDecision:
 class _OpenMacro:
     builder: MacroEdgeBuilder
     source_step: int
+    source_spec_id: str
     direct_credit_allowed: bool
     overflowed: bool = False
     forced_count: int = 0
@@ -212,6 +222,7 @@ class _OpenMacro:
 @dataclass(frozen=True, slots=True)
 class _ClosedMacro:
     edge: MacroEdge
+    source_spec_id: str
     direct_credit_allowed: bool
     progress_epoch: int
 
@@ -467,6 +478,7 @@ class FailureCreditEpisodePipeline:
                     legal_candidate_count=int(np.count_nonzero(step.snapshot.action_mask)),
                 ),
                 source_step=step.episode_step,
+                source_spec_id=before.scopes.active.spec_id,
                 direct_credit_allowed=active_spec.allows_direct_policy_credit,
             )
         elif self._active_macro is not None:
@@ -507,6 +519,7 @@ class FailureCreditEpisodePipeline:
                 destination_node=after.node,
                 destination_anchor=after.anchor,
             ),
+            source_spec_id=active.source_spec_id,
             direct_credit_allowed=active.direct_credit_allowed and not active.overflowed,
             progress_epoch=self._progress_epoch,
         )
@@ -750,14 +763,45 @@ class FailureCreditEpisodePipeline:
             # reproducible cannot provide a factual candidate-Q control.
             self._completion_controls_observed += 1
             return
-        # A completed transition is a factual zero-liveness-cost control, not
-        # evidence that its initiating action is strategically preferable.
-        # Positive actor credit requires an atomic matched-outcome comparison
-        # (or a future explicit completion-vs-loop witness), never merely
-        # leaving an event/reward/shop/selection surface.
+        # A completed transition is always a factual zero-liveness-cost
+        # control. It becomes positive actor evidence only for a verified clean
+        # exit from the reviewed selection transaction surfaces. This repairs
+        # the asymmetric selection curriculum (cycles were punished while
+        # successful completion had no policy path) without turning ordinary
+        # map/event/shop progress into generic strategic approval.
+        learn_step_index = context.learn_step_indices[-1]
+        learn_step = context.steps[learn_step_index]
+        completion_witness: PolicyWitness | None = None
+        if (
+            macro.direct_credit_allowed
+            and macro.source_spec_id in _COMPLETION_PREFER_SURFACE_IDS
+            and learn_step.actor_eligible
+        ):
+            supporting_steps = tuple(
+                sorted(
+                    {
+                        learn_step.episode_step,
+                        macro.edge.closing_step_id,
+                    }
+                )
+            )
+            completion_witness = PolicyWitness(
+                witness_id=_stable_id(
+                    "completion-witness",
+                    context.context_id,
+                    macro.source_spec_id,
+                    receipt.kind.value,
+                ),
+                kind=WitnessKind.COMPLETION_CONTROL,
+                attributed_step_indices=(learn_step_index,),
+                supporting_episode_steps=supporting_steps,
+                occurrences=1,
+                cycle_span=None,
+                successor_confirmed=True,
+            )
         pending = _PendingCompletion(
             context=context,
-            witness=None,
+            witness=completion_witness,
             scope_key=self._scope_key(macro.edge.anchor),
             failure_kind=(
                 "verified_flow_completion" if receipt.kind is ProgressKind.FLOW_ADVANCE else "verified_durable_commit"
@@ -1052,6 +1096,7 @@ class FailureCreditEpisodePipeline:
                     outcome=MacroEdgeOutcome.CENSORED,
                     closing_step_id=self._captured[-1].step.episode_step,
                 ),
+                source_spec_id=active.source_spec_id,
                 direct_credit_allowed=False,
                 progress_epoch=self._progress_epoch,
             )

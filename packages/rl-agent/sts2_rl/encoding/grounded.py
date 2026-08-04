@@ -695,13 +695,32 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V13 admits only the exact native ``upgrade_preview(s)`` factual containers
-# through the preview firewall and moves unknown future zones into the region
-# above every fixed zone ID.  Tensor shapes and feature slots remain stable,
-# but token presence and zone-embedding semantics change.  Exact resume must
-# therefore fail closed; explicitly reviewed model-parameter initialization is
-# still shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v13"
+# V14 makes the native shop-item alias contract part of the encoding identity.
+# V13 and the first implementation of merchant card removal shared a digest
+# even though a category-only native item changed from ``purchase_item`` / Run
+# to ``purchase_card_removal`` / Selection. Tensor shapes and feature slots
+# remain stable, but candidate transaction semantics differ. Exact resume must
+# therefore fail closed; explicitly reviewed model-parameter initialization
+# from the pinned V13 identity remains shape compatible.
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v14"
+
+# This table is executable encoder semantics, not parser convenience. Keep it
+# immutable and include it verbatim in the grounding identity payload so any
+# future alias addition, removal, or precedence change invalidates exact
+# continuation even when the version constant is accidentally left unchanged.
+_CANONICAL_ITEM_ALIAS_TABLE: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    ("id", ("id", "model_id")),
+    ("type", ("type", "category", "item_type", "item_kind", "kind")),
+    ("price", ("price", "cost")),
+    ("rarity", ("rarity",)),
+    ("slot_type", ("slot_type",)),
+    ("is_affordable", ("is_affordable",)),
+    ("enough_gold", ("enough_gold",)),
+    ("is_stocked", ("is_stocked",)),
+    ("is_on_sale", ("is_on_sale",)),
+    ("used", ("used",)),
+    ("slot_index", ("slot_index", "index")),
+)
 
 if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invariant
     raise RuntimeError(
@@ -709,17 +728,15 @@ if _FEATURE_ABI_END > MIN_TOKEN_FEATURE_DIM:  # pragma: no cover - import invari
     )
 
 
-@lru_cache(maxsize=1)
-def _grounding_encoding_identity_fingerprint() -> str:
-    """Hash the reviewed encoder contract exactly once per process.
+def _grounding_encoding_contract() -> dict[str, Any]:
+    """Build the complete deterministic payload behind the compact identity.
 
-    Every input below is a module-level ``Final`` constant fixed at import
-    time, so the serialized contract and its digest are process constants.
-    Callers receive a fresh dict built from immutable scalars; the cached
-    value can never be mutated through a returned mapping.
+    This private helper intentionally remains uncached so tests can audit the
+    payload itself. Production callers hash it once through
+    :func:`_grounding_encoding_identity_fingerprint`.
     """
 
-    contract = {
+    return {
         "version": GROUNDING_ENCODING_VERSION,
         "min_token_feature_dim": MIN_TOKEN_FEATURE_DIM,
         "feature_abi_end": _FEATURE_ABI_END,
@@ -760,8 +777,25 @@ def _grounding_encoding_identity_fingerprint() -> str:
         "candidate_local_roots": sorted(_CANDIDATE_LOCAL_ROOTS),
         "zone_ids": _ZONE_IDS,
         "unknown_zone_hash_start": _UNKNOWN_ZONE_HASH_START,
+        "canonical_item_aliases": [
+            [key, list(aliases)]
+            for key, aliases in _CANONICAL_ITEM_ALIAS_TABLE
+        ],
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
+
+
+@lru_cache(maxsize=1)
+def _grounding_encoding_identity_fingerprint() -> str:
+    """Hash the reviewed encoder contract exactly once per process.
+
+    Every input below is a module-level ``Final`` constant fixed at import
+    time, so the serialized contract and its digest are process constants.
+    Callers receive a fresh dict built from immutable scalars; the cached
+    value can never be mutated through a returned mapping.
+    """
+
+    contract = _grounding_encoding_contract()
     serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()
 
@@ -2558,24 +2592,10 @@ def _canonical_selection(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def _canonical_item(value: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for key, aliases in {
-        "id": ("id", "model_id"),
-        # ``category`` is the native HeadlessSim field.  The maintained C#
-        # patch also mirrors it into ``type``, but accepting the authoritative
-        # source name here keeps merchant card removal visible across restored
-        # or independently built simulator binaries instead of silently
-        # degrading it to an anonymous shop item.
-        "type": ("type", "category", "item_type", "item_kind", "kind"),
-        "price": ("price", "cost"),
-        "rarity": ("rarity",),
-        "slot_type": ("slot_type",),
-        "is_affordable": ("is_affordable",),
-        "enough_gold": ("enough_gold",),
-        "is_stocked": ("is_stocked",),
-        "is_on_sale": ("is_on_sale",),
-        "used": ("used",),
-        "slot_index": ("slot_index", "index"),
-    }.items():
+    # ``category`` is the native HeadlessSim field. The maintained C# patch
+    # also mirrors it into ``type``; the shared, fingerprinted alias table
+    # keeps both sources semantically identical and ABI-auditable.
+    for key, aliases in _CANONICAL_ITEM_ALIAS_TABLE:
         item = _first_present(value, *aliases)
         if item is not None:
             result[key] = item

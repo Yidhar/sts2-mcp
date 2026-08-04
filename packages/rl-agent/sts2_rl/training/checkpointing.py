@@ -158,7 +158,11 @@ def _failure_credit_abi() -> dict[str, str]:
 # learned parameter remains shape compatible. Queue/replay action indexes,
 # encoded snapshots, behavior probabilities, and optimizer moments still
 # belong to their source ABI, so these exceptions are valid only for the
-# model-only path.
+# model-only path. V13 admits native upgrade previews and isolates unknown
+# zones. V14 fingerprints the native shop-item alias table after the V13
+# implementation had changed category-only card-removal candidates without
+# changing its compact identity. V13 -> V14 is shape compatible only for
+# model parameters; candidate semantics, replay and optimizer state are not.
 #
 # Keep both sides as complete, immutable identities rather than accepting a
 # version prefix or dimensions alone.  Any later encoder edit changes the
@@ -199,12 +203,53 @@ _V13_ENCODING_IDENTITY = {
     "feature_abi_end": 215,
     "fingerprint_sha256": "ac119f0d1fe0de5c09394e091169f3b7712084bce8a90a9d02be4732f60ce5bf",
 }
+_V14_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v14",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    # A literal is required here: deriving it from the active encoder would
+    # silently bless any future unreviewed semantic change.
+    "fingerprint_sha256": "6a169803fdcd399272357dfe351a8b7375f16a1cb9e7cfccdc3b047f13f746ce",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V12_ENCODING_IDENTITY,
         _V13_ENCODING_IDENTITY,
     ),
+    (
+        _V13_ENCODING_IDENTITY,
+        _V14_ENCODING_IDENTITY,
+    ),
 )
+
+
+def _has_reviewed_model_initialization_encoding_path(
+    source: object,
+    target: object,
+) -> bool:
+    """Return whether exact pinned identities have a fully reviewed path.
+
+    Migrations are graph edges rather than a version-range allowlist. This
+    permits V12 to reach V14 only through the independently reviewed V12 ->
+    V13 and V13 -> V14 model-only edges, while unknown or tampered
+    fingerprints still fail closed.
+    """
+
+    frontier: list[object] = [source]
+    visited: list[object] = []
+    while frontier:
+        current = frontier.pop()
+        if current == target:
+            return True
+        if any(current == item for item in visited):
+            continue
+        visited.append(current)
+        frontier.extend(
+            destination
+            for origin, destination in _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS
+            if current == origin
+        )
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -908,17 +953,18 @@ def _validate_encoding_contract(
     Exact continuation may never cross a changed decision space: queued
     ``action_index`` values, behavior probabilities, transaction replay and
     recurrent state all belong to the source encoder.  Explicit model
-    parameter initialization may cross only the explicitly reviewed v12 ->
-    v13 migration.  Its tensor features are unchanged while strict action
-    grouping moves to the single Decision Semantics Kernel authority.
-    Shape-compatible but otherwise unknown encoders remain rejected.
+    parameter initialization may cross only a complete path of explicitly
+    reviewed, pinned encoding identities. Shape-compatible but otherwise
+    unknown encoders remain rejected.
     """
 
     target = grounding_encoding_identity()
     if source == target:
         return
-    migration = (source, target)
-    if model_only and any(migration == reviewed for reviewed in _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS):
+    if model_only and _has_reviewed_model_initialization_encoding_path(
+        source,
+        target,
+    ):
         return
     if model_only:
         raise ValueError(

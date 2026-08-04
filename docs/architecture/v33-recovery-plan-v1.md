@@ -157,6 +157,14 @@ liveness 损失不再与主 V-trace 共抢同一个全局 clip 配额：
 
 `liveness_completion_policy_weight` 由 0 恢复为 0.15。成功完成 selection transaction 的
 completion control 可以给策略头正信用，修复“循环有惩罚、成功完成却永远没有平反标签”的不对称。
+正信用严格限于语义内核确认的 `rest/selection` clean exit；普通 event/map/shop 推进仍然是
+critic-only completion control，不能被误当成战略选择正确。collector ABI 因此升为
+`sts2-failure-credit-collector-v5`。
+
+回归测试：
+
+- `test_selection_clean_exit_keeps_completion_prefer_credit`
+- `test_forge_selection_clean_exit_counts_and_retains_positive_credit`
 
 ### B6. 选择面定向探索——已修复
 

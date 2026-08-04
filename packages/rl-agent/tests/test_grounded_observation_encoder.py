@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import pickle
 from copy import deepcopy
 from dataclasses import replace
@@ -1259,12 +1260,53 @@ def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
 def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
+    assert identity == {
+        "version": "grounded-relational-runtime-encoding-v14",
+        "min_token_feature_dim": 224,
+        "feature_abi_end": 215,
+        "fingerprint_sha256": (
+            "6a169803fdcd399272357dfe351a8b7375f16a1cb9e7cfccdc3b047f13f746ce"
+        ),
+    }
     assert identity["version"] == GROUNDING_ENCODING_VERSION
     assert identity["min_token_feature_dim"] == 224
     assert identity["feature_abi_end"] <= 224
     assert len(identity["fingerprint_sha256"]) == 64
     assert set(identity["fingerprint_sha256"]) <= set("0123456789abcdef")
     assert grounding_encoding_identity() == identity
+
+
+def test_native_item_alias_precedence_is_part_of_encoding_fingerprint() -> None:
+    contract = grounded_encoding._grounding_encoding_contract()
+    aliases = contract["canonical_item_aliases"]
+    assert [
+        "type",
+        ["type", "category", "item_type", "item_kind", "kind"],
+    ] in aliases
+
+    serialized = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(serialized.encode()).hexdigest() == (
+        grounding_encoding_identity()["fingerprint_sha256"]
+    )
+
+    # Reconstruct the pre-fix alias semantics without mutating module state.
+    # The digest must change even if somebody forgets the explicit version
+    # bump during a future alias edit.
+    legacy_contract = deepcopy(contract)
+    legacy_contract["canonical_item_aliases"] = [
+        [key, [alias for alias in values if alias != "category"]]
+        if key == "type"
+        else [key, values]
+        for key, values in aliases
+    ]
+    legacy_serialized = json.dumps(
+        legacy_contract,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert hashlib.sha256(legacy_serialized.encode()).hexdigest() != (
+        grounding_encoding_identity()["fingerprint_sha256"]
+    )
 
 
 def test_unknown_zone_hashes_are_disjoint_from_every_fixed_zone() -> None:
@@ -1305,12 +1347,31 @@ def test_exact_native_upgrade_preview_reaches_world_and_candidate_binding() -> N
         "upgrade_level": 0,
         "is_upgraded": False,
         "cost": 2,
+        "dynamic_vars": [
+            {
+                "name": "damage",
+                "var_type": "DamageVar",
+                "base_value": 6,
+                "current_value": 6,
+                "int_value": 6,
+            }
+        ],
     }
     preview = {
         "id": "CARD.UPGRADE_TEST",
         "upgrade_level": 1,
         "is_upgraded": True,
         "cost": 1,
+        "dynamic_vars": [
+            {
+                "name": "damage",
+                "var_type": "DamageVar",
+                "base_value": 9,
+                "current_value": 9,
+                "int_value": 9,
+                "was_just_upgraded": True,
+            }
+        ],
     }
     observation = {
         "phase": "deck_upgrade",
@@ -1352,6 +1413,13 @@ def test_exact_native_upgrade_preview_reaches_world_and_candidate_binding() -> N
         row[upgrade_slot].item() == pytest.approx(_bounded_number(1))
         for row in local_features
     )
+    current_value_slot = _DYNAMIC_VALUE_SLOT_BY_KEY["current_value"]
+    # The model must receive the upgraded card's actual post-upgrade effect,
+    # not only an ``is_upgraded`` flag or the source card's old value.
+    assert any(
+        row[current_value_slot].item() == pytest.approx(_bounded_number(9))
+        for row in local_features
+    )
 
     source_relation = candidate.entity_aux_ids[0, 0]
     source_relation_binding = candidate.relation_binding_ids[0, 0]
@@ -1386,6 +1454,11 @@ def test_exact_native_upgrade_preview_reaches_world_and_candidate_binding() -> N
             .item()
         )
         >= 2
+    )
+    world_features = batch.world.features[0, world_active]
+    assert any(
+        row[current_value_slot].item() == pytest.approx(_bounded_number(9))
+        for row in world_features
     )
 
 

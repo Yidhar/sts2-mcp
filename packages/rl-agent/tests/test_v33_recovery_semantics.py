@@ -11,8 +11,13 @@ import torch
 from sts2_rl.training import build_training_resources, summarize_evaluation
 from sts2_rl.training import runtime as runtime_module
 from sts2_rl.training.collector import EpisodeMetrics, _is_forge_selection_surface
-from sts2_rl.training.config import TransactionLearningConfig
+from sts2_rl.training.config import FailureCreditConfig, TransactionLearningConfig
 from sts2_rl.training.episode_replay import EpisodeDecisionStep
+from sts2_rl.training.failure_credit import (
+    DirectPolicyTarget,
+    EvidenceStratum,
+    FailureOutcome,
+)
 from sts2_rl.training.runtime import (
     _checkpoint_role_for_prefix,
     _deadlock_streak_transition,
@@ -144,6 +149,67 @@ class _RestForgeSelectionCycleBackend(TerminalWithoutObservationFlagsBackend):
         return observation
 
 
+class _RestForgeSelectionSuccessBackend(_RestForgeSelectionCycleBackend):
+    """Complete one rest-site forge transaction and then win the run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.result_terminal_step = 3
+
+    def _actions(self) -> tuple[dict[str, object], ...]:
+        if self._step <= 1:
+            return super()._actions()
+        return (
+            {
+                "action_handle": "confirm-upgrade",
+                "action": "confirm_selection",
+                "kind": "confirm_selection",
+                "model_action_kind": "card_selection",
+                "model_action_variant": "confirm",
+                "selection_operation": "confirm",
+            },
+            {
+                "action_handle": "deselect-upgrade",
+                "action": "deselect_card",
+                "kind": "deselect_card",
+                "model_action_kind": "card_selection",
+                "model_action_variant": "deselect",
+                "selection_operation": "deselect",
+                "card": {
+                    **self._card("CARD.STRIKE", "strike-1"),
+                    "selection_membership": "selected",
+                    "is_selected": True,
+                },
+            },
+        )
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+        observation = super()._observation(terminal=terminal)
+        if not terminal:
+            return observation
+        observation.pop("card_selection", None)
+        observation.update(
+            phase="map",
+            decision_domain="map",
+            state_type="map",
+            screen="MAP",
+        )
+        player = observation["player"]
+        assert isinstance(player, dict)
+        player["deck"] = [
+            {
+                **self._card("CARD.STRIKE", "strike-1"),
+                "is_upgraded": True,
+                "upgrade_level": 1,
+            },
+            self._card("CARD.DEFEND", "defend-1"),
+        ]
+        run = observation["run"]
+        assert isinstance(run, dict)
+        run.update(active=False, room_type="map", room_model_id="MAP")
+        return observation
+
+
 def _recovery_config(*, max_steps: int, repeat_threshold: int):
     base = _event_loop_config(durable_window=max_steps)
     return replace(
@@ -271,6 +337,65 @@ def test_forge_surface_and_evaluation_metric_are_exact() -> None:
     assert summary["forge_transactions_started"] == 2
     assert summary["forge_transactions_completed"] == 1
     assert summary["forge_transaction_completion_rate"] == pytest.approx(0.5)
+
+
+def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None:
+    base = _recovery_config(max_steps=8, repeat_threshold=8)
+    config = replace(
+        base,
+        failure_credit=FailureCreditConfig(
+            mode="shadow",
+            burn_in_steps=1,
+            maximum_context_steps=16,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=_RestForgeSelectionSuccessBackend(),
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("forge-success-path")
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.0,
+            deterministic=True,
+            record=True,
+        )
+    finally:
+        resources.close()
+
+    assert episode.metrics.run_won
+    assert not episode.metrics.deadlocked
+    assert episode.metrics.selection_transactions_started == 1
+    assert episode.metrics.selection_transactions_completed == 1
+    assert episode.metrics.rest_site_selection_transactions_started == 1
+    assert episode.metrics.rest_site_selection_transactions_completed == 1
+    assert episode.metrics.forge_selection_transactions_started == 1
+    assert episode.metrics.forge_selection_transactions_completed == 1
+
+    funnel = episode.failure_credit_shadow_metrics
+    assert funnel is not None
+    assert funnel.completion_controls >= 1
+    assert funnel.actor_actionable_records >= 1
+    completions = tuple(
+        record
+        for record in episode.failure_credit_records
+        if record.incident.outcome is FailureOutcome.COMPLETED
+    )
+    assert completions
+    assert all(
+        EvidenceStratum.COMPLETION_CONTROL in record.plan.strata
+        for record in completions
+    )
+    preferred = tuple(
+        target
+        for record in completions
+        for target in record.plan.direct_policy_targets
+        if target.target is DirectPolicyTarget.PREFER
+    )
+    assert preferred
 
 
 def test_deadlock_streak_alerts_once_per_consecutive_run() -> None:

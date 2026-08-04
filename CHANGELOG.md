@@ -133,6 +133,14 @@ historical RL artifacts.
 
 ### Fixed
 
+- Advanced the grounded encoder identity to v14 and fingerprinted the ordered
+  native shop-item alias table. Category-only merchant removal can no longer
+  silently share the old v13 digest while changing from `purchase_item` / Run
+  to `purchase_card_removal` / Selection; v13 is accepted only through the
+  pinned model-parameter initialization edge, never exact resume. The failure-
+  credit collector is now v5: verified `rest/selection` clean exits emit the
+  completion `PREFER` label that v33's non-zero completion-policy weight
+  expects, while ordinary event/map/shop progress remains critic-only.
 - Landed the v33 stability recovery package (config v13) that answers the v32
   collapse chain with eight paired learning-semantics and guard fixes: B1
   detaches the cost-actor policy baseline so no π-side gradient leaks through
