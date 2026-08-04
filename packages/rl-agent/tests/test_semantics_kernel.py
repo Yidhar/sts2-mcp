@@ -130,6 +130,39 @@ def test_durable_commit_does_not_claim_flow_advance() -> None:
     assert not receipt.flow_advanced
 
 
+def test_screen_shaped_sim_raw_deck_relocation_is_transport_not_commit() -> None:
+    """Cancel teardown must not fabricate a deck mutation from raw view paths."""
+
+    kernel = DecisionSemanticsKernel()
+    before_observation = _event_observation()
+    after_observation = deepcopy(before_observation)
+    deck = deepcopy(before_observation["player"]["deck"])  # type: ignore[index]
+    before_observation["_sim_raw"] = {
+        "card_select": {"player": {"deck": deck}},
+    }
+    after_observation["_sim_raw"] = {
+        "rest": {"player": {"deck": deepcopy(deck)}},
+    }
+    before = kernel.identify(
+        observation=before_observation,
+        legal_actions=_event_actions(),
+    )
+    after = kernel.identify(
+        observation=after_observation,
+        legal_actions=_event_actions(),
+    )
+
+    assert before.node.exact == after.node.exact
+    receipt = kernel.classify_transition(
+        before=before,
+        after=after,
+        before_observation=before_observation,
+        after_observation=after_observation,
+    )
+    assert receipt.kind is ProgressKind.NONE
+    assert not receipt.durable_committed
+
+
 def test_linger9_anchor_survives_death_warning_and_revival_churn() -> None:
     kernel = DecisionSemanticsKernel()
     linger = _event_observation(page="LINGER9")

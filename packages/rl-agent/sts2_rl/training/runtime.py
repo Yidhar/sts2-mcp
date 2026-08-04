@@ -259,13 +259,25 @@ def summarize_evaluation(
             "act1_boundary_mean_revivals": 0.0,
             "act1_boundary_mean_hp_lost": 0.0,
             "selection_transactions_started": 0,
+            "selection_transactions_closed": 0,
+            "selection_transactions_committed": 0,
             "selection_transactions_completed": 0,
+            "selection_transactions_cancelled": 0,
+            "selection_transactions_unresolved": 0,
             "selection_transaction_completion_rate": 0.0,
             "rest_site_or_forge_transactions_started": 0,
+            "rest_site_or_forge_transactions_closed": 0,
+            "rest_site_or_forge_transactions_committed": 0,
             "rest_site_or_forge_transactions_completed": 0,
+            "rest_site_or_forge_transactions_cancelled": 0,
+            "rest_site_or_forge_transactions_unresolved": 0,
             "rest_site_or_forge_transaction_completion_rate": 0.0,
             "forge_transactions_started": 0,
+            "forge_transactions_closed": 0,
+            "forge_transactions_committed": 0,
             "forge_transactions_completed": 0,
+            "forge_transactions_cancelled": 0,
+            "forge_transactions_unresolved": 0,
             "forge_transaction_completion_rate": 0.0,
             "mean_policy_top1_top2_logit_margin": 0.0,
             "maximum_policy_top1_top2_logit_margin": 0.0,
@@ -285,17 +297,44 @@ def summarize_evaluation(
     selection_transactions_completed = sum(
         item.selection_transactions_completed for item in episodes
     )
+    selection_transactions_closed = sum(
+        item.selection_transactions_closed for item in episodes
+    )
+    selection_transactions_cancelled = sum(
+        item.selection_transactions_cancelled for item in episodes
+    )
+    selection_transactions_unresolved = sum(
+        item.selection_transactions_unresolved for item in episodes
+    )
     rest_site_transactions_started = sum(
         item.rest_site_selection_transactions_started for item in episodes
     )
     rest_site_transactions_completed = sum(
         item.rest_site_selection_transactions_completed for item in episodes
     )
+    rest_site_transactions_closed = sum(
+        item.rest_site_selection_transactions_closed for item in episodes
+    )
+    rest_site_transactions_cancelled = sum(
+        item.rest_site_selection_transactions_cancelled for item in episodes
+    )
+    rest_site_transactions_unresolved = sum(
+        item.rest_site_selection_transactions_unresolved for item in episodes
+    )
     forge_transactions_started = sum(
         item.forge_selection_transactions_started for item in episodes
     )
     forge_transactions_completed = sum(
         item.forge_selection_transactions_completed for item in episodes
+    )
+    forge_transactions_closed = sum(
+        item.forge_selection_transactions_closed for item in episodes
+    )
+    forge_transactions_cancelled = sum(
+        item.forge_selection_transactions_cancelled for item in episodes
+    )
+    forge_transactions_unresolved = sum(
+        item.forge_selection_transactions_unresolved for item in episodes
     )
     return {
         "evaluation_objective": evaluation_objective,
@@ -367,21 +406,33 @@ def summarize_evaluation(
             statistics.fmean(item[1] for item in act1_boundaries) if act1_boundaries else 0.0
         ),
         "selection_transactions_started": selection_transactions_started,
+        "selection_transactions_closed": selection_transactions_closed,
+        "selection_transactions_committed": selection_transactions_completed,
         "selection_transactions_completed": selection_transactions_completed,
+        "selection_transactions_cancelled": selection_transactions_cancelled,
+        "selection_transactions_unresolved": selection_transactions_unresolved,
         "selection_transaction_completion_rate": (
             selection_transactions_completed / selection_transactions_started
             if selection_transactions_started
             else 0.0
         ),
         "rest_site_or_forge_transactions_started": rest_site_transactions_started,
+        "rest_site_or_forge_transactions_closed": rest_site_transactions_closed,
+        "rest_site_or_forge_transactions_committed": rest_site_transactions_completed,
         "rest_site_or_forge_transactions_completed": rest_site_transactions_completed,
+        "rest_site_or_forge_transactions_cancelled": rest_site_transactions_cancelled,
+        "rest_site_or_forge_transactions_unresolved": rest_site_transactions_unresolved,
         "rest_site_or_forge_transaction_completion_rate": (
             rest_site_transactions_completed / rest_site_transactions_started
             if rest_site_transactions_started
             else 0.0
         ),
         "forge_transactions_started": forge_transactions_started,
+        "forge_transactions_closed": forge_transactions_closed,
+        "forge_transactions_committed": forge_transactions_completed,
         "forge_transactions_completed": forge_transactions_completed,
+        "forge_transactions_cancelled": forge_transactions_cancelled,
+        "forge_transactions_unresolved": forge_transactions_unresolved,
         "forge_transaction_completion_rate": (
             forge_transactions_completed / forge_transactions_started
             if forge_transactions_started

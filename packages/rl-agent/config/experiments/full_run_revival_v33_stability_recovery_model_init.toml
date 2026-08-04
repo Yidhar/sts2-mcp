@@ -1,8 +1,7 @@
 # Stability-recovery successor to the last healthy v32 periodic policy at
 # environment step 90,152. This is an explicit model-initialization lineage:
-# network parameters and mature entropy/exploration clocks are inherited while
+# network parameters and mature entropy/exploration/liveness clocks are inherited while
 # optimizer, replay, RNG, rollout queues and lineage-local counters reset.
-# Liveness calibration/risk-actor clocks intentionally restart from update 0.
 # Reward v5 and the engine-native revival budget of 64 remain unchanged.
 # Failure-credit executor v2 packs the four sampled records into one shared
 # replay graph while retaining an explicit equal-record loss reduction.
@@ -71,7 +70,11 @@ selection_surface_epsilon_floor = 0.25
 [runtime]
 rocm_sdpa_backend = "math"
 model_initialization_schedule_mode = "inherit"
-model_initialization_liveness_schedule_mode = "reset"
+# The source policy is already mature. Resetting this clock disables the
+# calibrated risk actor for most of the course and recreates the v30/v31
+# schedule shock. This inherits only the reviewed schedule phase; optimizer,
+# replay and RNG remain a new model-init lineage.
+model_initialization_liveness_schedule_mode = "inherit"
 total_environment_steps = 100000
 seed = 5000000
 log_dir = "runs/full-run-revival-v33-stability-recovery-model-init"

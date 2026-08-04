@@ -25,7 +25,7 @@ from .scopes import (
     ProgressScopeStack,
 )
 
-DECISION_IDENTITY_CONTRACT_VERSION: Final = "sts2-decision-identity-v1"
+DECISION_IDENTITY_CONTRACT_VERSION: Final = "sts2-decision-identity-v2"
 
 
 class DecisionSemanticsKernel:

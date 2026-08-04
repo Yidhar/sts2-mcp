@@ -10,7 +10,7 @@ from typing import Any, Final
 from .field_roles import COST_KEYS, DURABLE_KEYS, collect_role_values, exact_projection
 from .identity import SemanticKey, canonical_payload_bytes
 
-PROGRESS_RECEIPT_CONTRACT_VERSION: Final = "sts2-progress-receipt-v1"
+PROGRESS_RECEIPT_CONTRACT_VERSION: Final = "sts2-progress-receipt-v2"
 
 
 class ProgressKind(StrEnum):

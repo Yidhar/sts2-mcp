@@ -23,6 +23,13 @@ class FieldRole(StrEnum):
 
 TRANSPORT_KEYS: Final[frozenset[str]] = frozenset(
     {
+        # The simulator transport keeps an unnormalised copy of the current
+        # view under ``_sim_raw``.  Its shape follows the active screen (for
+        # example ``card_select.player.deck`` becomes ``rest.player.deck`` on
+        # Cancel), so it is neither an independent gameplay fact nor a durable
+        # resource authority.  Retaining it made a pure UI teardown look like
+        # a deck mutation and incorrectly awarded completion credit.
+        "_sim_raw",
         "action_handle",
         "client_id",
         "created_at",
@@ -133,7 +140,13 @@ def control_projection(value: Any) -> Any:
 
 
 def collect_role_values(value: Any, keys: frozenset[str]) -> Any:
-    """Collect matching fields with their full path for deterministic diffs."""
+    """Collect matching authoritative fields for deterministic diffs.
+
+    Transport subtrees are skipped wholesale.  Merely projecting the matched
+    leaf is insufficient: a duplicate raw view can relocate an otherwise
+    identical ``deck`` between screen-specific paths and thereby fabricate a
+    durable change from transport shape alone.
+    """
 
     found: list[dict[str, Any]] = []
 
@@ -141,6 +154,8 @@ def collect_role_values(value: Any, keys: frozenset[str]) -> Any:
         if isinstance(child, Mapping):
             for raw_key, grandchild in child.items():
                 key = str(raw_key)
+                if key.lower() in TRANSPORT_KEYS:
+                    continue
                 next_path = (*path, key)
                 if key.lower() in keys:
                     found.append(

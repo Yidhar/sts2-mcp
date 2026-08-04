@@ -145,11 +145,23 @@ class EpisodeMetrics:
     policy_top1_top2_logit_margin_mean: float = 0.0
     policy_top1_top2_logit_margin_max: float = 0.0
     selection_transactions_started: int = 0
+    selection_transactions_closed: int = 0
+    # ``completed`` is the compatibility name for a verified commit, not a
+    # generic page exit.  Cancelled and unresolved teardowns are reported
+    # separately so monitoring cannot call a rollback successful.
     selection_transactions_completed: int = 0
+    selection_transactions_cancelled: int = 0
+    selection_transactions_unresolved: int = 0
     rest_site_selection_transactions_started: int = 0
+    rest_site_selection_transactions_closed: int = 0
     rest_site_selection_transactions_completed: int = 0
+    rest_site_selection_transactions_cancelled: int = 0
+    rest_site_selection_transactions_unresolved: int = 0
     forge_selection_transactions_started: int = 0
+    forge_selection_transactions_closed: int = 0
     forge_selection_transactions_completed: int = 0
+    forge_selection_transactions_cancelled: int = 0
+    forge_selection_transactions_unresolved: int = 0
     shaping_reward_total: float = 0.0
     shaping_reward_per_max_floor: float = 0.0
     boss_victory_acts: tuple[int, ...] = ()
@@ -1047,6 +1059,165 @@ def _is_forge_selection_surface(
         .split()
     )
     return operation in {"upgrade", "forge"}
+
+
+_SELECTION_CANCEL_OPERATIONS = frozenset(
+    {
+        "cancel",
+        "cancel_prompt",
+        "cancel_selection",
+    }
+)
+_SELECTION_COMMIT_OPERATIONS = frozenset(
+    {
+        "confirm",
+        "confirm_selection",
+        # Max-one/automatic selection grids commit directly on Select and do
+        # not expose a separate confirmation action.
+        "select",
+        "select_card",
+    }
+)
+
+
+def _normalized_selection_action_operation(action: Mapping[str, object]) -> str:
+    """Return the reviewed selection operation, independent of dispatch IDs."""
+
+    prototype = _semantic_action_prototype(action)
+    nested = prototype.get("selection")
+    nested_operation = (
+        nested.get("operation_type") if isinstance(nested, Mapping) else None
+    )
+    raw = next(
+        (
+            value
+            for value in (
+                prototype.get("selection_operation"),
+                prototype.get("model_action_variant"),
+                prototype.get("operation"),
+                prototype.get("operation_type"),
+                nested_operation,
+                prototype.get("kind"),
+                prototype.get("action"),
+            )
+            if value is not None and str(value).strip()
+        ),
+        "",
+    )
+    return "_".join(str(raw).strip().lower().replace("-", " ").split())
+
+
+def _card_upgrade_level(card: Mapping[str, object]) -> int:
+    nested = card.get("card")
+    value = nested if isinstance(nested, Mapping) else card
+    levels: list[int] = []
+    for key in (
+        "upgrade_level",
+        "current_upgrade_level",
+        "upgrades",
+        "upgrade_count",
+    ):
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int | float) and math.isfinite(float(raw)):
+            levels.append(max(0, int(raw)))
+    if bool(value.get("is_upgraded")):
+        levels.append(1)
+    return max(levels, default=0)
+
+
+def _deck_upgrade_signature(
+    observation: Mapping[str, object],
+) -> tuple[tuple[str, int, int], ...] | None:
+    """Return definition counts and total upgrade levels for the real deck.
+
+    The signature deliberately ignores the screen-shaped ``_sim_raw`` mirror.
+    A forge commit is proved only when the same definition multiset remains and
+    at least one aggregate upgrade level increases.
+    """
+
+    raw_player = observation.get("player")
+    player = raw_player if isinstance(raw_player, Mapping) else {}
+    raw_deck = player.get("deck_cards", player.get("deck"))
+    if isinstance(raw_deck, Mapping):
+        raw_cards = raw_deck.get("cards")
+    else:
+        raw_cards = raw_deck
+    if not isinstance(raw_cards, list | tuple):
+        return None
+    aggregate: dict[str, tuple[int, int]] = {}
+    for item in raw_cards:
+        if not isinstance(item, Mapping):
+            return None
+        nested = item.get("card")
+        card = nested if isinstance(nested, Mapping) else item
+        raw_definition = _first_nonempty(card, _TRANSACTION_DEFINITION_KEYS)
+        if raw_definition is None:
+            return None
+        definition = str(raw_definition).strip()
+        raw_quantity = card.get("quantity", card.get("count", card.get("copies", 1)))
+        quantity = (
+            int(raw_quantity)
+            if not isinstance(raw_quantity, bool)
+            and isinstance(raw_quantity, int | float)
+            and math.isfinite(float(raw_quantity))
+            and int(raw_quantity) > 0
+            else 1
+        )
+        previous_count, previous_levels = aggregate.get(definition, (0, 0))
+        aggregate[definition] = (
+            previous_count + quantity,
+            previous_levels + quantity * _card_upgrade_level(card),
+        )
+    return tuple(
+        (definition, count, levels)
+        for definition, (count, levels) in sorted(aggregate.items())
+    )
+
+
+def _forge_upgrade_committed(
+    before: tuple[tuple[str, int, int], ...] | None,
+    after_observation: Mapping[str, object],
+) -> bool:
+    after = _deck_upgrade_signature(after_observation)
+    if before is None or after is None:
+        return False
+    before_counts = tuple((definition, count) for definition, count, _ in before)
+    after_counts = tuple((definition, count) for definition, count, _ in after)
+    if before_counts != after_counts:
+        return False
+    before_levels = {definition: levels for definition, _, levels in before}
+    return any(
+        levels > before_levels.get(definition, levels)
+        for definition, _, levels in after
+    )
+
+
+def _selection_transaction_exit_outcome(
+    *,
+    selected_action: Mapping[str, object],
+    clean_exit: bool,
+    is_forge: bool,
+    opening_deck_signature: tuple[tuple[str, int, int], ...] | None,
+    after_observation: Mapping[str, object],
+) -> Literal["committed", "cancelled", "unresolved"]:
+    """Classify transaction teardown without equating exit with success."""
+
+    if not clean_exit:
+        return "unresolved"
+    operation = _normalized_selection_action_operation(selected_action)
+    if is_forge:
+        if _forge_upgrade_committed(opening_deck_signature, after_observation):
+            return "committed"
+        if operation in _SELECTION_CANCEL_OPERATIONS:
+            return "cancelled"
+        return "unresolved"
+    if operation in _SELECTION_CANCEL_OPERATIONS:
+        return "cancelled"
+    if operation in _SELECTION_COMMIT_OPERATIONS:
+        return "committed"
+    return "unresolved"
 
 
 def _room_type(observation: Mapping[str, object]) -> str:
@@ -3105,11 +3276,20 @@ class GroundedCollector:
         policy_logit_margin_count = 0
         policy_top1_top2_logit_margin_max = 0.0
         selection_transactions_started = 0
+        selection_transactions_closed = 0
         selection_transactions_completed = 0
+        selection_transactions_cancelled = 0
+        selection_transactions_unresolved = 0
         rest_site_selection_transactions_started = 0
+        rest_site_selection_transactions_closed = 0
         rest_site_selection_transactions_completed = 0
+        rest_site_selection_transactions_cancelled = 0
+        rest_site_selection_transactions_unresolved = 0
         forge_selection_transactions_started = 0
+        forge_selection_transactions_closed = 0
         forge_selection_transactions_completed = 0
+        forge_selection_transactions_cancelled = 0
+        forge_selection_transactions_unresolved = 0
         shaping_reward_total = 0.0
         boss_victory_acts: set[int] = set()
         steps_taken = 0
@@ -3203,6 +3383,9 @@ class GroundedCollector:
         observed_transaction_opened_from_rest_site = False
         observed_transaction_is_forge = False
         observed_transaction_has_policy_choice = False
+        observed_transaction_opening_deck_signature: (
+            tuple[tuple[str, int, int], ...] | None
+        ) = None
         pending_observed_transaction_entry_episodic_index: int | None = None
         pending_observed_transaction_opened_from_rest_site = False
         episode_rewards: list[float] = []
@@ -3335,6 +3518,11 @@ class GroundedCollector:
                         state.observation,
                         choice.semantic_actions,
                     )
+                )
+                observed_transaction_opening_deck_signature = (
+                    _deck_upgrade_signature(state.observation)
+                    if observed_transaction_is_forge
+                    else None
                 )
                 observed_transaction_has_policy_choice = choice.valid_count > 1
                 pending_observed_transaction_entry_episodic_index = None
@@ -3648,6 +3836,9 @@ class GroundedCollector:
                         choice.semantic_actions,
                     )
                 )
+            selection_exit_outcome: (
+                Literal["committed", "cancelled", "unresolved"] | None
+            ) = None
             if (
                 observed_transaction_surface is not None
                 and (
@@ -3657,7 +3848,11 @@ class GroundedCollector:
                     or forced_horizon
                 )
             ):
-                completed_transaction = bool(
+                selection_transaction_closed = bool(
+                    next_observed_transaction_surface
+                    != observed_transaction_surface
+                )
+                clean_transaction_exit = bool(
                     next_observed_transaction_surface is None
                     and (
                         (
@@ -3671,7 +3866,24 @@ class GroundedCollector:
                         )
                     )
                 )
-                if completed_transaction:
+                selection_exit_outcome = _selection_transaction_exit_outcome(
+                    selected_action=selected_action,
+                    clean_exit=clean_transaction_exit,
+                    is_forge=observed_transaction_is_forge,
+                    opening_deck_signature=(
+                        observed_transaction_opening_deck_signature
+                    ),
+                    after_observation=next_state.observation,
+                )
+                selection_transactions_closed += int(selection_transaction_closed)
+                rest_site_selection_transactions_closed += int(
+                    selection_transaction_closed
+                    and observed_transaction_opened_from_rest_site
+                )
+                forge_selection_transactions_closed += int(
+                    selection_transaction_closed and observed_transaction_is_forge
+                )
+                if selection_exit_outcome == "committed":
                     selection_transactions_completed += 1
                     rest_site_selection_transactions_completed += int(
                         observed_transaction_opened_from_rest_site
@@ -3679,6 +3891,42 @@ class GroundedCollector:
                     forge_selection_transactions_completed += int(
                         observed_transaction_is_forge
                     )
+                elif selection_exit_outcome == "cancelled":
+                    selection_transactions_cancelled += 1
+                    rest_site_selection_transactions_cancelled += int(
+                        observed_transaction_opened_from_rest_site
+                    )
+                    forge_selection_transactions_cancelled += int(
+                        observed_transaction_is_forge
+                    )
+                else:
+                    selection_transactions_unresolved += 1
+                    rest_site_selection_transactions_unresolved += int(
+                        observed_transaction_opened_from_rest_site
+                    )
+                    forge_selection_transactions_unresolved += int(
+                        observed_transaction_is_forge
+                    )
+                if (
+                    clean_transaction_exit
+                    and selection_exit_outcome in {"cancelled", "unresolved"}
+                    and observed_transaction_entry_episodic_index is not None
+                ):
+                    entry_index = observed_transaction_entry_episodic_index
+                    if not 0 <= entry_index < len(episodic_steps):
+                        raise RuntimeError(
+                            "selection transaction entrance episodic index escaped its episode"
+                        )
+                    # An aborted transaction is policy-neutral in the complete-
+                    # episode actor objective.  Keep every task/value target,
+                    # but do not let a later run victory behavior-clone the
+                    # Smith -> Select -> Cancel rollback path (or let a later
+                    # defeat blame merely entering a recoverable transaction).
+                    for episodic_index in range(entry_index, len(episodic_steps)):
+                        episodic_steps[episodic_index] = replace(
+                            episodic_steps[episodic_index],
+                            policy_decision=False,
+                        )
                 if (
                     breakdown.outcome == "deadlock"
                     and trusted_policy_failure
@@ -3704,6 +3952,7 @@ class GroundedCollector:
                 observed_transaction_opened_from_rest_site = False
                 observed_transaction_is_forge = False
                 observed_transaction_has_policy_choice = False
+                observed_transaction_opening_deck_signature = None
             after_action_act, _ = _run_position(next_state.observation)
             transition_facts = next_state.transition.facts
             typed_run_result = transition_facts.get("run_result")
@@ -3760,9 +4009,12 @@ class GroundedCollector:
                 choice.valid_count > 1
                 and breakdown.outcome != "deadlock"
                 and not opens_selection_transaction
+                and selection_exit_outcome not in {"cancelled", "unresolved"}
             )
             episodic_policy_decision = bool(
-                choice.valid_count > 1 and breakdown.outcome != "deadlock"
+                choice.valid_count > 1
+                and breakdown.outcome != "deadlock"
+                and selection_exit_outcome not in {"cancelled", "unresolved"}
             )
             if episodic_enabled:
                 episodic_step_index = len(episodic_steps)
@@ -4405,18 +4657,39 @@ class GroundedCollector:
                     policy_top1_top2_logit_margin_max
                 ),
                 selection_transactions_started=selection_transactions_started,
+                selection_transactions_closed=selection_transactions_closed,
                 selection_transactions_completed=selection_transactions_completed,
+                selection_transactions_cancelled=selection_transactions_cancelled,
+                selection_transactions_unresolved=selection_transactions_unresolved,
                 rest_site_selection_transactions_started=(
                     rest_site_selection_transactions_started
+                ),
+                rest_site_selection_transactions_closed=(
+                    rest_site_selection_transactions_closed
                 ),
                 rest_site_selection_transactions_completed=(
                     rest_site_selection_transactions_completed
                 ),
+                rest_site_selection_transactions_cancelled=(
+                    rest_site_selection_transactions_cancelled
+                ),
+                rest_site_selection_transactions_unresolved=(
+                    rest_site_selection_transactions_unresolved
+                ),
                 forge_selection_transactions_started=(
                     forge_selection_transactions_started
                 ),
+                forge_selection_transactions_closed=(
+                    forge_selection_transactions_closed
+                ),
                 forge_selection_transactions_completed=(
                     forge_selection_transactions_completed
+                ),
+                forge_selection_transactions_cancelled=(
+                    forge_selection_transactions_cancelled
+                ),
+                forge_selection_transactions_unresolved=(
+                    forge_selection_transactions_unresolved
                 ),
                 shaping_reward_total=shaping_reward_total,
                 shaping_reward_per_max_floor=(

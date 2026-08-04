@@ -1,4 +1,4 @@
-"""Collector-side evidence pipeline for failure-credit v5.
+"""Collector-side evidence pipeline for failure-credit v6.
 
 This module is intentionally separate from the legacy transaction-v3 replay
 path.  It consumes the reviewed decision-semantics kernel online, while the
@@ -58,16 +58,64 @@ from .contracts import (
 from .corpus import EvidenceRecord, evidence_record_storage_nbytes
 
 FAILURE_CREDIT_DETECTOR_VERSION: Final = "sts2-semantic-macro-cycle-detector-v4"
-FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v5"
+FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v6"
 
-# Completion is not generic strategic approval. Only the two transactional
-# surfaces whose local objective is to finish a multi-step selection receive
+# Completion is not generic strategic approval. Only the reviewed transaction
+# surface whose local objective is to finish a multi-step selection receives
 # direct PREFER credit when the semantic kernel verifies their clean exit.
 # Event, map, shop and combat progress remain critic-only unless an atomic
 # matched-outcome witness supplies stronger evidence.
-_COMPLETION_PREFER_SURFACE_IDS: Final[frozenset[str]] = frozenset(
-    {"rest", "selection"}
-)
+_COMPLETION_PREFER_SURFACE_IDS: Final[frozenset[str]] = frozenset({"selection"})
+
+
+def _normalized_action_operation(step: LearningStep) -> str:
+    """Decode the reviewed operation from a semantic action identity.
+
+    The semantic key retains the canonical payload and is therefore the
+    authority here; no raw dispatch handle or candidate ordinal is consulted.
+    Selection completion credit is intentionally fail-closed when an older or
+    unknown adapter does not expose a reviewed operation.
+    """
+
+    payload = step.selected_action.loop.payload
+    if not isinstance(payload, Mapping):
+        return ""
+    action = payload.get("action")
+    if not isinstance(action, Mapping):
+        return ""
+    raw = action.get("operation")
+    return "_".join(str(raw or "").strip().lower().replace("-", " ").split())
+
+
+def _completion_actor_prefer_allowed(
+    macro: _ClosedMacro,
+    *,
+    receipt: ProgressReceipt,
+    learn_step: LearningStep,
+) -> bool:
+    """Return whether a local completion is factual positive actor evidence.
+
+    Closing a page is not the same as committing its transaction.  In
+    particular ``cancel_selection`` may return from a forge grid with no deck
+    mutation.  It remains a useful zero-cost critic control, but it must never
+    become a direct PREFER label.  Manual Confirm and an auto-committing Select
+    are the only reviewed selection operations that may receive positive local
+    policy credit, and they still require independently verified flow/durable
+    progress from the semantic kernel.
+    """
+
+    if (
+        not macro.direct_credit_allowed
+        or macro.source_spec_id not in _COMPLETION_PREFER_SURFACE_IDS
+        or not learn_step.actor_eligible
+        or receipt.kind
+        not in {
+            ProgressKind.FLOW_ADVANCE,
+            ProgressKind.DURABLE_COMMIT,
+        }
+    ):
+        return False
+    return _normalized_action_operation(learn_step) in {"confirm", "select"}
 
 
 def _positive_integer(value: object, *, label: str) -> int:
@@ -764,18 +812,17 @@ class FailureCreditEpisodePipeline:
             self._completion_controls_observed += 1
             return
         # A completed transition is always a factual zero-liveness-cost
-        # control. It becomes positive actor evidence only for a verified clean
-        # exit from the reviewed selection transaction surfaces. This repairs
-        # the asymmetric selection curriculum (cycles were punished while
-        # successful completion had no policy path) without turning ordinary
-        # map/event/shop progress into generic strategic approval.
+        # control.  It becomes positive actor evidence only when both the
+        # progress receipt and the reviewed action operation prove a commit.
+        # Page teardown alone is not success: Cancel is critic-only even when a
+        # transport/view bug would otherwise make the exit look progressive.
         learn_step_index = context.learn_step_indices[-1]
         learn_step = context.steps[learn_step_index]
         completion_witness: PolicyWitness | None = None
-        if (
-            macro.direct_credit_allowed
-            and macro.source_spec_id in _COMPLETION_PREFER_SURFACE_IDS
-            and learn_step.actor_eligible
+        if _completion_actor_prefer_allowed(
+            macro,
+            receipt=receipt,
+            learn_step=learn_step,
         ):
             supporting_steps = tuple(
                 sorted(

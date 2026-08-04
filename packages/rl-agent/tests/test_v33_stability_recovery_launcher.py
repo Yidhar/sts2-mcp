@@ -68,7 +68,7 @@ def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
     assert config.failure_credit.liveness_records_per_autograd_batch == 4
     assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(0.20)
     assert config.runtime.model_initialization_schedule_mode == "inherit"
-    assert config.runtime.model_initialization_liveness_schedule_mode == "reset"
+    assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"
     assert config.runtime.total_environment_steps == 100_000
     assert config.runtime.evaluation_steps == (0, 25_000, 50_000, 75_000)
     assert config.runtime.evaluation_episodes == 16

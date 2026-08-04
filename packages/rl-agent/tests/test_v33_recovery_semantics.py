@@ -36,6 +36,19 @@ from tests.test_v2_training_pipeline import (
 )
 
 
+class _ScriptedChoiceRng:
+    """Minimal policy-sampling RNG for deterministic transaction-path tests."""
+
+    def __init__(self, indices: tuple[int, ...]) -> None:
+        self._indices = iter(indices)
+
+    def choice(self, count: int, *, p: object) -> int:
+        del p
+        selected = next(self._indices)
+        assert 0 <= selected < count
+        return selected
+
+
 class _RestForgeSelectionCycleBackend(TerminalWithoutObservationFlagsBackend):
     """Open an upgrade grid from a rest surface, then toggle forever."""
 
@@ -164,14 +177,6 @@ class _RestForgeSelectionSuccessBackend(_RestForgeSelectionCycleBackend):
             return super()._actions()
         return (
             {
-                "action_handle": "confirm-upgrade",
-                "action": "confirm_selection",
-                "kind": "confirm_selection",
-                "model_action_kind": "card_selection",
-                "model_action_variant": "confirm",
-                "selection_operation": "confirm",
-            },
-            {
                 "action_handle": "deselect-upgrade",
                 "action": "deselect_card",
                 "kind": "deselect_card",
@@ -183,6 +188,14 @@ class _RestForgeSelectionSuccessBackend(_RestForgeSelectionCycleBackend):
                     "selection_membership": "selected",
                     "is_selected": True,
                 },
+            },
+            {
+                "action_handle": "confirm-upgrade",
+                "action": "confirm_selection",
+                "kind": "confirm_selection",
+                "model_action_kind": "card_selection",
+                "model_action_variant": "confirm",
+                "selection_operation": "confirm",
             },
         )
 
@@ -210,6 +223,136 @@ class _RestForgeSelectionSuccessBackend(_RestForgeSelectionCycleBackend):
         run = observation["run"]
         assert isinstance(run, dict)
         run.update(active=False, room_type="map", room_model_id="MAP")
+        return observation
+
+
+class _RestForgeCancelThenSuccessBackend(_RestForgeSelectionCycleBackend):
+    """Cancel one forge transaction, then commit the next one successfully."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.result_terminal_step = 6
+
+    def _rest_actions(self) -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "action_handle": f"rest-forge:{self._step}",
+                "action": "choose_rest_option",
+                "kind": "choose_rest_option",
+                "model_action_kind": "rest_site",
+                "model_action_variant": "forge",
+                "index": 0,
+            },
+            {
+                "action_handle": f"rest-alternate:{self._step}",
+                "action": "choose_rest_option",
+                "kind": "choose_rest_option",
+                "model_action_kind": "rest_site",
+                "model_action_variant": "rest",
+                "index": 1,
+            },
+        )
+
+    def _actions(self) -> tuple[dict[str, object], ...]:
+        if self._step in {0, 3}:
+            return self._rest_actions()
+        strike = self._card("CARD.STRIKE", "strike-1")
+        defend = self._card("CARD.DEFEND", "defend-1")
+        if self._step in {1, 4}:
+            return (
+                {
+                    "action_handle": f"select:{self._step}",
+                    "action": "select_card",
+                    "kind": "select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "select",
+                    "selection_operation": "select",
+                    "card": strike,
+                },
+                {
+                    "action_handle": f"select-alternate:{self._step}",
+                    "action": "select_card",
+                    "kind": "select_card",
+                    "model_action_kind": "card_selection",
+                    "model_action_variant": "select",
+                    "selection_operation": "select",
+                    "card": defend,
+                },
+            )
+        confirm = {
+            "action_handle": f"confirm:{self._step}",
+            "action": "confirm_selection",
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+            "selection_operation": "confirm",
+        }
+        cancel = {
+            "action_handle": f"cancel:{self._step}",
+            "action": "cancel_selection",
+            "kind": "cancel_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "cancel_prompt",
+            "selection_operation": "cancel_prompt",
+        }
+        # Zero logits deterministically exercise Cancel on attempt one and
+        # Confirm on attempt two.
+        return (confirm, cancel) if self._step == 2 else (cancel, confirm)
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+        upgraded = terminal or self._step >= self.result_terminal_step
+        strike = {
+            **self._card("CARD.STRIKE", "strike-1"),
+            "is_upgraded": upgraded,
+            "upgrade_level": int(upgraded),
+        }
+        defend = self._card("CARD.DEFEND", "defend-1")
+        at_rest = self._step in {0, 3}
+        observation: dict[str, object] = {
+            "phase": "map" if terminal else "rest" if at_rest else "selection",
+            "decision_domain": "map" if terminal else "resource" if at_rest else "build",
+            "state_type": "map" if terminal else "rest_site" if at_rest else "card_select",
+            "screen": "MAP" if terminal else "REST_SITE" if at_rest else "SELECTION",
+            "player": {
+                "character": "IRONCLAD",
+                "hp": 40,
+                "max_hp": 70,
+                "gold": 99,
+                "deck": [strike, defend],
+                "relics": [],
+                "potions": [],
+            },
+            "combat": {"in_progress": False, "enemies": []},
+            "run": {
+                "active": not terminal,
+                "act": 1,
+                "floor": 9,
+                "room_type": "map" if terminal else "rest",
+                "room_model_id": "MAP" if terminal else "REST_SITE",
+            },
+        }
+        raw_view = "map" if terminal else "rest" if at_rest else "card_select"
+        observation["_sim_raw"] = {
+            raw_view: {"player": {"deck": [strike, defend]}},
+        }
+        if terminal or at_rest:
+            return observation
+        selected = self._step in {2, 5}
+        observation["card_selection"] = {
+            "mode": "SimpleGrid",
+            "prompt_id": "card_selection.TO_UPGRADE",
+            "operation_type": "upgrade",
+            "source_zone": "Deck",
+            "destination_zone": "Deck",
+            "min_select": 1,
+            "max_select": 1,
+            "cards": [defend] if selected else [strike, defend],
+            "selected_cards": [strike] if selected else [],
+            "selected_count": int(selected),
+            "remaining_picks": 1 - int(selected),
+            "requires_manual_confirmation": True,
+            "can_confirm": selected,
+        }
         return observation
 
 
@@ -358,12 +501,13 @@ def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None
     )
     try:
         resources.collector.bind_failure_credit_run_id("forge-success-path")
+        resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
         with torch.no_grad():
             for parameter in resources.model.parameters():
                 parameter.zero_()
         episode = resources.collector.collect_episode(
-            epsilon=0.0,
-            deterministic=True,
+            epsilon=1.0,
+            deterministic=False,
             record=True,
         )
     finally:
@@ -399,6 +543,78 @@ def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None
         if target.target is DirectPolicyTarget.PREFER
     )
     assert preferred
+
+
+def test_cancelled_forge_is_neutral_and_only_verified_upgrade_commits() -> None:
+    base = _recovery_config(max_steps=12, repeat_threshold=8)
+    config = replace(
+        base,
+        failure_credit=FailureCreditConfig(
+            mode="shadow",
+            burn_in_steps=1,
+            maximum_context_steps=16,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=_RestForgeCancelThenSuccessBackend(),
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("forge-cancel-then-commit")
+        resources.collector._rng = _ScriptedChoiceRng(  # type: ignore[assignment]
+            (0, 0, 1, 0, 0, 1)
+        )
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=1.0,
+            deterministic=False,
+            record=True,
+        )
+    finally:
+        resources.close()
+
+    assert episode.metrics.run_won
+    assert episode.metrics.selection_transactions_started == 2
+    assert episode.metrics.selection_transactions_closed == 2
+    assert episode.metrics.selection_transactions_completed == 1
+    assert episode.metrics.selection_transactions_cancelled == 1
+    assert episode.metrics.selection_transactions_unresolved == 0
+    assert episode.metrics.rest_site_selection_transactions_closed == 2
+    assert episode.metrics.rest_site_selection_transactions_completed == 1
+    assert episode.metrics.rest_site_selection_transactions_cancelled == 1
+    assert episode.metrics.forge_selection_transactions_closed == 2
+    assert episode.metrics.forge_selection_transactions_completed == 1
+    assert episode.metrics.forge_selection_transactions_cancelled == 1
+
+    completed = episode.completed_episode
+    assert completed is not None
+    policy_eligibility = tuple(step.decision.policy_decision for step in completed.steps)
+    # Attempt one (Smith, Select, Cancel) is retained for value/Q learning but
+    # removed from the successful episode's actor imitation path.  Attempt two
+    # remains eligible through the verified deck-upgrade commit.
+    assert policy_eligibility == (False, False, False, True, True, True)
+
+    preferred_operations: list[str] = []
+    for record in episode.failure_credit_records:
+        for target in record.plan.direct_policy_targets:
+            if target.target is not DirectPolicyTarget.PREFER:
+                continue
+            payload = record.plan.context.steps[
+                target.step_index
+            ].selected_action.loop.payload
+            assert isinstance(payload, dict)
+            action = payload.get("action")
+            assert isinstance(action, dict)
+            preferred_operations.append(str(action.get("operation") or ""))
+    assert preferred_operations == ["confirm"]
+
+    summary = summarize_evaluation([episode.metrics], objective="run")
+    assert summary["forge_transactions_closed"] == 2
+    assert summary["forge_transactions_committed"] == 1
+    assert summary["forge_transactions_cancelled"] == 1
+    assert summary["forge_transactions_unresolved"] == 0
 
 
 def test_deadlock_streak_alerts_once_per_consecutive_run() -> None:

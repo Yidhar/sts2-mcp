@@ -2,9 +2,9 @@
 """Launch the reviewed v33 stability-recovery model-init lineage.
 
 The source is the atomically published v32 periodic checkpoint at environment
-step 90,152. Network tensors and mature entropy/epsilon clocks are inherited;
-optimizer, replay, RNG, actor queues, local counters and liveness phase clocks
-restart under config-v13. Exact resume from the v32 source is forbidden.
+step 90,152. Network tensors and mature entropy/epsilon/liveness clocks are
+inherited; optimizer, replay, RNG, actor queues and local counters restart
+under config-v13. Exact resume from the v32 source is forbidden.
 """
 
 from __future__ import annotations

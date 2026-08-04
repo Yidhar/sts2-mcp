@@ -1,6 +1,6 @@
 # v33 恢复与修复方案 v1
 
-状态：**实现完成，100k 实证验收待执行**。  
+状态：**实现完成，100k 实证验收待重新执行**。
 实现日期：2026-08-04。  
 依据：2026-08-02～04 的坍缩取证、跨血统行为审计（锻造零使用、药水正常、
 贪心锚点）、reward v5 数学审计与两轮文献对抗审查。
@@ -25,9 +25,9 @@
 | v33 model-init 启动器 | 已完成 | 父 checkpoint 的路径、ID、manifest/metadata 哈希、policy/update 均被钉死 |
 | checkpoint / rollback ABI | 已完成 | learner 动态状态、健康角色、守卫回滚次数和训练死锁连击可 exact round-trip |
 | E2 商店删牌动作覆盖 | 已完成 | 已确认参数化购买→remove→confirm→牌组减少的完整链，修复策略 subtype 丢失并补结果遥测 |
-| 静态与单元/集成验证 | 已完成 | Ruff、strict mypy、全量 1120 项 pytest 全通过 |
+| 静态与单元/集成验证 | 已完成 | Ruff、strict mypy、全量 1137 项 pytest 全通过；最终 ABI 升级后另有 37 项聚焦回归通过 |
 | 源 checkpoint 身份与训练 dry-run | 已完成 | 精确身份校验通过；model-init 命令含 `--initialize-from` 且不含 `--resume` |
-| 100k ROCm 在线训练与 n=64 终审 | **未执行** | 这是效果验收，不得用单元测试结果替代 |
+| 100k ROCm 在线训练与 n=64 终审 | **未完成** | 两次早期运行均已因已定位的基础设施/信用语义缺陷作废；修复后必须从固定父本建立新 lineage 重跑 |
 
 ### 0.1 关键实现文件
 
@@ -74,10 +74,13 @@ periodic-step-000090152
 
 这是 **model parameter initialization**，不是 exact resume：
 
-- 继承：网络参数、成熟的主熵/ε 调度时钟；
+- 继承：网络参数、成熟的主熵/ε 调度时钟，以及成熟的 liveness 校准/risk-actor 相位；
 - 重置：optimizer、replay、RNG、rollout queue、血统本地计数；
-- 独立重置：liveness head 校准与 risk-actor 相位时钟；
 - 不允许把 config v12 父 checkpoint 伪装成 config v13 exact resume。
+
+最初的 v33 草案曾独立重置 liveness 时钟；在线取证证明这会在约前 512 个 update 关闭
+risk actor，重现 v30/v31 的调度冲击。v33 后续 model-init 因此只重置可安全重建的训练状态，
+不再把成熟策略的保护执行相位退回冷启动。
 
 启动命令由测试保证使用 `--initialize-from`，且不出现 `--resume`。config v12 只被允许作为
 受控 model-init 迁移来源，v13 exact resume 继续要求严格 ABI 一致。
@@ -155,11 +158,14 @@ liveness 损失不再与主 V-trace 共抢同一个全局 clip 配额：
 
 ### B5. 完成信用重新开启——已修复
 
-`liveness_completion_policy_weight` 由 0 恢复为 0.15。成功完成 selection transaction 的
+`liveness_completion_policy_weight` 由 0 恢复为 0.15。成功**提交** selection transaction 的
 completion control 可以给策略头正信用，修复“循环有惩罚、成功完成却永远没有平反标签”的不对称。
-正信用严格限于语义内核确认的 `rest/selection` clean exit；普通 event/map/shop 推进仍然是
-critic-only completion control，不能被误当成战略选择正确。collector ABI 因此升为
-`sts2-failure-credit-collector-v5`。
+正信用严格限于语义内核确认有 flow/durable progress 且操作为 `Confirm` 或自动提交 `Select`；
+`Cancel`、`Deselect`、普通 rest/event/map/shop 推进都只能是 critic control，不能被误当成
+战略选择正确。collector ABI 因此升为 `sts2-failure-credit-collector-v6`，progress receipt
+ABI 升为 `sts2-progress-receipt-v2`。
+由于 transport 投影同时参与 exact/comparison node identity，decision identity ABI 也显式升为
+`sts2-decision-identity-v2`；旧 checkpoint 只能作为受审查的 model-init 参数来源，不能伪装成 exact resume。
 
 回归测试：
 
@@ -188,7 +194,7 @@ observed-selection 状态机现在独立于已禁用的 legacy transaction repla
 
 - 对 selection cycle / semantic deadlock，打开选择面的入口决策保留 value 标签；
 - 入口不接收该合成终局的负策略标签，避免把“尝试进入锻造/多选”学成禁忌；
-- clean exit 产生完成控制信用；
+- clean exit 只说明事务关闭；只有 verified commit 产生正完成信用；
 - forge 只由 `operation_type in {upgrade, forge}` 且来源为 rest-site 的精确语义计数，
   不用模糊字符串匹配。
 
@@ -200,6 +206,34 @@ observed-selection 状态机现在独立于已禁用的 legacy transaction repla
 
 - `test_selection_cycle_exempts_entrance_policy_without_legacy_transaction_replay`
 - `test_forge_surface_and_evaluation_metric_are_exact`
+
+### B7.1 事务退出、取消与提交的正式语义——已修复
+
+2026-08-04 在线 journal/replay 发现锻造路径反复执行
+`Smith → Select → Cancel → Smith`。根因不是模型看不到 Confirm，而是语义与信用通路把
+“退出页面”错误等价成“成功提交”：模拟器 `_sim_raw` 的页面镜像会把同一副牌从
+`card_select.player.deck` 搬到 `rest.player.deck`，旧 durable 投影按完整路径比较，因而把纯 UI
+teardown 误判成 deck mutation；failure-credit replay 中已实证出现 Cancel 的
+`verified_durable_commit/PREFER` 标签。
+
+正式契约现在将事务结果拆成：
+
+- `closed`：页面已退出；
+- `committed`：操作与后继事实共同证明提交成功；
+- `cancelled`：显式 Cancel 且无提交事实；
+- `unresolved`：事务生命周期已结束但提交证据不足（包括未正常退出即终止），fail-closed。
+
+锻造的 `committed` 还必须验证：规范化牌库定义多重集不变，至少一张牌的 aggregate upgrade
+level 增加。`_sim_raw` 整棵子树属于 transport，不能参与 exact/comparison/durable role 收集。
+取消或 unresolved attempt 的 task/value/Q 事实仍保留，但该 attempt 从 complete-episode actor
+loss 中中性化；如果随后整局获胜，胜局模仿也不能再奖励 `Smith → Select → Cancel`。循环失败
+仍由 detector-authoritative AVOID/risk 通路负责，不用硬编码自动确认或强制退出。
+
+回归测试：
+
+- `test_screen_shaped_sim_raw_deck_relocation_is_transport_not_commit`
+- `test_cancelled_forge_is_neutral_and_only_verified_upgrade_commits`
+- `test_forge_selection_clean_exit_counts_and_retains_positive_credit`
 
 ### B8. 守卫、回滚、告警与可观测性——已修复
 
@@ -428,8 +462,11 @@ $PY -m pytest -q
 
 ```text
 All checks passed!
-Success: no issues found in 82 source files
-1120 passed in 212.91s
+Success: no issues found in 79 source files
+1137 passed in 260.79s
+
+# progress/decision/failure-credit ABI 最终升级后的聚焦回归
+37 passed in 82.67s
 ```
 
 全量测试覆盖除了 v33 聚焦测试外，还包括旧 checkpoint 兼容、训练 pipeline、failure-credit、
@@ -462,6 +499,11 @@ python scripts/launch_v33_stability_recovery_model_init.py initialize
   `17/32`，随后第二个 step-zero restored checkpoint 与第一次不可变目录重名并触发
   `FileExistsError`。该链已由本节新增的 attempt artifact identity 修复并覆盖两次回滚测试；
 - 仍没有完成 100k，也没有生成完整的 10k/25k/50k/75k/100k held-out 结果；
+- 第二次在线尝试 `048c4071-5e76-47a4-a4d2-2a7b8466fde2` 在约 5.4k 环境步被主动停止并
+  判为无效 lineage。该运行实证暴露了 `Smith → Select → Cancel → Smith` 循环，以及旧语义把
+  Cancel 的 transport teardown 误标为 `verified_durable_commit/PREFER` 的问题；它不得 exact
+  resume，也不得作为后续 model-init 参数父本。B7.1 的事务提交语义、collector v6、progress
+  receipt v2 与 decision identity v2 正是对此证据的正式修复；
 - 因此 C 节中的胜率、熵、锻造和 deadlock 标准仍是门禁，不是结论。
 
 ---
