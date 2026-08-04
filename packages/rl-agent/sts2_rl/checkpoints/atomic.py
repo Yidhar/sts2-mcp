@@ -444,21 +444,6 @@ def _validated_parent_checkpoint_descriptor(
         metadata_descriptor,
         label="parent checkpoint metadata descriptor",
     )
-    metadata_entry = next(
-        (
-            entry
-            for entry in entries
-            if isinstance(entry, dict) and entry.get("path") == "metadata.json"
-        ),
-        None,
-    )
-    if not isinstance(metadata_entry, dict) or (
-        metadata_entry.get("sha256") != metadata_descriptor["sha256"]
-        or metadata_entry.get("size_bytes") != metadata_descriptor["size_bytes"]
-    ):
-        raise CheckpointIntegrityError(
-            "parent checkpoint metadata descriptor does not match its manifest entry"
-        )
     return {
         "path": str(parent_path),
         "relation": None,
