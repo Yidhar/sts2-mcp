@@ -133,6 +133,38 @@ historical RL artifacts.
 
 ### Fixed
 
+- Landed the v33 stability recovery package (config v13) that answers the v32
+  collapse chain with eight paired learning-semantics and guard fixes: B1
+  detaches the cost-actor policy baseline so no π-side gradient leaks through
+  the centered-risk term; B2 softens the unbounded direct `AVOID` objective
+  near one-hot policies and gives liveness records an independent 0.50
+  gradient-delta clip budget instead of contending with the primary V-trace
+  clip; B3 bounds episodic success imitation to a positive trust region
+  (ρ ≤ 1.20) so already-sharpened actions stop receiving unbounded positive
+  pressure; B4 raises the entropy floor to 0.004 and adds a batch-level
+  one-hot circuit breaker (8 saturated non-forced batches trigger 8 updates at
+  0.012) whose streak state exact-resumes from the stochastic checkpoint; B5
+  restores completion policy credit (0.15) for cleanly finished selection
+  transactions; B6 applies targeted ε ≥ 0.25 exploration only on
+  card-selection and rest-site surfaces with journaled behavior probabilities;
+  B7 exempts selection-transaction entrance decisions from synthetic
+  cycle-failure policy labels without the legacy transaction replay and counts
+  forge/upgrade completion by exact operation semantics; and B8 adds the
+  training deadlock-streak guard, evaluation guard rollback to the hashed
+  healthy anchor, immediate alert checkpoints and resident evaluation metrics.
+- Cleaned up redundant same-process hash/validation work on top of the v33
+  baseline without weakening any cross-process first validation or fail-closed
+  gate: removed the tautological parent-metadata manifest-entry recheck in
+  atomic publishing; cached process-constant contract identities
+  (grounding-encoding/action-grouping fingerprints and the surface-registry
+  manifest key, ~330 µs per decision to ~0); reused the replay validation
+  probe for metadata specs and dropped the provably redundant model-init
+  dry-run `load_state_dict` on a deep-copied model; dropped the consumerless
+  game-data manifest provenance layer and the unverified self-fingerprint from
+  `engine_revival_identity`; unified the dependency-drift definition on atomic
+  lock metadata; and let same-process resume/evaluation chains reuse a
+  revalidated checkpoint-directory handle instead of re-hashing multi-gigabyte
+  checkpoint directories two to three times per operation.
 - Corrected non-combat durable progress so HP, max HP, native deaths/revivals and
   cumulative loss cannot masquerade as forward room progress. Added a generic
   factual event-page transition cycle detector, authoritative event/selection
