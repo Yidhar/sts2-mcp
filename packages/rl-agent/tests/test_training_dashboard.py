@@ -443,6 +443,58 @@ def test_exact_resume_chain_aggregates_series_counters_gate_zero_and_context(tmp
     }
 
 
+def test_episode_projection_preserves_chronology_and_breaks_rollback_branches(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    for index, environment_steps in enumerate((1_000, 2_000, 400, 900), start=1):
+        _append_jsonl(
+            metrics,
+            {
+                "event": "train_episode",
+                "unix_s": 100.0 + index,
+                "environment_steps": environment_steps,
+                "max_floor": index,
+                "revivals_used": index * 2,
+            },
+        )
+
+    snapshot = DashboardStore(root).snapshot()
+
+    assert [episode["environment_steps"] for episode in snapshot["episodes"]] == [
+        1_000,
+        2_000,
+        400,
+        900,
+    ]
+    assert [episode["rollback_generation"] for episode in snapshot["episodes"]] == [
+        0,
+        0,
+        1,
+        1,
+    ]
+    assert [episode["rollback_boundary"] for episode in snapshot["episodes"]] == [
+        False,
+        False,
+        True,
+        False,
+    ]
+
+
+def test_explicit_rollback_generation_wins_over_legacy_step_inference() -> None:
+    episodes = monitoring_module._annotate_episode_generations(
+        [
+            {"environment_steps": 100, "rollback_generation": 3},
+            {"environment_steps": 200, "rollback_generation": 3},
+            {"environment_steps": 50, "rollback_generation": 4},
+        ]
+    )
+
+    assert [episode["rollback_generation"] for episode in episodes] == [3, 3, 4]
+    assert [episode["rollback_boundary"] for episode in episodes] == [False, False, True]
+
+
 def test_status_completed_overrides_stale_fresh_is_running_and_old_unknown_is_stale(tmp_path: Path) -> None:
     now = 10_000.0
 
@@ -560,6 +612,7 @@ def test_active_final_audit_is_fresh_evaluating_not_complete_at_training_horizon
         "pending_evaluation": {
             "kind": "final_audit",
             "gate": 100,
+            "attempt": 1,
             "journal_name": "final-audit-step-000000100.jsonl",
             "modified_at": now - 5.0,
         },
@@ -584,6 +637,71 @@ def test_validation_and_early_validation_journals_are_recognized(tmp_path: Path)
 
         assert snapshot["status"]["label"] == expected_label
         assert snapshot["lifecycle"]["pending_evaluation"]["kind"] == expected_kind
+
+
+def test_repeated_evaluation_gate_attempt_is_independent_and_visible(
+    tmp_path: Path,
+) -> None:
+    now = 3_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": 200.0,
+            "evaluation_gate": 20,
+            "evaluation_attempt": 1,
+            "evaluation_guard_rollbacks": 0,
+            "gate_kind": "early_validation",
+            "environment_steps": 20,
+            "episodes": 16,
+        },
+    )
+    os.utime(metrics, (200.0, 200.0))
+    journal_name = "early-validation-step-000000020-attempt-002.jsonl"
+    journal = run_directory / journal_name
+    _append_jsonl(
+        journal,
+        {
+            "event": "evaluation_started",
+            "evaluation_gate": 20,
+            "evaluation_attempt": 2,
+            "evaluation_guard_rollbacks": 1,
+            "gate_kind": "early_validation",
+            "evaluation_seeds": [7],
+        },
+    )
+    os.utime(journal, (now - 1.0, now - 1.0))
+
+    store = DashboardStore(root, stale_seconds=100.0, now=lambda: now)
+    snapshot = store.snapshot()
+    run_key = f"lineage/run-{RUN_A}"
+    journals = store.heldout_journals(run_key)["journals"]
+
+    assert snapshot["status"]["label"] == "早期评估中 · 门 20 · 尝试 2"
+    assert snapshot["status"]["evaluation_attempt"] == 2
+    assert snapshot["lifecycle"]["pending_evaluation"]["attempt"] == 2
+    assert journals[0]["evaluation_attempt"] == 2
+    assert journals[0]["complete"] is False
+
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation",
+            "unix_s": now,
+            "evaluation_gate": 20,
+            "evaluation_attempt": 2,
+            "evaluation_guard_rollbacks": 1,
+            "gate_kind": "early_validation",
+            "environment_steps": 20,
+            "episodes": 16,
+        },
+    )
+    os.utime(metrics, (now, now))
+
+    assert store.snapshot()["lifecycle"]["pending_evaluation"] is None
+    assert store.heldout_journals(run_key)["journals"][0]["complete"] is True
 
 
 def test_evaluation_completion_and_projection_are_keyed_by_kind_and_gate(
@@ -789,6 +907,10 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert "将由 seed 与已记录动作在后台复现完整地图" in html
     assert "匹配 simulator 中精确复现完整地图" in html
     assert "历史日志未记录完整拓扑时" not in html
+    assert "策略回滚处断线" in html
+    assert 'xLabel: "训练 Episode' in html
+    assert "point.breakBefore !== true" in html
+    assert 'rollback_generation: "回滚代"' in html
     assert 'const API_HELDOUT_JOURNALS = "/api/v1/heldout-journals"' in html
     assert 'const API_HELDOUT_EPISODE = "/api/v1/heldout-episode"' in html
     assert 'const API_HELDOUT_REPLAY_MAP = "/api/v1/heldout-replay-map"' in html

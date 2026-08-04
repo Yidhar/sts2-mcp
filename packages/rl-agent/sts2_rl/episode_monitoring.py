@@ -457,6 +457,8 @@ def _provenance(header: Mapping[str, object]) -> JsonDict:
     return {
         "evaluation_gate": header.get("evaluation_gate"),
         "gate_kind": header.get("gate_kind"),
+        "evaluation_attempt": header.get("evaluation_attempt"),
+        "evaluation_guard_rollbacks": header.get("evaluation_guard_rollbacks"),
         "actual_environment_steps": header.get("actual_environment_steps"),
         "policy_version": header.get("policy_version"),
         "actor_policy_version": header.get("actor_policy_version"),
@@ -523,6 +525,8 @@ def journal_descriptor(
         "journal_kind": journal_kind,
         "gate_kind": recorded_gate_kind or expected_gate_kind,
         "evaluation_gate": gate,
+        "evaluation_attempt": header.get("evaluation_attempt"),
+        "evaluation_guard_rollbacks": header.get("evaluation_guard_rollbacks"),
         "actual_environment_steps": header.get("actual_environment_steps"),
         "policy_version": header.get("policy_version"),
         "episode_count": len(seeds) if isinstance(seeds, list) else None,

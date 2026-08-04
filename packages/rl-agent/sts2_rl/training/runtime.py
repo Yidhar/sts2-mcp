@@ -708,14 +708,55 @@ def _checkpoint_path(root: Path, state: TrainingState, *, prefix: str) -> Path:
     return root / f"{prefix}-step-{state.environment_steps:09d}"
 
 
+def _evaluation_attempt_number(state: TrainingState) -> int:
+    """Return the one-based policy attempt within a rollback-capable run.
+
+    ``environment_steps`` is restored with a healthy checkpoint, so it cannot
+    identify repeated evaluation gates. The persisted rollback counter can.
+    """
+
+    return state.evaluation_guard_rollbacks + 1
+
+
+def _evaluation_journal_name(journal_kind: str, step: int, *, attempt: int) -> str:
+    """Name one immutable evaluation attempt without mixing rollback branches."""
+
+    if journal_kind not in {"evaluation", "early-validation", "final-audit"}:
+        raise ValueError(f"unsupported evaluation journal kind: {journal_kind}")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError("evaluation journal step must be a non-negative integer")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise ValueError("evaluation journal attempt must be a positive integer")
+    suffix = "" if attempt == 1 else f"-attempt-{attempt:03d}"
+    return f"{journal_kind}-step-{step:09d}{suffix}.jsonl"
+
+
+def _guard_alert_checkpoint_prefix(*, attempt: int) -> str:
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+        raise ValueError("guard alert attempt must be a positive integer")
+    return f"guard-alert-attempt-{attempt:03d}"
+
+
+def _guard_rollback_checkpoint_prefix(*, rollback_number: int) -> str:
+    if (
+        isinstance(rollback_number, bool)
+        or not isinstance(rollback_number, int)
+        or rollback_number <= 0
+    ):
+        raise ValueError("guard rollback number must be a positive integer")
+    return f"guard-rollback-restored-attempt-{rollback_number:03d}"
+
+
 def _checkpoint_role_for_prefix(prefix: str) -> str:
     if prefix in {
         "healthy-gate-zero",
         "healthy-validation",
         "guard-rollback-restored",
-    }:
+    } or prefix.startswith("guard-rollback-restored-attempt-"):
         return "healthy_evaluation_anchor"
-    if prefix in {"guard-alert", "guard-stop", "guard-stop-gate-zero"}:
+    if prefix in {"guard-alert", "guard-stop", "guard-stop-gate-zero"} or prefix.startswith(
+        "guard-alert-attempt-"
+    ):
         return "guard_failure_evidence"
     if prefix == "deadlock-streak-alert":
         return "deadlock_alert_evidence"
@@ -812,6 +853,8 @@ def _evaluation_context(
         "schema_version": "sts2-training-evaluation-context-v1",
         "evaluation_gate": evaluation_gate,
         "gate_kind": gate_kind,
+        "evaluation_attempt": _evaluation_attempt_number(state),
+        "evaluation_guard_rollbacks": state.evaluation_guard_rollbacks,
         "actual_environment_steps": state.environment_steps,
         "policy_version": state.policy_version,
         "actor_policy_version": state.actor_policy_version,
@@ -1171,6 +1214,8 @@ def run_training(
                 {
                     "environment_steps": state.environment_steps,
                     "evaluation_gate": evaluation_step,
+                    "evaluation_attempt": context["evaluation_attempt"],
+                    "evaluation_guard_rollbacks": context["evaluation_guard_rollbacks"],
                     "gate_kind": gate_kind,
                     "data_partition": data_partition,
                     "run_maximum_observed_candidates": (state.maximum_observed_candidates),
@@ -1181,6 +1226,8 @@ def run_training(
             if guard.get("stop_requested") is True:
                 stop = {
                     "evaluation_gate": evaluation_step,
+                    "evaluation_attempt": context["evaluation_attempt"],
+                    "evaluation_guard_rollbacks": context["evaluation_guard_rollbacks"],
                     "actual_environment_steps": state.environment_steps,
                     "gate_kind": gate_kind,
                     "data_partition": data_partition,
@@ -1264,7 +1311,11 @@ def run_training(
                             "validation",
                             config.runtime.evaluation_episodes,
                             completed_evaluations,
-                            f"evaluation-step-{step:09d}.jsonl",
+                            _evaluation_journal_name(
+                                "evaluation",
+                                step,
+                                attempt=_evaluation_attempt_number(state),
+                            ),
                         )
                     )
             for step in config.runtime.early_evaluation_steps:
@@ -1276,7 +1327,11 @@ def run_training(
                             "early_validation",
                             config.runtime.early_evaluation_episodes,
                             completed_early_evaluations,
-                            f"early-validation-step-{step:09d}.jsonl",
+                            _evaluation_journal_name(
+                                "early-validation",
+                                step,
+                                attempt=_evaluation_attempt_number(state),
+                            ),
                         )
                     )
             if include_final_audits:
@@ -1289,7 +1344,11 @@ def run_training(
                                 "final_audit",
                                 config.runtime.final_audit_episodes,
                                 completed_final_audits,
-                                f"final-audit-step-{step:09d}.jsonl",
+                                _evaluation_journal_name(
+                                    "final-audit",
+                                    step,
+                                    attempt=_evaluation_attempt_number(state),
+                                ),
                             )
                         )
             for (
@@ -1952,6 +2011,7 @@ def run_training(
                     {
                         **asdict(episode.metrics),
                         "environment_steps": state.environment_steps,
+                        "rollback_generation": state.evaluation_guard_rollbacks,
                         "learner_updates": state.learner_updates,
                         "policy_version": state.policy_version,
                         "actor_policy_version": state.actor_policy_version,
@@ -2118,13 +2178,14 @@ def run_training(
 
                 evaluation_guard_stop, guarded_evaluation_ran = run_due_evaluations()
                 if evaluation_guard_stop is not None:
+                    guard_attempt = _evaluation_attempt_number(state)
                     guard_alert_checkpoint = _save(
                         resources,
                         config=config,
                         state=state,
                         schedule_state=schedule_state,
                         checkpoint_root=checkpoint_root / f"run-{run_id}",
-                        prefix="guard-alert",
+                        prefix=_guard_alert_checkpoint_prefix(attempt=guard_attempt),
                         parent_checkpoint=parent_checkpoint,
                         run_id=run_id,
                         load_mode=load_mode,
@@ -2214,7 +2275,9 @@ def run_training(
                             state=state,
                             schedule_state=schedule_state,
                             checkpoint_root=checkpoint_root / f"run-{run_id}",
-                            prefix="guard-rollback-restored",
+                            prefix=_guard_rollback_checkpoint_prefix(
+                                rollback_number=rollback_number,
+                            ),
                             parent_checkpoint=validated_healthy.root,
                             run_id=run_id,
                             load_mode="in_process_rollback",

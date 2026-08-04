@@ -13,7 +13,7 @@ import re
 import stat
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import islice, pairwise
 from pathlib import Path
@@ -33,7 +33,9 @@ _PARENT_RUN_RE = re.compile(
 )
 _CHECKPOINT_RE = re.compile(r"^(?P<kind>periodic|final)-step-(?P<step>[0-9]+)$")
 _EVALUATION_RE = re.compile(
-    r"^(?P<journal_kind>evaluation|early-validation|final-audit)-" r"step-(?P<step>[0-9]{1,18})\.jsonl$"
+    r"^(?P<journal_kind>evaluation|early-validation|final-audit)-"
+    r"step-(?P<step>[0-9]{1,18})"
+    r"(?:-attempt-(?P<attempt>(?=[0-9]{1,9}\.jsonl$)0*[1-9][0-9]*))?\.jsonl$"
 )
 _EVALUATION_GATE_KIND_BY_JOURNAL = {
     "evaluation": "validation",
@@ -211,6 +213,7 @@ def _project_episode(event: JsonDict, episode_number: int) -> JsonDict:
     return {
         "timestamp": _finite_number(event.get("unix_s")),
         "environment_steps": _integer(event.get("environment_steps")),
+        "rollback_generation": event.get("rollback_generation"),
         "episode": episode_number,
         "episode_id": event.get("episode_id"),
         "seed": event.get("reset_seed"),
@@ -250,6 +253,34 @@ def _project_episode(event: JsonDict, episode_number: int) -> JsonDict:
         "act_revival_counts": event.get("act_revival_counts"),
         "act_hp_loss_counts": event.get("act_hp_loss_counts"),
     }
+
+
+def _annotate_episode_generations(episodes: Sequence[JsonDict]) -> list[JsonDict]:
+    """Mark rollback boundaries without reordering chronological episodes.
+
+    New telemetry carries an explicit generation. For legacy journals a strict
+    environment-step decrease is an auditable single-collector rollback.
+    """
+
+    projected: list[JsonDict] = []
+    generation = 0
+    previous_environment_steps: int | None = None
+    for episode in episodes:
+        current = dict(episode)
+        environment_steps = _integer(current.get("environment_steps"))
+        explicit = _finite_number(current.get("rollback_generation"))
+        if explicit is not None and explicit >= 0:
+            generation = int(explicit)
+        elif previous_environment_steps is not None and environment_steps < previous_environment_steps:
+            generation += 1
+        current["rollback_generation"] = generation
+        current["rollback_boundary"] = bool(
+            projected
+            and generation != _integer(projected[-1].get("rollback_generation"))
+        )
+        projected.append(current)
+        previous_environment_steps = environment_steps
+    return projected
 
 
 def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
@@ -630,17 +661,19 @@ def _pending_evaluation_status(
 ) -> JsonDict:
     evaluation_kind = _string(pending_evaluation.get("kind"), "validation")
     evaluation_gate = _integer(pending_evaluation.get("gate"))
+    evaluation_attempt = max(1, _integer(pending_evaluation.get("attempt"), 1))
+    attempt_label = f" · 尝试 {evaluation_attempt}" if evaluation_attempt > 1 else ""
     if evaluation_kind == "final_audit":
-        label = f"最终审计中 · 门 {evaluation_gate}"
+        label = f"最终审计中 · 门 {evaluation_gate}{attempt_label}"
         evidence = [
             "最终审计 journal 活跃且尚无对应 evaluation 汇总",
             "run_complete 尚未持久化; 整个运行尚未完成",
         ]
     elif evaluation_kind == "early_validation":
-        label = f"早期评估中 · 门 {evaluation_gate}"
+        label = f"早期评估中 · 门 {evaluation_gate}{attempt_label}"
         evidence = ["早期评估 journal 活跃且尚无对应 evaluation 汇总"]
     else:
-        label = f"评估中 · 门 {evaluation_gate}"
+        label = f"评估中 · 门 {evaluation_gate}{attempt_label}"
         evidence = ["评估 journal 活跃且尚无对应 evaluation 汇总"]
     projected = {
         "state": "evaluating",
@@ -648,6 +681,7 @@ def _pending_evaluation_status(
         "label": label,
         "evaluation_kind": evaluation_kind,
         "evaluation_gate": evaluation_gate,
+        "evaluation_attempt": evaluation_attempt,
         "evidence": evidence,
     }
     if telemetry_age is not None:
@@ -788,6 +822,8 @@ def _normalise_evaluation(event: JsonDict) -> JsonDict:
     return {
         "timestamp": _finite_number(event.get("unix_s")),
         "evaluation_gate": gate,
+        "evaluation_attempt": max(1, _integer(event.get("evaluation_attempt"), 1)),
+        "evaluation_guard_rollbacks": max(0, _integer(event.get("evaluation_guard_rollbacks"))),
         "gate_kind": gate_kind,
         "data_partition": _string(event.get("data_partition"))
         or ("final_audit" if gate_kind == "final_audit" else "validation"),
@@ -1102,6 +1138,7 @@ class DashboardStore:
                     if _finite_number(event.get("evaluation_gate")) is not None
                     else event.get("environment_steps")
                 ),
+                max(1, _integer(event.get("evaluation_attempt"), 1)),
             )
             for event in recent_objects
             if event.get("event") == "evaluation"
@@ -1168,10 +1205,18 @@ class DashboardStore:
         recorded_gate = _finite_number(parsed.provenance.get("evaluation_gate"))
         expected_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[match.group("journal_kind")]
         recorded_kind = _string(parsed.provenance.get("gate_kind"))
+        expected_attempt = int(match.group("attempt") or 1)
+        recorded_attempt = _finite_number(parsed.provenance.get("evaluation_attempt"))
         if recorded_gate is not None and int(recorded_gate) != expected_gate:
             raise ValueError("held-out journal filename/header gate mismatch")
         if recorded_kind and recorded_kind != expected_kind:
             raise ValueError("held-out journal filename/header gate kind mismatch")
+        if (
+            match.group("attempt") is not None and recorded_attempt is None
+        ) or (
+            recorded_attempt is not None and int(recorded_attempt) != expected_attempt
+        ):
+            raise ValueError("held-out journal filename/header attempt mismatch")
         return parsed, expected_gate
 
     def heldout_journals(self, run_key: str) -> JsonDict:
@@ -1188,6 +1233,7 @@ class DashboardStore:
                         if _finite_number(event.get("evaluation_gate")) is not None
                         else event.get("environment_steps")
                     ),
+                    max(1, _integer(event.get("evaluation_attempt"), 1)),
                 )
                 for event in parser.evaluations
             }
@@ -1204,15 +1250,23 @@ class DashboardStore:
                         continue
                     journal_kind = match.group("journal_kind")
                     gate = int(match.group("step"))
+                    attempt = int(match.group("attempt") or 1)
                     gate_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[journal_kind]
                     descriptor = journal_descriptor(
                         entry,
                         parent=selected.run_directory,
                         journal_kind=journal_kind,
                         gate=gate,
-                        complete=(gate_kind, gate) in completed_gates,
+                        complete=(gate_kind, gate, attempt) in completed_gates,
                     )
                     if descriptor is not None:
+                        recorded_attempt = _finite_number(descriptor.get("evaluation_attempt"))
+                        if (
+                            match.group("attempt") is not None and recorded_attempt is None
+                        ) or (
+                            recorded_attempt is not None and int(recorded_attempt) != attempt
+                        ):
+                            continue
                         journals.append(descriptor)
             except OSError:
                 pass
@@ -1496,7 +1550,7 @@ class DashboardStore:
         self,
         run: DiscoveredRun,
         *,
-        completed_gates: set[tuple[str, int]],
+        completed_gates: set[tuple[str, int, int]],
         metrics_mtime: float | None,
     ) -> tuple[float | None, JsonDict | None]:
         latest_mtime: float | None = None
@@ -1522,12 +1576,16 @@ class DashboardStore:
                 except (OSError, OverflowError, ValueError):
                     continue
                 gate_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[match.group("journal_kind")]
+                attempt = int(match.group("attempt") or 1)
                 if latest_mtime is None or modified > latest_mtime:
                     latest_mtime = modified
-                if (gate_kind, gate) not in completed_gates and (pending_mtime is None or modified >= pending_mtime):
+                if (gate_kind, gate, attempt) not in completed_gates and (
+                    pending_mtime is None or modified >= pending_mtime
+                ):
                     pending_evaluation = {
                         "kind": gate_kind,
                         "gate": gate,
+                        "attempt": attempt,
                         "journal_name": entry.name,
                         "modified_at": modified,
                     }
@@ -1553,6 +1611,7 @@ class DashboardStore:
                     if _finite_number(event.get("evaluation_gate")) is not None
                     else event.get("environment_steps")
                 ),
+                max(1, _integer(event.get("evaluation_attempt"), 1)),
             )
             for event in parser.evaluations
         }
@@ -1833,7 +1892,7 @@ class DashboardStore:
                 eta = None
             confidence = confidence_15m if rate_15m is not None else confidence_60m
 
-            evaluations_by_gate: dict[tuple[str, int], tuple[int, JsonDict]] = {}
+            evaluations_by_gate: dict[tuple[str, int, int], tuple[int, JsonDict]] = {}
             evaluation_sequence = 0
             for _, aggregate, boundary in segments:
                 for event in _bounded_evaluations(aggregate, boundary):
@@ -1841,6 +1900,7 @@ class DashboardStore:
                     key = (
                         _string(normalised.get("gate_kind"), "validation"),
                         _integer(normalised.get("evaluation_gate")),
+                        max(1, _integer(normalised.get("evaluation_attempt"), 1)),
                     )
                     evaluations_by_gate[key] = (evaluation_sequence, normalised)
                     evaluation_sequence += 1
@@ -1874,9 +1934,13 @@ class DashboardStore:
                 projected_evaluations.sort(key=lambda item: item[0])
             evaluations = [evaluation for _, evaluation in projected_evaluations]
 
-            episodes = [
-                episode for _, aggregate, boundary in segments for episode in _bounded_episodes(aggregate, boundary)
-            ][-_MAX_EPISODES:]
+            episodes = _annotate_episode_generations(
+                [
+                    episode
+                    for _, aggregate, boundary in segments
+                    for episode in _bounded_episodes(aggregate, boundary)
+                ][-_MAX_EPISODES:]
+            )
             learner_series = [
                 point for _, aggregate, boundary in segments for point in _bounded_learner_series(aggregate, boundary)
             ]

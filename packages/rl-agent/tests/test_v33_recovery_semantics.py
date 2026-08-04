@@ -21,6 +21,9 @@ from sts2_rl.training.failure_credit import (
 from sts2_rl.training.runtime import (
     _checkpoint_role_for_prefix,
     _deadlock_streak_transition,
+    _evaluation_journal_name,
+    _guard_alert_checkpoint_prefix,
+    _guard_rollback_checkpoint_prefix,
     _is_healthy_rollback_checkpoint,
 )
 from sts2_rl.training.trajectory import TrajectoryJournal
@@ -460,6 +463,23 @@ def _evaluation_metric(index: int) -> EpisodeMetrics:
     )
 
 
+def test_guard_attempt_artifact_names_are_unique_and_role_stable() -> None:
+    assert _evaluation_journal_name(
+        "early-validation", 5_000, attempt=1
+    ) == "early-validation-step-000005000.jsonl"
+    assert _evaluation_journal_name(
+        "early-validation", 5_000, attempt=2
+    ) == "early-validation-step-000005000-attempt-002.jsonl"
+    assert _guard_alert_checkpoint_prefix(attempt=2) == "guard-alert-attempt-002"
+    assert _guard_rollback_checkpoint_prefix(
+        rollback_number=2
+    ) == "guard-rollback-restored-attempt-002"
+    assert _checkpoint_role_for_prefix("guard-alert-attempt-002") == "guard_failure_evidence"
+    assert _checkpoint_role_for_prefix(
+        "guard-rollback-restored-attempt-002"
+    ) == "healthy_evaluation_anchor"
+
+
 def test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -531,8 +551,8 @@ def test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues(
     )
     assert rollback["rollback_number"] == 1
     assert "healthy-gate-zero-step-000000000" in rollback["healthy_checkpoint"]
-    assert "guard-alert-step-000000002" in rollback["failed_checkpoint"]
-    assert "guard-rollback-restored-step-000000000" in rollback[
+    assert "guard-alert-attempt-001-step-000000002" in rollback["failed_checkpoint"]
+    assert "guard-rollback-restored-attempt-001-step-000000000" in rollback[
         "restored_checkpoint"
     ]
 
@@ -542,7 +562,7 @@ def test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues(
     restored_metadata = json.loads(
         (
             checkpoint_root
-            / "guard-rollback-restored-step-000000000"
+            / "guard-rollback-restored-attempt-001-step-000000000"
             / "metadata.json"
         ).read_text(encoding="utf-8")
     )
@@ -551,6 +571,86 @@ def test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues(
         "in_process_rollback"
     )
     assert restored_metadata["training_state"]["evaluation_guard_rollbacks"] == 1
+
+
+def test_two_guard_rollbacks_use_independent_journals_and_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/v33-two-guard-rollbacks",
+            checkpoint_dir="checkpoints/v33-two-guard-rollbacks",
+            checkpoint_interval_steps=100,
+            evaluation_steps=(0, 2),
+            evaluation_episodes=16,
+            early_evaluation_steps=(),
+            final_audit_steps=(),
+            evaluation_liveness_guard_enabled=True,
+            evaluation_guard_min_liveness_episodes=16,
+            evaluation_guard_liveness_baseline_failures=0,
+            evaluation_guard_liveness_baseline_episodes=16,
+            evaluation_guard_min_liveness_regression_rate=0.20,
+            evaluation_guard_failure_action="rollback_continue",
+            evaluation_guard_max_rollbacks=2,
+        ),
+    )
+    failure_counts = iter((0, 16, 16, 0))
+    journal_names: list[str] = []
+
+    def fake_evaluation(
+        _resources: object,
+        *,
+        episodes: int,
+        journal_path: str | Path,
+        **_kwargs: object,
+    ) -> tuple[list[EpisodeMetrics], dict[str, object]]:
+        journal_names.append(Path(journal_path).name)
+        failures = next(failure_counts)
+        results = [_evaluation_metric(index) for index in range(episodes)]
+        return results, {
+            "greedy_liveness": {
+                "episode_count": episodes,
+                "selection_cycle_episode_rate": 0.0,
+                "liveness_failure_episode_count": failures,
+                "liveness_failure_episode_rate": failures / episodes,
+            }
+        }
+
+    monkeypatch.setattr(runtime_module, "_evaluate_training_gate", fake_evaluation)
+
+    state = runtime_module.run_training(config, backend=FakeCombatBackend())
+
+    assert state.environment_steps == 4
+    assert state.evaluation_guard_rollbacks == 2
+    assert journal_names == [
+        "evaluation-step-000000000.jsonl",
+        "evaluation-step-000000002.jsonl",
+        "evaluation-step-000000002-attempt-002.jsonl",
+        "evaluation-step-000000002-attempt-003.jsonl",
+    ]
+
+    metrics_path = next(
+        (tmp_path / "runs" / "v33-two-guard-rollbacks").glob("run-*/metrics.jsonl")
+    )
+    events = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rollbacks = [event for event in events if event["event"] == "evaluation_guard_rollback"]
+    assert [event["rollback_number"] for event in rollbacks] == [1, 2]
+    evaluations = [event for event in events if event["event"] == "evaluation"]
+    assert [event["evaluation_attempt"] for event in evaluations] == [1, 1, 2, 3]
+    assert [event["evaluation_guard_rollbacks"] for event in evaluations] == [0, 0, 1, 2]
+    restored = [Path(event["restored_checkpoint"]) for event in rollbacks]
+    assert len(set(restored)) == 2
+    assert all(path.is_dir() for path in restored)
+    assert restored[0].name.startswith("guard-rollback-restored-attempt-001-step-")
+    assert restored[1].name.startswith("guard-rollback-restored-attempt-002-step-")
 
 
 def test_four_training_deadlocks_publish_one_immediate_alert_checkpoint(

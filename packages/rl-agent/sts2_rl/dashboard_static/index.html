@@ -1445,7 +1445,7 @@
           <article class="card chart-panel">
             <div class="chart-heading">
               <h3>训练 episode 趋势</h3>
-              <span>最远楼层与复活次数</span>
+              <span>按完成顺序；策略回滚处断线</span>
             </div>
             <div id="episode-chart" class="chart" aria-live="polite"></div>
           </article>
@@ -1464,8 +1464,9 @@
             <table aria-label="最近训练 episode">
               <thead>
                 <tr>
-                  <th>环境步</th>
+                  <th>当前环境步</th>
                   <th>Episode</th>
+                  <th>回滚代</th>
                   <th class="numeric">最远楼层</th>
                   <th class="numeric">复活</th>
                   <th class="numeric">失血</th>
@@ -1883,6 +1884,7 @@
         revivals: "复活次数",
         revival_count: "复活次数",
         max_revivals: "最大复活次数",
+        rollback_generation: "回滚代",
         player_hp_lost: "玩家失血",
         hp_lost: "玩家失血",
         steps: "动作步",
@@ -2266,28 +2268,42 @@
       }
 
       function episodeX(episode, index) {
-        return finite(first(episode, ["environment_steps", "env_step", "step"], index));
+        return finite(first(episode, ["episode", "episode_index"], index + 1));
       }
 
       function renderEpisodes(snapshot) {
         const episodes = Array.isArray(snapshot.episodes) ? snapshot.episodes : [];
         const latest = snapshot.latest_episode || (episodes.length ? episodes[episodes.length - 1] : null);
         renderKeyValues("latest-episode-kv", latest, [
-          "episode", "environment_steps", "max_floor", "final_floor", "revivals",
+          "episode", "environment_steps", "rollback_generation", "max_floor", "final_floor", "revivals",
           "player_hp_lost", "steps", "reward", "outcome", "termination_reason"
         ]);
         setText("latest-episode-time", latest ? dateTime(first(latest, ["timestamp", "time", "created_at"], null)) : "—");
 
         const floorPoints = [];
         const revivalPoints = [];
+        let previousEnvironmentSteps = null;
+        let previousRollbackGeneration = null;
         episodes.forEach((episode, index) => {
           const x = episodeX(episode, index);
+          const environmentSteps = finite(first(episode, ["environment_steps", "env_step", "step"], null));
+          const rollbackGeneration = finite(episode.rollback_generation);
+          const rollbackBoundary = episode.rollback_boundary === true ||
+            (rollbackGeneration != null && previousRollbackGeneration != null &&
+              rollbackGeneration !== previousRollbackGeneration) ||
+            (rollbackGeneration == null && previousEnvironmentSteps != null &&
+              environmentSteps != null && environmentSteps < previousEnvironmentSteps);
           const floor = finite(first(episode, ["max_floor", "maximum_floor", "final_floor", "floor"], null));
           const revivals = finite(first(episode, ["revivals", "revival_count", "max_revivals"], null));
-          if (x != null && floor != null) floorPoints.push({ x, y: floor, meta: `环境步 ${int(x)}：楼层 ${decimal(floor)}` });
-          if (x != null && revivals != null) {
-            revivalPoints.push({ x, y: revivals, meta: `环境步 ${int(x)}：复活 ${decimal(revivals)}` });
+          const context = `Episode ${int(x)} · 当前环境步 ${int(environmentSteps)} · 回滚代 ${int(rollbackGeneration)}`;
+          if (x != null && floor != null) {
+            floorPoints.push({ x, y: floor, breakBefore: rollbackBoundary, meta: `${context}：楼层 ${decimal(floor)}` });
           }
+          if (x != null && revivals != null) {
+            revivalPoints.push({ x, y: revivals, breakBefore: rollbackBoundary, meta: `${context}：复活 ${decimal(revivals)}` });
+          }
+          previousEnvironmentSteps = environmentSteps;
+          previousRollbackGeneration = rollbackGeneration;
         });
         renderLineChart("episode-chart", [
           { label: "最远楼层", color: "--series-1", points: floorPoints },
@@ -2299,7 +2315,7 @@
             axis: "right"
           }
         ], {
-          xLabel: "环境步",
+          xLabel: "训练 Episode（完成顺序）",
           yLabel: "最远楼层",
           rightYLabel: "复活次数",
           empty: "完成训练 episode 后显示楼层与复活趋势"
@@ -2311,7 +2327,7 @@
         if (!recent.length) {
           const row = document.createElement("tr");
           const cell = createCell("尚无训练 episode 记录", "wrap");
-          cell.colSpan = 7;
+          cell.colSpan = 8;
           row.append(cell);
           body.append(row);
           return;
@@ -2323,6 +2339,7 @@
           row.append(
             createCell(int(first(episode, ["environment_steps", "env_step", "step"], null))),
             createCell(int(first(episode, ["episode", "episode_index"], originalIndex))),
+            createCell(int(episode.rollback_generation), "numeric"),
             createCell(decimal(first(episode, ["max_floor", "maximum_floor", "final_floor", "floor"], null)), "numeric"),
             createCell(decimal(first(episode, ["revivals", "revival_count", "max_revivals"], null)), "numeric"),
             createCell(decimal(first(episode, ["player_hp_lost", "hp_lost"], null)), "numeric"),
@@ -2489,7 +2506,9 @@
         const kindKey = journal.gate_kind || journal.journal_kind || "validation";
         const kind = labels[kindKey] || humanKey(kindKey);
         const complete = journal.complete === true ? "完成" : journal.complete === false ? "写入中" : "未知";
-        return `${kind} ${gate} · ${int(journal.episode_count)} 局 · ${complete} · ${decimal((journal.size_bytes || 0) / 1048576, 1)}MB`;
+        const attempt = finite(journal.evaluation_attempt);
+        const attemptLabel = attempt != null && attempt > 1 ? ` · 尝试 ${int(attempt)}` : "";
+        return `${kind} ${gate}${attemptLabel} · ${int(journal.episode_count)} 局 · ${complete} · ${decimal((journal.size_bytes || 0) / 1048576, 1)}MB`;
       }
 
       function populateJournalSelect(journals) {
@@ -3796,7 +3815,7 @@
           const color = `var(${item.color})`;
           const yScale = item.axis === "right" ? rightYScale : leftYScale;
           const pathData = item.points
-            .map((point, index) => `${index ? "L" : "M"} ${xScale(point.x).toFixed(2)} ${yScale(point.y).toFixed(2)}`)
+            .map((point, index) => `${index && point.breakBefore !== true ? "L" : "M"} ${xScale(point.x).toFixed(2)} ${yScale(point.y).toFixed(2)}`)
             .join(" ");
           const pathAttrs = {
             d: pathData,

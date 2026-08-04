@@ -223,6 +223,17 @@ guard 失败不再只把 run 标记为停止：
 6. 重新执行被 guard 拒绝的评估并继续训练；
 7. 单个血统最多回滚 2 次，避免无限回滚循环。
 
+回滚会恢复 `environment_steps`，因此 gate 数字和环境步都不能充当重试的唯一身份。正式 artifact
+identity 是 `(gate_kind, gate, evaluation_attempt)`：第一代保留历史文件名，后续代使用
+`*-attempt-NNN.jsonl`；guard alert 与 restored checkpoint 同样带 attempt / rollback 序号。
+evaluation summary 和 journal header 都持久化 `evaluation_attempt` 与
+`evaluation_guard_rollbacks`，监控端要求文件名/header 一致并按三元组判断完成。这样同一 5k gate
+的失败 16 局不会与回滚后的 16 局混成 32 局，第二次恢复到 step 0 也不会撞上第一次的不可变目录。
+
+训练 episode 遥测另存 `rollback_generation`。监控按 episode 完成顺序画图，并在代际变化处断线；
+旧日志没有该字段时，仅用单 collector 环境步严格下降推断边界。环境步仍显示在 tooltip 和表格中，
+但不再被误用为跨回滚单调的横轴。
+
 目录名、prefix 或“曾经完成过评估”都不能把普通 checkpoint 冒充成健康锚点。
 新 checkpoint 将角色写入原子发布且受哈希保护的 metadata。旧 checkpoint 若缺少 role，仍可按原 ABI
 读取并视为 ordinary，以保持历史 exact-resume 兼容；它绝不会被当作健康回滚锚点。显式非法 role
@@ -240,6 +251,9 @@ checkpoint 还新增持久化：
 - `test_checkpoint_roundtrip_restores_v33_learner_dynamics_and_health_role`
 - `test_rollback_anchor_requires_hashed_health_role_not_directory_name`
 - `test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues`
+- `test_two_guard_rollbacks_use_independent_journals_and_checkpoints`
+- `test_repeated_evaluation_gate_attempt_is_independent_and_visible`
+- `test_episode_projection_preserves_chronology_and_breaks_rollback_branches`
 - `test_four_training_deadlocks_publish_one_immediate_alert_checkpoint`
 - `test_paused_actor_can_rewind_private_checkpoint_counters`
 
@@ -441,8 +455,13 @@ python scripts/launch_v33_stability_recovery_model_init.py initialize
 
 ### G3. 已知尚未完成的证据
 
-- 没有启动 v33 的 100k 在线训练；
-- 没有生成 0/5k/10k/25k/50k/75k/100k held-out 结果；
+- 首次 v33 在线运行 `f86b7015-f6ab-4498-90d6-be23c0608815` 已启动，但在第二次
+  guard 回滚时于 5,621 环境步失败，因此不能充当 100k 效果结论；
+- 首次 5k 尝试为 16/16 liveness failure；回滚后重试本身是 1/16 failure、Act 1
+  `15/16`、Act 3 / 通关 `12/16`。旧运行时把两次评估追加到同一 journal，错误汇总为
+  `17/32`，随后第二个 step-zero restored checkpoint 与第一次不可变目录重名并触发
+  `FileExistsError`。该链已由本节新增的 attempt artifact identity 修复并覆盖两次回滚测试；
+- 仍没有完成 100k，也没有生成完整的 10k/25k/50k/75k/100k held-out 结果；
 - 因此 C 节中的胜率、熵、锻造和 deadlock 标准仍是门禁，不是结论。
 
 ---

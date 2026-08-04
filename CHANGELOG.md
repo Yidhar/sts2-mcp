@@ -133,6 +133,15 @@ historical RL artifacts.
 
 ### Fixed
 
+- Isolated every rollback-era evaluation attempt at the artifact boundary.
+  Repeated gates now receive attempt-qualified journals and immutable guard /
+  restored-checkpoint prefixes, evaluation summaries persist the attempt and
+  rollback generation, and the monitor keys completion by kind + gate +
+  attempt. This prevents an earlier failed 16-seed journal from being merged
+  into a post-rollback retry and prevents a second rollback from colliding with
+  an existing step-zero checkpoint. Training episode charts now use completion
+  order, expose the rollback generation, and break the line at rewind
+  boundaries instead of drawing backward across unrelated policy branches.
 - Advanced the grounded encoder identity to v14 and fingerprinted the ordered
   native shop-item alias table. Category-only merchant removal can no longer
   silently share the old v13 digest while changing from `purchase_item` / Run
