@@ -53,6 +53,10 @@ WATCHDOG_EVENT_SCHEMA_VERSION = "sts2-native-exit-watchdog-v1"
 # Disabled by default; continuation adapters opt in explicitly.
 SUPERVISED_STALL_TIMEOUT_SECONDS: float | None = None
 RUN_NAME = "full-run-revival-v27-infinite-random-init"
+# Launcher lifecycle state and trainer run discovery usually share a name, but
+# an exact-recovery adapter may supervise a successor in the original trainer
+# log namespace while retaining the failed launcher's immutable state file.
+STATE_NAME = RUN_NAME
 ACTIVE_ARTIFACT_ROOT = Path(
     "/mnt/e/game/project/sts2_mcp_artifacts/runtime"
 )
@@ -832,7 +836,7 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _state_path(paths: LaunchPaths) -> Path:
-    return paths.launcher_dir / f"{RUN_NAME}.state.json"
+    return paths.launcher_dir / f"{STATE_NAME}.state.json"
 
 
 def _successor_log_root(paths: LaunchPaths) -> Path:

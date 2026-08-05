@@ -98,6 +98,8 @@ def test_v33_recovery_supervisor_reenters_adapter_with_recovery_pins(
     manifest = paths.manifest_dir / "recovery.launch.json"
 
     assert launcher._core.RUN_NAME == launcher.RUN_NAME
+    assert launcher._core.STATE_NAME == launcher.STATE_NAME
+    assert launcher.STATE_NAME != launcher.RUN_NAME
     assert launcher._core.RESUME_RUN_ID == launcher.SOURCE_RUN_ID
     assert launcher._core.RESUME_STEP == launcher.SOURCE_ENVIRONMENT_STEPS
     assert launcher._core.RESUME_CHECKPOINT_ID == launcher.SOURCE_CHECKPOINT_ID
@@ -107,4 +109,8 @@ def test_v33_recovery_supervisor_reenters_adapter_with_recovery_pins(
         "supervise",
         "--manifest",
         str(manifest),
+    )
+    status = launcher._core.read_status(paths, enforce_active_root=False)
+    assert status["state_path"] == str(
+        paths.launcher_dir / f"{launcher.STATE_NAME}.state.json"
     )

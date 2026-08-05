@@ -499,7 +499,8 @@ shape 施加 `256 steps / 1024 candidates / 16 segments` 三个 pack 上限。�
   `learner_progress` 时启用，评估与原子 checkpoint 静默不再误杀；
 - v33 `periodic-step-000030089` 建立固定 checkpoint ID、manifest SHA256、
   metadata SHA256 的 exact-resume adapter，恢复 optimizer/replay/RNG/queue/
-  counters，而不是再次 model-init。
+  counters，而不是再次 model-init；trainer run discovery 与 launcher state
+  使用独立命名空间，旧 model-init 终态不会被覆盖或误当作恢复 schema。
 
 ### P2：replay v6 去重存储
 
