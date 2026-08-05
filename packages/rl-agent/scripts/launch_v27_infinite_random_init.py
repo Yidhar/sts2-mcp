@@ -883,6 +883,66 @@ def _metrics_events(metrics_path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def _last_metrics_event(
+    metrics_path: Path,
+    *,
+    maximum_bytes: int = 8 * 1024 * 1024,
+) -> dict[str, Any] | None:
+    """Read only the final complete metrics event for the live watchdog.
+
+    Re-reading the whole training journal once per second would itself become
+    a supervisor bottleneck. Metrics lines already have the same eight-MiB
+    audit ceiling in :func:`_metrics_events`, so an exponentially grown tail is
+    sufficient. A final torn write is ignored.
+    """
+
+    if maximum_bytes <= 0:
+        raise ValueError("maximum_bytes must be positive")
+    window = min(64 * 1024, maximum_bytes)
+    try:
+        with metrics_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            while True:
+                start = max(0, size - window)
+                handle.seek(start)
+                payload = handle.read(size - start)
+                if start > 0:
+                    separator = payload.find(b"\n")
+                    payload = b"" if separator < 0 else payload[separator + 1 :]
+                for raw_line in reversed(payload.splitlines()):
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        event = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        return event
+                if start == 0:
+                    return None
+                if window >= maximum_bytes:
+                    raise LaunchError(
+                        "final metrics line exceeds the audited size limit"
+                    )
+                window = min(maximum_bytes, window * 2)
+    except FileNotFoundError:
+        return None
+
+
+def _learner_update_in_flight(last_event: Mapping[str, Any] | None) -> bool:
+    """Return whether stale telemetry belongs to an unfinished learner call.
+
+    Evaluation and atomic checkpoint publication may leave the parent journal
+    unchanged much longer than a learner update. Only an unmatched learner
+    start/progress event is eligible for the short native-stall watchdog.
+    """
+
+    if last_event is None:
+        return False
+    return last_event.get("event") in {"learner_update_start", "learner_progress"}
+
+
 def _matching_resume_run_start(
     metrics_path: Path,
     *,
@@ -1807,22 +1867,45 @@ def supervise(paths: LaunchPaths, *, manifest_path: Path) -> dict[str, Any]:
                     )
                 except OSError:
                     telemetry_age = None
-                if telemetry_age is not None and telemetry_age > stall_timeout:
+                last_metrics_event = _last_metrics_event(bound_metrics)
+                learner_update_in_flight = _learner_update_in_flight(
+                    last_metrics_event
+                )
+                if (
+                    telemetry_age is not None
+                    and telemetry_age > stall_timeout
+                    and learner_update_in_flight
+                ):
                     event_id = _sha256_bytes(
-                        f"{launch_id}:learner-stall-watchdog-v1".encode()
+                        f"{launch_id}:learner-stall-watchdog-v2".encode()
                     )
                     _append_jsonl_event_once(
                         bound_metrics,
                         {
                             "event": "learner_stall_detected",
                             "unix_s": time.time(),
-                            "schema_version": "sts2-learner-stall-watchdog-v1",
-                            "source": "persistent-learner-stall-watchdog",
+                            "schema_version": "sts2-learner-stall-watchdog-v2",
+                            "source": "stage-aware-persistent-learner-stall-watchdog",
                             "watchdog_event_id": event_id,
                             "launch_id": launch_id,
                             "run_name": RUN_NAME,
                             "telemetry_age_s": telemetry_age,
                             "stall_timeout_s": stall_timeout,
+                            "last_metrics_event": (
+                                last_metrics_event.get("event")
+                                if last_metrics_event is not None
+                                else None
+                            ),
+                            "last_learner_stage": (
+                                last_metrics_event.get("stage")
+                                if last_metrics_event is not None
+                                else None
+                            ),
+                            "last_learner_update_number": (
+                                last_metrics_event.get("update_number")
+                                if last_metrics_event is not None
+                                else None
+                            ),
                             "trainer_process_identity": (
                                 asdict(trainer_identity)
                                 if trainer_identity is not None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 
 import torch
@@ -50,6 +50,15 @@ _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1 = 8
 _ONE_HOT_BREAKER_DURATION_UPDATES_V1 = 8
 _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1 = 0.012
 _ONE_HOT_BREAKER_RATIO_TOLERANCE_V1 = 1.0e-6
+
+# Execution-only liveness graph bounds. They do not change sampled records,
+# labels, loss weights or the equal-record objective, so exact resume may adopt
+# this safer execution plan without changing training lineage. A single record
+# is never truncated: an over-budget record becomes an auditable singleton.
+_LIVENESS_AUTOGRAD_PACKING_VERSION = 1
+_LIVENESS_AUTOGRAD_MAX_STEPS = 256
+_LIVENESS_AUTOGRAD_MAX_CANDIDATES = 1_024
+_LIVENESS_AUTOGRAD_MAX_SEGMENTS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +222,16 @@ class LivenessReplayWork:
 
 
 @dataclass(frozen=True, slots=True)
+class LivenessAutogradPack:
+    """One contiguous, equal-record-preserving liveness backward pack."""
+
+    start: int
+    end: int
+    work: LivenessReplayWork
+    oversized_singleton: bool
+
+
+@dataclass(frozen=True, slots=True)
 class LivenessLabelRow:
     """Pure DTO actor/critic-mask decision for one recurrent replay row."""
 
@@ -273,6 +292,93 @@ class LivenessLabelManifest:
 
     def row_map(self) -> dict[tuple[str, int], LivenessLabelRow]:
         return {row.key: row for row in self.rows}
+
+
+def _liveness_autograd_packs(
+    manifests: Sequence[LivenessLabelManifest],
+    *,
+    maximum_records: int,
+) -> tuple[LivenessAutogradPack, ...]:
+    """Partition replay records by actual active-shape graph work.
+
+    Packing only by record count allowed one 256-step failure context plus
+    three short controls to form a graph far larger than the benchmark
+    fixture. This preserves order and the exact global equal-record objective
+    while bounding steps, candidates and TBPTT graph segments. Evidence is
+    never truncated or rejected.
+    """
+
+    if isinstance(maximum_records, bool) or not isinstance(maximum_records, int):
+        raise TypeError("maximum_records must be an integer")
+    if maximum_records <= 0:
+        raise ValueError("maximum_records must be positive")
+    if not manifests:
+        return ()
+
+    packs: list[LivenessAutogradPack] = []
+    pack_start = 0
+    contexts = 0
+    steps = 0
+    candidates = 0
+    segments = 0
+
+    def publish(end: int) -> None:
+        nonlocal pack_start, contexts, steps, candidates, segments
+        if end <= pack_start:
+            return
+        record_count = end - pack_start
+        oversized = record_count == 1 and (
+            steps > _LIVENESS_AUTOGRAD_MAX_STEPS
+            or candidates > _LIVENESS_AUTOGRAD_MAX_CANDIDATES
+            or segments > _LIVENESS_AUTOGRAD_MAX_SEGMENTS
+        )
+        packs.append(
+            LivenessAutogradPack(
+                start=pack_start,
+                end=end,
+                work=LivenessReplayWork(
+                    contexts=contexts,
+                    steps=steps,
+                    candidates=candidates,
+                    autograd_segments=segments,
+                ),
+                oversized_singleton=oversized,
+            )
+        )
+        pack_start = end
+        contexts = 0
+        steps = 0
+        candidates = 0
+        segments = 0
+
+    for index, manifest in enumerate(manifests):
+        work = manifest.work
+        current_records = index - pack_start
+        would_exceed = current_records > 0 and (
+            current_records + 1 > maximum_records
+            or steps + work.steps > _LIVENESS_AUTOGRAD_MAX_STEPS
+            or candidates + work.candidates > _LIVENESS_AUTOGRAD_MAX_CANDIDATES
+            or segments + work.autograd_segments > _LIVENESS_AUTOGRAD_MAX_SEGMENTS
+        )
+        if would_exceed:
+            publish(index)
+
+        contexts += work.contexts
+        steps += work.steps
+        candidates += work.candidates
+        segments += work.autograd_segments
+
+        # An individually over-budget record stays intact but cannot pull
+        # another record into the same graph.
+        if (
+            work.steps > _LIVENESS_AUTOGRAD_MAX_STEPS
+            or work.candidates > _LIVENESS_AUTOGRAD_MAX_CANDIDATES
+            or work.autograd_segments > _LIVENESS_AUTOGRAD_MAX_SEGMENTS
+        ):
+            publish(index + 1)
+
+    publish(len(manifests))
+    return tuple(packs)
 
 
 @dataclass(slots=True)
@@ -1884,10 +1990,20 @@ class VTraceLearner:
         recurrent_started_ns = time.perf_counter_ns()
         batch_size = len(unrolls)
         maximum_time = max(len(unroll.steps) for unroll in unrolls)
+        report(
+            "recurrent_batch_setup_start",
+            recurrent_batch_size=batch_size,
+            recurrent_maximum_time_steps=maximum_time,
+        )
         hidden = torch.stack(
             [torch.from_numpy(unroll.initial_recurrent_state.copy()) for unroll in unrolls],
             dim=0,
         ).to(device=self.device, dtype=next(self.model.parameters()).dtype)
+        report(
+            "recurrent_batch_setup_complete",
+            recurrent_batch_size=batch_size,
+            recurrent_maximum_time_steps=maximum_time,
+        )
 
         log_prob_rows: list[Tensor] = []
         value_rows: list[Tensor] = []
@@ -1900,20 +2016,53 @@ class VTraceLearner:
 
         self.model.train()
         for time_index in range(maximum_time):
+            completed_steps = time_index + 1
+            detailed_progress = (
+                completed_steps == 1
+                or completed_steps == maximum_time
+                or completed_steps % 4 == 0
+            )
             active = [index for index, unroll in enumerate(unrolls) if time_index < len(unroll.steps)]
             active_tensor = torch.tensor(active, device=self.device, dtype=torch.long)
             snapshots = tuple(unrolls[index].steps[time_index].snapshot for index in active)
+            if detailed_progress:
+                report(
+                    "recurrent_step_collate_start",
+                    recurrent_time_step=completed_steps,
+                    recurrent_maximum_time_steps=maximum_time,
+                    recurrent_active_unrolls=len(active),
+                )
             encoded = collate_encoded_snapshots(
                 snapshots,
                 expected_config=self.encoder.config,
                 expected_fingerprint=encoding_fingerprint,
                 device=self.device,
             )
+            if detailed_progress:
+                report(
+                    "recurrent_step_collate_complete",
+                    recurrent_time_step=completed_steps,
+                    recurrent_maximum_time_steps=maximum_time,
+                    recurrent_active_unrolls=len(active),
+                )
+                report(
+                    "recurrent_step_forward_start",
+                    recurrent_time_step=completed_steps,
+                    recurrent_maximum_time_steps=maximum_time,
+                    recurrent_active_unrolls=len(active),
+                )
             output = self.model(
                 encoded,
                 hidden.index_select(0, active_tensor),
                 validate=False,
             )
+            if detailed_progress:
+                report(
+                    "recurrent_step_forward_complete",
+                    recurrent_time_step=completed_steps,
+                    recurrent_maximum_time_steps=maximum_time,
+                    recurrent_active_unrolls=len(active),
+                )
             hidden = hidden.index_copy(0, active_tensor, output.recurrent_state)
             log_policy = output.policy_log_probabilities()
             selected = torch.tensor(
@@ -1974,8 +2123,7 @@ class VTraceLearner:
                     ),
                 )
             )
-            completed_steps = time_index + 1
-            if completed_steps == 1 or completed_steps == maximum_time or completed_steps % 4 == 0:
+            if detailed_progress:
                 report(
                     "recurrent_forward_progress",
                     completed_time_steps=completed_steps,
@@ -2134,16 +2282,21 @@ class VTraceLearner:
         packed_liveness_losses: list[LivenessCreditLosses] = []
         packed_record_counts: list[int] = []
         liveness_pack_size = self.failure_credit_config.liveness_records_per_autograd_batch
-        liveness_autograd_microbatches = math.ceil(len(credit_plans) / liveness_pack_size) if credit_plans else 0
-        for pack_index, pack_start in enumerate(range(0, len(credit_plans), liveness_pack_size)):
-            pack_end = min(pack_start + liveness_pack_size, len(credit_plans))
+        liveness_packs = _liveness_autograd_packs(
+            admitted_manifests,
+            maximum_records=liveness_pack_size,
+        )
+        liveness_autograd_microbatches = len(liveness_packs)
+        for pack_index, pack in enumerate(liveness_packs):
+            pack_start = pack.start
+            pack_end = pack.end
             plan_pack = credit_plans[pack_start:pack_end]
             manifest_pack = admitted_manifests[pack_start:pack_end]
             pack_record_count = len(plan_pack)
-            pack_contexts = sum(manifest.work.contexts for manifest in manifest_pack)
-            pack_steps = sum(manifest.work.steps for manifest in manifest_pack)
-            pack_candidates = sum(manifest.work.candidates for manifest in manifest_pack)
-            pack_segments = sum(manifest.work.autograd_segments for manifest in manifest_pack)
+            pack_contexts = pack.work.contexts
+            pack_steps = pack.work.steps
+            pack_candidates = pack.work.candidates
+            pack_segments = pack.work.autograd_segments
             # Report the complete active-shape pack before model forward. A
             # native GPU stall can then be attributed to one bounded graph and
             # its workload. Per-record events remain for monitor compatibility.
@@ -2158,6 +2311,11 @@ class VTraceLearner:
                 liveness_batch_steps=pack_steps,
                 liveness_batch_candidates=pack_candidates,
                 liveness_batch_autograd_segments=pack_segments,
+                liveness_batch_oversized_singleton=int(pack.oversized_singleton),
+                liveness_autograd_packing_version=_LIVENESS_AUTOGRAD_PACKING_VERSION,
+                liveness_autograd_max_steps=_LIVENESS_AUTOGRAD_MAX_STEPS,
+                liveness_autograd_max_candidates=_LIVENESS_AUTOGRAD_MAX_CANDIDATES,
+                liveness_autograd_max_segments=_LIVENESS_AUTOGRAD_MAX_SEGMENTS,
             )
             for offset, admitted_manifest in enumerate(manifest_pack):
                 report(

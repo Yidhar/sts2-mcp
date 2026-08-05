@@ -133,6 +133,13 @@ historical RL artifacts.
 
 ### Fixed
 
+- Bounded liveness autograd packs by actual active-shape steps, candidates and
+  TBPTT segments instead of record count alone, while preserving every record
+  and the exact equal-record objective. Added staged recurrent setup/collate/
+  forward heartbeats, made the native-stall watchdog learner-stage-aware so it
+  cannot mistake evaluation/checkpoint silence for a wedged update, and added
+  a checkpoint-hash-pinned exact-resume adapter for the interrupted v33
+  30,089-step checkpoint.
 - Isolated every rollback-era evaluation attempt at the artifact boundary.
   Repeated gates now receive attempt-qualified journals and immutable guard /
   restored-checkpoint prefixes, evaluation summaries persist the attempt and

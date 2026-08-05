@@ -46,6 +46,7 @@ class LaunchError(RuntimeError):
 RUN_NAME = "full-run-revival-v29-failure-credit-v4-exact-continuation-350k"
 SOURCE_RUN_ID = "78554f34-a31e-48ed-8e3e-8e58effc2790"
 SOURCE_ENVIRONMENT_STEPS = 100_000
+SOURCE_TOTAL_ENVIRONMENT_STEPS = 100_000
 TARGET_ENVIRONMENT_STEPS = 350_000
 ADDITIONAL_ENVIRONMENT_STEPS = TARGET_ENVIRONMENT_STEPS - SOURCE_ENVIRONMENT_STEPS
 SOURCE_CHECKPOINT_ID = "075b8174-1dab-4293-90bd-9c63f0aab277"
@@ -213,7 +214,7 @@ def _validate_checkpoint_summary(summary: Mapping[str, Any], *, paths: Any) -> d
         "environment_steps": SOURCE_ENVIRONMENT_STEPS,
         "policy_version": SOURCE_POLICY_VERSION,
         "learner_updates": SOURCE_LEARNER_UPDATES,
-        "source_total_environment_steps": SOURCE_ENVIRONMENT_STEPS,
+        "source_total_environment_steps": SOURCE_TOTAL_ENVIRONMENT_STEPS,
         "target_total_environment_steps": TARGET_ENVIRONMENT_STEPS,
         "checkpoint_format": "sts2-recurrent-vtrace-checkpoint-v5",
     }

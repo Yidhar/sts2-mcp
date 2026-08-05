@@ -190,6 +190,55 @@ def _append_event(path: Path, event: dict[str, object]) -> None:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+def test_stage_aware_watchdog_only_arms_inside_an_unfinished_learner_update(
+    tmp_path: Path,
+) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    _append_event(metrics, {"event": "run_start"})
+    assert not launcher._learner_update_in_flight(
+        launcher._last_metrics_event(metrics)
+    )
+
+    _append_event(metrics, {"event": "learner_update_start", "update_number": 7})
+    assert launcher._learner_update_in_flight(launcher._last_metrics_event(metrics))
+
+    _append_event(
+        metrics,
+        {
+            "event": "learner_progress",
+            "update_number": 7,
+            "stage": "recurrent_step_forward_start",
+        },
+    )
+    event = launcher._last_metrics_event(metrics)
+    assert event is not None
+    assert event["stage"] == "recurrent_step_forward_start"
+    assert launcher._learner_update_in_flight(event)
+
+    _append_event(metrics, {"event": "learner_update", "update_number": 7})
+    assert not launcher._learner_update_in_flight(
+        launcher._last_metrics_event(metrics)
+    )
+
+    # Evaluation/checkpoint silence must not be classified as a learner stall.
+    _append_event(metrics, {"event": "evaluation_start", "environment_steps": 25_000})
+    assert not launcher._learner_update_in_flight(
+        launcher._last_metrics_event(metrics)
+    )
+
+
+def test_last_metrics_event_ignores_a_torn_final_write(tmp_path: Path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    _append_event(metrics, {"event": "learner_update", "update_number": 9})
+    with metrics.open("ab") as handle:
+        handle.write(b'{"event":"learner_progress"')
+
+    assert launcher._last_metrics_event(metrics) == {
+        "event": "learner_update",
+        "update_number": 9,
+    }
+
+
 def _supervised_manifest(
     paths: object,
     *,

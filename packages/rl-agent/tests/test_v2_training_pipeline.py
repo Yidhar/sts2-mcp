@@ -900,7 +900,7 @@ def test_checkpoint_rejects_completed_evaluation_gate_beyond_training_horizon(
     try:
         with pytest.raises(
             ValueError,
-            match="cannot complete gates beyond training_state.environment_steps",
+            match=r"cannot complete gates beyond training_state.environment_steps",
         ):
             save_training_checkpoint(
                 target,
@@ -2291,6 +2291,19 @@ def test_vtrace_learner_updates_policy_value_and_recurrent_parameters() -> None:
         assert torch.isfinite(torch.tensor(metrics.loss))
         assert metrics.importance_ratio_mean > 0.0
         assert progress[0][0] == "validation_complete"
+        stages = [stage for stage, _ in progress]
+        assert stages[:7] == [
+            "validation_complete",
+            "recurrent_batch_setup_start",
+            "recurrent_batch_setup_complete",
+            "recurrent_step_collate_start",
+            "recurrent_step_collate_complete",
+            "recurrent_step_forward_start",
+            "recurrent_step_forward_complete",
+        ]
+        assert stages.index("recurrent_step_forward_complete") < stages.index(
+            "recurrent_forward_progress"
+        )
         assert progress[-1][0] == "optimizer_complete"
         assert any(stage == "backward_complete" for stage, _ in progress)
         assert all(payload["elapsed_ms"] >= 0.0 for _, payload in progress)

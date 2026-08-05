@@ -479,6 +479,28 @@ ROCm 7.2.1、FP32/math-SDPA，`warmup=1, iterations=3` 的实测如下：
 critic-only head routing、静态编码预批处理和稳定 shape bucket，而不是继续
 无界增加 record pack 或改变训练信号。
 
+#### P1b 生产异构负载加固（2026-08-05）
+
+v33 生产运行证明“4 records”不是稳定的图工作量单位：一次更新把
+`256+33+33+33` steps、`1450` candidates、`17` TBPTT segments 合进同一
+autograd graph；该更新总耗时升至 94.65 秒，下一更新随后在首个 recurrent
+forward 前失去遥测并被旧 30 分钟 watchdog 终止。
+
+执行器因此改为保留 `records_per_autograd_batch=4` 上限，同时按实际 active
+shape 施加 `256 steps / 1024 candidates / 16 segments` 三个 pack 上限。超限
+只会拆分连续 pack，不会截断、拒绝或重新抽样 evidence；单条超限记录完整
+保留为带标记的 singleton。每个 pack 仍按 `record_count / total_records`
+缩放，所以全局 per-record 等权目标不变。上述生产形状固定拆为 `1+3`。
+
+同时补充以下可恢复性约束：
+
+- recurrent setup、collate、forward 的首步/每四步分阶段心跳；
+- watchdog 仅在最后事件为未完成的 `learner_update_start` 或
+  `learner_progress` 时启用，评估与原子 checkpoint 静默不再误杀；
+- v33 `periodic-step-000030089` 建立固定 checkpoint ID、manifest SHA256、
+  metadata SHA256 的 exact-resume adapter，恢复 optimizer/replay/RNG/queue/
+  counters，而不是再次 model-init。
+
 ### P2：replay v6 去重存储
 
 - ContextBlobStore、columnar snapshot、identity interning；

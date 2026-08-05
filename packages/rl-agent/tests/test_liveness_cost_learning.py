@@ -40,14 +40,41 @@ from sts2_rl.training.failure_credit import (
 )
 from sts2_rl.training.learner import (
     LivenessCreditLosses,
+    LivenessLabelManifest,
+    LivenessReplayWork,
     VTraceLearner,
     _apply_parameter_gradient_delta_,
     _clip_parameter_gradient_delta_,
+    _liveness_autograd_packs,
     _parameter_gradient_delta_snapshot,
     _parameter_gradient_snapshot,
     compile_liveness_label_manifest,
     liveness_credit_losses,
 )
+
+
+def _work_manifest(
+    *,
+    steps: int,
+    candidates: int,
+    segments: int,
+) -> LivenessLabelManifest:
+    return LivenessLabelManifest(
+        learner_update=0,
+        calibration_active=False,
+        risk_actor_enabled=True,
+        rows=(),
+        cycle_groups=(),
+        contrast_groups=(),
+        policy_lag_suppressed_labels=0,
+        risk_actor_phase_suppressed_labels=0,
+        work=LivenessReplayWork(
+            contexts=1,
+            steps=steps,
+            candidates=candidates,
+            autograd_segments=segments,
+        ),
+    )
 
 
 def _model_config() -> GroundedCandidateConfig:
@@ -1325,6 +1352,40 @@ def test_liveness_recurrent_replay_detaches_each_tbptt_window() -> None:
     assert trainable_hidden_is_detached == [True, False, True, False, True]
     assert losses.replayed_steps == 6
     assert losses.autograd_segments == 3
+
+
+def test_work_aware_liveness_packer_isolates_a_full_context_from_short_controls() -> None:
+    manifests = (
+        _work_manifest(steps=256, candidates=1_020, segments=14),
+        _work_manifest(steps=33, candidates=129, segments=1),
+        _work_manifest(steps=33, candidates=132, segments=1),
+        _work_manifest(steps=33, candidates=169, segments=1),
+    )
+
+    packs = _liveness_autograd_packs(manifests, maximum_records=4)
+
+    assert [(pack.start, pack.end) for pack in packs] == [(0, 1), (1, 4)]
+    assert packs[0].work == manifests[0].work
+    assert packs[1].work == LivenessReplayWork(
+        contexts=3,
+        steps=99,
+        candidates=430,
+        autograd_segments=3,
+    )
+    assert not any(pack.oversized_singleton for pack in packs)
+
+
+def test_work_aware_liveness_packer_keeps_an_oversized_record_intact_and_alone() -> None:
+    manifests = (
+        _work_manifest(steps=300, candidates=1_500, segments=20),
+        _work_manifest(steps=1, candidates=3, segments=1),
+    )
+
+    packs = _liveness_autograd_packs(manifests, maximum_records=4)
+
+    assert [(pack.start, pack.end) for pack in packs] == [(0, 1), (1, 2)]
+    assert packs[0].oversized_singleton
+    assert not packs[1].oversized_singleton
 
 
 def test_update_backpropagates_failure_credit_in_configured_record_packs(
