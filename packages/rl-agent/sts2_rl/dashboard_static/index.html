@@ -2558,12 +2558,13 @@
         const selected = action.selected && typeof action.selected === "object" ? action.selected : action;
         const location = selected.column != null ? ` · 列 ${int(selected.column)}` : "";
         const forced = action.forced === true ? " · forced" : "";
-        return `${scalar(selected.kind)} · ${scalar(selected.label)}${location}${forced}`;
+        const localized = first(selected, ["display_name", "label"], "未记录");
+        return `${scalar(selected.kind)} · ${scalar(localized)}${location}${forced}`;
       }
 
       function candidateDescription(candidate) {
         const probability = finite(candidate && candidate.probability);
-        return `${scalar(first(candidate || {}, ["card_id", "label", "kind"], "未记录"))}` +
+        return `${scalar(first(candidate || {}, ["display_name", "card_id", "label", "kind"], "未记录"))}` +
           `${candidate && candidate.column != null ? `@列${int(candidate.column)}` : ""}` +
           `${probability == null ? "" : ` ${(probability * 100).toFixed(1)}%`}` +
           `${candidate && candidate.selected ? " ✓" : ""}`;
@@ -2668,13 +2669,14 @@
         const itemKind = String(first(item || {}, ["type", "card_type", "kind"], kind) || kind).toLowerCase();
         chip.dataset.kind = kind === "card" ? itemKind : kind;
         const id = first(item || {}, ["card_id", "relic_id", "potion_id", "id", "name", "title"], null);
+        const displayName = first(item || {}, ["display_name"], null);
         const upgraded = item && (
           item.upgraded === true || item.is_upgraded === true ||
           finite(item.upgrade_count) > 0 || finite(item.upgrade_level) > 0
         );
         const quantity = Math.max(1, Math.round(finite(first(item || {}, ["quantity", "count", "stack_count"], 1)) || 1));
         const label = document.createElement("span");
-        label.textContent = `${entityDisplayName(id)}${upgraded ? "+" : ""}`;
+        label.textContent = `${displayName || entityDisplayName(id)}${upgraded ? "+" : ""}`;
         chip.append(label);
         if (quantity > 1) {
           const count = document.createElement("span");
@@ -2689,6 +2691,7 @@
           .filter(Boolean);
         const rarity = first(item || {}, ["rarity"], null);
         chip.title = [
+          id ? `内部 ID ${id}` : "",
           rarity ? `稀有度 ${rarity}` : "",
           modifiers.length ? `附魔/词缀 ${modifiers.join(", ")}` : "",
           item && item.floor_added_to_deck != null ? `加入楼层 ${item.floor_added_to_deck}` : ""
@@ -2988,6 +2991,9 @@
         const chip = document.createElement("span");
         chip.className = "decision-chip";
         chip.textContent = actionDescription(action);
+        const selected = action && action.selected && typeof action.selected === "object" ? action.selected : action;
+        const entityId = first(selected || {}, ["entity_id", "card_id"], null);
+        if (entityId) chip.title = `内部 ID ${entityId}`;
         return chip;
       }
 
@@ -3099,6 +3105,9 @@
               const chip = document.createElement("span");
               chip.className = "decision-chip";
               chip.textContent = reward.skipped ? "跳过卡牌奖励" : `拿牌 ${actionDescription(reward)}`;
+              const selected = reward && reward.selected && typeof reward.selected === "object" ? reward.selected : {};
+              const entityId = first(selected, ["entity_id", "card_id"], null);
+              if (entityId) chip.title = `内部 ID ${entityId}`;
               chips.append(chip);
             });
             detail.append(heading, chips);
@@ -3193,6 +3202,10 @@
             line.textContent = `Act ${int(reward.act)} Floor ${int(reward.floor)} · ` +
               `${reward.skipped ? "跳过" : `选择 ${actionDescription(reward)}`} · 候选 ${candidates}` +
               ` · 候选覆盖 ${scalar(reward.candidate_coverage)}`;
+            const internalIds = [reward.selected, ...(Array.isArray(reward.candidates) ? reward.candidates : [])]
+              .map((item) => first(item || {}, ["entity_id", "card_id"], null))
+              .filter((value, index, values) => value && values.indexOf(value) === index);
+            if (internalIds.length) line.title = `内部 ID ${internalIds.join(", ")}`;
             rewardTarget.append(line);
           });
         }
@@ -3259,7 +3272,7 @@
             const line = document.createElement("div");
             line.className = "card";
             const actions = Array.isArray(anomaly.cycle_actions)
-              ? anomaly.cycle_actions.map((action) => `${scalar(action.kind)}:${scalar(action.label)}`).join(" → ")
+              ? anomaly.cycle_actions.map((action) => `${scalar(action.kind)}:${scalar(first(action, ["display_name", "label"], "未记录"))}`).join(" → ")
               : "未记录";
             line.textContent = `${scalar(anomaly.kind)} · step ${int(anomaly.step)} · span ${int(anomaly.cycle_span)} · ` +
               `重复 ${int(anomaly.occurrences)} · ${actions}`;

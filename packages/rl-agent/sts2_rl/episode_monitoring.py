@@ -24,7 +24,9 @@ from collections import OrderedDict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
+
+from sts2_rl.entity_localization import EntityKind, localized_entity_name
 
 JsonDict = dict[str, Any]
 
@@ -178,6 +180,7 @@ def _project_card(value: object) -> tuple[JsonDict | None, int]:
     quantity = min(_MAX_ITEM_QUANTITY, max(1, quantity))
     projected: JsonDict = {
         "card_id": identifier,
+        "display_name": localized_entity_name(identifier, kind="card"),
         "name": _bounded_string(card.get("name")) or _bounded_string(card.get("title")),
         "type": _bounded_string(card.get("type")),
         "rarity": _bounded_string(card.get("rarity")),
@@ -244,7 +247,11 @@ def _project_inventory(value: object, *, kind: str, limit: int) -> tuple[list[Js
         identifier = next((_bounded_string(source.get(key)) for key in identifier_keys if source.get(key)), None)
         if identifier is None:
             continue
-        row: JsonDict = {f"{kind}_id": identifier}
+        entity_kind = cast(EntityKind | None, kind if kind in {"card", "relic", "potion"} else None)
+        row: JsonDict = {
+            f"{kind}_id": identifier,
+            "display_name": localized_entity_name(identifier, kind=entity_kind),
+        }
         for key in scalar_keys:
             row[key] = _bounded_string(source.get(key))
         for key in numeric_keys:
@@ -400,6 +407,34 @@ def _project_action(action: Mapping[str, object]) -> JsonDict:
             "point_type": _bounded_string(map_node.get("point_type")),
             "index": _integer(map_node.get("index")) if _finite(map_node.get("index")) is not None else None,
         }
+    item_category = _string(item.get("category"))
+    entity_kind: EntityKind | None = None
+    entity_id: str | None = None
+    for candidate_kind, sources in (
+        (cast(EntityKind, "card"), ((action, ("card_id",)), (card, ("card_id", "id")))),
+        (cast(EntityKind, "relic"), ((action, ("relic_id",)), (item, ("relic_id",)))),
+        (cast(EntityKind, "potion"), ((action, ("potion_id",)), (item, ("potion_id",)))),
+    ):
+        for source, keys in sources:
+            for key in keys:
+                value = _bounded_string(source.get(key))
+                if value is not None:
+                    entity_kind = candidate_kind
+                    entity_id = value
+                    break
+            if entity_id is not None:
+                break
+        if entity_id is not None:
+            break
+    if entity_id is None and item_category in {"card", "relic", "potion"}:
+        entity_kind = cast(EntityKind, item_category)
+        for key in (f"{item_category}_id", "id"):
+            entity_id = _bounded_string(item.get(key))
+            if entity_id is not None:
+                break
+    display_name = (
+        localized_entity_name(entity_id, kind=entity_kind) if entity_id is not None else _action_label(action)
+    )
     projected: JsonDict = {
         "kind": kind,
         "label": _action_label(action),
@@ -414,7 +449,10 @@ def _project_action(action: Mapping[str, object]) -> JsonDict:
         "map_node": projected_map_node,
         "card_id": _string(action.get("card_id")) or _string(card.get("card_id")) or None,
         "card_rarity": _string(action.get("card_rarity")) or _string(card.get("rarity")) or None,
-        "item_category": _string(item.get("category")) or None,
+        "item_category": item_category or None,
+        "entity_kind": entity_kind,
+        "entity_id": entity_id,
+        "display_name": display_name,
     }
     return projected
 

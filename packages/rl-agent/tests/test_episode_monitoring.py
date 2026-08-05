@@ -315,11 +315,20 @@ def test_parse_heldout_journal_projects_route_rewards_floors_and_deadlock(tmp_pa
     }
     assert detail["map_topologies"] == []
     assert detail["card_rewards"][0]["selected"]["card_id"] == "BASH"
+    assert detail["card_rewards"][0]["selected"]["display_name"] == "痛击"
     assert {candidate["card_id"] for candidate in detail["card_rewards"][0]["candidates"]} == {
         "BASH",
         "ANGER",
         None,
     }
+    assert (
+        next(
+            candidate["display_name"]
+            for candidate in detail["card_rewards"][0]["candidates"]
+            if candidate["card_id"] == "ANGER"
+        )
+        == "愤怒"
+    )
     assert detail["card_rewards"][1]["skipped"] is True
     normal_floor = detail["floors"][1]
     assert normal_floor["room_type"] == "monster"
@@ -399,7 +408,15 @@ def _rich_observation(
                 "usage": "CombatOnly",
                 "index": 0,
                 "secret": "must-not-leak",
-            }
+            },
+            {
+                "potion_id": "POTION.SKILL_POTION",
+                "name": "SKILL_POTION.title",
+                "rarity": "Uncommon",
+                "usage": "CombatOnly",
+                "index": 1,
+                "secret": "must-not-leak",
+            },
         ],
     }
     observation["map"] = {
@@ -529,7 +546,10 @@ def test_rich_snapshots_project_latest_loadout_without_counting_steps_or_maps(
     afflicted_bash = next(card for card in loadout["deck"] if card["card_id"] == "CARD.BASH")
     assert afflicted_bash["afflictions"][0]["id"] == "AFFLICTION.BOUND"
     assert loadout["relics"][0]["relic_id"] == "RELIC.BURNING_BLOOD"
+    assert loadout["relics"][0]["display_name"] == "燃烧之血"
     assert loadout["potions"][0]["potion_id"] == "POTION.FIRE"
+    assert loadout["potions"][1]["potion_id"] == "POTION.SKILL_POTION"
+    assert loadout["potions"][1]["display_name"] == "技能药水"
     assert "secret" not in loadout["relics"][0]
     assert "transport_only_secret" not in plain_strike
 

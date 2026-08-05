@@ -901,6 +901,9 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert "Held-out 对局下钻" in html
     assert "拿牌记录" in html
     assert "最终构筑" in html
+    assert '["display_name", "card_id", "label", "kind"]' in html
+    assert 'const displayName = first(item || {}, ["display_name"], null);' in html
+    assert "内部 ID ${id}" in html
     assert 'id="heldout-map-visual"' in html
     assert 'id="heldout-floor-visual"' in html
     assert 'id="heldout-final-deck"' in html
