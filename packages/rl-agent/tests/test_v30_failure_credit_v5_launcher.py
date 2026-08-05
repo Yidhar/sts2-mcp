@@ -84,6 +84,15 @@ def test_v30_command_is_model_initialization_not_exact_resume(tmp_path: Path) ->
         )
 
 
+def test_v30_model_init_owns_a_lineage_scoped_launcher_state(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+
+    assert launcher._core.STATE_NAME == launcher.RUN_NAME
+    assert launcher._core._state_path(paths) == (
+        paths.launcher_dir / f"{launcher.RUN_NAME}.state.json"
+    )
+
+
 def test_v30_checkpoint_source_is_fully_pinned(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     summary = _checkpoint_summary(paths)

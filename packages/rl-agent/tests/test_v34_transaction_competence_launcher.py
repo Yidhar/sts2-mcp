@@ -128,5 +128,9 @@ def test_v34_supervisor_reenters_adapter_and_keeps_pins(tmp_path: Path) -> None:
     assert Path(command[1]).name == SCRIPT.name
     assert command[-2:] == ("--manifest", str(manifest))
     assert launcher._core.RUN_NAME == launcher.RUN_NAME
+    assert launcher._core.STATE_NAME == launcher.RUN_NAME
+    assert launcher._core._state_path(paths) == (
+        paths.launcher_dir / f"{launcher.RUN_NAME}.state.json"
+    )
     assert launcher._core.RESUME_RUN_ID == launcher.SOURCE_RUN_ID
     assert launcher._core.RESUME_STEP == 75_714

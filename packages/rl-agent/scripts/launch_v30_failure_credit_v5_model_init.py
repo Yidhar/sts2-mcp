@@ -521,6 +521,13 @@ def _configure_supervisor_core() -> None:
     _core.SUPERVISED_SCHEMA_VERSION = SUPERVISED_SCHEMA_VERSION
     _core.SUPERVISED_STATE_SCHEMA_VERSION = SUPERVISED_STATE_SCHEMA_VERSION
     _core.RUN_NAME = RUN_NAME
+    # The v27 supervisor intentionally separates the trainer log namespace
+    # (RUN_NAME) from the lifecycle-state namespace (STATE_NAME) so recovery
+    # adapters may opt into a different state file.  Model-initialization
+    # adapters do not: every lineage must own its own state file.  Leaving this
+    # at the v27 module default makes a new adapter read/write the unrelated
+    # v27 state and either reject its schema or corrupt another control plane.
+    _core.STATE_NAME = RUN_NAME
     _core.ACTIVE_ARTIFACT_ROOT = ACTIVE_ARTIFACT_ROOT
     _core.RESUME_RUN_ID = SOURCE_RUN_ID
     _core.RESUME_STEP = SOURCE_ENVIRONMENT_STEPS
