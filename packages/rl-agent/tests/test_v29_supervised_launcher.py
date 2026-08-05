@@ -857,6 +857,7 @@ def test_v29_trainer_environment_is_idempotent_across_supervisor(
         launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS,
     )
     assert first["LC_CTYPE"] == "C.UTF-8"
+    assert first["HSA_ENABLE_DXG_DETECTION"] == "1"
     assert first["OMP_NUM_THREADS"] == "4"
     assert first["PATH"] == launcher.os.pathsep.join(
         (
@@ -900,6 +901,9 @@ def test_v29_launcher_and_trainer_environment_contracts_have_exact_parity(
     )
     assert launcher._V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS == (
         trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS
+    )
+    assert launcher.ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION == (
+        trainer_launch_contract.ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION
     )
     assert tuple(environment) == (trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
     assert tuple(launcher_contract["set"]) == (trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS)
@@ -1460,7 +1464,7 @@ def test_v29_hermetic_environment_survives_python_exec_as_exact_set(
     launcher.os.name != "posix",
     reason="READY/GO bootstrap exec integration is Linux-specific",
 )
-def test_ready_go_bootstrap_exec_preserves_exact_v29_ten_key_environment(
+def test_ready_go_bootstrap_exec_preserves_exact_v29_hermetic_environment(
     tmp_path: Path,
 ) -> None:
     paths = launcher.validate_layout(
@@ -1542,7 +1546,7 @@ def test_ready_go_bootstrap_exec_preserves_exact_v29_ten_key_environment(
             process.wait(timeout=2.0)
     observed = json.loads(marker.read_text(encoding="utf-8"))
     assert observed == environment
-    assert len(observed) == 10
+    assert len(observed) == 11
     assert tuple(observed) == tuple(sorted(environment))
     assert set(observed) == set(
         trainer_launch_contract.V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS,

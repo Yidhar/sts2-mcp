@@ -34,6 +34,11 @@ FORMAL_REPORT_GENERATION_SOURCE_VERSION: Final = "sts2-formal-report-generation-
 RUNTIME_READINESS_SEAL_VERSION: Final = "sts2-runtime-readiness-evidence-v1"
 SOURCE_AUTHORITY_VERSION: Final = "sts2-two-phase-source-authority-v1"
 EXTERNAL_SEAL_VERSION: Final = "sts2-external-launch-contract-seal-v1"
+ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION: Final = (
+    "sts2-rocdxg-hermetic-execution-contract-v1"
+)
+ROCDXG_DXG_DETECTION_ENVIRONMENT_KEY: Final = "HSA_ENABLE_DXG_DETECTION"
+ROCDXG_DXG_DETECTION_ENVIRONMENT_VALUE: Final = "1"
 
 _SHA256_LENGTH = 64
 _INITIAL_STATE_FIELDS = (
@@ -58,6 +63,7 @@ V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS: Final = (
     "MKL_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
+    ROCDXG_DXG_DETECTION_ENVIRONMENT_KEY,
     "LC_CTYPE",
     "PATH",
 )
@@ -663,7 +669,16 @@ def _trainer_environment_payload(
             f"missing={sorted(expected_keys - actual_keys)} "
             f"extra={sorted(actual_keys - expected_keys)}"
         )
+    if environment[ROCDXG_DXG_DETECTION_ENVIRONMENT_KEY] != (
+        ROCDXG_DXG_DETECTION_ENVIRONMENT_VALUE
+    ):
+        raise SupervisedLaunchContractError(
+            "trainer environment violates the ROCDXG execution contract: "
+            f"{ROCDXG_DXG_DETECTION_ENVIRONMENT_KEY} must equal "
+            f"{ROCDXG_DXG_DETECTION_ENVIRONMENT_VALUE!r}"
+        )
     return {
+        "execution_contract_version": ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION,
         "set": {key: environment[key] for key in V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS},
         "unset": list(V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS),
     }
@@ -1323,6 +1338,9 @@ def validate_supervised_model_initialization_binding(
 __all__ = [
     "EXTERNAL_SEAL_VERSION",
     "FORMAL_REPORT_GENERATION_SOURCE_VERSION",
+    "ROCDXG_DXG_DETECTION_ENVIRONMENT_KEY",
+    "ROCDXG_DXG_DETECTION_ENVIRONMENT_VALUE",
+    "ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION",
     "RUNTIME_READINESS_REPORT_VERSION",
     "RUNTIME_READINESS_SEAL_VERSION",
     "SOURCE_AUTHORITY_VERSION",

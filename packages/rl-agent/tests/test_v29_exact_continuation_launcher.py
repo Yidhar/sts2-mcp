@@ -118,6 +118,7 @@ def test_trainer_environment_is_complete_and_hermetic(
     environment = launcher.build_environment(paths)
 
     assert set(environment) == {
+        "HSA_ENABLE_DXG_DETECTION",
         "LC_CTYPE",
         "MKL_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
@@ -132,6 +133,7 @@ def test_trainer_environment_is_complete_and_hermetic(
     assert environment["PATH"] == (f"{paths.venv_python.parent}:/usr/bin:/bin")
     assert environment["PYTHONPATH"] == str(paths.package_root)
     assert environment["STS2_ARTIFACT_ROOT"] == str(paths.artifact_root)
+    assert environment["HSA_ENABLE_DXG_DETECTION"] == "1"
     assert "SECRET_FROM_AMBIENT_SHELL" not in environment
     assert "PYTHONHOME" not in environment
 

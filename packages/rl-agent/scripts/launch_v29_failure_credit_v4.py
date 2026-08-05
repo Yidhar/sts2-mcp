@@ -140,12 +140,18 @@ REQUIRED_SHADOW_CODE_PATHS = frozenset(
     },
 )
 TERMINAL_STATUSES = frozenset({"completed", "interrupted", "failed"})
+ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION = (
+    "sts2-rocdxg-hermetic-execution-contract-v1"
+)
 
 # v29 deliberately does not inherit the launcher's ambient environment.  This
 # is a process-boundary ABI: preflight, the detached supervisor, the bootstrap
 # and the exec'd trainer must all observe this exact key set.  In particular,
 # explicitly setting ``LC_CTYPE`` prevents CPython's locale coercion from
 # adding it after ``execve(2)`` and thereby changing the trainer-side digest.
+# ``HSA_ENABLE_DXG_DETECTION=1`` is likewise part of the process-boundary ABI:
+# ROCDXG does not expose the GPU to a process created from this otherwise empty
+# environment without it, so inheriting it from a shell is not acceptable.
 _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS = (
     "STS2_ARTIFACT_ROOT",
     "PYTHONPATH",
@@ -155,6 +161,7 @@ _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS = (
     "MKL_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
+    "HSA_ENABLE_DXG_DETECTION",
     "LC_CTYPE",
     "PATH",
 )
@@ -240,6 +247,7 @@ class _V29PreflightNamespace:
             "MKL_NUM_THREADS": "4",
             "OPENBLAS_NUM_THREADS": "4",
             "NUMEXPR_NUM_THREADS": "4",
+            "HSA_ENABLE_DXG_DETECTION": "1",
             "LC_CTYPE": "C.UTF-8",
             "PATH": os.pathsep.join(
                 (
@@ -684,6 +692,7 @@ def _exact_trainer_environment_payload(
             f"extra={sorted(actual_keys - expected_keys)}",
         )
     return {
+        "execution_contract_version": ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION,
         "set": {key: environment[key] for key in _V29_HERMETIC_TRAINER_ENVIRONMENT_KEYS},
         "unset": list(
             _V29_HERMETIC_TRAINER_ENVIRONMENT_UNSET_KEYS,

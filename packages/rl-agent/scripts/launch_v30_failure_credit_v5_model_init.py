@@ -71,6 +71,9 @@ SUPERVISED_STATE_SCHEMA_VERSION = "sts2-v30-failure-credit-v5-model-init-supervi
 # seconds, while a long evaluation/checkpoint still gets ample headroom.  A
 # wedged forward must become a durable failure instead of remaining unknown.
 LEARNER_STALL_TIMEOUT_SECONDS = 30.0 * 60.0
+ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION = (
+    "sts2-rocdxg-hermetic-execution-contract-v1"
+)
 
 
 def _load_supervisor_core() -> Any:
@@ -117,6 +120,7 @@ def build_environment(paths: Any) -> dict[str, str]:
     """Return the complete reviewed trainer environment, never an overlay."""
 
     return {
+        "HSA_ENABLE_DXG_DETECTION": "1",
         "LC_CTYPE": "C.UTF-8",
         "MKL_NUM_THREADS": "4",
         "NUMEXPR_NUM_THREADS": "4",
@@ -366,6 +370,9 @@ def run_model_initialization_preflight(paths: Any) -> dict[str, Any]:
         "trainer_command_has_initialize_from": True,
         "trainer_environment": {
             "mode": "complete-hermetic-environment",
+            "execution_contract_version": (
+                ROCDXG_HERMETIC_EXECUTION_CONTRACT_VERSION
+            ),
             "set": dict(environment),
             "unset_by_construction": [
                 "PYTHONHOME",

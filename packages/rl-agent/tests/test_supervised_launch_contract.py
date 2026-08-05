@@ -45,6 +45,7 @@ def _trainer_environment() -> dict[str, str]:
         "MKL_NUM_THREADS": "4",
         "OPENBLAS_NUM_THREADS": "4",
         "NUMEXPR_NUM_THREADS": "4",
+        "HSA_ENABLE_DXG_DETECTION": "1",
         "LC_CTYPE": "C.UTF-8",
         "PATH": "/tmp/venv/bin:/usr/bin:/bin",
     }
@@ -441,6 +442,8 @@ def test_launch_contract_rejects_trainer_environment_drift(
         ),
         lambda value: value.pop("PYTHONPATH"),
         lambda value: value.__setitem__("PYTHONHOME", "/tmp/injected"),
+        lambda value: value.__setitem__("HSA_ENABLE_DXG_DETECTION", "0"),
+        lambda value: value.pop("HSA_ENABLE_DXG_DETECTION"),
     ):
         environment = _trainer_environment()
         mutate(environment)
