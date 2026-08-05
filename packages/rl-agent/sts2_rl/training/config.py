@@ -17,10 +17,11 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v13"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v14"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V13 = "sts2-relational-curriculum-config-v13"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -826,6 +827,74 @@ class CurriculumConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TransactionExplorationConfig:
+    """Training-only exploration of reviewed multi-step transaction grammar.
+
+    The explorer never names a card, assigns an intrinsic reward, or changes
+    deterministic evaluation.  It only makes rare transaction entrances
+    visible and mixes the ordinary behavior policy with a forward-only
+    Select/Confirm proposal while an authoritative selection operation is
+    active.  The exact mixed behavior probability remains available to
+    V-trace, so this is data collection rather than an untracked action rewrite.
+    """
+
+    enabled: bool = False
+    operations: tuple[str, ...] = ()
+    entry_epsilon_floor: float = 0.0
+    completion_guidance_probability: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("transaction_exploration.enabled must be a boolean")
+        raw_operations = self.operations
+        if not isinstance(raw_operations, tuple):
+            if not isinstance(raw_operations, Sequence) or isinstance(raw_operations, str | bytes):
+                raise TypeError("transaction_exploration.operations must be an array")
+            raw_operations = tuple(raw_operations)
+            object.__setattr__(self, "operations", raw_operations)
+        normalized_operations: list[str] = []
+        for raw_operation in raw_operations:
+            if not isinstance(raw_operation, str) or not raw_operation.strip():
+                raise TypeError("transaction_exploration.operations entries must be non-empty strings")
+            operation = "_".join(raw_operation.strip().lower().replace("-", " ").split())
+            if operation not in {"upgrade", "remove"}:
+                raise ValueError(
+                    "transaction_exploration.operations supports only the reviewed "
+                    "'upgrade' and 'remove' operation families"
+                )
+            if operation in normalized_operations:
+                raise ValueError(f"transaction_exploration.operations contains duplicate operation {operation!r}")
+            normalized_operations.append(operation)
+        normalized_tuple = tuple(sorted(normalized_operations))
+        if normalized_tuple != self.operations:
+            object.__setattr__(self, "operations", normalized_tuple)
+
+        entry_floor = _require_finite_number(
+            self.entry_epsilon_floor,
+            label="transaction_exploration.entry_epsilon_floor",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        guidance_probability = _require_finite_number(
+            self.completion_guidance_probability,
+            label="transaction_exploration.completion_guidance_probability",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if self.enabled:
+            if not self.operations:
+                raise ValueError("enabled transaction exploration requires at least one operation")
+            if entry_floor <= 0.0:
+                raise ValueError("enabled transaction exploration requires a positive entry_epsilon_floor")
+            # A probability of exactly one would erase behavior support for
+            # Cancel/Deselect and invalidate off-policy importance correction.
+            if not 0.0 < guidance_probability < 1.0:
+                raise ValueError("enabled transaction exploration requires " "0 < completion_guidance_probability < 1")
+        elif self.operations or entry_floor != 0.0 or guidance_probability != 0.0:
+            raise ValueError("disabled transaction exploration requires empty operations and zero probabilities")
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     device: str = "auto"
     collector_device: str = "cpu"
@@ -1078,6 +1147,7 @@ class TrainingConfig:
     episodic_learning: EpisodicLearningConfig = field(default_factory=EpisodicLearningConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    transaction_exploration: TransactionExplorationConfig = field(default_factory=TransactionExplorationConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
@@ -1097,6 +1167,7 @@ class TrainingConfig:
             ("episodic_learning", EpisodicLearningConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
+            ("transaction_exploration", TransactionExplorationConfig),
             ("runtime", RuntimeConfig),
             ("diagnostics", DiagnosticsConfig),
         ):
@@ -1143,6 +1214,11 @@ class TrainingConfig:
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("engine-bailout preheat requires the headless backend")
+        if (
+            self.transaction_exploration.enabled
+            and self.transaction_exploration.entry_epsilon_floor < self.curriculum.epsilon_end
+        ):
+            raise ValueError("transaction_exploration.entry_epsilon_floor must be at least " "curriculum.epsilon_end")
         expected_discount = 1.0 if self.curriculum.mode == "native-revival-preheat" else TASK_REWARD_SPEC.discount
         if self.optimization.discount != expected_discount:
             raise ValueError(
@@ -1186,6 +1262,10 @@ class TrainingConfig:
         # new lineage schedule before comparison so a checkpoint written from
         # this exact config can resume without a tuple/list false mismatch.
         rollout["deterministic_probe_environment_steps"] = list(self.rollout.deterministic_probe_environment_steps)
+        transaction_exploration = payload["transaction_exploration"]
+        if not isinstance(transaction_exploration, dict):  # pragma: no cover - asdict invariant
+            raise TypeError("serialized transaction exploration config must be an object")
+        transaction_exploration["operations"] = list(self.transaction_exploration.operations)
         runtime = payload["runtime"]
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")
@@ -1312,6 +1392,11 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
         ),
         environment=_construct(EnvironmentConfig, _table(payload, "environment"), label="environment"),
         curriculum=_construct(CurriculumConfig, _table(payload, "curriculum"), label="curriculum"),
+        transaction_exploration=_construct(
+            TransactionExplorationConfig,
+            _table(payload, "transaction_exploration"),
+            label="transaction_exploration",
+        ),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
         diagnostics=_construct(DiagnosticsConfig, _table(payload, "diagnostics"), label="diagnostics"),
     )
@@ -1322,9 +1407,10 @@ def model_initialization_config_from_mapping(
 ) -> TrainingConfig:
     """Interpret one reviewed source-config change for model-only use.
 
-    V12 adds the independent liveness-credit model/loss ABI.  V13 hardens its
-    optimization and runtime semantics without changing model parameter
-    shapes. V11 checkpoints
+    V12 adds the independent liveness-credit model/loss ABI. V13 hardens its
+    optimization/runtime semantics. V14 adds an explicit, training-only
+    transaction exploration contract without changing model parameter shapes.
+    V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
     head is freshly initialized by the reviewed checkpoint overlay.  V10 also
     predates ``fresh_policy_sequences``, so that field receives its
@@ -1343,6 +1429,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V10,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V12,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V13,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1370,6 +1457,11 @@ def model_initialization_config_from_mapping(
         # A legacy checkpoint can provide compatible shared model parameters,
         # but it cannot claim the new semantic/evidence/replay contract.
         migrated["failure_credit"] = {"mode": "disabled"}
+    if "transaction_exploration" in payload:
+        raise ValueError("pre-V14 model-initialization config unexpectedly contains a " "transaction_exploration table")
+    # The reviewed migration is behavior preserving. Enabling the new explorer
+    # belongs to the successor config, never to checkpoint interpretation.
+    migrated["transaction_exploration"] = {"enabled": False}
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 
@@ -1419,6 +1511,7 @@ __all__ = [
     "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
+    "TransactionExplorationConfig",
     "TransactionLearningConfig",
     "engine_revival_identity",
     "load_training_config",

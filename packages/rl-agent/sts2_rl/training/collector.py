@@ -141,6 +141,10 @@ class EpisodeMetrics:
     definition_hash_collisions_total: int = 0
     relation_hash_collisions_total: int = 0
     targeted_selection_exploration_decisions: int = 0
+    targeted_transaction_entry_exploration_decisions: int = 0
+    transaction_completion_guidance_decisions: int = 0
+    transaction_completion_forward_decisions: int = 0
+    transaction_completion_guidance_fallbacks: int = 0
     maximum_effective_collection_epsilon: float = 0.0
     policy_top1_top2_logit_margin_mean: float = 0.0
     policy_top1_top2_logit_margin_max: float = 0.0
@@ -162,6 +166,11 @@ class EpisodeMetrics:
     forge_selection_transactions_completed: int = 0
     forge_selection_transactions_cancelled: int = 0
     forge_selection_transactions_unresolved: int = 0
+    shop_card_removal_transactions_started: int = 0
+    shop_card_removal_transactions_closed: int = 0
+    shop_card_removal_transactions_completed: int = 0
+    shop_card_removal_transactions_cancelled: int = 0
+    shop_card_removal_transactions_unresolved: int = 0
     shaping_reward_total: float = 0.0
     shaping_reward_per_max_floor: float = 0.0
     boss_victory_acts: tuple[int, ...] = ()
@@ -283,6 +292,11 @@ class _ActionChoice:
     relation_hash_collisions: int
     effective_epsilon: float
     targeted_selection_exploration: bool
+    targeted_transaction_entry_exploration: bool
+    transaction_completion_guidance: bool
+    transaction_completion_forward_selected: bool
+    transaction_completion_guidance_fallback: bool
+    transaction_operation: str
 
 
 @dataclass(slots=True)
@@ -1037,6 +1051,117 @@ def _uses_targeted_selection_exploration(
     )
 
 
+_TRANSACTION_EXPLORATION_OPERATIONS = frozenset({"upgrade", "remove"})
+
+
+def _canonical_transaction_operation(value: object) -> str:
+    """Map reviewed transport/selection aliases to one strategy-free family."""
+
+    normalized = "_".join(str(value or "").strip().lower().replace("-", " ").split())
+    if normalized in {
+        "forge",
+        "open_upgrade_selection",
+        "smith",
+        "upgrade",
+    }:
+        return "upgrade"
+    if normalized in {
+        "card_removal",
+        "purchase_card_removal",
+        "remove",
+        "remove_card",
+    }:
+        return "remove"
+    return ""
+
+
+def _selection_transaction_operation(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> str:
+    selection = _transaction_selection_context(observation, semantic_actions)
+    if selection is None:
+        return ""
+    return _canonical_transaction_operation(selection.get("operation_type", selection.get("operation")))
+
+
+def _transaction_entry_operation(action: Mapping[str, object]) -> str:
+    """Return the operation opened by one macro action, if reviewed.
+
+    This classification is restricted to generic protocol fields.  It never
+    inspects a card definition, event, encounter, relic, or character ID.
+    """
+
+    prototype = _semantic_action_prototype(action)
+    nested_transaction = prototype.get("transaction")
+    if isinstance(nested_transaction, Mapping):
+        operation = _canonical_transaction_operation(
+            nested_transaction.get("operation_type", nested_transaction.get("operation"))
+        )
+        if operation:
+            return operation
+
+    model_kind = "_".join(str(prototype.get("model_action_kind") or "").strip().lower().replace("-", " ").split())
+    if model_kind == "shop":
+        item = prototype.get("item")
+        if isinstance(item, Mapping):
+            operation = _canonical_transaction_operation(item.get("category", item.get("type")))
+            if operation == "remove":
+                return operation
+    if model_kind in {"rest_site", "restsite"}:
+        option = prototype.get("option")
+        if isinstance(option, Mapping):
+            for key in ("type", "option_type", "id", "option_id"):
+                operation = _canonical_transaction_operation(option.get(key))
+                if operation:
+                    return operation
+        for key in (
+            "model_action_variant",
+            "option_type",
+            "option_id",
+            "kind",
+            "action",
+        ):
+            operation = _canonical_transaction_operation(prototype.get(key))
+            if operation:
+                return operation
+    return ""
+
+
+def _is_shop_card_removal_entry(action: Mapping[str, object]) -> bool:
+    prototype = _semantic_action_prototype(action)
+    model_kind = "_".join(str(prototype.get("model_action_kind") or "").strip().lower().replace("-", " ").split())
+    return bool(model_kind == "shop" and _transaction_entry_operation(prototype) == "remove")
+
+
+def _transaction_entry_exploration_branch_ids(
+    *,
+    policy_branch_ids: NDArray[np.int64],
+    semantic_actions: tuple[Mapping[str, object], ...],
+    enabled_operations: frozenset[str],
+) -> tuple[NDArray[np.int64], bool]:
+    """Give each reviewed entrance a cardinality-independent explorer branch."""
+
+    if policy_branch_ids.ndim != 1 or len(semantic_actions) != len(policy_branch_ids):
+        raise CollectionProtocolError("transaction entry branch IDs and semantic actions have different shapes")
+    if not enabled_operations:
+        return policy_branch_ids, False
+    unknown = enabled_operations - _TRANSACTION_EXPLORATION_OPERATIONS
+    if unknown:
+        raise ValueError("unsupported transaction exploration operations: " + ", ".join(sorted(unknown)))
+    operations = tuple(_transaction_entry_operation(action) for action in semantic_actions)
+    present = tuple(sorted({item for item in operations if item in enabled_operations}))
+    if not present:
+        return policy_branch_ids, False
+    remapped = policy_branch_ids.astype(np.int64, copy=True)
+    next_branch_id = int(remapped.max(initial=-1)) + 1
+    for offset, operation in enumerate(present):
+        for index, candidate_operation in enumerate(operations):
+            if candidate_operation == operation:
+                remapped[index] = next_branch_id + offset
+    return remapped, True
+
+
 def _is_forge_selection_surface(
     observation: Mapping[str, object],
     semantic_actions: tuple[Mapping[str, object], ...],
@@ -1051,13 +1176,7 @@ def _is_forge_selection_surface(
     selection = _transaction_selection_context(observation, semantic_actions)
     if selection is None:
         return False
-    operation = "_".join(
-        str(selection.get("operation_type") or "")
-        .strip()
-        .lower()
-        .replace("-", " ")
-        .split()
-    )
+    operation = "_".join(str(selection.get("operation_type") or "").strip().lower().replace("-", " ").split())
     return operation in {"upgrade", "forge"}
 
 
@@ -1085,9 +1204,7 @@ def _normalized_selection_action_operation(action: Mapping[str, object]) -> str:
 
     prototype = _semantic_action_prototype(action)
     nested = prototype.get("selection")
-    nested_operation = (
-        nested.get("operation_type") if isinstance(nested, Mapping) else None
-    )
+    nested_operation = nested.get("operation_type") if isinstance(nested, Mapping) else None
     raw = next(
         (
             value
@@ -1105,6 +1222,69 @@ def _normalized_selection_action_operation(action: Mapping[str, object]) -> str:
         "",
     )
     return "_".join(str(raw).strip().lower().replace("-", " ").split())
+
+
+def _transaction_completion_guided_behavior(
+    *,
+    policy: NDArray[np.float32],
+    valid: NDArray[np.bool_],
+    semantic_actions: tuple[Mapping[str, object], ...],
+    base_behavior: NDArray[np.float64],
+    operation: str,
+    guidance_probability: float,
+) -> tuple[NDArray[np.float64], frozenset[int], bool]:
+    """Mix exact behavior with a forward Select/Confirm transaction proposal.
+
+    Confirm dominates Select once it is legal.  Before that point, all legal
+    Select candidates retain their learned relative policy mass.  Cancel and
+    Deselect keep non-zero support through ``base_behavior``; consequently the
+    returned distribution is a valid, fully auditable behavior policy rather
+    than a hidden action override.
+    """
+
+    if operation not in _TRANSACTION_EXPLORATION_OPERATIONS:
+        return base_behavior, frozenset(), False
+    if policy.shape != valid.shape or base_behavior.shape != valid.shape:
+        raise CollectionProtocolError("transaction guidance inputs have different shapes")
+    if len(semantic_actions) != len(valid):
+        raise CollectionProtocolError("transaction guidance lost semantic candidate alignment")
+    probability = float(guidance_probability)
+    if not math.isfinite(probability) or not 0.0 <= probability < 1.0:
+        raise ValueError("transaction completion guidance probability must be in [0, 1)")
+    if probability == 0.0:
+        return base_behavior, frozenset(), False
+
+    confirm_indices: list[int] = []
+    select_indices: list[int] = []
+    for index, action in enumerate(semantic_actions):
+        if not bool(valid[index]):
+            continue
+        normalized = _normalized_selection_action_operation(action)
+        if normalized in {"confirm", "confirm_selection"}:
+            confirm_indices.append(index)
+        elif normalized in {"select", "select_card"}:
+            select_indices.append(index)
+    forward_indices = confirm_indices or select_indices
+    if not forward_indices:
+        return base_behavior, frozenset(), True
+
+    guided = np.zeros(policy.shape, dtype=np.float64)
+    forward_policy = policy[forward_indices].astype(np.float64, copy=False)
+    if not np.all(np.isfinite(forward_policy)) or np.any(forward_policy < 0.0):
+        raise CollectionProtocolError("model produced invalid transaction forward policy mass")
+    forward_mass = float(forward_policy.sum())
+    if math.isfinite(forward_mass) and forward_mass > 0.0:
+        guided[forward_indices] = forward_policy / forward_mass
+    else:  # pragma: no cover - the full legal policy is validated by caller
+        guided[forward_indices] = 1.0 / len(forward_indices)
+    behavior = (1.0 - probability) * base_behavior + probability * guided
+    behavior_mass = float(behavior.sum())
+    if not math.isfinite(behavior_mass) or behavior_mass <= 0.0:
+        raise CollectionProtocolError("transaction guidance produced invalid behavior mass")
+    behavior /= behavior_mass
+    if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0) or np.any(behavior[~valid] != 0.0):
+        raise CollectionProtocolError("transaction guidance produced an invalid behavior policy")
+    return behavior, frozenset(forward_indices), False
 
 
 def _card_upgrade_level(card: Mapping[str, object]) -> int:
@@ -1170,10 +1350,7 @@ def _deck_upgrade_signature(
             previous_count + quantity,
             previous_levels + quantity * _card_upgrade_level(card),
         )
-    return tuple(
-        (definition, count, levels)
-        for definition, (count, levels) in sorted(aggregate.items())
-    )
+    return tuple((definition, count, levels) for definition, (count, levels) in sorted(aggregate.items()))
 
 
 def _forge_upgrade_committed(
@@ -1188,17 +1365,37 @@ def _forge_upgrade_committed(
     if before_counts != after_counts:
         return False
     before_levels = {definition: levels for definition, _, levels in before}
-    return any(
-        levels > before_levels.get(definition, levels)
-        for definition, _, levels in after
-    )
+    return any(levels > before_levels.get(definition, levels) for definition, _, levels in after)
+
+
+def _deck_card_removal_committed(
+    before: tuple[tuple[str, int, int], ...] | None,
+    after_observation: Mapping[str, object],
+) -> bool:
+    """Prove that exactly one existing deck card was removed.
+
+    Gold spend, page exit, and a Confirm click are insufficient.  The real
+    player deck must contain exactly one fewer card, no definition may gain a
+    copy, and no previously unseen definition may appear.
+    """
+
+    after = _deck_upgrade_signature(after_observation)
+    if before is None or after is None:
+        return False
+    before_counts = {definition: count for definition, count, _ in before}
+    after_counts = {definition: count for definition, count, _ in after}
+    if sum(after_counts.values()) != sum(before_counts.values()) - 1:
+        return False
+    if any(definition not in before_counts for definition in after_counts):
+        return False
+    return all(after_counts.get(definition, 0) <= before_count for definition, before_count in before_counts.items())
 
 
 def _selection_transaction_exit_outcome(
     *,
     selected_action: Mapping[str, object],
     clean_exit: bool,
-    is_forge: bool,
+    operation: str,
     opening_deck_signature: tuple[tuple[str, int, int], ...] | None,
     after_observation: Mapping[str, object],
 ) -> Literal["committed", "cancelled", "unresolved"]:
@@ -1206,16 +1403,23 @@ def _selection_transaction_exit_outcome(
 
     if not clean_exit:
         return "unresolved"
-    operation = _normalized_selection_action_operation(selected_action)
-    if is_forge:
+    transaction_operation = _canonical_transaction_operation(operation)
+    selected_operation = _normalized_selection_action_operation(selected_action)
+    if transaction_operation == "upgrade":
         if _forge_upgrade_committed(opening_deck_signature, after_observation):
             return "committed"
-        if operation in _SELECTION_CANCEL_OPERATIONS:
+        if selected_operation in _SELECTION_CANCEL_OPERATIONS:
             return "cancelled"
         return "unresolved"
-    if operation in _SELECTION_CANCEL_OPERATIONS:
+    if transaction_operation == "remove":
+        if _deck_card_removal_committed(opening_deck_signature, after_observation):
+            return "committed"
+        if selected_operation in _SELECTION_CANCEL_OPERATIONS:
+            return "cancelled"
+        return "unresolved"
+    if selected_operation in _SELECTION_CANCEL_OPERATIONS:
         return "cancelled"
-    if operation in _SELECTION_COMMIT_OPERATIONS:
+    if selected_operation in _SELECTION_COMMIT_OPERATIONS:
         return "committed"
     return "unresolved"
 
@@ -2653,6 +2857,9 @@ class GroundedCollector:
         failure_credit_run_id: str | None = None,
         failure_credit_pipeline_config: FailureCreditPipelineConfig | None = None,
         selection_surface_epsilon_floor: float = 0.0,
+        transaction_exploration_operations: tuple[str, ...] = (),
+        transaction_entry_epsilon_floor: float = 0.0,
+        transaction_completion_guidance_probability: float = 0.0,
     ) -> None:
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
@@ -2713,6 +2920,40 @@ class GroundedCollector:
             or not 0.0 <= float(selection_surface_epsilon_floor) <= 1.0
         ):
             raise ValueError("selection_surface_epsilon_floor must be finite and in [0, 1]")
+        if not isinstance(transaction_exploration_operations, tuple):
+            raise TypeError("transaction_exploration_operations must be a tuple")
+        normalized_transaction_operations = frozenset(
+            _canonical_transaction_operation(operation) for operation in transaction_exploration_operations
+        )
+        if "" in normalized_transaction_operations or len(normalized_transaction_operations) != len(
+            transaction_exploration_operations
+        ):
+            raise ValueError("transaction_exploration_operations must contain unique reviewed operations")
+        if normalized_transaction_operations - _TRANSACTION_EXPLORATION_OPERATIONS:
+            raise ValueError("transaction_exploration_operations contains an unsupported operation")
+        for name, value in (
+            ("transaction_entry_epsilon_floor", transaction_entry_epsilon_floor),
+            (
+                "transaction_completion_guidance_probability",
+                transaction_completion_guidance_probability,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+        if transaction_completion_guidance_probability >= 1.0:
+            raise ValueError("transaction_completion_guidance_probability must be less than 1")
+        if normalized_transaction_operations:
+            if transaction_entry_epsilon_floor <= 0.0:
+                raise ValueError("transaction exploration operations require a positive entry epsilon floor")
+            if transaction_completion_guidance_probability <= 0.0:
+                raise ValueError("transaction exploration operations require positive completion guidance")
+        elif transaction_entry_epsilon_floor != 0.0 or transaction_completion_guidance_probability != 0.0:
+            raise ValueError("transaction exploration probabilities require reviewed operations")
         if isinstance(combat_net_progress_window, bool) or not isinstance(combat_net_progress_window, int):
             raise TypeError("combat_net_progress_window must be an integer")
         if combat_net_progress_window <= 0:
@@ -2762,6 +3003,9 @@ class GroundedCollector:
         self.failure_credit_shadow_enabled = failure_credit_shadow_enabled
         self.failure_credit_learning_enabled = failure_credit_learning_enabled
         self.selection_surface_epsilon_floor = float(selection_surface_epsilon_floor)
+        self.transaction_exploration_operations = normalized_transaction_operations
+        self.transaction_entry_epsilon_floor = float(transaction_entry_epsilon_floor)
+        self.transaction_completion_guidance_probability = float(transaction_completion_guidance_probability)
         self.failure_credit_pipeline_config = failure_credit_pipeline_config or FailureCreditPipelineConfig(
             detector_window_steps=deadlock_window,
             context_burn_in_steps=transaction_burn_in_steps or 0,
@@ -3106,23 +3350,60 @@ class GroundedCollector:
                 relation_hash_collisions=encoded.relation_hash_collisions,
                 effective_epsilon=0.0,
                 targeted_selection_exploration=False,
+                targeted_transaction_entry_exploration=False,
+                transaction_completion_guidance=False,
+                transaction_completion_forward_selected=False,
+                transaction_completion_guidance_fallback=False,
+                transaction_operation=_selection_transaction_operation(
+                    state.observation,
+                    semantic_actions,
+                ),
             )
 
         targeted_surface = _uses_targeted_selection_exploration(
             state.observation,
             semantic_actions,
         )
-        effective_epsilon = (
-            max(normalized_epsilon, self.selection_surface_epsilon_floor)
-            if targeted_surface
-            else normalized_epsilon
+        exploration_branch_ids, targeted_transaction_entry_surface = _transaction_entry_exploration_branch_ids(
+            policy_branch_ids=policy_branch_ids,
+            semantic_actions=semantic_actions,
+            enabled_operations=self.transaction_exploration_operations,
         )
-        behavior = _branch_balanced_epsilon_behavior(
+        effective_epsilon = normalized_epsilon
+        if targeted_surface:
+            effective_epsilon = max(
+                effective_epsilon,
+                self.selection_surface_epsilon_floor,
+            )
+        if targeted_transaction_entry_surface:
+            effective_epsilon = max(
+                effective_epsilon,
+                self.transaction_entry_epsilon_floor,
+            )
+        base_behavior = _branch_balanced_epsilon_behavior(
             policy=policy,
             valid=valid,
-            policy_branch_ids=policy_branch_ids,
+            policy_branch_ids=exploration_branch_ids,
             epsilon=effective_epsilon,
         )
+        transaction_operation = _selection_transaction_operation(
+            state.observation,
+            semantic_actions,
+        )
+        guidance_eligible = bool(transaction_operation in self.transaction_exploration_operations)
+        if guidance_eligible:
+            behavior, forward_indices, guidance_fallback = _transaction_completion_guided_behavior(
+                policy=policy,
+                valid=valid,
+                semantic_actions=semantic_actions,
+                base_behavior=base_behavior,
+                operation=transaction_operation,
+                guidance_probability=(self.transaction_completion_guidance_probability),
+            )
+        else:
+            behavior = base_behavior
+            forward_indices = frozenset()
+            guidance_fallback = False
         selected = int(self._rng.choice(len(behavior), p=behavior))
         reference = encoded.action(selected)
         return _ActionChoice(
@@ -3144,9 +3425,12 @@ class GroundedCollector:
             definition_hash_collisions=encoded.definition_hash_collisions,
             relation_hash_collisions=encoded.relation_hash_collisions,
             effective_epsilon=effective_epsilon,
-            targeted_selection_exploration=bool(
-                targeted_surface and effective_epsilon > normalized_epsilon
-            ),
+            targeted_selection_exploration=bool(targeted_surface and effective_epsilon > normalized_epsilon),
+            targeted_transaction_entry_exploration=bool(targeted_transaction_entry_surface and effective_epsilon > 0.0),
+            transaction_completion_guidance=bool(guidance_eligible and not guidance_fallback),
+            transaction_completion_forward_selected=bool(guidance_eligible and selected in forward_indices),
+            transaction_completion_guidance_fallback=bool(guidance_fallback),
+            transaction_operation=transaction_operation,
         )
 
     def _step(
@@ -3271,6 +3555,10 @@ class GroundedCollector:
         definition_hash_collisions_total = 0
         relation_hash_collisions_total = 0
         targeted_selection_exploration_decisions = 0
+        targeted_transaction_entry_exploration_decisions = 0
+        transaction_completion_guidance_decisions = 0
+        transaction_completion_forward_decisions = 0
+        transaction_completion_guidance_fallbacks = 0
         maximum_effective_collection_epsilon = 0.0
         policy_logit_margin_total = 0.0
         policy_logit_margin_count = 0
@@ -3290,6 +3578,11 @@ class GroundedCollector:
         forge_selection_transactions_completed = 0
         forge_selection_transactions_cancelled = 0
         forge_selection_transactions_unresolved = 0
+        shop_card_removal_transactions_started = 0
+        shop_card_removal_transactions_closed = 0
+        shop_card_removal_transactions_completed = 0
+        shop_card_removal_transactions_cancelled = 0
+        shop_card_removal_transactions_unresolved = 0
         shaping_reward_total = 0.0
         boss_victory_acts: set[int] = set()
         steps_taken = 0
@@ -3382,12 +3675,14 @@ class GroundedCollector:
         observed_transaction_entry_episodic_index: int | None = None
         observed_transaction_opened_from_rest_site = False
         observed_transaction_is_forge = False
+        observed_transaction_operation = ""
+        observed_transaction_is_shop_card_removal = False
         observed_transaction_has_policy_choice = False
-        observed_transaction_opening_deck_signature: (
-            tuple[tuple[str, int, int], ...] | None
-        ) = None
+        observed_transaction_opening_deck_signature: tuple[tuple[str, int, int], ...] | None = None
         pending_observed_transaction_entry_episodic_index: int | None = None
         pending_observed_transaction_opened_from_rest_site = False
+        pending_observed_transaction_entry_operation = ""
+        pending_observed_transaction_is_shop_card_removal = False
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
         # Complete-run replay is collected independently of fixed unroll
@@ -3451,18 +3746,18 @@ class GroundedCollector:
             )
             definition_hash_collisions_total += choice.definition_hash_collisions
             relation_hash_collisions_total += choice.relation_hash_collisions
-            targeted_selection_exploration_decisions += int(
-                choice.targeted_selection_exploration
-            )
+            targeted_selection_exploration_decisions += int(choice.targeted_selection_exploration)
+            targeted_transaction_entry_exploration_decisions += int(choice.targeted_transaction_entry_exploration)
+            transaction_completion_guidance_decisions += int(choice.transaction_completion_guidance)
+            transaction_completion_forward_decisions += int(choice.transaction_completion_forward_selected)
+            transaction_completion_guidance_fallbacks += int(choice.transaction_completion_guidance_fallback)
             maximum_effective_collection_epsilon = max(
                 maximum_effective_collection_epsilon,
                 choice.effective_epsilon,
             )
             valid_policy_indices = np.flatnonzero(choice.snapshot.action_mask)
             if valid_policy_indices.size > 1:
-                ranked_probabilities = np.sort(
-                    choice.policy[valid_policy_indices].astype(np.float64, copy=False)
-                )
+                ranked_probabilities = np.sort(choice.policy[valid_policy_indices].astype(np.float64, copy=False))
                 logit_margin = float(
                     math.log(max(float(ranked_probabilities[-1]), 1e-30))
                     - math.log(max(float(ranked_probabilities[-2]), 1e-30))
@@ -3494,17 +3789,10 @@ class GroundedCollector:
                 state.observation,
                 choice.semantic_actions,
             )
-            current_transaction_surface = (
-                current_observed_transaction_surface if transaction_enabled else None
-            )
-            if (
-                current_observed_transaction_surface is not None
-                and observed_transaction_surface is None
-            ):
+            current_transaction_surface = current_observed_transaction_surface if transaction_enabled else None
+            if current_observed_transaction_surface is not None and observed_transaction_surface is None:
                 observed_transaction_surface = current_observed_transaction_surface
-                observed_transaction_entry_episodic_index = (
-                    pending_observed_transaction_entry_episodic_index
-                )
+                observed_transaction_entry_episodic_index = pending_observed_transaction_entry_episodic_index
                 observed_transaction_opened_from_rest_site = (
                     pending_observed_transaction_opened_from_rest_site
                     or _is_rest_site_decision_surface(
@@ -3512,36 +3800,39 @@ class GroundedCollector:
                         choice.semantic_actions,
                     )
                 )
-                observed_transaction_is_forge = bool(
-                    observed_transaction_opened_from_rest_site
-                    and _is_forge_selection_surface(
+                observed_transaction_operation = (
+                    _selection_transaction_operation(
                         state.observation,
                         choice.semantic_actions,
                     )
+                    or pending_observed_transaction_entry_operation
+                )
+                observed_transaction_is_forge = bool(
+                    observed_transaction_opened_from_rest_site and observed_transaction_operation == "upgrade"
+                )
+                observed_transaction_is_shop_card_removal = bool(
+                    pending_observed_transaction_is_shop_card_removal and observed_transaction_operation == "remove"
                 )
                 observed_transaction_opening_deck_signature = (
                     _deck_upgrade_signature(state.observation)
-                    if observed_transaction_is_forge
+                    if observed_transaction_operation in {"upgrade", "remove"}
                     else None
                 )
                 observed_transaction_has_policy_choice = choice.valid_count > 1
                 pending_observed_transaction_entry_episodic_index = None
                 pending_observed_transaction_opened_from_rest_site = False
+                pending_observed_transaction_entry_operation = ""
+                pending_observed_transaction_is_shop_card_removal = False
                 selection_transactions_started += 1
-                rest_site_selection_transactions_started += int(
-                    observed_transaction_opened_from_rest_site
-                )
-                forge_selection_transactions_started += int(
-                    observed_transaction_is_forge
-                )
+                rest_site_selection_transactions_started += int(observed_transaction_opened_from_rest_site)
+                forge_selection_transactions_started += int(observed_transaction_is_forge)
+                shop_card_removal_transactions_started += int(observed_transaction_is_shop_card_removal)
             if (
                 current_observed_transaction_surface is not None
-                and current_observed_transaction_surface
-                == observed_transaction_surface
+                and current_observed_transaction_surface == observed_transaction_surface
             ):
                 observed_transaction_has_policy_choice = bool(
-                    observed_transaction_has_policy_choice
-                    or choice.valid_count > 1
+                    observed_transaction_has_policy_choice or choice.valid_count > 1
                 )
             current_transaction_node = (
                 _transaction_node_key(
@@ -3599,12 +3890,9 @@ class GroundedCollector:
                 next_state.observation,
                 next_semantic_actions,
             )
-            next_transaction_surface = (
-                next_observed_transaction_surface if transaction_enabled else None
-            )
+            next_transaction_surface = next_observed_transaction_surface if transaction_enabled else None
             opens_selection_transaction = bool(
-                current_observed_transaction_surface is None
-                and next_observed_transaction_surface is not None
+                current_observed_transaction_surface is None and next_observed_transaction_surface is not None
             )
             result_terminal = next_state.terminated or next_state.truncated
             forced_horizon = step_offset + 1 >= episode_limit and not next_state.terminated and not next_state.truncated
@@ -3778,10 +4066,7 @@ class GroundedCollector:
             selection_action_cycle = bool(
                 effective_deadlock_evidence is not None
                 and current_observed_transaction_surface is not None
-                and (
-                    observed_transaction_has_policy_choice
-                    or exact_cycle_has_policy_choice
-                )
+                and (observed_transaction_has_policy_choice or exact_cycle_has_policy_choice)
                 and not forced_horizon
             )
             # Combat no-progress, a repeated factual event transition and a
@@ -3820,93 +4105,65 @@ class GroundedCollector:
                 horizon_exhausted=bool(curriculum_horizon and self.horizon_as_failure),
             )
             reward_total += breakdown.reward
-            shaping_reward_total += float(
-                breakdown.reward
-                - breakdown.terminal_reward
-                - breakdown.progress_reward
-            )
+            shaping_reward_total += float(breakdown.reward - breakdown.terminal_reward - breakdown.progress_reward)
             revivals_used += breakdown.revivals_used_delta
             player_hp_lost += breakdown.player_hp_lost_delta
             final_outcome = breakdown.outcome
             deadlocked = breakdown.outcome == "deadlock"
             if opens_selection_transaction:
-                pending_observed_transaction_opened_from_rest_site = (
-                    _is_rest_site_decision_surface(
-                        state.observation,
-                        choice.semantic_actions,
-                    )
+                pending_observed_transaction_opened_from_rest_site = _is_rest_site_decision_surface(
+                    state.observation,
+                    choice.semantic_actions,
                 )
-            selection_exit_outcome: (
-                Literal["committed", "cancelled", "unresolved"] | None
-            ) = None
-            if (
-                observed_transaction_surface is not None
-                and (
-                    next_observed_transaction_surface != observed_transaction_surface
-                    or result_terminal
-                    or breakdown.task_terminal
-                    or forced_horizon
-                )
+                pending_observed_transaction_entry_operation = _transaction_entry_operation(selected_action)
+                pending_observed_transaction_is_shop_card_removal = _is_shop_card_removal_entry(selected_action)
+            selection_exit_outcome: Literal["committed", "cancelled", "unresolved"] | None = None
+            if observed_transaction_surface is not None and (
+                next_observed_transaction_surface != observed_transaction_surface
+                or result_terminal
+                or breakdown.task_terminal
+                or forced_horizon
             ):
-                selection_transaction_closed = bool(
-                    next_observed_transaction_surface
-                    != observed_transaction_surface
-                )
+                selection_transaction_closed = bool(next_observed_transaction_surface != observed_transaction_surface)
                 clean_transaction_exit = bool(
                     next_observed_transaction_surface is None
                     and (
-                        (
-                            not result_terminal
-                            and not breakdown.task_terminal
-                            and not forced_horizon
-                        )
-                        or (
-                            result_terminal
-                            and breakdown.outcome == "success"
-                        )
+                        (not result_terminal and not breakdown.task_terminal and not forced_horizon)
+                        or (result_terminal and breakdown.outcome == "success")
                     )
                 )
                 selection_exit_outcome = _selection_transaction_exit_outcome(
                     selected_action=selected_action,
                     clean_exit=clean_transaction_exit,
-                    is_forge=observed_transaction_is_forge,
-                    opening_deck_signature=(
-                        observed_transaction_opening_deck_signature
-                    ),
+                    operation=observed_transaction_operation,
+                    opening_deck_signature=(observed_transaction_opening_deck_signature),
                     after_observation=next_state.observation,
                 )
                 selection_transactions_closed += int(selection_transaction_closed)
                 rest_site_selection_transactions_closed += int(
-                    selection_transaction_closed
-                    and observed_transaction_opened_from_rest_site
+                    selection_transaction_closed and observed_transaction_opened_from_rest_site
                 )
                 forge_selection_transactions_closed += int(
                     selection_transaction_closed and observed_transaction_is_forge
                 )
+                shop_card_removal_transactions_closed += int(
+                    selection_transaction_closed and observed_transaction_is_shop_card_removal
+                )
                 if selection_exit_outcome == "committed":
                     selection_transactions_completed += 1
-                    rest_site_selection_transactions_completed += int(
-                        observed_transaction_opened_from_rest_site
-                    )
-                    forge_selection_transactions_completed += int(
-                        observed_transaction_is_forge
-                    )
+                    rest_site_selection_transactions_completed += int(observed_transaction_opened_from_rest_site)
+                    forge_selection_transactions_completed += int(observed_transaction_is_forge)
+                    shop_card_removal_transactions_completed += int(observed_transaction_is_shop_card_removal)
                 elif selection_exit_outcome == "cancelled":
                     selection_transactions_cancelled += 1
-                    rest_site_selection_transactions_cancelled += int(
-                        observed_transaction_opened_from_rest_site
-                    )
-                    forge_selection_transactions_cancelled += int(
-                        observed_transaction_is_forge
-                    )
+                    rest_site_selection_transactions_cancelled += int(observed_transaction_opened_from_rest_site)
+                    forge_selection_transactions_cancelled += int(observed_transaction_is_forge)
+                    shop_card_removal_transactions_cancelled += int(observed_transaction_is_shop_card_removal)
                 else:
                     selection_transactions_unresolved += 1
-                    rest_site_selection_transactions_unresolved += int(
-                        observed_transaction_opened_from_rest_site
-                    )
-                    forge_selection_transactions_unresolved += int(
-                        observed_transaction_is_forge
-                    )
+                    rest_site_selection_transactions_unresolved += int(observed_transaction_opened_from_rest_site)
+                    forge_selection_transactions_unresolved += int(observed_transaction_is_forge)
+                    shop_card_removal_transactions_unresolved += int(observed_transaction_is_shop_card_removal)
                 if (
                     clean_transaction_exit
                     and selection_exit_outcome in {"cancelled", "unresolved"}
@@ -3914,9 +4171,7 @@ class GroundedCollector:
                 ):
                     entry_index = observed_transaction_entry_episodic_index
                     if not 0 <= entry_index < len(episodic_steps):
-                        raise RuntimeError(
-                            "selection transaction entrance episodic index escaped its episode"
-                        )
+                        raise RuntimeError("selection transaction entrance episodic index escaped its episode")
                     # An aborted transaction is policy-neutral in the complete-
                     # episode actor objective.  Keep every task/value target,
                     # but do not let a later run victory behavior-clone the
@@ -3934,9 +4189,7 @@ class GroundedCollector:
                 ):
                     entry_index = observed_transaction_entry_episodic_index
                     if not 0 <= entry_index < len(episodic_steps):
-                        raise RuntimeError(
-                            "selection transaction entrance episodic index escaped its episode"
-                        )
+                        raise RuntimeError("selection transaction entrance episodic index escaped its episode")
                     # A delayed selection-cycle terminal is not a factual
                     # one-step consequence of the action that opened the
                     # surface.  Preserve its value target but do not turn
@@ -3951,6 +4204,8 @@ class GroundedCollector:
                 observed_transaction_entry_episodic_index = None
                 observed_transaction_opened_from_rest_site = False
                 observed_transaction_is_forge = False
+                observed_transaction_operation = ""
+                observed_transaction_is_shop_card_removal = False
                 observed_transaction_has_policy_choice = False
                 observed_transaction_opening_deck_signature = None
             after_action_act, _ = _run_position(next_state.observation)
@@ -4045,9 +4300,7 @@ class GroundedCollector:
                     )
                 )
                 if opens_selection_transaction:
-                    pending_observed_transaction_entry_episodic_index = (
-                        episodic_step_index
-                    )
+                    pending_observed_transaction_entry_episodic_index = episodic_step_index
                 if pre_action_combat and not next_combat_in_progress:
                     active_combat_id = None
                 elif not pre_action_combat and next_combat_in_progress:
@@ -4362,9 +4615,12 @@ class GroundedCollector:
                     "value": choice.value,
                     "behavior_log_probability": choice.behavior_log_probability,
                     "effective_collection_epsilon": choice.effective_epsilon,
-                    "targeted_selection_exploration": (
-                        choice.targeted_selection_exploration
-                    ),
+                    "targeted_selection_exploration": (choice.targeted_selection_exploration),
+                    "targeted_transaction_entry_exploration": (choice.targeted_transaction_entry_exploration),
+                    "transaction_completion_guidance": (choice.transaction_completion_guidance),
+                    "transaction_completion_forward_selected": (choice.transaction_completion_forward_selected),
+                    "transaction_completion_guidance_fallback": (choice.transaction_completion_guidance_fallback),
+                    "transaction_operation": choice.transaction_operation or None,
                     "reward": breakdown.reward,
                     "terminal_reward": breakdown.terminal_reward,
                     "potential_reward": breakdown.potential_reward,
@@ -4642,59 +4898,38 @@ class GroundedCollector:
                 maximum_relation_hash_collisions_per_decision=(maximum_relation_hash_collisions_per_decision),
                 definition_hash_collisions_total=(definition_hash_collisions_total),
                 relation_hash_collisions_total=(relation_hash_collisions_total),
-                targeted_selection_exploration_decisions=(
-                    targeted_selection_exploration_decisions
-                ),
-                maximum_effective_collection_epsilon=(
-                    maximum_effective_collection_epsilon
-                ),
+                targeted_selection_exploration_decisions=(targeted_selection_exploration_decisions),
+                targeted_transaction_entry_exploration_decisions=(targeted_transaction_entry_exploration_decisions),
+                transaction_completion_guidance_decisions=(transaction_completion_guidance_decisions),
+                transaction_completion_forward_decisions=(transaction_completion_forward_decisions),
+                transaction_completion_guidance_fallbacks=(transaction_completion_guidance_fallbacks),
+                maximum_effective_collection_epsilon=(maximum_effective_collection_epsilon),
                 policy_top1_top2_logit_margin_mean=(
-                    policy_logit_margin_total / policy_logit_margin_count
-                    if policy_logit_margin_count
-                    else 0.0
+                    policy_logit_margin_total / policy_logit_margin_count if policy_logit_margin_count else 0.0
                 ),
-                policy_top1_top2_logit_margin_max=(
-                    policy_top1_top2_logit_margin_max
-                ),
+                policy_top1_top2_logit_margin_max=(policy_top1_top2_logit_margin_max),
                 selection_transactions_started=selection_transactions_started,
                 selection_transactions_closed=selection_transactions_closed,
                 selection_transactions_completed=selection_transactions_completed,
                 selection_transactions_cancelled=selection_transactions_cancelled,
                 selection_transactions_unresolved=selection_transactions_unresolved,
-                rest_site_selection_transactions_started=(
-                    rest_site_selection_transactions_started
-                ),
-                rest_site_selection_transactions_closed=(
-                    rest_site_selection_transactions_closed
-                ),
-                rest_site_selection_transactions_completed=(
-                    rest_site_selection_transactions_completed
-                ),
-                rest_site_selection_transactions_cancelled=(
-                    rest_site_selection_transactions_cancelled
-                ),
-                rest_site_selection_transactions_unresolved=(
-                    rest_site_selection_transactions_unresolved
-                ),
-                forge_selection_transactions_started=(
-                    forge_selection_transactions_started
-                ),
-                forge_selection_transactions_closed=(
-                    forge_selection_transactions_closed
-                ),
-                forge_selection_transactions_completed=(
-                    forge_selection_transactions_completed
-                ),
-                forge_selection_transactions_cancelled=(
-                    forge_selection_transactions_cancelled
-                ),
-                forge_selection_transactions_unresolved=(
-                    forge_selection_transactions_unresolved
-                ),
+                rest_site_selection_transactions_started=(rest_site_selection_transactions_started),
+                rest_site_selection_transactions_closed=(rest_site_selection_transactions_closed),
+                rest_site_selection_transactions_completed=(rest_site_selection_transactions_completed),
+                rest_site_selection_transactions_cancelled=(rest_site_selection_transactions_cancelled),
+                rest_site_selection_transactions_unresolved=(rest_site_selection_transactions_unresolved),
+                forge_selection_transactions_started=(forge_selection_transactions_started),
+                forge_selection_transactions_closed=(forge_selection_transactions_closed),
+                forge_selection_transactions_completed=(forge_selection_transactions_completed),
+                forge_selection_transactions_cancelled=(forge_selection_transactions_cancelled),
+                forge_selection_transactions_unresolved=(forge_selection_transactions_unresolved),
+                shop_card_removal_transactions_started=(shop_card_removal_transactions_started),
+                shop_card_removal_transactions_closed=(shop_card_removal_transactions_closed),
+                shop_card_removal_transactions_completed=(shop_card_removal_transactions_completed),
+                shop_card_removal_transactions_cancelled=(shop_card_removal_transactions_cancelled),
+                shop_card_removal_transactions_unresolved=(shop_card_removal_transactions_unresolved),
                 shaping_reward_total=shaping_reward_total,
-                shaping_reward_per_max_floor=(
-                    shaping_reward_total / max(1, max_floor)
-                ),
+                shaping_reward_per_max_floor=(shaping_reward_total / max(1, max_floor)),
                 boss_victory_acts=tuple(sorted(boss_victory_acts)),
             ),
             actor_policy_version=segment_policy_version,

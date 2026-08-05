@@ -1,0 +1,104 @@
+# Transaction-competence successor to the healthy v33 policy at environment
+# step 75,714. This is an explicit config-v14 model-initialization lineage:
+# network tensors and mature entropy/exploration/liveness clocks are inherited,
+# while optimizer, replay, RNG, queues and lineage-local counters restart.
+#
+# The transaction explorer changes collection support, not the task reward. It
+# gives the rare Smith/card-removal entrances their own exploration branches and
+# mixes the behavior policy with an auditable forward Select/Confirm proposal.
+# Deterministic held-out evaluation never uses this proposal, so an evaluation
+# completion proves transfer into the policy rather than assisted execution.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.004
+entropy_decay_updates = 3000
+entropy_breaker = "one-hot-v1"
+
+[rollout]
+queue_capacity = 24
+
+[transaction_learning]
+# Failure-credit v5 remains the single transaction/deadlock learning plane.
+enabled = false
+
+[failure_credit]
+mode = "learning"
+replay_capacity = 4096
+replay_byte_capacity = 2147483648
+sample_records = 4
+burn_in_steps = 32
+maximum_context_steps = 256
+maximum_episode_completion_controls = 32
+maximum_episode_completion_bytes = 134217728
+direct_witness_quota = 0
+multi_edge_cycle_quota = 0
+risk_sequence_quota = 1
+unresolved_stall_quota = 1
+completion_control_quota = 1
+matched_outcome_pair_quota = 1
+maximum_matched_pairs_per_publication = 8
+policy_gradient_max_lag = 128
+liveness_head_calibration_updates = 256
+liveness_risk_actor_start_update = 512
+liveness_records_per_autograd_batch = 4
+liveness_tbptt_window_steps = 16
+liveness_maximum_contexts_per_record = 2
+liveness_maximum_replayed_steps_per_update = 4096
+liveness_maximum_replayed_candidates_per_update = 1048576
+liveness_value_critic_weight = 0.10
+liveness_cost_critic_weight = 0.25
+liveness_cost_actor_weight = 0.10
+liveness_direct_policy_weight = 0.25
+liveness_cycle_policy_weight = 0.10
+liveness_contrast_policy_weight = 0.10
+liveness_completion_policy_weight = 0.15
+liveness_risk_advantage_clip = 0.25
+liveness_contrast_margin = 0.10
+liveness_gradient_clip_norm = 0.50
+
+[episodic_learning]
+fresh_policy_sequences = 1
+success_policy_trust_region_epsilon = 0.20
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+selection_surface_epsilon_floor = 0.25
+
+[transaction_exploration]
+enabled = true
+operations = ["upgrade", "remove"]
+# These floors affect only the reviewed transaction entrances/grammar. They do
+# not increase exploration on ordinary combat or route decisions.
+entry_epsilon_floor = 0.50
+# Keep 5% support for the ordinary behavior policy so V-trace probabilities
+# remain exact and Cancel/Deselect are never removed from the legal action set.
+completion_guidance_probability = 0.95
+
+[runtime]
+rocm_sdpa_backend = "math"
+model_initialization_schedule_mode = "inherit"
+model_initialization_liveness_schedule_mode = "inherit"
+total_environment_steps = 100000
+seed = 6000000
+log_dir = "runs/full-run-revival-v34-transaction-competence-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v34-transaction-competence-model-init"
+checkpoint_interval_steps = 10000
+evaluation_steps = [0, 25000, 50000, 75000]
+evaluation_episodes = 16
+early_evaluation_steps = [5000, 10000]
+early_evaluation_episodes = 16
+final_audit_steps = [100000]
+final_audit_episodes = 64
+evaluation_liveness_guard_enabled = true
+evaluation_guard_min_liveness_episodes = 16
+evaluation_guard_liveness_baseline_failures = 2
+evaluation_guard_liveness_baseline_episodes = 16
+evaluation_guard_min_liveness_regression_rate = 0.20
+training_deadlock_streak_alert_episodes = 4
+evaluation_guard_failure_action = "rollback_continue"
+evaluation_guard_max_rollbacks = 2

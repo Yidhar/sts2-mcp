@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v13"
+version = "sts2-relational-curriculum-config-v14"
 profile = "preheat"
 
 [model]
@@ -133,6 +133,12 @@ revival_budget = -1
 epsilon_start = 0.70
 epsilon_end = 0.10
 epsilon_decay_steps = 100000
+
+[transaction_exploration]
+enabled = false
+operations = []
+entry_epsilon_floor = 0.0
+completion_guidance_probability = 0.0
 
 [runtime]
 device = "auto"

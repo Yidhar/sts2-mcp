@@ -16,6 +16,7 @@ from sts2_rl.training import (
     RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
+    TransactionExplorationConfig,
     engine_revival_identity,
     load_training_config,
     training_config_from_mapping,
@@ -30,13 +31,16 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v13"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v14"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
     assert preheat.curriculum.mode == "native-revival-preheat"
     assert preheat.curriculum.revival_mechanism == ENGINE_REVIVAL_MECHANISM
     assert preheat.curriculum.revival_budget == -1
+    assert not default.transaction_exploration.enabled
+    assert not combat.transaction_exploration.enabled
+    assert not preheat.transaction_exploration.enabled
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
     assert preheat.transaction_learning.completion_policy_weight == 0.25
@@ -573,16 +577,11 @@ def test_v32_budget64_inherits_mature_schedules_without_changing_model_shape() -
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
     v31 = load_training_config(
         profile="preheat",
-        config_path=(
-            experiment_root
-            / "full_run_revival_v31_failure_credit_capacity_model_init.toml"
-        ),
+        config_path=(experiment_root / "full_run_revival_v31_failure_credit_capacity_model_init.toml"),
     )
     v32 = load_training_config(
         profile="preheat",
-        config_path=(
-            experiment_root / "full_run_revival_v32_budget64_mature_model_init.toml"
-        ),
+        config_path=(experiment_root / "full_run_revival_v32_budget64_mature_model_init.toml"),
     )
 
     assert v32.model == v31.model
@@ -652,6 +651,7 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
     source.pop("failure_credit")
+    source.pop("transaction_exploration")
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
@@ -681,6 +681,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v11"
     source.pop("failure_credit")
+    source.pop("transaction_exploration")
 
     with pytest.raises(ValueError, match="unsupported training config version"):
         training_config_from_mapping(source)
@@ -688,6 +689,58 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
     assert not migrated.failure_credit.shadow_enabled
+
+
+def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v13"
+    source.pop("transaction_exploration")
+
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert not migrated.transaction_exploration.enabled
+    assert migrated.transaction_exploration.operations == ()
+
+
+def test_transaction_exploration_contract_is_versioned_and_fail_closed() -> None:
+    enabled = TransactionExplorationConfig(
+        enabled=True,
+        operations=("remove", "upgrade"),
+        entry_epsilon_floor=0.20,
+        completion_guidance_probability=0.95,
+    )
+    assert enabled.operations == ("remove", "upgrade")
+    with pytest.raises(ValueError, match="supports only"):
+        TransactionExplorationConfig(
+            enabled=True,
+            operations=("smith_specific_card",),
+            entry_epsilon_floor=0.20,
+            completion_guidance_probability=0.95,
+        )
+    with pytest.raises(ValueError, match="non-zero|zero probabilities|requires empty"):
+        TransactionExplorationConfig(entry_epsilon_floor=0.20)
+    with pytest.raises(ValueError, match="less than 1|0 <"):
+        TransactionExplorationConfig(
+            enabled=True,
+            operations=("upgrade",),
+            entry_epsilon_floor=0.20,
+            completion_guidance_probability=1.0,
+        )
+
+    base = load_training_config(profile="preheat")
+    with pytest.raises(ValueError, match="at least curriculum.epsilon_end"):
+        replace(
+            base,
+            transaction_exploration=TransactionExplorationConfig(
+                enabled=True,
+                operations=("upgrade",),
+                entry_epsilon_floor=0.05,
+                completion_guidance_probability=0.95,
+            ),
+        )
 
 
 def test_unknown_replay_section_is_rejected() -> None:

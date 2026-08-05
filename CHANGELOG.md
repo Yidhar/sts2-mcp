@@ -41,8 +41,19 @@ historical RL artifacts.
   re-armed Lizard Tail preheat implementation with `engine-bailout-v1`.
   Existing v9 runs are not exact-resume compatible; learned network parameters
   may be imported only through an explicit fresh-lineage model initialization.
+- Advanced the curriculum config to v14 for the explicit training-only
+  transaction-exploration contract. Config-v13 checkpoints remain eligible
+  only for the reviewed parameter-only v13-to-v14 model-init migration; they
+  cannot silently exact-resume with changed Smith/card-removal behavior.
 
 ### Added
+
+- Added a strategy-neutral transaction competence curriculum for rest-site
+  Smith and merchant card removal. Rare entrances receive candidate-count-
+  independent exploration and active Selection pages use an exactly logged
+  Select/Confirm behavior mixture. Deterministic evaluation remains unassisted,
+  and success requires an authoritative deck upgrade or exact one-card removal
+  rather than a UI exit or Confirm click.
 
 - Added a finite-revival curriculum stage that initializes the held-out-validated
   v24 network into a fresh lineage with a hidden, run-scoped bailout budget of

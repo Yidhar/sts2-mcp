@@ -10,9 +10,9 @@ import pytest
 from sts2_rl.training import CONFIG_VERSION, load_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v33_stability_recovery_model_init.py"
-CONFIG = PACKAGE_ROOT / "config" / "experiments" / "full_run_revival_v33_stability_recovery_model_init.toml"
-SPEC = importlib.util.spec_from_file_location("v33_stability_recovery_launcher", SCRIPT)
+SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v34_transaction_competence_model_init.py"
+CONFIG = PACKAGE_ROOT / "config" / "experiments" / "full_run_revival_v34_transaction_competence_model_init.toml"
+SPEC = importlib.util.spec_from_file_location("v34_transaction_competence_launcher", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 launcher = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = launcher
@@ -54,35 +54,26 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
+def test_v34_recipe_enables_only_reviewed_transaction_exploration() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v14"
-    assert not config.transaction_exploration.enabled
+    explorer = config.transaction_exploration
+    assert explorer.enabled
+    assert explorer.operations == ("remove", "upgrade")
+    assert explorer.entry_epsilon_floor == pytest.approx(0.50)
+    assert explorer.completion_guidance_probability == pytest.approx(0.95)
     assert config.curriculum.revival_budget == 64
     assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)
-    assert config.optimization.entropy_weight_end == pytest.approx(0.004)
-    assert config.optimization.entropy_breaker == "one-hot-v1"
-    assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)
-    assert config.failure_credit.liveness_gradient_clip_norm == pytest.approx(0.50)
-    assert config.failure_credit.sample_records == 4
-    assert config.failure_credit.liveness_records_per_autograd_batch == 4
-    assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(0.20)
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"
     assert config.runtime.total_environment_steps == 100_000
     assert config.runtime.evaluation_steps == (0, 25_000, 50_000, 75_000)
-    assert config.runtime.evaluation_episodes == 16
     assert config.runtime.early_evaluation_steps == (5_000, 10_000)
-    assert config.runtime.early_evaluation_episodes == 16
     assert config.runtime.final_audit_steps == (100_000,)
-    assert config.runtime.final_audit_episodes == 64
-    assert config.runtime.training_deadlock_streak_alert_episodes == 4
-    assert config.runtime.evaluation_guard_failure_action == "rollback_continue"
-    assert config.runtime.evaluation_guard_max_rollbacks == 2
 
 
-def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
+def test_v34_is_a_pinned_model_initialization_not_exact_resume(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
@@ -91,11 +82,11 @@ def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
     assert command.count("--initialize-from") == 1
     assert command[command.index("--initialize-from") + 1] == str(launcher.source_checkpoint_path(paths))
     assert "--resume" not in command
-    assert launcher.SOURCE_RUN_ID == "481995a5-0221-4f59-9293-9105cd336068"
-    assert launcher.SOURCE_ENVIRONMENT_STEPS == 90_152
-    assert launcher.SOURCE_POLICY_VERSION == 1_467
-    assert launcher.SOURCE_LEARNER_UPDATES == 1_467
-    assert launcher.SOURCE_CHECKPOINT_ID == "1c0d5284-6be0-4367-a669-166f37b9b3ec"
+    assert launcher.SOURCE_RUN_ID == "6c7e939a-9b11-4624-8847-77a8d71631ab"
+    assert launcher.SOURCE_ENVIRONMENT_STEPS == 75_714
+    assert launcher.SOURCE_POLICY_VERSION == 1_227
+    assert launcher.SOURCE_LEARNER_UPDATES == 1_227
+    assert launcher.SOURCE_CHECKPOINT_ID == "1c412b44-c288-4278-b2e0-373bf9d20a5e"
     assert launcher._validate_checkpoint_summary(
         _checkpoint_summary(paths),
         paths=paths,
@@ -107,7 +98,7 @@ def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
         )
 
 
-def test_v33_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> None:
+def test_v34_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     summary = _checkpoint_summary(paths)
     for key in (
@@ -129,15 +120,13 @@ def test_v33_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> N
             )
 
 
-def test_v33_supervisor_reenters_the_v33_adapter_and_keeps_its_pins(
-    tmp_path: Path,
-) -> None:
+def test_v34_supervisor_reenters_adapter_and_keeps_pins(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    manifest = tmp_path / "v33.launch.json"
+    manifest = tmp_path / "v34.launch.json"
     command = launcher.build_supervisor_command(paths, manifest_path=manifest)
 
     assert Path(command[1]).name == SCRIPT.name
     assert command[-2:] == ("--manifest", str(manifest))
     assert launcher._core.RUN_NAME == launcher.RUN_NAME
     assert launcher._core.RESUME_RUN_ID == launcher.SOURCE_RUN_ID
-    assert launcher._core.RESUME_STEP == 90_152
+    assert launcher._core.RESUME_STEP == 75_714
