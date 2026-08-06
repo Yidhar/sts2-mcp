@@ -2241,7 +2241,7 @@ class VTraceLearner:
         log_prob_rows: list[Tensor] = []
         value_rows: list[Tensor] = []
         entropy_rows: list[Tensor] = []
-        candidate_count_rows: list[Tensor] = []
+        normalized_entropy_rows: list[Tensor] = []
         valid_rows: list[Tensor] = []
         policy_rows: list[Tensor] = []
         behavior_rows: list[Tensor] = []
@@ -2305,18 +2305,15 @@ class VTraceLearner:
                 dtype=torch.long,
             )
             selected_log_prob = log_policy.gather(1, selected[:, None]).squeeze(1)
-            entropy = output.policy_entropy()
-            candidate_counts = output.action_mask.sum(dim=1).to(
-                dtype=entropy.dtype
-            )
+            entropy, normalized_entropy = output.policy_entropy_and_normalized()
 
             floating_zero = output.value.new_zeros(batch_size)
             bool_zero = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
             log_prob_rows.append(floating_zero.index_copy(0, active_tensor, selected_log_prob))
             value_rows.append(floating_zero.index_copy(0, active_tensor, output.value))
             entropy_rows.append(floating_zero.index_copy(0, active_tensor, entropy))
-            candidate_count_rows.append(
-                floating_zero.index_copy(0, active_tensor, candidate_counts)
+            normalized_entropy_rows.append(
+                floating_zero.index_copy(0, active_tensor, normalized_entropy)
             )
             valid_rows.append(bool_zero.index_fill(0, active_tensor, True))
             policy_rows.append(
@@ -2403,7 +2400,7 @@ class VTraceLearner:
         log_probs = torch.stack(log_prob_rows)
         values = torch.stack(value_rows)
         entropies = torch.stack(entropy_rows)
-        candidate_counts = torch.stack(candidate_count_rows)
+        normalized_entropies = torch.stack(normalized_entropy_rows)
         valid = torch.stack(valid_rows)
         policy_decisions = torch.stack(policy_rows) & valid
         behavior_log_probs = torch.stack(behavior_rows)
@@ -2450,11 +2447,7 @@ class VTraceLearner:
         # exact pattern used by the one-hot breaker.
         active_ratios = ratios[policy_decisions]
         clipped = (active_ratios > self.config.vtrace_rho_clip).float()
-        active_entropies = entropies[policy_decisions]
-        active_candidate_counts = candidate_counts[policy_decisions]
-        active_normalized_entropies = active_entropies / active_candidate_counts.log().clamp_min(
-            1.0e-6
-        )
+        active_normalized_entropies = normalized_entropies[policy_decisions]
         scheduled_entropy_weight = _annealed_entropy_weight(
             self.config,
             policy_version=schedule_policy_version,

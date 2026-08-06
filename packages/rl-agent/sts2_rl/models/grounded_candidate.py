@@ -939,13 +939,20 @@ class RecurrentCandidateOutput:
             torch.full_like(selected, -1),
         )
 
-    def policy_entropy(self) -> Tensor:
-        """Return count-balanced hierarchical entropy for each batch row.
+    def policy_entropy_and_normalized(self) -> tuple[Tensor, Tensor]:
+        """Return count-balanced entropy and its exact normalized value.
 
         The branch entropy is conventional.  Conditional entropy is normalized
         by ``log(candidate_count)`` before being averaged under branch
         probability, so merely exposing more candidates in one semantic branch
         cannot make that branch more attractive to the entropy objective.
+
+        This objective is not bounded by ``log(total_candidate_count)``.  If
+        ``q_b`` is one for a branch with multiple candidates and zero for a
+        singleton branch, its exact maximum is ``log(sum_b(exp(q_b)))``.  The
+        second return value uses that capacity, keeping policy-health telemetry
+        in ``[0, 1]`` without mixing the hierarchical objective with ordinary
+        flat-categorical entropy.
         """
 
         (
@@ -988,7 +995,32 @@ class RecurrentCandidateOutput:
             conditional_entropy / torch.log(counts.clamp_min(2.0)),
             torch.zeros_like(conditional_entropy),
         )
-        return branch_entropy + (branch_probabilities * conditional_entropy).sum(dim=-1)
+        entropy = branch_entropy + (branch_probabilities * conditional_entropy).sum(dim=-1)
+
+        branch_capacity_weights = torch.where(
+            counts > 1.0,
+            torch.full_like(counts, math.e),
+            torch.where(counts > 0.0, torch.ones_like(counts), torch.zeros_like(counts)),
+        )
+        capacity = torch.log(
+            branch_capacity_weights.sum(dim=-1).clamp_min(1.0)
+        )
+        normalized = torch.where(
+            capacity > 0.0,
+            entropy / capacity.clamp_min(torch.finfo(entropy.dtype).tiny),
+            torch.zeros_like(entropy),
+        )
+        # Both values are assembled from float32 scatter reductions.  Clamp
+        # only the dimensionless diagnostic after applying the mathematically
+        # matching capacity; this canonicalizes roundoff without changing the
+        # entropy objective or hiding non-finite model outputs.
+        normalized = normalized.clamp(min=0.0, max=1.0)
+        return entropy, normalized
+
+    def policy_entropy(self) -> Tensor:
+        """Return count-balanced hierarchical entropy for each batch row."""
+
+        return self.policy_entropy_and_normalized()[0]
 
 
 def _make_transformer_stack(

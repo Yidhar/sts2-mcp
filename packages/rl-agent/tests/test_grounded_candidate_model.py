@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import pytest
@@ -335,6 +336,42 @@ def test_hierarchical_policy_does_not_turn_branch_cardinality_into_preference(
         two_candidates.policy_entropy(),
         four_candidates.policy_entropy(),
     )
+
+
+def test_hierarchical_policy_normalizes_entropy_by_its_exact_capacity(
+    config: GroundedCandidateConfig,
+) -> None:
+    model = RecurrentCandidateModel(config).eval()
+    template = model(_make_batch(config))
+    multi_branch = 2
+    singleton_branch = 5
+
+    # Uniform actions inside the multi-candidate branch and branch logits
+    # proportional to exp(q_b) attain the exact capacity log(e + 1).
+    maximum_entropy = replace(
+        template,
+        policy_logits=torch.tensor([[1.0, 1.0, 0.0]]),
+        policy_branch_ids=torch.tensor(
+            [[multi_branch, multi_branch, singleton_branch]],
+            dtype=torch.long,
+        ),
+        action_mask=torch.ones((1, 3), dtype=torch.bool),
+    )
+    entropy, normalized = maximum_entropy.policy_entropy_and_normalized()
+    torch.testing.assert_close(entropy, torch.tensor([math.log(math.e + 1.0)]))
+    torch.testing.assert_close(normalized, torch.ones(1))
+
+    # The old flat normalization used log(3), which is not an upper bound for
+    # the count-balanced hierarchical objective and caused the v37 first
+    # learner update to fail closed.
+    assert float((entropy / math.log(3.0)).item()) > 1.0
+
+    collapsed = replace(
+        maximum_entropy,
+        policy_logits=torch.tensor([[20.0, -20.0, -20.0]]),
+    )
+    _, collapsed_normalized = collapsed.policy_entropy_and_normalized()
+    assert 0.0 <= float(collapsed_normalized.item()) < 1.0e-6
 
 
 def test_confirm_and_deselect_are_learned_distinct_branches_without_hard_coding(
