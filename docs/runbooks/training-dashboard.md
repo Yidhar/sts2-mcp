@@ -139,7 +139,7 @@ All endpoints are same-origin and return `Cache-Control: no-store`.
 | `/api/v1/heldout-journals?run=<key>` | Cheap journal directory/provenance list; does not parse decision rows |
 | `/api/v1/heldout-episodes?run=<key>&journal=<key>` | Lazily parse one selected journal and return a bounded episode index |
 | `/api/v1/heldout-episode?run=<key>&journal=<key>&episode=<id>` | One bounded run projection with route/floor/loadout/reward/anomaly facts |
-| `/api/v1/heldout-replay-map?run=<key>&journal=<key>&episode=<id>` | Deterministically reconstruct all visited Act maps from seed plus recorded actions; memory-cached |
+| `/api/v1/heldout-replay-map?run=<key>&journal=<key>&episode=<id>` | Deterministically reconstruct all visited Act maps and exact macro outcomes from seed plus recorded actions; memory-cached |
 
 The `run`, `journal`, and `episode` queries accept only server-issued keys from
 the preceding endpoint. They are not arbitrary filesystem paths; extra or
@@ -166,7 +166,8 @@ The graphical map uses one durable contract for every supported journal:
 1. the compact route and `policy_topk` branches render immediately;
 2. the monitor resets the matching simulator from the recorded seed, replays
    the exact recorded action indexes, captures each visited Act's `map.nodes`,
-   and overlays the actual route;
+   and projects macro transitions such as healing, card upgrades/removals,
+   purchases, and acquired entities from their exact before/after states;
 3. a repeated view uses the stat-keyed in-memory result rather than replaying.
 
 The trajectory journal deliberately does **not** persist one full map topology
@@ -174,12 +175,23 @@ per Act. Existing `sts2-trajectory-journal-v4` logs already contain the seed,
 pinned apphost/managed-simulator hashes, and every dispatched action index, so
 they are fully compatible with reconstruction and require neither a downgrade
 path nor a new logging ABI. In a real three-Act old-journal validation, the
-parser found 958 decisions; the map endpoint replayed the first 687 without
-state/action divergence, captured 66/51/51 nodes for Acts 1/2/3, and stopped in
-about 10.0 seconds on the test machine. Replaying the entire 958-decision
-episode separately took about 14.5 seconds. A cached HTTP view returned in
-about 71 milliseconds. Timings are hardware-, process-, and episode-dependent
-and are not a service-level guarantee.
+parser found and replayed all 958 decisions without state/action divergence,
+captured 66/51/51 nodes for Acts 1/2/3, and completed in about 14.5 seconds on
+the test machine. A cached HTTP view returned in about 71 milliseconds. Timings
+are hardware-, process-, and episode-dependent and are not a service-level
+guarantee.
+
+New `sts2-trajectory-journal-v5` summaries additionally preserve a bounded,
+reviewed action-identity projection for card, shop-item, rest-option, and
+selection fields. This lets the monitor name upgraded, removed, and purchased
+entities without duplicating complete card descriptions on every decision.
+Version-4 logs remain fully supported: the same deterministic seed-and-action
+replay that reconstructs the map also recovers exact macro action outcomes.
+
+The legacy response field `forced=true` means only that
+`legal_action_count == 1`. The dashboard renders this as automatic advancement
+with an `only_legal_action` explanation; it must not be interpreted as a model
+preference among multiple strategies.
 
 The final loadout follows the same rule. It is rendered only from the latest
 available bounded player snapshot, with snapshot step/reason and omission

@@ -917,6 +917,10 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert 'const API_HELDOUT_JOURNALS = "/api/v1/heldout-journals"' in html
     assert 'const API_HELDOUT_EPISODE = "/api/v1/heldout-episode"' in html
     assert 'const API_HELDOUT_REPLAY_MAP = "/api/v1/heldout-replay-map"' in html
+    assert "function macroActionsForFloor(episode, floor)" in html
+    assert "自动推进" in html and "唯一合法动作" in html
+    assert "不代表模型在多个策略中选择" in html
+    assert '" · forced"' not in html
     assert "innerHTML" not in html
 
 
@@ -1291,9 +1295,17 @@ def test_http_heldout_drilldown_is_lazy_key_scoped_and_read_only(tmp_path: Path)
         def load(self, path: Path, *, episode_id: str, detail: object) -> dict[str, object]:
             replay_calls.append((path, episode_id, detail))
             return {
-                "schema": "sts2-heldout-map-replay-v1",
+                "schema": "sts2-heldout-episode-replay-v2",
                 "episode_id": episode_id,
                 "map_topologies": [{"act": 1, "nodes": []}],
+                "macro_actions": [
+                    {
+                        "step": 7,
+                        "kind": "choose_rest_option",
+                        "semantic_label": "休息回血: 20 → 44 (+24)",
+                    }
+                ],
+                "macro_actions_omitted": 0,
                 "reproduction": {"mode": "seed_and_recorded_action_replay"},
                 "cache_hit": False,
             }
@@ -1329,7 +1341,8 @@ def test_http_heldout_drilldown_is_lazy_key_scoped_and_read_only(tmp_path: Path)
         status, _, body = _request(server, "GET", replay_path)
         assert status == 200
         replay = json.loads(body)
-        assert replay["schema"] == "sts2-heldout-map-replay-v1"
+        assert replay["schema"] == "sts2-heldout-episode-replay-v2"
+        assert replay["macro_actions"][0]["semantic_label"] == "休息回血: 20 → 44 (+24)"
         assert replay["reproduction"]["mode"] == "seed_and_recorded_action_replay"
         assert replay["run"]["run_id"] == RUN_A
         assert replay_calls[0][0] == run_directory / journal_name

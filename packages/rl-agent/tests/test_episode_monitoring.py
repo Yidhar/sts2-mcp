@@ -337,6 +337,8 @@ def test_parse_heldout_journal_projects_route_rewards_floors_and_deadlock(tmp_pa
     assert normal_floor["combat_result"] == "victory"
     claim = next(item for item in normal_floor["macro_decisions"] if item["kind"] == "claim_reward")
     assert claim["forced"] is True
+    assert claim["automatic"] is True
+    assert claim["automatic_reason"] == "only_legal_action"
     elite_floor = detail["floors"][2]
     assert elite_floor["hp_loss_delta"] == 80
     assert elite_floor["revivals_delta"] == 1

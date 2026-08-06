@@ -2576,11 +2576,73 @@
 
       function actionDescription(action) {
         if (!action || typeof action !== "object") return "未记录";
+        const replayFact = action.replay_fact && typeof action.replay_fact === "object"
+          ? action.replay_fact
+          : (typeof action.semantic_label === "string" ? action : null);
+        if (replayFact && replayFact.semantic_label) return scalar(replayFact.semantic_label);
         const selected = action.selected && typeof action.selected === "object" ? action.selected : action;
         const location = selected.column != null ? ` · 列 ${int(selected.column)}` : "";
-        const forced = action.forced === true ? " · forced" : "";
+        const automatic = action.forced === true || action.automatic === true;
+        const kind = scalar(first(selected, ["kind", "action", "model_action_kind"], action.kind || "unknown"));
+        if (kind === "proceed" && automatic) return "自动推进（唯一合法动作）";
+        const kindLabels = {
+          choose_rest_option: "休息点选择",
+          select_card: "选择卡牌",
+          deselect_card: "取消选择卡牌",
+          confirm_selection: "确认选择",
+          cancel_selection: "取消选择",
+          shop_purchase: "商店购买",
+          proceed: "离开当前页面",
+        };
+        const optionId = scalar(first(selected, ["option_id", "option_name"], ""));
+        const restLabels = {
+          HEAL: "休息回血",
+          SMITH: "锻造升级",
+          DIG: "挖掘遗物",
+          LIFT: "举重强化",
+          RECALL: "回忆",
+        };
+        if (kind === "choose_rest_option" && optionId) {
+          return `${restLabels[optionId.toUpperCase()] || `休息点操作：${optionId}`}` +
+            `${automatic ? "（唯一合法动作）" : ""}`;
+        }
         const localized = first(selected, ["display_name", "label"], "未记录");
-        return `${scalar(selected.kind)} · ${scalar(localized)}${location}${forced}`;
+        const automaticSuffix = automatic ? " · 唯一合法动作" : "";
+        return `${kindLabels[kind] || kind} · ${scalar(localized)}${location}${automaticSuffix}`;
+      }
+
+      function macroActionsForFloor(episode, floor) {
+        const raw = Array.isArray(floor && floor.macro_decisions) ? floor.macro_decisions : [];
+        const facts = (Array.isArray(episode && episode.replay_macro_actions)
+          ? episode.replay_macro_actions
+          : []).filter(
+          (fact) => int(fact.act) === int(floor.act) && int(fact.floor) === int(floor.floor)
+        );
+        const factByStep = new Map(facts.map((fact) => [int(fact.step), fact]));
+        const seenSteps = new Set();
+        const merged = raw.map((action) => {
+          const step = int(action && action.step);
+          seenSteps.add(step);
+          const fact = factByStep.get(step);
+          return fact ? { ...action, replay_fact: fact } : action;
+        });
+        facts.forEach((fact) => {
+          const step = int(fact.step);
+          if (seenSteps.has(step)) return;
+          merged.push({
+            step,
+            kind: scalar(fact.kind),
+            forced: fact.automatic === true,
+            automatic: fact.automatic === true,
+            selected: {
+              kind: scalar(fact.kind),
+              display_name: scalar(fact.semantic_label),
+              entity_id: fact.entity && fact.entity.entity_id,
+            },
+            replay_fact: fact,
+          });
+        });
+        return merged.sort((left, right) => int(left.step) - int(right.step));
       }
 
       function candidateDescription(candidate) {
@@ -3013,8 +3075,20 @@
         chip.className = "decision-chip";
         chip.textContent = actionDescription(action);
         const selected = action && action.selected && typeof action.selected === "object" ? action.selected : action;
-        const entityId = first(selected || {}, ["entity_id", "card_id"], null);
-        if (entityId) chip.title = `内部 ID ${entityId}`;
+        const replayFact = action && action.replay_fact && typeof action.replay_fact === "object"
+          ? action.replay_fact
+          : null;
+        const entityId = first(
+          (replayFact && replayFact.entity) || selected || {},
+          ["entity_id", "card_id"],
+          null
+        );
+        const notes = [];
+        if (entityId) notes.push(`内部 ID ${entityId}`);
+        if (action && (action.forced === true || action.automatic === true)) {
+          notes.push("该状态只有一个合法动作，属于自动推进，不代表模型在多个策略中选择");
+        }
+        if (notes.length) chip.title = notes.join("\n");
         return chip;
       }
 
@@ -3097,11 +3171,11 @@
                 `${int(floor.combat_rounds)} 回合 · ${int(floor.combat_decisions)} 个战斗决策`
             )
           );
-          const macros = Array.isArray(floor.macro_decisions) ? floor.macro_decisions : [];
+          const macros = macroActionsForFloor(episode, floor);
           const rewards = cardRewards.filter((reward) => int(reward.floor) === int(floor.floor));
           if (macros.length || rewards.length) {
             const heading = document.createElement("strong");
-            heading.textContent = "宏观决策与奖励";
+            heading.textContent = "宏观决策、实际结果与奖励";
             const chips = document.createElement("div");
             chips.className = "decision-chip-row";
             const macroGroups = new Map();
@@ -3259,7 +3333,7 @@
                 ` · 权威累计失血差 ${int(floor.hp_loss_delta)} · 复活 ${int(floor.entry_revivals)} → ${int(floor.exit_revivals)}`
             );
             lines.append(combat, hp);
-            const macros = Array.isArray(floor.macro_decisions) ? floor.macro_decisions : [];
+            const macros = macroActionsForFloor(episode, floor);
             if (macros.length) {
               const macro = detailLine("宏观选择", macros.map(actionDescription).join(" ｜ "));
               lines.append(macro);
@@ -3416,12 +3490,14 @@
             state.selectedEpisodeDetail !== episode
           ) return;
           episode.map_topologies = Array.isArray(payload.map_topologies) ? payload.map_topologies : [];
+          episode.replay_macro_actions = Array.isArray(payload.macro_actions) ? payload.macro_actions : [];
+          episode.replay_macro_actions_omitted = int(payload.macro_actions_omitted);
           episode.map_reproduction = payload.reproduction || {};
           episode.map_replay_state = "completed";
           delete episode.map_replay_error;
           renderReplayAct(episode, state.selectedReplayAct);
           const cached = payload.cache_hit === true ? " · 缓存命中" : "";
-          setDetailStatus(`单局详情与完整地图已加载${cached}`, "completed");
+          setDetailStatus(`单局详情、完整地图与宏观结果已加载${cached}`, "completed");
         } catch (error) {
           if (
             replayToken !== state.mapReplayToken || runKey !== state.selectedRun ||

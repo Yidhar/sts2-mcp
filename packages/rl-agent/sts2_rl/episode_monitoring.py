@@ -391,6 +391,8 @@ def _project_action(action: Mapping[str, object]) -> JsonDict:
     kind = _action_kind(action)
     item = _mapping(action.get("item"))
     card = _mapping(action.get("card"))
+    option = _mapping(action.get("option"))
+    selection = _mapping(action.get("selection"))
     map_node = _mapping(action.get("map_node"))
     map_node_coord = _project_coord(map_node.get("coord")) or _project_coord(map_node)
     coord = _project_coord(action.get("coord")) or map_node_coord
@@ -448,8 +450,29 @@ def _project_action(action: Mapping[str, object]) -> JsonDict:
         "coord": coord,
         "map_node": projected_map_node,
         "card_id": _string(action.get("card_id")) or _string(card.get("card_id")) or None,
+        "card_index": (
+            _integer(action.get("card_index"))
+            if _finite(action.get("card_index")) is not None
+            else (
+                _integer(card.get("index"))
+                if _finite(card.get("index")) is not None
+                else None
+            )
+        ),
         "card_rarity": _string(action.get("card_rarity")) or _string(card.get("rarity")) or None,
         "item_category": item_category or None,
+        "item_cost": (
+            _integer(item.get("cost", item.get("price")))
+            if _finite(item.get("cost", item.get("price"))) is not None
+            else None
+        ),
+        "option_id": _string(option.get("id")) or None,
+        "option_name": _string(option.get("name")) or None,
+        "selection_operation": (
+            _string(action.get("selection_operation"))
+            or _string(selection.get("operation_type"))
+            or None
+        ),
         "entity_kind": entity_kind,
         "entity_id": entity_id,
         "display_name": display_name,
@@ -771,6 +794,7 @@ class _EpisodeBuilder:
         kind = _action_kind(action)
         selected = _project_action(action)
         candidates = _policy_candidates(event)
+        automatic = _integer(event.get("legal_action_count"), -1) == 1
         compact_decision = {
             "step": step,
             "screen": screen or None,
@@ -779,7 +803,18 @@ class _EpisodeBuilder:
             "selected": selected,
             "candidates": candidates,
             "legal_action_count": event.get("legal_action_count"),
-            "forced": _integer(event.get("legal_action_count"), -1) == 1,
+            # ``forced`` is retained for response compatibility.  The explicit
+            # automatic fields state the real semantics: the environment
+            # exposed exactly one legal action; this was not a policy choice
+            # among alternatives.
+            "forced": automatic,
+            "automatic": automatic,
+            "automatic_reason": "only_legal_action" if automatic else None,
+            "transaction_operation": (
+                _string(event.get("transaction_operation"))
+                or _string(_mapping(observation.get("card_selection")).get("operation_type"))
+                or None
+            ),
             "value": _finite(event.get("value")),
         }
         self._recent_actions.append(compact_decision)

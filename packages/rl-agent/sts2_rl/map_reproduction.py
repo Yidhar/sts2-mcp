@@ -26,17 +26,53 @@ from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
 from sts2_env.headless_sim_bridge_client import HeadlessSimBridgeClient
+from sts2_rl.entity_localization import EntityKind, localized_entity_name
 
 JsonDict = dict[str, Any]
 
-MAP_REPLAY_SCHEMA: Final = "sts2-heldout-map-replay-v1"
+MAP_REPLAY_SCHEMA: Final = "sts2-heldout-episode-replay-v2"
 _MAX_LINE_BYTES: Final = 8 * 1024 * 1024
 _MAX_REPLAY_ACTIONS: Final = 30_000
 _MAX_REPLAY_SECONDS: Final = 120.0
 _MAX_MAP_ACTS: Final = 8
 _MAX_MAP_NODES: Final = 128
 _MAX_MAP_CHILDREN: Final = 16
+_MAX_MACRO_ACTIONS: Final = 1_024
 _ACTION_HANDLE_RE = re.compile(r"^sim:(?P<index>[0-9]+):")
+_MACRO_ACTION_KINDS: Final = frozenset(
+    {
+        "choose_event_option",
+        "choose_rest_option",
+        "shop_purchase",
+        "claim_reward",
+        "claim_treasure_relic",
+        "select_card",
+        "deselect_card",
+        "confirm_selection",
+        "cancel_selection",
+    }
+)
+_MACRO_SCREENS: Final = frozenset({"EVENT", "REST_SITE", "SHOP", "CARD_SELECTION"})
+_REST_OPTION_LABELS: Final = {
+    "HEAL": "休息回血",
+    "SMITH": "锻造升级",
+    "DIG": "挖掘遗物",
+    "LIFT": "举重强化",
+    "RECALL": "回忆",
+}
+_OPERATION_LABELS: Final = {
+    "upgrade": "升级",
+    "remove": "删牌",
+    "transform": "变换",
+    "enchant": "附魔",
+    "select": "选择",
+}
+_SHOP_CATEGORY_LABELS: Final = {
+    "card": "卡牌",
+    "relic": "遗物",
+    "potion": "药水",
+    "card_removal": "删牌服务",
+}
 
 
 class MapReplayUnavailable(ValueError):
@@ -94,6 +130,334 @@ def _integer(value: object, default: int = 0) -> int:
 
 def _string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _action_kind(action: Mapping[str, Any]) -> str:
+    return (
+        _string(action.get("action"))
+        or _string(action.get("kind"))
+        or _string(action.get("model_action_kind"))
+        or "unknown"
+    )
+
+
+def _collection_total(value: object) -> int:
+    if not isinstance(value, list):
+        return 0
+    total = 0
+    for item in value:
+        quantity = _integer(_mapping(item).get("quantity"), 1)
+        total += max(1, quantity)
+    return total
+
+
+def _player_resources(observation: Mapping[str, Any]) -> JsonDict:
+    player = _mapping(observation.get("player"))
+    return {
+        "hp": _integer(player.get("hp")),
+        "max_hp": _integer(player.get("max_hp")),
+        "gold": _integer(player.get("gold")),
+        "deck_count": _collection_total(player.get("deck")),
+        "relic_count": _collection_total(player.get("relics")),
+        "potion_count": _collection_total(player.get("potions")),
+    }
+
+
+def _entity_identifier(value: Mapping[str, Any], *, kind: EntityKind) -> str | None:
+    fields_by_kind: dict[EntityKind, tuple[str, ...]] = {
+        "card": ("card_id", "id"),
+        "relic": ("relic_id", "id"),
+        "potion": ("potion_id", "id"),
+    }
+    for key in fields_by_kind[kind]:
+        identifier = _string(value.get(key))
+        if identifier is not None:
+            return identifier
+    return None
+
+
+def _project_entity(
+    value: Mapping[str, Any],
+    *,
+    kind: EntityKind,
+) -> JsonDict | None:
+    identifier = _entity_identifier(value, kind=kind)
+    if identifier is None:
+        return None
+    index_value = value.get("index", value.get("card_index", value.get("slot")))
+    projected: JsonDict = {
+        "kind": kind,
+        "entity_id": identifier,
+        "display_name": localized_entity_name(identifier, kind=kind),
+        "index": _integer(index_value) if isinstance(index_value, int | float) else None,
+    }
+    if kind == "card":
+        upgraded = value.get("is_upgraded")
+        projected["is_upgraded"] = upgraded if isinstance(upgraded, bool) else None
+        projected["type"] = _string(value.get("type"))
+        projected["rarity"] = _string(value.get("rarity"))
+    return projected
+
+
+def _action_entity(action: Mapping[str, Any]) -> JsonDict | None:
+    card = _mapping(action.get("card"))
+    entity = _project_entity(card, kind="card")
+    if entity is not None:
+        return entity
+    item = _mapping(action.get("item"))
+    category = (_string(item.get("category")) or _string(item.get("type")) or "").lower()
+    if category in {"card", "relic", "potion"}:
+        kind = cast(EntityKind, category)
+        nested = _mapping(item.get(category))
+        return _project_entity(nested or item, kind=kind)
+    for kind, key in (
+        (cast(EntityKind, "card"), "card_id"),
+        (cast(EntityKind, "relic"), "relic_id"),
+        (cast(EntityKind, "potion"), "potion_id"),
+    ):
+        identifier = _string(action.get(key))
+        if identifier is not None:
+            return _project_entity({key: identifier}, kind=kind)
+    return None
+
+
+def _selected_card_entities(observation: Mapping[str, Any]) -> list[JsonDict]:
+    selection = _mapping(observation.get("card_selection"))
+    cards = selection.get("selected_cards")
+    if not isinstance(cards, list):
+        return []
+    entities: list[JsonDict] = []
+    for card in cards:
+        entity = _project_entity(_mapping(card), kind="card")
+        if entity is not None:
+            entities.append(entity)
+    return entities
+
+
+def _entity_signature(entity: Mapping[str, Any]) -> str:
+    return json.dumps(
+        {
+            "kind": entity.get("kind"),
+            "entity_id": entity.get("entity_id"),
+            "is_upgraded": entity.get("is_upgraded"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _entity_multiset(
+    observation: Mapping[str, Any],
+    *,
+    field: str,
+    kind: EntityKind,
+) -> dict[str, tuple[JsonDict, int]]:
+    player = _mapping(observation.get("player"))
+    values = player.get(field)
+    if not isinstance(values, list):
+        return {}
+    result: dict[str, tuple[JsonDict, int]] = {}
+    for raw in values:
+        source = _mapping(raw)
+        entity = _project_entity(source, kind=kind)
+        if entity is None:
+            continue
+        quantity = max(1, _integer(source.get("quantity"), 1))
+        signature = _entity_signature(entity)
+        previous = result.get(signature)
+        result[signature] = (entity, quantity + (previous[1] if previous else 0))
+    return result
+
+
+def _entity_changes(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    field: str,
+    kind: EntityKind,
+) -> tuple[list[JsonDict], list[JsonDict]]:
+    old = _entity_multiset(before, field=field, kind=kind)
+    new = _entity_multiset(after, field=field, kind=kind)
+    gained: list[JsonDict] = []
+    removed: list[JsonDict] = []
+    for signature in sorted(set(old) | set(new)):
+        old_entity, old_count = old.get(signature, ({}, 0))
+        new_entity, new_count = new.get(signature, ({}, 0))
+        if new_count > old_count:
+            gained.append({**new_entity, "quantity": new_count - old_count})
+        elif old_count > new_count:
+            removed.append({**old_entity, "quantity": old_count - new_count})
+    return gained, removed
+
+
+def _entity_text(entity: Mapping[str, Any], *, upgraded_suffix: bool = False) -> str:
+    name = _string(entity.get("display_name")) or _string(entity.get("entity_id")) or "未知对象"
+    if upgraded_suffix and entity.get("is_upgraded") is not True:
+        return f"{name}+"
+    if entity.get("is_upgraded") is True and not name.endswith("+"):
+        return f"{name}+"
+    return name
+
+
+def _entities_text(entities: list[JsonDict], *, upgraded_suffix: bool = False) -> str:
+    labels: list[str] = []
+    for entity in entities:
+        quantity = max(1, _integer(entity.get("quantity"), 1))
+        label = _entity_text(entity, upgraded_suffix=upgraded_suffix)
+        labels.append(f"{label} x {quantity}" if quantity > 1 else label)
+    return "、".join(labels)
+
+
+def _positive_effect_text(effects: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for field, label in (
+        ("gained_cards", "获得卡牌"),
+        ("gained_relics", "获得遗物"),
+        ("gained_potions", "获得药水"),
+    ):
+        entities = effects.get(field)
+        if isinstance(entities, list) and entities:
+            parts.append(f"{label} {_entities_text(entities)}")
+    max_hp = _integer(effects.get("max_hp"))
+    gold = _integer(effects.get("gold"))
+    if max_hp > 0:
+        parts.append(f"最大生命 +{max_hp}")
+    if gold > 0:
+        parts.append(f"金币 +{gold}")
+    return "、".join(parts)
+
+
+def _macro_action_fact(
+    *,
+    step: int,
+    action: Mapping[str, Any],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    legal_action_count: int,
+) -> JsonDict | None:
+    kind = _action_kind(action)
+    screen = _string(before.get("screen")) or "UNKNOWN"
+    if kind not in _MACRO_ACTION_KINDS and not (kind == "proceed" and screen in _MACRO_SCREENS):
+        return None
+
+    run = _mapping(before.get("run"))
+    before_resources = _player_resources(before)
+    after_resources = _player_resources(after)
+    effects: JsonDict = {
+        key: _integer(after_resources.get(key)) - _integer(before_resources.get(key))
+        for key in before_resources
+    }
+    for field, entity_kind, gained_key, removed_key in (
+        ("deck", cast(EntityKind, "card"), "gained_cards", "removed_cards"),
+        ("relics", cast(EntityKind, "relic"), "gained_relics", "removed_relics"),
+        ("potions", cast(EntityKind, "potion"), "gained_potions", "removed_potions"),
+    ):
+        gained, removed = _entity_changes(before, after, field=field, kind=entity_kind)
+        if gained:
+            effects[gained_key] = gained
+        if removed:
+            effects[removed_key] = removed
+
+    entity = _action_entity(action)
+    selection = _mapping(before.get("card_selection"))
+    operation = (_string(selection.get("operation_type")) or "").lower()
+    selected_entities = _selected_card_entities(before)
+    automatic = legal_action_count == 1
+    semantic_label = _string(action.get("label")) or kind
+    positive_effect = _positive_effect_text(effects)
+
+    if kind == "choose_rest_option":
+        option = _mapping(action.get("option"))
+        option_id = (_string(option.get("id")) or "").upper()
+        option_label = _REST_OPTION_LABELS.get(option_id, f"休息点操作: {option_id or '未知'}")
+        if option_id == "HEAL":
+            hp_before = _integer(before_resources.get("hp"))
+            hp_after = _integer(after_resources.get("hp"))
+            semantic_label = f"{option_label}: {hp_before} → {hp_after} (+{max(0, hp_after - hp_before)})"
+        else:
+            semantic_label = option_label
+            if positive_effect:
+                semantic_label += f": {positive_effect}"
+    elif kind in {"select_card", "deselect_card"}:
+        operation_label = _OPERATION_LABELS.get(operation, operation or "卡牌")
+        verb = "选择" if kind == "select_card" else "取消选择"
+        entity_label = _entity_text(entity) if entity is not None else "未知卡牌"
+        semantic_label = f"{verb}{operation_label}: {entity_label}"
+    elif kind == "confirm_selection":
+        operation_label = _OPERATION_LABELS.get(operation, operation or "选择")
+        if operation == "upgrade":
+            names = _entities_text(selected_entities, upgraded_suffix=True)
+            semantic_label = f"完成升级: {names or '未知卡牌'}"
+        elif operation == "remove":
+            names = _entities_text(selected_entities)
+            semantic_label = f"完成删牌: {names or '未知卡牌'}"
+        elif operation == "transform":
+            removed_effect = effects.get("removed_cards")
+            gained_effect = effects.get("gained_cards")
+            removed_text = _entities_text(removed_effect) if isinstance(removed_effect, list) else "未知卡牌"
+            gained_text = _entities_text(gained_effect) if isinstance(gained_effect, list) else "未知卡牌"
+            semantic_label = f"完成变换: {removed_text} → {gained_text}"
+        else:
+            names = _entities_text(selected_entities)
+            semantic_label = f"确认{operation_label}: {names or '完成'}"
+    elif kind == "cancel_selection":
+        operation_label = _OPERATION_LABELS.get(operation, operation or "选择")
+        semantic_label = f"取消{operation_label}"
+    elif kind == "shop_purchase":
+        item = _mapping(action.get("item"))
+        category = (_string(item.get("category")) or _string(item.get("type")) or "unknown").lower()
+        category_label = _SHOP_CATEGORY_LABELS.get(category, category)
+        charged_now = max(0, -_integer(effects.get("gold")))
+        quoted_cost = max(0, _integer(item.get("cost", item.get("price"))))
+        # Card-removal purchases open a selection transaction and may charge
+        # only when it commits.  Preserve the authoritative quoted item price
+        # instead of rendering that entry step as a zero-cost purchase.
+        cost = charged_now or quoted_cost
+        if entity is not None:
+            semantic_label = f"购买{category_label}: {_entity_text(entity)} ({cost} 金币)"
+        else:
+            semantic_label = f"购买{category_label} ({cost} 金币)"
+    elif kind == "claim_treasure_relic":
+        semantic_label = f"获得遗物: {_entity_text(entity) if entity is not None else '未知遗物'}"
+    elif kind == "claim_reward":
+        semantic_label = f"领取奖励: {positive_effect}" if positive_effect else "领取奖励"
+    elif kind == "choose_event_option":
+        option = _mapping(action.get("option"))
+        option_label = _string(option.get("name")) or _string(option.get("id")) or semantic_label
+        semantic_label = f"事件选择: {option_label}"
+        if positive_effect:
+            semantic_label += f"; {positive_effect}"
+    elif kind == "proceed":
+        location = {
+            "REST_SITE": "休息点",
+            "SHOP": "商店",
+            "EVENT": "事件",
+            "CARD_SELECTION": "选择界面",
+        }.get(screen, "当前页面")
+        semantic_label = f"自动离开{location}" if automatic else f"离开{location}"
+        if automatic:
+            semantic_label += " (唯一合法动作)"
+
+    fact: JsonDict = {
+        "step": step,
+        "act": _integer(run.get("act")),
+        "floor": _integer(run.get("floor")),
+        "room_type": _string(run.get("room_type")),
+        "screen": screen,
+        "kind": kind,
+        "automatic": automatic,
+        "automatic_reason": "only_legal_action" if automatic else None,
+        "semantic_label": semantic_label,
+        "operation": operation or None,
+        "entity": entity,
+        "selected_entities": selected_entities,
+        "positive_effect": positive_effect or None,
+        "resources_before": before_resources,
+        "resources_after": after_resources,
+        "effects": effects,
+    }
+    return fact
 
 
 def _selected_action_index(selected: Mapping[str, Any]) -> int | None:
@@ -281,7 +645,7 @@ def reconstruct_episode_maps(
     simulator_exe: Path,
     client_factory: Callable[[Path], _ReplayClient] = _default_client_factory,
 ) -> JsonDict:
-    """Replay one completed episode and capture each visited Act map."""
+    """Replay one completed episode and recover maps plus exact macro outcomes."""
 
     provenance = _mapping(detail.get("provenance"))
     identity = _verify_identity(simulator_exe, provenance)
@@ -295,6 +659,8 @@ def reconstruct_episode_maps(
     required_acts = _required_acts(detail)
     actions = _episode_actions(journal_path, episode_id)
     maps: dict[int, JsonDict] = {}
+    macro_actions: list[JsonDict] = []
+    macro_actions_omitted = 0
     actions_replayed = 0
     started = time.perf_counter()
 
@@ -320,8 +686,6 @@ def reconstruct_episode_maps(
             topology = _project_topology(observation, replay_step=action.step)
             if topology is not None:
                 maps.setdefault(_integer(topology.get("act")), topology)
-                if required_acts.issubset(maps):
-                    break
             legal_actions = response.get("legal_actions")
             if not isinstance(legal_actions, list) or not 0 <= action.index < len(legal_actions):
                 count = len(legal_actions) if isinstance(legal_actions, list) else 0
@@ -331,10 +695,28 @@ def reconstruct_episode_maps(
             episode = _string(response.get("episode_id"))
             if episode is None:
                 raise MapReplayUnavailable("地图复现失败: HeadlessSim 响应缺少 episode_id")
+            selected_action = _mapping(legal_actions[action.index])
             try:
-                response = client.step(episode, action_index=action.index, timeout_ms=20_000)
+                next_response = client.step(episode, action_index=action.index, timeout_ms=20_000)
             except Exception as exc:
                 raise MapReplayUnavailable(f"地图复现失败: step {action.step} 模拟器拒绝动作") from exc
+            next_observation = _mapping(next_response.get("obs"))
+            fact = _macro_action_fact(
+                step=action.step,
+                action=selected_action,
+                before=observation,
+                after=next_observation,
+                legal_action_count=len(legal_actions),
+            )
+            if fact is not None:
+                if len(macro_actions) < _MAX_MACRO_ACTIONS:
+                    macro_actions.append(fact)
+                else:
+                    macro_actions_omitted += 1
+            next_topology = _project_topology(next_observation, replay_step=action.step + 1)
+            if next_topology is not None:
+                maps.setdefault(_integer(next_topology.get("act")), next_topology)
+            response = next_response
             actions_replayed += 1
 
     missing = sorted(required_acts.difference(maps))
@@ -345,12 +727,15 @@ def reconstruct_episode_maps(
         "schema": MAP_REPLAY_SCHEMA,
         "episode_id": episode_id,
         "map_topologies": [maps[act] for act in sorted(maps) if act in required_acts],
+        "macro_actions": macro_actions,
+        "macro_actions_omitted": macro_actions_omitted,
         "reproduction": {
             "mode": "seed_and_recorded_action_replay",
             "seed": seed,
             "character": character,
             "ascension": ascension,
             "required_acts": sorted(required_acts),
+            "actions_available": len(actions),
             "actions_replayed": actions_replayed,
             "elapsed_seconds": elapsed,
             "simulator": identity,
@@ -417,4 +802,3 @@ __all__ = [
     "SeedMapReplayCache",
     "reconstruct_episode_maps",
 ]
-

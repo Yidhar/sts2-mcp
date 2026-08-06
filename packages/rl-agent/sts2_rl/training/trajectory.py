@@ -24,7 +24,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final, TextIO
 
-TRAJECTORY_JOURNAL_VERSION: Final = "sts2-trajectory-journal-v4"
+TRAJECTORY_JOURNAL_VERSION: Final = "sts2-trajectory-journal-v5"
 SEMANTIC_FINGERPRINT_VERSION: Final = "sts2-semantic-decision-v1"
 
 _DEFAULT_SNAPSHOT_INTERVAL: Final = 256
@@ -530,6 +530,86 @@ def _compact_action(action: Any) -> dict[str, Any]:
     projected = _bounded_compact_projection(action, max_depth=2, max_items=8)
     if not isinstance(projected, dict):  # pragma: no cover - mapping above
         raise TypeError("compact action projection must be a mapping")
+
+    # A generic alphabetic width cap is safe for volume but used to discard the
+    # identifiers operators need most.  In particular, a card DTO has enough
+    # fields before ``id``/``name`` alphabetically that v4 summaries rendered a
+    # transaction as only ``select_card #13``.  Overlay a fixed, reviewed
+    # identity projection after the bounded generic projection.  The field set
+    # is constant-size, descriptive text remains excluded, and rich snapshots
+    # are still the only place that retains complete DTOs.
+    projected.update(
+        _compact_entity(
+            action,
+            keys=(
+                "action",
+                "kind",
+                "model_action_kind",
+                "model_action_variant",
+                "label",
+                "index",
+                "idx",
+                "action_index",
+                "card_index",
+                "selection_operation",
+                "shop_action",
+            ),
+        )
+    )
+    nested_identity_fields: dict[str, tuple[str, ...]] = {
+        "card": (
+            "index",
+            "id",
+            "card_id",
+            "name",
+            "title",
+            "type",
+            "rarity",
+            "cost",
+            "is_upgraded",
+            "upgrade_level",
+            "floor_added_to_deck",
+        ),
+        "item": (
+            "index",
+            "category",
+            "type",
+            "cost",
+            "price",
+            "name",
+            "card_id",
+            "card_name",
+            "relic_id",
+            "relic_name",
+            "potion_id",
+            "potion_name",
+        ),
+        "option": (
+            "index",
+            "id",
+            "name",
+            "heal_amount",
+            "is_enabled",
+        ),
+        "selection": (
+            "operation_type",
+            "mode",
+            "prompt_id",
+            "source_zone",
+            "destination_zone",
+            "is_selected",
+            "selected_count",
+            "min_select",
+            "max_select",
+        ),
+    }
+    for key, fields in nested_identity_fields.items():
+        identity = _compact_entity(action.get(key), keys=fields)
+        if not identity:
+            continue
+        # Replace the generic nested projection rather than merging into it:
+        # the reviewed identity is both more useful and more tightly bounded.
+        projected[key] = identity
     return projected
 
 

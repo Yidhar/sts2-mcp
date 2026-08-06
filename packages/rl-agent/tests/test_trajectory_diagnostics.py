@@ -259,7 +259,7 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     snapshots = [item for item in records if item["record_kind"] == "rich_snapshot"]
     assert len(summaries) == 5
     assert {item["step_index"] for item in snapshots} == {0, 2, 4}
-    assert all(item["journal_version"] == "sts2-trajectory-journal-v4" for item in records)
+    assert all(item["journal_version"] == "sts2-trajectory-journal-v5" for item in records)
 
     ordinary = summaries[1]
     assert "observation" not in ordinary
@@ -287,6 +287,61 @@ def test_trajectory_journal_writes_compact_steps_and_bounded_rich_snapshots(
     assert last["snapshot_reasons"] == ["episode_last"]
     assert len(first["observation"]["player"]["deck"]) == 16
     assert "action_handle" not in first["selected_action"]
+
+
+def test_compact_action_preserves_transaction_entity_identity(tmp_path: Path) -> None:
+    path = tmp_path / "journal.jsonl"
+    event = _journal_decision(
+        episode_id="transaction-episode",
+        step_index=1,
+    )
+    action = {
+        "action": "select_card",
+        "kind": "select_card",
+        "action_index": 14,
+        "card_index": 14,
+        "selection_operation": "select",
+        "card": {
+            # Prove the reviewed identity overlay, rather than alphabetic width
+            # order, keeps the operator-facing identity.
+            **{f"a_field_{index}": index for index in range(16)},
+            "id": "CARD.SETUP_STRIKE",
+            "name": "SETUP_STRIKE.title",
+            "type": "Attack",
+            "is_upgraded": False,
+            "floor_added_to_deck": 6,
+        },
+        "selection": {
+            "operation_type": "select",
+            "mode": "DeckUpgrade",
+            "prompt_id": "card_selection.TO_UPGRADE",
+        },
+    }
+    event["legal_actions"] = [action]
+    event["selected_action"] = action
+    event["selected_index"] = 0
+    event["policy_topk"] = [{"index": 0, "probability": 1.0}]
+
+    with TrajectoryJournal(path) as journal:
+        journal.write(event)
+
+    summary = next(
+        item for item in _read_jsonl(path) if item["record_kind"] == "summary"
+    )
+    selected = summary["selected_action"]
+    assert selected["card_index"] == 14
+    assert selected["card"] == {
+        "floor_added_to_deck": 6,
+        "id": "CARD.SETUP_STRIKE",
+        "is_upgraded": False,
+        "name": "SETUP_STRIKE.title",
+        "type": "Attack",
+    }
+    assert selected["selection"] == {
+        "mode": "DeckUpgrade",
+        "operation_type": "select",
+        "prompt_id": "card_selection.TO_UPGRADE",
+    }
 
 
 def test_trajectory_summary_keeps_parameterized_shop_action_surface(
