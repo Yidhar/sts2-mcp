@@ -47,9 +47,13 @@ MACRO_SURFACES: Final[tuple[MacroSurface, ...]] = (
     "rest",
     "shop",
 )
-MACRO_TELEMETRY_SCHEMA: Final = "sts2-macro-surface-telemetry-v1"
+MACRO_TELEMETRY_SCHEMA: Final = "sts2-macro-surface-telemetry-v2"
+MACRO_PROBABILITY_MASS_CONTRACT: Final = "sts2-macro-probability-mass-v1"
 MACRO_SENSITIVITY_SCHEMA: Final = "sts2-macro-policy-sensitivity-v1"
 FIXED_MACRO_PROBE_SUITE_VERSION: Final = "grounded-visible-facts-v1"
+_FLOAT32_EPSILON: Final = 2.0**-23
+_MIN_NUMERIC_MASS_TOLERANCE: Final = 2.0e-5
+_MAX_NUMERIC_MASS_TOLERANCE: Final = 1.0e-4
 _V6_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v6"
 _V7_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v7"
 _V8_CONFIG_VERSION: Final = "sts2-relational-curriculum-config-v8"
@@ -155,6 +159,34 @@ class _EntropyBounds:
     top_gap_above_uniform: float
     recorded_mass: float
     recorded_count: int
+    numeric_mass_error: float
+    numeric_mass_tolerance: float
+    numeric_renormalized: bool
+
+
+class MacroJournalContractError(ValueError):
+    """One structurally invalid policy distribution in a macro journal."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _numeric_probability_mass_tolerance(candidate_count: int) -> float:
+    """Return the reviewed float32 accumulation allowance for one decision.
+
+    The hierarchical policy uses several float32 reductions (including GPU
+    scatter reductions) before probabilities reach the JSON journal.  Its
+    mathematically normalized result can therefore miss one by several ulps.
+    Scale the allowance with the number of reduction terms, but cap it at 100
+    ppm so a genuinely malformed distribution cannot be accepted as rounding.
+    """
+
+    reduction_bound = 32.0 * _FLOAT32_EPSILON * max(1, candidate_count)
+    return min(
+        _MAX_NUMERIC_MASS_TOLERANCE,
+        max(_MIN_NUMERIC_MASS_TOLERANCE, reduction_bound),
+    )
 
 
 def _integer(value: object) -> int | None:
@@ -228,28 +260,62 @@ def _entropy_bounds(
         probability = _finite_probability(item.get("probability"))
         candidate_index = _integer(item.get("candidate_index", item.get("index")))
         if probability is None or candidate_index is None:
-            raise ValueError("macro journal policy_topk contains an invalid item")
+            raise MacroJournalContractError(
+                "invalid_item",
+                "macro journal policy_topk contains an invalid item",
+            )
         if candidate_index < 0 or candidate_index >= candidate_count:
-            raise ValueError("macro journal policy_topk candidate index is out of range")
+            raise MacroJournalContractError(
+                "candidate_index_out_of_range",
+                "macro journal policy_topk candidate index is out of range",
+            )
         if candidate_index in candidate_indices:
-            raise ValueError("macro journal policy_topk repeats a candidate index")
+            raise MacroJournalContractError(
+                "duplicate_candidate_index",
+                "macro journal policy_topk repeats a candidate index",
+            )
         candidate_indices.add(candidate_index)
         probabilities.append(probability)
     if not probabilities:
         return None
     if len(probabilities) > candidate_count:
-        raise ValueError("macro journal records more probabilities than candidates")
+        raise MacroJournalContractError(
+            "too_many_probabilities",
+            "macro journal records more probabilities than candidates",
+        )
 
     probabilities.sort(reverse=True)
     recorded_mass = math.fsum(probabilities)
-    tolerance = 1e-5
-    if recorded_mass > 1.0 + tolerance:
-        raise ValueError("macro journal policy probabilities sum above one")
-    residual = max(0.0, 1.0 - min(recorded_mass, 1.0))
+    tolerance = _numeric_probability_mass_tolerance(candidate_count)
     missing = candidate_count - len(probabilities)
+    numeric_mass_error = abs(recorded_mass - 1.0) if missing == 0 else max(0.0, recorded_mass - 1.0)
+    numeric_renormalized = False
+    if recorded_mass > 1.0:
+        if recorded_mass > 1.0 + tolerance:
+            raise MacroJournalContractError(
+                "probability_mass_above_one",
+                "macro journal policy probabilities sum above one",
+            )
+        probabilities = [probability / recorded_mass for probability in probabilities]
+        numeric_renormalized = True
+        effective_recorded_mass = 1.0
+    else:
+        effective_recorded_mass = recorded_mass
+    residual = max(0.0, 1.0 - effective_recorded_mass)
     if missing == 0:
         if residual > tolerance:
-            raise ValueError("complete macro journal policy probabilities do not sum to one")
+            raise MacroJournalContractError(
+                "complete_probability_mass_below_one",
+                "complete macro journal policy probabilities do not sum to one",
+            )
+        if effective_recorded_mass <= 0.0:
+            raise MacroJournalContractError(
+                "complete_probability_mass_zero",
+                "complete macro journal policy probabilities have zero mass",
+            )
+        if not numeric_renormalized and effective_recorded_mass != 1.0:
+            probabilities = [probability / effective_recorded_mass for probability in probabilities]
+            numeric_renormalized = True
         entropy = -math.fsum(probability * math.log(probability) for probability in probabilities if probability > 0.0)
         normalized = entropy / math.log(candidate_count) if candidate_count > 1 else 0.0
         top = probabilities[0]
@@ -261,11 +327,17 @@ def _entropy_bounds(
             top_gap_above_uniform=top - (1.0 / candidate_count),
             recorded_mass=recorded_mass,
             recorded_count=len(probabilities),
+            numeric_mass_error=numeric_mass_error,
+            numeric_mass_tolerance=tolerance,
+            numeric_renormalized=numeric_renormalized,
         )
 
     cap = probabilities[-1]
     if residual > (missing * cap) + tolerance:
-        raise ValueError("macro journal top-k residual is inconsistent with descending policy probabilities")
+        raise MacroJournalContractError(
+            "inconsistent_topk_residual",
+            "macro journal top-k residual is inconsistent with descending policy probabilities",
+        )
     base_entropy = -math.fsum(probability * math.log(probability) for probability in probabilities if probability > 0.0)
     maximum_tail_entropy = -residual * math.log(residual / missing) if residual > 0.0 else 0.0
     minimum_tail_entropy = 0.0
@@ -278,7 +350,10 @@ def _entropy_bounds(
         if remaining <= tolerance:
             break
     if remaining > tolerance:
-        raise ValueError("macro journal residual could not fit below the top-k boundary")
+        raise MacroJournalContractError(
+            "residual_exceeds_topk_boundary",
+            "macro journal residual could not fit below the top-k boundary",
+        )
     normalizer = math.log(candidate_count) if candidate_count > 1 else 1.0
     top = probabilities[0]
     return _EntropyBounds(
@@ -289,6 +364,9 @@ def _entropy_bounds(
         top_gap_above_uniform=top - (1.0 / candidate_count),
         recorded_mass=recorded_mass,
         recorded_count=len(probabilities),
+        numeric_mass_error=numeric_mass_error,
+        numeric_mass_tolerance=tolerance,
+        numeric_renormalized=numeric_renormalized,
     )
 
 
@@ -298,6 +376,8 @@ def _mean(values: Sequence[float]) -> float | None:
 
 def summarize_macro_records(
     records: Iterable[Mapping[str, Any]],
+    *,
+    strict_probability_contract: bool = True,
 ) -> dict[str, Any]:
     """Aggregate compact held-out journal decisions by macro surface."""
 
@@ -315,6 +395,12 @@ def summarize_macro_records(
             decisions[surface].append(record)
 
     surfaces: dict[str, Any] = {}
+    probability_contract_checked = 0
+    probability_contract_accepted = 0
+    probability_contract_renormalized = 0
+    probability_contract_violations: Counter[str] = Counter()
+    maximum_numeric_mass_error = 0.0
+    maximum_numeric_mass_tolerance = 0.0
     for surface in MACRO_SURFACES:
         surface_records = decisions.get(surface, [])
         episodes: set[str] = set()
@@ -372,9 +458,26 @@ def summarize_macro_records(
             if not isinstance(raw_topk, Sequence) or isinstance(raw_topk, str | bytes):
                 continue
             topk = [item for item in raw_topk if isinstance(item, Mapping)]
-            bounds = _entropy_bounds(candidate_count=candidate_count, topk=topk)
+            probability_contract_checked += 1
+            try:
+                bounds = _entropy_bounds(candidate_count=candidate_count, topk=topk)
+            except MacroJournalContractError as exc:
+                if strict_probability_contract:
+                    raise
+                probability_contract_violations[exc.code] += 1
+                continue
             if bounds is None:
                 continue
+            probability_contract_accepted += 1
+            probability_contract_renormalized += int(bounds.numeric_renormalized)
+            maximum_numeric_mass_error = max(
+                maximum_numeric_mass_error,
+                bounds.numeric_mass_error,
+            )
+            maximum_numeric_mass_tolerance = max(
+                maximum_numeric_mass_tolerance,
+                bounds.numeric_mass_tolerance,
+            )
             probability_decisions += 1
             entropy_lower.append(bounds.lower)
             entropy_upper.append(bounds.upper)
@@ -418,13 +521,32 @@ def summarize_macro_records(
         "schema_version": MACRO_TELEMETRY_SCHEMA,
         "diagnostic_only": True,
         "training_samples_emitted": 0,
+        "valid": not probability_contract_violations,
+        "probability_mass_contract": {
+            "schema_version": MACRO_PROBABILITY_MASS_CONTRACT,
+            "valid": not probability_contract_violations,
+            "strict": strict_probability_contract,
+            "checked_decision_count": probability_contract_checked,
+            "accepted_decision_count": probability_contract_accepted,
+            "numeric_renormalized_decision_count": probability_contract_renormalized,
+            "invalid_decision_count": sum(probability_contract_violations.values()),
+            "invalid_reason_counts": dict(sorted(probability_contract_violations.items())),
+            "maximum_numeric_mass_error": maximum_numeric_mass_error,
+            "maximum_numeric_mass_tolerance": maximum_numeric_mass_tolerance,
+            "minimum_numeric_mass_tolerance": _MIN_NUMERIC_MASS_TOLERANCE,
+            "maximum_allowed_numeric_mass_tolerance": _MAX_NUMERIC_MASS_TOLERANCE,
+        },
         "surface_order": list(MACRO_SURFACES),
         "total_macro_decisions": sum(int(surface["decision_count"]) for surface in surfaces.values()),
         "surfaces": surfaces,
     }
 
 
-def read_macro_journal(path: str | Path) -> dict[str, Any]:
+def read_macro_journal(
+    path: str | Path,
+    *,
+    strict_probability_contract: bool = True,
+) -> dict[str, Any]:
     """Read one evaluation JSONL journal and return macro telemetry."""
 
     journal = Path(path).expanduser().resolve()
@@ -443,7 +565,10 @@ def read_macro_journal(path: str | Path) -> dict[str, Any]:
                     raise ValueError(f"macro journal line {line_number} must contain an object")
                 yield value
 
-        return summarize_macro_records(_records())
+        return summarize_macro_records(
+            _records(),
+            strict_probability_contract=strict_probability_contract,
+        )
 
 
 def _card(
@@ -832,12 +957,8 @@ def evaluate_macro_sensitivity(
                     raise ValueError(f"macro sensitivity case {case.name!r} changed the legality mask")
                 reference_probabilities = reference_output.policy_probabilities()[0][reference_mask].float()
                 comparison_probabilities = comparison_output.policy_probabilities()[0][comparison_mask].float()
-                reference_greedy = int(
-                    reference_output.greedy_action_indices()[0].item()
-                )
-                comparison_greedy = int(
-                    comparison_output.greedy_action_indices()[0].item()
-                )
+                reference_greedy = int(reference_output.greedy_action_indices()[0].item())
+                comparison_greedy = int(comparison_output.greedy_action_indices()[0].item())
                 probability_delta = (comparison_probabilities - reference_probabilities).abs()
                 logit_delta = (
                     _finite_candidate_logits(comparison_output) - _finite_candidate_logits(reference_output)
@@ -877,9 +998,7 @@ def evaluate_macro_sensitivity(
                         "policy_total_variation": float(0.5 * probability_delta.sum().cpu()),
                         "policy_max_abs_probability_delta": float(probability_delta.max().cpu()),
                         "policy_max_abs_logit_delta": float(logit_delta.max().cpu()),
-                        "top_candidate_changed": bool(
-                            reference_greedy != comparison_greedy
-                        ),
+                        "top_candidate_changed": bool(reference_greedy != comparison_greedy),
                         "value_abs_deltas": value_deltas,
                         "reference_transaction_q_values": _optional_candidate_values(
                             reference_output,
@@ -949,43 +1068,28 @@ def _diagnostic_model_initialization_config(
     migrated = deepcopy(dict(payload))
     raw_rollout = migrated.get("rollout")
     if not isinstance(raw_rollout, Mapping):
-        raise ValueError(
-            "reviewed macro checkpoint config migration requires a rollout table"
-        )
+        raise ValueError("reviewed macro checkpoint config migration requires a rollout table")
     rollout = dict(raw_rollout)
     if "deterministic_probe_environment_steps" in rollout:
         raise ValueError(
-            f"{source_version} macro checkpoint config unexpectedly contains "
-            "deterministic_probe_environment_steps"
+            f"{source_version} macro checkpoint config unexpectedly contains " "deterministic_probe_environment_steps"
         )
     rollout["deterministic_probe_environment_steps"] = []
     migrated["rollout"] = rollout
     if source_version == _V6_CONFIG_VERSION:
         raw_episodic = migrated.get("episodic_learning")
         if not isinstance(raw_episodic, Mapping):
-            raise ValueError(
-                "reviewed macro checkpoint config migration requires an "
-                "episodic_learning table"
-            )
+            raise ValueError("reviewed macro checkpoint config migration requires an " "episodic_learning table")
         episodic = dict(raw_episodic)
         if "macro_sample_fraction" in episodic:
-            raise ValueError(
-                "v6 macro checkpoint config unexpectedly contains "
-                "macro_sample_fraction"
-            )
+            raise ValueError("v6 macro checkpoint config unexpectedly contains " "macro_sample_fraction")
         episodic["macro_sample_fraction"] = 0.0
         migrated["episodic_learning"] = episodic
     raw_episodic = migrated.get("episodic_learning")
     if not isinstance(raw_episodic, Mapping):
-        raise ValueError(
-            "reviewed macro checkpoint config migration requires an "
-            "episodic_learning table"
-        )
+        raise ValueError("reviewed macro checkpoint config migration requires an " "episodic_learning table")
     if "fresh_policy_sequences" in raw_episodic:
-        raise ValueError(
-            f"{source_version} macro checkpoint config unexpectedly contains "
-            "fresh_policy_sequences"
-        )
+        raise ValueError(f"{source_version} macro checkpoint config unexpectedly contains " "fresh_policy_sequences")
     # Chain the historical diagnostic defaults through the one reviewed V10
     # -> V11 model-only migration.  The strict exact-resume parser remains
     # untouched.
@@ -1096,9 +1200,11 @@ if __name__ == "__main__":  # pragma: no cover - exercised through main
 
 __all__ = [
     "FIXED_MACRO_PROBE_SUITE_VERSION",
+    "MACRO_PROBABILITY_MASS_CONTRACT",
     "MACRO_SENSITIVITY_SCHEMA",
     "MACRO_SURFACES",
     "MACRO_TELEMETRY_SCHEMA",
+    "MacroJournalContractError",
     "MacroSensitivityCase",
     "classify_macro_surface",
     "evaluate_checkpoint_macro_sensitivity",

@@ -885,10 +885,22 @@ class RecurrentCandidateOutput:
         """
 
         log_probabilities = self.policy_log_probabilities()
-        return torch.where(
+        probabilities = torch.where(
             self.action_mask.bool(),
             torch.exp(log_probabilities),
             torch.zeros_like(log_probabilities),
+        )
+        # The hierarchical factorization contains multiple float32 scatter
+        # reductions.  On GPU their accumulated roundoff can leave a legal row
+        # a few parts per million away from one even though the log policy is
+        # mathematically normalized.  Canonicalize the inference distribution
+        # before it reaches collectors and diagnostic journals.  All-masked
+        # rows deliberately remain zero.
+        mass = probabilities.sum(dim=-1, keepdim=True)
+        return torch.where(
+            mass > 0.0,
+            probabilities / mass.clamp_min(torch.finfo(probabilities.dtype).tiny),
+            probabilities,
         )
 
     def policy_branch_probabilities(self) -> Tensor:

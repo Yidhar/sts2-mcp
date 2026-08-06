@@ -668,12 +668,42 @@ def _evaluate_training_gate(
     # diagnostic module also supports standalone checkpoint audits and imports
     # checkpoint/config helpers from this package.
     from sts2_rl.macro_evaluation import (
+        MACRO_PROBABILITY_MASS_CONTRACT,
+        MACRO_SURFACES,
+        MACRO_TELEMETRY_SCHEMA,
         evaluate_macro_sensitivity,
         read_macro_journal,
     )
 
     summary: dict[str, Any] = dict(scalar_summary)
-    summary["macro_surface_telemetry"] = read_macro_journal(journal_path)
+    try:
+        summary["macro_surface_telemetry"] = read_macro_journal(
+            journal_path,
+            strict_probability_contract=False,
+        )
+    except (OSError, ValueError) as exc:
+        # Macro telemetry is explicitly diagnostic-only. A corrupt optional
+        # summary must be visible and must invalidate that diagnostic, but it
+        # cannot terminate a healthy learner after held-out episodes already
+        # completed. Liveness below remains fail-closed because it is an actual
+        # training guard rather than optional telemetry.
+        summary["macro_surface_telemetry"] = {
+            "schema_version": MACRO_TELEMETRY_SCHEMA,
+            "diagnostic_only": True,
+            "training_samples_emitted": 0,
+            "valid": False,
+            "probability_mass_contract": {
+                "schema_version": MACRO_PROBABILITY_MASS_CONTRACT,
+                "valid": False,
+            },
+            "read_error": {
+                "type": type(exc).__name__,
+                "message": str(exc)[:1024],
+            },
+            "surface_order": list(MACRO_SURFACES),
+            "total_macro_decisions": 0,
+            "surfaces": {},
+        }
     summary["macro_policy_sensitivity"] = evaluate_macro_sensitivity(
         resources.collector_model,
         resources.encoder,

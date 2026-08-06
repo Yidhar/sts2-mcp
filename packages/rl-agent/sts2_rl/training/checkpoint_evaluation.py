@@ -250,7 +250,10 @@ def _evaluate_checkpoint_policy_unprotected(
                 journal_path=staging_journal_path,
                 backend_factory=(None if backend is not None else lambda: build_backend(config)),
             )
-            macro_surface_telemetry = read_macro_journal(staging_journal_path)
+            macro_surface_telemetry = read_macro_journal(
+                staging_journal_path,
+                strict_probability_contract=False,
+            )
             if len(resources.rollout_queue) != 0:
                 raise RuntimeError("evaluation unexpectedly populated the rollout queue")
         finally:

@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+import sts2_rl.macro_evaluation as macro_evaluation_module
 from sts2_rl.checkpoints import CheckpointIntegrityError, ValidatedResumeCheckpoint
 from sts2_rl.contracts import (
     BackendCapabilities,
@@ -3751,6 +3752,56 @@ def test_training_gate_adds_diagnostic_only_macro_metrics_without_learning(
         assert all(
             torch.equal(resources.collector_model.state_dict()[key], value) for key, value in collector_before.items()
         )
+    finally:
+        resources.close()
+
+
+def test_training_gate_does_not_terminate_on_optional_macro_telemetry_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = _config()
+    config = replace(
+        base,
+        model=replace(
+            base.model,
+            max_world_tokens=512,
+            max_candidates=8,
+            max_candidate_local_tokens=32,
+        ),
+    )
+    resources = build_training_resources(config, backend=FakeCombatBackend())
+
+    def fail_macro_telemetry(*args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise ValueError("synthetic optional diagnostic failure")
+
+    monkeypatch.setattr(
+        macro_evaluation_module,
+        "read_macro_journal",
+        fail_macro_telemetry,
+    )
+    try:
+        episodes, summary = runtime_module._evaluate_training_gate(
+            resources,
+            episodes=1,
+            base_seed=6,
+            journal_path=tmp_path / "training-gate-invalid-macro.jsonl",
+            backend_factory=None,
+        )
+
+        assert len(episodes) == 1
+        telemetry = summary["macro_surface_telemetry"]
+        assert telemetry["diagnostic_only"] is True
+        assert telemetry["training_samples_emitted"] == 0
+        assert telemetry["valid"] is False
+        assert telemetry["read_error"] == {
+            "type": "ValueError",
+            "message": "synthetic optional diagnostic failure",
+        }
+        # The actual liveness guard input remains present and independently
+        # fail-closed; only optional macro telemetry is isolated.
+        assert "greedy_liveness" in summary
     finally:
         resources.close()
 

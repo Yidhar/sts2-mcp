@@ -149,6 +149,95 @@ def test_macro_surface_telemetry_rejects_inconsistent_topk() -> None:
         summarize_macro_records([record])
 
 
+def test_macro_surface_telemetry_renormalizes_reviewed_float32_mass_drift() -> None:
+    # Exact values from the v34 50k held-out journal that previously terminated
+    # a healthy learner.  This is a complete four-candidate distribution whose
+    # raw float32 hierarchical mass is 15.04 ppm above one.
+    probabilities = [
+        0.9979878664016724,
+        0.001463199034333229,
+        0.0005639757728204131,
+        0.0,
+    ]
+    record = _decision(
+        surface="card_reward",
+        episode="v34-float32-drift",
+        candidate_count=4,
+        probabilities=probabilities,
+    )
+
+    summary = summarize_macro_records([record])
+
+    contract = summary["probability_mass_contract"]
+    assert summary["valid"] is True
+    assert contract["checked_decision_count"] == 1
+    assert contract["accepted_decision_count"] == 1
+    assert contract["numeric_renormalized_decision_count"] == 1
+    assert contract["invalid_decision_count"] == 0
+    assert contract["maximum_numeric_mass_error"] == pytest.approx(sum(probabilities) - 1.0)
+    reward = summary["surfaces"]["card_reward"]
+    assert reward["policy_probability_decision_count"] == 1
+    assert reward["mean_recorded_probability_mass"] == pytest.approx(sum(probabilities))
+    assert reward["mean_top_probability"] == pytest.approx(probabilities[0] / sum(probabilities))
+    assert math.isfinite(reward["mean_exact_normalized_entropy"])
+
+
+@pytest.mark.parametrize(
+    ("mutator", "reason"),
+    [
+        (
+            lambda record: record["policy_topk"].__setitem__(
+                1,
+                {**record["policy_topk"][1], "candidate_index": 0},
+            ),
+            "duplicate_candidate_index",
+        ),
+        (
+            lambda record: record["policy_topk"][0].__setitem__(
+                "candidate_index",
+                3,
+            ),
+            "candidate_index_out_of_range",
+        ),
+        (
+            lambda record: record["policy_topk"][0].__setitem__(
+                "probability",
+                0.8,
+            ),
+            "probability_mass_above_one",
+        ),
+    ],
+)
+def test_macro_surface_telemetry_non_strict_mode_audits_structural_corruption(
+    mutator: object,
+    reason: str,
+) -> None:
+    record = _decision(
+        surface="card_reward",
+        episode="invalid-policy-contract",
+        candidate_count=2,
+        probabilities=[0.6, 0.4],
+    )
+    assert callable(mutator)
+    mutator(record)
+
+    with pytest.raises(ValueError):
+        summarize_macro_records([record])
+
+    summary = summarize_macro_records(
+        [record],
+        strict_probability_contract=False,
+    )
+    contract = summary["probability_mass_contract"]
+    assert summary["valid"] is False
+    assert contract["checked_decision_count"] == 1
+    assert contract["accepted_decision_count"] == 0
+    assert contract["invalid_decision_count"] == 1
+    assert contract["invalid_reason_counts"] == {reason: 1}
+    assert summary["surfaces"]["card_reward"]["decision_count"] == 1
+    assert summary["surfaces"]["card_reward"]["policy_probability_decision_count"] == 0
+
+
 def _model_config() -> GroundedCandidateConfig:
     return GroundedCandidateConfig(
         token_feature_dim=224,
@@ -247,6 +336,7 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
     del source["failure_credit"]
+    del source["transaction_exploration"]
     episodic = source["episodic_learning"]
     rollout = source["rollout"]
     assert isinstance(episodic, dict)
@@ -279,6 +369,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v7"
     del source["failure_credit"]
+    del source["transaction_exploration"]
     optimization = source["optimization"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
@@ -325,6 +416,7 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
     del source["failure_credit"]
+    del source["transaction_exploration"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
     assert isinstance(rollout, dict)
@@ -353,6 +445,7 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
     del source["failure_credit"]
+    del source["transaction_exploration"]
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
