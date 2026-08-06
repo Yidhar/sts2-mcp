@@ -42,11 +42,20 @@ def _remove_v16_guard_field(payload: dict[str, object]) -> None:
     runtime.pop("evaluation_guard_enforcement_start_steps")
 
 
+def _remove_v17_stability_fields(payload: dict[str, object]) -> None:
+    failure = payload["failure_credit"]
+    episodic = payload["episodic_learning"]
+    assert isinstance(failure, dict)
+    assert isinstance(episodic, dict)
+    failure.pop("liveness_risk_actor_min_selected_probability")
+    episodic.pop("success_imitation_exempt_surfaces")
+
+
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v16"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v17"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -180,6 +189,31 @@ def test_failure_credit_quota_budget_accounts_for_all_learnable_strata() -> None
             unresolved_stall_quota=1,
             completion_control_quota=1,
             matched_outcome_pair_quota=1,
+        )
+
+
+def test_v17_stability_controls_are_fail_closed() -> None:
+    assert (
+        FailureCreditConfig(
+            liveness_risk_actor_min_selected_probability=0.01,
+        ).liveness_risk_actor_min_selected_probability
+        == pytest.approx(0.01)
+    )
+    with pytest.raises(ValueError, match="must be in \\[0, 1\\)"):
+        FailureCreditConfig(
+            liveness_risk_actor_min_selected_probability=1.0,
+        )
+
+    assert EpisodicLearningConfig(
+        success_imitation_exempt_surfaces=("rest_site", "shop"),
+    ).success_imitation_exempt_surfaces == ("rest_site", "shop")
+    with pytest.raises(ValueError, match="canonical lowercase"):
+        EpisodicLearningConfig(
+            success_imitation_exempt_surfaces=("RestSite",),
+        )
+    with pytest.raises(ValueError, match="duplicate surface"):
+        EpisodicLearningConfig(
+            success_imitation_exempt_surfaces=("shop", "shop"),
         )
 
 
@@ -674,6 +708,7 @@ def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
 def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
@@ -706,6 +741,7 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
 def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v11"
+    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
@@ -722,6 +758,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
 def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v13"
+    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("transaction_exploration")
@@ -744,6 +781,7 @@ def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
 def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v14"
+    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
 
@@ -758,6 +796,7 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
 
     unexpected = TrainingConfig().to_mapping()
     unexpected["version"] = "sts2-relational-curriculum-config-v14"
+    _remove_v17_stability_fields(unexpected)
     with pytest.raises(ValueError, match="unexpectedly contains V15"):
         model_initialization_config_from_mapping(unexpected)
 
@@ -765,6 +804,7 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
 def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v15"
+    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
 
     with pytest.raises(ValueError, match="unsupported training config version"):
@@ -780,7 +820,31 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
 
     unexpected = TrainingConfig().to_mapping()
     unexpected["version"] = "sts2-relational-curriculum-config-v15"
+    _remove_v17_stability_fields(unexpected)
     with pytest.raises(ValueError, match="V16 evaluation guard"):
+        model_initialization_config_from_mapping(unexpected)
+
+
+def test_v16_stability_migration_is_model_init_only() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v16"
+    _remove_v17_stability_fields(source)
+
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.failure_credit.liveness_risk_actor_min_selected_probability == 0.0
+    assert migrated.episodic_learning.success_imitation_exempt_surfaces == ()
+    assert (
+        migrated.runtime.evaluation_guard_enforcement_start_steps
+        == TrainingConfig().runtime.evaluation_guard_enforcement_start_steps
+    )
+
+    unexpected = TrainingConfig().to_mapping()
+    unexpected["version"] = "sts2-relational-curriculum-config-v16"
+    with pytest.raises(ValueError, match="V17 risk-actor saturation floor"):
         model_initialization_config_from_mapping(unexpected)
 
 

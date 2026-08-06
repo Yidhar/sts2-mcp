@@ -46,11 +46,17 @@ from .transaction import (
     selection_delta_index,
 )
 
-_LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v1"
+_LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v2"
 _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1 = 8
 _ONE_HOT_BREAKER_DURATION_UPDATES_V1 = 8
 _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1 = 0.012
 _ONE_HOT_BREAKER_RATIO_TOLERANCE_V1 = 1.0e-6
+_POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2 = 8
+_POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2 = 16
+_POLICY_COLLAPSE_BREAKER_ENTROPY_WEIGHT_V2 = 0.012
+_POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2 = 0.10
+_POLICY_COLLAPSE_BREAKER_LOW_ENTROPY_FRACTION_V2 = 0.75
+_POLICY_COLLAPSE_BREAKER_MINIMUM_DECISIONS_V2 = 16
 
 # Execution-only liveness graph bounds. They do not change sampled records,
 # labels, loss weights or the equal-record objective, so exact resume may adopt
@@ -86,9 +92,11 @@ class LearnerMetrics:
     policy_loss: float
     value_loss: float
     entropy: float
+    normalized_entropy: float
     entropy_weight: float
     entropy_breaker_active: int
     entropy_breaker_one_hot_condition: int
+    entropy_breaker_soft_collapse_condition: int
     entropy_breaker_consecutive_batches: int
     entropy_breaker_remaining_updates: int
     entropy_breaker_triggers: int
@@ -155,6 +163,7 @@ class LearnerMetrics:
     liveness_censored_suppressed_labels: int
     liveness_policy_lag_suppressed_labels: int
     liveness_risk_actor_phase_suppressed_labels: int
+    liveness_risk_actor_saturation_suppressed_labels: int
     liveness_centered_risk_mean: float
     liveness_centered_risk_max_abs: float
     liveness_policy_gradient_norm: float
@@ -183,6 +192,7 @@ class LearnerMetrics:
     episodic_failure_policy_suppressed_labels: int
     episodic_policy_lag_suppressed_labels: int
     episodic_success_trust_region_suppressed_labels: int
+    episodic_success_surface_exempted_labels: int
     episodic_task_value_labels: int
     episodic_revival_value_labels: int
     episodic_efficiency_policy_labels: int
@@ -261,6 +271,7 @@ class LivenessCreditLosses:
     censored_suppressed_labels: int
     policy_lag_suppressed_labels: int
     risk_actor_phase_suppressed_labels: int
+    risk_actor_saturation_suppressed_labels: int
     centered_risk_mean: float
     centered_risk_max_abs: float
     replayed_contexts: int = 0
@@ -772,6 +783,7 @@ def liveness_credit_losses(
     contrast_pairs: tuple[tuple[int, int], ...] = (),
     contrast_margins: tuple[float, ...] | None = None,
     risk_advantage_clip: float = 0.25,
+    risk_actor_min_selected_probability: float = 0.0,
     contrast_margin: float = 0.10,
 ) -> LivenessCreditLosses:
     """Build factual liveness losses over one active-shape decision batch.
@@ -852,6 +864,15 @@ def liveness_credit_losses(
         or float(contrast_margin) < 0.0
     ):
         raise ValueError("contrast_margin must be finite and non-negative")
+    if (
+        isinstance(risk_actor_min_selected_probability, bool)
+        or not isinstance(risk_actor_min_selected_probability, int | float)
+        or not math.isfinite(float(risk_actor_min_selected_probability))
+        or not 0.0 <= float(risk_actor_min_selected_probability) < 1.0
+    ):
+        raise ValueError(
+            "risk_actor_min_selected_probability must be finite and in [0, 1)"
+        )
 
     forced = _optional_row_mask(
         forced_mask,
@@ -899,7 +920,6 @@ def liveness_credit_losses(
     actor_eligible = (~forced) & (~censored) & (legal_counts > 1)
     critic_eligible = critic_requested & (~censored)
     value_eligible = value_requested & (~censored)
-    risk_actor_eligible = actor_requested & actor_eligible
     direct_eligible = direct_requested & actor_eligible
     completion_eligible = completion_requested & actor_eligible
 
@@ -969,6 +989,22 @@ def liveness_credit_losses(
         min=-float(risk_advantage_clip),
         max=float(risk_advantage_clip),
     )
+    selected_probabilities = selected_log_probabilities.detach().exp()
+    # A positive centered risk asks gradient descent to lower the factual
+    # selected action.  Once that action is already below the reviewed floor,
+    # repeating the same direction changes shared representations far more
+    # than behaviour.  Keep critic labels and all negative-risk recovery
+    # labels; suppress only the already-satisfied actor direction.
+    saturation_suppressed = (
+        actor_requested
+        & actor_eligible
+        & (centered_risk >= 0.0)
+        & (
+            selected_probabilities
+            < float(risk_actor_min_selected_probability)
+        )
+    )
+    risk_actor_eligible = actor_requested & actor_eligible & (~saturation_suppressed)
     if bool(risk_actor_eligible.any().item()):
         risk_actor_loss = (selected_log_probabilities[risk_actor_eligible] * centered_risk[risk_actor_eligible]).mean()
         active_centered = centered_risk[risk_actor_eligible]
@@ -1096,6 +1132,9 @@ def liveness_credit_losses(
         censored_suppressed_labels=censored_suppressed,
         policy_lag_suppressed_labels=0,
         risk_actor_phase_suppressed_labels=0,
+        risk_actor_saturation_suppressed_labels=int(
+            saturation_suppressed.sum().item()
+        ),
         centered_risk_mean=centered_risk_mean,
         centered_risk_max_abs=centered_risk_max_abs,
     )
@@ -1205,6 +1244,7 @@ class _EpisodicLossBatch:
     failure_policy_suppressed_labels: int
     policy_lag_suppressed_labels: int
     success_trust_region_suppressed_labels: int
+    success_surface_exempted_labels: int
     task_value_labels: int
     revival_value_labels: int
     efficiency_policy_labels: int
@@ -1243,6 +1283,7 @@ def _empty_liveness_credit_losses(reference: Tensor) -> LivenessCreditLosses:
         censored_suppressed_labels=0,
         policy_lag_suppressed_labels=0,
         risk_actor_phase_suppressed_labels=0,
+        risk_actor_saturation_suppressed_labels=0,
         centered_risk_mean=0.0,
         centered_risk_max_abs=0.0,
     )
@@ -1309,6 +1350,9 @@ def _mean_liveness_credit_losses(
         censored_suppressed_labels=sum(batch.censored_suppressed_labels for batch in batches),
         policy_lag_suppressed_labels=sum(batch.policy_lag_suppressed_labels for batch in batches),
         risk_actor_phase_suppressed_labels=sum(batch.risk_actor_phase_suppressed_labels for batch in batches),
+        risk_actor_saturation_suppressed_labels=sum(
+            batch.risk_actor_saturation_suppressed_labels for batch in batches
+        ),
         centered_risk_mean=centered_risk_mean,
         centered_risk_max_abs=max(batch.centered_risk_max_abs for batch in batches),
         replayed_contexts=sum(batch.replayed_contexts for batch in batches),
@@ -1455,7 +1499,7 @@ class VTraceLearner:
             raise ValueError("transaction learner config and model-head configuration differ")
         if self.failure_credit_config.learning_enabled != self.model.liveness_head_enabled:
             raise ValueError("liveness-credit config and model-head configuration differ")
-        self._one_hot_batch_streak = 0
+        self._collapse_batch_streak = 0
         self._entropy_breaker_remaining_updates = 0
         self._entropy_breaker_triggers = 0
 
@@ -1468,7 +1512,7 @@ class VTraceLearner:
 
         return {
             "version": _LEARNER_DYNAMICS_STATE_VERSION,
-            "one_hot_batch_streak": self._one_hot_batch_streak,
+            "collapse_batch_streak": self._collapse_batch_streak,
             "entropy_breaker_remaining_updates": self._entropy_breaker_remaining_updates,
             "entropy_breaker_triggers": self._entropy_breaker_triggers,
         }
@@ -1479,7 +1523,7 @@ class VTraceLearner:
             raise TypeError("learner dynamics state must be an object")
         expected = {
             "version",
-            "one_hot_batch_streak",
+            "collapse_batch_streak",
             "entropy_breaker_remaining_updates",
             "entropy_breaker_triggers",
         }
@@ -1493,9 +1537,15 @@ class VTraceLearner:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"learner dynamics {key} must be a non-negative integer")
             values[key] = value
-        if values["one_hot_batch_streak"] >= _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1:
-            raise ValueError("learner one-hot streak must be below its trigger threshold")
-        if values["entropy_breaker_remaining_updates"] > _ONE_HOT_BREAKER_DURATION_UPDATES_V1:
+        if values["collapse_batch_streak"] >= max(
+            _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1,
+            _POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2,
+        ):
+            raise ValueError("learner collapse streak must be below its trigger threshold")
+        if values["entropy_breaker_remaining_updates"] > max(
+            _ONE_HOT_BREAKER_DURATION_UPDATES_V1,
+            _POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2,
+        ):
             raise ValueError("learner entropy-breaker duration exceeds the source contract")
         return {
             "version": _LEARNER_DYNAMICS_STATE_VERSION,
@@ -1504,7 +1554,7 @@ class VTraceLearner:
 
     def load_dynamics_state_dict(self, payload: object) -> None:
         validated = self.validate_dynamics_state_dict(payload)
-        self._one_hot_batch_streak = int(validated["one_hot_batch_streak"])
+        self._collapse_batch_streak = int(validated["collapse_batch_streak"])
         self._entropy_breaker_remaining_updates = int(validated["entropy_breaker_remaining_updates"])
         self._entropy_breaker_triggers = int(validated["entropy_breaker_triggers"])
 
@@ -1514,15 +1564,31 @@ class VTraceLearner:
         base_weight: float,
         active_ratios: Tensor,
         clipped: Tensor,
-    ) -> tuple[float, bool, bool]:
-        """Apply the source-versioned v33 one-hot circuit breaker."""
+        active_normalized_entropies: Tensor | None = None,
+    ) -> tuple[float, bool, bool, bool]:
+        """Apply the selected source-versioned policy-collapse breaker."""
 
         if self.config.entropy_breaker == "disabled":
-            self._one_hot_batch_streak = 0
+            self._collapse_batch_streak = 0
             self._entropy_breaker_remaining_updates = 0
-            return base_weight, False, False
-        if self.config.entropy_breaker != "one-hot-v1":  # pragma: no cover - config validates
-            raise RuntimeError("unsupported entropy breaker")
+            return base_weight, False, False, False
+        if active_ratios.ndim != 1 or clipped.shape != active_ratios.shape:
+            raise ValueError("entropy breaker ratios and clip mask must be aligned vectors")
+        if active_normalized_entropies is not None:
+            if (
+                active_normalized_entropies.ndim != 1
+                or active_normalized_entropies.shape != active_ratios.shape
+                or not bool(torch.isfinite(active_normalized_entropies).all().item())
+                or bool(
+                    (
+                        (active_normalized_entropies < 0.0)
+                        | (active_normalized_entropies > 1.0 + 1.0e-6)
+                    ).any().item()
+                )
+            ):
+                raise ValueError(
+                    "entropy breaker normalized entropies must be finite aligned values in [0, 1]"
+                )
         maximum_ratio = float(active_ratios.detach().max().item()) if active_ratios.numel() else 0.0
         clip_fraction = float(clipped.detach().mean().item()) if clipped.numel() else 0.0
         one_hot_condition = bool(
@@ -1535,16 +1601,57 @@ class VTraceLearner:
             )
             and clip_fraction == 0.0
         )
-        self._one_hot_batch_streak = self._one_hot_batch_streak + 1 if one_hot_condition else 0
-        if self._one_hot_batch_streak >= _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1:
-            self._one_hot_batch_streak = 0
-            self._entropy_breaker_remaining_updates = _ONE_HOT_BREAKER_DURATION_UPDATES_V1
+        soft_collapse_condition = False
+        if self.config.entropy_breaker == "policy-collapse-v2":
+            if active_normalized_entropies is None:
+                raise ValueError(
+                    "policy-collapse-v2 requires normalized policy entropy"
+                )
+            normalized = active_normalized_entropies.detach()
+            soft_collapse_condition = bool(
+                normalized.numel()
+                >= _POLICY_COLLAPSE_BREAKER_MINIMUM_DECISIONS_V2
+                and float(normalized.mean().item())
+                <= _POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2
+                and float(
+                    (
+                        normalized
+                        <= _POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                )
+                >= _POLICY_COLLAPSE_BREAKER_LOW_ENTROPY_FRACTION_V2
+            )
+            # V2 intentionally keys the breaker to policy entropy rather than
+            # the legacy importance-ratio heuristic.  Fresh on-policy batches
+            # commonly have rho == 1 with no clipping even when their action
+            # distribution is healthy, so OR-ing that condition into V2 would
+            # turn the circuit breaker on during ordinary learning.  Keep the
+            # legacy observation as telemetry, but only entropy collapse may
+            # trigger the V2 intervention.
+            condition = soft_collapse_condition
+            consecutive_batches = _POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2
+            duration_updates = _POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2
+            breaker_weight = _POLICY_COLLAPSE_BREAKER_ENTROPY_WEIGHT_V2
+        elif self.config.entropy_breaker == "one-hot-v1":
+            condition = one_hot_condition
+            consecutive_batches = _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1
+            duration_updates = _ONE_HOT_BREAKER_DURATION_UPDATES_V1
+            breaker_weight = _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1
+        else:  # pragma: no cover - config validates
+            raise RuntimeError("unsupported entropy breaker")
+        self._collapse_batch_streak = self._collapse_batch_streak + 1 if condition else 0
+        if self._collapse_batch_streak >= consecutive_batches:
+            self._collapse_batch_streak = 0
+            self._entropy_breaker_remaining_updates = duration_updates
             self._entropy_breaker_triggers += 1
         active = self._entropy_breaker_remaining_updates > 0
-        effective = max(base_weight, _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1) if active else base_weight
+        effective = max(base_weight, breaker_weight) if active else base_weight
         if active:
             self._entropy_breaker_remaining_updates -= 1
-        return effective, active, one_hot_condition
+        return effective, active, one_hot_condition, soft_collapse_condition
 
     def credit_plan_liveness_losses(
         self,
@@ -1988,6 +2095,9 @@ class VTraceLearner:
                 contrast_pairs=tuple(contrast_pairs),
                 contrast_margins=tuple(contrast_margins),
                 risk_advantage_clip=(self.failure_credit_config.liveness_risk_advantage_clip),
+                risk_actor_min_selected_probability=(
+                    self.failure_credit_config.liveness_risk_actor_min_selected_probability
+                ),
                 contrast_margin=self.failure_credit_config.liveness_contrast_margin,
             )
             return replace(
@@ -2131,6 +2241,7 @@ class VTraceLearner:
         log_prob_rows: list[Tensor] = []
         value_rows: list[Tensor] = []
         entropy_rows: list[Tensor] = []
+        candidate_count_rows: list[Tensor] = []
         valid_rows: list[Tensor] = []
         policy_rows: list[Tensor] = []
         behavior_rows: list[Tensor] = []
@@ -2195,12 +2306,18 @@ class VTraceLearner:
             )
             selected_log_prob = log_policy.gather(1, selected[:, None]).squeeze(1)
             entropy = output.policy_entropy()
+            candidate_counts = output.action_mask.sum(dim=1).to(
+                dtype=entropy.dtype
+            )
 
             floating_zero = output.value.new_zeros(batch_size)
             bool_zero = torch.zeros(batch_size, device=self.device, dtype=torch.bool)
             log_prob_rows.append(floating_zero.index_copy(0, active_tensor, selected_log_prob))
             value_rows.append(floating_zero.index_copy(0, active_tensor, output.value))
             entropy_rows.append(floating_zero.index_copy(0, active_tensor, entropy))
+            candidate_count_rows.append(
+                floating_zero.index_copy(0, active_tensor, candidate_counts)
+            )
             valid_rows.append(bool_zero.index_fill(0, active_tensor, True))
             policy_rows.append(
                 bool_zero.index_copy(
@@ -2286,6 +2403,7 @@ class VTraceLearner:
         log_probs = torch.stack(log_prob_rows)
         values = torch.stack(value_rows)
         entropies = torch.stack(entropy_rows)
+        candidate_counts = torch.stack(candidate_count_rows)
         valid = torch.stack(valid_rows)
         policy_decisions = torch.stack(policy_rows) & valid
         behavior_log_probs = torch.stack(behavior_rows)
@@ -2332,6 +2450,11 @@ class VTraceLearner:
         # exact pattern used by the one-hot breaker.
         active_ratios = ratios[policy_decisions]
         clipped = (active_ratios > self.config.vtrace_rho_clip).float()
+        active_entropies = entropies[policy_decisions]
+        active_candidate_counts = candidate_counts[policy_decisions]
+        active_normalized_entropies = active_entropies / active_candidate_counts.log().clamp_min(
+            1.0e-6
+        )
         scheduled_entropy_weight = _annealed_entropy_weight(
             self.config,
             policy_version=schedule_policy_version,
@@ -2340,10 +2463,12 @@ class VTraceLearner:
             entropy_weight,
             entropy_breaker_active,
             entropy_breaker_one_hot_condition,
+            entropy_breaker_soft_collapse_condition,
         ) = self._entropy_weight_for_batch(
             base_weight=scheduled_entropy_weight,
             active_ratios=active_ratios,
             clipped=clipped,
+            active_normalized_entropies=active_normalized_entropies,
         )
         online_objective_loss = (
             self.config.policy_weight * policy_loss + self.config.value_weight * value_loss - entropy_weight * entropy
@@ -2681,10 +2806,18 @@ class VTraceLearner:
             policy_loss=float(policy_loss.detach().item()),
             value_loss=float(value_loss.detach().item()),
             entropy=float(entropy.detach().item()),
+            normalized_entropy=(
+                float(active_normalized_entropies.detach().mean().item())
+                if active_normalized_entropies.numel()
+                else 0.0
+            ),
             entropy_weight=entropy_weight,
             entropy_breaker_active=int(entropy_breaker_active),
             entropy_breaker_one_hot_condition=int(entropy_breaker_one_hot_condition),
-            entropy_breaker_consecutive_batches=self._one_hot_batch_streak,
+            entropy_breaker_soft_collapse_condition=int(
+                entropy_breaker_soft_collapse_condition
+            ),
+            entropy_breaker_consecutive_batches=self._collapse_batch_streak,
             entropy_breaker_remaining_updates=(self._entropy_breaker_remaining_updates),
             entropy_breaker_triggers=self._entropy_breaker_triggers,
             advantage_mean=(float(active_advantages.detach().mean().item()) if active_advantages.numel() else 0.0),
@@ -2792,6 +2925,9 @@ class VTraceLearner:
             liveness_censored_suppressed_labels=(liveness_losses.censored_suppressed_labels),
             liveness_policy_lag_suppressed_labels=(liveness_losses.policy_lag_suppressed_labels),
             liveness_risk_actor_phase_suppressed_labels=(liveness_losses.risk_actor_phase_suppressed_labels),
+            liveness_risk_actor_saturation_suppressed_labels=(
+                liveness_losses.risk_actor_saturation_suppressed_labels
+            ),
             liveness_centered_risk_mean=liveness_losses.centered_risk_mean,
             liveness_centered_risk_max_abs=(liveness_losses.centered_risk_max_abs),
             liveness_policy_gradient_norm=liveness_policy_gradient_norm,
@@ -2824,6 +2960,9 @@ class VTraceLearner:
             episodic_failure_policy_suppressed_labels=(episodic_losses.failure_policy_suppressed_labels),
             episodic_policy_lag_suppressed_labels=(episodic_losses.policy_lag_suppressed_labels),
             episodic_success_trust_region_suppressed_labels=(episodic_losses.success_trust_region_suppressed_labels),
+            episodic_success_surface_exempted_labels=(
+                episodic_losses.success_surface_exempted_labels
+            ),
             episodic_task_value_labels=episodic_losses.task_value_labels,
             episodic_revival_value_labels=(episodic_losses.revival_value_labels),
             episodic_efficiency_policy_labels=(episodic_losses.efficiency_policy_labels),
@@ -2991,6 +3130,7 @@ class VTraceLearner:
                 failure_policy_suppressed_labels=0,
                 policy_lag_suppressed_labels=0,
                 success_trust_region_suppressed_labels=0,
+                success_surface_exempted_labels=0,
                 task_value_labels=0,
                 revival_value_labels=0,
                 efficiency_policy_labels=0,
@@ -3049,6 +3189,7 @@ class VTraceLearner:
         failure_policy_suppressed_labels = 0
         policy_lag_suppressed_labels = 0
         success_trust_region_suppressed_labels = 0
+        success_surface_exempted_labels = 0
 
         for time_index in range(maximum_time):
             active = [index for index, sequence in enumerate(sequences) if time_index < len(sequence.learn_steps)]
@@ -3123,6 +3264,17 @@ class VTraceLearner:
                     failure_policy_suppressed_labels += 1
                     continue
                 success_policy_candidate_labels += 1
+                if (
+                    decision.decision_surface
+                    in self.episodic_config.success_imitation_exempt_surfaces
+                ):
+                    # The complete successful trajectory still supervises all
+                    # horizon value heads above.  Only repeated selected-action
+                    # imitation is disabled on explicitly reviewed sparse
+                    # strategic surfaces; online V-trace and factual SMDP-Q
+                    # retain contextual preference learning there.
+                    success_surface_exempted_labels += 1
+                    continue
                 policy_lag = current_policy_version - decision.policy_version
                 if policy_lag > self.episodic_config.policy_gradient_max_lag:
                     # Complete episodes remain authoritative long-horizon value
@@ -3272,6 +3424,7 @@ class VTraceLearner:
             failure_policy_suppressed_labels=failure_policy_suppressed_labels,
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
             success_trust_region_suppressed_labels=(success_trust_region_suppressed_labels),
+            success_surface_exempted_labels=success_surface_exempted_labels,
             task_value_labels=len(task_predictions),
             revival_value_labels=len(revival_predictions),
             efficiency_policy_labels=efficiency_policy_labels,

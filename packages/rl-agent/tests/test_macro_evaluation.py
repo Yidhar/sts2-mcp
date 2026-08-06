@@ -41,6 +41,15 @@ def _remove_v16_guard_field(payload: dict[str, object]) -> None:
     del runtime["evaluation_guard_enforcement_start_steps"]
 
 
+def _remove_v17_stability_fields(payload: dict[str, object]) -> None:
+    failure = payload["failure_credit"]
+    episodic = payload["episodic_learning"]
+    assert isinstance(failure, dict)
+    assert isinstance(episodic, dict)
+    del failure["liveness_risk_actor_min_selected_probability"]
+    del episodic["success_imitation_exempt_surfaces"]
+
+
 def _decision(
     *,
     surface: str,
@@ -352,6 +361,7 @@ def test_macro_journal_cli_writes_standalone_diagnostic_report(
 def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
+    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -387,6 +397,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v7"
+    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -436,6 +447,7 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
+    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -467,6 +479,7 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]

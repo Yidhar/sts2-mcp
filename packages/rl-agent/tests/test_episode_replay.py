@@ -677,10 +677,46 @@ def test_fresh_policy_reservation_keeps_one_global_value_slot() -> None:
         "fresh_policy_quota_missed": 0,
         "fresh_policy_candidate_episodes": 1,
         "fresh_policy_candidate_decisions": 1,
+        "fresh_policy_surface_exempted_decisions": 0,
         "sampled_fresh_policy_lag_min": 0,
         "sampled_fresh_policy_lag_mean": 0.0,
         "sampled_fresh_policy_lag_max": 0,
     }
+
+
+def test_fresh_policy_reservation_excludes_success_imitation_surfaces() -> None:
+    episode = _surface_episode(
+        episode_id="surface-exemption",
+        surfaces=("rest_site", "shop", "map"),
+        won=True,
+    )
+    replay = BoundedEpisodicReplay(
+        capacity=1,
+        byte_capacity=episode.storage_nbytes(),
+        episode_byte_capacity=episode.storage_nbytes(),
+        max_segments_per_episode=3,
+        seed=43,
+    )
+    assert replay.put(episode)
+
+    sample = replay.sample_for_learning(
+        1,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=1.0,
+        current_policy_version=7,
+        policy_gradient_max_lag=128,
+        fresh_policy_sequences=1,
+        success_imitation_exempt_surfaces=("rest_site", "shop"),
+    )
+
+    assert len(sample.sequences) == 1
+    assert sample.sequences[0].learn_start_step == 2
+    assert sample.sequences[0].learn_steps[0].decision.decision_surface == "map"
+    assert sample.diagnostics.fresh_policy_candidate_episodes == 1
+    assert sample.diagnostics.fresh_policy_candidate_decisions == 1
+    assert sample.diagnostics.fresh_policy_surface_exempted_decisions == 2
+    assert sample.diagnostics.fresh_policy_quota_filled == 1
 
 
 @pytest.mark.parametrize(
@@ -1615,13 +1651,14 @@ def test_indexed_fresh_sampling_preserves_legacy_step_order_for_version_runs() -
         # surface tie, then indexed the eligible decisions in episode order.
         expected_rng.integers(0, 1)
         expected_step = int(expected_rng.integers(0, 3))
-        actual, candidate_episodes, candidate_decisions = (
+        actual, candidate_episodes, candidate_decisions, exempted_decisions = (
             episode_replay_module._fresh_policy_candidates(
                 (episode,),
                 (sampling_index,),
                 episode_order=(0,),
                 current_policy_version=7,
                 maximum_policy_lag=1,
+                exempt_surfaces=frozenset(),
                 rng=np.random.default_rng(seed),
             )
         )
@@ -1629,6 +1666,7 @@ def test_indexed_fresh_sampling_preserves_legacy_step_order_for_version_runs() -
         assert actual == ((0, expected_step, 7 - (7, 6, 7)[expected_step]),)
         assert candidate_episodes == 1
         assert candidate_decisions == 3
+        assert exempted_decisions == 0
 
 
 def test_concurrent_put_completes_while_sampling_materializes_snapshot(

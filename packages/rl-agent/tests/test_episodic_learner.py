@@ -74,28 +74,30 @@ def test_one_hot_entropy_breaker_triggers_after_eight_batches_and_resumes_exactl
     ratios = torch.ones(5)
     clipped = torch.zeros(5)
     for expected_streak in range(1, 8):
-        weight, active, condition = learner._entropy_weight_for_batch(
+        weight, active, condition, soft_condition = learner._entropy_weight_for_batch(
             base_weight=0.004,
             active_ratios=ratios,
             clipped=clipped,
         )
         assert condition is True
+        assert soft_condition is False
         assert active is False
         assert weight == pytest.approx(0.004)
-        assert learner.dynamics_state_dict()["one_hot_batch_streak"] == expected_streak
+        assert learner.dynamics_state_dict()["collapse_batch_streak"] == expected_streak
 
-    weight, active, condition = learner._entropy_weight_for_batch(
+    weight, active, condition, soft_condition = learner._entropy_weight_for_batch(
         base_weight=0.004,
         active_ratios=ratios,
         clipped=clipped,
     )
     assert condition is True
+    assert soft_condition is False
     assert active is True
     assert weight == pytest.approx(0.012)
     state = learner.dynamics_state_dict()
     assert state == {
-        "version": "sts2-vtrace-learner-dynamics-v1",
-        "one_hot_batch_streak": 0,
+        "version": "sts2-vtrace-learner-dynamics-v2",
+        "collapse_batch_streak": 0,
         "entropy_breaker_remaining_updates": 7,
         "entropy_breaker_triggers": 1,
     }
@@ -103,15 +105,99 @@ def test_one_hot_entropy_breaker_triggers_after_eight_batches_and_resumes_exactl
     restored, _ = _learner()
     restored.config = learner.config
     restored.load_dynamics_state_dict(state)
-    weight, active, condition = restored._entropy_weight_for_batch(
+    weight, active, condition, soft_condition = restored._entropy_weight_for_batch(
         base_weight=0.004,
         active_ratios=torch.tensor([0.8, 0.9]),
         clipped=torch.zeros(2),
     )
     assert condition is False
+    assert soft_condition is False
     assert active is True
     assert weight == pytest.approx(0.012)
     assert restored.dynamics_state_dict()["entropy_breaker_remaining_updates"] == 6
+
+
+def test_policy_collapse_v2_breaker_detects_soft_entropy_collapse() -> None:
+    learner, _ = _learner()
+    learner.config = OptimizationConfig(
+        entropy_weight=0.006,
+        entropy_weight_end=0.004,
+        entropy_decay_updates=3_000,
+        entropy_breaker="policy-collapse-v2",
+    )
+    ratios = torch.full((32,), 0.8)
+    clipped = torch.zeros(32)
+    collapsed_entropies = torch.full((32,), 0.05)
+    for expected_streak in range(1, 8):
+        weight, active, one_hot, soft = learner._entropy_weight_for_batch(
+            base_weight=0.004,
+            active_ratios=ratios,
+            clipped=clipped,
+            active_normalized_entropies=collapsed_entropies,
+        )
+        assert one_hot is False
+        assert soft is True
+        assert active is False
+        assert weight == pytest.approx(0.004)
+        assert learner.dynamics_state_dict()["collapse_batch_streak"] == expected_streak
+
+    weight, active, one_hot, soft = learner._entropy_weight_for_batch(
+        base_weight=0.004,
+        active_ratios=ratios,
+        clipped=clipped,
+        active_normalized_entropies=collapsed_entropies,
+    )
+    assert one_hot is False
+    assert soft is True
+    assert active is True
+    assert weight == pytest.approx(0.012)
+    assert learner.dynamics_state_dict() == {
+        "version": "sts2-vtrace-learner-dynamics-v2",
+        "collapse_batch_streak": 0,
+        "entropy_breaker_remaining_updates": 15,
+        "entropy_breaker_triggers": 1,
+    }
+
+    # A small set of naturally decisive states cannot trip the batch-level
+    # breaker, and a healthy normalized-entropy batch resets the streak.
+    weight, active, one_hot, soft = learner._entropy_weight_for_batch(
+        base_weight=0.004,
+        active_ratios=torch.full((8,), 0.8),
+        clipped=torch.zeros(8),
+        active_normalized_entropies=torch.full((8,), 0.01),
+    )
+    assert one_hot is False
+    assert soft is False
+    assert active is True
+    assert weight == pytest.approx(0.012)
+
+
+def test_policy_collapse_v2_does_not_treat_fresh_on_policy_ratios_as_collapse() -> None:
+    learner, _ = _learner()
+    learner.config = OptimizationConfig(
+        entropy_weight=0.006,
+        entropy_weight_end=0.004,
+        entropy_decay_updates=3_000,
+        entropy_breaker="policy-collapse-v2",
+    )
+    for _ in range(16):
+        weight, active, one_hot, soft = learner._entropy_weight_for_batch(
+            base_weight=0.004,
+            active_ratios=torch.ones(32),
+            clipped=torch.zeros(32),
+            active_normalized_entropies=torch.full((32,), 0.65),
+        )
+        assert one_hot is True  # retained legacy diagnostic only
+        assert soft is False
+        assert active is False
+        assert weight == pytest.approx(0.004)
+
+    assert learner.dynamics_state_dict() == {
+        "version": "sts2-vtrace-learner-dynamics-v2",
+        "collapse_batch_streak": 0,
+        "entropy_breaker_remaining_updates": 0,
+        "entropy_breaker_triggers": 0,
+    }
 
 
 def _model_config(*, dropout: float = 0.0) -> GroundedCandidateConfig:
@@ -198,13 +284,20 @@ def _episode(
     final_revivals: int = 0,
     policy_decisions: tuple[bool, ...] | None = None,
     policy_versions: tuple[int, ...] | None = None,
+    decision_surfaces: tuple[str, ...] | None = None,
 ) -> CompletedEpisode:
     if policy_decisions is None:
         policy_decisions = (True,) * len(snapshots)
     if policy_versions is None:
         policy_versions = (0,) * len(snapshots)
+    if decision_surfaces is None:
+        decision_surfaces = tuple(
+            "combat" if snapshot.domain_id == 1 else "other"
+            for snapshot in snapshots
+        )
     assert len(policy_decisions) == len(snapshots)
     assert len(policy_versions) == len(snapshots)
+    assert len(decision_surfaces) == len(snapshots)
     steps = tuple(
         EpisodeDecisionStep(
             snapshot=snapshot,
@@ -223,9 +316,7 @@ def _episode(
             revivals_after=final_revivals if index == len(snapshots) - 1 else 0,
             hp_loss_before=0.0,
             hp_loss_after=0.0,
-            decision_surface=(
-                "combat" if snapshot.domain_id == 1 else "other"
-            ),
+            decision_surface=decision_surfaces[index],
             act_boundary=(
                 BoundaryOutcome.SUCCEEDED if won else BoundaryOutcome.FAILED
             )
@@ -280,6 +371,7 @@ def _learner(
     revival_policy_weight: float = 0.05,
     secondary_advantage_fraction: float = 0.25,
     success_policy_trust_region_epsilon: float = 0.20,
+    success_imitation_exempt_surfaces: tuple[str, ...] = (),
     dropout: float = 0.0,
 ) -> tuple[VTraceLearner, GroundedEncodingConfig]:
     torch.manual_seed(11)
@@ -304,6 +396,9 @@ def _learner(
             secondary_advantage_fraction=secondary_advantage_fraction,
             success_policy_trust_region_epsilon=(
                 success_policy_trust_region_epsilon
+            ),
+            success_imitation_exempt_surfaces=(
+                success_imitation_exempt_surfaces
             ),
         ),
     )
@@ -1002,6 +1097,47 @@ def test_success_imitation_stops_outside_the_positive_trust_region() -> None:
     assert losses.success_trust_region_suppressed_labels == 1
     assert losses.policy_labels == 0
     assert losses.policy_active_sequences == 0
+    assert losses.task_value_labels == 2
+    assert losses.task_value_loss.detach().item() > 0.0
+    assert losses.primary_policy_loss.detach().item() == 0.0
+
+    learner.model.zero_grad(set_to_none=True)
+    losses.total_loss.backward()
+    assert all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        for name, parameter in learner.model.named_parameters()
+        if name.startswith("policy_head.")
+    )
+
+
+def test_success_imitation_surface_exemption_keeps_value_learning() -> None:
+    learner, encoding = _learner(
+        learn_steps=1,
+        primary_policy_weight=1.0,
+        task_value_weight=1.0,
+        revival_value_weight=0.0,
+        revival_policy_weight=0.0,
+        secondary_advantage_fraction=0.0,
+        success_imitation_exempt_surfaces=("rest_site", "shop"),
+    )
+    snapshot = _snapshot(encoding, domain_id=0)
+    _zero_multiscale_heads(learner.model)
+    episode = _episode(
+        (snapshot,),
+        episode_id="successful-rest-site",
+        won=True,
+        decision_surfaces=("rest_site",),
+    )
+
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=0,
+    )
+
+    assert losses.success_policy_candidate_labels == 1
+    assert losses.success_surface_exempted_labels == 1
+    assert losses.policy_labels == 0
+    assert losses.efficiency_policy_labels == 0
     assert losses.task_value_labels == 2
     assert losses.task_value_loss.detach().item() > 0.0
     assert losses.primary_policy_loss.detach().item() == 0.0

@@ -60,7 +60,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 def test_v36_recipe_uses_two_sided_support_and_non_destructive_guard() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v16"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v17"
     transaction = config.transaction_learning
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)

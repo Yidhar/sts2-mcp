@@ -209,7 +209,14 @@ def test_run_objective_fails_closed_without_typed_run_result() -> None:
 
 def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
-    assert identity["version"] == "sts2-run-survival-efficiency-v5"
+    assert identity["version"] == "sts2-run-survival-efficiency-v6"
+    assert identity["spec"]["revival_linear_weight"] == pytest.approx(0.010)
+    assert identity["spec"]["revival_quadratic_weight"] == pytest.approx(0.0009)
+    assert (
+        identity["spec"]["hp_loss_weight"]
+        + identity["spec"]["revival_cost_cap"]
+        + identity["spec"]["pace_budget"]
+    ) == pytest.approx(0.99)
     calculator = RevivalEfficiencyRewardCalculator(
         maximum_episode_steps=512,
     )
@@ -400,27 +407,38 @@ def test_explicit_combat_victory_reason_precedes_missing_terminal_player_hp() ->
     assert facts.combat_result == "victory"
 
 
-def test_v5_revival_cost_keeps_long_tail_resolution() -> None:
+def test_v6_revival_cost_is_convex_through_the_finite_curriculum() -> None:
     calculator = RevivalEfficiencyRewardCalculator(maximum_episode_steps=512)
 
     first = calculator.evaluate(
         _result(step=0, revivals_used=0),
         _result(step=1, revivals_used=1, revivals_used_delta=1),
     )
-    tail = calculator.evaluate(
-        _result(step=0, revivals_used=20),
-        _result(step=1, revivals_used=21, revivals_used_delta=1),
+    middle = calculator.evaluate(
+        _result(step=0, revivals_used=7),
+        _result(step=1, revivals_used=8, revivals_used_delta=1),
     )
-    distant = calculator.evaluate(
-        _result(step=0, revivals_used=34),
-        _result(step=1, revivals_used=160, revivals_used_delta=126),
+    late = calculator.evaluate(
+        _result(step=0, revivals_used=14),
+        _result(step=1, revivals_used=15, revivals_used_delta=1),
+    )
+    curriculum_edge = calculator.evaluate(
+        _result(step=0, revivals_used=15),
+        _result(step=1, revivals_used=16, revivals_used_delta=1),
     )
     capped = calculator.evaluate(
-        _result(step=0, revivals_used=170),
-        _result(step=1, revivals_used=1_000_000, revivals_used_delta=999_830),
+        _result(step=0, revivals_used=17),
+        _result(step=1, revivals_used=1_000_000, revivals_used_delta=999_983),
     )
 
-    assert first.revival_penalty == pytest.approx(-0.005)
-    assert tail.revival_penalty == pytest.approx(-0.005)
-    assert distant.revival_penalty == pytest.approx(-0.18)
+    assert first.revival_penalty == pytest.approx(-0.0109)
+    assert middle.revival_penalty == pytest.approx(-0.0235)
+    assert late.revival_penalty == pytest.approx(-0.0361)
+    assert curriculum_edge.revival_penalty == pytest.approx(-0.0379)
+    assert (
+        abs(curriculum_edge.revival_penalty)
+        > abs(late.revival_penalty)
+        > abs(middle.revival_penalty)
+        > abs(first.revival_penalty)
+    )
     assert capped.revival_penalty == pytest.approx(0.0)

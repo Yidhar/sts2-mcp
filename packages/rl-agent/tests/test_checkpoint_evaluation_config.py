@@ -14,7 +14,7 @@ def _v10_payload() -> dict[str, Any]:
     payload["version"] = "sts2-relational-curriculum-config-v10"
     # V10 predates the failure-credit and transaction-exploration tables.
     # Reconstruct the historical payload instead of only relabeling the
-    # current V14 mapping.
+    # current V17 mapping.
     del payload["failure_credit"]
     del payload["transaction_exploration"]
     transaction_learning = payload["transaction_learning"]
@@ -28,6 +28,7 @@ def _v10_payload() -> dict[str, Any]:
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
+    del episodic["success_imitation_exempt_surfaces"]
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
     del runtime["evaluation_guard_enforcement_start_steps"]

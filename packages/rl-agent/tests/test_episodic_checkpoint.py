@@ -292,8 +292,8 @@ def test_checkpoint_roundtrip_restores_v33_learner_dynamics_and_health_role(
     config = _episodic_config()
     source = build_training_resources(config, backend=FakeCombatBackend())
     expected_dynamics = {
-        "version": "sts2-vtrace-learner-dynamics-v1",
-        "one_hot_batch_streak": 3,
+        "version": "sts2-vtrace-learner-dynamics-v2",
+        "collapse_batch_streak": 3,
         "entropy_breaker_remaining_updates": 5,
         "entropy_breaker_triggers": 2,
     }
@@ -803,8 +803,8 @@ def test_stochastic_state_captures_collector_only_cuda_rng_without_real_gpu(
         collector=SimpleNamespace(state_dict=lambda: {"sentinel": True}),
         learner=SimpleNamespace(
             dynamics_state_dict=lambda: {
-                "version": "sts2-vtrace-learner-dynamics-v1",
-                "one_hot_batch_streak": 0,
+                "version": "sts2-vtrace-learner-dynamics-v2",
+                "collapse_batch_streak": 0,
                 "entropy_breaker_remaining_updates": 0,
                 "entropy_breaker_triggers": 0,
             }
@@ -832,8 +832,8 @@ def test_stochastic_state_cpu_path_does_not_probe_cuda_driver(
         collector=SimpleNamespace(state_dict=lambda: {"sentinel": True}),
         learner=SimpleNamespace(
             dynamics_state_dict=lambda: {
-                "version": "sts2-vtrace-learner-dynamics-v1",
-                "one_hot_batch_streak": 0,
+                "version": "sts2-vtrace-learner-dynamics-v2",
+                "collapse_batch_streak": 0,
                 "entropy_breaker_remaining_updates": 0,
                 "entropy_breaker_triggers": 0,
             }

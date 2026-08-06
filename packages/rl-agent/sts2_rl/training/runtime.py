@@ -1924,6 +1924,9 @@ def run_training(
                     current_policy_version=policy_version_before_update,
                     policy_gradient_max_lag=(config.episodic_learning.policy_gradient_max_lag),
                     fresh_policy_sequences=(config.episodic_learning.fresh_policy_sequences),
+                    success_imitation_exempt_surfaces=(
+                        config.episodic_learning.success_imitation_exempt_surfaces
+                    ),
                 )
                 if resources.episodic_replay is not None
                 else None

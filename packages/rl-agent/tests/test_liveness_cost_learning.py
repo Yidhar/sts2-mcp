@@ -706,6 +706,43 @@ def test_cost_actor_policy_baseline_is_detached_from_policy_gradient() -> None:
     assert torch.count_nonzero(actual) == 3
 
 
+def test_cost_actor_suppresses_only_already_satisfied_low_probability_risk() -> None:
+    policy_logits = torch.nn.Parameter(
+        torch.tensor(
+            [
+                [-12.0, 0.0],  # risky selected action already below the floor
+                [-12.0, 0.0],  # low-probability selected action is predicted safer
+                [-2.0, 0.0],   # risky selected action still has behavioural mass
+            ]
+        )
+    )
+    costs = torch.tensor(
+        [
+            [0.9, 0.1],
+            [0.1, 0.9],
+            [0.9, 0.1],
+        ]
+    )
+    losses = liveness_credit_losses(
+        policy_log_probabilities=torch.log_softmax(policy_logits, dim=1),
+        candidate_liveness_cost_values=costs,
+        action_mask=torch.ones((3, 2), dtype=torch.bool),
+        selected_action_indices=torch.zeros(3, dtype=torch.long),
+        risk_actor_mask=torch.ones(3, dtype=torch.bool),
+        risk_advantage_clip=0.25,
+        risk_actor_min_selected_probability=0.01,
+    )
+    gradient = torch.autograd.grad(losses.risk_actor_loss, policy_logits)[0]
+
+    assert losses.risk_actor_saturation_suppressed_labels == 1
+    assert losses.risk_actor_labels == 2
+    torch.testing.assert_close(gradient[0], torch.zeros(2))
+    # Gradient descent raises the rare but safer factual action.
+    assert gradient[1, 0] < 0.0 < gradient[1, 1]
+    # It still lowers a risky action whose probability remains material.
+    assert gradient[2, 0] > 0.0 > gradient[2, 1]
+
+
 def test_direct_avoid_softening_is_finite_and_bounded_near_one_hot_policy() -> None:
     saturated_logits = torch.nn.Parameter(torch.tensor([[8.0, -8.0]]))
     saturated = liveness_credit_losses(

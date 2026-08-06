@@ -17,13 +17,14 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v16"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v17"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V13 = "sts2-relational-curriculum-config-v13"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V14 = "sts2-relational-curriculum-config-v14"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V15 = "sts2-relational-curriculum-config-v15"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V16 = "sts2-relational-curriculum-config-v16"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -204,7 +205,11 @@ class OptimizationConfig:
     # Source-versioned v33 circuit breaker.  Its thresholds and temporary
     # weight are code constants rather than launch-time knobs, so an operator
     # cannot silently change the learning recipe with a CLI override.
-    entropy_breaker: Literal["disabled", "one-hot-v1"] = "disabled"
+    entropy_breaker: Literal[
+        "disabled",
+        "one-hot-v1",
+        "policy-collapse-v2",
+    ] = "disabled"
 
     def __post_init__(self) -> None:
         learning_rate = _require_finite_number(
@@ -260,8 +265,15 @@ class OptimizationConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.entropy_weight_end > self.entropy_weight:
             raise ValueError("entropy_weight_end cannot exceed entropy_weight")
-        if self.entropy_breaker not in {"disabled", "one-hot-v1"}:
-            raise ValueError("optimization.entropy_breaker must be 'disabled' or 'one-hot-v1'")
+        if self.entropy_breaker not in {
+            "disabled",
+            "one-hot-v1",
+            "policy-collapse-v2",
+        }:
+            raise ValueError(
+                "optimization.entropy_breaker must be 'disabled', "
+                "'one-hot-v1', or 'policy-collapse-v2'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +524,12 @@ class FailureCreditConfig:
     # an explicit, causal PREFER witness.
     liveness_completion_policy_weight: float = 0.0
     liveness_risk_advantage_clip: float = 0.25
+    # A positive centered-risk label suppresses its factual selected action.
+    # Once the current policy has already pushed that action below this floor,
+    # repeating the same suppression has negligible behavioural value but can
+    # coherently translate the shared policy trunk.  Critics and negative-risk
+    # (recovery) labels remain active.  Zero preserves the pre-v17 behaviour.
+    liveness_risk_actor_min_selected_probability: float = 0.0
     liveness_contrast_margin: float = 0.10
     # The complete formal liveness objective receives this independent
     # gradient-delta budget before episodic gradients and the global optimizer
@@ -601,6 +619,7 @@ class FailureCreditConfig:
             "liveness_contrast_policy_weight",
             "liveness_completion_policy_weight",
             "liveness_risk_advantage_clip",
+            "liveness_risk_actor_min_selected_probability",
             "liveness_contrast_margin",
             "liveness_gradient_clip_norm",
         ):
@@ -611,6 +630,11 @@ class FailureCreditConfig:
             )
         if self.liveness_risk_advantage_clip > 1.0:
             raise ValueError("failure_credit.liveness_risk_advantage_clip must be in [0, 1]")
+        if self.liveness_risk_actor_min_selected_probability >= 1.0:
+            raise ValueError(
+                "failure_credit.liveness_risk_actor_min_selected_probability "
+                "must be in [0, 1)"
+            )
         if self.liveness_gradient_clip_norm <= 0.0:
             raise ValueError("failure_credit.liveness_gradient_clip_norm must be positive")
 
@@ -671,6 +695,12 @@ class EpisodicLearningConfig:
     # already more than this multiplicative trust region above the factual
     # behavior policy.  Value labels remain active.
     success_policy_trust_region_epsilon: float = 0.20
+    # Successful complete episodes remain factual value supervision on every
+    # surface, but selected-action imitation can become a one-way ratchet on
+    # sparse strategic entry surfaces.  Listed surface identities therefore
+    # stay available to value/SMDP learning while being excluded from repeated
+    # success imitation and from the reserved fresh-policy sampler.
+    success_imitation_exempt_surfaces: tuple[str, ...] = ()
     # Old complete episodes remain useful factual value targets, but their
     # selected-action likelihood must not continue moving a much newer policy.
     # The learner therefore keeps value supervision and suppresses only policy
@@ -701,6 +731,33 @@ class EpisodicLearningConfig:
         )
         if self.fresh_policy_sequences > self.sample_sequences:
             raise ValueError("episodic_learning.fresh_policy_sequences cannot exceed " "sample_sequences")
+        surfaces = self.success_imitation_exempt_surfaces
+        if not isinstance(surfaces, tuple):
+            surfaces = tuple(surfaces)
+            object.__setattr__(self, "success_imitation_exempt_surfaces", surfaces)
+        normalized_surfaces: list[str] = []
+        for index, surface in enumerate(surfaces):
+            if not isinstance(surface, str):
+                raise TypeError(
+                    "episodic_learning.success_imitation_exempt_surfaces"
+                    f"[{index}] must be text"
+                )
+            normalized = surface.strip().lower()
+            if (
+                not normalized
+                or normalized != surface
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in normalized)
+            ):
+                raise ValueError(
+                    "episodic_learning.success_imitation_exempt_surfaces "
+                    "must contain canonical lowercase surface keys"
+                )
+            if normalized in normalized_surfaces:
+                raise ValueError(
+                    "episodic_learning.success_imitation_exempt_surfaces "
+                    "contains a duplicate surface"
+                )
+            normalized_surfaces.append(normalized)
         _require_int(
             self.burn_in_steps,
             label="episodic_learning.burn_in_steps",
@@ -1308,6 +1365,12 @@ class TrainingConfig:
         if not isinstance(transaction_exploration, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized transaction exploration config must be an object")
         transaction_exploration["operations"] = list(self.transaction_exploration.operations)
+        episodic_learning = payload["episodic_learning"]
+        if not isinstance(episodic_learning, dict):  # pragma: no cover - asdict invariant
+            raise TypeError("serialized episodic learning config must be an object")
+        episodic_learning["success_imitation_exempt_surfaces"] = list(
+            self.episodic_learning.success_imitation_exempt_surfaces
+        )
         runtime = payload["runtime"]
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")
@@ -1457,6 +1520,12 @@ def model_initialization_config_from_mapping(
     one-sided entry floor with a two-sided support corridor and adds a bounded,
     non-destructive evaluation-guard recovery phase. The lifecycle heads use
     the already reviewed optional transaction-head migration gate.
+    V17 adds a convex revival-efficiency reward contract, a policy-saturation
+    eligibility floor for the liveness risk actor, an explicit success-
+    imitation surface exemption, and the policy-collapse-v2 entropy breaker.
+    These are training semantics, so V16 checkpoints are accepted only for
+    model-parameter initialization; optimizer/replay/RNG state cannot cross
+    the boundary.
     V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
     head is freshly initialized by the reviewed checkpoint overlay.  V10 also
@@ -1479,6 +1548,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V13,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1509,6 +1579,7 @@ def model_initialization_config_from_mapping(
     if source_version not in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
     }:
         if "transaction_exploration" in payload:
             raise ValueError(
@@ -1530,7 +1601,10 @@ def model_initialization_config_from_mapping(
         "lifecycle_entry_support_probability_floor",
         "lifecycle_smdp_q_weight",
     }
-    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V15:
+    if source_version not in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
+    }:
         unexpected_lifecycle_fields = lifecycle_fields.intersection(
             transaction_learning
         )
@@ -1545,16 +1619,55 @@ def model_initialization_config_from_mapping(
         raise ValueError(
             f"{source_version} model-initialization config has no runtime table"
         )
-    if "evaluation_guard_enforcement_start_steps" in runtime:
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V16:
+        if "evaluation_guard_enforcement_start_steps" not in runtime:
+            raise ValueError(
+                "V16 model-initialization config is missing its evaluation "
+                "guard enforcement boundary"
+            )
+    else:
+        if "evaluation_guard_enforcement_start_steps" in runtime:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains the V16 evaluation guard enforcement boundary"
+            )
+        # Pre-V16 configs enforced every guard exactly as before. A successor
+        # recipe may opt into a non-zero recovery phase only after migration.
+        migrated["runtime"] = {
+            **dict(runtime),
+            "evaluation_guard_enforcement_start_steps": 0,
+        }
+
+    raw_failure = migrated.get("failure_credit")
+    if not isinstance(raw_failure, Mapping):
+        raise ValueError(
+            f"{source_version} model-initialization config has no "
+            "failure_credit table after reviewed migration"
+        )
+    if "liveness_risk_actor_min_selected_probability" in raw_failure:
         raise ValueError(
             f"{source_version} model-initialization config unexpectedly "
-            "contains the V16 evaluation guard enforcement boundary"
+            "contains the V17 risk-actor saturation floor"
         )
-    # Pre-V16 configs enforced every guard exactly as before. A successor
-    # recipe may opt into a non-zero recovery phase only after migration.
-    migrated["runtime"] = {
-        **dict(runtime),
-        "evaluation_guard_enforcement_start_steps": 0,
+    migrated["failure_credit"] = {
+        **dict(raw_failure),
+        "liveness_risk_actor_min_selected_probability": 0.0,
+    }
+
+    raw_episodic = migrated.get("episodic_learning")
+    if not isinstance(raw_episodic, Mapping):
+        raise ValueError(
+            f"{source_version} model-initialization config has no "
+            "episodic_learning table after reviewed migration"
+        )
+    if "success_imitation_exempt_surfaces" in raw_episodic:
+        raise ValueError(
+            f"{source_version} model-initialization config unexpectedly "
+            "contains the V17 success-imitation surface exemption"
+        )
+    migrated["episodic_learning"] = {
+        **dict(raw_episodic),
+        "success_imitation_exempt_surfaces": (),
     }
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)

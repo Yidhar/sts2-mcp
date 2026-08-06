@@ -1,0 +1,130 @@
+# Liveness-stability successor to the immutable healthy v36 validation anchor
+# at local environment step 25,474. This is an explicit config-v17 model-
+# initialization lineage: compatible network tensors and mature schedule clocks
+# are inherited, while optimizer, replay, RNG, queues and lineage-local counters
+# restart. Exact resume across reward/learner/config semantics is forbidden.
+#
+# The transaction corridor below is byte-for-byte the reviewed v36 recipe.
+# V37 changes only the failed liveness/efficiency control plane: convex revival
+# cost v6, a finite 16-revival curriculum, saturation-aware liveness actor
+# eligibility, strategic-surface success-imitation exemptions, and an entropy-
+# based soft-collapse breaker. No action is masked/rewritten and no forge,
+# removal or rest reward is fabricated.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.004
+entropy_decay_updates = 3000
+entropy_breaker = "policy-collapse-v2"
+
+[rollout]
+queue_capacity = 24
+
+[transaction_learning]
+enabled = true
+replay_capacity = 4096
+replay_byte_capacity = 1073741824
+sample_traces = 4
+burn_in_steps = 32
+effect_weight = 0.05
+transaction_q_weight = 0.0
+# Entry steps remain excluded from this CE. It applies only to factual
+# transaction-internal completion paths and exact repeated cancel cycles.
+completion_policy_weight = 0.15
+pairwise_ranking_weight = 0.0
+# Smaller than v35's 0.25 because this is a numerical support barrier, not a
+# strategic preference objective.
+lifecycle_entry_support_weight = 0.05
+lifecycle_entry_support_probability_floor = 0.05
+lifecycle_smdp_q_weight = 0.10
+
+[failure_credit]
+mode = "learning"
+replay_capacity = 4096
+replay_byte_capacity = 2147483648
+sample_records = 4
+burn_in_steps = 32
+maximum_context_steps = 256
+maximum_episode_completion_controls = 32
+maximum_episode_completion_bytes = 134217728
+direct_witness_quota = 0
+multi_edge_cycle_quota = 0
+risk_sequence_quota = 1
+unresolved_stall_quota = 1
+completion_control_quota = 1
+matched_outcome_pair_quota = 1
+maximum_matched_pairs_per_publication = 8
+policy_gradient_max_lag = 128
+liveness_head_calibration_updates = 256
+liveness_risk_actor_start_update = 512
+liveness_records_per_autograd_batch = 4
+liveness_tbptt_window_steps = 16
+liveness_maximum_contexts_per_record = 2
+liveness_maximum_replayed_steps_per_update = 4096
+liveness_maximum_replayed_candidates_per_update = 1048576
+liveness_value_critic_weight = 0.10
+liveness_cost_critic_weight = 0.25
+liveness_cost_actor_weight = 0.10
+liveness_direct_policy_weight = 0.25
+liveness_cycle_policy_weight = 0.10
+liveness_contrast_policy_weight = 0.10
+liveness_completion_policy_weight = 0.15
+liveness_risk_advantage_clip = 0.25
+# Do not keep translating the shared trunk to suppress a risky selected action
+# after its current policy probability is already below 1%. Critics and the
+# opposite (recovery) actor direction remain eligible.
+liveness_risk_actor_min_selected_probability = 0.01
+liveness_contrast_margin = 0.10
+liveness_gradient_clip_norm = 0.50
+
+[episodic_learning]
+fresh_policy_sequences = 1
+success_policy_trust_region_epsilon = 0.20
+# Full-run success remains factual value supervision here. Repeated CE-style
+# imitation is excluded only on the two strategic entry surfaces whose old
+# policy had already formed a one-way success ratchet.
+success_imitation_exempt_surfaces = ["rest_site", "shop"]
+
+[curriculum]
+revival_budget = 16
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+selection_surface_epsilon_floor = 0.25
+
+[transaction_exploration]
+enabled = true
+operations = ["upgrade", "remove"]
+entry_epsilon_floor = 0.50
+completion_guidance_probability = 0.95
+
+[runtime]
+rocm_sdpa_backend = "math"
+model_initialization_schedule_mode = "inherit"
+model_initialization_liveness_schedule_mode = "inherit"
+total_environment_steps = 100000
+seed = 6300000
+log_dir = "runs/full-run-revival-v37-liveness-stability-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v37-liveness-stability-model-init"
+checkpoint_interval_steps = 10000
+# Bound collapse detection latency to 10k steps rather than leaving the
+# 25k->50k blind interval that allowed the v36 accident to deepen.
+evaluation_steps = [0, 20000, 40000, 60000, 80000]
+evaluation_episodes = 16
+early_evaluation_steps = [5000, 10000, 30000, 50000, 70000, 90000]
+early_evaluation_episodes = 16
+final_audit_steps = [100000]
+final_audit_episodes = 64
+evaluation_liveness_guard_enabled = true
+evaluation_guard_min_liveness_episodes = 16
+evaluation_guard_liveness_baseline_failures = 0
+evaluation_guard_liveness_baseline_episodes = 16
+evaluation_guard_min_liveness_regression_rate = 0.20
+training_deadlock_streak_alert_episodes = 4
+# Gate 0 and 5k remain immutable diagnostics/checkpoints. At 10k and later the
+# guard stops on collapse while preserving the exact failing candidate. It can
+# never roll back or replay a discarded learning segment.
+evaluation_guard_enforcement_start_steps = 10000
+evaluation_guard_failure_action = "stop"
+evaluation_guard_max_rollbacks = 0

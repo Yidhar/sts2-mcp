@@ -773,6 +773,7 @@ class EpisodicReplaySampleDiagnostics:
     fresh_policy_quota_filled: int = 0
     fresh_policy_candidate_episodes: int = 0
     fresh_policy_candidate_decisions: int = 0
+    fresh_policy_surface_exempted_decisions: int = 0
     sampled_fresh_policy_lag_min: int | None = None
     sampled_fresh_policy_lag_mean: float | None = None
     sampled_fresh_policy_lag_max: int | None = None
@@ -788,6 +789,9 @@ class EpisodicReplaySampleDiagnostics:
             "fresh_policy_quota_missed": self.fresh_policy_quota_missed,
             "fresh_policy_candidate_episodes": self.fresh_policy_candidate_episodes,
             "fresh_policy_candidate_decisions": self.fresh_policy_candidate_decisions,
+            "fresh_policy_surface_exempted_decisions": (
+                self.fresh_policy_surface_exempted_decisions
+            ),
             "sampled_fresh_policy_lag_min": self.sampled_fresh_policy_lag_min,
             "sampled_fresh_policy_lag_mean": self.sampled_fresh_policy_lag_mean,
             "sampled_fresh_policy_lag_max": self.sampled_fresh_policy_lag_max,
@@ -1058,8 +1062,9 @@ def _fresh_policy_candidates(
     episode_order: tuple[int, ...],
     current_policy_version: int,
     maximum_policy_lag: int,
+    exempt_surfaces: frozenset[str],
     rng: np.random.Generator,
-) -> tuple[tuple[tuple[int, int, int], ...], int, int]:
+) -> tuple[tuple[tuple[int, int, int], ...], int, int, int]:
     """Return one surface-balanced fresh successful decision per episode.
 
     The returned triples are ``(episode_index, decision_index, policy_lag)``.
@@ -1079,6 +1084,7 @@ def _fresh_policy_candidates(
     ] = {}
     full_run_successes: set[int] = set()
     candidate_decisions = 0
+    exempted_decisions = 0
     for episode_index in episode_order:
         episode = episodes[episode_index]
         sampling_index = sampling_indexes[episode_index]
@@ -1098,6 +1104,9 @@ def _fresh_policy_candidates(
                 if 0 <= current_policy_version - version.policy_version <= maximum_policy_lag
             )
             eligible_count = sum(len(version.step_indexes) for version in eligible_versions)
+            if surface_index.decision_surface in exempt_surfaces:
+                exempted_decisions += eligible_count
+                continue
             if eligible_count:
                 per_surface[surface_index.decision_surface] = (
                     eligible_versions,
@@ -1144,7 +1153,12 @@ def _fresh_policy_candidates(
         result.append((episode_index, decision_index, lag))
         surface_counts[surface] += 1
 
-    return tuple(result), len(per_episode), candidate_decisions
+    return (
+        tuple(result),
+        len(per_episode),
+        candidate_decisions,
+        exempted_decisions,
+    )
 
 
 class BoundedEpisodicReplay:
@@ -1269,6 +1283,7 @@ class BoundedEpisodicReplay:
             current_policy_version=None,
             policy_gradient_max_lag=None,
             fresh_policy_sequences=0,
+            success_imitation_exempt_surfaces=(),
         ).sequences
 
     def sample_for_learning(
@@ -1281,6 +1296,7 @@ class BoundedEpisodicReplay:
         current_policy_version: int,
         policy_gradient_max_lag: int,
         fresh_policy_sequences: int,
+        success_imitation_exempt_surfaces: tuple[str, ...] = (),
     ) -> EpisodicReplaySample:
         """Reserve fresh successful policy credit without deleting old value data.
 
@@ -1315,6 +1331,20 @@ class BoundedEpisodicReplay:
             raise ValueError(
                 "episodic replay fresh_policy_sequences must be in [0, maximum]"
             )
+        if not isinstance(success_imitation_exempt_surfaces, tuple) or any(
+            not isinstance(surface, str) or not surface
+            for surface in success_imitation_exempt_surfaces
+        ):
+            raise ValueError(
+                "episodic replay success-imitation exemptions must be a "
+                "tuple of non-empty surface keys"
+            )
+        if len(set(success_imitation_exempt_surfaces)) != len(
+            success_imitation_exempt_surfaces
+        ):
+            raise ValueError(
+                "episodic replay success-imitation exemptions contain duplicates"
+            )
         return self._sample(
             maximum,
             learn_steps=learn_steps,
@@ -1323,6 +1353,9 @@ class BoundedEpisodicReplay:
             current_policy_version=current_policy_version,
             policy_gradient_max_lag=policy_gradient_max_lag,
             fresh_policy_sequences=fresh_policy_sequences,
+            success_imitation_exempt_surfaces=(
+                success_imitation_exempt_surfaces
+            ),
         )
 
     def _sample(
@@ -1335,6 +1368,7 @@ class BoundedEpisodicReplay:
         current_policy_version: int | None,
         policy_gradient_max_lag: int | None,
         fresh_policy_sequences: int,
+        success_imitation_exempt_surfaces: tuple[str, ...],
     ) -> EpisodicReplaySample:
         _integer(maximum, label="episodic replay sample maximum", minimum=1)
         _integer(learn_steps, label="episodic replay learn_steps", minimum=1)
@@ -1379,6 +1413,7 @@ class BoundedEpisodicReplay:
             fresh_lags: list[int] = []
             fresh_candidate_episodes = 0
             fresh_candidate_decisions = 0
+            fresh_surface_exempted_decisions = 0
             if fresh_policy_sequences:
                 if current_policy_version is None or policy_gradient_max_lag is None:
                     raise RuntimeError("fresh policy sampling is missing its policy contract")
@@ -1386,12 +1421,16 @@ class BoundedEpisodicReplay:
                     fresh_candidates,
                     fresh_candidate_episodes,
                     fresh_candidate_decisions,
+                    fresh_surface_exempted_decisions,
                 ) = _fresh_policy_candidates(
                     episodes,
                     sampling_indexes,
                     episode_order=order,
                     current_policy_version=current_policy_version,
                     maximum_policy_lag=policy_gradient_max_lag,
+                    exempt_surfaces=frozenset(
+                        success_imitation_exempt_surfaces
+                    ),
                     rng=self._rng,
                 )
                 for episode_index, decision_index, lag in fresh_candidates:
@@ -1431,6 +1470,9 @@ class BoundedEpisodicReplay:
                         fresh_policy_quota_filled=len(fresh_lags),
                         fresh_policy_candidate_episodes=fresh_candidate_episodes,
                         fresh_policy_candidate_decisions=fresh_candidate_decisions,
+                        fresh_policy_surface_exempted_decisions=(
+                            fresh_surface_exempted_decisions
+                        ),
                         sampled_fresh_policy_lag_min=(min(fresh_lags) if fresh_lags else None),
                         sampled_fresh_policy_lag_mean=(
                             float(sum(fresh_lags) / len(fresh_lags)) if fresh_lags else None
