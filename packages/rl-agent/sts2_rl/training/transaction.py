@@ -86,10 +86,10 @@ class TransactionLifecycleEvidence:
 
     The selected entry remains a normal legal action.  This DTO records the
     exact recurrent trace position, behavior probability and authoritative
-    post-condition needed to recover policy support without introducing a
-    card-specific reward or rewriting the action mask.  Only a verified
-    ``COMMITTED`` lifecycle may produce the one-sided entry-support target or
-    the semi-Markov entry-Q target.
+    post-condition needed to retain bidirectional policy support without
+    introducing a card-specific reward or rewriting the action mask. Only a
+    verified ``COMMITTED`` lifecycle may produce the entry support-corridor
+    target or the semi-Markov entry-Q target.
     """
 
     operation: str
@@ -540,7 +540,7 @@ def factual_transaction_policy_targets(
         learn_steps,
         start=trace.burn_in_steps,
     ):
-        # Entry competence has a distinct one-sided support contract.  Never
+        # Entry competence has a distinct two-sided support contract. Never
         # let the legacy completed-path CE turn it into an unbounded permanent
         # imitation target after the configured support floor is restored.
         if step_index == lifecycle_entry_index:

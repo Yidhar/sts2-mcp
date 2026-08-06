@@ -35,6 +35,12 @@ def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None
         del transaction_learning[key]
 
 
+def _remove_v16_guard_field(payload: dict[str, object]) -> None:
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    del runtime["evaluation_guard_enforcement_start_steps"]
+
+
 def _decision(
     *,
     surface: str,
@@ -347,6 +353,7 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
     _remove_v15_transaction_lifecycle_fields(source)
+    _remove_v16_guard_field(source)
     del source["failure_credit"]
     del source["transaction_exploration"]
     episodic = source["episodic_learning"]
@@ -381,6 +388,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v7"
     _remove_v15_transaction_lifecycle_fields(source)
+    _remove_v16_guard_field(source)
     del source["failure_credit"]
     del source["transaction_exploration"]
     optimization = source["optimization"]
@@ -429,6 +437,7 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
     _remove_v15_transaction_lifecycle_fields(source)
+    _remove_v16_guard_field(source)
     del source["failure_credit"]
     del source["transaction_exploration"]
     rollout = source["rollout"]
@@ -459,6 +468,7 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
     _remove_v15_transaction_lifecycle_fields(source)
+    _remove_v16_guard_field(source)
     del source["failure_credit"]
     del source["transaction_exploration"]
     episodic = source["episodic_learning"]

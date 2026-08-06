@@ -28,6 +28,9 @@ def _v10_payload() -> dict[str, Any]:
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    del runtime["evaluation_guard_enforcement_start_steps"]
     return payload
 
 

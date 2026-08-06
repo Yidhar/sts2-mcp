@@ -691,9 +691,99 @@ def test_guard_attempt_artifact_names_are_unique_and_role_stable() -> None:
         rollback_number=2
     ) == "guard-rollback-restored-attempt-002"
     assert _checkpoint_role_for_prefix("guard-alert-attempt-002") == "guard_failure_evidence"
+    assert _checkpoint_role_for_prefix("guard-grace-gate-zero") == "guard_failure_evidence"
     assert _checkpoint_role_for_prefix(
         "guard-rollback-restored-attempt-002"
     ) == "healthy_evaluation_anchor"
+
+
+def test_guard_recovery_phase_checkpoints_once_and_never_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    base = _config(total_steps=4)
+    config = replace(
+        base,
+        runtime=replace(
+            base.runtime,
+            log_dir="runs/v36-guard-recovery",
+            checkpoint_dir="checkpoints/v36-guard-recovery",
+            checkpoint_interval_steps=100,
+            evaluation_steps=(0, 2, 3),
+            evaluation_episodes=16,
+            early_evaluation_steps=(),
+            final_audit_steps=(),
+            evaluation_liveness_guard_enabled=True,
+            evaluation_guard_min_liveness_episodes=16,
+            evaluation_guard_liveness_baseline_failures=0,
+            evaluation_guard_liveness_baseline_episodes=16,
+            evaluation_guard_min_liveness_regression_rate=0.20,
+            evaluation_guard_enforcement_start_steps=3,
+            evaluation_guard_failure_action="stop",
+            evaluation_guard_max_rollbacks=0,
+        ),
+    )
+    failure_counts = iter((0, 16, 16))
+
+    def fake_evaluation(
+        _resources: object,
+        *,
+        episodes: int,
+        **_kwargs: object,
+    ) -> tuple[list[EpisodeMetrics], dict[str, object]]:
+        failures = next(failure_counts)
+        results = [_evaluation_metric(index) for index in range(episodes)]
+        return results, {
+            "greedy_liveness": {
+                "episode_count": episodes,
+                "selection_cycle_episode_rate": failures / episodes,
+                "liveness_failure_episode_count": failures,
+                "liveness_failure_episode_rate": failures / episodes,
+            }
+        }
+
+    monkeypatch.setattr(runtime_module, "_evaluate_training_gate", fake_evaluation)
+
+    state = runtime_module.run_training(config, backend=FakeCombatBackend())
+
+    # The failed gate at scheduled step 2 is consumed once and training moves
+    # forward. The step-3 failure is enforced at the next episode boundary.
+    assert state.environment_steps == 4
+    assert state.evaluation_guard_rollbacks == 0
+    metrics_path = next(
+        (tmp_path / "runs" / "v36-guard-recovery").glob("run-*/metrics.jsonl")
+    )
+    events = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    evaluations = [event for event in events if event["event"] == "evaluation"]
+    assert [event["evaluation_gate"] for event in evaluations] == [0, 2, 3]
+    grace_events = [
+        event for event in events if event["event"] == "evaluation_guard_grace_continue"
+    ]
+    assert len(grace_events) == 1
+    assert grace_events[0]["evaluation_gate"] == 2
+    assert grace_events[0]["guard_enforced"] is False
+    assert not any(event["event"] == "evaluation_guard_rollback" for event in events)
+    stopped = next(
+        event for event in events if event["event"] == "evaluation_guard_stopped"
+    )
+    assert stopped["evaluation_gate"] == 3
+    assert stopped["guard_enforced"] is True
+
+    checkpoint_root = next(
+        (tmp_path / "checkpoints" / "v36-guard-recovery").glob("run-*")
+    )
+    grace_candidate = (
+        checkpoint_root / "guard-alert-attempt-001-step-000000002"
+    )
+    assert grace_candidate.is_dir()
+    grace_metadata = json.loads(
+        (grace_candidate / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert grace_metadata["checkpoint_role"] == "guard_failure_evidence"
 
 
 def test_guard_failure_rolls_back_to_hashed_health_anchor_and_continues(

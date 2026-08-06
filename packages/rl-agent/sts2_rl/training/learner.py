@@ -1143,6 +1143,39 @@ def one_sided_policy_support_loss(
     return loss, log_gap
 
 
+def two_sided_policy_support_loss(
+    selected_log_probability: Tensor,
+    alternative_log_probability: Tensor,
+    *,
+    probability_floor: float,
+) -> tuple[Tensor, Tensor]:
+    """Keep both an action and its legal complement out of absorption.
+
+    This loss is preference-free: it is zero whenever the selected action and
+    the aggregate probability of every other legal action are both at least
+    ``probability_floor``. Outside that interval it restores only missing
+    numerical support; factual return learning decides which side should be
+    larger in a given state.
+    """
+
+    if not math.isfinite(probability_floor) or not 0.0 < probability_floor < 0.5:
+        raise ValueError(
+            "two-sided probability_floor must be finite and strictly between 0 and 0.5"
+        )
+    selected_loss, selected_gap = one_sided_policy_support_loss(
+        selected_log_probability,
+        probability_floor=probability_floor,
+    )
+    alternative_loss, alternative_gap = one_sided_policy_support_loss(
+        alternative_log_probability,
+        probability_floor=probability_floor,
+    )
+    return selected_loss + alternative_loss, torch.maximum(
+        selected_gap,
+        alternative_gap,
+    )
+
+
 def _annealed_entropy_weight(
     config: OptimizationConfig,
     *,
@@ -3427,11 +3460,36 @@ class VTraceLearner:
                     entry_action_index = trace.steps[
                         lifecycle.entry_step_index
                     ].action_index
-                    entry_log_probability = entry_output.policy_log_probabilities()[
-                        0, entry_action_index
-                    ].float()
-                    support_loss, log_gap = one_sided_policy_support_loss(
+                    entry_policy_log_probabilities = (
+                        entry_output.policy_log_probabilities()[0].float()
+                    )
+                    entry_log_probability = entry_policy_log_probabilities[
+                        entry_action_index
+                    ]
+                    entry_snapshot = trace.steps[
+                        lifecycle.entry_step_index
+                    ].snapshot
+                    alternative_action_indices = [
+                        index
+                        for index, enabled in enumerate(entry_snapshot.action_mask)
+                        if bool(enabled) and index != entry_action_index
+                    ]
+                    if not alternative_action_indices:
+                        raise RuntimeError(
+                            "transaction lifecycle support entry has no legal alternative"
+                        )
+                    alternative_indices = torch.tensor(
+                        alternative_action_indices,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    alternative_log_probability = torch.logsumexp(
+                        entry_policy_log_probabilities[alternative_indices],
+                        dim=0,
+                    )
+                    support_loss, log_gap = two_sided_policy_support_loss(
                         entry_log_probability,
+                        alternative_log_probability,
                         probability_floor=(
                             self.transaction_config.lifecycle_entry_support_probability_floor
                         ),
@@ -3647,4 +3705,5 @@ __all__ = [
     "compile_liveness_label_manifest",
     "liveness_credit_losses",
     "one_sided_policy_support_loss",
+    "two_sided_policy_support_loss",
 ]

@@ -36,11 +36,17 @@ def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None
     transaction_learning.pop("lifecycle_smdp_q_weight")
 
 
+def _remove_v16_guard_field(payload: dict[str, object]) -> None:
+    runtime = payload["runtime"]
+    assert isinstance(runtime, dict)
+    runtime.pop("evaluation_guard_enforcement_start_steps")
+
+
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v15"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v16"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -518,6 +524,15 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
             evaluation_steps=(),
             evaluation_liveness_guard_enabled=True,
         )
+    with pytest.raises(ValueError, match="enforcement_start_steps requires"):
+        RuntimeConfig(evaluation_guard_enforcement_start_steps=5_000)
+    bounded_guard = RuntimeConfig(
+        evaluation_liveness_guard_enabled=True,
+        evaluation_guard_enforcement_start_steps=10_000,
+        evaluation_guard_failure_action="stop",
+        evaluation_guard_max_rollbacks=0,
+    )
+    assert bounded_guard.evaluation_guard_enforcement_start_steps == 10_000
     with pytest.raises(ValueError, match="entropy_weight_end"):
         OptimizationConfig(entropy_weight=0.01, entropy_weight_end=0.02)
 
@@ -659,6 +674,7 @@ def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
 def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
     source.pop("transaction_exploration")
@@ -690,6 +706,7 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
 def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v11"
+    _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
     source.pop("transaction_exploration")
@@ -705,6 +722,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
 def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v13"
+    _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("transaction_exploration")
 
@@ -726,6 +744,7 @@ def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
 def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v14"
+    _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
 
     with pytest.raises(ValueError, match="unsupported training config version"):
@@ -740,6 +759,28 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     unexpected = TrainingConfig().to_mapping()
     unexpected["version"] = "sts2-relational-curriculum-config-v14"
     with pytest.raises(ValueError, match="unexpectedly contains V15"):
+        model_initialization_config_from_mapping(unexpected)
+
+
+def test_v15_guard_recovery_migration_is_model_init_only() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v15"
+    _remove_v16_guard_field(source)
+
+    with pytest.raises(ValueError, match="unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.runtime.evaluation_guard_enforcement_start_steps == 0
+    assert (
+        migrated.transaction_learning.lifecycle_entry_support_probability_floor
+        == TrainingConfig().transaction_learning.lifecycle_entry_support_probability_floor
+    )
+
+    unexpected = TrainingConfig().to_mapping()
+    unexpected["version"] = "sts2-relational-curriculum-config-v15"
+    with pytest.raises(ValueError, match="V16 evaluation guard"):
         model_initialization_config_from_mapping(unexpected)
 
 
@@ -789,10 +830,10 @@ def test_transaction_lifecycle_loss_contract_is_bounded_and_opt_in() -> None:
         lifecycle_smdp_q_weight=0.10,
     )
     assert enabled.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
-    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+    with pytest.raises(ValueError, match="strictly between 0 and 0.5"):
         replace(enabled, lifecycle_entry_support_probability_floor=0.0)
-    with pytest.raises(ValueError, match="strictly between 0 and 1"):
-        replace(enabled, lifecycle_entry_support_probability_floor=1.0)
+    with pytest.raises(ValueError, match="strictly between 0 and 0.5"):
+        replace(enabled, lifecycle_entry_support_probability_floor=0.5)
     with pytest.raises(ValueError, match="require transaction_learning.enabled"):
         TransactionLearningConfig(
             enabled=False,

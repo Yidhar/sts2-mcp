@@ -128,14 +128,17 @@ sts2_rl.train
   logits directly: completed unique factual steps are preferred and exact
   repeated semantic node/action cycles are avoided. Deselect stays legal; no
   action rewrite, prompt/card ID rule, or forced confirmation is allowed.
-- A verified upgrade/removal lifecycle may restore support to the exact factual
-  entry action with a one-sided log-probability objective. The objective must
-  have finite gradient after probability underflow and become exactly zero at
-  its configured support floor. Cancelled, unresolved and deadlocked
-  lifecycles are never positive entry labels. Entry value uses only the
-  factual option reward/discount and a detached factual post-state bootstrap;
-  it must not add an upgrade/removal reward bonus or turn an auxiliary Q value
-  into an action rewrite.
+- A verified upgrade/removal lifecycle may restore numerical support with a
+  two-sided legal-policy corridor: the factual entry and the aggregate of all
+  other legal actions must each retain the configured minimum probability.
+  The objective must have finite gradient after probability underflow and
+  become exactly zero once both sides are inside the corridor. It must not
+  encode whether upgrade/removal or its alternative is strategically better;
+  that contextual preference belongs to factual return/Q learning. Cancelled,
+  unresolved and deadlocked lifecycles are never positive entry labels. Entry
+  value uses only the factual option reward/discount and a detached factual
+  post-state bootstrap; it must not add an upgrade/removal reward bonus or turn
+  an auxiliary Q value into an action rewrite.
 - Evaluation uses generic semantic state/action recurrence detection and writes
   diagnostic trajectories; diagnostics never become training samples.
 

@@ -866,6 +866,30 @@ def _evaluation_attempt_number(state: TrainingState) -> int:
     return state.evaluation_guard_rollbacks + 1
 
 
+def _evaluation_guard_is_enforced(
+    config: TrainingConfig,
+    *,
+    evaluation_gate: int,
+) -> bool:
+    """Return whether a failed scheduled gate may alter control flow.
+
+    Compare the scheduled gate, not the episode-boundary step where evaluation
+    actually runs, so a long episode cannot turn a diagnostic gate into an
+    enforced one.
+    """
+
+    if (
+        isinstance(evaluation_gate, bool)
+        or not isinstance(evaluation_gate, int)
+        or evaluation_gate < 0
+    ):
+        raise ValueError("evaluation gate must be a non-negative integer")
+    return (
+        evaluation_gate
+        >= config.runtime.evaluation_guard_enforcement_start_steps
+    )
+
+
 def _evaluation_journal_name(journal_kind: str, step: int, *, attempt: int) -> str:
     """Name one immutable evaluation attempt without mixing rollback branches."""
 
@@ -905,6 +929,8 @@ def _checkpoint_role_for_prefix(prefix: str) -> str:
     if prefix in {"guard-alert", "guard-stop", "guard-stop-gate-zero"} or prefix.startswith(
         "guard-alert-attempt-"
     ):
+        return "guard_failure_evidence"
+    if prefix == "guard-grace-gate-zero":
         return "guard_failure_evidence"
     if prefix == "deadlock-streak-alert":
         return "deadlock_alert_evidence"
@@ -1372,6 +1398,10 @@ def run_training(
                 },
             )
             if guard.get("stop_requested") is True:
+                guard_enforced = _evaluation_guard_is_enforced(
+                    config,
+                    evaluation_gate=evaluation_step,
+                )
                 stop = {
                     "evaluation_gate": evaluation_step,
                     "evaluation_attempt": context["evaluation_attempt"],
@@ -1382,8 +1412,19 @@ def run_training(
                     "liveness_guard": guard,
                     "policy_version": state.policy_version,
                     "policy_model_state_sha256": context["policy_model_state_sha256"],
+                    "guard_enforced": guard_enforced,
+                    "evaluation_guard_enforcement_start_steps": (
+                        config.runtime.evaluation_guard_enforcement_start_steps
+                    ),
                 }
-                metrics.write("evaluation_guard_stop_requested", stop)
+                metrics.write(
+                    (
+                        "evaluation_guard_stop_requested"
+                        if guard_enforced
+                        else "evaluation_guard_grace_requested"
+                    ),
+                    stop,
+                )
                 return stop
             return None
 
@@ -1527,11 +1568,17 @@ def run_training(
             return None, guarded_evaluation_ran
 
         if gate_zero_ran:
-            gate_zero_prefix = (
-                "guard-stop-gate-zero"
-                if evaluation_guard_stop is not None
-                else "healthy-gate-zero"
+            gate_zero_guard_enforced = bool(
+                evaluation_guard_stop is not None
+                and evaluation_guard_stop.get("guard_enforced") is True
             )
+            gate_zero_prefix = "healthy-gate-zero"
+            if evaluation_guard_stop is not None:
+                gate_zero_prefix = (
+                    "guard-stop-gate-zero"
+                    if gate_zero_guard_enforced
+                    else "guard-grace-gate-zero"
+                )
             gate_zero_checkpoint = _save(
                 resources,
                 config=config,
@@ -1558,6 +1605,17 @@ def run_training(
                         "state": asdict(state),
                     },
                 )
+            elif not gate_zero_guard_enforced:
+                metrics.write(
+                    "evaluation_guard_grace_continue",
+                    {
+                        **evaluation_guard_stop,
+                        "checkpoint": str(gate_zero_checkpoint),
+                        "state": asdict(state),
+                        "evaluation_state": current_evaluation_state().to_mapping(),
+                    },
+                )
+                evaluation_guard_stop = None
             else:
                 metrics.write(
                     "evaluation_guard_stopped",
@@ -2326,6 +2384,9 @@ def run_training(
 
                 evaluation_guard_stop, guarded_evaluation_ran = run_due_evaluations()
                 if evaluation_guard_stop is not None:
+                    guard_enforced = (
+                        evaluation_guard_stop.get("guard_enforced") is True
+                    )
                     guard_attempt = _evaluation_attempt_number(state)
                     guard_alert_checkpoint = _save(
                         resources,
@@ -2342,7 +2403,8 @@ def run_training(
                         runtime_provenance=runtime_provenance,
                     )
                     rollback_available = bool(
-                        config.runtime.evaluation_guard_failure_action
+                        guard_enforced
+                        and config.runtime.evaluation_guard_failure_action
                         == "rollback_continue"
                         and last_healthy_checkpoint is not None
                         and state.evaluation_guard_rollbacks
@@ -2362,6 +2424,24 @@ def run_training(
                             ),
                         },
                     )
+                    if not guard_enforced:
+                        parent_checkpoint = guard_alert_checkpoint
+                        load_mode = "in_process_successor"
+                        metrics.write(
+                            "evaluation_guard_grace_continue",
+                            {
+                                **evaluation_guard_stop,
+                                "checkpoint": str(guard_alert_checkpoint),
+                                "state": asdict(state),
+                                "evaluation_state": (
+                                    current_evaluation_state().to_mapping()
+                                ),
+                            },
+                        )
+                        evaluation_guard_stop = None
+                        maintenance_requested = False
+                        pipeline.resume()
+                        continue
                     if rollback_available:
                         if last_healthy_checkpoint is None:  # pragma: no cover - guarded above
                             raise RuntimeError("evaluation rollback lost its healthy checkpoint")

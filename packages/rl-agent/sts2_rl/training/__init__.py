@@ -69,6 +69,7 @@ from .learner import (
     compile_liveness_label_manifest,
     liveness_credit_losses,
     one_sided_policy_support_loss,
+    two_sided_policy_support_loss,
 )
 from .pipeline import ActorLearnerPipeline
 from .runtime import (
@@ -172,4 +173,5 @@ __all__ = [
     "summarize_evaluation",
     "training_config_from_mapping",
     "training_schedule_state_from_metadata",
+    "two_sided_policy_support_loss",
 ]

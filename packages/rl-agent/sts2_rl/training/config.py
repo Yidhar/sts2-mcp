@@ -17,12 +17,13 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v15"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v16"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V13 = "sts2-relational-curriculum-config-v13"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V14 = "sts2-relational-curriculum-config-v14"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V15 = "sts2-relational-curriculum-config-v15"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -352,10 +353,11 @@ class TransactionLearningConfig:
     # shared legal-candidate policy directly. This is not a reward, action mask,
     # action rewrite, or card/prompt-specific rule.
     completion_policy_weight: float = 0.25
-    # A verified upgrade/removal lifecycle receives a one-sided policy-support
-    # target at the action that opened the transaction. Unlike permanent CE,
-    # this loss becomes exactly zero once the model assigns the configured
-    # minimum probability, leaving strategic preference to return/Q learning.
+    # A verified upgrade/removal lifecycle receives a two-sided support
+    # corridor at the action that opened the transaction: both the entry and
+    # the aggregate of its legal alternatives retain a minimum probability.
+    # The loss is exactly zero inside the corridor, so it cannot decide when to
+    # upgrade/remove; factual long-horizon return learning owns that preference.
     lifecycle_entry_support_weight: float = 0.0
     lifecycle_entry_support_probability_floor: float = 0.05
     # Semi-Markov entry-Q target: factual reward over the whole transaction,
@@ -406,10 +408,10 @@ class TransactionLearningConfig:
                 label=f"transaction_learning.{name}",
                 minimum=0.0,
             )
-        if not 0.0 < self.lifecycle_entry_support_probability_floor < 1.0:
+        if not 0.0 < self.lifecycle_entry_support_probability_floor < 0.5:
             raise ValueError(
                 "transaction_learning.lifecycle_entry_support_probability_floor "
-                "must be strictly between 0 and 1"
+                "must be strictly between 0 and 0.5"
             )
         if not self.enabled and (
             self.lifecycle_entry_support_weight > 0.0
@@ -967,6 +969,11 @@ class RuntimeConfig:
     evaluation_guard_liveness_baseline_episodes: int = 0
     evaluation_guard_min_liveness_regression_rate: float = 0.0
     training_deadlock_streak_alert_episodes: int = 0
+    # Failed gates below this scheduled step are checkpointed/reported and
+    # consumed, but cannot stop or roll back the lineage. This is an explicitly
+    # bounded recovery phase, not a retry loop; at/above the boundary the
+    # configured guard action is enforced.
+    evaluation_guard_enforcement_start_steps: int = 0
     evaluation_guard_failure_action: Literal["stop", "rollback_continue"] = "stop"
     evaluation_guard_max_rollbacks: int = 0
 
@@ -999,6 +1006,7 @@ class RuntimeConfig:
             "evaluation_guard_liveness_baseline_failures",
             "evaluation_guard_liveness_baseline_episodes",
             "training_deadlock_streak_alert_episodes",
+            "evaluation_guard_enforcement_start_steps",
             "evaluation_guard_max_rollbacks",
         ):
             _require_int(
@@ -1076,6 +1084,14 @@ class RuntimeConfig:
                 raise ValueError("rollback_continue requires the evaluation liveness guard")
             if self.evaluation_guard_max_rollbacks <= 0:
                 raise ValueError("rollback_continue requires evaluation_guard_max_rollbacks > 0")
+        if (
+            self.evaluation_guard_enforcement_start_steps > 0
+            and not self.evaluation_liveness_guard_enabled
+        ):
+            raise ValueError(
+                "runtime evaluation_guard_enforcement_start_steps requires "
+                "the evaluation liveness guard"
+            )
         if (
             not isinstance(self.log_dir, str)
             or not isinstance(self.checkpoint_dir, str)
@@ -1323,6 +1339,7 @@ class TrainingConfig:
             "evaluation_guard_liveness_baseline_episodes",
             "evaluation_guard_min_liveness_regression_rate",
             "training_deadlock_streak_alert_episodes",
+            "evaluation_guard_enforcement_start_steps",
             "evaluation_guard_failure_action",
             "evaluation_guard_max_rollbacks",
         ):
@@ -1436,8 +1453,10 @@ def model_initialization_config_from_mapping(
     V12 adds the independent liveness-credit model/loss ABI. V13 hardens its
     optimization/runtime semantics. V14 adds an explicit, training-only
     transaction exploration contract. V15 adds authoritative transaction
-    lifecycle replay and entry-support/SMDP loss controls. The new lifecycle
-    heads use the already reviewed optional transaction-head migration gate.
+    lifecycle replay and entry-support/SMDP loss controls. V16 replaces the
+    one-sided entry floor with a two-sided support corridor and adds a bounded,
+    non-destructive evaluation-guard recovery phase. The lifecycle heads use
+    the already reviewed optional transaction-head migration gate.
     V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
     head is freshly initialized by the reviewed checkpoint overlay.  V10 also
@@ -1459,6 +1478,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V12,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V13,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1486,7 +1506,10 @@ def model_initialization_config_from_mapping(
         # A legacy checkpoint can provide compatible shared model parameters,
         # but it cannot claim the new semantic/evidence/replay contract.
         migrated["failure_credit"] = {"mode": "disabled"}
-    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V14:
+    if source_version not in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
+    }:
         if "transaction_exploration" in payload:
             raise ValueError(
                 "pre-V14 model-initialization config unexpectedly contains a "
@@ -1507,15 +1530,32 @@ def model_initialization_config_from_mapping(
         "lifecycle_entry_support_probability_floor",
         "lifecycle_smdp_q_weight",
     }
-    unexpected_lifecycle_fields = lifecycle_fields.intersection(
-        transaction_learning
-    )
-    if unexpected_lifecycle_fields:
+    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V15:
+        unexpected_lifecycle_fields = lifecycle_fields.intersection(
+            transaction_learning
+        )
+        if unexpected_lifecycle_fields:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains V15 transaction lifecycle fields: "
+                + ", ".join(sorted(unexpected_lifecycle_fields))
+            )
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise ValueError(
+            f"{source_version} model-initialization config has no runtime table"
+        )
+    if "evaluation_guard_enforcement_start_steps" in runtime:
         raise ValueError(
             f"{source_version} model-initialization config unexpectedly "
-            "contains V15 transaction lifecycle fields: "
-            + ", ".join(sorted(unexpected_lifecycle_fields))
+            "contains the V16 evaluation guard enforcement boundary"
         )
+    # Pre-V16 configs enforced every guard exactly as before. A successor
+    # recipe may opt into a non-zero recovery phase only after migration.
+    migrated["runtime"] = {
+        **dict(runtime),
+        "evaluation_guard_enforcement_start_steps": 0,
+    }
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 

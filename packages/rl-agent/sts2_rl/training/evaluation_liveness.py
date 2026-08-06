@@ -334,6 +334,16 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
             _shop_item_category(action) == "card_removal"
             for action in tail_actions
         )
+        # Choosing a rest-site option and later cancelling a card selection is
+        # authoritative evidence that the option opened a transaction. A
+        # normal HP rest exits the room and cannot produce this same cycle.
+        has_rest_site_transaction_entry = "choose_rest_option" in tail_kinds
+        has_transaction_cancel_cycle = bool(
+            cycle_span is not None
+            and cycle_span > 0
+            and "cancel_selection" in tail_kinds
+            and (has_card_removal_purchase or has_rest_site_transaction_entry)
+        )
         if (
             cycle_span is not None
             and cycle_span > 0
@@ -351,11 +361,12 @@ def summarize_greedy_liveness_journal(path: str | Path) -> dict[str, Any]:
         )
         if (
             cycle_span is not None
-            and cycle_span <= 2
+            and cycle_span > 0
             and (
                 _kind(last.get("selected_action"))
                 in {"select_card", "deselect_card", "confirm_selection"}
                 or alternating_selection_tail
+                or has_transaction_cancel_cycle
             )
         ):
             selection_cycle_episodes += 1

@@ -411,9 +411,12 @@ Upgrade/removal competence uses a separate authoritative lifecycle contract.
 The trace includes the exact factual action that opened the service, the complete
 selection suffix, and either a verified deck mutation plus factual post-state or
 a cancelled/unresolved/deadlock result. Only a verified commit may receive a
-one-sided normalized log-probability support target. This target remains
-differentiable after softmax probability underflow and becomes exactly zero at
-its configured support floor; it does not permanently clone the guided behavior.
+two-sided normalized log-probability support corridor. The factual entry and the
+aggregate of every other legal action each retain a configured minimum; the
+target remains differentiable after softmax probability underflow and becomes
+exactly zero when both sides are inside the corridor. It therefore prevents both
+all-rest and all-service absorption without permanently cloning the guided
+behavior or deciding the contextual rest/forge/removal preference.
 The same verified lifecycle may train a semi-Markov entry Q target from the
 already-versioned reward/discount sequence and a detached factual post-state
 value. No service bonus, legality rewrite, or Q-driven action override is allowed.

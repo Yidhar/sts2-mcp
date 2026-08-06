@@ -57,7 +57,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 def test_v34_recipe_enables_only_reviewed_transaction_exploration() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v15"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v16"
     explorer = config.transaction_exploration
     assert explorer.enabled
     assert explorer.operations == ("remove", "upgrade")

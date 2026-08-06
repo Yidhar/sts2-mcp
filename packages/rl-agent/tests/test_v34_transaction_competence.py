@@ -17,6 +17,7 @@ from sts2_rl.training import (
     factual_transaction_policy_targets,
     one_sided_policy_support_loss,
     summarize_evaluation,
+    two_sided_policy_support_loss,
 )
 from sts2_rl.training.collector import (
     _branch_balanced_epsilon_behavior,
@@ -449,6 +450,47 @@ def test_one_sided_entry_support_recovers_from_softmax_absorption_and_stops_at_f
     assert supported_gap.detach().item() == pytest.approx(0.0)
     assert supported_logits.grad is not None
     assert supported_logits.grad.tolist() == pytest.approx([0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    ("logits", "selected_index", "expected_gradient"),
+    (
+        ([80.0, -80.0], 1, [1.0, -1.0]),
+        ([80.0, -80.0], 0, [1.0, -1.0]),
+    ),
+)
+def test_two_sided_entry_support_recovers_either_absorbed_branch(
+    logits: list[float],
+    selected_index: int,
+    expected_gradient: list[float],
+) -> None:
+    values = torch.tensor(logits, requires_grad=True)
+    log_probabilities = torch.log_softmax(values, dim=0)
+    alternative_index = 1 - selected_index
+    loss, gap = two_sided_policy_support_loss(
+        log_probabilities[selected_index],
+        log_probabilities[alternative_index],
+        probability_floor=0.05,
+    )
+    loss.backward()
+
+    assert loss.detach().item() > 100.0
+    assert gap.detach().item() > 100.0
+    assert values.grad is not None
+    assert values.grad.tolist() == pytest.approx(expected_gradient)
+
+    supported = torch.tensor([0.0, 0.0], requires_grad=True)
+    supported_log_probabilities = torch.log_softmax(supported, dim=0)
+    supported_loss, supported_gap = two_sided_policy_support_loss(
+        supported_log_probabilities[0],
+        supported_log_probabilities[1],
+        probability_floor=0.05,
+    )
+    supported_loss.backward()
+    assert supported_loss.detach().item() == pytest.approx(0.0)
+    assert supported_gap.detach().item() == pytest.approx(0.0)
+    assert supported.grad is not None
+    assert supported.grad.tolist() == pytest.approx([0.0, 0.0])
 
 
 @pytest.mark.parametrize(

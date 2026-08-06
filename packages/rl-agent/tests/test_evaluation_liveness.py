@@ -436,9 +436,9 @@ def test_three_step_shop_removal_cancel_cycle_is_a_liveness_failure(
     assert summary["liveness_failure_episode_count"] == 11
     assert summary["liveness_failure_episode_rate"] == 11 / 16
     assert summary["card_removal_cancel_cycle_episode_count"] == 11
-    # The old <=2 selection-only detector intentionally does not own this
-    # cross-surface shop -> select -> cancel transaction cycle.
-    assert summary["selection_cycle_episode_count"] == 0
+    # Cross-surface shop -> select -> cancel is still a selection-transaction
+    # cycle even though its minimal period is three rather than two.
+    assert summary["selection_cycle_episode_count"] == 11
 
     guard = evaluate_liveness_guard(
         summary,
@@ -453,6 +453,56 @@ def test_three_step_shop_removal_cancel_cycle_is_a_liveness_failure(
         item["kind"] == "liveness_failure_collapse"
         for item in guard["violations"]
     )
+
+
+def test_rest_forge_entry_cancel_cycle_is_a_selection_liveness_failure(
+    tmp_path: Path,
+) -> None:
+    records: list[dict[str, object]] = []
+    for episode in range(16):
+        deadlocked = episode < 11
+        selected_actions = (
+            (
+                {"action": "choose_rest_option", "index": 1},
+                {"action": "cancel_selection"},
+            )
+            * 8
+            if deadlocked
+            else ({"action": "proceed"},)
+        )
+        for step, selected_action in enumerate(selected_actions):
+            record = _decision(
+                episode,
+                step,
+                selected=str(selected_action["action"]),
+            )
+            record["selected_action"] = selected_action
+            if deadlocked and step == len(selected_actions) - 1:
+                record["deadlock"] = {"cycle_span": 2, "occurrences": 8}
+            records.append(record)
+
+    journal = tmp_path / "rest-forge-cancel-cycle.jsonl"
+    journal.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary = summarize_greedy_liveness_journal(journal)
+    assert summary["episode_count"] == 16
+    assert summary["cycle_episode_count"] == 11
+    assert summary["selection_cycle_episode_count"] == 11
+    assert summary["liveness_failure_episode_count"] == 11
+    assert summary["liveness_failure_episode_rate"] == 11 / 16
+
+    guard = evaluate_liveness_guard(
+        summary,
+        RuntimeConfig(
+            evaluation_steps=(10_000,),
+            evaluation_episodes=16,
+            evaluation_liveness_guard_enabled=True,
+        ),
+    )
+    assert guard["stop_requested"] is True
 
 
 def test_liveness_guard_uses_frozen_baseline_before_stopping() -> None:
