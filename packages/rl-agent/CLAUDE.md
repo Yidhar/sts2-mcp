@@ -92,10 +92,13 @@ sts2_rl.train
   curriculum truncations. The short binary/schema/runtime-mechanics preflight
   validates transport facts only; it does not score a policy.
 - Forced singleton actions generate no policy target or policy-gradient term.
-- Main V-trace data is consumed once in FIFO order. Two bounded,
+- Main V-trace data is consumed once in FIFO order. Three bounded,
   training-partition-only sidecars are maintained. Transaction replay stores
-  factual select/deselect/confirm/cancel transitions. Complete-episode replay
+  factual select/deselect/confirm/cancel transitions plus authoritative
+  upgrade/removal entry-to-exit lifecycle evidence. Complete-episode replay
   stores immutable CPU snapshots and authoritative combat/Act/run outcomes;
+  failure-credit replay stores versioned liveness evidence and matched factual
+  outcomes;
   it never retains GPU tensors, hidden states, autograd graphs, held-out
   diagnostics, or fabricated counterfactual actions.
 - With complete-episode replay enabled, runtime may retain exactly one fetched
@@ -125,6 +128,14 @@ sts2_rl.train
   logits directly: completed unique factual steps are preferred and exact
   repeated semantic node/action cycles are avoided. Deselect stays legal; no
   action rewrite, prompt/card ID rule, or forced confirmation is allowed.
+- A verified upgrade/removal lifecycle may restore support to the exact factual
+  entry action with a one-sided log-probability objective. The objective must
+  have finite gradient after probability underflow and become exactly zero at
+  its configured support floor. Cancelled, unresolved and deadlocked
+  lifecycles are never positive entry labels. Entry value uses only the
+  factual option reward/discount and a detached factual post-state bootstrap;
+  it must not add an upgrade/removal reward bonus or turn an auxiliary Q value
+  into an action rewrite.
 - Evaluation uses generic semantic state/action recurrence detection and writes
   diagnostic trajectories; diagnostics never become training samples.
 
@@ -138,11 +149,11 @@ never appear in logs.
 All mutable output lives below `STS2_ARTIFACT_ROOT`, outside the checkout.
 Checkpoint publication is atomic and hashes learner model, actor model, optimizer,
 the pending rollout queue, bounded transaction replay, bounded complete-episode
-replay (when enabled), and metadata. Exact resume
+replay, bounded failure-credit replay (when enabled), and metadata. Exact resume
 rejects contract, reward projection, dependency lock, encoding, model/config or
 payload drift; optional static catalog provenance is not a gate. A declared
 `model_parameter_initialization` may inherit only shape-compatible network tensors
-into a new lineage; optimizer, queue, RNG, counters, and both replay sidecars reset.
+into a new lineage; optimizer, queue, RNG, counters, and all replay sidecars reset.
 Older compatible checkpoints may initialize all shared network tensors while
 the complete all-or-none long-horizon head group starts fresh; this is never
 reported as exact resume.

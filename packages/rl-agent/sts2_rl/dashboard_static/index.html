@@ -1898,9 +1898,30 @@
         reason: "原因",
         deadlock: "Deadlock",
         stall_failure: "净进展停滞",
-        loss: "总损失",
-        total_loss: "总损失",
-        learner_loss: "学习器损失",
+        loss: "有符号复合目标",
+        total_loss: "有符号复合目标",
+        learner_loss: "有符号复合目标",
+        online_objective_loss: "在线 V-trace 目标",
+        transaction_objective_loss: "事务目标",
+        liveness_objective_loss: "Liveness 目标",
+        episodic_objective_loss: "长视界目标",
+        transaction_entry_support_loss: "入口支持损失",
+        transaction_smdp_q_loss: "入口 SMDP-Q 损失",
+        transaction_entry_support_labels: "入口支持标签",
+        transaction_entry_support_satisfied_labels: "已达支持下限",
+        transaction_smdp_q_labels: "入口 SMDP-Q 标签",
+        transaction_lifecycle_committed: "事务提交证据",
+        transaction_lifecycle_cancelled: "事务取消证据",
+        transaction_lifecycle_unresolved: "事务未决证据",
+        transaction_lifecycle_deadlock: "事务死锁证据",
+        transaction_entry_model_probability_mean: "入口当前模型概率",
+        transaction_entry_collection_model_probability_mean: "入口采集时模型概率",
+        transaction_entry_behavior_probability_mean: "入口行为概率",
+        transaction_entry_log_support_gap_mean: "入口 log 支持缺口",
+        transaction_upgrade_entry_support_labels: "锻造入口标签",
+        transaction_remove_entry_support_labels: "删牌入口标签",
+        transaction_upgrade_entry_model_probability_mean: "锻造入口模型概率",
+        transaction_remove_entry_model_probability_mean: "删牌入口模型概率",
         td_loss: "TD 损失",
         q_loss: "Q 损失",
         policy_loss: "策略损失",
@@ -3502,8 +3523,20 @@
         const latestLearner = snapshot.latest_learner || null;
         const latestActor = snapshot.latest_actor || null;
         renderKeyValues("latest-learner-kv", latestLearner, [
-          "learner_updates", "policy_version", "loss", "td_loss", "q_loss", "policy_loss",
-          "value_loss", "grad_norm", "replay_size", "batch_size", "learner_updates_per_s"
+          "learner_updates", "policy_version", "loss", "online_objective_loss",
+          "transaction_objective_loss", "liveness_objective_loss", "episodic_objective_loss",
+          "policy_loss", "value_loss", "transaction_entry_support_loss",
+          "transaction_smdp_q_loss", "transaction_entry_support_labels",
+          "transaction_entry_support_satisfied_labels", "transaction_smdp_q_labels",
+          "transaction_lifecycle_committed", "transaction_lifecycle_cancelled",
+          "transaction_lifecycle_unresolved", "transaction_lifecycle_deadlock",
+          "transaction_entry_model_probability_mean",
+          "transaction_entry_collection_model_probability_mean",
+          "transaction_entry_behavior_probability_mean", "transaction_entry_log_support_gap_mean",
+          "transaction_upgrade_entry_support_labels", "transaction_remove_entry_support_labels",
+          "transaction_upgrade_entry_model_probability_mean",
+          "transaction_remove_entry_model_probability_mean", "grad_norm",
+          "learner_updates_per_s"
         ]);
         renderKeyValues("latest-actor-kv", latestActor, [
           "environment_steps", "actor_steps", "collector_steps", "env_steps_per_s",
@@ -3521,17 +3554,38 @@
         );
 
         const learnerSeries = Array.isArray(snapshot.learner_series) ? snapshot.learner_series : [];
-        const lossPoints = [];
+        const objectiveFields = [
+          ["loss", "有符号复合目标", "--series-4"],
+          ["online_objective_loss", "在线 V-trace", "--series-1"],
+          ["transaction_objective_loss", "事务", "--series-2"],
+          ["liveness_objective_loss", "Liveness", "--series-3"],
+          ["episodic_objective_loss", "长视界", "--series-5"]
+        ];
+        const objectivePoints = Object.fromEntries(objectiveFields.map(([field]) => [field, []]));
         learnerSeries.forEach((item, index) => {
           const x = finite(first(item, ["learner_updates", "update", "update_step", "environment_steps"], index));
-          const y = finite(first(item, ["loss", "total_loss", "learner_loss", "td_loss", "q_loss"], null));
-          if (x != null && y != null) {
-            lossPoints.push({ x, y, meta: `更新 ${int(x)}：损失 ${decimal(y, 5)}` });
-          }
+          if (x == null) return;
+          objectiveFields.forEach(([field, label]) => {
+            const fallback = field === "loss" ? ["loss", "total_loss", "learner_loss"] : [field];
+            const y = finite(first(item, fallback, null));
+            if (y != null) {
+              objectivePoints[field].push({ x, y, meta: `更新 ${int(x)}：${label} ${decimal(y, 5)}` });
+            }
+          });
         });
-        renderLineChart("learner-chart", [
-          { label: "训练损失", color: "--series-4", points: lossPoints }
-        ], { xLabel: "学习器更新", yLabel: "损失", empty: "学习器记录损失后显示趋势" });
+        renderLineChart(
+          "learner-chart",
+          objectiveFields.map(([field, label, color]) => ({
+            label,
+            color,
+            points: objectivePoints[field]
+          })),
+          {
+            xLabel: "学习器更新",
+            yLabel: "有符号目标值（不可按单调下降解读）",
+            empty: "学习器记录目标分量后显示趋势"
+          }
+        );
       }
 
       function checkpointValue(item, keys, fallback = null) {

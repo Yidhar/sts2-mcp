@@ -35,8 +35,9 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v3"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v3"
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v4"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v4"
+TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v1"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -68,6 +69,139 @@ class TransactionPolicyTarget(IntEnum):
 
     AVOID = 0
     PREFER = 1
+
+
+class TransactionLifecycleOutcome(IntEnum):
+    """Authoritative result of an entry -> selection -> exit lifecycle."""
+
+    COMMITTED = 0
+    CANCELLED = 1
+    UNRESOLVED = 2
+    DEADLOCK = 3
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionLifecycleEvidence:
+    """Factual evidence linking a rare transaction entrance to its result.
+
+    The selected entry remains a normal legal action.  This DTO records the
+    exact recurrent trace position, behavior probability and authoritative
+    post-condition needed to recover policy support without introducing a
+    card-specific reward or rewriting the action mask.  Only a verified
+    ``COMMITTED`` lifecycle may produce the one-sided entry-support target or
+    the semi-Markov entry-Q target.
+    """
+
+    operation: str
+    entry_step_index: int
+    exit_step_index: int
+    entry_behavior_log_probability: float
+    entry_model_probability: float
+    entry_policy_version: int
+    entry_action_fingerprint: str
+    outcome: TransactionLifecycleOutcome
+    effect_verified: bool
+    post_snapshot: EncodedDecisionSnapshot | None = None
+    post_terminal: bool = False
+    option_return: float | None = None
+    option_discount: float | None = None
+    option_steps: int | None = None
+    version: str = TRANSACTION_LIFECYCLE_VERSION
+
+    def __post_init__(self) -> None:
+        operation = str(self.operation).strip().lower()
+        if operation not in {"upgrade", "remove"}:
+            raise ValueError("transaction lifecycle operation must be upgrade or remove")
+        object.__setattr__(self, "operation", operation)
+        for label, value in (
+            ("entry_step_index", self.entry_step_index),
+            ("exit_step_index", self.exit_step_index),
+            ("entry_policy_version", self.entry_policy_version),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"transaction lifecycle {label} must be a non-negative integer")
+        if self.exit_step_index < self.entry_step_index:
+            raise ValueError("transaction lifecycle exit precedes its entry")
+        behavior_log_probability = _finite(
+            self.entry_behavior_log_probability,
+            label="entry_behavior_log_probability",
+        )
+        if behavior_log_probability > 1.0e-7:
+            raise ValueError("transaction lifecycle behavior log probability must be <= 0")
+        model_probability = _finite(
+            self.entry_model_probability,
+            label="entry_model_probability",
+        )
+        if not 0.0 <= model_probability <= 1.0:
+            raise ValueError("transaction lifecycle model probability must be in [0, 1]")
+        _require_key(
+            self.entry_action_fingerprint,
+            label="entry_action_fingerprint",
+        )
+        if not isinstance(self.outcome, TransactionLifecycleOutcome):
+            raise TypeError("transaction lifecycle outcome has the wrong type")
+        if not isinstance(self.effect_verified, bool):
+            raise TypeError("transaction lifecycle effect_verified must be a boolean")
+        if not isinstance(self.post_terminal, bool):
+            raise TypeError("transaction lifecycle post_terminal must be a boolean")
+        if (self.outcome is TransactionLifecycleOutcome.COMMITTED) is not self.effect_verified:
+            raise ValueError("only a committed lifecycle may own a verified effect")
+        if self.outcome is TransactionLifecycleOutcome.COMMITTED:
+            if self.post_terminal:
+                if self.post_snapshot is not None:
+                    raise ValueError("terminal transaction lifecycle cannot own a post snapshot")
+            elif not isinstance(self.post_snapshot, EncodedDecisionSnapshot):
+                raise TypeError("non-terminal committed transaction lifecycle requires a post snapshot")
+        elif self.post_snapshot is not None:
+            raise ValueError("non-committed transaction lifecycle cannot own a post snapshot")
+        elif self.post_terminal:
+            raise ValueError("non-committed transaction lifecycle cannot claim a successful terminal post-state")
+
+        target_values = (
+            self.option_return,
+            self.option_discount,
+            self.option_steps,
+        )
+        if any(value is not None for value in target_values) and not all(
+            value is not None for value in target_values
+        ):
+            raise ValueError("transaction lifecycle option target must be all present or all absent")
+        if self.option_return is not None:
+            if self.outcome is not TransactionLifecycleOutcome.COMMITTED:
+                raise ValueError("only a committed lifecycle may own an option target")
+            _finite(self.option_return, label="option_return")
+            option_discount = _finite(self.option_discount, label="option_discount")
+            if not 0.0 <= option_discount <= 1.0:
+                raise ValueError("transaction lifecycle option_discount must be in [0, 1]")
+            if self.post_terminal and option_discount != 0.0:
+                raise ValueError("terminal transaction lifecycle option discount must be zero")
+            if (
+                isinstance(self.option_steps, bool)
+                or not isinstance(self.option_steps, int)
+                or self.option_steps <= 0
+            ):
+                raise ValueError("transaction lifecycle option_steps must be positive")
+        if self.version != TRANSACTION_LIFECYCLE_VERSION:
+            raise ValueError(f"unsupported transaction lifecycle version: {self.version!r}")
+
+    @property
+    def support_eligible(self) -> bool:
+        return bool(
+            self.outcome is TransactionLifecycleOutcome.COMMITTED
+            and self.effect_verified
+        )
+
+    @property
+    def option_target_observed(self) -> bool:
+        return self.option_return is not None
+
+    def storage_nbytes(self) -> int:
+        return (
+            (self.post_snapshot.storage_nbytes() if self.post_snapshot is not None else 0)
+            + len(self.operation.encode("utf-8"))
+            + len(self.entry_action_fingerprint.encode("utf-8"))
+            + 128
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +369,7 @@ class TransactionTrace:
     steps: tuple[TransactionStep, ...]
     burn_in_steps: int = 0
     outcome: TransactionOutcome = TransactionOutcome.CENSORED
+    lifecycle: TransactionLifecycleEvidence | None = None
     data_partition: str = "training"
     version: str = TRANSACTION_TRACE_VERSION
 
@@ -266,6 +401,24 @@ class TransactionTrace:
             raise TypeError("transaction trace contains a non-TransactionStep item")
         if self.burn_in_steps >= len(self.steps):
             raise ValueError("transaction burn-in must leave at least one learn step")
+        if self.lifecycle is not None:
+            if not isinstance(self.lifecycle, TransactionLifecycleEvidence):
+                raise TypeError("transaction lifecycle evidence has the wrong type")
+            lifecycle = self.lifecycle
+            if lifecycle.entry_step_index != self.burn_in_steps:
+                raise ValueError(
+                    "transaction lifecycle entry must be the first learn step after burn-in"
+                )
+            if lifecycle.exit_step_index != len(self.steps) - 1:
+                raise ValueError("transaction lifecycle exit must be the final factual step")
+            entry_step = self.steps[lifecycle.entry_step_index]
+            if (
+                entry_step.action_fingerprint
+                != lifecycle.entry_action_fingerprint
+            ):
+                raise ValueError("transaction lifecycle entry action fingerprint differs from trace")
+            if lifecycle.entry_policy_version != self.policy_version:
+                raise ValueError("transaction lifecycle policy version differs from trace")
         object.__setattr__(self, "initial_recurrent_state", _owned_state(self.initial_recurrent_state))
         if bool(np.count_nonzero(self.initial_recurrent_state)):
             raise ValueError("transaction replay requires zero initial state and current-network burn-in")
@@ -281,6 +434,11 @@ class TransactionTrace:
             + len(self.trace_id.encode("utf-8"))
             + len(self.episode_id.encode("utf-8"))
             + len(self.surface_key.encode("utf-8"))
+            + (
+                self.lifecycle.storage_nbytes()
+                if self.lifecycle is not None
+                else 0
+            )
             + 128
         )
 
@@ -373,10 +531,20 @@ def factual_transaction_policy_targets(
                 avoided_indices.add(trace.burn_in_steps + local_index)
 
     labels: list[FactualTransactionPolicyTarget] = []
+    lifecycle_entry_index = (
+        trace.lifecycle.entry_step_index
+        if trace.lifecycle is not None
+        else None
+    )
     for step_index, step in enumerate(
         learn_steps,
         start=trace.burn_in_steps,
     ):
+        # Entry competence has a distinct one-sided support contract.  Never
+        # let the legacy completed-path CE turn it into an unbounded permanent
+        # imitation target after the configured support floor is restored.
+        if step_index == lifecycle_entry_index:
+            continue
         if int(np.count_nonzero(step.snapshot.action_mask)) <= 1:
             continue
         if step_index in avoided_indices:
@@ -476,10 +644,29 @@ def backfill_factual_monte_carlo_returns(
     if authoritative_outcome and discounts[-1] != 0.0:
         raise ValueError("authoritative episode outcome must end with zero discount")
 
+    lifecycle = trace.lifecycle
+    if lifecycle is not None and lifecycle.support_eligible:
+        entry_absolute = trace.start_step + lifecycle.entry_step_index
+        exit_absolute = trace.start_step + lifecycle.exit_step_index
+        if not 0 <= entry_absolute <= exit_absolute < len(rewards):
+            raise ValueError("transaction lifecycle option span escapes the factual episode")
+        option_return = 0.0
+        option_discount = 1.0
+        for index in range(entry_absolute, exit_absolute + 1):
+            option_return += option_discount * rewards[index]
+            option_discount *= discounts[index]
+        lifecycle = replace(
+            lifecycle,
+            option_return=option_return,
+            option_discount=option_discount,
+            option_steps=exit_absolute - entry_absolute + 1,
+        )
+
     if not authoritative_outcome:
         return replace(
             trace,
             steps=tuple(replace(step, transaction_return=None, return_steps=None) for step in trace.steps),
+            lifecycle=lifecycle,
         )
 
     returns = [0.0] * len(rewards)
@@ -501,6 +688,7 @@ def backfill_factual_monte_carlo_returns(
             )
             for offset, step in enumerate(trace.steps)
         ),
+        lifecycle=lifecycle,
     )
 
 
@@ -559,6 +747,10 @@ class BoundedTransactionReplay:
             "monotonic_completion": set(),
             "corrective_completion": set(),
         }
+        self._committed_lifecycle_trace_ids: dict[str, set[str]] = {
+            "upgrade": set(),
+            "remove": set(),
+        }
         self._storage_nbytes = 0
         self._put_count = 0
         self._sample_count = 0
@@ -593,6 +785,11 @@ class BoundedTransactionReplay:
                 # eviction remains deterministic FIFO.
                 protected_trace_ids = {
                     *self._actionable_avoid_trace_ids,
+                    *(
+                        trace_id
+                        for trace_ids in self._committed_lifecycle_trace_ids.values()
+                        for trace_id in trace_ids
+                    ),
                     *(trace_id for ids in self._selection_strata.values() for trace_id in ids),
                 }
                 eviction_index = next(
@@ -612,6 +809,8 @@ class BoundedTransactionReplay:
                 del self._items[eviction_index]
                 self._trace_ids.remove(evicted.trace_id)
                 self._actionable_avoid_trace_ids.discard(evicted.trace_id)
+                for trace_ids in self._committed_lifecycle_trace_ids.values():
+                    trace_ids.discard(evicted.trace_id)
                 for trace_ids in self._selection_strata.values():
                     trace_ids.discard(evicted.trace_id)
                 self._storage_nbytes -= evicted.storage_nbytes()
@@ -620,6 +819,10 @@ class BoundedTransactionReplay:
             self._trace_ids.add(trace.trace_id)
             if has_factual_avoid:
                 self._actionable_avoid_trace_ids.add(trace.trace_id)
+            if trace.lifecycle is not None and trace.lifecycle.support_eligible:
+                self._committed_lifecycle_trace_ids[
+                    trace.lifecycle.operation
+                ].add(trace.trace_id)
             if selection_stratum is not None:
                 self._selection_strata[selection_stratum].add(trace.trace_id)
             self._storage_nbytes += size
@@ -655,6 +858,33 @@ class BoundedTransactionReplay:
                 )
                 if candidates.size:
                     selected.append(int(self._rng.choice(candidates, size=1, replace=False)[0]))
+
+            # A verified rare transaction completion is the only source of
+            # entry-support and SMDP labels. Reserve one slot before broad
+            # sampling so abundant ordinary/event traces cannot starve it.
+            for operation in ("upgrade", "remove"):
+                lifecycle_indices = np.asarray(
+                    [
+                        index
+                        for index, item in enumerate(items)
+                        if (
+                            item.trace_id
+                            in self._committed_lifecycle_trace_ids[operation]
+                            and index not in selected
+                        )
+                    ],
+                    dtype=np.int64,
+                )
+                if lifecycle_indices.size and len(selected) < count:
+                    selected.append(
+                        int(
+                            self._rng.choice(
+                                lifecycle_indices,
+                                size=1,
+                                replace=False,
+                            )[0]
+                        )
+                    )
 
             # An exact selection cycle is itself an actionable AVOID trace and
             # gets first refusal.  If no such cycle is available, preserve the
@@ -770,6 +1000,16 @@ class BoundedTransactionReplay:
                 "selection_cycle_size": len(self._selection_strata["selection_cycle"]),
                 "selection_monotonic_completion_size": len(self._selection_strata["monotonic_completion"]),
                 "selection_corrective_completion_size": len(self._selection_strata["corrective_completion"]),
+                "committed_lifecycle_size": sum(
+                    len(trace_ids)
+                    for trace_ids in self._committed_lifecycle_trace_ids.values()
+                ),
+                "committed_upgrade_lifecycle_size": len(
+                    self._committed_lifecycle_trace_ids["upgrade"]
+                ),
+                "committed_remove_lifecycle_size": len(
+                    self._committed_lifecycle_trace_ids["remove"]
+                ),
             }
 
     def state_dict(self) -> dict[str, Any]:
@@ -831,6 +1071,15 @@ class BoundedTransactionReplay:
         except (TypeError, ValueError) as exc:
             raise ValueError("transaction replay RNG checkpoint is invalid") from exc
         actionable_avoid_trace_ids = {item.trace_id for item in items if _has_factual_avoid_target(item)}
+        committed_lifecycle_trace_ids: dict[str, set[str]] = {
+            "upgrade": set(),
+            "remove": set(),
+        }
+        for item in items:
+            if item.lifecycle is not None and item.lifecycle.support_eligible:
+                committed_lifecycle_trace_ids[item.lifecycle.operation].add(
+                    item.trace_id
+                )
         selection_strata: dict[str, set[str]] = {
             "selection_cycle": set(),
             "monotonic_completion": set(),
@@ -844,6 +1093,7 @@ class BoundedTransactionReplay:
             self._items = deque(items)
             self._trace_ids = set(ids)
             self._actionable_avoid_trace_ids = actionable_avoid_trace_ids
+            self._committed_lifecycle_trace_ids = committed_lifecycle_trace_ids
             self._selection_strata = selection_strata
             self._storage_nbytes = storage_nbytes
             self._rng.bit_generator.state = dict(payload["rng_state"])
@@ -856,12 +1106,15 @@ class BoundedTransactionReplay:
 __all__ = [
     "SELECTION_DELTA_COUNT",
     "TRANSACTION_EFFECT_COUNT",
+    "TRANSACTION_LIFECYCLE_VERSION",
     "TRANSACTION_REPLAY_VERSION",
     "TRANSACTION_TRACE_VERSION",
     "BoundedTransactionReplay",
     "FactualTransactionPolicyTarget",
     "ObservedTransactionPair",
     "TransactionEffect",
+    "TransactionLifecycleEvidence",
+    "TransactionLifecycleOutcome",
     "TransactionOutcome",
     "TransactionPolicyTarget",
     "TransactionStep",

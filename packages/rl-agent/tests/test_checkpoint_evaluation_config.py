@@ -17,6 +17,14 @@ def _v10_payload() -> dict[str, Any]:
     # current V14 mapping.
     del payload["failure_credit"]
     del payload["transaction_exploration"]
+    transaction_learning = payload["transaction_learning"]
+    assert isinstance(transaction_learning, dict)
+    for key in (
+        "lifecycle_entry_support_weight",
+        "lifecycle_entry_support_probability_floor",
+        "lifecycle_smdp_q_weight",
+    ):
+        del transaction_learning[key]
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]

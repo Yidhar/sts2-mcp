@@ -180,6 +180,43 @@ def _assert_numpy_rng_equal(left: tuple[Any, ...], right: tuple[Any, ...]) -> No
     assert left[2:] == right[2:]
 
 
+def test_transaction_lifecycle_abi_is_persisted_and_required_for_exact_resume(
+    tmp_path: Path,
+) -> None:
+    config = _transaction_config()
+    source = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        checkpoint = save_training_checkpoint(
+            tmp_path / "transaction-lifecycle-abi",
+            config=config,
+            resources=source,
+            state=TrainingState(environment_steps=11),
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source.close()
+
+    metadata_path = checkpoint / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["transaction_lifecycle_abi"] == (
+        "sts2-transaction-lifecycle-evidence-v1"
+    )
+    metadata.pop("transaction_lifecycle_abi")
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _update_manifest_entry(checkpoint, "metadata.json")
+
+    with pytest.raises(ValueError, match="lifecycle-evidence ABI"):
+        preflight_training_checkpoint(
+            checkpoint,
+            config=config,
+            resolved_device="cpu",
+            resolved_collector_device="cpu",
+        )
+
+
 def _assert_models_equal(
     actual: dict[str, torch.Tensor],
     expected: dict[str, torch.Tensor],

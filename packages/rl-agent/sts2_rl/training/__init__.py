@@ -68,6 +68,7 @@ from .learner import (
     VTraceLearner,
     compile_liveness_label_manifest,
     liveness_credit_losses,
+    one_sided_policy_support_loss,
 )
 from .pipeline import ActorLearnerPipeline
 from .runtime import (
@@ -82,6 +83,8 @@ from .transaction import (
     FactualTransactionPolicyTarget,
     ObservedTransactionPair,
     TransactionEffect,
+    TransactionLifecycleEvidence,
+    TransactionLifecycleOutcome,
     TransactionOutcome,
     TransactionPolicyTarget,
     TransactionStep,
@@ -134,6 +137,8 @@ __all__ = [
     "TransactionEffect",
     "TransactionExplorationConfig",
     "TransactionLearningConfig",
+    "TransactionLifecycleEvidence",
+    "TransactionLifecycleOutcome",
     "TransactionOutcome",
     "TransactionPolicyTarget",
     "TransactionStep",
@@ -157,6 +162,7 @@ __all__ = [
     "load_training_checkpoint",
     "load_training_config",
     "observed_outcome_pairs",
+    "one_sided_policy_support_loss",
     "preflight_model_initialization",
     "preflight_training_checkpoint",
     "resolve_device",

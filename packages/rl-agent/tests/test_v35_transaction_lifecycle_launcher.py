@@ -10,9 +10,17 @@ import pytest
 from sts2_rl.training import CONFIG_VERSION, load_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v33_stability_recovery_model_init.py"
-CONFIG = PACKAGE_ROOT / "config" / "experiments" / "full_run_revival_v33_stability_recovery_model_init.toml"
-SPEC = importlib.util.spec_from_file_location("v33_stability_recovery_launcher", SCRIPT)
+SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v35_transaction_lifecycle_model_init.py"
+CONFIG = (
+    PACKAGE_ROOT
+    / "config"
+    / "experiments"
+    / "full_run_revival_v35_transaction_lifecycle_model_init.toml"
+)
+SPEC = importlib.util.spec_from_file_location(
+    "v35_transaction_lifecycle_launcher",
+    SCRIPT,
+)
 assert SPEC is not None and SPEC.loader is not None
 launcher = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = launcher
@@ -54,48 +62,47 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
+def test_v35_recipe_enables_only_bounded_lifecycle_entry_credit() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v15"
-    assert not config.transaction_exploration.enabled
+    transaction = config.transaction_learning
+    assert transaction.enabled
+    assert transaction.effect_weight == pytest.approx(0.05)
+    assert transaction.transaction_q_weight == pytest.approx(0.0)
+    assert transaction.completion_policy_weight == pytest.approx(0.0)
+    assert transaction.pairwise_ranking_weight == pytest.approx(0.0)
+    assert transaction.lifecycle_entry_support_weight == pytest.approx(0.25)
+    assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
+    assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
+    assert transaction.replay_byte_capacity == 1_073_741_824
+    explorer = config.transaction_exploration
+    assert explorer.enabled
+    assert explorer.operations == ("remove", "upgrade")
+    assert explorer.entry_epsilon_floor == pytest.approx(0.50)
+    assert explorer.completion_guidance_probability == pytest.approx(0.95)
     assert config.curriculum.revival_budget == 64
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)
-    assert config.optimization.entropy_weight_end == pytest.approx(0.004)
-    assert config.optimization.entropy_breaker == "one-hot-v1"
-    assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)
-    assert config.failure_credit.liveness_gradient_clip_norm == pytest.approx(0.50)
-    assert config.failure_credit.sample_records == 4
-    assert config.failure_credit.liveness_records_per_autograd_batch == 4
-    assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(0.20)
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"
     assert config.runtime.total_environment_steps == 100_000
-    assert config.runtime.evaluation_steps == (0, 25_000, 50_000, 75_000)
-    assert config.runtime.evaluation_episodes == 16
-    assert config.runtime.early_evaluation_steps == (5_000, 10_000)
-    assert config.runtime.early_evaluation_episodes == 16
-    assert config.runtime.final_audit_steps == (100_000,)
-    assert config.runtime.final_audit_episodes == 64
-    assert config.runtime.training_deadlock_streak_alert_episodes == 4
-    assert config.runtime.evaluation_guard_failure_action == "rollback_continue"
-    assert config.runtime.evaluation_guard_max_rollbacks == 2
 
 
-def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
+def test_v35_is_pinned_model_initialization_from_frozen_healthy_v34(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
     command = launcher.build_resume_trainer_command(paths)
 
     assert command.count("--initialize-from") == 1
-    assert command[command.index("--initialize-from") + 1] == str(launcher.source_checkpoint_path(paths))
+    assert command[command.index("--initialize-from") + 1] == str(
+        launcher.source_checkpoint_path(paths)
+    )
     assert "--resume" not in command
-    assert launcher.SOURCE_RUN_ID == "481995a5-0221-4f59-9293-9105cd336068"
-    assert launcher.SOURCE_ENVIRONMENT_STEPS == 90_152
-    assert launcher.SOURCE_POLICY_VERSION == 1_467
-    assert launcher.SOURCE_LEARNER_UPDATES == 1_467
-    assert launcher.SOURCE_CHECKPOINT_ID == "1c0d5284-6be0-4367-a669-166f37b9b3ec"
+    assert launcher.SOURCE_RUN_ID == "795ad740-bcf6-4707-86a0-8a3b3301a13c"
+    assert launcher.SOURCE_ENVIRONMENT_STEPS == 50_320
+    assert launcher.SOURCE_POLICY_VERSION == 814
+    assert launcher.SOURCE_LEARNER_UPDATES == 814
+    assert launcher.SOURCE_CHECKPOINT_ID == "2a3cccf8-09f5-4808-9991-86af6e6f3cfc"
     assert launcher._validate_checkpoint_summary(
         _checkpoint_summary(paths),
         paths=paths,
@@ -107,7 +114,7 @@ def test_v33_is_a_fully_pinned_model_initialization_not_exact_resume(
         )
 
 
-def test_v33_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> None:
+def test_v35_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     summary = _checkpoint_summary(paths)
     for key in (
@@ -129,15 +136,17 @@ def test_v33_checkpoint_pin_rejects_every_identity_mismatch(tmp_path: Path) -> N
             )
 
 
-def test_v33_supervisor_reenters_the_v33_adapter_and_keeps_its_pins(
-    tmp_path: Path,
-) -> None:
+def test_v35_supervisor_reenters_adapter_and_keeps_pins(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    manifest = tmp_path / "v33.launch.json"
+    manifest = tmp_path / "v35.launch.json"
     command = launcher.build_supervisor_command(paths, manifest_path=manifest)
 
     assert Path(command[1]).name == SCRIPT.name
     assert command[-2:] == ("--manifest", str(manifest))
     assert launcher._core.RUN_NAME == launcher.RUN_NAME
+    assert launcher._core.STATE_NAME == launcher.RUN_NAME
+    assert launcher._core._state_path(paths) == (
+        paths.launcher_dir / f"{launcher.RUN_NAME}.state.json"
+    )
     assert launcher._core.RESUME_RUN_ID == launcher.SOURCE_RUN_ID
-    assert launcher._core.RESUME_STEP == 90_152
+    assert launcher._core.RESUME_STEP == 50_320

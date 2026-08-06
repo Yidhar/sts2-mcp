@@ -55,7 +55,9 @@ from .sdpa import (
 )
 from .seeding import SIGNED_INT32_MAX
 from .transaction import (
+    TRANSACTION_LIFECYCLE_VERSION,
     BoundedTransactionReplay,
+    TransactionLifecycleEvidence,
     TransactionStep,
     TransactionTrace,
 )
@@ -577,7 +579,7 @@ def _validated_transaction_replay_payload(
     Pickle restores dataclass instances without invoking their ``__post_init__``
     methods.  The replay container can therefore prove its own capacity, RNG,
     and index invariants while still containing a stale or malformed nested
-    trace.  Reconstruct every trace/step to re-run the v3 dataclass contracts,
+    trace.  Reconstruct every trace/step to re-run the v4 dataclass contracts,
     and validate every encoded snapshot against the active decision ABI before
     any live learner resource is mutated.
     """
@@ -619,10 +621,33 @@ def _validated_transaction_replay_payload(
                 expected_fingerprint=expected_fingerprint,
             )
             validated_steps.append(validated_step)
+        validated_lifecycle: TransactionLifecycleEvidence | None = None
+        if trace.lifecycle is not None:
+            raw_lifecycle = trace.lifecycle
+            validated_post_snapshot = raw_lifecycle.post_snapshot
+            if validated_post_snapshot is not None:
+                validated_post_snapshot = replace(
+                    validated_post_snapshot,
+                    world=replace(validated_post_snapshot.world),
+                    candidates=replace(validated_post_snapshot.candidates),
+                    locals=replace(validated_post_snapshot.locals),
+                )
+                validated_post_snapshot.validate(
+                    expected_config=expected_config,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            validated_lifecycle = replace(
+                raw_lifecycle,
+                post_snapshot=validated_post_snapshot,
+            )
         # Likewise, reconstructing the trace re-applies its version, training
         # partition, key, outcome, burn-in, and zero-state invariants that
         # pickle itself does not execute.
-        validated_trace = replace(trace, steps=tuple(validated_steps))
+        validated_trace = replace(
+            trace,
+            steps=tuple(validated_steps),
+            lifecycle=validated_lifecycle,
+        )
         if validated_trace.initial_recurrent_state.shape != expected_hidden_shape:
             raise ValueError("checkpoint transaction recurrent state differs from model hidden size")
         if validated_trace.burn_in_steps > configured_burn_in:
@@ -1090,8 +1115,13 @@ def _validate_metadata(
     if config.transaction_learning.enabled:
         if metadata.get("transaction_heads_enabled") is not True:
             raise ValueError("transaction-enabled checkpoint has no head ABI marker")
+        if metadata.get("transaction_lifecycle_abi") != TRANSACTION_LIFECYCLE_VERSION:
+            raise ValueError("transaction-enabled checkpoint has no lifecycle-evidence ABI marker")
         if not isinstance(metadata.get("transaction_replay_spec"), dict):
             raise ValueError("transaction-enabled checkpoint has no replay specification")
+    else:
+        if metadata.get("transaction_lifecycle_abi") not in (None,):
+            raise ValueError("non-transaction checkpoint cannot contain a lifecycle-evidence ABI marker")
     if config.episodic_learning.enabled:
         if metadata.get("episodic_target_abi") != _EPISODIC_TARGET_ABI:
             raise ValueError("exact-resume checkpoint has no episodic target ABI marker")
@@ -1367,6 +1397,9 @@ def save_training_checkpoint(
             "sdpa_backend": recorded_sdpa,
             "execution_provenance": checkpoint_execution_provenance,
             "transaction_heads_enabled": config.transaction_learning.enabled,
+            "transaction_lifecycle_abi": (
+                TRANSACTION_LIFECYCLE_VERSION if config.transaction_learning.enabled else None
+            ),
             "transaction_replay_spec": (
                 _transaction_replay_spec(transaction_replay_payload) if transaction_replay_payload is not None else None
             ),

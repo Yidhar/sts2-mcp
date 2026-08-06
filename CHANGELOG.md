@@ -45,6 +45,10 @@ historical RL artifacts.
   transaction-exploration contract. Config-v13 checkpoints remain eligible
   only for the reviewed parameter-only v13-to-v14 model-init migration; they
   cannot silently exact-resume with changed Smith/card-removal behavior.
+- Advanced the curriculum config to v15 and transaction trace/replay to v4 for
+  authoritative upgrade/removal lifecycle credit. Config-v14 checkpoints are
+  accepted only by the reviewed v14-to-v15 parameter-initialization migration;
+  exact resume fails closed because the replay evidence semantics changed.
 
 ### Added
 
@@ -54,6 +58,19 @@ historical RL artifacts.
   Select/Confirm behavior mixture. Deterministic evaluation remains unassisted,
   and success requires an authoritative deck upgrade or exact one-card removal
   rather than a UI exit or Confirm click.
+- Added committed transaction lifecycle replay linking the exact forge/removal
+  entry action to its authoritative deck mutation. A bounded one-sided
+  log-probability support loss remains differentiable after softmax probability
+  underflow and turns off exactly at a configured probability floor. A factual
+  semi-Markov entry-Q target spans entry through exit and bootstraps from the
+  detached post-transaction value. Cancelled, unresolved and deadlocked paths
+  receive no positive entry label, and no upgrade/removal reward or action
+  rewrite was introduced. Replay reserves committed upgrade and removal strata
+  independently so one service cannot starve the other.
+- Split learner telemetry into online, transaction, liveness and episodic
+  objective components. The historical `loss` remains their signed composite
+  and is now labelled accordingly in the dashboard rather than being presented
+  as a monotonic supervised-loss curve.
 
 - Added a finite-revival curriculum stage that initializes the held-out-validated
   v24 network into a fresh lineage with a hidden, run-scoped bailout budget of

@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from sts2_rl.artifacts import resolve_artifact_path
+
 SCHEMA_VERSION = "sts2-rocdxg-process-lifecycle-stress-v1"
 EXECUTION_CONTRACT_VERSION = "sts2-rocdxg-hermetic-execution-contract-v1"
 HSA_KEY = "HSA_ENABLE_DXG_DETECTION"
@@ -303,8 +305,9 @@ def main() -> int:
         returncode = 2
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered + "\n", encoding="utf-8")
+        output = resolve_artifact_path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
     return returncode
 

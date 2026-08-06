@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -10,7 +11,11 @@ from sts2_rl.contracts import StepRequest
 from sts2_rl.training import (
     FailureCreditConfig,
     TransactionExplorationConfig,
+    TransactionLearningConfig,
+    TransactionLifecycleOutcome,
     build_training_resources,
+    factual_transaction_policy_targets,
+    one_sided_policy_support_loss,
     summarize_evaluation,
 )
 from sts2_rl.training.collector import (
@@ -26,6 +31,7 @@ from sts2_rl.training.failure_credit import (
 from tests.test_v2_training_pipeline import TerminalWithoutObservationFlagsBackend
 from tests.test_v33_recovery_semantics import (
     _recovery_config,
+    _RestForgeCancelThenSuccessBackend,
     _RestForgeSelectionSuccessBackend,
     _ScriptedChoiceRng,
 )
@@ -45,6 +51,27 @@ def _exploration_config(*, max_steps: int):
             operations=("upgrade", "remove"),
             entry_epsilon_floor=0.50,
             completion_guidance_probability=0.95,
+        ),
+    )
+
+
+def _lifecycle_learning_config(*, max_steps: int):
+    base = _exploration_config(max_steps=max_steps)
+    return replace(
+        base,
+        transaction_learning=TransactionLearningConfig(
+            enabled=True,
+            replay_capacity=64,
+            replay_byte_capacity=64 * 1024 * 1024,
+            sample_traces=4,
+            burn_in_steps=1,
+            effect_weight=0.0,
+            transaction_q_weight=0.0,
+            completion_policy_weight=0.0,
+            lifecycle_entry_support_weight=0.25,
+            lifecycle_entry_support_probability_floor=0.05,
+            lifecycle_smdp_q_weight=0.25,
+            pairwise_ranking_weight=0.0,
         ),
     )
 
@@ -394,3 +421,158 @@ def test_transaction_exploration_never_changes_deterministic_evaluation() -> Non
     assert episode.metrics.targeted_transaction_entry_exploration_decisions == 0
     assert episode.metrics.transaction_completion_guidance_decisions == 0
     assert episode.metrics.transaction_completion_forward_decisions == 0
+
+
+def test_one_sided_entry_support_recovers_from_softmax_absorption_and_stops_at_floor() -> None:
+    saturated_logits = torch.tensor([80.0, -80.0], requires_grad=True)
+    saturated_log_probability = torch.log_softmax(saturated_logits, dim=0)[1]
+    saturated_loss, saturated_gap = one_sided_policy_support_loss(
+        saturated_log_probability,
+        probability_floor=0.05,
+    )
+    saturated_loss.backward()
+
+    assert saturated_loss.detach().item() > 100.0
+    assert saturated_gap.detach().item() > 100.0
+    assert saturated_logits.grad is not None
+    assert saturated_logits.grad.tolist() == pytest.approx([1.0, -1.0])
+
+    supported_logits = torch.tensor([0.0, math.log(0.1 / 0.9)], requires_grad=True)
+    supported_log_probability = torch.log_softmax(supported_logits, dim=0)[1]
+    supported_loss, supported_gap = one_sided_policy_support_loss(
+        supported_log_probability,
+        probability_floor=0.05,
+    )
+    supported_loss.backward()
+
+    assert supported_loss.detach().item() == pytest.approx(0.0)
+    assert supported_gap.detach().item() == pytest.approx(0.0)
+    assert supported_logits.grad is not None
+    assert supported_logits.grad.tolist() == pytest.approx([0.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    ("backend", "choices", "operation"),
+    (
+        (_RestForgeSelectionSuccessBackend, (0, 0, 1), "upgrade"),
+        (_ShopRemovalSuccessBackend, (0, 0, 1), "remove"),
+    ),
+)
+def test_verified_transaction_lifecycle_links_entry_to_terminal_commit(
+    backend: type[TerminalWithoutObservationFlagsBackend],
+    choices: tuple[int, ...],
+    operation: str,
+) -> None:
+    config = _lifecycle_learning_config(max_steps=8)
+    resources = build_training_resources(config, backend=backend())
+    try:
+        resources.collector.bind_failure_credit_run_id(f"lifecycle-{operation}")
+        resources.collector._rng = _ScriptedChoiceRng(choices)  # type: ignore[assignment]
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+            for parameter in resources.collector_model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.05,
+            deterministic=False,
+            record=True,
+        )
+        lifecycle_traces = tuple(
+            trace for trace in episode.transaction_traces if trace.lifecycle is not None
+        )
+        assert len(lifecycle_traces) == 1
+        trace = lifecycle_traces[0]
+        lifecycle = trace.lifecycle
+        assert lifecycle is not None
+        assert lifecycle.operation == operation
+        assert lifecycle.outcome is TransactionLifecycleOutcome.COMMITTED
+        assert lifecycle.effect_verified
+        assert lifecycle.support_eligible
+        assert lifecycle.entry_step_index == trace.burn_in_steps
+        assert lifecycle.exit_step_index == len(trace.steps) - 1
+        assert lifecycle.post_terminal
+        assert lifecycle.post_snapshot is None
+        assert lifecycle.option_target_observed
+        assert lifecycle.option_discount == pytest.approx(0.0)
+        assert lifecycle.option_steps == len(trace.steps)
+        assert all(
+            target.step_index != lifecycle.entry_step_index
+            for target in factual_transaction_policy_targets(trace)
+        )
+
+        losses = resources.learner._transaction_losses((trace,))
+        assert losses.entry_support_labels == 1
+        assert losses.smdp_q_labels == 1
+        assert losses.entry_support_satisfied_labels == 1
+        assert losses.entry_support_loss.detach().item() == pytest.approx(0.0)
+        assert losses.entry_model_probability_mean >= 0.05
+        assert losses.smdp_q_loss.detach().item() > 0.0
+        if operation == "upgrade":
+            assert losses.upgrade_entry_support_labels == 1
+            assert losses.remove_entry_support_labels == 0
+        else:
+            assert losses.upgrade_entry_support_labels == 0
+            assert losses.remove_entry_support_labels == 1
+        resources.learner.optimizer.zero_grad(set_to_none=True)
+        losses.smdp_q_loss.backward()
+        q_gradients = tuple(
+            parameter.grad
+            for name, parameter in resources.model.named_parameters()
+            if name.startswith("transaction_q_head.") and parameter.grad is not None
+        )
+        assert q_gradients
+        assert any(bool(torch.count_nonzero(gradient)) for gradient in q_gradients)
+    finally:
+        resources.close()
+
+
+def test_cancelled_transaction_lifecycle_never_creates_positive_entry_credit() -> None:
+    config = _lifecycle_learning_config(max_steps=12)
+    resources = build_training_resources(
+        config,
+        backend=_RestForgeCancelThenSuccessBackend(),
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("lifecycle-cancel-then-commit")
+        resources.collector._rng = _ScriptedChoiceRng(  # type: ignore[assignment]
+            (0, 0, 1, 0, 0, 1)
+        )
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+            for parameter in resources.collector_model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.05,
+            deterministic=False,
+            record=True,
+        )
+        lifecycle_traces = tuple(
+            trace for trace in episode.transaction_traces if trace.lifecycle is not None
+        )
+        assert len(lifecycle_traces) == 2
+        cancelled = next(
+            trace
+            for trace in lifecycle_traces
+            if trace.lifecycle is not None
+            and trace.lifecycle.outcome is TransactionLifecycleOutcome.CANCELLED
+        )
+        committed = next(
+            trace
+            for trace in lifecycle_traces
+            if trace.lifecycle is not None
+            and trace.lifecycle.outcome is TransactionLifecycleOutcome.COMMITTED
+        )
+        assert cancelled.lifecycle is not None
+        assert not cancelled.lifecycle.support_eligible
+        assert not cancelled.lifecycle.option_target_observed
+        assert committed.lifecycle is not None
+        assert committed.lifecycle.support_eligible
+        losses = resources.learner._transaction_losses(lifecycle_traces)
+        assert losses.lifecycle_cancelled == 1
+        assert losses.lifecycle_committed == 1
+        assert losses.entry_support_labels == 1
+        assert losses.smdp_q_labels == 1
+    finally:
+        resources.close()

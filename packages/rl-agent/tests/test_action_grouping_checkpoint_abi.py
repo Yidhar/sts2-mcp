@@ -503,6 +503,9 @@ def test_reviewed_pre_v14_initialization_inherits_only_model_parameters(
             "selection_cycle_size": 0,
             "selection_monotonic_completion_size": 0,
             "selection_corrective_completion_size": 0,
+            "committed_lifecycle_size": 0,
+            "committed_upgrade_lifecycle_size": 0,
+            "committed_remove_lifecycle_size": 0,
         }
         assert target.transaction_replay.state_dict()["rng_state"] == (initial_replay["rng_state"])
         for key, expected in source_state.items():

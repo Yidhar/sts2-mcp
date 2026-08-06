@@ -67,6 +67,8 @@ from .trajectory import (
 )
 from .transaction import (
     TransactionEffect,
+    TransactionLifecycleEvidence,
+    TransactionLifecycleOutcome,
     TransactionOutcome,
     TransactionStep,
     TransactionTrace,
@@ -3671,6 +3673,11 @@ class GroundedCollector:
         active_transaction_burn_in = 0
         active_transaction_policy_version = policy_version
         active_transaction_seen_nodes: set[str] = set()
+        active_transaction_entry_step_index: int | None = None
+        active_transaction_entry_behavior_log_probability = 0.0
+        active_transaction_entry_model_probability = 0.0
+        active_transaction_entry_action_fingerprint = ""
+        active_transaction_operation = ""
         observed_transaction_surface: str | None = None
         observed_transaction_entry_episodic_index: int | None = None
         observed_transaction_opened_from_rest_site = False
@@ -3679,10 +3686,18 @@ class GroundedCollector:
         observed_transaction_is_shop_card_removal = False
         observed_transaction_has_policy_choice = False
         observed_transaction_opening_deck_signature: tuple[tuple[str, int, int], ...] | None = None
+        observed_transaction_entry_behavior_log_probability = 0.0
+        observed_transaction_entry_model_probability = 0.0
+        observed_transaction_entry_action_fingerprint = ""
+        observed_transaction_entry_policy_version = policy_version
         pending_observed_transaction_entry_episodic_index: int | None = None
         pending_observed_transaction_opened_from_rest_site = False
         pending_observed_transaction_entry_operation = ""
         pending_observed_transaction_is_shop_card_removal = False
+        pending_transaction_entry_behavior_log_probability = 0.0
+        pending_transaction_entry_model_probability = 0.0
+        pending_transaction_entry_action_fingerprint = ""
+        pending_transaction_entry_policy_version = policy_version
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
         # Complete-run replay is collected independently of fixed unroll
@@ -3818,11 +3833,27 @@ class GroundedCollector:
                     if observed_transaction_operation in {"upgrade", "remove"}
                     else None
                 )
+                observed_transaction_entry_behavior_log_probability = (
+                    pending_transaction_entry_behavior_log_probability
+                )
+                observed_transaction_entry_model_probability = (
+                    pending_transaction_entry_model_probability
+                )
+                observed_transaction_entry_action_fingerprint = (
+                    pending_transaction_entry_action_fingerprint
+                )
+                observed_transaction_entry_policy_version = (
+                    pending_transaction_entry_policy_version
+                )
                 observed_transaction_has_policy_choice = choice.valid_count > 1
                 pending_observed_transaction_entry_episodic_index = None
                 pending_observed_transaction_opened_from_rest_site = False
                 pending_observed_transaction_entry_operation = ""
                 pending_observed_transaction_is_shop_card_removal = False
+                pending_transaction_entry_behavior_log_probability = 0.0
+                pending_transaction_entry_model_probability = 0.0
+                pending_transaction_entry_action_fingerprint = ""
+                pending_transaction_entry_policy_version = policy_version
                 selection_transactions_started += 1
                 rest_site_selection_transactions_started += int(observed_transaction_opened_from_rest_site)
                 forge_selection_transactions_started += int(observed_transaction_is_forge)
@@ -3850,12 +3881,62 @@ class GroundedCollector:
             if current_transaction_surface is not None:
                 if active_transaction_surface is None:
                     burn_in_context = self.transaction_burn_in_steps or 0
-                    context = tuple(transaction_context)[-burn_in_context:] if burn_in_context else ()
+                    lifecycle_candidate = bool(
+                        observed_transaction_operation in {"upgrade", "remove"}
+                        and observed_transaction_entry_action_fingerprint
+                    )
+                    context_count = burn_in_context + int(lifecycle_candidate)
+                    context = (
+                        tuple(transaction_context)[-context_count:]
+                        if context_count
+                        else ()
+                    )
                     active_transaction_surface = current_transaction_surface
                     active_transaction_steps = [item[1] for item in context]
                     active_transaction_start_step = context[0][0] if context else step_offset
-                    active_transaction_burn_in = len(context)
-                    active_transaction_policy_version = segment_policy_version
+                    active_transaction_burn_in = (
+                        min(burn_in_context, max(0, len(context) - 1))
+                        if lifecycle_candidate
+                        else len(context)
+                    )
+                    active_transaction_entry_step_index = (
+                        active_transaction_burn_in
+                        if lifecycle_candidate
+                        else None
+                    )
+                    active_transaction_entry_behavior_log_probability = (
+                        observed_transaction_entry_behavior_log_probability
+                    )
+                    active_transaction_entry_model_probability = (
+                        observed_transaction_entry_model_probability
+                    )
+                    active_transaction_entry_action_fingerprint = (
+                        observed_transaction_entry_action_fingerprint
+                    )
+                    active_transaction_operation = observed_transaction_operation
+                    active_transaction_policy_version = (
+                        observed_transaction_entry_policy_version
+                        if lifecycle_candidate
+                        else segment_policy_version
+                    )
+                    if lifecycle_candidate:
+                        if not context:
+                            raise RuntimeError(
+                                "transaction lifecycle lost its factual entry context"
+                            )
+                        entry_step_index = active_transaction_entry_step_index
+                        if entry_step_index is None:  # pragma: no cover - construction invariant
+                            raise RuntimeError(
+                                "transaction lifecycle lost its entry step index"
+                            )
+                        entry_step = active_transaction_steps[entry_step_index]
+                        if (
+                            entry_step.action_fingerprint
+                            != active_transaction_entry_action_fingerprint
+                        ):
+                            raise RuntimeError(
+                                "transaction lifecycle entry fingerprint differs from context"
+                            )
                     active_transaction_seen_nodes = {current_transaction_node}
                 elif active_transaction_surface != current_transaction_surface:
                     raise RuntimeError("transaction surface changed without an observed exit transition")
@@ -4117,6 +4198,16 @@ class GroundedCollector:
                 )
                 pending_observed_transaction_entry_operation = _transaction_entry_operation(selected_action)
                 pending_observed_transaction_is_shop_card_removal = _is_shop_card_removal_entry(selected_action)
+                pending_transaction_entry_behavior_log_probability = (
+                    choice.behavior_log_probability
+                )
+                pending_transaction_entry_model_probability = float(
+                    choice.policy[choice.candidate_index]
+                )
+                pending_transaction_entry_action_fingerprint = (
+                    transaction_action_fingerprint
+                )
+                pending_transaction_entry_policy_version = segment_policy_version
             selection_exit_outcome: Literal["committed", "cancelled", "unresolved"] | None = None
             if observed_transaction_surface is not None and (
                 next_observed_transaction_surface != observed_transaction_surface
@@ -4208,6 +4299,10 @@ class GroundedCollector:
                 observed_transaction_is_shop_card_removal = False
                 observed_transaction_has_policy_choice = False
                 observed_transaction_opening_deck_signature = None
+                observed_transaction_entry_behavior_log_probability = 0.0
+                observed_transaction_entry_model_probability = 0.0
+                observed_transaction_entry_action_fingerprint = ""
+                observed_transaction_entry_policy_version = policy_version
             after_action_act, _ = _run_position(next_state.observation)
             transition_facts = next_state.transition.facts
             typed_run_result = transition_facts.get("run_result")
@@ -4369,11 +4464,21 @@ class GroundedCollector:
                 trusted_deadlock_trace_emitted = False
                 if current_transaction_surface is not None:
                     active_transaction_steps.append(factual_transaction_step)
-                    maximum_transaction_steps = (self.transaction_burn_in_steps or 0) + liveness_learn_tail_steps
+                    maximum_transaction_steps = (
+                        (self.transaction_burn_in_steps or 0)
+                        + liveness_learn_tail_steps
+                        + int(active_transaction_entry_step_index is not None)
+                    )
                     if len(active_transaction_steps) > maximum_transaction_steps:
                         overflow = len(active_transaction_steps) - maximum_transaction_steps
                         del active_transaction_steps[:overflow]
                         active_transaction_start_step += overflow
+                        if active_transaction_entry_step_index is not None:
+                            # A pathological unresolved transaction outlived
+                            # the exact entry-context window. It remains valid
+                            # liveness/value evidence, but can no longer claim
+                            # exact entry support or SMDP credit.
+                            active_transaction_entry_step_index = None
                         active_transaction_burn_in = min(
                             self.transaction_burn_in_steps or 0,
                             max(0, len(active_transaction_steps) - 1),
@@ -4406,6 +4511,66 @@ class GroundedCollector:
                             active_transaction_outcome = TransactionOutcome.COMPLETED
                         else:
                             active_transaction_outcome = TransactionOutcome.CENSORED
+                        lifecycle: TransactionLifecycleEvidence | None = None
+                        if active_transaction_entry_step_index is not None:
+                            if breakdown.outcome == "deadlock" and trusted_policy_failure:
+                                lifecycle_outcome = TransactionLifecycleOutcome.DEADLOCK
+                            elif selection_exit_outcome == "committed":
+                                lifecycle_outcome = TransactionLifecycleOutcome.COMMITTED
+                            elif selection_exit_outcome == "cancelled":
+                                lifecycle_outcome = TransactionLifecycleOutcome.CANCELLED
+                            else:
+                                lifecycle_outcome = TransactionLifecycleOutcome.UNRESOLVED
+                            post_snapshot: EncodedDecisionSnapshot | None = None
+                            post_terminal = bool(
+                                lifecycle_outcome
+                                is TransactionLifecycleOutcome.COMMITTED
+                                and (
+                                    result_terminal
+                                    or breakdown.task_terminal
+                                    or breakdown.discount == 0.0
+                                )
+                            )
+                            if lifecycle_outcome is TransactionLifecycleOutcome.COMMITTED:
+                                if not next_state.legal_actions and not post_terminal:
+                                    raise RuntimeError(
+                                        "committed transaction lifecycle has no post-state legal actions"
+                                    )
+                                if not post_terminal:
+                                    lifecycle_encoding_started_ns = time.perf_counter_ns()
+                                    post_snapshot = self.encoder.encode(
+                                        next_state.observation,
+                                        next_state.legal_actions,
+                                        device=self.device,
+                                    ).snapshot
+                                    timings.record(
+                                        "transaction_post_encoding",
+                                        lifecycle_encoding_started_ns,
+                                    )
+                            lifecycle = TransactionLifecycleEvidence(
+                                operation=active_transaction_operation,
+                                entry_step_index=active_transaction_entry_step_index,
+                                exit_step_index=len(active_transaction_steps) - 1,
+                                entry_behavior_log_probability=(
+                                    active_transaction_entry_behavior_log_probability
+                                ),
+                                entry_model_probability=(
+                                    active_transaction_entry_model_probability
+                                ),
+                                entry_policy_version=(
+                                    active_transaction_policy_version
+                                ),
+                                entry_action_fingerprint=(
+                                    active_transaction_entry_action_fingerprint
+                                ),
+                                outcome=lifecycle_outcome,
+                                effect_verified=(
+                                    lifecycle_outcome
+                                    is TransactionLifecycleOutcome.COMMITTED
+                                ),
+                                post_snapshot=post_snapshot,
+                                post_terminal=post_terminal,
+                            )
                         transaction_traces_pending.append(
                             TransactionTrace(
                                 trace_id=(
@@ -4424,12 +4589,18 @@ class GroundedCollector:
                                 steps=tuple(active_transaction_steps),
                                 burn_in_steps=active_transaction_burn_in,
                                 outcome=active_transaction_outcome,
+                                lifecycle=lifecycle,
                             )
                         )
                         trusted_deadlock_trace_emitted = active_transaction_outcome is TransactionOutcome.DEADLOCK
                         active_transaction_surface = None
                         active_transaction_steps = []
                         active_transaction_seen_nodes = set()
+                        active_transaction_entry_step_index = None
+                        active_transaction_entry_behavior_log_probability = 0.0
+                        active_transaction_entry_model_probability = 0.0
+                        active_transaction_entry_action_fingerprint = ""
+                        active_transaction_operation = ""
                 if breakdown.outcome == "deadlock" and (
                     current_transaction_surface is None
                     or (trusted_policy_failure and not trusted_deadlock_trace_emitted)

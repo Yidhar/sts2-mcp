@@ -142,11 +142,14 @@ The final discount is zero exactly at task terminal/deadlock. A positive final
 discount requires a bootstrap snapshot. Unrolls are placed in a bounded FIFO and
 consumed once. They are never inserted into a generic transition replay.
 
-Two purpose-specific, training-partition-only sidecars are maintained:
+Three purpose-specific, training-partition-only sidecars are maintained:
 
-1. transaction replay stores factual select/deselect/confirm/cancel sequences;
+1. transaction replay stores factual select/deselect/confirm/cancel sequences
+   and authoritative upgrade/removal entry-to-exit lifecycle evidence;
 2. complete-episode replay stores immutable CPU decision snapshots and the
-   authoritative result/cost labels backfilled at combat, Act and run boundaries.
+   authoritative result/cost labels backfilled at combat, Act and run boundaries;
+3. failure-credit replay stores versioned liveness evidence and matched factual
+   outcome controls.
 
 The episode sidecar is bounded independently by episode count, total logical
 bytes, per-episode bytes and sampled segments per episode. Oversized episodes
@@ -404,6 +407,17 @@ separate structures. The preheat profile also records one training-partition,
 epsilon-zero liveness probe every 16 episodes so deterministic argmax failures can
 enter replay without contaminating held-out evaluation.
 
+Upgrade/removal competence uses a separate authoritative lifecycle contract.
+The trace includes the exact factual action that opened the service, the complete
+selection suffix, and either a verified deck mutation plus factual post-state or
+a cancelled/unresolved/deadlock result. Only a verified commit may receive a
+one-sided normalized log-probability support target. This target remains
+differentiable after softmax probability underflow and becomes exactly zero at
+its configured support floor; it does not permanently clone the guided behavior.
+The same verified lifecycle may train a semi-Markov entry Q target from the
+already-versioned reward/discount sequence and a detached factual post-state
+value. No service bonus, legality rewrite, or Q-driven action override is allowed.
+
 These are generic loop detectors, not card/UI/boss heuristics. A combat-progress
 termination populates `EpisodeMetrics.stall_evidence` exactly once; every
 non-stall episode leaves it null. The bounded mapping records the tracker anchor,
@@ -492,7 +506,7 @@ do not by themselves establish that a response is strategically correct.
 
 ## Checkpoint ABI
 
-The format is `sts2-recurrent-vtrace-checkpoint-v4` and contains:
+The format is `sts2-recurrent-vtrace-checkpoint-v5` and contains:
 
 ```text
 metadata.json
@@ -503,17 +517,19 @@ rollout_queue.pkl
 stochastic_state.pkl
 transaction_replay.pkl   # when transaction learning is enabled
 episodic_replay.pkl      # when complete-episode learning is enabled
+failure_credit_replay.pkl # when failure-credit learning is enabled
 checkpoint.manifest.json
 ```
 
 Publication is atomic and SHA-256 covers every payload. Exact resume validates
 the contract/reward/dependency identities, model and encoding config, learner and
 actor tensor specifications, optimizer layout, pending unrolls, devices, RNGs,
-both enabled replay corpora (including sampler RNG/counters/capacities), and
+all enabled replay corpora (including sampler RNG/counters/capacities), and
 collector continuation state before mutating live resources. Every payload is
 probed against independent temporary objects before live resources are mutated.
-Old checkpoints containing `replay_buffer.pkl` are rejected; there is no v1
-compatibility loader and a v3 checkpoint is not an exact-resume source for v4.
+Old checkpoints containing `replay_buffer.pkl` are rejected; there is no legacy
+compatibility loader. A checkpoint whose transaction lifecycle/evidence ABI
+differs is not an exact-resume source for v5.
 
 `--initialize-from` is a different, explicit operation. When learned tensor
 shapes are unchanged, capacity/config changes such as `max_candidates = 96` to
@@ -523,7 +539,7 @@ v9-to-v10 identities; shape compatibility alone is insufficient. For an
 explicitly recognized v3 source, all six long-horizon head prefixes must be
 absent as one complete group; those target heads remain freshly initialized
 while every inherited tensor must match exactly by name, shape and dtype.
-Optimizer state, queued unrolls, RNGs, collector continuation, counters, both
+Optimizer state, queued unrolls, RNGs, collector continuation, counters, all
 replay corpora and policy-version numbers are not imported. Child checkpoint
 provenance uses the `model_parameter_initialization` relation, so this cannot be
 confused with exact resume.

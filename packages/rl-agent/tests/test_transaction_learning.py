@@ -28,6 +28,8 @@ from sts2_rl.training import (
     TrainingState,
     TransactionEffect,
     TransactionLearningConfig,
+    TransactionLifecycleEvidence,
+    TransactionLifecycleOutcome,
     TransactionOutcome,
     TransactionPolicyTarget,
     TransactionStep,
@@ -1242,7 +1244,7 @@ def test_transaction_liveness_targets_directly_update_policy_head() -> None:
         before = probability()
         losses = learner._transaction_losses((trace,))
         learner.optimizer.zero_grad(set_to_none=True)
-        losses[4].backward()
+        losses.completion_policy_loss.backward()
         policy_gradients = [
             parameter.grad
             for name, parameter in model.named_parameters()
@@ -1605,6 +1607,84 @@ def test_event_deadlock_avoids_only_repeated_pair_not_one_off_corrective_revisit
     )
 
 
+def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+
+    def lifecycle_trace(operation: str) -> TransactionTrace:
+        action_fingerprint = f"entry:{operation}"
+        trace = _sequence_trace(
+            snapshot,
+            trace_id=f"lifecycle-{operation}",
+            outcome=TransactionOutcome.COMPLETED,
+            steps=(("entry", "exit", action_fingerprint, 0, TransactionEffect.EXIT),),
+        )
+        return replace(
+            trace,
+            lifecycle=TransactionLifecycleEvidence(
+                operation=operation,
+                entry_step_index=0,
+                exit_step_index=0,
+                entry_behavior_log_probability=math.log(0.5),
+                entry_model_probability=0.0,
+                entry_policy_version=0,
+                entry_action_fingerprint=action_fingerprint,
+                outcome=TransactionLifecycleOutcome.COMMITTED,
+                effect_verified=True,
+                post_terminal=True,
+                option_return=1.0,
+                option_discount=0.0,
+                option_steps=1,
+            ),
+        )
+
+    replay = BoundedTransactionReplay(
+        capacity=16,
+        byte_capacity=50_000_000,
+        seed=31,
+    )
+    for index in range(8):
+        assert replay.put(
+            _trace(
+                snapshot,
+                trace_id=f"ordinary-lifecycle-control-{index}",
+                action_index=index % 2,
+                action_fingerprint=f"ordinary:{index}",
+                effect=TransactionEffect.EXIT,
+                transaction_return=1.0,
+                outcome=TransactionOutcome.COMPLETED,
+            )
+        )
+    assert replay.put(lifecycle_trace("upgrade"))
+    assert replay.put(lifecycle_trace("remove"))
+    assert replay.metrics()["committed_lifecycle_size"] == 2
+    assert replay.metrics()["committed_upgrade_lifecycle_size"] == 1
+    assert replay.metrics()["committed_remove_lifecycle_size"] == 1
+    assert {trace.lifecycle.operation for trace in replay.sample(2) if trace.lifecycle} == {
+        "upgrade",
+        "remove",
+    }
+
+    restored = BoundedTransactionReplay(
+        capacity=replay.capacity,
+        byte_capacity=replay.byte_capacity,
+        seed=999,
+    )
+    restored.load_state_dict(replay.state_dict())
+    assert restored.metrics() == replay.metrics()
+    assert {
+        trace.lifecycle.operation
+        for trace in restored.sample(2)
+        if trace.lifecycle is not None
+    } == {"upgrade", "remove"}
+
+
 def test_replay_samples_all_available_selection_structure_strata_after_restore() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(
@@ -1901,8 +1981,8 @@ def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() ->
         handle.remove()
 
     assert forward_calls == 2
-    assert losses[5] == 1
-    assert losses[6] == 1
+    assert losses.effect_labels == 1
+    assert losses.q_labels == 1
     with pytest.raises(ValueError, match="zero initial state"):
         replace(
             trace,

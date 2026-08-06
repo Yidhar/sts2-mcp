@@ -17,11 +17,12 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v14"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v15"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V13 = "sts2-relational-curriculum-config-v13"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V14 = "sts2-relational-curriculum-config-v14"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -351,6 +352,16 @@ class TransactionLearningConfig:
     # shared legal-candidate policy directly. This is not a reward, action mask,
     # action rewrite, or card/prompt-specific rule.
     completion_policy_weight: float = 0.25
+    # A verified upgrade/removal lifecycle receives a one-sided policy-support
+    # target at the action that opened the transaction. Unlike permanent CE,
+    # this loss becomes exactly zero once the model assigns the configured
+    # minimum probability, leaving strategic preference to return/Q learning.
+    lifecycle_entry_support_weight: float = 0.0
+    lifecycle_entry_support_probability_floor: float = 0.05
+    # Semi-Markov entry-Q target: factual reward over the whole transaction,
+    # followed by a detached post-transaction value bootstrap. This is not a
+    # hand-authored forge/removal bonus.
+    lifecycle_smdp_q_weight: float = 0.0
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -383,6 +394,9 @@ class TransactionLearningConfig:
             "effect_weight",
             "transaction_q_weight",
             "completion_policy_weight",
+            "lifecycle_entry_support_weight",
+            "lifecycle_entry_support_probability_floor",
+            "lifecycle_smdp_q_weight",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",
@@ -391,6 +405,18 @@ class TransactionLearningConfig:
                 getattr(self, name),
                 label=f"transaction_learning.{name}",
                 minimum=0.0,
+            )
+        if not 0.0 < self.lifecycle_entry_support_probability_floor < 1.0:
+            raise ValueError(
+                "transaction_learning.lifecycle_entry_support_probability_floor "
+                "must be strictly between 0 and 1"
+            )
+        if not self.enabled and (
+            self.lifecycle_entry_support_weight > 0.0
+            or self.lifecycle_smdp_q_weight > 0.0
+        ):
+            raise ValueError(
+                "transaction lifecycle losses require transaction_learning.enabled"
             )
 
 
@@ -1409,7 +1435,9 @@ def model_initialization_config_from_mapping(
 
     V12 adds the independent liveness-credit model/loss ABI. V13 hardens its
     optimization/runtime semantics. V14 adds an explicit, training-only
-    transaction exploration contract without changing model parameter shapes.
+    transaction exploration contract. V15 adds authoritative transaction
+    lifecycle replay and entry-support/SMDP loss controls. The new lifecycle
+    heads use the already reviewed optional transaction-head migration gate.
     V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
     head is freshly initialized by the reviewed checkpoint overlay.  V10 also
@@ -1430,6 +1458,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V12,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V13,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1457,11 +1486,36 @@ def model_initialization_config_from_mapping(
         # A legacy checkpoint can provide compatible shared model parameters,
         # but it cannot claim the new semantic/evidence/replay contract.
         migrated["failure_credit"] = {"mode": "disabled"}
-    if "transaction_exploration" in payload:
-        raise ValueError("pre-V14 model-initialization config unexpectedly contains a " "transaction_exploration table")
-    # The reviewed migration is behavior preserving. Enabling the new explorer
-    # belongs to the successor config, never to checkpoint interpretation.
-    migrated["transaction_exploration"] = {"enabled": False}
+    if source_version != _MODEL_INITIALIZATION_SOURCE_CONFIG_V14:
+        if "transaction_exploration" in payload:
+            raise ValueError(
+                "pre-V14 model-initialization config unexpectedly contains a "
+                "transaction_exploration table"
+            )
+        # The reviewed migration is behavior preserving. Enabling the new
+        # explorer belongs to the successor config, never to checkpoint
+        # interpretation.
+        migrated["transaction_exploration"] = {"enabled": False}
+    transaction_learning = payload.get("transaction_learning")
+    if not isinstance(transaction_learning, Mapping):
+        raise ValueError(
+            f"{source_version} model-initialization config has no "
+            "transaction_learning table"
+        )
+    lifecycle_fields = {
+        "lifecycle_entry_support_weight",
+        "lifecycle_entry_support_probability_floor",
+        "lifecycle_smdp_q_weight",
+    }
+    unexpected_lifecycle_fields = lifecycle_fields.intersection(
+        transaction_learning
+    )
+    if unexpected_lifecycle_fields:
+        raise ValueError(
+            f"{source_version} model-initialization config unexpectedly "
+            "contains V15 transaction lifecycle fields: "
+            + ", ".join(sorted(unexpected_lifecycle_fields))
+        )
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 
