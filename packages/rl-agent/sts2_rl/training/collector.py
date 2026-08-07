@@ -1017,6 +1017,35 @@ def _player_hp_ratio(observation: Mapping[str, object]) -> float:
     return min(1.0, hp / maximum)
 
 
+def _act_exit_hp_ratio(
+    *,
+    before_observation: Mapping[str, object],
+    after_observation: Mapping[str, object],
+    authoritative_run_result: str | None,
+) -> float:
+    """Read the factual HP ratio at an authoritative Act-success boundary.
+
+    Ordinary Act transitions retain a player receipt in the post-action
+    observation, so that receipt remains authoritative.  A typed run victory
+    is different: the simulator is allowed to return a sparse terminal
+    observation after the final proceed action.  In that one case the last
+    pre-terminal observation is the final player receipt for the completed
+    Act.  Do not turn this into a general fallback; a missing or malformed
+    player receipt on a non-terminal Act transition remains a protocol error.
+    """
+
+    raw_after_player = after_observation.get("player")
+    after_player = raw_after_player if isinstance(raw_after_player, Mapping) else {}
+    has_after_player_receipt = bool(
+        {"hp", "current_hp", "max_hp", "maximum_hp"}.intersection(after_player)
+    )
+    if has_after_player_receipt:
+        return _player_hp_ratio(after_observation)
+    if authoritative_run_result == "victory":
+        return _player_hp_ratio(before_observation)
+    return _player_hp_ratio(after_observation)
+
+
 def _hp_band(observation: Mapping[str, object]) -> str:
     try:
         ratio = _player_hp_ratio(observation)
@@ -4515,8 +4544,10 @@ class GroundedCollector:
                                 ActSegmentHealth(
                                     act=completed_act,
                                     boundary_step_index=len(episodic_steps),
-                                    exit_hp_ratio=_player_hp_ratio(
-                                        next_state.observation
+                                    exit_hp_ratio=_act_exit_hp_ratio(
+                                        before_observation=state.observation,
+                                        after_observation=next_state.observation,
+                                        authoritative_run_result=authoritative_run_result,
                                     ),
                                     cumulative_revivals=revivals_used,
                                     revival_budget=effective_budget,
