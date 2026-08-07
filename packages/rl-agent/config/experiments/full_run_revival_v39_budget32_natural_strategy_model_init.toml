@@ -1,0 +1,130 @@
+# Budget-32 successor to the immutable v38 final checkpoint at local
+# environment step 100,000. This is an explicit config-v17 model-initialization
+# lineage: compatible network tensors and mature schedule clocks are inherited,
+# while optimizer, replay, RNG, queues and lineage-local counters restart.
+# Exact resume across revival-budget semantics is forbidden.
+#
+# V39 continues v38's withdrawal of temporary behavior-side transaction
+# scaffolding. The policy must choose rest/forge/removal and complete the
+# resulting transaction from its own logits.
+# The factual transaction learning corridor, revival economics, liveness fixes,
+# and strategic-surface anti-ratchet exemptions remain unchanged. No action is
+# masked/rewritten and no rest, forge, removal, or HP-threshold preference is
+# hand-authored.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.004
+entropy_decay_updates = 3000
+entropy_breaker = "policy-collapse-v2"
+
+[rollout]
+queue_capacity = 24
+
+[transaction_learning]
+enabled = true
+replay_capacity = 4096
+replay_byte_capacity = 1073741824
+sample_traces = 4
+burn_in_steps = 32
+effect_weight = 0.05
+transaction_q_weight = 0.0
+# Entry steps remain excluded from transaction-internal completion CE. The
+# lifecycle corridor below only prevents numerical absorption at exact zero; it
+# does not encode whether rest, forge, removal, or purchase is strategically
+# preferable in a particular state.
+completion_policy_weight = 0.15
+pairwise_ranking_weight = 0.0
+lifecycle_entry_support_weight = 0.05
+lifecycle_entry_support_probability_floor = 0.05
+lifecycle_smdp_q_weight = 0.10
+
+[failure_credit]
+mode = "learning"
+replay_capacity = 4096
+replay_byte_capacity = 2147483648
+sample_records = 4
+burn_in_steps = 32
+maximum_context_steps = 256
+maximum_episode_completion_controls = 32
+maximum_episode_completion_bytes = 134217728
+direct_witness_quota = 0
+multi_edge_cycle_quota = 0
+risk_sequence_quota = 1
+unresolved_stall_quota = 1
+completion_control_quota = 1
+matched_outcome_pair_quota = 1
+maximum_matched_pairs_per_publication = 8
+policy_gradient_max_lag = 128
+liveness_head_calibration_updates = 256
+liveness_risk_actor_start_update = 512
+liveness_records_per_autograd_batch = 4
+liveness_tbptt_window_steps = 16
+liveness_maximum_contexts_per_record = 2
+liveness_maximum_replayed_steps_per_update = 4096
+liveness_maximum_replayed_candidates_per_update = 1048576
+liveness_value_critic_weight = 0.10
+liveness_cost_critic_weight = 0.25
+liveness_cost_actor_weight = 0.10
+liveness_direct_policy_weight = 0.25
+liveness_cycle_policy_weight = 0.10
+liveness_contrast_policy_weight = 0.10
+liveness_completion_policy_weight = 0.15
+liveness_risk_advantage_clip = 0.25
+liveness_risk_actor_min_selected_probability = 0.01
+liveness_contrast_margin = 0.10
+liveness_gradient_clip_norm = 0.50
+
+[episodic_learning]
+fresh_policy_sequences = 1
+success_policy_trust_region_epsilon = 0.20
+success_imitation_exempt_surfaces = ["rest_site", "shop"]
+
+[curriculum]
+revival_budget = 32
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+# Temporary selection-surface exploration is fully withdrawn in v39.
+selection_surface_epsilon_floor = 0.0
+
+[transaction_exploration]
+# Temporary behavior-side entry forcing and select->confirm guidance are fully
+# withdrawn. Keeping this explicit disabled block makes the provenance auditable
+# and prevents profile defaults from silently re-enabling the scaffold.
+enabled = false
+operations = []
+entry_epsilon_floor = 0.0
+completion_guidance_probability = 0.0
+
+[runtime]
+rocm_sdpa_backend = "math"
+model_initialization_schedule_mode = "inherit"
+model_initialization_liveness_schedule_mode = "inherit"
+total_environment_steps = 250000
+# Preserve the held-out seed namespace so v38->v39 evaluation is paired rather
+# than confounded by a new map distribution.
+seed = 6300000
+log_dir = "runs/full-run-revival-v39-budget32-natural-strategy-model-init"
+checkpoint_dir = "checkpoints/full-run-revival-v39-budget32-natural-strategy-model-init"
+checkpoint_interval_steps = 10000
+evaluation_steps = [0, 50000, 100000, 150000, 200000]
+evaluation_episodes = 16
+early_evaluation_steps = [10000, 25000, 75000, 125000, 175000, 225000]
+early_evaluation_episodes = 16
+final_audit_steps = [250000]
+final_audit_episodes = 64
+evaluation_liveness_guard_enabled = true
+evaluation_guard_min_liveness_episodes = 16
+evaluation_guard_liveness_baseline_failures = 0
+evaluation_guard_liveness_baseline_episodes = 16
+evaluation_guard_min_liveness_regression_rate = 0.20
+training_deadlock_streak_alert_episodes = 4
+# This is a stop-only safety breaker. Rollback/replay of a discarded policy
+# segment remains disabled, so a newly learned strategy is never silently
+# replaced by an earlier gate checkpoint.
+evaluation_guard_enforcement_start_steps = 10000
+evaluation_guard_failure_action = "stop"
+evaluation_guard_max_rollbacks = 0
+
