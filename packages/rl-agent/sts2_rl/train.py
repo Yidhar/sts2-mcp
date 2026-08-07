@@ -226,11 +226,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     initialization: Path | None = None
     if args.resume and args.initialize_from:
         raise SystemExit("--resume and --initialize-from are mutually exclusive")
-    if args.model_initialization_attestation and (
-        not args.initialize_from or supervised_launch is None
-    ):
+    if args.model_initialization_attestation and not args.initialize_from:
+        # A byte attestation is an independent, pinned proof for one immutable
+        # model-initialization source.  It is deliberately usable by the
+        # durable launcher supervisor, whose manifest fixes the trainer
+        # command but which does not inject the separate trainer-side
+        # ``--launch-contract`` protocol.  Requiring that unrelated protocol
+        # here made the reviewed v41 command pass both launcher preflights and
+        # then fail before run_start.  The attestation validator itself binds
+        # the checkpoint root, manifest/metadata digests and source counters;
+        # exact resume remains ineligible for this fast path.
         raise SystemExit(
-            "a model-initialization attestation requires supervised --initialize-from"
+            "a model-initialization attestation requires --initialize-from"
         )
     if args.resume:
         resume = resolve_external_input_path(args.resume)

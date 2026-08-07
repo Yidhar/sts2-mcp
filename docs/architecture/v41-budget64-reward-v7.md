@@ -80,5 +80,12 @@ Launcher and trainer re-hash the small attestation, checkpoint manifest and
 metadata, then validate checkpoint ID, source run/step, complete file set,
 path containment, sizes, hash descriptors, semantic identity and model ABI.
 They do **not** read and hash every large payload again.  This authority is
-accepted only for supervised model initialization; exact resume continues to
-require a fresh full payload hash pass.
+accepted only for the pinned model-initialization source; exact resume
+continues to require a fresh full payload hash pass.
+
+The attestation proof is independent of the optional trainer-side
+`--launch-contract` protocol.  The durable launcher already pins the complete
+trainer command in its own immutable manifest, while the attestation binds the
+one permitted `--initialize-from` source.  Requiring both protocols would make
+the detached supervisor's reviewed command fail only after launch without
+adding another source-identity check.

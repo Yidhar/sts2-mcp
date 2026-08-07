@@ -1122,11 +1122,9 @@ def run_training(
         raise ValueError(
             "model-initialization attestation and SHA-256 must be supplied together"
         )
-    if model_initialization_attestation is not None and (
-        initialize_from is None or supervised_launch_contract is None
-    ):
+    if model_initialization_attestation is not None and initialize_from is None:
         raise ValueError(
-            "model-initialization attestation requires a supervised model initialization"
+            "model-initialization attestation requires model initialization"
         )
     if runtime_provenance is not None and not isinstance(
         runtime_provenance,
