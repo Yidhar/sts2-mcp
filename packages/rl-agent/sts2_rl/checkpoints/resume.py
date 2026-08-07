@@ -285,6 +285,168 @@ def validate_model_initialization_checkpoint(
     )
 
 
+def validate_attested_model_initialization_checkpoint(
+    checkpoint: str | Path,
+    *,
+    attestation: str | Path,
+    expected_attestation_sha256: str,
+    required_files: Collection[str] = EXACT_RESUME_REQUIRED_FILES,
+) -> ValidatedResumeCheckpoint:
+    """Validate an immutable model source using a prior byte-verification receipt.
+
+    The attestation is a pinned supervised-launch manifest produced by an
+    earlier full SHA-256 preflight of this exact checkpoint.  Reuse avoids
+    reading multi-gigabyte replay sidecars on every launcher/trainer process.
+    This path still hashes the attestation, checkpoint manifest and metadata;
+    validates every manifest digest descriptor; checks the complete file set,
+    path containment and current sizes; and re-runs semantic identity/ABI
+    validation.  It deliberately does not re-hash large payload bytes.
+
+    This is model-initialization-only authority.  Exact resume must always use
+    :func:`validate_resume_checkpoint` and a fresh full payload hash pass.
+    """
+
+    expected_digest = _require_sha256(
+        expected_attestation_sha256,
+        label="model-initialization attestation SHA-256",
+    )
+    attestation_path = Path(attestation).expanduser().resolve(strict=False)
+    try:
+        attestation_bytes = attestation_path.read_bytes()
+    except OSError as exc:
+        raise CheckpointIntegrityError(
+            f"model-initialization attestation is unreadable: {attestation_path}"
+        ) from exc
+    observed_digest = hashlib.sha256(attestation_bytes).hexdigest()
+    if observed_digest != expected_digest:
+        raise CheckpointIntegrityError(
+            "model-initialization attestation SHA-256 mismatch: "
+            f"expected={expected_digest} actual={observed_digest}"
+        )
+    try:
+        attestation_payload = _object(
+            json.loads(attestation_bytes),
+            label="model-initialization attestation",
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointIntegrityError(
+            "model-initialization attestation is not valid UTF-8 JSON"
+        ) from exc
+    schema = attestation_payload.get("schema_version")
+    if not isinstance(schema, str) or not schema.endswith(
+        "model-init-supervised-launch-v1"
+    ):
+        raise CheckpointIntegrityError(
+            "model-initialization attestation schema is unsupported"
+        )
+    attested_by = _object(
+        attestation_payload.get("attested_by"),
+        label="model-initialization attestation provenance",
+    )
+    if attested_by.get("full_payload_hash_preflight") is not True:
+        raise CheckpointIntegrityError(
+            "model-initialization attestation has no full-payload verification claim"
+        )
+    _require_sha256(
+        attested_by.get("launch_manifest_sha256"),
+        label="model-initialization attestation source-manifest SHA-256",
+    )
+    source = _object(
+        attestation_payload.get("source_checkpoint"),
+        label="model-initialization attestation source_checkpoint",
+    )
+    root = Path(checkpoint).expanduser().resolve(strict=False)
+    source_root = source.get("root")
+    if not isinstance(source_root, str) or Path(source_root).resolve(
+        strict=False
+    ) != root:
+        raise CheckpointIntegrityError(
+            "model-initialization attestation names another checkpoint root"
+        )
+    expected_manifest_digest = _require_sha256(
+        source.get("manifest_sha256"),
+        label="attested checkpoint manifest SHA-256",
+    )
+    expected_metadata_digest = _require_sha256(
+        source.get("metadata_sha256"),
+        label="attested checkpoint metadata SHA-256",
+    )
+    try:
+        manifest_bytes = (root / "checkpoint.manifest.json").read_bytes()
+        metadata_bytes = (root / "metadata.json").read_bytes()
+    except OSError as exc:
+        raise CheckpointIntegrityError(
+            f"attested checkpoint identity files are unreadable: {root}"
+        ) from exc
+    if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_digest:
+        raise CheckpointIntegrityError("attested checkpoint manifest SHA-256 mismatch")
+    if hashlib.sha256(metadata_bytes).hexdigest() != expected_metadata_digest:
+        raise CheckpointIntegrityError("attested checkpoint metadata SHA-256 mismatch")
+
+    manifest = verify_checkpoint_directory(
+        root,
+        require_manifest=True,
+        require_hashes=True,
+        require_all_files_listed=True,
+        verify_payload_contents=False,
+    )
+    if manifest is None:  # pragma: no cover - strict verifier cannot return None
+        raise CheckpointIntegrityError(f"atomic checkpoint manifest is required: {root}")
+    attested_files = source.get("manifest_files")
+    if not isinstance(attested_files, list) or manifest.get("files") != attested_files:
+        raise CheckpointIntegrityError(
+            "checkpoint manifest file descriptors differ from the byte attestation"
+        )
+    if manifest.get("checkpoint_id") != source.get("checkpoint_id"):
+        raise CheckpointIntegrityError(
+            "checkpoint ID differs from the byte attestation"
+        )
+    _require_manifest_entries(
+        manifest,
+        required_files=required_files,
+        operation="attested model initialization",
+    )
+    metadata = _object(
+        json.loads(metadata_bytes),
+        label="checkpoint metadata",
+    )
+    _validate_semantic_identity(
+        manifest=manifest,
+        metadata=metadata,
+        require_current_runtime_identity=False,
+    )
+    provenance = metadata.get("provenance")
+    training_state = metadata.get("training_state")
+    source_runtime = metadata.get("training_config")
+    if not isinstance(provenance, dict) or not isinstance(training_state, dict):
+        raise CheckpointIntegrityError(
+            "attested checkpoint has no provenance or training state"
+        )
+    if not isinstance(source_runtime, dict):
+        raise CheckpointIntegrityError(
+            "attested checkpoint has no source training configuration"
+        )
+    runtime = source_runtime.get("runtime")
+    if not isinstance(runtime, dict):
+        raise CheckpointIntegrityError(
+            "attested checkpoint has no source runtime configuration"
+        )
+    expected_source_fields = {
+        "checkpoint_format": metadata.get("format"),
+        "experiment_run_id": provenance.get("experiment_run_id"),
+        "environment_steps": training_state.get("environment_steps"),
+        "policy_version": training_state.get("policy_version"),
+        "learner_updates": training_state.get("learner_updates"),
+        "source_total_environment_steps": runtime.get("total_environment_steps"),
+    }
+    for key, value in expected_source_fields.items():
+        if source.get(key) != value:
+            raise CheckpointIntegrityError(
+                f"attested checkpoint {key} differs from metadata"
+            )
+    return ValidatedResumeCheckpoint(root=root, manifest=manifest, metadata=metadata)
+
+
 def revalidate_checkpoint_identity(
     validated: ValidatedResumeCheckpoint,
     *,

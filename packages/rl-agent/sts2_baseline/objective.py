@@ -52,17 +52,16 @@ class RevivalEfficiencyRewardSpec:
     fewer training revivals, and fewer decisions; it does not reward damage.
     """
 
-    version: str = field(default="sts2-run-survival-efficiency-v6", init=False)
+    version: str = field(default="sts2-run-survival-efficiency-v7", init=False)
     required_discount: float = field(default=1.0, init=False)
     hp_loss_weight: float = field(default=0.55, init=False)
-    # V5's constant 0.005 marginal cost was still too small compared with the
-    # variance of a complete run and made repeated revival an inexpensive way
-    # to fill failure/liveness replay.  V6 is deliberately convex over the
-    # reviewed 16-revival curriculum: early exploration remains affordable,
-    # while successive revivals become increasingly distinguishable.
-    revival_linear_weight: float = field(default=0.010, init=False)
-    revival_quadratic_weight: float = field(default=0.0009, init=False)
+    # V6 reached this cap at revival 17, so every revival from 18 through a
+    # later 32/64-revival course had exactly zero scalar marginal cost.  V7
+    # spends the same bounded cost budget uniformly across the *configured*
+    # finite course.  Thus every permitted revival remains distinguishable,
+    # while tightening the curriculum automatically raises the unit price.
     revival_cost_cap: float = field(default=0.40, init=False)
+    revival_reference_budget: int = field(default=64, init=False)
     pace_budget: float = field(default=0.04, init=False)
     hp_loss_scale: float = field(default=80.0, init=False)
 
@@ -99,6 +98,11 @@ def revival_efficiency_reward_identity() -> dict[str, Any]:
         "base": task_reward_identity(),
         "spec": asdict(REVIVAL_EFFICIENCY_REWARD_SPEC),
         "revival_event_source": "observation._training.revivals_used exact counter",
+        "revival_budget_source": (
+            "positive observation._training.revival_budget; otherwise "
+            "spec.revival_reference_budget"
+        ),
+        "revival_cost_schedule": "cap*min(revivals_used/revival_budget,1)",
         "hp_loss_source": "observation._training.player_hp_lost exact counter",
         "ordering": "task_outcome+run_progress>bounded_survival_efficiency>decisions",
         "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
@@ -148,24 +152,44 @@ def _bounded_resource_score(amount: float, scale: float) -> float:
     return normalized_amount / (normalized_amount + normalized_scale)
 
 
-def _revival_efficiency_cost(amount: float) -> float:
-    """Return the versioned, bounded cumulative v6 revival cost.
+def _training_revival_budget(observation: Mapping[str, Any]) -> int:
+    """Return the positive finite course budget used by reward v7.
 
-    ``0.010*k + 0.0009*k^2`` gives every revival through the finite 16-revival
-    curriculum a stronger marginal cost than the previous 0.005 constant.
-    The bounded 0.40 revival budget plus 0.55 HP-loss and 0.04 pace budgets is
-    0.99, strictly below one terminal-outcome unit, so every task victory still
-    outranks every task failure before efficiency is used as a tie-break.
+    Historical/unlimited observations encode the budget as ``-1`` (and some
+    fixtures omit it).  Those observations use the reviewed 64-revival
+    reference horizon rather than silently collapsing the denominator to one.
+    A positive non-integral budget is malformed and fails closed.
     """
 
+    training = _mapping(observation.get("_training"))
+    raw = training.get("revival_budget")
+    if raw is None:
+        return REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget
+    value = _number(raw, default=float("nan"))
+    if not math.isfinite(value):
+        raise ValueError("training revival budget must be finite")
+    if value <= 0.0:
+        return REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget
+    if not value.is_integer():
+        raise ValueError("training revival budget must be an integer")
+    return int(value)
+
+
+def _revival_efficiency_cost(amount: float, *, revival_budget: int) -> float:
+    """Return the versioned, bounded cumulative v7 revival cost.
+
+    ``0.40 * min(k / B, 1)`` preserves a non-zero marginal penalty for every
+    revival admitted by finite course budget ``B``.  At B=64 the unit price is
+    0.00625; at B=32 it is 0.0125; at B=16 it is 0.025.  The complete revival,
+    HP-loss and pace preference remains bounded by 0.99, strictly below one
+    terminal-outcome unit.
+    """
+
+    if isinstance(revival_budget, bool) or revival_budget <= 0:
+        raise ValueError("revival_budget must be a positive integer")
     normalized_amount = max(0.0, float(amount))
-    raw_cost = (
-        REVIVAL_EFFICIENCY_REWARD_SPEC.revival_linear_weight * normalized_amount
-        + REVIVAL_EFFICIENCY_REWARD_SPEC.revival_quadratic_weight
-        * normalized_amount
-        * normalized_amount
-    )
-    return min(REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap, raw_cost)
+    normalized_fraction = min(normalized_amount / float(revival_budget), 1.0)
+    return REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap * normalized_fraction
 
 
 def _typed_terminal_result(result: EnvironmentResult, *, objective: TaskObjective) -> str:
@@ -321,8 +345,12 @@ class RevivalEfficiencyRewardCalculator:
         )
         before_revivals = _training_counter(before.observation, "revivals_used")
         after_revivals = _training_counter(after.observation, "revivals_used")
+        before_revival_budget = _training_revival_budget(before.observation)
+        after_revival_budget = _training_revival_budget(after.observation)
         before_hp_lost = _training_counter(before.observation, "player_hp_lost")
         after_hp_lost = _training_counter(after.observation, "player_hp_lost")
+        if after_revival_budget != before_revival_budget:
+            raise ValueError("training revival budget must remain constant within an episode")
         if after_revivals < before_revivals or after_hp_lost < before_hp_lost:
             raise ValueError("training efficiency counters must be monotonic")
 
@@ -339,8 +367,14 @@ class RevivalEfficiencyRewardCalculator:
             )
         )
         revival_penalty = -(
-            _revival_efficiency_cost(after_revivals)
-            - _revival_efficiency_cost(before_revivals)
+            _revival_efficiency_cost(
+                after_revivals,
+                revival_budget=after_revival_budget,
+            )
+            - _revival_efficiency_cost(
+                before_revivals,
+                revival_budget=before_revival_budget,
+            )
         )
         pace_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.pace_budget / float(
             self.maximum_episode_steps

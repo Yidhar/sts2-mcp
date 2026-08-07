@@ -71,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=("compatible atomic checkpoint model for a fresh lineage; never exact resume"),
     )
     parser.add_argument(
+        "--model-initialization-attestation",
+        help=(
+            "pinned prior full-byte verification manifest for a trusted immutable "
+            "model-initialization source"
+        ),
+    )
+    parser.add_argument(
+        "--model-initialization-attestation-sha256",
+        help="expected SHA-256 of --model-initialization-attestation",
+    )
+    parser.add_argument(
         "--launch-contract",
         help="absolute immutable supervised-launch contract path",
     )
@@ -112,6 +123,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if bool(args.launch_contract) != bool(args.launch_contract_sha256):
         raise SystemExit("--launch-contract and --launch-contract-sha256 must be supplied together")
+    if bool(args.model_initialization_attestation) != bool(
+        args.model_initialization_attestation_sha256
+    ):
+        raise SystemExit(
+            "--model-initialization-attestation and its SHA-256 must be supplied together"
+        )
     supervised_launch: SupervisedLaunchContract | None = None
     if args.launch_contract is not None:
         try:
@@ -209,6 +226,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     initialization: Path | None = None
     if args.resume and args.initialize_from:
         raise SystemExit("--resume and --initialize-from are mutually exclusive")
+    if args.model_initialization_attestation and (
+        not args.initialize_from or supervised_launch is None
+    ):
+        raise SystemExit(
+            "a model-initialization attestation requires supervised --initialize-from"
+        )
     if args.resume:
         resume = resolve_external_input_path(args.resume)
     if args.initialize_from:
@@ -223,6 +246,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         config,
         resume_from=resume,
         initialize_from=initialization,
+        model_initialization_attestation=(
+            resolve_external_input_path(args.model_initialization_attestation)
+            if args.model_initialization_attestation
+            else None
+        ),
+        model_initialization_attestation_sha256=(
+            str(args.model_initialization_attestation_sha256)
+            if args.model_initialization_attestation_sha256
+            else None
+        ),
         runtime_provenance=runtime_provenance,
         supervised_launch_contract=supervised_launch,
     )

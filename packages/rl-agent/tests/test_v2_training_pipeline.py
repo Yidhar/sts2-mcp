@@ -4380,6 +4380,94 @@ def test_prevalidated_exact_resume_skips_only_the_duplicate_directory_hash(
         independent.close()
 
 
+def test_attested_model_initialization_skips_payload_rehash_but_keeps_identity_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    source_resources = build_training_resources(config, backend=FakeCombatBackend())
+    try:
+        checkpoint = save_training_checkpoint(
+            tmp_path / "attested-model-source",
+            config=config,
+            resources=source_resources,
+            state=TrainingState(
+                environment_steps=73,
+                learner_updates=4,
+                policy_version=4,
+                actor_policy_version=4,
+            ),
+            run_id="attested-source-run",
+            checkpoint_load_mode="fresh",
+        )
+    finally:
+        source_resources.close()
+
+    manifest_bytes = (checkpoint / "checkpoint.manifest.json").read_bytes()
+    metadata_bytes = (checkpoint / "metadata.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    metadata = json.loads(metadata_bytes)
+    attestation_payload = {
+        "schema_version": "sts2-test-model-init-supervised-launch-v1",
+        "attested_by": {
+            "launch_manifest_sha256": "1" * 64,
+            "full_payload_hash_preflight": True,
+        },
+        "source_checkpoint": {
+            "root": str(checkpoint.resolve()),
+            "checkpoint_id": manifest["checkpoint_id"],
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+            "manifest_files": manifest["files"],
+            "experiment_run_id": metadata["provenance"]["experiment_run_id"],
+            "environment_steps": 73,
+            "policy_version": 4,
+            "learner_updates": 4,
+            "source_total_environment_steps": metadata["training_config"]["runtime"][
+                "total_environment_steps"
+            ],
+            "target_total_environment_steps": config.runtime.total_environment_steps,
+            "checkpoint_format": metadata["format"],
+        },
+    }
+    attestation = tmp_path / "source-byte-attestation.json"
+    attestation.write_text(
+        json.dumps(attestation_payload, sort_keys=True),
+        encoding="utf-8",
+    )
+    attestation_sha256 = hashlib.sha256(attestation.read_bytes()).hexdigest()
+
+    from sts2_rl.checkpoints import atomic as atomic_module
+
+    real_hash = atomic_module._sha256
+
+    def forbidden_payload_hash(path: Path) -> str:
+        if path.resolve().is_relative_to(checkpoint.resolve()):
+            raise AssertionError(
+                "attested model initialization re-hashed payload bytes"
+            )
+        return real_hash(path)
+
+    monkeypatch.setattr(atomic_module, "_sha256", forbidden_payload_hash)
+    validated = preflight_model_initialization(
+        checkpoint,
+        config=config,
+        attestation=attestation,
+        attestation_sha256=attestation_sha256,
+    )
+    assert validated.root == checkpoint.resolve()
+
+    with (checkpoint / "network.pt").open("ab") as handle:
+        handle.write(b"corruption")
+    with pytest.raises(CheckpointIntegrityError, match="size mismatch"):
+        preflight_model_initialization(
+            checkpoint,
+            config=config,
+            attestation=attestation,
+            attestation_sha256=attestation_sha256,
+        )
+
+
 def test_prevalidated_handle_cannot_weaken_exact_resume_identity(
     tmp_path: Path,
 ) -> None:

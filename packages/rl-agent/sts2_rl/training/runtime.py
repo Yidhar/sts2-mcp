@@ -1109,11 +1109,25 @@ def run_training(
     backend: EnvironmentBackend | None = None,
     resume_from: str | Path | None = None,
     initialize_from: str | Path | None = None,
+    model_initialization_attestation: str | Path | None = None,
+    model_initialization_attestation_sha256: str | None = None,
     runtime_provenance: Mapping[str, Any] | None = None,
     supervised_launch_contract: SupervisedLaunchContract | None = None,
 ) -> TrainingState:
     if resume_from is not None and initialize_from is not None:
         raise ValueError("resume_from and initialize_from are mutually exclusive")
+    if bool(model_initialization_attestation) != bool(
+        model_initialization_attestation_sha256
+    ):
+        raise ValueError(
+            "model-initialization attestation and SHA-256 must be supplied together"
+        )
+    if model_initialization_attestation is not None and (
+        initialize_from is None or supervised_launch_contract is None
+    ):
+        raise ValueError(
+            "model-initialization attestation requires a supervised model initialization"
+        )
     if runtime_provenance is not None and not isinstance(
         runtime_provenance,
         Mapping,
@@ -1139,6 +1153,8 @@ def run_training(
         prevalidated_initialization = preflight_model_initialization(
             initialize_from,
             config=config,
+            attestation=model_initialization_attestation,
+            attestation_sha256=model_initialization_attestation_sha256,
         )
     supervised_source: dict[str, Any] | None = None
     if supervised_launch_contract is not None:

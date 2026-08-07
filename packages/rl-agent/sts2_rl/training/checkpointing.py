@@ -24,6 +24,7 @@ from sts2_rl.checkpoints import (
     contract_metadata,
     reject_frozen_exact_resume,
     revalidate_checkpoint_identity,
+    validate_attested_model_initialization_checkpoint,
     validate_model_initialization_checkpoint,
     validate_resume_checkpoint,
 )
@@ -1221,9 +1222,27 @@ def preflight_model_initialization(
     *,
     config: TrainingConfig,
     prevalidated: ValidatedResumeCheckpoint | None = None,
+    attestation: str | Path | None = None,
+    attestation_sha256: str | None = None,
 ) -> ValidatedResumeCheckpoint:
+    if bool(attestation) != bool(attestation_sha256):
+        raise ValueError(
+            "model-initialization attestation and SHA-256 must be supplied together"
+        )
+    if prevalidated is not None and attestation is not None:
+        raise ValueError(
+            "prevalidated handle and cross-process attestation are mutually exclusive"
+        )
     if prevalidated is None:
-        validated = validate_model_initialization_checkpoint(checkpoint)
+        if attestation is None:
+            validated = validate_model_initialization_checkpoint(checkpoint)
+        else:
+            assert attestation_sha256 is not None
+            validated = validate_attested_model_initialization_checkpoint(
+                checkpoint,
+                attestation=attestation,
+                expected_attestation_sha256=attestation_sha256,
+            )
     else:
         validated = _reuse_prevalidated_checkpoint(
             prevalidated,

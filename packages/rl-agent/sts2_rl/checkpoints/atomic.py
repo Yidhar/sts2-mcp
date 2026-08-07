@@ -494,12 +494,16 @@ def verify_checkpoint_directory(
     require_manifest: bool = False,
     require_hashes: bool = False,
     require_all_files_listed: bool = False,
+    verify_payload_contents: bool = True,
 ) -> dict[str, Any] | None:
     """Validate the atomic completion manifest and its payload files.
 
     Diagnostic callers may accept ``None`` for a missing manifest. Grounded
-    training resume always sets all three strict flags through
-    ``validate_resume_checkpoint``.
+    training resume always sets all three strict flags and leaves
+    ``verify_payload_contents=True`` through ``validate_resume_checkpoint``.
+    The false setting is reserved for an independently pinned prior-byte
+    attestation used by model initialization; it still validates descriptors,
+    path containment, file set and sizes.
     """
 
     root = Path(checkpoint).resolve(strict=False)
@@ -584,7 +588,7 @@ def verify_checkpoint_directory(
                 raise CheckpointIntegrityError(
                     f"invalid checkpoint SHA-256 for {relative_path}"
                 )
-            if _sha256(file_path) != expected_hash:
+            if verify_payload_contents and _sha256(file_path) != expected_hash:
                 raise CheckpointIntegrityError(
                     f"checkpoint hash mismatch for {relative_path}"
                 )
