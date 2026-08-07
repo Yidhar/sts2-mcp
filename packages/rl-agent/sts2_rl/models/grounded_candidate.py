@@ -610,6 +610,9 @@ class RecurrentCandidateOutput:
     combat_revival_cost_value: Tensor  # [B]
     act_revival_cost_value: Tensor  # [B]
     run_revival_cost_value: Tensor  # [B]
+    # Bounded factual HP-loss estimate to the current combat boundary.  This
+    # is candidate-independent and never acts as a hand-authored policy bonus.
+    combat_hp_loss_value: Tensor  # [B], [0, 1]
     action_mask: Tensor  # [B, A] bool
     candidate_effect_logits: Tensor | None = None  # [B, A, 4]
     selection_delta_logits: Tensor | None = None  # [B, A, 3]
@@ -704,6 +707,7 @@ class RecurrentCandidateOutput:
             ("combat_revival_cost_value", self.combat_revival_cost_value),
             ("act_revival_cost_value", self.act_revival_cost_value),
             ("run_revival_cost_value", self.run_revival_cost_value),
+            ("combat_hp_loss_value", self.combat_hp_loss_value),
         ):
             _require_shape(f"output.{name}", value, (batch_size,))
             _require_finite_floating(f"output.{name}", value)
@@ -716,6 +720,13 @@ class RecurrentCandidateOutput:
         ):
             if bool((value < 0.0).any().item()):
                 raise ValueError(f"output.{name} must be non-negative")
+        if bool(
+            (
+                (self.combat_hp_loss_value < 0.0)
+                | (self.combat_hp_loss_value > 1.0)
+            ).any().item()
+        ):
+            raise ValueError("output.combat_hp_loss_value must be in [0, 1]")
 
         for name, optional_value, shape in (
             (
@@ -1274,6 +1285,9 @@ class RecurrentCandidateModel(nn.Module):
         self.combat_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
         self.act_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
         self.run_revival_cost_value_head = self._nonnegative_scalar_head(cfg.recurrent_hidden_dim)
+        self.combat_hp_loss_value_head = self._bounded_scalar_head(
+            cfg.recurrent_hidden_dim
+        )
         if enable_transaction_heads:
             self.candidate_effect_head: nn.Module | None = self._categorical_head(
                 cfg.d_model,
@@ -1723,6 +1737,9 @@ class RecurrentCandidateModel(nn.Module):
             combat_revival_cost_value=self.combat_revival_cost_value_head(next_recurrent_state).squeeze(-1),
             act_revival_cost_value=self.act_revival_cost_value_head(next_recurrent_state).squeeze(-1),
             run_revival_cost_value=self.run_revival_cost_value_head(next_recurrent_state).squeeze(-1),
+            combat_hp_loss_value=self.combat_hp_loss_value_head(
+                next_recurrent_state
+            ).squeeze(-1),
             action_mask=mask,
             candidate_effect_logits=candidate_effect_logits,
             selection_delta_logits=selection_delta_logits,

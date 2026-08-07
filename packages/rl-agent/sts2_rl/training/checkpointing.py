@@ -38,7 +38,7 @@ from sts2_rl.semantics import (
 )
 from sts2_rl.semantics.identity import SEMANTIC_KEY_CONTRACT_VERSION
 
-from .config import TrainingConfig, training_config_from_mapping
+from .config import CONFIG_VERSION, TrainingConfig, training_config_from_mapping
 from .episode_replay import BoundedEpisodicReplay
 from .factory import TrainingResources
 from .failure_credit import (
@@ -78,6 +78,7 @@ _EVALUATION_GATE_STATE_VERSION = "sts2-evaluation-gate-state-v1"
 _LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
 _EPISODIC_TARGET_ABI = "sts2-episodic-task-targets-one-terminal-unit-v2"
 _LIVENESS_COST_HEAD_ABI = "sts2-liveness-cost-heads-v1"
+_COMBAT_HP_LOSS_HEAD_ABI = "sts2-combat-hp-loss-value-head-v1"
 _CHECKPOINT_ROLES = frozenset(
     {
         "ordinary",
@@ -99,6 +100,7 @@ _LIVENESS_HEAD_PREFIXES = (
     "liveness_cost_value_head.",
     "candidate_liveness_cost_head.",
 )
+_COMBAT_HP_LOSS_HEAD_PREFIXES = ("combat_hp_loss_value_head.",)
 _TRANSACTION_HEAD_PREFIXES = (
     "candidate_effect_head.",
     "selection_delta_head.",
@@ -1113,6 +1115,10 @@ def _validate_metadata(
             raise ValueError("non-learning checkpoint cannot contain a failure-credit " "replay specification")
     if metadata.get("long_horizon_value_head_abi") != _LONG_HORIZON_VALUE_HEAD_ABI:
         raise ValueError("exact-resume checkpoint has no long-horizon value-head ABI marker")
+    if metadata.get("combat_hp_loss_value_head_abi") != _COMBAT_HP_LOSS_HEAD_ABI:
+        raise ValueError(
+            "exact-resume checkpoint has no combat HP-loss value-head ABI marker"
+        )
     if config.transaction_learning.enabled:
         if metadata.get("transaction_heads_enabled") is not True:
             raise ValueError("transaction-enabled checkpoint has no head ABI marker")
@@ -1412,6 +1418,7 @@ def save_training_checkpoint(
             "failure_credit_replay_enabled": (config.failure_credit.learning_enabled),
             "failure_credit_replay_spec": failure_credit_replay_spec,
             "long_horizon_value_head_abi": _LONG_HORIZON_VALUE_HEAD_ABI,
+            "combat_hp_loss_value_head_abi": _COMBAT_HP_LOSS_HEAD_ABI,
             "episodic_target_abi": _EPISODIC_TARGET_ABI,
             "sdpa_backend": recorded_sdpa,
             "execution_provenance": checkpoint_execution_provenance,
@@ -1634,6 +1641,10 @@ def initialize_model_from_checkpoint(
     if validated.metadata.get("model_state_spec") != _tensor_spec(state):
         raise ValueError("model initialization source tensor specification differs")
     target_state = resources.model.state_dict()
+    source_training_config = validated.metadata.get("training_config")
+    if not isinstance(source_training_config, Mapping):
+        raise ValueError("model initialization checkpoint has no training config")
+    source_config_version = source_training_config.get("version")
     migrated = _model_parameter_initialization_state(
         state,
         target_state=target_state,
@@ -1641,6 +1652,7 @@ def initialize_model_from_checkpoint(
         allow_source_transaction_head_drop=(not config.transaction_learning.enabled),
         allow_missing_long_horizon_heads=(validated.metadata.get("format") in _LONG_HORIZON_MISSING_FORMATS),
         allow_missing_liveness_heads=config.failure_credit.learning_enabled,
+        allow_missing_combat_hp_loss_head=(source_config_version != CONFIG_VERSION),
     )
     # Preserve the freshly constructed target-only parameters and RNG lineage;
     # the migration overlays compatible learned tensors onto that exact model
@@ -1663,11 +1675,13 @@ def _model_parameter_initialization_state(
     allow_source_transaction_head_drop: bool = False,
     allow_missing_long_horizon_heads: bool = False,
     allow_missing_liveness_heads: bool = False,
+    allow_missing_combat_hp_loss_head: bool = False,
 ) -> dict[str, Any]:
     """Fail-closed overlay used only by explicit parameter initialization.
 
     Exact resume never calls this path. Optional transaction heads, the six
-    long-horizon state heads, and the two-part liveness-cost head family are
+    long-horizon state heads, the two-part liveness-cost head family, and the
+    bounded combat HP-loss head are
     independent all-or-none migration groups. Only a validated older-format
     checkpoint may omit long-horizon heads. Liveness heads may be omitted only
     when the target explicitly enables the new failure-credit learner. A
@@ -1713,6 +1727,9 @@ def _model_parameter_initialization_state(
         raise ValueError("model initialization source contains unsupported tensors: " + ", ".join(unexpected))
     target_long_horizon_heads = {key for key in target_state if key.startswith(_LONG_HORIZON_HEAD_PREFIXES)}
     target_liveness_heads = {key for key in target_state if key.startswith(_LIVENESS_HEAD_PREFIXES)}
+    target_combat_hp_loss_heads = {
+        key for key in target_state if key.startswith(_COMBAT_HP_LOSS_HEAD_PREFIXES)
+    }
     if not target_long_horizon_heads:
         raise ValueError("model initialization target has no long-horizon head tensors")
     target_liveness_prefixes = {
@@ -1722,6 +1739,10 @@ def _model_parameter_initialization_state(
         raise ValueError("model initialization target has an incomplete liveness-head family")
     if allow_missing_liveness_heads and not target_liveness_heads:
         raise ValueError("liveness-head migration was enabled but the target has no liveness tensors")
+    if allow_missing_combat_hp_loss_head and not target_combat_hp_loss_heads:
+        raise ValueError(
+            "combat-HP-loss-head migration was enabled but the target has no tensors"
+        )
 
     missing = set(target_state) - set(source_state)
     permitted_missing: set[str] = set()
@@ -1749,6 +1770,18 @@ def _model_parameter_initialization_state(
                 "model initialization source must contain either all or none " "of the liveness-head tensors"
             )
         permitted_missing.update(target_liveness_heads)
+
+    missing_combat_hp_loss = missing & target_combat_hp_loss_heads
+    if missing_combat_hp_loss:
+        if (
+            not allow_missing_combat_hp_loss_head
+            or missing_combat_hp_loss != target_combat_hp_loss_heads
+        ):
+            raise ValueError(
+                "model initialization source must contain either all or none "
+                "of the combat HP-loss head tensors"
+            )
+        permitted_missing.update(target_combat_hp_loss_heads)
 
     shared_missing = sorted(missing - permitted_missing)
     if shared_missing:

@@ -76,7 +76,7 @@ from .trajectory import TrajectoryJournal
 # telemetry.  Exact-resume safety is enforced independently by the config,
 # encoding, replay and objective checkpoint contracts; this marker makes the
 # failure-credit-v4 publication/sampling order distinguishable in metrics.
-_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v5-v8"
+_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v5-v9"
 
 
 def _failure_credit_quotas(
@@ -778,6 +778,9 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "lifecycle_smdp_q_weight": (
                 config.transaction_learning.lifecycle_smdp_q_weight
             ),
+            "lifecycle_smdp_horizon": (
+                config.transaction_learning.lifecycle_smdp_horizon
+            ),
             "pairwise_ranking_weight": (config.transaction_learning.pairwise_ranking_weight),
         },
         "transaction_exploration": {
@@ -818,6 +821,24 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "revival_policy_weight": (config.episodic_learning.revival_policy_weight),
             "secondary_advantage_fraction": (config.episodic_learning.secondary_advantage_fraction),
             "primary_success_tie_tolerance": (config.episodic_learning.primary_success_tie_tolerance),
+            "act_segment_imitation_enabled": (
+                config.episodic_learning.act_segment_imitation_enabled
+            ),
+            "act_segment_policy_weight": (
+                config.episodic_learning.act_segment_policy_weight
+            ),
+            "act_segment_min_exit_hp_ratio": (
+                config.episodic_learning.act_segment_min_exit_hp_ratio
+            ),
+            "act_segment_max_revival_fraction": (
+                config.episodic_learning.act_segment_max_revival_fraction
+            ),
+            "combat_hp_loss_value_weight": (
+                config.episodic_learning.combat_hp_loss_value_weight
+            ),
+            "combat_hp_loss_reference": (
+                config.episodic_learning.combat_hp_loss_reference
+            ),
             "policy_gradient_max_lag": (config.episodic_learning.policy_gradient_max_lag),
         },
         "encoding_contract": grounding_encoding_identity(),
@@ -835,6 +856,7 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
         "combat_revival_cost_value_shape": list(output.combat_revival_cost_value.shape),
         "act_revival_cost_value_shape": list(output.act_revival_cost_value.shape),
         "run_revival_cost_value_shape": list(output.run_revival_cost_value.shape),
+        "combat_hp_loss_value_shape": list(output.combat_hp_loss_value.shape),
         "recurrent_state_shape": list(output.recurrent_state.shape),
         "world_shape": list(decision.batch.world.features.shape),
         "candidate_shape": list(decision.batch.candidates.features.shape),
@@ -1940,6 +1962,15 @@ def run_training(
                     fresh_policy_sequences=(config.episodic_learning.fresh_policy_sequences),
                     success_imitation_exempt_surfaces=(
                         config.episodic_learning.success_imitation_exempt_surfaces
+                    ),
+                    act_segment_imitation_enabled=(
+                        config.episodic_learning.act_segment_imitation_enabled
+                    ),
+                    act_segment_min_exit_hp_ratio=(
+                        config.episodic_learning.act_segment_min_exit_hp_ratio
+                    ),
+                    act_segment_max_revival_fraction=(
+                        config.episodic_learning.act_segment_max_revival_fraction
                     ),
                 )
                 if resources.episodic_replay is not None

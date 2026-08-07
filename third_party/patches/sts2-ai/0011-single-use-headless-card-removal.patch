@@ -1,0 +1,12 @@
+diff --git a/src/Core/Entities/Merchant/MerchantCardRemovalEntry.cs b/src/Core/Entities/Merchant/MerchantCardRemovalEntry.cs
+index ddc7903..028183c 100644
+--- a/src/Core/Entities/Merchant/MerchantCardRemovalEntry.cs
++++ b/src/Core/Entities/Merchant/MerchantCardRemovalEntry.cs
+@@ -60,6 +60,7 @@ public sealed class MerchantCardRemovalEntry : MerchantEntry
+ 		bool flag = await RunManager.Instance.OneOffSynchronizer.DoLocalMerchantCardRemoval(goldToSpend, cancelable);
+ 		if (flag)
+ 		{
++			SetUsed();
+ 			NRun.Instance?.MerchantRoom?.Inventory.OnCardRemovalUsed();
+ 		}
+ 		return (flag, goldToSpend);

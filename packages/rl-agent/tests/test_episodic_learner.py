@@ -22,6 +22,7 @@ from sts2_rl.encoding.snapshot import collate_encoded_snapshots, sparse_token_ta
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 from sts2_rl.training.config import EpisodicLearningConfig, OptimizationConfig
 from sts2_rl.training.episode_replay import (
+    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
@@ -358,6 +359,7 @@ def _sequence(
         configured_burn_in_steps=configured_burn_in_steps,
         source_episode_won=episode.won,
         source_episode_authoritative=episode.completion.authoritative,
+        act_segment_health=episode.act_segment_health,
     )
 
 
@@ -372,6 +374,12 @@ def _learner(
     secondary_advantage_fraction: float = 0.25,
     success_policy_trust_region_epsilon: float = 0.20,
     success_imitation_exempt_surfaces: tuple[str, ...] = (),
+    act_segment_imitation_enabled: bool = False,
+    act_segment_policy_weight: float = 0.30,
+    act_segment_min_exit_hp_ratio: float = 0.35,
+    act_segment_max_revival_fraction: float = 0.34,
+    combat_hp_loss_value_weight: float = 0.0,
+    combat_hp_loss_reference: float = 80.0,
     dropout: float = 0.0,
 ) -> tuple[VTraceLearner, GroundedEncodingConfig]:
     torch.manual_seed(11)
@@ -400,6 +408,14 @@ def _learner(
             success_imitation_exempt_surfaces=(
                 success_imitation_exempt_surfaces
             ),
+            act_segment_imitation_enabled=act_segment_imitation_enabled,
+            act_segment_policy_weight=act_segment_policy_weight,
+            act_segment_min_exit_hp_ratio=act_segment_min_exit_hp_ratio,
+            act_segment_max_revival_fraction=(
+                act_segment_max_revival_fraction
+            ),
+            combat_hp_loss_value_weight=combat_hp_loss_value_weight,
+            combat_hp_loss_reference=combat_hp_loss_reference,
         ),
     )
     assert learner.device == CPU
@@ -569,6 +585,199 @@ def test_failed_horizon_is_value_only_without_anti_imitation_policy_label() -> N
         parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
         for name, parameter in learner.model.named_parameters()
         if name.startswith("policy_head.")
+    )
+
+
+def _failed_run_after_act_one(
+    snapshot: EncodedDecisionSnapshot,
+    *,
+    exit_hp_ratio: float,
+    cumulative_revivals: int,
+    revival_budget: int = 64,
+) -> CompletedEpisode:
+    steps = (
+        EpisodeDecisionStep(
+            snapshot=snapshot,
+            step_index=0,
+            action_index=0,
+            behavior_log_probability=-0.6931471805599453,
+            policy_decision=True,
+            policy_version=0,
+            act=1,
+            combat_id=None,
+            task_reward=0.0,
+            discount=1.0,
+            revivals_before=0,
+            revivals_after=cumulative_revivals,
+            hp_loss_before=0.0,
+            hp_loss_after=10.0,
+            act_boundary=BoundaryOutcome.SUCCEEDED,
+            decision_surface="map",
+        ),
+        EpisodeDecisionStep(
+            snapshot=snapshot,
+            step_index=1,
+            action_index=1,
+            behavior_log_probability=-0.6931471805599453,
+            policy_decision=True,
+            policy_version=0,
+            act=2,
+            combat_id=None,
+            task_reward=-1.0,
+            discount=0.0,
+            revivals_before=cumulative_revivals,
+            revivals_after=cumulative_revivals,
+            hp_loss_before=10.0,
+            hp_loss_after=10.0,
+            act_boundary=BoundaryOutcome.FAILED,
+            decision_surface="map",
+        ),
+    )
+    return backfill_completed_episode(
+        episode_id="failed-after-act-one",
+        steps=steps,
+        completion=EpisodeCompletion(
+            authoritative=True,
+            won=False,
+            final_revivals=cumulative_revivals,
+            final_hp_loss=10.0,
+            terminal_reason="run_defeat",
+        ),
+        act_segment_health=(
+            ActSegmentHealth(
+                act=1,
+                boundary_step_index=0,
+                exit_hp_ratio=exit_hp_ratio,
+                cumulative_revivals=cumulative_revivals,
+                revival_budget=revival_budget,
+            ),
+        ),
+    )
+
+
+def test_healthy_act_prefix_in_failed_run_gets_lower_weight_policy_imitation() -> None:
+    learner, encoding = _learner(
+        learn_steps=1,
+        primary_policy_weight=0.25,
+        task_value_weight=0.0,
+        revival_value_weight=0.0,
+        revival_policy_weight=0.0,
+        act_segment_imitation_enabled=True,
+        act_segment_policy_weight=0.30,
+    )
+    snapshot = _snapshot(encoding, domain_id=0)
+    _zero_multiscale_heads(learner.model)
+    for parameter in learner.model.policy_head.parameters():
+        torch.nn.init.zeros_(parameter)
+
+    successful_run = _episode(
+        (snapshot,),
+        episode_id="complete-run-win",
+        won=True,
+    )
+    healthy_prefix = _failed_run_after_act_one(
+        snapshot,
+        exit_hp_ratio=0.60,
+        cumulative_revivals=4,
+    )
+    run_loss = learner._episodic_losses(
+        (_sequence(successful_run),),
+        current_policy_version=0,
+    )
+    prefix_loss = learner._episodic_losses(
+        (_sequence(healthy_prefix),),
+        current_policy_version=0,
+    )
+
+    assert prefix_loss.act_segment_policy_labels == 1
+    assert prefix_loss.act_segment_healthy_acts == 1
+    assert prefix_loss.policy_labels == 1
+    assert prefix_loss.efficiency_policy_labels == 0
+    assert prefix_loss.failure_policy_suppressed_labels == 0
+    assert prefix_loss.total_loss.detach().item() == pytest.approx(
+        0.30 * run_loss.total_loss.detach().item(),
+        rel=1.0e-5,
+    )
+
+
+def test_unhealthy_act_prefix_remains_value_only() -> None:
+    learner, encoding = _learner(
+        learn_steps=1,
+        act_segment_imitation_enabled=True,
+    )
+    episode = _failed_run_after_act_one(
+        _snapshot(encoding, domain_id=0),
+        exit_hp_ratio=0.20,
+        cumulative_revivals=24,
+    )
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=0,
+    )
+
+    assert losses.act_segment_policy_labels == 0
+    assert losses.act_segment_healthy_acts == 0
+    assert losses.act_segment_health_gate_suppressed_labels == 1
+    assert losses.policy_labels == 0
+    assert losses.failure_policy_suppressed_labels == 1
+
+
+def test_failed_combat_hp_loss_is_bounded_factual_value_supervision() -> None:
+    learner, encoding = _learner(
+        learn_steps=1,
+        primary_policy_weight=0.0,
+        task_value_weight=0.0,
+        revival_value_weight=0.0,
+        revival_policy_weight=0.0,
+        combat_hp_loss_value_weight=0.10,
+        combat_hp_loss_reference=80.0,
+    )
+    snapshot = _snapshot(encoding, domain_id=1)
+    episode = backfill_completed_episode(
+        episode_id="failed-combat-hp-loss",
+        steps=(
+            EpisodeDecisionStep(
+                snapshot=snapshot,
+                step_index=0,
+                action_index=0,
+                behavior_log_probability=-0.6931471805599453,
+                policy_decision=True,
+                policy_version=0,
+                act=1,
+                combat_id="combat-1",
+                task_reward=-1.0,
+                discount=0.0,
+                revivals_before=0,
+                revivals_after=1,
+                hp_loss_before=0.0,
+                hp_loss_after=20.0,
+                combat_boundary=BoundaryOutcome.FAILED,
+                act_boundary=BoundaryOutcome.FAILED,
+                decision_surface="combat",
+            ),
+        ),
+        completion=EpisodeCompletion(
+            authoritative=True,
+            won=False,
+            final_revivals=1,
+            final_hp_loss=20.0,
+            terminal_reason="run_defeat",
+        ),
+    )
+
+    losses = learner._episodic_losses(
+        (_sequence(episode),),
+        current_policy_version=0,
+    )
+    learner.model.zero_grad(set_to_none=True)
+    losses.total_loss.backward()
+
+    assert losses.combat_hp_loss_value_labels == 1
+    assert losses.combat_hp_loss_value_loss.detach().item() > 0.0
+    assert torch.isfinite(losses.combat_hp_loss_value_loss)
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+        for parameter in learner.model.combat_hp_loss_value_head.parameters()
     )
 
 

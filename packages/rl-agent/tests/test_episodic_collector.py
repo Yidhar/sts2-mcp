@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,10 +26,76 @@ from sts2_rl.training import (
 )
 from sts2_rl.training.collector import (
     _episodic_decision_surface,
+    _extended_transaction_option_endpoint,
+    _macro_return_diagnostics,
     _noncombat_durable_projections,
 )
 from sts2_rl.training.episode_replay import BoundaryOutcome
 from tests.test_v2_training_pipeline import _config
+
+
+def test_macro_return_diagnostics_group_factual_returns_without_learning_labels() -> None:
+    diagnostics = _macro_return_diagnostics(
+        rewards=(0.0, 0.5, 1.0),
+        discounts=(1.0, 1.0, 0.0),
+        decisions=(
+            (0, "rest_site", "choose_rest_option:rest", "low_25_50", 1),
+            (1, "rest_site", "choose_rest_option:rest", "low_25_50", 1),
+            (1, "rest_site", "choose_rest_option:smith", "low_25_50", 1),
+        ),
+        authoritative=True,
+    )
+    by_action = {item.action_key: item for item in diagnostics}
+    assert by_action["choose_rest_option:rest"].count == 2
+    assert by_action["choose_rest_option:rest"].mean_return == pytest.approx(1.5)
+    assert by_action["choose_rest_option:smith"].count == 1
+    assert by_action["choose_rest_option:smith"].mean_return == pytest.approx(1.5)
+    assert _macro_return_diagnostics(
+        rewards=(1.0,),
+        discounts=(0.0,),
+        decisions=((0, "map", "choose_map_node", "high_75_100", 1),),
+        authoritative=False,
+    ) == ()
+
+
+def test_extended_transaction_endpoint_stops_before_next_rest_choice_or_at_act_boundary() -> None:
+    trace = SimpleNamespace(
+        start_step=0,
+        lifecycle=SimpleNamespace(
+            support_eligible=True,
+            entry_step_index=0,
+            exit_step_index=0,
+        ),
+    )
+    step = lambda floor, surface, boundary=BoundaryOutcome.NONE: SimpleNamespace(  # noqa: E731
+        floor=floor,
+        decision_surface=surface,
+        act_boundary=boundary,
+    )
+
+    next_rest = _extended_transaction_option_endpoint(
+        trace,
+        episodic_steps=(
+            step(4, "shop"),
+            step(5, "combat"),
+            step(6, "card_reward"),
+            step(9, "rest_site"),
+        ),
+        authoritative_outcome=False,
+    )
+    assert next_rest == (2, "next_rest_site")
+
+    next_act = _extended_transaction_option_endpoint(
+        trace,
+        episodic_steps=(
+            step(4, "shop"),
+            step(5, "combat"),
+            step(17, "combat", BoundaryOutcome.SUCCEEDED),
+            step(18, "rest_site"),
+        ),
+        authoritative_outcome=False,
+    )
+    assert next_act == (2, "act_boundary")
 
 
 def _counter(observation: dict[str, Any], name: str) -> float:

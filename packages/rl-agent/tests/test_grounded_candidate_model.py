@@ -468,6 +468,9 @@ def test_multiscale_state_values_are_well_formed(
         # Episodic learning uses a log1p observation model for the long-tailed
         # factual count. The Softplus head support makes that transform total.
         assert torch.isfinite(torch.log1p(value)).all()
+    assert output.combat_hp_loss_value.shape == (2,)
+    assert torch.all(output.combat_hp_loss_value >= 0.0)
+    assert torch.all(output.combat_hp_loss_value <= 1.0)
 
 
 def test_output_validation_rejects_malformed_multiscale_value(
@@ -493,6 +496,13 @@ def test_output_validation_rejects_malformed_multiscale_value(
             -1.0,
         ),
     )
+    malformed_hp_support = replace(
+        output,
+        combat_hp_loss_value=torch.full_like(
+            output.combat_hp_loss_value,
+            1.1,
+        ),
+    )
 
     with pytest.raises(ValueError, match="NaN or infinity"):
         malformed_finite.validate(config)
@@ -500,6 +510,8 @@ def test_output_validation_rejects_malformed_multiscale_value(
         malformed_shape.validate(config)
     with pytest.raises(ValueError, match="must be non-negative"):
         malformed_support.validate(config)
+    with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+        malformed_hp_support.validate(config)
 
 
 def test_forward_backward_reaches_shared_world_and_candidate_parameters(
@@ -517,6 +529,9 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
     selected = torch.tensor([0, 2], dtype=torch.long)
     policy_loss = -torch.log(probabilities[torch.arange(2), selected].clamp_min(1e-8)).mean()
     multiscale_value_loss = sum(getattr(output, field).square().mean() for field in MULTISCALE_STATE_VALUE_FIELDS)
+    multiscale_value_loss = (
+        multiscale_value_loss + output.combat_hp_loss_value.square().mean()
+    )
     loss = policy_loss + output.value.square().mean() + multiscale_value_loss
     loss.backward()
 
@@ -542,14 +557,17 @@ def test_forward_backward_reaches_shared_world_and_candidate_parameters(
         "combat_revival_cost_value_head",
         "act_revival_cost_value_head",
         "run_revival_cost_value_head",
+        "combat_hp_loss_value_head",
     ):
-        head_grad = getattr(model, head_name)[-2 if "revival" in head_name else -1].weight.grad
+        head_grad = getattr(model, head_name)[
+            -2 if "revival" in head_name or "hp_loss" in head_name else -1
+        ].weight.grad
         assert head_grad is not None and torch.isfinite(head_grad).all()
 
 
 def test_default_model_stays_small() -> None:
     model = RecurrentCandidateModel()
-    assert model.parameter_count == 4_413_512
+    assert model.parameter_count == 4_447_049
 
 
 def test_batch_shape_contract_rejects_misaligned_candidate_local_axis(

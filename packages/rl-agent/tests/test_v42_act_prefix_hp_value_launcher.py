@@ -11,12 +11,12 @@ from sts2_baseline import REVIVAL_EFFICIENCY_REWARD_SPEC
 from sts2_rl.training import CONFIG_VERSION, load_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v41_budget64_reward_v7_model_init.py"
+SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v42_act_prefix_hp_value_model_init.py"
 CONFIG = (
     PACKAGE_ROOT
     / "config"
     / "experiments"
-    / "full_run_revival_v41_budget64_reward_v7_model_init.toml"
+    / "full_run_revival_v42_act_prefix_hp_value_model_init.toml"
 )
 V40_CONFIG = (
     PACKAGE_ROOT
@@ -25,7 +25,7 @@ V40_CONFIG = (
     / "full_run_revival_v40_budget64_recovery_model_init.toml"
 )
 SPEC = importlib.util.spec_from_file_location(
-    "v41_budget64_reward_v7_launcher",
+    "v42_act_prefix_hp_value_launcher",
     SCRIPT,
 )
 assert SPEC is not None and SPEC.loader is not None
@@ -69,22 +69,54 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v41_changes_reward_identity_and_runtime_paths_from_v40() -> None:
+def test_v42_enables_act_prefix_hp_value_and_extended_smdp_without_scaffolding() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v40 = load_training_config(profile="preheat", config_path=V40_CONFIG)
 
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
     assert config.optimization == v40.optimization
     assert config.rollout == v40.rollout
-    assert config.transaction_learning == v40.transaction_learning
+    assert config.transaction_learning.lifecycle_smdp_horizon == (
+        "next_rest_or_act"
+    )
+    assert config.transaction_learning.lifecycle_smdp_q_weight == pytest.approx(
+        v40.transaction_learning.lifecycle_smdp_q_weight
+    )
     assert config.transaction_exploration == v40.transaction_exploration
     assert config.failure_credit == v40.failure_credit
-    assert config.episodic_learning == v40.episodic_learning
+    assert config.episodic_learning.act_segment_imitation_enabled is True
+    assert config.episodic_learning.act_segment_policy_weight == pytest.approx(
+        0.30
+    )
+    assert config.episodic_learning.act_segment_min_exit_hp_ratio == pytest.approx(
+        0.35
+    )
+    assert config.episodic_learning.act_segment_max_revival_fraction == pytest.approx(
+        0.34
+    )
+    assert config.episodic_learning.combat_hp_loss_value_weight == pytest.approx(
+        0.05
+    )
+    assert config.episodic_learning.combat_hp_loss_reference == pytest.approx(
+        80.0
+    )
+    assert config.episodic_learning.success_imitation_exempt_surfaces == (
+        "rest_site",
+        "shop",
+    )
     assert config.model == v40.model
     assert config.environment == v40.environment
     assert config.curriculum == v40.curriculum
     assert config.curriculum.revival_budget == 64
     assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
+    assert config.transaction_exploration.enabled is False
+    assert config.transaction_exploration.entry_epsilon_floor == pytest.approx(
+        0.0
+    )
+    assert (
+        config.transaction_exploration.completion_guidance_probability
+        == pytest.approx(0.0)
+    )
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == (
         "sts2-run-survival-efficiency-v7"
     )
@@ -98,7 +130,7 @@ def test_v41_changes_reward_identity_and_runtime_paths_from_v40() -> None:
     assert config.runtime.evaluation_guard_max_rollbacks == 0
 
 
-def test_v41_is_pinned_model_initialization_from_v39_healthy_gate(
+def test_v42_is_pinned_model_initialization_from_v39_healthy_gate(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
@@ -146,7 +178,7 @@ def test_v41_is_pinned_model_initialization_from_v39_healthy_gate(
         )
 
 
-def test_v41_checkpoint_pin_rejects_every_identity_mismatch(
+def test_v42_checkpoint_pin_rejects_every_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
@@ -170,11 +202,11 @@ def test_v41_checkpoint_pin_rejects_every_identity_mismatch(
             )
 
 
-def test_v41_supervisor_reenters_adapter_and_keeps_pins(
+def test_v42_supervisor_reenters_adapter_and_keeps_pins(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
-    manifest = tmp_path / "v41.launch.json"
+    manifest = tmp_path / "v42.launch.json"
     command = launcher.build_supervisor_command(paths, manifest_path=manifest)
 
     assert Path(command[1]).name == SCRIPT.name

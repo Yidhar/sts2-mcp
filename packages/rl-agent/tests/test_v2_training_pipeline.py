@@ -1335,12 +1335,18 @@ def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
     config = _config()
     report = inspect_baseline(config)
-    assert report["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v8")
+    assert report["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v9")
     assert report["active_shape_batching"] is True
     assert report["deterministic_probe_environment_steps"] == []
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
     assert report["episodic_learning"]["macro_sample_fraction"] == 0.0
+    assert report["episodic_learning"]["act_segment_imitation_enabled"] is False
+    assert report["episodic_learning"]["combat_hp_loss_value_weight"] == 0.0
+    assert report["transaction_learning"]["lifecycle_smdp_horizon"] == (
+        "transaction_exit"
+    )
+    assert report["combat_hp_loss_value_shape"] == [1]
     assert report["failure_credit"]["sampling_quotas"][EvidenceStratum.UNRESOLVED_STALL.value] == 1
     assert report["failure_credit"]["censored_quota"] == 0
 
@@ -2757,7 +2763,7 @@ def test_runtime_failure_credit_modes_preserve_shadow_isolation_and_episode_orde
     metrics_path = next((tmp_path / "runs" / f"failure-credit-{mode}").glob("run-*/metrics.jsonl"))
     events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     run_start = next(item for item in events if item["event"] == "run_start")
-    assert run_start["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v8")
+    assert run_start["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v9")
     train_episode = next(item for item in events if item["event"] == "train_episode")
     assert train_episode["failure_credit_mode"] == mode
     assert train_episode["failure_credit_records_emitted"] >= 1

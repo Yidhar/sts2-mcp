@@ -1641,6 +1641,7 @@ def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -
                 option_return=1.0,
                 option_discount=0.0,
                 option_steps=1,
+                option_boundary="transaction_exit",
             ),
         )
 
@@ -1911,6 +1912,64 @@ def test_factual_mc_backfill_masks_infrastructure_aborts() -> None:
     )
     assert infrastructure_abort.steps[0].transaction_return is None
     assert infrastructure_abort.steps[0].return_steps is None
+
+
+def test_extended_lifecycle_option_uses_factual_next_macro_boundary_without_bootstrap() -> None:
+    encoding = GroundedEncodingConfig.from_model_config(
+        _model_config(),
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    trace = _sequence_trace(
+        snapshot,
+        trace_id="extended-option",
+        outcome=TransactionOutcome.COMPLETED,
+        steps=(("entry", "exit", "smith", 0, TransactionEffect.EXIT),),
+    )
+    trace = replace(
+        trace,
+        lifecycle=TransactionLifecycleEvidence(
+            operation="upgrade",
+            entry_step_index=0,
+            exit_step_index=0,
+            entry_behavior_log_probability=math.log(0.5),
+            entry_model_probability=0.5,
+            entry_policy_version=0,
+            entry_action_fingerprint="smith",
+            outcome=TransactionLifecycleOutcome.COMMITTED,
+            effect_verified=True,
+            post_snapshot=snapshot,
+        ),
+    )
+    rewards = (0.1, 0.2, 0.3, 0.4, 9.0)
+    discounts = (1.0, 1.0, 1.0, 1.0, 0.0)
+
+    extended = backfill_factual_monte_carlo_returns(
+        trace,
+        episode_rewards=rewards,
+        episode_discounts=discounts,
+        authoritative_outcome=True,
+        option_horizon_end=3,
+        option_horizon_boundary="next_rest_site",
+        require_extended_option_horizon=True,
+    )
+    assert extended.lifecycle is not None
+    assert extended.lifecycle.option_return == pytest.approx(1.0)
+    assert extended.lifecycle.option_discount == 0.0
+    assert extended.lifecycle.option_steps == 4
+    assert extended.lifecycle.option_boundary == "next_rest_site"
+
+    censored_before_boundary = backfill_factual_monte_carlo_returns(
+        trace,
+        episode_rewards=rewards,
+        episode_discounts=discounts,
+        authoritative_outcome=False,
+        require_extended_option_horizon=True,
+    )
+    assert censored_before_boundary.lifecycle is not None
+    assert not censored_before_boundary.lifecycle.option_target_observed
 
 
 def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() -> None:
@@ -3050,6 +3109,7 @@ def test_legacy_v10_lineage_without_transaction_section_exact_resumes_only_disab
             "failure_credit_replay_enabled": False,
             "failure_credit_replay_spec": None,
             "long_horizon_value_head_abi": "sts2-long-horizon-value-heads-v1",
+            "combat_hp_loss_value_head_abi": "sts2-combat-hp-loss-value-head-v1",
             "episodic_replay_enabled": False,
         },
     )

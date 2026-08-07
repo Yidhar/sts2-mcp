@@ -50,6 +50,23 @@ def _remove_v17_stability_fields(payload: dict[str, object]) -> None:
     del episodic["success_imitation_exempt_surfaces"]
 
 
+def _remove_v18_act_hp_and_option_fields(payload: dict[str, object]) -> None:
+    episodic = payload["episodic_learning"]
+    transaction = payload["transaction_learning"]
+    assert isinstance(episodic, dict)
+    assert isinstance(transaction, dict)
+    for key in (
+        "act_segment_imitation_enabled",
+        "act_segment_policy_weight",
+        "act_segment_min_exit_hp_ratio",
+        "act_segment_max_revival_fraction",
+        "combat_hp_loss_value_weight",
+        "combat_hp_loss_reference",
+    ):
+        del episodic[key]
+    del transaction["lifecycle_smdp_horizon"]
+
+
 def _decision(
     *,
     surface: str,
@@ -361,6 +378,7 @@ def test_macro_journal_cli_writes_standalone_diagnostic_report(
 def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source = load_training_config(profile="preheat").to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v6"
+    _remove_v18_act_hp_and_option_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
@@ -397,6 +415,7 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v7"
+    _remove_v18_act_hp_and_option_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
@@ -447,6 +466,7 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v8"
+    _remove_v18_act_hp_and_option_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
@@ -479,6 +499,7 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     active = load_training_config(profile="preheat")
     source = active.to_mapping()
     source["version"] = "sts2-relational-curriculum-config-v10"
+    _remove_v18_act_hp_and_option_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)

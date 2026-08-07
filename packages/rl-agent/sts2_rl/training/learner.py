@@ -23,7 +23,11 @@ from .config import (
     OptimizationConfig,
     TransactionLearningConfig,
 )
-from .episode_replay import HorizonTargets, ReplaySequence
+from .episode_replay import (
+    HorizonTargets,
+    ReplaySequence,
+    healthy_act_segment_for_step,
+)
 from .failure_credit.actor_eligibility import (
     actor_step_is_fresh,
     contrast_actor_unit_effective,
@@ -183,6 +187,8 @@ class LearnerMetrics:
     episodic_task_value_loss: float
     episodic_revival_value_loss: float
     episodic_revival_policy_loss: float
+    episodic_act_segment_policy_loss: float
+    episodic_combat_hp_loss_value_loss: float
     episodic_sequences: int
     episodic_burn_in_steps: int
     episodic_learn_steps: int
@@ -193,7 +199,11 @@ class LearnerMetrics:
     episodic_policy_lag_suppressed_labels: int
     episodic_success_trust_region_suppressed_labels: int
     episodic_success_surface_exempted_labels: int
+    episodic_act_segment_policy_labels: int
+    episodic_act_segment_health_gate_suppressed_labels: int
+    episodic_act_segment_healthy_acts: int
     episodic_task_value_labels: int
+    episodic_combat_hp_loss_value_labels: int
     episodic_revival_value_labels: int
     episodic_efficiency_policy_labels: int
     episodic_importance_ratio_mean: float
@@ -1236,6 +1246,8 @@ class _EpisodicLossBatch:
     task_value_loss: Tensor
     revival_value_loss: Tensor
     revival_policy_loss: Tensor
+    act_segment_policy_loss: Tensor
+    combat_hp_loss_value_loss: Tensor
     burn_in_steps: int
     learn_steps: int
     success_policy_candidate_labels: int
@@ -1245,7 +1257,11 @@ class _EpisodicLossBatch:
     policy_lag_suppressed_labels: int
     success_trust_region_suppressed_labels: int
     success_surface_exempted_labels: int
+    act_segment_policy_labels: int
+    act_segment_health_gate_suppressed_labels: int
+    act_segment_healthy_acts: int
     task_value_labels: int
+    combat_hp_loss_value_labels: int
     revival_value_labels: int
     efficiency_policy_labels: int
     importance_ratios: Tensor
@@ -2711,6 +2727,14 @@ class VTraceLearner:
                         "episodic_revival_policy_loss",
                         episodic_losses.revival_policy_loss,
                     ),
+                    (
+                        "episodic_act_segment_policy_loss",
+                        episodic_losses.act_segment_policy_loss,
+                    ),
+                    (
+                        "episodic_combat_hp_loss_value_loss",
+                        episodic_losses.combat_hp_loss_value_loss,
+                    ),
                 ),
             )
             episodic_losses.total_loss.backward()  # type: ignore[no-untyped-call]
@@ -2944,6 +2968,12 @@ class VTraceLearner:
             episodic_task_value_loss=float(episodic_losses.task_value_loss.detach().item()),
             episodic_revival_value_loss=float(episodic_losses.revival_value_loss.detach().item()),
             episodic_revival_policy_loss=float(episodic_losses.revival_policy_loss.detach().item()),
+            episodic_act_segment_policy_loss=float(
+                episodic_losses.act_segment_policy_loss.detach().item()
+            ),
+            episodic_combat_hp_loss_value_loss=float(
+                episodic_losses.combat_hp_loss_value_loss.detach().item()
+            ),
             episodic_sequences=len(episodic_sequences),
             episodic_burn_in_steps=episodic_losses.burn_in_steps,
             episodic_learn_steps=episodic_losses.learn_steps,
@@ -2956,7 +2986,19 @@ class VTraceLearner:
             episodic_success_surface_exempted_labels=(
                 episodic_losses.success_surface_exempted_labels
             ),
+            episodic_act_segment_policy_labels=(
+                episodic_losses.act_segment_policy_labels
+            ),
+            episodic_act_segment_health_gate_suppressed_labels=(
+                episodic_losses.act_segment_health_gate_suppressed_labels
+            ),
+            episodic_act_segment_healthy_acts=(
+                episodic_losses.act_segment_healthy_acts
+            ),
             episodic_task_value_labels=episodic_losses.task_value_labels,
+            episodic_combat_hp_loss_value_labels=(
+                episodic_losses.combat_hp_loss_value_labels
+            ),
             episodic_revival_value_labels=(episodic_losses.revival_value_labels),
             episodic_efficiency_policy_labels=(episodic_losses.efficiency_policy_labels),
             episodic_importance_ratio_mean=(
@@ -3115,6 +3157,8 @@ class VTraceLearner:
                 task_value_loss=zero,
                 revival_value_loss=zero,
                 revival_policy_loss=zero,
+                act_segment_policy_loss=zero,
+                combat_hp_loss_value_loss=zero,
                 burn_in_steps=0,
                 learn_steps=0,
                 success_policy_candidate_labels=0,
@@ -3124,7 +3168,11 @@ class VTraceLearner:
                 policy_lag_suppressed_labels=0,
                 success_trust_region_suppressed_labels=0,
                 success_surface_exempted_labels=0,
+                act_segment_policy_labels=0,
+                act_segment_health_gate_suppressed_labels=0,
+                act_segment_healthy_acts=0,
                 task_value_labels=0,
+                combat_hp_loss_value_labels=0,
                 revival_value_labels=0,
                 efficiency_policy_labels=0,
                 importance_ratios=empty_ratios,
@@ -3172,7 +3220,10 @@ class VTraceLearner:
         task_targets: list[float] = []
         revival_predictions: list[Tensor] = []
         revival_targets: list[float] = []
+        combat_hp_loss_predictions: list[Tensor] = []
+        combat_hp_loss_targets: list[float] = []
         primary_policy_terms: list[Tensor] = []
+        act_segment_policy_terms: list[Tensor] = []
         revival_policy_terms: list[Tensor] = []
         combined_policy_terms: list[Tensor] = []
         importance_ratios: list[Tensor] = []
@@ -3183,6 +3234,9 @@ class VTraceLearner:
         policy_lag_suppressed_labels = 0
         success_trust_region_suppressed_labels = 0
         success_surface_exempted_labels = 0
+        act_segment_policy_labels = 0
+        act_segment_health_gate_suppressed_labels = 0
+        healthy_act_keys: set[tuple[str, int]] = set()
 
         for time_index in range(maximum_time):
             active = [index for index, sequence in enumerate(sequences) if time_index < len(sequence.learn_steps)]
@@ -3231,6 +3285,22 @@ class VTraceLearner:
                             raise RuntimeError("successful horizon has no revival target")
                         revival_predictions.append(revival_prediction)
                         revival_targets.append(float(target.future_revivals))
+                    if (
+                        horizon == "combat"
+                        and self.episodic_config.combat_hp_loss_value_weight > 0.0
+                    ):
+                        if target.future_hp_loss is None:  # pragma: no cover
+                            raise RuntimeError("observed combat has no HP-loss target")
+                        combat_hp_loss_predictions.append(
+                            output.combat_hp_loss_value[row]
+                        )
+                        combat_hp_loss_targets.append(
+                            1.0
+                            - math.exp(
+                                -float(target.future_hp_loss)
+                                / self.episodic_config.combat_hp_loss_reference
+                            )
+                        )
 
                 if not decision.policy_decision:
                     continue
@@ -3241,6 +3311,43 @@ class VTraceLearner:
                 if primary is None:
                     continue
                 primary_horizon, primary_target, primary_prediction, _ = primary
+                act_segment_imitation = False
+                policy_weight = self.episodic_config.primary_policy_weight
+                if (
+                    primary_target.success is not True
+                    and self.episodic_config.act_segment_imitation_enabled
+                    and step.run.observed
+                    and step.run.success is False
+                    and step.act.observed
+                    and step.act.success is True
+                ):
+                    act_health = healthy_act_segment_for_step(
+                        step,
+                        sequences[active[row]].act_segment_health,
+                        minimum_exit_hp_ratio=(
+                            self.episodic_config.act_segment_min_exit_hp_ratio
+                        ),
+                        maximum_revival_fraction=(
+                            self.episodic_config.act_segment_max_revival_fraction
+                        ),
+                    )
+                    if act_health is True:
+                        act_item = next(
+                            item for item in horizons if item[0] == "act"
+                        )
+                        primary_horizon, primary_target, primary_prediction, _ = (
+                            act_item
+                        )
+                        act_segment_imitation = True
+                        policy_weight = (
+                            self.episodic_config.primary_policy_weight
+                            * self.episodic_config.act_segment_policy_weight
+                        )
+                        healthy_act_keys.add(
+                            (sequences[active[row]].episode_id, decision.act)
+                        )
+                    else:
+                        act_segment_health_gate_suppressed_labels += 1
                 if primary_target.success is not True:
                     # A failed long horizon is authoritative evidence for the
                     # task-value heads, but it is not a counterfactual action
@@ -3313,13 +3420,31 @@ class VTraceLearner:
                     success_trust_region_suppressed_labels += 1
                     continue
                 policy_active_sequence_indexes.add(active[row])
-                primary_signal = self.episodic_config.primary_policy_weight * primary_advantage.detach()
-                primary_policy_terms.append(-clipped_ratio * selected_log_probability * primary_advantage.detach())
+                primary_signal = policy_weight * primary_advantage.detach()
+                raw_policy_term = (
+                    -clipped_ratio
+                    * selected_log_probability
+                    * primary_advantage.detach()
+                )
+                primary_policy_terms.append(raw_policy_term)
+                if act_segment_imitation:
+                    act_segment_policy_terms.append(
+                        policy_weight * raw_policy_term
+                    )
+                    act_segment_policy_labels += 1
 
                 secondary_signal = primary_signal.new_zeros(())
-                efficiency = next(
-                    (item for item in reversed(horizons) if item[1].efficiency_eligible),
-                    None,
+                efficiency = (
+                    None
+                    if act_segment_imitation
+                    else next(
+                        (
+                            item
+                            for item in reversed(horizons)
+                            if item[1].efficiency_eligible
+                        ),
+                        None,
+                    )
                 )
                 if efficiency is not None:
                     _, efficiency_target, _, cost_prediction = efficiency
@@ -3394,13 +3519,32 @@ class VTraceLearner:
             if revival_predictions
             else zero
         )
+        combat_hp_loss_value_loss = (
+            F.smooth_l1_loss(
+                torch.stack(combat_hp_loss_predictions).float(),
+                torch.tensor(
+                    combat_hp_loss_targets,
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+            )
+            if combat_hp_loss_predictions
+            else zero
+        )
         primary_policy_loss = torch.stack(primary_policy_terms).mean() if primary_policy_terms else zero
         revival_policy_loss = torch.stack(revival_policy_terms).mean() if revival_policy_terms else zero
+        act_segment_policy_loss = (
+            torch.stack(act_segment_policy_terms).mean()
+            if act_segment_policy_terms
+            else zero
+        )
         combined_policy_loss = torch.stack(combined_policy_terms).mean() if combined_policy_terms else zero
         total_loss = (
             combined_policy_loss
             + self.episodic_config.task_value_weight * task_value_loss
             + self.episodic_config.revival_value_weight * revival_value_loss
+            + self.episodic_config.combat_hp_loss_value_weight
+            * combat_hp_loss_value_loss
         )
         ratio_tensor = torch.stack(importance_ratios).float() if importance_ratios else empty_ratios
         return _EpisodicLossBatch(
@@ -3409,6 +3553,8 @@ class VTraceLearner:
             task_value_loss=task_value_loss,
             revival_value_loss=revival_value_loss,
             revival_policy_loss=revival_policy_loss,
+            act_segment_policy_loss=act_segment_policy_loss,
+            combat_hp_loss_value_loss=combat_hp_loss_value_loss,
             burn_in_steps=total_burn_in_steps,
             learn_steps=total_learn_steps,
             success_policy_candidate_labels=success_policy_candidate_labels,
@@ -3418,7 +3564,13 @@ class VTraceLearner:
             policy_lag_suppressed_labels=policy_lag_suppressed_labels,
             success_trust_region_suppressed_labels=(success_trust_region_suppressed_labels),
             success_surface_exempted_labels=success_surface_exempted_labels,
+            act_segment_policy_labels=act_segment_policy_labels,
+            act_segment_health_gate_suppressed_labels=(
+                act_segment_health_gate_suppressed_labels
+            ),
+            act_segment_healthy_acts=len(healthy_act_keys),
             task_value_labels=len(task_predictions),
+            combat_hp_loss_value_labels=len(combat_hp_loss_predictions),
             revival_value_labels=len(revival_predictions),
             efficiency_policy_labels=efficiency_policy_labels,
             importance_ratios=ratio_tensor,
@@ -3661,6 +3813,16 @@ class VTraceLearner:
                     )
 
                     if not lifecycle.option_target_observed:
+                        if (
+                            self.transaction_config.lifecycle_smdp_horizon
+                            == "next_rest_or_act"
+                        ):
+                            # A committed transaction near a censored episode
+                            # end may never observe the requested next macro
+                            # boundary.  Keep its factual support-corridor
+                            # label, but do not fabricate or bootstrap an
+                            # option-Q target.
+                            continue
                         raise RuntimeError(
                             "committed transaction lifecycle has no SMDP option target"
                         )
@@ -3670,11 +3832,7 @@ class VTraceLearner:
                         raise RuntimeError(
                             "committed transaction lifecycle has an incomplete SMDP target"
                         )
-                    if lifecycle.post_terminal:
-                        if option_discount != 0.0:
-                            raise RuntimeError(
-                                "terminal transaction lifecycle has a non-zero option discount"
-                            )
+                    if option_discount == 0.0:
                         post_value = torch.zeros(
                             (),
                             device=self.device,

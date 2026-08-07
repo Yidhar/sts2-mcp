@@ -13,6 +13,7 @@ import sts2_rl.training.episode_replay as episode_replay_module
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 from sts2_rl.encoding.snapshot import sparse_token_table
 from sts2_rl.training.episode_replay import (
+    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
@@ -801,6 +802,112 @@ def test_fresh_policy_reservation_requires_an_actual_learner_label() -> None:
     assert sample.diagnostics.fresh_policy_quota_missed == 1
 
 
+def test_fresh_policy_reservation_indexes_only_healthy_failed_act_prefixes() -> None:
+    snapshot = _snapshot()
+
+    def failed_after_act(*, hp_ratio: float, episode_id: str) -> CompletedEpisode:
+        steps = (
+            _step(
+                snapshot,
+                0,
+                act=1,
+                combat_id=None,
+                reward=0.0,
+                before_revivals=0,
+                after_revivals=4,
+                before_hp=0.0,
+                after_hp=10.0,
+                act_boundary=BoundaryOutcome.SUCCEEDED,
+                decision_surface="map",
+            ),
+            _step(
+                snapshot,
+                1,
+                act=2,
+                combat_id=None,
+                reward=-1.0,
+                before_revivals=4,
+                after_revivals=4,
+                before_hp=10.0,
+                after_hp=10.0,
+                act_boundary=BoundaryOutcome.FAILED,
+                decision_surface="map",
+            ),
+        )
+        return backfill_completed_episode(
+            episode_id=episode_id,
+            steps=steps,
+            completion=EpisodeCompletion(
+                authoritative=True,
+                won=False,
+                final_revivals=4,
+                final_hp_loss=10.0,
+                terminal_reason="run_defeat",
+            ),
+            act_segment_health=(
+                ActSegmentHealth(
+                    act=1,
+                    boundary_step_index=0,
+                    exit_hp_ratio=hp_ratio,
+                    cumulative_revivals=4,
+                    revival_budget=64,
+                ),
+            ),
+        )
+
+    healthy = failed_after_act(hp_ratio=0.60, episode_id="healthy-act-prefix")
+    unhealthy = failed_after_act(hp_ratio=0.20, episode_id="unhealthy-act-prefix")
+    episodes = (healthy, unhealthy)
+    replay = BoundedEpisodicReplay(
+        capacity=2,
+        byte_capacity=sum(episode.storage_nbytes() for episode in episodes),
+        episode_byte_capacity=max(episode.storage_nbytes() for episode in episodes),
+        max_segments_per_episode=1,
+        seed=79,
+    )
+    assert all(replay.put(episode) for episode in episodes)
+
+    sample = replay.sample_for_learning(
+        1,
+        learn_steps=1,
+        burn_in_steps=0,
+        macro_sample_fraction=0.0,
+        current_policy_version=7,
+        policy_gradient_max_lag=0,
+        fresh_policy_sequences=1,
+        act_segment_imitation_enabled=True,
+        act_segment_min_exit_hp_ratio=0.35,
+        act_segment_max_revival_fraction=0.34,
+    )
+
+    assert sample.diagnostics.fresh_policy_candidate_episodes == 1
+    assert sample.diagnostics.fresh_policy_candidate_decisions == 1
+    assert sample.diagnostics.fresh_policy_quota_filled == 1
+    assert sample.sequences[0].episode_id == "healthy-act-prefix"
+    assert sample.sequences[0].learn_start_step == 0
+    assert sample.sequences[0].act_segment_health == healthy.act_segment_health
+
+
+def test_act_health_revival_fraction_is_strictly_budget_bounded() -> None:
+    allowed = ActSegmentHealth(
+        act=1,
+        boundary_step_index=0,
+        exit_hp_ratio=0.60,
+        cumulative_revivals=21,
+        revival_budget=64,
+    )
+    rejected = replace(allowed, cumulative_revivals=22)
+
+    assert allowed.healthy(
+        minimum_exit_hp_ratio=0.35,
+        maximum_revival_fraction=0.34,
+    )
+    assert not rejected.healthy(
+        minimum_exit_hp_ratio=0.35,
+        maximum_revival_fraction=0.34,
+    )
+
+
 def test_censored_run_with_successful_act_is_fresh_policy_eligible() -> None:
     snapshot = _snapshot()
     decisions = (
@@ -1434,7 +1541,7 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
         macro_sample_fraction=0.5,
     )
     payload = original.state_dict()
-    assert payload["version"] == "sts2-episodic-replay-v3"
+    assert payload["version"] == "sts2-episodic-replay-v4"
     assert payload["sample_count"] == 2
     assert payload["macro_sample_count"] == 1
     assert set(payload) == {

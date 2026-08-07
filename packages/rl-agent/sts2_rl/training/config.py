@@ -17,7 +17,7 @@ from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v17"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v18"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
@@ -25,6 +25,7 @@ _MODEL_INITIALIZATION_SOURCE_CONFIG_V13 = "sts2-relational-curriculum-config-v13
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V14 = "sts2-relational-curriculum-config-v14"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V15 = "sts2-relational-curriculum-config-v15"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V16 = "sts2-relational-curriculum-config-v16"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V17 = "sts2-relational-curriculum-config-v17"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -376,6 +377,14 @@ class TransactionLearningConfig:
     # followed by a detached post-transaction value bootstrap. This is not a
     # hand-authored forge/removal bonus.
     lifecycle_smdp_q_weight: float = 0.0
+    # The legacy target stops at the transaction exit and bootstraps from the
+    # immediately following state.  ``next_rest_or_act`` instead uses only the
+    # factual reward sequence through the next rest-site arrival, Act boundary,
+    # or authoritative terminal and deliberately sets the bootstrap discount
+    # to zero at that semantic boundary.
+    lifecycle_smdp_horizon: Literal["transaction_exit", "next_rest_or_act"] = (
+        "transaction_exit"
+    )
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -424,6 +433,14 @@ class TransactionLearningConfig:
             raise ValueError(
                 "transaction_learning.lifecycle_entry_support_probability_floor "
                 "must be strictly between 0 and 0.5"
+            )
+        if self.lifecycle_smdp_horizon not in {
+            "transaction_exit",
+            "next_rest_or_act",
+        }:
+            raise ValueError(
+                "transaction_learning.lifecycle_smdp_horizon must be "
+                "transaction_exit or next_rest_or_act"
             )
         if not self.enabled and (
             self.lifecycle_entry_support_weight > 0.0
@@ -701,6 +718,22 @@ class EpisodicLearningConfig:
     # stay available to value/SMDP learning while being excluded from repeated
     # success imitation and from the reserved fresh-policy sampler.
     success_imitation_exempt_surfaces: tuple[str, ...] = ()
+    # A failed run can still contain a factually completed, healthy Act.  This
+    # optional lower imitation rung reuses the exact observed actions from that
+    # Act instead of treating the entire failed run as value-only.  Run wins
+    # remain the dominant rung; no failed final Act is imitated.
+    act_segment_imitation_enabled: bool = False
+    # Multiplicative fraction of ``primary_policy_weight``.  Keeping this at
+    # or below one makes a complete run win structurally dominant even when
+    # failed-prefix examples are much more numerous.
+    act_segment_policy_weight: float = 0.30
+    act_segment_min_exit_hp_ratio: float = 0.35
+    act_segment_max_revival_fraction: float = 0.34
+    # Candidate-independent, bounded factual HP-loss regression for completed
+    # combats.  A zero weight keeps the auxiliary head dormant while retaining
+    # an explicit ABI for model-initialization migrations.
+    combat_hp_loss_value_weight: float = 0.0
+    combat_hp_loss_reference: float = 80.0
     # Old complete episodes remain useful factual value targets, but their
     # selected-action likelihood must not continue moving a much newer policy.
     # The learner therefore keeps value supervision and suppresses only policy
@@ -710,6 +743,10 @@ class EpisodicLearningConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("episodic_learning.enabled must be a boolean")
+        if not isinstance(self.act_segment_imitation_enabled, bool):
+            raise TypeError(
+                "episodic_learning.act_segment_imitation_enabled must be a boolean"
+            )
         for name in (
             "replay_capacity_episodes",
             "replay_capacity_bytes",
@@ -776,11 +813,38 @@ class EpisodicLearningConfig:
             "task_value_weight",
             "revival_value_weight",
             "revival_policy_weight",
+            "combat_hp_loss_value_weight",
         ):
             _require_finite_number(
                 getattr(self, name),
                 label=f"episodic_learning.{name}",
                 minimum=0.0,
+            )
+        _require_finite_number(
+            self.act_segment_policy_weight,
+            label="episodic_learning.act_segment_policy_weight",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        _require_finite_number(
+            self.act_segment_min_exit_hp_ratio,
+            label="episodic_learning.act_segment_min_exit_hp_ratio",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        _require_finite_number(
+            self.act_segment_max_revival_fraction,
+            label="episodic_learning.act_segment_max_revival_fraction",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        hp_reference = _require_finite_number(
+            self.combat_hp_loss_reference,
+            label="episodic_learning.combat_hp_loss_reference",
+        )
+        if hp_reference <= 0.0:
+            raise ValueError(
+                "episodic_learning.combat_hp_loss_reference must be positive"
             )
         _require_finite_number(
             self.secondary_advantage_fraction,
@@ -1523,7 +1587,9 @@ def model_initialization_config_from_mapping(
     V17 adds a convex revival-efficiency reward contract, a policy-saturation
     eligibility floor for the liveness risk actor, an explicit success-
     imitation surface exemption, and the policy-collapse-v2 entropy breaker.
-    These are training semantics, so V16 checkpoints are accepted only for
+    V18 adds healthy Act-prefix imitation, a bounded factual combat HP-loss
+    head, and the extended factual transaction option horizon.  These are
+    training/data/model semantics, so V17 checkpoints are accepted only for
     model-parameter initialization; optimizer/replay/RNG state cannot cross
     the boundary.
     V11 checkpoints
@@ -1549,6 +1615,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1580,6 +1647,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V14,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
     }:
         if "transaction_exploration" in payload:
             raise ValueError(
@@ -1604,6 +1672,7 @@ def model_initialization_config_from_mapping(
     if source_version not in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
     }:
         unexpected_lifecycle_fields = lifecycle_fields.intersection(
             transaction_learning
@@ -1619,7 +1688,10 @@ def model_initialization_config_from_mapping(
         raise ValueError(
             f"{source_version} model-initialization config has no runtime table"
         )
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V16:
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+    }:
         if "evaluation_guard_enforcement_start_steps" not in runtime:
             raise ValueError(
                 "V16 model-initialization config is missing its evaluation "
@@ -1644,15 +1716,22 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "failure_credit table after reviewed migration"
         )
-    if "liveness_risk_actor_min_selected_probability" in raw_failure:
-        raise ValueError(
-            f"{source_version} model-initialization config unexpectedly "
-            "contains the V17 risk-actor saturation floor"
-        )
-    migrated["failure_credit"] = {
-        **dict(raw_failure),
-        "liveness_risk_actor_min_selected_probability": 0.0,
-    }
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V17:
+        if "liveness_risk_actor_min_selected_probability" not in raw_failure:
+            raise ValueError(
+                "V17 model-initialization config is missing its risk-actor "
+                "saturation floor"
+            )
+    else:
+        if "liveness_risk_actor_min_selected_probability" in raw_failure:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains the V17 risk-actor saturation floor"
+            )
+        migrated["failure_credit"] = {
+            **dict(raw_failure),
+            "liveness_risk_actor_min_selected_probability": 0.0,
+        }
 
     raw_episodic = migrated.get("episodic_learning")
     if not isinstance(raw_episodic, Mapping):
@@ -1660,14 +1739,53 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "episodic_learning table after reviewed migration"
         )
-    if "success_imitation_exempt_surfaces" in raw_episodic:
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V17:
+        if "success_imitation_exempt_surfaces" not in raw_episodic:
+            raise ValueError(
+                "V17 model-initialization config is missing its success-"
+                "imitation surface exemption"
+            )
+    else:
+        if "success_imitation_exempt_surfaces" in raw_episodic:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains the V17 success-imitation surface exemption"
+            )
+        raw_episodic = {
+            **dict(raw_episodic),
+            "success_imitation_exempt_surfaces": (),
+        }
+    v18_fields = {
+        "act_segment_imitation_enabled": False,
+        "act_segment_policy_weight": 0.30,
+        "act_segment_min_exit_hp_ratio": 0.35,
+        "act_segment_max_revival_fraction": 0.34,
+        "combat_hp_loss_value_weight": 0.0,
+        "combat_hp_loss_reference": 80.0,
+    }
+    unexpected_v18 = set(v18_fields).intersection(raw_episodic)
+    if unexpected_v18:
         raise ValueError(
             f"{source_version} model-initialization config unexpectedly "
-            "contains the V17 success-imitation surface exemption"
+            "contains V18 episodic fields: "
+            + ", ".join(sorted(unexpected_v18))
         )
     migrated["episodic_learning"] = {
         **dict(raw_episodic),
-        "success_imitation_exempt_surfaces": (),
+        **v18_fields,
+    }
+
+    raw_transaction = migrated.get("transaction_learning")
+    if not isinstance(raw_transaction, Mapping):  # pragma: no cover - checked above
+        raise ValueError("model-initialization config lost transaction_learning")
+    if "lifecycle_smdp_horizon" in raw_transaction:
+        raise ValueError(
+            f"{source_version} model-initialization config unexpectedly "
+            "contains the V18 transaction option horizon"
+        )
+    migrated["transaction_learning"] = {
+        **dict(raw_transaction),
+        "lifecycle_smdp_horizon": "transaction_exit",
     }
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)

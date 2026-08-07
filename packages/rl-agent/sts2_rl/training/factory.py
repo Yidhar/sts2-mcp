@@ -250,6 +250,9 @@ def build_training_resources(
             transaction_burn_in_steps=(
                 config.transaction_learning.burn_in_steps if config.transaction_learning.enabled else None
             ),
+            transaction_smdp_horizon=(
+                config.transaction_learning.lifecycle_smdp_horizon
+            ),
             episodic_learning_enabled=config.episodic_learning.enabled,
             failure_credit_shadow_enabled=(config.failure_credit.mode == "shadow"),
             failure_credit_learning_enabled=(config.failure_credit.learning_enabled),

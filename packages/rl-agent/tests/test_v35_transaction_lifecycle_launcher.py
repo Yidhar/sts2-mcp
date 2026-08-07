@@ -65,7 +65,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 def test_v35_recipe_enables_only_bounded_lifecycle_entry_credit() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v17"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
     transaction = config.transaction_learning
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)

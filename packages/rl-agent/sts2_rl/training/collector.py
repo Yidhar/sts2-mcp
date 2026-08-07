@@ -38,6 +38,7 @@ from sts2_rl.encoding import (
 from sts2_rl.models import RecurrentCandidateModel
 
 from .episode_replay import (
+    ActSegmentHealth,
     BoundaryOutcome,
     CompletedEpisode,
     EpisodeCompletion,
@@ -90,6 +91,26 @@ class RewardCalculator(Protocol):
         deadlock: bool = False,
         horizon_exhausted: bool = False,
     ) -> TaskReward: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MacroReturnDiagnostic:
+    """Non-learning factual return aggregate for one macro decision slice."""
+
+    decision_surface: str
+    action_key: str
+    hp_band: str
+    act: int
+    count: int
+    mean_return: float
+
+    def __post_init__(self) -> None:
+        if not self.decision_surface or not self.action_key or not self.hp_band:
+            raise ValueError("macro return diagnostic keys must be non-empty")
+        if self.act < 0 or self.count <= 0:
+            raise ValueError("macro return diagnostic counters are invalid")
+        if not math.isfinite(self.mean_return):
+            raise ValueError("macro return diagnostic mean must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +197,7 @@ class EpisodeMetrics:
     shaping_reward_total: float = 0.0
     shaping_reward_per_max_floor: float = 0.0
     boss_victory_acts: tuple[int, ...] = ()
+    macro_return_diagnostics: tuple[MacroReturnDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -978,6 +1000,125 @@ def _run_position(observation: Mapping[str, object]) -> tuple[int, int]:
     act = int(max(0.0, _number(run.get("act", observation.get("act")))))
     floor = int(max(0.0, _number(run.get("floor", observation.get("floor")))))
     return act, floor
+
+
+def _player_hp_ratio(observation: Mapping[str, object]) -> float:
+    raw_player = observation.get("player")
+    player = raw_player if isinstance(raw_player, Mapping) else {}
+    hp = max(0.0, _number(player.get("hp", player.get("current_hp"))))
+    maximum = max(
+        0.0,
+        _number(player.get("max_hp", player.get("maximum_hp"))),
+    )
+    if maximum <= 0.0:
+        raise CollectionProtocolError(
+            "authoritative Act/macro health receipt has no positive player max HP"
+        )
+    return min(1.0, hp / maximum)
+
+
+def _hp_band(observation: Mapping[str, object]) -> str:
+    try:
+        ratio = _player_hp_ratio(observation)
+    except CollectionProtocolError:
+        return "unknown"
+    if ratio < 0.25:
+        return "critical_0_25"
+    if ratio < 0.50:
+        return "low_25_50"
+    if ratio < 0.75:
+        return "mid_50_75"
+    return "high_75_100"
+
+
+def _diagnostic_action_key(action: Mapping[str, object]) -> str:
+    prototype = _semantic_action_prototype(action)
+    kind = str(
+        prototype.get("model_action_kind")
+        or prototype.get("action")
+        or prototype.get("kind")
+        or "unknown"
+    ).strip().lower()
+    variant = str(
+        prototype.get("model_action_variant")
+        or prototype.get("operation")
+        or prototype.get("option_id")
+        or ""
+    ).strip().lower()
+    return f"{kind}:{variant}" if variant else kind
+
+
+def _macro_return_diagnostics(
+    *,
+    rewards: tuple[float, ...],
+    discounts: tuple[float, ...],
+    decisions: tuple[tuple[int, str, str, str, int], ...],
+    authoritative: bool,
+) -> tuple[MacroReturnDiagnostic, ...]:
+    """Aggregate exact observed reward-to-terminal returns; never train on it."""
+
+    if not authoritative or not rewards:
+        return ()
+    if len(rewards) != len(discounts):
+        raise RuntimeError("macro diagnostic reward/discount streams are misaligned")
+    returns = [0.0] * len(rewards)
+    suffix = 0.0
+    for index in range(len(rewards) - 1, -1, -1):
+        suffix = float(rewards[index]) + float(discounts[index]) * suffix
+        returns[index] = suffix
+    grouped: dict[tuple[str, str, str, int], list[float]] = {}
+    for step_index, surface, action_key, hp_band, act in decisions:
+        if not 0 <= step_index < len(returns):
+            raise RuntimeError("macro diagnostic decision lies outside its reward stream")
+        grouped.setdefault((surface, action_key, hp_band, act), []).append(
+            returns[step_index]
+        )
+    return tuple(
+        MacroReturnDiagnostic(
+            decision_surface=surface,
+            action_key=action_key,
+            hp_band=hp_band,
+            act=act,
+            count=len(values),
+            mean_return=sum(values) / len(values),
+        )
+        for (surface, action_key, hp_band, act), values in sorted(grouped.items())
+    )
+
+
+def _extended_transaction_option_endpoint(
+    trace: TransactionTrace,
+    *,
+    episodic_steps: tuple[EpisodeDecisionStep, ...],
+    authoritative_outcome: bool,
+) -> tuple[int, str] | None:
+    """Locate the first fully observed next-rest/Act/run option boundary."""
+
+    lifecycle = trace.lifecycle
+    if lifecycle is None or not lifecycle.support_eligible:
+        return None
+    entry = trace.start_step + lifecycle.entry_step_index
+    exit_step = trace.start_step + lifecycle.exit_step_index
+    if not 0 <= entry <= exit_step < len(episodic_steps):
+        raise RuntimeError("transaction lifecycle is not aligned to episodic facts")
+    entry_floor = episodic_steps[entry].floor
+    for index in range(exit_step + 1, len(episodic_steps)):
+        step = episodic_steps[index]
+        if step.act_boundary in {
+            BoundaryOutcome.SUCCEEDED,
+            BoundaryOutcome.FAILED,
+        }:
+            return index, "act_boundary"
+        if (
+            step.decision_surface in {"rest_site", "restsite", "rest"}
+            and step.floor != entry_floor
+        ):
+            # Arrival at the next rest site ends the option before executing
+            # the next rest-vs-forge choice itself.
+            return index - 1, "next_rest_site"
+    if authoritative_outcome:
+        return len(episodic_steps) - 1, "run_terminal"
+    return None
 
 
 def _combat_in_progress(observation: Mapping[str, object]) -> bool:
@@ -2853,6 +2994,9 @@ class GroundedCollector:
         training_revival_budget: int | None = None,
         horizon_as_failure: bool = False,
         transaction_burn_in_steps: int | None = None,
+        transaction_smdp_horizon: Literal[
+            "transaction_exit", "next_rest_or_act"
+        ] = "transaction_exit",
         episodic_learning_enabled: bool = False,
         failure_credit_shadow_enabled: bool = False,
         failure_credit_learning_enabled: bool = False,
@@ -2892,10 +3036,19 @@ class GroundedCollector:
             or transaction_burn_in_steps < 0
         ):
             raise ValueError("transaction_burn_in_steps must be non-negative or null")
+        if transaction_smdp_horizon not in {
+            "transaction_exit",
+            "next_rest_or_act",
+        }:
+            raise ValueError("unsupported transaction SMDP horizon")
         if not isinstance(episodic_learning_enabled, bool):
             raise TypeError("episodic_learning_enabled must be a boolean")
         if episodic_learning_enabled and (scenario != "full-run" or objective != "run"):
             raise ValueError("episodic learning requires the full-run scenario and run objective")
+        if transaction_smdp_horizon == "next_rest_or_act" and not episodic_learning_enabled:
+            raise ValueError(
+                "extended transaction SMDP horizons require episodic factual boundaries"
+            )
         if not isinstance(failure_credit_shadow_enabled, bool):
             raise TypeError("failure_credit_shadow_enabled must be a boolean")
         if not isinstance(failure_credit_learning_enabled, bool):
@@ -3001,6 +3154,7 @@ class GroundedCollector:
         self.training_revival_budget = training_revival_budget
         self.horizon_as_failure = bool(horizon_as_failure)
         self.transaction_burn_in_steps = transaction_burn_in_steps
+        self.transaction_smdp_horizon = transaction_smdp_horizon
         self.episodic_learning_enabled = episodic_learning_enabled
         self.failure_credit_shadow_enabled = failure_credit_shadow_enabled
         self.failure_credit_learning_enabled = failure_credit_learning_enabled
@@ -3700,6 +3854,9 @@ class GroundedCollector:
         pending_transaction_entry_policy_version = policy_version
         episode_rewards: list[float] = []
         episode_discounts: list[float] = []
+        episodic_diagnostic_rewards: list[float] = []
+        episodic_diagnostic_discounts: list[float] = []
+        episodic_macro_decisions: list[tuple[int, str, str, str, int]] = []
         # Complete-run replay is collected independently of fixed unroll
         # streaming.  These are immutable CPU snapshots, never recurrent
         # hidden tensors or autograd graphs.
@@ -3711,6 +3868,7 @@ class GroundedCollector:
             active_combat_id = f"combat:{next_combat_identity}"
             next_combat_identity += 1
         act_boundary_efficiency: dict[int, tuple[int, float]] = {}
+        act_segment_health: dict[int, ActSegmentHealth] = {}
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -3719,7 +3877,7 @@ class GroundedCollector:
                 raise CollectionProtocolError(
                     f"episode={state.episode_id!r} step={state.step_index} returned zero legal actions"
                 )
-            pre_action_act, _ = _run_position(state.observation)
+            pre_action_act, pre_action_floor = _run_position(state.observation)
             pre_action_combat = _combat_in_progress(state.observation)
             if episodic_enabled and pre_action_combat != (active_combat_id is not None):
                 raise RuntimeError("episodic combat identity drifted from the factual state")
@@ -4344,6 +4502,26 @@ class GroundedCollector:
                             completed_act,
                             (revivals_used, player_hp_lost),
                         )
+                        if completed_act == pre_action_act:
+                            configured_budget = self.training_revival_budget
+                            effective_budget = (
+                                configured_budget
+                                if configured_budget is not None
+                                and configured_budget > 0
+                                else 64
+                            )
+                            act_segment_health.setdefault(
+                                completed_act,
+                                ActSegmentHealth(
+                                    act=completed_act,
+                                    boundary_step_index=len(episodic_steps),
+                                    exit_hp_ratio=_player_hp_ratio(
+                                        next_state.observation
+                                    ),
+                                    cumulative_revivals=revivals_used,
+                                    revival_budget=effective_budget,
+                                ),
+                            )
             if (
                 combat_boundary is BoundaryOutcome.SUCCEEDED
                 and pre_action_act >= 1
@@ -4377,6 +4555,7 @@ class GroundedCollector:
                         policy_decision=episodic_policy_decision,
                         policy_version=segment_policy_version,
                         act=pre_action_act,
+                        floor=pre_action_floor,
                         combat_id=step_combat_id,
                         # Long-horizon primary credit excludes every
                         # efficiency/pace shaping term by construction.
@@ -4394,6 +4573,20 @@ class GroundedCollector:
                         ),
                     )
                 )
+                episodic_diagnostic_rewards.append(float(breakdown.reward))
+                episodic_diagnostic_discounts.append(float(breakdown.discount))
+                if episodic_policy_decision and not pre_action_combat:
+                    episodic_macro_decisions.append(
+                        (
+                            episodic_step_index,
+                            episodic_steps[-1].decision_surface,
+                            _diagnostic_action_key(
+                                choice.semantic_actions[choice.candidate_index]
+                            ),
+                            _hp_band(state.observation),
+                            pre_action_act,
+                        )
+                    )
                 if opens_selection_transaction:
                     pending_observed_transaction_entry_episodic_index = episodic_step_index
                 if pre_action_combat and not next_combat_in_progress:
@@ -4947,15 +5140,39 @@ class GroundedCollector:
         authoritative_outcome = bool(authoritative_native_outcome or trusted_policy_failure)
         transaction_traces: tuple[TransactionTrace, ...] = ()
         if transaction_traces_pending:
-            transaction_traces = tuple(
-                backfill_factual_monte_carlo_returns(
-                    trace,
-                    episode_rewards=tuple(episode_rewards),
-                    episode_discounts=tuple(episode_discounts),
-                    authoritative_outcome=authoritative_outcome,
+            backfilled_traces: list[TransactionTrace] = []
+            for trace in transaction_traces_pending:
+                option_endpoint = (
+                    _extended_transaction_option_endpoint(
+                        trace,
+                        episodic_steps=tuple(episodic_steps),
+                        authoritative_outcome=authoritative_outcome,
+                    )
+                    if self.transaction_smdp_horizon == "next_rest_or_act"
+                    else None
                 )
-                for trace in transaction_traces_pending
-            )
+                backfilled_traces.append(
+                    backfill_factual_monte_carlo_returns(
+                        trace,
+                        episode_rewards=tuple(episode_rewards),
+                        episode_discounts=tuple(episode_discounts),
+                        authoritative_outcome=authoritative_outcome,
+                        option_horizon_end=(
+                            option_endpoint[0]
+                            if option_endpoint is not None
+                            else None
+                        ),
+                        option_horizon_boundary=(
+                            option_endpoint[1]
+                            if option_endpoint is not None
+                            else None
+                        ),
+                        require_extended_option_horizon=(
+                            self.transaction_smdp_horizon == "next_rest_or_act"
+                        ),
+                    )
+                )
+            transaction_traces = tuple(backfilled_traces)
         run_won = bool(self.objective == "run" and state.terminated and terminal_facts.get("run_result") == "victory")
         combat_won = bool(
             self.objective == "combat" and state.terminated and terminal_facts.get("combat_result") == "victory"
@@ -5004,6 +5221,9 @@ class GroundedCollector:
                 episode_id=f"seed-{reset_seed}:{state.episode_id}",
                 steps=tuple(episodic_steps),
                 completion=completion,
+                act_segment_health=tuple(
+                    act_segment_health[act] for act in sorted(act_segment_health)
+                ),
                 data_partition="training",
             )
         failure_credit_records: tuple[EvidenceRecord, ...] = ()
@@ -5029,6 +5249,12 @@ class GroundedCollector:
             failure_credit_records = failure_credit_result.records
             failure_credit_shadow_metrics = failure_credit_result.metrics
         ordered_act_efficiency = tuple(act_boundary_efficiency[act] for act in sorted(act_boundary_efficiency))
+        macro_return_diagnostics = _macro_return_diagnostics(
+            rewards=tuple(episodic_diagnostic_rewards),
+            discounts=tuple(episodic_diagnostic_discounts),
+            decisions=tuple(episodic_macro_decisions),
+            authoritative=bool(completed_episode is not None and completed_episode.completion.authoritative),
+        )
         return CollectedEpisode(
             unrolls=tuple(unrolls),
             metrics=EpisodeMetrics(
@@ -5102,6 +5328,7 @@ class GroundedCollector:
                 shaping_reward_total=shaping_reward_total,
                 shaping_reward_per_max_floor=(shaping_reward_total / max(1, max_floor)),
                 boss_victory_acts=tuple(sorted(boss_victory_acts)),
+                macro_return_diagnostics=macro_return_diagnostics,
             ),
             actor_policy_version=segment_policy_version,
             behavior_policy_version=final_behavior_policy_version,
@@ -5120,4 +5347,5 @@ __all__ = [
     "EpisodeMetrics",
     "EpisodeProgress",
     "GroundedCollector",
+    "MacroReturnDiagnostic",
 ]

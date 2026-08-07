@@ -72,7 +72,7 @@ def test_v40_changes_only_budget_and_runtime_paths_from_v39() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v39 = load_training_config(profile="preheat", config_path=V39_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v17"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
     assert config.optimization == v39.optimization
     assert config.rollout == v39.rollout
     assert config.transaction_learning == v39.transaction_learning

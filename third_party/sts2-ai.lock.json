@@ -54,9 +54,13 @@
     {
       "path": "third_party/patches/sts2-ai/0010-headless-event-and-post-combat-lifecycle.patch",
       "sha256": "976f34ce70ecfea44989e0f2b4e0015abc9d0e0c95dd31c25731c48220750d1c"
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0011-single-use-headless-card-removal.patch",
+      "sha256": "4660942cca8bc769fee7606d7f848f08d4c9efd3bf80e2cbc3cc54d6ac01fc69"
     }
   ],
-  "patched_tree": "f94b594ce17925bc393873489f38875fb6621d4f",
+  "patched_tree": "ffebbda98b8b731d8f2d2a7597dcea4c669839ef",
   "migration_notes": [
     "The former local-only 459f30873eac374c160f0b409d2d8167e7eead7c / 0712bffbcd18348eb81479c4f3c65b94b254a646 pin was lost and is not advertised by the upstream remote.",
     "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",

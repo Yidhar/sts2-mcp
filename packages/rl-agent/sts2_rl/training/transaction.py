@@ -35,9 +35,9 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v4"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v4"
-TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v1"
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v5"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v5"
+TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v2"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -106,6 +106,7 @@ class TransactionLifecycleEvidence:
     option_return: float | None = None
     option_discount: float | None = None
     option_steps: int | None = None
+    option_boundary: str | None = None
     version: str = TRANSACTION_LIFECYCLE_VERSION
 
     def __post_init__(self) -> None:
@@ -161,6 +162,7 @@ class TransactionLifecycleEvidence:
             self.option_return,
             self.option_discount,
             self.option_steps,
+            self.option_boundary,
         )
         if any(value is not None for value in target_values) and not all(
             value is not None for value in target_values
@@ -181,6 +183,13 @@ class TransactionLifecycleEvidence:
                 or self.option_steps <= 0
             ):
                 raise ValueError("transaction lifecycle option_steps must be positive")
+            if self.option_boundary not in {
+                "transaction_exit",
+                "next_rest_site",
+                "act_boundary",
+                "run_terminal",
+            }:
+                raise ValueError("transaction lifecycle option boundary is invalid")
         if self.version != TRANSACTION_LIFECYCLE_VERSION:
             raise ValueError(f"unsupported transaction lifecycle version: {self.version!r}")
 
@@ -617,6 +626,9 @@ def backfill_factual_monte_carlo_returns(
     episode_rewards: tuple[float, ...],
     episode_discounts: tuple[float, ...],
     authoritative_outcome: bool,
+    option_horizon_end: int | None = None,
+    option_horizon_boundary: str | None = None,
+    require_extended_option_horizon: bool = False,
 ) -> TransactionTrace:
     """Backfill factual task returns after an episode outcome is authoritative.
 
@@ -631,6 +643,16 @@ def backfill_factual_monte_carlo_returns(
         raise TypeError("trace must be a TransactionTrace")
     if not isinstance(authoritative_outcome, bool):
         raise TypeError("authoritative_outcome must be a boolean")
+    if not isinstance(require_extended_option_horizon, bool):
+        raise TypeError("require_extended_option_horizon must be a boolean")
+    if (option_horizon_end is None) != (option_horizon_boundary is None):
+        raise ValueError("extended option endpoint and boundary must appear together")
+    if option_horizon_end is not None and (
+        isinstance(option_horizon_end, bool)
+        or not isinstance(option_horizon_end, int)
+        or option_horizon_end < 0
+    ):
+        raise ValueError("option_horizon_end must be a non-negative integer")
     if not isinstance(episode_rewards, tuple) or not isinstance(episode_discounts, tuple):
         raise TypeError("episode rewards and discounts must be tuples")
     if not episode_rewards or len(episode_rewards) != len(episode_discounts):
@@ -650,17 +672,42 @@ def backfill_factual_monte_carlo_returns(
         exit_absolute = trace.start_step + lifecycle.exit_step_index
         if not 0 <= entry_absolute <= exit_absolute < len(rewards):
             raise ValueError("transaction lifecycle option span escapes the factual episode")
-        option_return = 0.0
-        option_discount = 1.0
-        for index in range(entry_absolute, exit_absolute + 1):
-            option_return += option_discount * rewards[index]
-            option_discount *= discounts[index]
-        lifecycle = replace(
-            lifecycle,
-            option_return=option_return,
-            option_discount=option_discount,
-            option_steps=exit_absolute - entry_absolute + 1,
-        )
+        if require_extended_option_horizon and option_horizon_end is None:
+            lifecycle = replace(
+                lifecycle,
+                option_return=None,
+                option_discount=None,
+                option_steps=None,
+                option_boundary=None,
+            )
+        else:
+            endpoint = (
+                option_horizon_end
+                if option_horizon_end is not None
+                else exit_absolute
+            )
+            boundary = option_horizon_boundary or "transaction_exit"
+            if not exit_absolute <= endpoint < len(rewards):
+                raise ValueError("transaction lifecycle option endpoint is invalid")
+            option_return = 0.0
+            running_discount = 1.0
+            for index in range(entry_absolute, endpoint + 1):
+                option_return += running_discount * rewards[index]
+                running_discount *= discounts[index]
+            lifecycle = replace(
+                lifecycle,
+                option_return=option_return,
+                # Extended boundaries are factual semi-Markov terminals.  Do
+                # not inject a noisy learned bootstrap after observing the
+                # requested next-rest/Act/run span in full.
+                option_discount=(
+                    0.0
+                    if require_extended_option_horizon
+                    else running_discount
+                ),
+                option_steps=endpoint - entry_absolute + 1,
+                option_boundary=boundary,
+            )
 
     if not authoritative_outcome:
         return replace(

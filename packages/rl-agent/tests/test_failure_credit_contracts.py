@@ -574,6 +574,48 @@ def test_outcome_matcher_enriches_an_incoming_attributed_failure() -> None:
     assert pair.better.step.selected_action.comparison != (pair.worse.step.selected_action.comparison)
 
 
+def test_outcome_matcher_crosses_resume_run_ids_but_not_semantic_abi() -> None:
+    failure = _direct_failure_record(
+        _context(context_id="resume-failure", action_index=1),
+        incident_id="resume-failure-source",
+    )
+    completion = _completion_record(
+        _context(context_id="resume-completion", action_index=0),
+        incident_id="resume-completion-source",
+    )
+
+    cross_segment_incident = replace(
+        completion.incident,
+        provenance=replace(completion.incident.provenance, run_id="resume-segment-b"),
+    )
+    cross_segment = EvidenceRecord(
+        incident=cross_segment_incident,
+        plan=CreditCompiler().compile(cross_segment_incident),
+    )
+    matched = OutcomePairMatcher(maximum_pairs_per_publication=1).match(
+        (cross_segment,),
+        retained_records=(failure,),
+    )
+    assert matched.matched_pair_count == 1
+
+    incompatible_incident = replace(
+        cross_segment_incident,
+        provenance=replace(
+            cross_segment_incident.provenance,
+            environment_schema_version="environment-v2",
+        ),
+    )
+    incompatible = EvidenceRecord(
+        incident=incompatible_incident,
+        plan=CreditCompiler().compile(incompatible_incident),
+    )
+    rejected = OutcomePairMatcher(maximum_pairs_per_publication=1).match(
+        (incompatible,),
+        retained_records=(failure,),
+    )
+    assert rejected.matched_pair_count == 0
+
+
 def test_outcome_matcher_uses_unresolved_stall_only_with_exact_completion_contrast() -> None:
     failure_context = _context(
         context_id="stall-match-failure",

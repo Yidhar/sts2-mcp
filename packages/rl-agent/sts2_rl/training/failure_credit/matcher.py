@@ -36,7 +36,7 @@ from .contracts import (
 )
 from .corpus import EvidenceRecord
 
-FAILURE_CREDIT_MATCHER_VERSION: Final = "sts2-outcome-pair-matcher-v2"
+FAILURE_CREDIT_MATCHER_VERSION: Final = "sts2-outcome-pair-matcher-v3"
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -81,10 +81,15 @@ def _comparison_key(
 
 
 def _provenance_abi(provenance: CreditProvenance) -> tuple[str, ...]:
-    """Return every source/semantic field except the behavior policy clock."""
+    """Return semantic provenance shared across exact continuation segments.
+
+    ``run_id`` is a storage/launch lineage coordinate, not an environment or
+    evidence semantic.  Keeping it here made otherwise identical records on
+    opposite sides of a resume boundary impossible to pair.  Every actual
+    semantic version and the training partition remain fail-closed below.
+    """
 
     return (
-        provenance.run_id,
         provenance.game_version,
         provenance.environment_schema_version,
         provenance.identity_version,

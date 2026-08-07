@@ -20,6 +20,7 @@ from .collector import (
     CollectionProtocolError,
     EpisodeMetrics,
     GroundedCollector,
+    MacroReturnDiagnostic,
 )
 from .config import (
     CONFIG_VERSION,
@@ -41,6 +42,7 @@ from .config import (
     training_config_from_mapping,
 )
 from .episode_replay import (
+    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
@@ -98,6 +100,7 @@ from .transaction import (
 __all__ = [
     "CONFIG_VERSION",
     "ENGINE_REVIVAL_MECHANISM",
+    "ActSegmentHealth",
     "ActorLearnerPipeline",
     "ActorSupervisorState",
     "BoundaryOutcome",
@@ -125,6 +128,7 @@ __all__ = [
     "LivenessLabelManifest",
     "LivenessLabelRow",
     "LivenessReplayWork",
+    "MacroReturnDiagnostic",
     "ModelConfig",
     "ObservedTransactionPair",
     "OptimizationConfig",

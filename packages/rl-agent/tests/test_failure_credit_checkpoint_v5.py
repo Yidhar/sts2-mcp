@@ -37,6 +37,7 @@ _TRANSACTION_PREFIXES = (
     "selection_delta_head.",
     "transaction_q_head.",
 )
+_COMBAT_HP_LOSS_PREFIX = "combat_hp_loss_value_head."
 
 
 def _learning_config():
@@ -88,6 +89,16 @@ def _liveness_state(
     state: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     return {key: value for key, value in state.items() if key.startswith(_LIVENESS_PREFIXES)}
+
+
+def _combat_hp_loss_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in state.items()
+        if key.startswith(_COMBAT_HP_LOSS_PREFIX)
+    }
 
 
 def _transaction_state(
@@ -279,7 +290,9 @@ def test_liveness_head_model_initialization_is_all_or_none() -> None:
         )
 
     one_family_missing = {
-        key: value for key, value in target.items() if not key.startswith("candidate_liveness_cost_head.")
+        key: value
+        for key, value in target.items()
+        if not key.startswith("candidate_liveness_cost_head.")
     }
     with pytest.raises(
         ValueError,
@@ -292,6 +305,38 @@ def test_liveness_head_model_initialization_is_all_or_none() -> None:
             allow_missing_liveness_heads=True,
         )
 
+
+def test_combat_hp_loss_head_model_initialization_is_all_or_none() -> None:
+    config = _learning_config()
+    target = RecurrentCandidateModel(
+        config.model.to_model_config(),
+        enable_liveness_head=True,
+    ).state_dict()
+    hp_loss = _combat_hp_loss_state(target)
+    assert hp_loss
+
+    absent = {key: value for key, value in target.items() if key not in hp_loss}
+    migrated = checkpointing_module._model_parameter_initialization_state(
+        absent,
+        target_state=target,
+        allow_missing_transaction_heads=False,
+        allow_missing_combat_hp_loss_head=True,
+    )
+    for key, expected in hp_loss.items():
+        assert torch.equal(migrated[key], expected), key
+
+    partial = dict(target)
+    partial.pop(next(iter(hp_loss)))
+    with pytest.raises(
+        ValueError,
+        match="all or none.*combat HP-loss head",
+    ):
+        checkpointing_module._model_parameter_initialization_state(
+            partial,
+            target_state=target,
+            allow_missing_transaction_heads=False,
+            allow_missing_combat_hp_loss_head=True,
+        )
 
 def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -> None:
     config = _learning_config()

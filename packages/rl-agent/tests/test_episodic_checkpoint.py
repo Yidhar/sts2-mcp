@@ -199,7 +199,7 @@ def test_transaction_lifecycle_abi_is_persisted_and_required_for_exact_resume(
     metadata_path = checkpoint / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["transaction_lifecycle_abi"] == (
-        "sts2-transaction-lifecycle-evidence-v1"
+        "sts2-transaction-lifecycle-evidence-v2"
     )
     metadata.pop("transaction_lifecycle_abi")
     metadata_path.write_text(

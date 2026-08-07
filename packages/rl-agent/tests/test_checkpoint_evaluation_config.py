@@ -14,7 +14,7 @@ def _v10_payload() -> dict[str, Any]:
     payload["version"] = "sts2-relational-curriculum-config-v10"
     # V10 predates the failure-credit and transaction-exploration tables.
     # Reconstruct the historical payload instead of only relabeling the
-    # current V17 mapping.
+    # current V18 mapping.
     del payload["failure_credit"]
     del payload["transaction_exploration"]
     transaction_learning = payload["transaction_learning"]
@@ -23,12 +23,22 @@ def _v10_payload() -> dict[str, Any]:
         "lifecycle_entry_support_weight",
         "lifecycle_entry_support_probability_floor",
         "lifecycle_smdp_q_weight",
+        "lifecycle_smdp_horizon",
     ):
         del transaction_learning[key]
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
     del episodic["success_imitation_exempt_surfaces"]
+    for key in (
+        "act_segment_imitation_enabled",
+        "act_segment_policy_weight",
+        "act_segment_min_exit_hp_ratio",
+        "act_segment_max_revival_fraction",
+        "combat_hp_loss_value_weight",
+        "combat_hp_loss_reference",
+    ):
+        del episodic[key]
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
     del runtime["evaluation_guard_enforcement_start_steps"]
