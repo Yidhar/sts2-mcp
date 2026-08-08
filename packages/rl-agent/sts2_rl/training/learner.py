@@ -130,6 +130,7 @@ class LearnerMetrics:
     transaction_policy_avoided_labels: int
     transaction_entry_support_labels: int
     transaction_entry_support_satisfied_labels: int
+    transaction_entry_support_singleton_suppressed_labels: int
     transaction_smdp_q_labels: int
     transaction_lifecycle_committed: int
     transaction_lifecycle_cancelled: int
@@ -236,6 +237,7 @@ class _TransactionLossBatch:
     policy_avoided_labels: int
     entry_support_labels: int
     entry_support_satisfied_labels: int
+    entry_support_singleton_suppressed_labels: int
     smdp_q_labels: int
     lifecycle_committed: int
     lifecycle_cancelled: int
@@ -2875,6 +2877,9 @@ class VTraceLearner:
             transaction_entry_support_satisfied_labels=(
                 transaction_losses.entry_support_satisfied_labels
             ),
+            transaction_entry_support_singleton_suppressed_labels=(
+                transaction_losses.entry_support_singleton_suppressed_labels
+            ),
             transaction_smdp_q_labels=transaction_losses.smdp_q_labels,
             transaction_lifecycle_committed=(
                 transaction_losses.lifecycle_committed
@@ -3601,6 +3606,7 @@ class VTraceLearner:
                 policy_avoided_labels=0,
                 entry_support_labels=0,
                 entry_support_satisfied_labels=0,
+                entry_support_singleton_suppressed_labels=0,
                 smdp_q_labels=0,
                 lifecycle_committed=0,
                 lifecycle_cancelled=0,
@@ -3644,6 +3650,7 @@ class VTraceLearner:
             "remove": [],
         }
         entry_support_satisfied_labels = 0
+        entry_support_singleton_suppressed_labels = 0
         lifecycle_counts = {
             TransactionLifecycleOutcome.COMMITTED: 0,
             TransactionLifecycleOutcome.CANCELLED: 0,
@@ -3773,44 +3780,51 @@ class VTraceLearner:
                         if bool(enabled) and index != entry_action_index
                     ]
                     if not alternative_action_indices:
-                        raise RuntimeError(
-                            "transaction lifecycle support entry has no legal alternative"
+                        # A committed lifecycle may factually begin at a forced
+                        # singleton decision (for example an event that opens
+                        # the upgrade selection with no other legal action).
+                        # The two-sided corridor is undefined without a legal
+                        # alternative, and forced singleton actions never
+                        # generate a policy target.  Emit no support-corridor
+                        # label; the factual SMDP entry value labels below
+                        # remain valid value supervision.
+                        entry_support_singleton_suppressed_labels += 1
+                    else:
+                        alternative_indices = torch.tensor(
+                            alternative_action_indices,
+                            device=self.device,
+                            dtype=torch.long,
                         )
-                    alternative_indices = torch.tensor(
-                        alternative_action_indices,
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                    alternative_log_probability = torch.logsumexp(
-                        entry_policy_log_probabilities[alternative_indices],
-                        dim=0,
-                    )
-                    support_loss, log_gap = two_sided_policy_support_loss(
-                        entry_log_probability,
-                        alternative_log_probability,
-                        probability_floor=(
-                            self.transaction_config.lifecycle_entry_support_probability_floor
-                        ),
-                    )
-                    entry_support_terms.append(support_loss)
-                    detached_gap = float(log_gap.detach().item())
-                    entry_support_satisfied_labels += int(detached_gap <= 1.0e-7)
-                    entry_log_support_gaps.append(detached_gap)
-                    entry_model_probabilities.append(
-                        float(torch.exp(entry_log_probability.detach()).item())
-                    )
-                    entry_collection_model_probabilities.append(
-                        lifecycle.entry_model_probability
-                    )
-                    entry_behavior_probabilities.append(
-                        math.exp(lifecycle.entry_behavior_log_probability)
-                    )
-                    operation_entry_model_probabilities[lifecycle.operation].append(
-                        entry_model_probabilities[-1]
-                    )
-                    operation_entry_behavior_probabilities[lifecycle.operation].append(
-                        entry_behavior_probabilities[-1]
-                    )
+                        alternative_log_probability = torch.logsumexp(
+                            entry_policy_log_probabilities[alternative_indices],
+                            dim=0,
+                        )
+                        support_loss, log_gap = two_sided_policy_support_loss(
+                            entry_log_probability,
+                            alternative_log_probability,
+                            probability_floor=(
+                                self.transaction_config.lifecycle_entry_support_probability_floor
+                            ),
+                        )
+                        entry_support_terms.append(support_loss)
+                        detached_gap = float(log_gap.detach().item())
+                        entry_support_satisfied_labels += int(detached_gap <= 1.0e-7)
+                        entry_log_support_gaps.append(detached_gap)
+                        entry_model_probabilities.append(
+                            float(torch.exp(entry_log_probability.detach()).item())
+                        )
+                        entry_collection_model_probabilities.append(
+                            lifecycle.entry_model_probability
+                        )
+                        entry_behavior_probabilities.append(
+                            math.exp(lifecycle.entry_behavior_log_probability)
+                        )
+                        operation_entry_model_probabilities[lifecycle.operation].append(
+                            entry_model_probabilities[-1]
+                        )
+                        operation_entry_behavior_probabilities[lifecycle.operation].append(
+                            entry_behavior_probabilities[-1]
+                        )
 
                     if not lifecycle.option_target_observed:
                         if (
@@ -3951,6 +3965,9 @@ class VTraceLearner:
             policy_avoided_labels=completion_policy_avoided_labels,
             entry_support_labels=len(entry_support_terms),
             entry_support_satisfied_labels=entry_support_satisfied_labels,
+            entry_support_singleton_suppressed_labels=(
+                entry_support_singleton_suppressed_labels
+            ),
             smdp_q_labels=len(smdp_q_predictions),
             lifecycle_committed=lifecycle_counts[
                 TransactionLifecycleOutcome.COMMITTED

@@ -618,3 +618,67 @@ def test_cancelled_transaction_lifecycle_never_creates_positive_entry_credit() -
         assert losses.smdp_q_labels == 1
     finally:
         resources.close()
+
+
+def test_forced_singleton_lifecycle_entry_suppresses_support_corridor() -> None:
+    """A committed lifecycle whose entry was a forced singleton must not
+    produce a two-sided support label (there is no legal alternative to keep
+    inside the corridor), must not crash the learner, and must keep its
+    factual SMDP entry value labels."""
+
+    config = _lifecycle_learning_config(max_steps=8)
+    resources = build_training_resources(
+        config,
+        backend=_RestForgeSelectionSuccessBackend(),
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("lifecycle-singleton")
+        resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+            for parameter in resources.collector_model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.05,
+            deterministic=False,
+            record=True,
+        )
+        trace = next(
+            trace
+            for trace in episode.transaction_traces
+            if trace.lifecycle is not None
+        )
+        lifecycle = trace.lifecycle
+        assert lifecycle is not None
+        assert lifecycle.support_eligible
+
+        entry_index = lifecycle.entry_step_index
+        entry_step = trace.steps[entry_index]
+        singleton_mask = np.zeros_like(entry_step.snapshot.action_mask)
+        singleton_mask[entry_step.action_index] = True
+        singleton_step = replace(
+            entry_step,
+            snapshot=replace(entry_step.snapshot, action_mask=singleton_mask),
+        )
+        singleton_trace = replace(
+            trace,
+            steps=tuple(
+                singleton_step if index == entry_index else step
+                for index, step in enumerate(trace.steps)
+            ),
+        )
+
+        losses = resources.learner._transaction_losses((singleton_trace,))
+        assert losses.entry_support_singleton_suppressed_labels == 1
+        assert losses.entry_support_labels == 0
+        assert losses.upgrade_entry_support_labels == 0
+        assert losses.entry_support_loss.detach().item() == pytest.approx(0.0)
+        assert losses.smdp_q_labels == 1
+        assert losses.lifecycle_committed == 1
+
+        baseline = resources.learner._transaction_losses((trace,))
+        assert baseline.entry_support_singleton_suppressed_labels == 0
+        assert baseline.entry_support_labels == 1
+    finally:
+        resources.close()
