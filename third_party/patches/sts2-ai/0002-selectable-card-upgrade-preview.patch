@@ -1,0 +1,105 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 3cbc185..932b022 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -988,6 +988,16 @@ public static class FullRunApiStateBuilder
+ 	}
+ 
+ 	private static FullRunApiCardOption ToApiSelectableCardOption(CombatTrainingSelectableCardSnapshot card)
++	{
++		FullRunApiCardOption option = ToApiSelectableCardOptionCore(card);
++		if (card.UpgradePreview != null)
++		{
++			option.upgrade_preview = ToApiSelectableCardOptionCore(card.UpgradePreview);
++		}
++		return option;
++	}
++
++	private static FullRunApiCardOption ToApiSelectableCardOptionCore(CombatTrainingSelectableCardSnapshot card)
+ 	{
+ 		return new FullRunApiCardOption
+ 		{
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+index c1bbd95..b654888 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateDtos.cs
+@@ -290,6 +290,11 @@ public sealed class FullRunApiCardOption
+ 	public List<FullRunApiCardModifier> enchantments { get; set; } = new List<FullRunApiCardModifier>();
+ 
+ 	public List<FullRunApiCardModifier> afflictions { get; set; } = new List<FullRunApiCardModifier>();
++
++	// Exact native card-upgrade projection: this same card at upgrade level
++	// +1, or null when the card is not upgradable. Consumed by the trainer's
++	// grounded encoder through its reviewed upgrade_preview exemption.
++	public FullRunApiCardOption? upgrade_preview { get; set; }
+ }
+ 
+ public sealed class FullRunApiPotionState
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
+index bcbc45b..be0e125 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
+@@ -406,6 +406,45 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+ 	}
+ 
+ 	public static CombatTrainingSelectableCardSnapshot BuildSelectableCardSnapshot(CardModel card, int choiceIndex)
++	{
++		CombatTrainingSelectableCardSnapshot snapshot = BuildSelectableCardSnapshotCore(card, choiceIndex);
++		snapshot.UpgradePreview = BuildUpgradePreviewSnapshot(card, choiceIndex);
++		return snapshot;
++	}
++
++	private static CombatTrainingSelectableCardSnapshot? BuildUpgradePreviewSnapshot(CardModel card, int choiceIndex)
++	{
++		if (!card.IsUpgradable)
++		{
++			return null;
++		}
++		try
++		{
++			// A detached fresh instance keeps live run state untouched while
++			// the canonical UpgradeInternal path (per-card OnUpgrade hooks +
++			// dynamic-var recalculation) produces the exact upgraded facts.
++			CardModel preview = ModelDb.GetById<CardModel>(card.Id).ToMutable();
++			int targetLevel = card.CurrentUpgradeLevel + 1;
++			while (preview.CurrentUpgradeLevel < targetLevel && preview.IsUpgradable)
++			{
++				preview.UpgradeInternal();
++				preview.FinalizeUpgradeInternal();
++			}
++			if (!preview.IsUpgraded)
++			{
++				return null;
++			}
++			return BuildSelectableCardSnapshotCore(preview, choiceIndex);
++		}
++		catch (Exception)
++		{
++			// The preview is optional enrichment; a card whose detached
++			// reconstruction fails simply ships without one.
++			return null;
++		}
++	}
++
++	private static CombatTrainingSelectableCardSnapshot BuildSelectableCardSnapshotCore(CardModel card, int choiceIndex)
+ 	{
+ 		return new CombatTrainingSelectableCardSnapshot
+ 		{
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
+index 9eacd11..506d225 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingDtos.cs
+@@ -492,4 +492,13 @@ public sealed class CombatTrainingSelectableCardSnapshot
+ 	public List<CombatTrainingCardModifierSnapshot> Enchantments { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
+ 
+ 	public List<CombatTrainingCardModifierSnapshot> Afflictions { get; set; } = new List<CombatTrainingCardModifierSnapshot>();
++
++	/// <summary>
++	/// Detached factual snapshot of this exact card at upgrade level +1,
++	/// built through the canonical UpgradeInternal path on a fresh ModelDb
++	/// instance. Null when the card is not upgradable. This is an exact
++	/// native card-upgrade projection (an alternative factual card state),
++	/// never a planner/action-effect preview.
++	/// </summary>
++	public CombatTrainingSelectableCardSnapshot? UpgradePreview { get; set; }
+ }
