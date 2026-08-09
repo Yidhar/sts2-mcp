@@ -13,6 +13,7 @@ from sts2_rl.training import (
     TransactionExplorationConfig,
     TransactionLearningConfig,
     TransactionLifecycleOutcome,
+    TransactionPolicyTarget,
     build_training_resources,
     factual_transaction_policy_targets,
     one_sided_policy_support_loss,
@@ -680,5 +681,57 @@ def test_forced_singleton_lifecycle_entry_suppresses_support_corridor() -> None:
         baseline = resources.learner._transaction_losses((trace,))
         assert baseline.entry_support_singleton_suppressed_labels == 0
         assert baseline.entry_support_labels == 1
+    finally:
+        resources.close()
+
+
+@pytest.mark.parametrize(
+    ("backend", "choices"),
+    (
+        (_RestForgeSelectionSuccessBackend, (0, 0, 1)),
+        (_ShopRemovalSuccessBackend, (0, 0, 1)),
+    ),
+)
+def test_completion_ce_excludes_card_target_steps_in_verified_lifecycles(
+    backend: type[TerminalWithoutObservationFlagsBackend],
+    choices: tuple[int, ...],
+) -> None:
+    """Inside a verified upgrade/removal lifecycle the card-target select
+    steps receive neither PREFER nor AVOID from the completed-path CE; the
+    forward (confirm/proceed) steps keep their PREFER labels."""
+
+    config = _lifecycle_learning_config(max_steps=8)
+    resources = build_training_resources(config, backend=backend())
+    try:
+        resources.collector.bind_failure_credit_run_id("target-ce-exclusion")
+        resources.collector._rng = _ScriptedChoiceRng(choices)  # type: ignore[assignment]
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+            for parameter in resources.collector_model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.05,
+            deterministic=False,
+            record=True,
+        )
+        trace = next(
+            trace
+            for trace in episode.transaction_traces
+            if trace.lifecycle is not None
+        )
+        assert trace.lifecycle is not None and trace.lifecycle.support_eligible
+
+        labels = factual_transaction_policy_targets(trace)
+        target_steps = {
+            index
+            for index, step in enumerate(trace.steps)
+            if step.selected_count_delta > 0
+        }
+        assert target_steps, "fixture must contain a card-target select step"
+        assert all(label.step_index not in target_steps for label in labels)
+        assert any(
+            label.target is TransactionPolicyTarget.PREFER for label in labels
+        ), "forward completion steps must keep PREFER labels"
     finally:
         resources.close()

@@ -540,10 +540,9 @@ def factual_transaction_policy_targets(
                 avoided_indices.add(trace.burn_in_steps + local_index)
 
     labels: list[FactualTransactionPolicyTarget] = []
+    lifecycle = trace.lifecycle
     lifecycle_entry_index = (
-        trace.lifecycle.entry_step_index
-        if trace.lifecycle is not None
-        else None
+        lifecycle.entry_step_index if lifecycle is not None else None
     )
     for step_index, step in enumerate(
         learn_steps,
@@ -555,6 +554,20 @@ def factual_transaction_policy_targets(
         if step_index == lifecycle_entry_index:
             continue
         if int(np.count_nonzero(step.snapshot.action_mask)) <= 1:
+            continue
+        if (
+            lifecycle is not None
+            and lifecycle.support_eligible
+            and step.selected_count_delta > 0
+        ):
+            # Which card to select inside a verified upgrade/removal
+            # lifecycle has its own target-credit contract (factual
+            # option-return Q on the shared representation). A completed-path
+            # PREFER here would re-imprint the incumbent target every
+            # completion — the measured mechanism behind one shared target
+            # heuristic ruling both the upgrade and removal surfaces — and
+            # the mirrored AVOID would permanently suppress every rival
+            # target. Forward steps (confirm/proceed) keep their labels.
             continue
         if step_index in avoided_indices:
             labels.append(
