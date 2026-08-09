@@ -75,7 +75,12 @@ def test_v45_changes_only_exploration_roster_from_v44() -> None:
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
     assert config.optimization == v44.optimization
     assert config.rollout == v44.rollout
-    assert config.transaction_learning == v44.transaction_learning
+    assert v44.transaction_learning.transaction_q_weight == 0.0
+    assert config.transaction_learning.transaction_q_weight == 0.05
+    from dataclasses import replace as _replace
+    assert _replace(config.transaction_learning, transaction_q_weight=0.0) == (
+        v44.transaction_learning
+    )
     assert v44.transaction_exploration.enabled is False
     assert config.transaction_exploration.enabled is True
     assert config.transaction_exploration.operations == ("relic_purchase", "reward_skip")
