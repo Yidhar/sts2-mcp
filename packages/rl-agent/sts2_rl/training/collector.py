@@ -1223,7 +1223,9 @@ def _uses_targeted_selection_exploration(
     )
 
 
-_TRANSACTION_EXPLORATION_OPERATIONS = frozenset({"upgrade", "remove"})
+_TRANSACTION_EXPLORATION_OPERATIONS = frozenset(
+    {"upgrade", "remove", "reward_skip", "relic_purchase"}
+)
 
 
 def _canonical_transaction_operation(value: object) -> str:
@@ -1273,6 +1275,16 @@ def _transaction_entry_operation(action: Mapping[str, object]) -> str:
         if operation:
             return operation
 
+    for key in ("model_action_kind", "action", "kind"):
+        normalized_kind = "_".join(
+            str(prototype.get(key) or "").strip().lower().replace("-", " ").split()
+        )
+        if normalized_kind in {"skip_card_reward", "reward_skip", "skip_reward"}:
+            # Declining a combat card reward is a reviewed single-decision
+            # entrance: the deck-growth alternative to taking a card. The
+            # classification reads only the generic action kind.
+            return "reward_skip"
+
     model_kind = "_".join(str(prototype.get("model_action_kind") or "").strip().lower().replace("-", " ").split())
     if model_kind == "shop":
         item = prototype.get("item")
@@ -1280,6 +1292,17 @@ def _transaction_entry_operation(action: Mapping[str, object]) -> str:
             operation = _canonical_transaction_operation(item.get("category", item.get("type")))
             if operation == "remove":
                 return operation
+            category = "_".join(
+                str(item.get("category") or item.get("type") or "")
+                .strip()
+                .lower()
+                .replace("-", " ")
+                .split()
+            )
+            if category == "relic":
+                # Purchasing a relic is a reviewed single-decision entrance.
+                # Only the generic item category is read, never a relic ID.
+                return "relic_purchase"
     if model_kind in {"rest_site", "restsite"}:
         option = prototype.get("option")
         if isinstance(option, Mapping):

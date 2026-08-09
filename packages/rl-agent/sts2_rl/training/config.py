@@ -1006,10 +1006,11 @@ class TransactionExplorationConfig:
             if not isinstance(raw_operation, str) or not raw_operation.strip():
                 raise TypeError("transaction_exploration.operations entries must be non-empty strings")
             operation = "_".join(raw_operation.strip().lower().replace("-", " ").split())
-            if operation not in {"upgrade", "remove"}:
+            if operation not in {"upgrade", "remove", "reward_skip", "relic_purchase"}:
                 raise ValueError(
                     "transaction_exploration.operations supports only the reviewed "
-                    "'upgrade' and 'remove' operation families"
+                    "'upgrade', 'remove', 'reward_skip' and 'relic_purchase' "
+                    "operation families"
                 )
             if operation in normalized_operations:
                 raise ValueError(f"transaction_exploration.operations contains duplicate operation {operation!r}")
@@ -1035,10 +1036,24 @@ class TransactionExplorationConfig:
                 raise ValueError("enabled transaction exploration requires at least one operation")
             if entry_floor <= 0.0:
                 raise ValueError("enabled transaction exploration requires a positive entry_epsilon_floor")
-            # A probability of exactly one would erase behavior support for
-            # Cancel/Deselect and invalidate off-policy importance correction.
-            if not 0.0 < guidance_probability < 1.0:
-                raise ValueError("enabled transaction exploration requires " "0 < completion_guidance_probability < 1")
+            # Completion guidance only has meaning for operations that open a
+            # multi-step selection transaction. Single-decision entrances
+            # (reward_skip, relic_purchase) resolve at the entry action, so a
+            # pure single-decision roster keeps guidance at exactly zero.
+            selection_operations = {"upgrade", "remove"} & set(self.operations)
+            if selection_operations:
+                # A probability of exactly one would erase behavior support for
+                # Cancel/Deselect and invalidate off-policy importance correction.
+                if not 0.0 < guidance_probability < 1.0:
+                    raise ValueError(
+                        "enabled selection-transaction exploration requires "
+                        "0 < completion_guidance_probability < 1"
+                    )
+            elif guidance_probability != 0.0:
+                raise ValueError(
+                    "single-decision transaction exploration requires "
+                    "completion_guidance_probability == 0"
+                )
         elif self.operations or entry_floor != 0.0 or guidance_probability != 0.0:
             raise ValueError("disabled transaction exploration requires empty operations and zero probabilities")
 

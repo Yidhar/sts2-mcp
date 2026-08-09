@@ -735,3 +735,56 @@ def test_completion_ce_excludes_card_target_steps_in_verified_lifecycles(
         ), "forward completion steps must keep PREFER labels"
     finally:
         resources.close()
+
+
+def test_entry_classifier_recognizes_single_decision_entrances() -> None:
+    from sts2_rl.training.collector import _transaction_entry_operation
+
+    assert _transaction_entry_operation({"kind": "skip_card_reward"}) == "reward_skip"
+    assert (
+        _transaction_entry_operation({"action": "skip_card_reward"})
+        == "reward_skip"
+    )
+    assert (
+        _transaction_entry_operation(
+            {"model_action_kind": "shop", "item": {"category": "relic"}}
+        )
+        == "relic_purchase"
+    )
+    # Existing families unchanged.
+    assert (
+        _transaction_entry_operation(
+            {"model_action_kind": "shop", "item": {"category": "card_removal"}}
+        )
+        == "remove"
+    )
+    assert (
+        _transaction_entry_operation(
+            {"model_action_kind": "shop", "item": {"category": "card"}}
+        )
+        == ""
+    )
+    assert (
+        _transaction_entry_operation(
+            {"model_action_kind": "shop", "item": {"category": "potion"}}
+        )
+        == ""
+    )
+    assert _transaction_entry_operation({"kind": "select_card_reward"}) == ""
+
+
+def test_exploration_config_accepts_single_decision_operations() -> None:
+    config = TransactionExplorationConfig(
+        enabled=True,
+        operations=("reward_skip", "relic_purchase"),
+        entry_epsilon_floor=0.15,
+        completion_guidance_probability=0.0,
+    )
+    assert config.operations == ("relic_purchase", "reward_skip")
+    with pytest.raises(ValueError, match="reviewed"):
+        TransactionExplorationConfig(
+            enabled=True,
+            operations=("buy_everything",),
+            entry_epsilon_floor=0.15,
+            completion_guidance_probability=0.0,
+        )
