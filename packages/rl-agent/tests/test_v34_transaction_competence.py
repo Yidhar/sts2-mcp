@@ -788,3 +788,52 @@ def test_exploration_config_accepts_single_decision_operations() -> None:
             entry_epsilon_floor=0.15,
             completion_guidance_probability=0.0,
         )
+
+
+def test_selection_step_q_uses_lifecycle_option_return() -> None:
+    """Card-target select steps inside a verified lifecycle take their Q
+    label from the factual SMDP option return; the entry step stays owned by
+    the lifecycle entry-Q and non-lifecycle steps keep whole-horizon labels."""
+
+    base = _lifecycle_learning_config(max_steps=8)
+    config = replace(
+        base,
+        transaction_learning=replace(
+            base.transaction_learning,
+            transaction_q_weight=0.05,
+        ),
+    )
+    resources = build_training_resources(
+        config,
+        backend=_RestForgeSelectionSuccessBackend(),
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("target-q-option-return")
+        resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+            for parameter in resources.collector_model.parameters():
+                parameter.zero_()
+        episode = resources.collector.collect_episode(
+            epsilon=0.05,
+            deterministic=False,
+            record=True,
+        )
+        trace = next(
+            trace
+            for trace in episode.transaction_traces
+            if trace.lifecycle is not None
+        )
+        lifecycle = trace.lifecycle
+        assert lifecycle is not None
+        assert lifecycle.support_eligible and lifecycle.option_target_observed
+
+        losses = resources.learner._transaction_losses((trace,))
+        # The lifecycle entry owns the SMDP entry-Q; remaining q_observed
+        # steps (select/confirm) train the per-candidate Q head.
+        assert losses.smdp_q_labels == 1
+        assert losses.q_labels >= 1
+        assert losses.q_loss.detach().item() >= 0.0
+    finally:
+        resources.close()

@@ -3743,8 +3743,31 @@ class VTraceLearner:
                 if step.q_observed and not lifecycle_owns_entry_q:
                     if step.transaction_return is None:  # pragma: no cover - property invariant
                         raise RuntimeError("q_observed transaction has no return")
-                    q_values.append(output.transaction_q_values[0, action_index])
-                    q_targets.append(step.transaction_return)
+                    lifecycle_target = trace.lifecycle
+                    if (
+                        lifecycle_target is not None
+                        and lifecycle_target.support_eligible
+                        and lifecycle_target.option_target_observed
+                        and lifecycle_target.option_return is not None
+                        and lifecycle_target.entry_step_index
+                        < step_index
+                        <= lifecycle_target.exit_step_index
+                        and step.selected_count_delta > 0
+                    ):
+                        # Card-target selection steps inside a verified
+                        # lifecycle learn Q against the SAME factual SMDP
+                        # option return as the entry (through the next
+                        # rest-site/Act/terminal boundary) instead of the
+                        # whole-episode transaction return.  This is the
+                        # target-level short-horizon credit: Q(select A) and
+                        # Q(select B) now differ on a 10-20 floor factual
+                        # horizon.  Non-lifecycle q_observed steps keep their
+                        # original whole-horizon labels.
+                        q_values.append(output.transaction_q_values[0, action_index])
+                        q_targets.append(float(lifecycle_target.option_return))
+                    else:
+                        q_values.append(output.transaction_q_values[0, action_index])
+                        q_targets.append(step.transaction_return)
             if trace_policy_losses:
                 # Equal trace weight prevents a long repeated cycle from
                 # overwhelming many short, factual completion paths.
