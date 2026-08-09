@@ -16,8 +16,13 @@ from sts2_rl.encoding import GroundedEncodingConfig
 from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
+from .transaction_operations import (
+    TRANSACTION_EXPLORATION_OPERATIONS,
+    TRANSACTION_GUIDANCE_OPERATIONS,
+    canonical_transaction_operation,
+)
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v18"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v19"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
@@ -26,6 +31,7 @@ _MODEL_INITIALIZATION_SOURCE_CONFIG_V14 = "sts2-relational-curriculum-config-v14
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V15 = "sts2-relational-curriculum-config-v15"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V16 = "sts2-relational-curriculum-config-v16"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V17 = "sts2-relational-curriculum-config-v17"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V18 = "sts2-relational-curriculum-config-v18"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -385,6 +391,18 @@ class TransactionLearningConfig:
     lifecycle_smdp_horizon: Literal["transaction_exit", "next_rest_or_act"] = (
         "transaction_exit"
     )
+    # A calibrated factual option-Q target can directly move the shared actor
+    # even when the selected action has reached a softmax absorbing state.
+    # This bounded CE bridge is deliberately opt-in and separately gated by
+    # learner age, policy provenance, Q residual and collection/current policy
+    # drift.  It is neither an action bonus nor an expert label.
+    lifecycle_advantage_policy_weight: float = 0.0
+    lifecycle_advantage_start_update: int = 0
+    lifecycle_advantage_temperature: float = 0.25
+    lifecycle_advantage_clip: float = 1.0
+    lifecycle_advantage_q_error_gate: float = 0.25
+    lifecycle_advantage_max_policy_lag: int = 128
+    lifecycle_advantage_max_log_probability_shift: float = 1.0
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -414,12 +432,26 @@ class TransactionLearningConfig:
             minimum=0,
         )
         for name in (
+            "lifecycle_advantage_start_update",
+            "lifecycle_advantage_max_policy_lag",
+        ):
+            _require_int(
+                getattr(self, name),
+                label=f"transaction_learning.{name}",
+                minimum=0,
+            )
+        for name in (
             "effect_weight",
             "transaction_q_weight",
             "completion_policy_weight",
             "lifecycle_entry_support_weight",
             "lifecycle_entry_support_probability_floor",
             "lifecycle_smdp_q_weight",
+            "lifecycle_advantage_policy_weight",
+            "lifecycle_advantage_temperature",
+            "lifecycle_advantage_clip",
+            "lifecycle_advantage_q_error_gate",
+            "lifecycle_advantage_max_log_probability_shift",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",
@@ -442,9 +474,18 @@ class TransactionLearningConfig:
                 "transaction_learning.lifecycle_smdp_horizon must be "
                 "transaction_exit or next_rest_or_act"
             )
+        if self.lifecycle_advantage_temperature <= 0.0:
+            raise ValueError(
+                "transaction_learning.lifecycle_advantage_temperature must be positive"
+            )
+        if self.lifecycle_advantage_clip <= 0.0:
+            raise ValueError(
+                "transaction_learning.lifecycle_advantage_clip must be positive"
+            )
         if not self.enabled and (
             self.lifecycle_entry_support_weight > 0.0
             or self.lifecycle_smdp_q_weight > 0.0
+            or self.lifecycle_advantage_policy_weight > 0.0
         ):
             raise ValueError(
                 "transaction lifecycle losses require transaction_learning.enabled"
@@ -1005,8 +1046,8 @@ class TransactionExplorationConfig:
         for raw_operation in raw_operations:
             if not isinstance(raw_operation, str) or not raw_operation.strip():
                 raise TypeError("transaction_exploration.operations entries must be non-empty strings")
-            operation = "_".join(raw_operation.strip().lower().replace("-", " ").split())
-            if operation not in {"upgrade", "remove", "reward_skip", "relic_purchase"}:
+            operation = canonical_transaction_operation(raw_operation)
+            if operation not in TRANSACTION_EXPLORATION_OPERATIONS:
                 raise ValueError(
                     "transaction_exploration.operations supports only the reviewed "
                     "'upgrade', 'remove', 'reward_skip' and 'relic_purchase' "
@@ -1040,7 +1081,9 @@ class TransactionExplorationConfig:
             # multi-step selection transaction. Single-decision entrances
             # (reward_skip, relic_purchase) resolve at the entry action, so a
             # pure single-decision roster keeps guidance at exactly zero.
-            selection_operations = {"upgrade", "remove"} & set(self.operations)
+            selection_operations = TRANSACTION_GUIDANCE_OPERATIONS & set(
+                self.operations
+            )
             if selection_operations:
                 # A probability of exactly one would erase behavior support for
                 # Cancel/Deselect and invalidate off-policy importance correction.
@@ -1603,8 +1646,10 @@ def model_initialization_config_from_mapping(
     eligibility floor for the liveness risk actor, an explicit success-
     imitation surface exemption, and the policy-collapse-v2 entropy breaker.
     V18 adds healthy Act-prefix imitation, a bounded factual combat HP-loss
-    head, and the extended factual transaction option horizon.  These are
-    training/data/model semantics, so V17 checkpoints are accepted only for
+    head, and the extended factual transaction option horizon. V19 adds a
+    guarded factual option-advantage actor bridge; all of its new controls
+    migrate disabled so an older policy is never reinterpreted as supervised
+    actor data. These are training/data/model semantics, so V18 checkpoints are accepted only for
     model-parameter initialization; optimizer/replay/RNG state cannot cross
     the boundary.
     V11 checkpoints
@@ -1631,6 +1676,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1663,6 +1709,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
     }:
         if "transaction_exploration" in payload:
             raise ValueError(
@@ -1688,6 +1735,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V15,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
     }:
         unexpected_lifecycle_fields = lifecycle_fields.intersection(
             transaction_learning
@@ -1706,6 +1754,7 @@ def model_initialization_config_from_mapping(
     if source_version in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
     }:
         if "evaluation_guard_enforcement_start_steps" not in runtime:
             raise ValueError(
@@ -1731,7 +1780,10 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "failure_credit table after reviewed migration"
         )
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V17:
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+    }:
         if "liveness_risk_actor_min_selected_probability" not in raw_failure:
             raise ValueError(
                 "V17 model-initialization config is missing its risk-actor "
@@ -1754,7 +1806,10 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "episodic_learning table after reviewed migration"
         )
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V17:
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+    }:
         if "success_imitation_exempt_surfaces" not in raw_episodic:
             raise ValueError(
                 "V17 model-initialization config is missing its success-"
@@ -1778,29 +1833,64 @@ def model_initialization_config_from_mapping(
         "combat_hp_loss_value_weight": 0.0,
         "combat_hp_loss_reference": 80.0,
     }
-    unexpected_v18 = set(v18_fields).intersection(raw_episodic)
-    if unexpected_v18:
-        raise ValueError(
-            f"{source_version} model-initialization config unexpectedly "
-            "contains V18 episodic fields: "
-            + ", ".join(sorted(unexpected_v18))
-        )
-    migrated["episodic_learning"] = {
-        **dict(raw_episodic),
-        **v18_fields,
-    }
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18:
+        missing_v18 = set(v18_fields) - set(raw_episodic)
+        if missing_v18:
+            raise ValueError(
+                "V18 model-initialization config is missing episodic fields: "
+                + ", ".join(sorted(missing_v18))
+            )
+        migrated["episodic_learning"] = dict(raw_episodic)
+    else:
+        unexpected_v18 = set(v18_fields).intersection(raw_episodic)
+        if unexpected_v18:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains V18 episodic fields: "
+                + ", ".join(sorted(unexpected_v18))
+            )
+        migrated["episodic_learning"] = {
+            **dict(raw_episodic),
+            **v18_fields,
+        }
 
     raw_transaction = migrated.get("transaction_learning")
     if not isinstance(raw_transaction, Mapping):  # pragma: no cover - checked above
         raise ValueError("model-initialization config lost transaction_learning")
-    if "lifecycle_smdp_horizon" in raw_transaction:
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18:
+        if "lifecycle_smdp_horizon" not in raw_transaction:
+            raise ValueError(
+                "V18 model-initialization config is missing its transaction option horizon"
+            )
+    elif "lifecycle_smdp_horizon" in raw_transaction:
         raise ValueError(
             f"{source_version} model-initialization config unexpectedly "
             "contains the V18 transaction option horizon"
         )
+    v19_transaction_fields = {
+        "lifecycle_advantage_policy_weight": 0.0,
+        "lifecycle_advantage_start_update": 0,
+        "lifecycle_advantage_temperature": 0.25,
+        "lifecycle_advantage_clip": 1.0,
+        "lifecycle_advantage_q_error_gate": 0.25,
+        "lifecycle_advantage_max_policy_lag": 128,
+        "lifecycle_advantage_max_log_probability_shift": 1.0,
+    }
+    unexpected_v19 = set(v19_transaction_fields).intersection(raw_transaction)
+    if unexpected_v19:
+        raise ValueError(
+            f"{source_version} model-initialization config unexpectedly "
+            "contains V19 transaction actor fields: "
+            + ", ".join(sorted(unexpected_v19))
+        )
     migrated["transaction_learning"] = {
         **dict(raw_transaction),
-        "lifecycle_smdp_horizon": "transaction_exit",
+        **(
+            {}
+            if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18
+            else {"lifecycle_smdp_horizon": "transaction_exit"}
+        ),
+        **v19_transaction_fields,
     }
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)

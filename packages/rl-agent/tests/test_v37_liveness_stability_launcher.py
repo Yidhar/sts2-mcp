@@ -63,7 +63,7 @@ def test_v37_keeps_v36_transaction_corridor_and_repairs_liveness_plane() -> None
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v36 = load_training_config(profile="preheat", config_path=V36_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     transaction = config.transaction_learning
     assert transaction == v36.transaction_learning
     assert transaction.enabled

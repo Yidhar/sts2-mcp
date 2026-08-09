@@ -39,7 +39,15 @@ diff --git a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs 
 index bcbc45b..be0e125 100644
 --- a/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
 +++ b/STS2AI/ENV/Sim/HeadlessSim/Training/CombatTrainingChoiceAdapter.cs
-@@ -406,6 +406,45 @@ internal static class CombatTrainingChoiceSnapshotBuilder
+@@ -10,6 +10,7 @@ using MegaCrit.Sts2.Core.Localization;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Nodes.Cards.Holders;
+ using MegaCrit.Sts2.Core.Nodes.CommonUi;
++using MegaCrit.Sts2.Core.Simulation;
+ using MegaCrit.Sts2.Core.Nodes.Combat;
+ using MegaCrit.Sts2.Core.Nodes.GodotExtensions;
+ 
+@@ -406,6 +406,52 @@ internal static class CombatTrainingChoiceSnapshotBuilder
  	}
  
  	public static CombatTrainingSelectableCardSnapshot BuildSelectableCardSnapshot(CardModel card, int choiceIndex)
@@ -55,28 +63,35 @@ index bcbc45b..be0e125 100644
 +		{
 +			return null;
 +		}
++		FullRunSimulationDiagnostics.Increment("upgrade_preview.eligible");
 +		try
 +		{
-+			// A detached fresh instance keeps live run state untouched while
-+			// the canonical UpgradeInternal path (per-card OnUpgrade hooks +
-+			// dynamic-var recalculation) produces the exact upgraded facts.
-+			CardModel preview = ModelDb.GetById<CardModel>(card.Id).ToMutable();
++			// Clone the exact mutable card instance so enchantments, afflictions,
++			// current upgrade level, energy/dynamic variables and other instance
++			// facts survive. Rebuilding from ModelDb silently erased those facts.
++			CardModel preview = card.IsMutable
++				? (CardModel)card.ClonePreservingMutability()
++				: card.ToMutable();
 +			int targetLevel = card.CurrentUpgradeLevel + 1;
 +			while (preview.CurrentUpgradeLevel < targetLevel && preview.IsUpgradable)
 +			{
 +				preview.UpgradeInternal();
 +				preview.FinalizeUpgradeInternal();
 +			}
-+			if (!preview.IsUpgraded)
++			if (preview.CurrentUpgradeLevel != targetLevel)
 +			{
++				FullRunSimulationDiagnostics.Increment("upgrade_preview.unavailable_after_upgrade");
 +				return null;
 +			}
++			FullRunSimulationDiagnostics.Increment("upgrade_preview.emitted");
 +			return BuildSelectableCardSnapshotCore(preview, choiceIndex);
 +		}
 +		catch (Exception)
 +		{
-+			// The preview is optional enrichment; a card whose detached
-+			// reconstruction fails simply ships without one.
++			// Optional enrichment must never mutate or stop the live run, but a
++			// failed exact clone is observable through perf_stats rather than
++			// becoming a silent blind-upgrade regression.
++			FullRunSimulationDiagnostics.Increment("upgrade_preview.exception");
 +			return null;
 +		}
 +	}
@@ -96,10 +111,11 @@ index 9eacd11..506d225 100644
 +
 +	/// <summary>
 +	/// Detached factual snapshot of this exact card at upgrade level +1,
-+	/// built through the canonical UpgradeInternal path on a fresh ModelDb
-+	/// instance. Null when the card is not upgradable. This is an exact
++	/// built by cloning the exact source instance and applying the canonical
++	/// UpgradeInternal path. Null when the card is not upgradable. This is an exact
 +	/// native card-upgrade projection (an alternative factual card state),
 +	/// never a planner/action-effect preview.
 +	/// </summary>
 +	public CombatTrainingSelectableCardSnapshot? UpgradePreview { get; set; }
  }
+

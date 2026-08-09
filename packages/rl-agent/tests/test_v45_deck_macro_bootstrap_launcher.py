@@ -72,7 +72,7 @@ def test_v45_changes_only_exploration_roster_from_v44() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v44 = load_training_config(profile="preheat", config_path=V44_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     assert config.optimization == v44.optimization
     assert config.rollout == v44.rollout
     assert v44.transaction_learning.transaction_q_weight == 0.0

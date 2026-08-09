@@ -14,7 +14,10 @@ from torch import Tensor
 from sts2_baseline import SequenceUnroll
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.encoding.grounded import grounding_encoding_identity
-from sts2_rl.encoding.snapshot import collate_encoded_snapshots
+from sts2_rl.encoding.snapshot import (
+    EncodedDecisionSnapshot,
+    collate_encoded_snapshots,
+)
 from sts2_rl.models import RecurrentCandidateModel, RecurrentCandidateOutput
 
 from .config import (
@@ -121,6 +124,7 @@ class LearnerMetrics:
     transaction_completion_policy_loss: float
     transaction_entry_support_loss: float
     transaction_smdp_q_loss: float
+    transaction_advantage_policy_loss: float
     transaction_traces: int
     transaction_effect_labels: int
     transaction_q_labels: int
@@ -132,6 +136,15 @@ class LearnerMetrics:
     transaction_entry_support_satisfied_labels: int
     transaction_entry_support_singleton_suppressed_labels: int
     transaction_smdp_q_labels: int
+    transaction_advantage_policy_labels: int
+    transaction_advantage_policy_positive_labels: int
+    transaction_advantage_policy_negative_labels: int
+    transaction_advantage_policy_phase_suppressed_labels: int
+    transaction_advantage_policy_lag_suppressed_labels: int
+    transaction_advantage_policy_q_error_suppressed_labels: int
+    transaction_advantage_policy_drift_suppressed_labels: int
+    transaction_advantage_policy_singleton_suppressed_labels: int
+    transaction_advantage_mean: float
     transaction_lifecycle_committed: int
     transaction_lifecycle_cancelled: int
     transaction_lifecycle_unresolved: int
@@ -142,10 +155,13 @@ class LearnerMetrics:
     transaction_entry_log_support_gap_mean: float
     transaction_upgrade_entry_support_labels: int
     transaction_remove_entry_support_labels: int
+    transaction_rest_entry_support_labels: int
     transaction_upgrade_entry_model_probability_mean: float
     transaction_remove_entry_model_probability_mean: float
+    transaction_rest_entry_model_probability_mean: float
     transaction_upgrade_entry_behavior_probability_mean: float
     transaction_remove_entry_behavior_probability_mean: float
+    transaction_rest_entry_behavior_probability_mean: float
     liveness_credit_loss: float
     liveness_cost_critic_loss: float
     liveness_value_critic_loss: float
@@ -229,6 +245,7 @@ class _TransactionLossBatch:
     completion_policy_loss: Tensor
     entry_support_loss: Tensor
     smdp_q_loss: Tensor
+    advantage_policy_loss: Tensor
     effect_labels: int
     q_labels: int
     pair_count: int
@@ -239,6 +256,15 @@ class _TransactionLossBatch:
     entry_support_satisfied_labels: int
     entry_support_singleton_suppressed_labels: int
     smdp_q_labels: int
+    advantage_policy_labels: int
+    advantage_policy_positive_labels: int
+    advantage_policy_negative_labels: int
+    advantage_policy_phase_suppressed_labels: int
+    advantage_policy_lag_suppressed_labels: int
+    advantage_policy_q_error_suppressed_labels: int
+    advantage_policy_drift_suppressed_labels: int
+    advantage_policy_singleton_suppressed_labels: int
+    advantage_mean: float
     lifecycle_committed: int
     lifecycle_cancelled: int
     lifecycle_unresolved: int
@@ -249,10 +275,13 @@ class _TransactionLossBatch:
     entry_log_support_gap_mean: float
     upgrade_entry_support_labels: int
     remove_entry_support_labels: int
+    rest_entry_support_labels: int
     upgrade_entry_model_probability_mean: float
     remove_entry_model_probability_mean: float
+    rest_entry_model_probability_mean: float
     upgrade_entry_behavior_probability_mean: float
     remove_entry_behavior_probability_mean: float
+    rest_entry_behavior_probability_mean: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -2484,7 +2513,11 @@ class VTraceLearner:
         online_objective_loss = (
             self.config.policy_weight * policy_loss + self.config.value_weight * value_loss - entropy_weight * entropy
         )
-        transaction_losses = self._transaction_losses(transaction_traces)
+        transaction_losses = self._transaction_losses(
+            transaction_traces,
+            current_policy_version=current_policy_version,
+            schedule_learner_update=schedule_learner_update,
+        )
         transaction_effect_loss = transaction_losses.effect_loss
         transaction_delta_loss = transaction_losses.delta_loss
         transaction_q_loss = transaction_losses.q_loss
@@ -2501,6 +2534,8 @@ class VTraceLearner:
             * transaction_losses.entry_support_loss
             + self.transaction_config.lifecycle_smdp_q_weight
             * transaction_losses.smdp_q_loss
+            + self.transaction_config.lifecycle_advantage_policy_weight
+            * transaction_losses.advantage_policy_loss
         )
         total_loss = online_objective_loss + transaction_objective_loss
         _require_finite(
@@ -2522,6 +2557,10 @@ class VTraceLearner:
                     transaction_losses.entry_support_loss,
                 ),
                 ("transaction_smdp_q_loss", transaction_losses.smdp_q_loss),
+                (
+                    "transaction_advantage_policy_loss",
+                    transaction_losses.advantage_policy_loss,
+                ),
             ),
         )
         target_and_loss_ms = _elapsed_ms(target_started_ns)
@@ -2860,6 +2899,9 @@ class VTraceLearner:
             transaction_smdp_q_loss=float(
                 transaction_losses.smdp_q_loss.detach().item()
             ),
+            transaction_advantage_policy_loss=float(
+                transaction_losses.advantage_policy_loss.detach().item()
+            ),
             transaction_traces=len(transaction_traces),
             transaction_effect_labels=transaction_losses.effect_labels,
             transaction_q_labels=transaction_losses.q_labels,
@@ -2881,6 +2923,31 @@ class VTraceLearner:
                 transaction_losses.entry_support_singleton_suppressed_labels
             ),
             transaction_smdp_q_labels=transaction_losses.smdp_q_labels,
+            transaction_advantage_policy_labels=(
+                transaction_losses.advantage_policy_labels
+            ),
+            transaction_advantage_policy_positive_labels=(
+                transaction_losses.advantage_policy_positive_labels
+            ),
+            transaction_advantage_policy_negative_labels=(
+                transaction_losses.advantage_policy_negative_labels
+            ),
+            transaction_advantage_policy_phase_suppressed_labels=(
+                transaction_losses.advantage_policy_phase_suppressed_labels
+            ),
+            transaction_advantage_policy_lag_suppressed_labels=(
+                transaction_losses.advantage_policy_lag_suppressed_labels
+            ),
+            transaction_advantage_policy_q_error_suppressed_labels=(
+                transaction_losses.advantage_policy_q_error_suppressed_labels
+            ),
+            transaction_advantage_policy_drift_suppressed_labels=(
+                transaction_losses.advantage_policy_drift_suppressed_labels
+            ),
+            transaction_advantage_policy_singleton_suppressed_labels=(
+                transaction_losses.advantage_policy_singleton_suppressed_labels
+            ),
+            transaction_advantage_mean=transaction_losses.advantage_mean,
             transaction_lifecycle_committed=(
                 transaction_losses.lifecycle_committed
             ),
@@ -2911,17 +2978,26 @@ class VTraceLearner:
             transaction_remove_entry_support_labels=(
                 transaction_losses.remove_entry_support_labels
             ),
+            transaction_rest_entry_support_labels=(
+                transaction_losses.rest_entry_support_labels
+            ),
             transaction_upgrade_entry_model_probability_mean=(
                 transaction_losses.upgrade_entry_model_probability_mean
             ),
             transaction_remove_entry_model_probability_mean=(
                 transaction_losses.remove_entry_model_probability_mean
             ),
+            transaction_rest_entry_model_probability_mean=(
+                transaction_losses.rest_entry_model_probability_mean
+            ),
             transaction_upgrade_entry_behavior_probability_mean=(
                 transaction_losses.upgrade_entry_behavior_probability_mean
             ),
             transaction_remove_entry_behavior_probability_mean=(
                 transaction_losses.remove_entry_behavior_probability_mean
+            ),
+            transaction_rest_entry_behavior_probability_mean=(
+                transaction_losses.rest_entry_behavior_probability_mean
             ),
             liveness_credit_loss=float(liveness_credit_loss.detach().item()),
             liveness_cost_critic_loss=float(
@@ -3585,9 +3661,18 @@ class VTraceLearner:
     def _transaction_losses(
         self,
         traces: tuple[TransactionTrace, ...],
+        *,
+        current_policy_version: int = 0,
+        schedule_learner_update: int = 0,
     ) -> _TransactionLossBatch:
         """Compute factual transaction, entry-support and SMDP losses."""
 
+        for label, value in (
+            ("current_policy_version", current_policy_version),
+            ("schedule_learner_update", schedule_learner_update),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"transaction {label} must be a non-negative integer")
         zero = next(self.model.parameters()).sum() * 0.0
         if not traces:
             return _TransactionLossBatch(
@@ -3598,6 +3683,7 @@ class VTraceLearner:
                 completion_policy_loss=zero,
                 entry_support_loss=zero,
                 smdp_q_loss=zero,
+                advantage_policy_loss=zero,
                 effect_labels=0,
                 q_labels=0,
                 pair_count=0,
@@ -3608,6 +3694,15 @@ class VTraceLearner:
                 entry_support_satisfied_labels=0,
                 entry_support_singleton_suppressed_labels=0,
                 smdp_q_labels=0,
+                advantage_policy_labels=0,
+                advantage_policy_positive_labels=0,
+                advantage_policy_negative_labels=0,
+                advantage_policy_phase_suppressed_labels=0,
+                advantage_policy_lag_suppressed_labels=0,
+                advantage_policy_q_error_suppressed_labels=0,
+                advantage_policy_drift_suppressed_labels=0,
+                advantage_policy_singleton_suppressed_labels=0,
+                advantage_mean=0.0,
                 lifecycle_committed=0,
                 lifecycle_cancelled=0,
                 lifecycle_unresolved=0,
@@ -3618,10 +3713,13 @@ class VTraceLearner:
                 entry_log_support_gap_mean=0.0,
                 upgrade_entry_support_labels=0,
                 remove_entry_support_labels=0,
+                rest_entry_support_labels=0,
                 upgrade_entry_model_probability_mean=0.0,
                 remove_entry_model_probability_mean=0.0,
+                rest_entry_model_probability_mean=0.0,
                 upgrade_entry_behavior_probability_mean=0.0,
                 remove_entry_behavior_probability_mean=0.0,
+                rest_entry_behavior_probability_mean=0.0,
             )
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         effect_logits: list[Tensor] = []
@@ -3637,6 +3735,15 @@ class VTraceLearner:
         entry_support_terms: list[Tensor] = []
         smdp_q_predictions: list[Tensor] = []
         smdp_q_targets: list[Tensor] = []
+        advantage_policy_terms: list[Tensor] = []
+        advantage_values: list[float] = []
+        advantage_policy_positive_labels = 0
+        advantage_policy_negative_labels = 0
+        advantage_policy_phase_suppressed_labels = 0
+        advantage_policy_lag_suppressed_labels = 0
+        advantage_policy_q_error_suppressed_labels = 0
+        advantage_policy_drift_suppressed_labels = 0
+        advantage_policy_singleton_suppressed_labels = 0
         entry_model_probabilities: list[float] = []
         entry_collection_model_probabilities: list[float] = []
         entry_behavior_probabilities: list[float] = []
@@ -3644,10 +3751,12 @@ class VTraceLearner:
         operation_entry_model_probabilities: dict[str, list[float]] = {
             "upgrade": [],
             "remove": [],
+            "rest": [],
         }
         operation_entry_behavior_probabilities: dict[str, list[float]] = {
             "upgrade": [],
             "remove": [],
+            "rest": [],
         }
         entry_support_satisfied_labels = 0
         entry_support_singleton_suppressed_labels = 0
@@ -3657,6 +3766,119 @@ class VTraceLearner:
             TransactionLifecycleOutcome.UNRESOLVED: 0,
             TransactionLifecycleOutcome.DEADLOCK: 0,
         }
+
+        def add_advantage_policy_target(
+            *,
+            output: RecurrentCandidateOutput,
+            snapshot: EncodedDecisionSnapshot,
+            action_index: int,
+            target: Tensor,
+            collection_model_log_probability: float,
+            provenance_policy_version: int,
+        ) -> None:
+            """Admit one bounded, factual option-advantage actor target.
+
+            Unlike V-trace/importance-weighted imitation, the CE derivative is
+            non-zero when the selected policy probability is numerically zero.
+            Admission is nevertheless fail-closed: only a calibrated selected
+            Q prediction from a recent, collection-compatible policy may move
+            the actor.  The target and all gating/strength terms are detached;
+            gradients flow only through normalized policy log-probabilities.
+            """
+
+            nonlocal advantage_policy_positive_labels
+            nonlocal advantage_policy_negative_labels
+            nonlocal advantage_policy_phase_suppressed_labels
+            nonlocal advantage_policy_lag_suppressed_labels
+            nonlocal advantage_policy_q_error_suppressed_labels
+            nonlocal advantage_policy_drift_suppressed_labels
+            nonlocal advantage_policy_singleton_suppressed_labels
+
+            if self.transaction_config.lifecycle_advantage_policy_weight <= 0.0:
+                return
+            legal_indices = [
+                index
+                for index, enabled in enumerate(snapshot.action_mask)
+                if bool(enabled)
+            ]
+            if len(legal_indices) <= 1:
+                advantage_policy_singleton_suppressed_labels += 1
+                return
+            if (
+                schedule_learner_update
+                < self.transaction_config.lifecycle_advantage_start_update
+            ):
+                advantage_policy_phase_suppressed_labels += 1
+                return
+            lag = current_policy_version - provenance_policy_version
+            if lag < 0:
+                raise ValueError(
+                    "transaction option target comes from a future policy version"
+                )
+            if lag > self.transaction_config.lifecycle_advantage_max_policy_lag:
+                advantage_policy_lag_suppressed_labels += 1
+                return
+            if output.transaction_q_values is None:  # pragma: no cover - caller invariant
+                raise RuntimeError("option actor target requires transaction Q values")
+            log_policy = output.policy_log_probabilities()[0].float()
+            current_log_probability = log_policy[action_index].detach()
+            if (
+                abs(
+                    float(current_log_probability.item())
+                    - float(collection_model_log_probability)
+                )
+                > self.transaction_config.lifecycle_advantage_max_log_probability_shift
+            ):
+                advantage_policy_drift_suppressed_labels += 1
+                return
+            selected_q = output.transaction_q_values[0, action_index].float()
+            detached_target = target.detach().float()
+            if (
+                abs(float((selected_q.detach() - detached_target).item()))
+                > self.transaction_config.lifecycle_advantage_q_error_gate
+            ):
+                advantage_policy_q_error_suppressed_labels += 1
+                return
+            legal = torch.tensor(
+                legal_indices,
+                device=self.device,
+                dtype=torch.long,
+            )
+            alternatives = legal[legal != action_index]
+            if alternatives.numel() == 0:  # pragma: no cover - singleton gate
+                raise RuntimeError("option target lost its legal alternative")
+            # The baseline must be counterfactual.  Including the selected
+            # action makes a probability-one incumbent cancel its own
+            # advantage exactly, recreating the absorbing state this bridge
+            # exists to remove.  Renormalizing only the other legal actions is
+            # stable even when every alternative has exponentially small
+            # current probability.
+            alternative_weights = torch.softmax(
+                log_policy[alternatives].detach(),
+                dim=0,
+            )
+            alternative_q_values = output.transaction_q_values[
+                0, alternatives
+            ].float().detach()
+            baseline = (alternative_weights * alternative_q_values).sum()
+            advantage = float((detached_target - baseline).item())
+            if abs(advantage) <= 1.0e-8:
+                return
+            strength = min(
+                abs(advantage)
+                / self.transaction_config.lifecycle_advantage_temperature,
+                self.transaction_config.lifecycle_advantage_clip,
+            )
+            if advantage > 0.0:
+                advantage_policy_terms.append(-strength * log_policy[action_index])
+                advantage_policy_positive_labels += 1
+            else:
+                advantage_policy_terms.append(
+                    -strength * torch.logsumexp(log_policy[alternatives], dim=0)
+                )
+                advantage_policy_negative_labels += 1
+            advantage_values.append(advantage)
+
         for trace_index, trace in enumerate(traces):
             configured_burn_in = self.transaction_config.burn_in_steps
             if trace.burn_in_steps > configured_burn_in:
@@ -3672,6 +3894,7 @@ class VTraceLearner:
             policy_targets = {item.step_index: item.target for item in factual_transaction_policy_targets(trace)}
             trace_policy_losses: list[Tensor] = []
             entry_output: RecurrentCandidateOutput | None = None
+            step_outputs: dict[int, RecurrentCandidateOutput] = {}
             for step_index, step in enumerate(trace.steps):
                 step.snapshot.validate(
                     expected_config=self.encoder.config,
@@ -3694,6 +3917,7 @@ class VTraceLearner:
                     hidden = hidden.detach()
                 if step_index < trace.burn_in_steps:
                     continue
+                step_outputs[step_index] = output
                 if (
                     output.candidate_effect_logits is None
                     or output.selection_delta_logits is None
@@ -3743,29 +3967,10 @@ class VTraceLearner:
                 if step.q_observed and not lifecycle_owns_entry_q:
                     if step.transaction_return is None:  # pragma: no cover - property invariant
                         raise RuntimeError("q_observed transaction has no return")
-                    lifecycle_target = trace.lifecycle
-                    if (
-                        lifecycle_target is not None
-                        and lifecycle_target.support_eligible
-                        and lifecycle_target.option_target_observed
-                        and lifecycle_target.option_return is not None
-                        and lifecycle_target.entry_step_index
-                        < step_index
-                        <= lifecycle_target.exit_step_index
-                        and step.selected_count_delta > 0
-                    ):
-                        # Card-target selection steps inside a verified
-                        # lifecycle learn Q against the SAME factual SMDP
-                        # option return as the entry (through the next
-                        # rest-site/Act/terminal boundary) instead of the
-                        # whole-episode transaction return.  This is the
-                        # target-level short-horizon credit: Q(select A) and
-                        # Q(select B) now differ on a 10-20 floor factual
-                        # horizon.  Non-lifecycle q_observed steps keep their
-                        # original whole-horizon labels.
-                        q_values.append(output.transaction_q_values[0, action_index])
-                        q_targets.append(float(lifecycle_target.option_return))
-                    else:
+                    # Selection-origin option targets need the lifecycle post
+                    # bootstrap calculated below. Defer those exact rows;
+                    # ordinary factual transaction returns remain immediate.
+                    if not step.option_target_observed:
                         q_values.append(output.transaction_q_values[0, action_index])
                         q_targets.append(step.transaction_return)
             if trace_policy_losses:
@@ -3908,6 +4113,65 @@ class VTraceLearner:
                         ].float()
                     )
                     smdp_q_targets.append(smdp_target.detach())
+                    add_advantage_policy_target(
+                        output=entry_output,
+                        snapshot=entry_snapshot,
+                        action_index=entry_action_index,
+                        target=smdp_target,
+                        collection_model_log_probability=trace.steps[
+                            lifecycle.entry_step_index
+                        ].model_log_probability,
+                        provenance_policy_version=(
+                            lifecycle.entry_policy_version
+                        ),
+                    )
+
+                    # Target selection rows use their own action-origin return;
+                    # the entry-prefix return is never copied onto them.  A
+                    # transaction-exit horizon shares only the detached post
+                    # value bootstrap, while the production next-rest/Act
+                    # horizon is fully observed and therefore has discount 0.
+                    for step_index in range(
+                        lifecycle.entry_step_index + 1,
+                        lifecycle.exit_step_index + 1,
+                    ):
+                        step = trace.steps[step_index]
+                        if not step.option_target_observed:
+                            continue
+                        if step.selected_count_delta <= 0:
+                            raise RuntimeError(
+                                "selection-origin option target is not a positive selection"
+                            )
+                        step_output = step_outputs.get(step_index)
+                        if step_output is None or step_output.transaction_q_values is None:
+                            raise RuntimeError(
+                                "selection-origin option target was not replayed"
+                            )
+                        if step.option_return is None or step.option_discount is None:
+                            raise RuntimeError(
+                                "selection-origin option target is incomplete"
+                            )
+                        step_target = torch.as_tensor(
+                            step.option_return,
+                            device=self.device,
+                            dtype=torch.float32,
+                        ) + step.option_discount * post_value
+                        q_values.append(
+                            step_output.transaction_q_values[
+                                0, step.action_index
+                            ]
+                        )
+                        q_targets.append(float(step_target.detach().item()))
+                        add_advantage_policy_target(
+                            output=step_output,
+                            snapshot=step.snapshot,
+                            action_index=step.action_index,
+                            target=step_target,
+                            collection_model_log_probability=(
+                                step.model_log_probability
+                            ),
+                            provenance_policy_version=trace.policy_version,
+                        )
 
         effect_loss = (
             F.cross_entropy(
@@ -3968,6 +4232,11 @@ class VTraceLearner:
             if smdp_q_predictions
             else zero
         )
+        advantage_policy_loss = (
+            torch.stack(advantage_policy_terms).mean()
+            if advantage_policy_terms
+            else zero
+        )
 
         def mean_or_zero(values: list[float]) -> float:
             return float(sum(values) / len(values)) if values else 0.0
@@ -3980,6 +4249,7 @@ class VTraceLearner:
             completion_policy_loss=completion_policy_loss,
             entry_support_loss=entry_support_loss,
             smdp_q_loss=smdp_q_loss,
+            advantage_policy_loss=advantage_policy_loss,
             effect_labels=len(effect_targets),
             q_labels=len(q_targets),
             pair_count=len(pairs),
@@ -3992,6 +4262,29 @@ class VTraceLearner:
                 entry_support_singleton_suppressed_labels
             ),
             smdp_q_labels=len(smdp_q_predictions),
+            advantage_policy_labels=len(advantage_policy_terms),
+            advantage_policy_positive_labels=(
+                advantage_policy_positive_labels
+            ),
+            advantage_policy_negative_labels=(
+                advantage_policy_negative_labels
+            ),
+            advantage_policy_phase_suppressed_labels=(
+                advantage_policy_phase_suppressed_labels
+            ),
+            advantage_policy_lag_suppressed_labels=(
+                advantage_policy_lag_suppressed_labels
+            ),
+            advantage_policy_q_error_suppressed_labels=(
+                advantage_policy_q_error_suppressed_labels
+            ),
+            advantage_policy_drift_suppressed_labels=(
+                advantage_policy_drift_suppressed_labels
+            ),
+            advantage_policy_singleton_suppressed_labels=(
+                advantage_policy_singleton_suppressed_labels
+            ),
+            advantage_mean=mean_or_zero(advantage_values),
             lifecycle_committed=lifecycle_counts[
                 TransactionLifecycleOutcome.COMMITTED
             ],
@@ -4022,17 +4315,26 @@ class VTraceLearner:
             remove_entry_support_labels=len(
                 operation_entry_model_probabilities["remove"]
             ),
+            rest_entry_support_labels=len(
+                operation_entry_model_probabilities["rest"]
+            ),
             upgrade_entry_model_probability_mean=mean_or_zero(
                 operation_entry_model_probabilities["upgrade"]
             ),
             remove_entry_model_probability_mean=mean_or_zero(
                 operation_entry_model_probabilities["remove"]
             ),
+            rest_entry_model_probability_mean=mean_or_zero(
+                operation_entry_model_probabilities["rest"]
+            ),
             upgrade_entry_behavior_probability_mean=mean_or_zero(
                 operation_entry_behavior_probabilities["upgrade"]
             ),
             remove_entry_behavior_probability_mean=mean_or_zero(
                 operation_entry_behavior_probabilities["remove"]
+            ),
+            rest_entry_behavior_probability_mean=mean_or_zero(
+                operation_entry_behavior_probabilities["rest"]
             ),
         )
 

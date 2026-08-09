@@ -68,11 +68,26 @@ def _remove_v18_act_prefix_fields(payload: dict[str, object]) -> None:
     transaction.pop("lifecycle_smdp_horizon")
 
 
+def _remove_v19_transaction_actor_fields(payload: dict[str, object]) -> None:
+    transaction = payload["transaction_learning"]
+    assert isinstance(transaction, dict)
+    for field in (
+        "lifecycle_advantage_policy_weight",
+        "lifecycle_advantage_start_update",
+        "lifecycle_advantage_temperature",
+        "lifecycle_advantage_clip",
+        "lifecycle_advantage_q_error_gate",
+        "lifecycle_advantage_max_policy_lag",
+        "lifecycle_advantage_max_log_probability_shift",
+    ):
+        transaction.pop(field)
+
+
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
@@ -196,7 +211,7 @@ def test_failure_credit_quota_budget_accounts_for_all_learnable_strata() -> None
 
     with pytest.raises(
         ValueError,
-        match="evidence quotas cannot exceed sample_records",
+        match=r"evidence quotas cannot exceed sample_records",
     ):
         FailureCreditConfig(
             sample_records=5,
@@ -216,7 +231,7 @@ def test_v17_stability_controls_are_fail_closed() -> None:
         ).liveness_risk_actor_min_selected_probability
         == pytest.approx(0.01)
     )
-    with pytest.raises(ValueError, match="must be in \\[0, 1\\)"):
+    with pytest.raises(ValueError, match=r"must be in \[0, 1\)"):
         FailureCreditConfig(
             liveness_risk_actor_min_selected_probability=1.0,
         )
@@ -224,11 +239,11 @@ def test_v17_stability_controls_are_fail_closed() -> None:
     assert EpisodicLearningConfig(
         success_imitation_exempt_surfaces=("rest_site", "shop"),
     ).success_imitation_exempt_surfaces == ("rest_site", "shop")
-    with pytest.raises(ValueError, match="canonical lowercase"):
+    with pytest.raises(ValueError, match=r"canonical lowercase"):
         EpisodicLearningConfig(
             success_imitation_exempt_surfaces=("RestSite",),
         )
-    with pytest.raises(ValueError, match="duplicate surface"):
+    with pytest.raises(ValueError, match=r"duplicate surface"):
         EpisodicLearningConfig(
             success_imitation_exempt_surfaces=("shop", "shop"),
         )
@@ -514,42 +529,42 @@ def test_v22b_policy75_overlay_is_an_exact_continuation_lineage() -> None:
 
 
 def test_model_and_rollout_configs_fail_closed() -> None:
-    with pytest.raises(ValueError, match="relational_candidate_v3"):
+    with pytest.raises(ValueError, match=r"relational_candidate_v3"):
         ModelConfig(architecture="grounded_candidate_v1")
-    with pytest.raises(ValueError, match="minimum_unrolls"):
+    with pytest.raises(ValueError, match=r"minimum_unrolls"):
         RolloutConfig(queue_capacity=4, minimum_unrolls=5)
-    with pytest.raises(ValueError, match="one collector"):
+    with pytest.raises(ValueError, match=r"one collector"):
         RolloutConfig(collector_workers=2)
-    with pytest.raises(TypeError, match="integer"):
+    with pytest.raises(TypeError, match=r"integer"):
         RolloutConfig(unroll_length=True)  # type: ignore[arg-type]
     normalized = RolloutConfig(
         deterministic_probe_environment_steps=[512, 1_024],  # type: ignore[arg-type]
     )
     assert normalized.deterministic_probe_environment_steps == (512, 1_024)
-    with pytest.raises(ValueError, match="strictly increasing"):
+    with pytest.raises(ValueError, match=r"strictly increasing"):
         RolloutConfig(deterministic_probe_environment_steps=(512, 512))
-    with pytest.raises(ValueError, match="must be >= 1"):
+    with pytest.raises(ValueError, match=r"must be >= 1"):
         RolloutConfig(deterministic_probe_environment_steps=(0,))
 
 
 def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
-    with pytest.raises(ValueError, match="vtrace_rho_clip"):
+    with pytest.raises(ValueError, match=r"vtrace_rho_clip"):
         OptimizationConfig(vtrace_rho_clip=0.0)
-    with pytest.raises(ValueError, match="deadlock_repeat_threshold"):
+    with pytest.raises(ValueError, match=r"deadlock_repeat_threshold"):
         DiagnosticsConfig(deadlock_window=4, deadlock_repeat_threshold=5)
-    with pytest.raises(ValueError, match="combat_net_progress_window"):
+    with pytest.raises(ValueError, match=r"combat_net_progress_window"):
         DiagnosticsConfig(combat_net_progress_window=0)
-    with pytest.raises(ValueError, match="noncombat_durable_progress_window"):
+    with pytest.raises(ValueError, match=r"noncombat_durable_progress_window"):
         DiagnosticsConfig(noncombat_durable_progress_window=0)
-    with pytest.raises(TypeError, match="room_windows must be a table"):
+    with pytest.raises(TypeError, match=r"room_windows must be a table"):
         DiagnosticsConfig(combat_net_progress_room_windows=())  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="identifiers must be non-empty"):
+    with pytest.raises(TypeError, match=r"identifiers must be non-empty"):
         DiagnosticsConfig(combat_net_progress_room_windows={" ": 8})
-    with pytest.raises(TypeError, match="must be an integer"):
+    with pytest.raises(TypeError, match=r"must be an integer"):
         DiagnosticsConfig(combat_net_progress_encounter_windows={"BOSS": True})
-    with pytest.raises(ValueError, match="must be >= 1"):
+    with pytest.raises(ValueError, match=r"must be >= 1"):
         DiagnosticsConfig(combat_net_progress_encounter_windows={"BOSS": 0})
-    with pytest.raises(ValueError, match="duplicate normalized identifier"):
+    with pytest.raises(ValueError, match=r"duplicate normalized identifier"):
         DiagnosticsConfig(
             combat_net_progress_room_windows={"boss": 4, "BOSS": 8},
         )
@@ -559,23 +574,23 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
     assert normalized.combat_net_progress_room_windows == {
         "TEST_SUBJECT_BOSS": 128,
     }
-    with pytest.raises(ValueError, match="combat_min_net_hp_fraction"):
+    with pytest.raises(ValueError, match=r"combat_min_net_hp_fraction"):
         DiagnosticsConfig(combat_min_net_hp_fraction=0.0)
-    with pytest.raises(ValueError, match="strictly increasing"):
+    with pytest.raises(ValueError, match=r"strictly increasing"):
         RuntimeConfig(evaluation_steps=(0, 10, 10))
-    with pytest.raises(ValueError, match="must be disjoint"):
+    with pytest.raises(ValueError, match=r"must be disjoint"):
         RuntimeConfig(
             evaluation_steps=(0, 10),
             early_evaluation_steps=(10,),
             early_evaluation_episodes=2,
         )
     RuntimeConfig(evaluation_liveness_guard_enabled=True)
-    with pytest.raises(ValueError, match="requires early evaluation"):
+    with pytest.raises(ValueError, match=r"requires early evaluation"):
         RuntimeConfig(
             evaluation_steps=(),
             evaluation_liveness_guard_enabled=True,
         )
-    with pytest.raises(ValueError, match="enforcement_start_steps requires"):
+    with pytest.raises(ValueError, match=r"enforcement_start_steps requires"):
         RuntimeConfig(evaluation_guard_enforcement_start_steps=5_000)
     bounded_guard = RuntimeConfig(
         evaluation_liveness_guard_enabled=True,
@@ -584,18 +599,18 @@ def test_vtrace_and_diagnostics_bounds_are_strict() -> None:
         evaluation_guard_max_rollbacks=0,
     )
     assert bounded_guard.evaluation_guard_enforcement_start_steps == 10_000
-    with pytest.raises(ValueError, match="entropy_weight_end"):
+    with pytest.raises(ValueError, match=r"entropy_weight_end"):
         OptimizationConfig(entropy_weight=0.01, entropy_weight_end=0.02)
 
 
 def test_environment_and_task_horizons_must_match() -> None:
     base = TrainingConfig()
-    with pytest.raises(ValueError, match="full-run"):
+    with pytest.raises(ValueError, match=r"full-run"):
         replace(base, curriculum=CurriculumConfig(reward_objective="combat"))
 
 
 def test_native_revival_preheat_supports_a_headless_full_run_curriculum() -> None:
-    with pytest.raises(ValueError, match="requires revival_mechanism"):
+    with pytest.raises(ValueError, match=r"requires revival_mechanism"):
         CurriculumConfig(mode="native-revival-preheat", reward_objective="combat")
     curriculum = CurriculumConfig(
         mode="native-revival-preheat",
@@ -622,9 +637,9 @@ def test_engine_revival_identity_is_explicit_and_fail_closed() -> None:
     assert "fingerprint" not in identity
     assert "fingerprint_sha256" not in identity
 
-    with pytest.raises(ValueError, match="engine revival mechanism"):
+    with pytest.raises(ValueError, match=r"engine revival mechanism"):
         CurriculumConfig(revival_mechanism=ENGINE_REVIVAL_MECHANISM)
-    with pytest.raises(ValueError, match="engine-bailout-v1"):
+    with pytest.raises(ValueError, match=r"engine-bailout-v1"):
         CurriculumConfig(
             mode="native-revival-preheat",
             reward_objective="combat",
@@ -635,13 +650,13 @@ def test_engine_revival_identity_is_explicit_and_fail_closed() -> None:
 
 def test_preheat_and_standard_discount_contracts_fail_closed() -> None:
     preheat = load_training_config(profile="preheat")
-    with pytest.raises(ValueError, match="reward contract discount 1.0"):
+    with pytest.raises(ValueError, match=r"reward contract discount 1.0"):
         replace(
             preheat,
             optimization=replace(preheat.optimization, discount=0.997),
         )
     standard = load_training_config(profile="default")
-    with pytest.raises(ValueError, match="reward contract discount 0.997"):
+    with pytest.raises(ValueError, match=r"reward contract discount 0.997"):
         replace(
             standard,
             optimization=replace(standard.optimization, discount=1.0),
@@ -718,12 +733,13 @@ def test_runtime_output_schedule_is_not_lineage_but_rollout_contract_is() -> Non
 def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
     payload = TrainingConfig().to_mapping()
     payload["version"] = "sts2-grounded-baseline-config-v2"
-    with pytest.raises(ValueError, match="unsupported"):
+    with pytest.raises(ValueError, match=r"unsupported"):
         training_config_from_mapping(payload)
 
 
 def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v10"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
@@ -734,7 +750,7 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -747,17 +763,18 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
         **episodic,
         "fresh_policy_sequences": 1,
     }
-    with pytest.raises(ValueError, match="unexpectedly contains"):
+    with pytest.raises(ValueError, match=r"unexpectedly contains"):
         model_initialization_config_from_mapping(unexpected)
 
     unsupported = dict(source)
     unsupported["version"] = "sts2-relational-curriculum-config-v9"
-    with pytest.raises(ValueError, match="no reviewed config migration"):
+    with pytest.raises(ValueError, match=r"no reviewed config migration"):
         model_initialization_config_from_mapping(unsupported)
 
 
 def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v11"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
@@ -766,7 +783,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     source.pop("failure_credit")
     source.pop("transaction_exploration")
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -776,6 +793,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
 
 def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v13"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
@@ -783,7 +801,7 @@ def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("transaction_exploration")
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -794,19 +812,20 @@ def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     transaction_learning = source["transaction_learning"]
     assert isinstance(transaction_learning, dict)
     transaction_learning["lifecycle_entry_support_weight"] = 0.25
-    with pytest.raises(ValueError, match="unexpectedly contains V15"):
+    with pytest.raises(ValueError, match=r"unexpectedly contains V15"):
         model_initialization_config_from_mapping(source)
 
 
 def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -816,21 +835,23 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     assert migrated.transaction_exploration == TrainingConfig().transaction_exploration
 
     unexpected = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(unexpected)
     _remove_v17_stability_fields(unexpected)
-    with pytest.raises(ValueError, match="unexpectedly contains V15"):
+    with pytest.raises(ValueError, match=r"unexpectedly contains V15"):
         model_initialization_config_from_mapping(unexpected)
 
 
 def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -842,20 +863,22 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     )
 
     unexpected = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(unexpected)
     _remove_v17_stability_fields(unexpected)
-    with pytest.raises(ValueError, match="V16 evaluation guard"):
+    with pytest.raises(ValueError, match=r"V16 evaluation guard"):
         model_initialization_config_from_mapping(unexpected)
 
 
 def test_v16_stability_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v16"
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -868,18 +891,20 @@ def test_v16_stability_migration_is_model_init_only() -> None:
     )
 
     unexpected = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v16"
     _remove_v18_act_prefix_fields(unexpected)
-    with pytest.raises(ValueError, match="V17 risk-actor saturation floor"):
+    with pytest.raises(ValueError, match=r"V17 risk-actor saturation floor"):
         model_initialization_config_from_mapping(unexpected)
 
 
 def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v17"
     _remove_v18_act_prefix_fields(source)
 
-    with pytest.raises(ValueError, match="unsupported training config version"):
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
@@ -890,8 +915,39 @@ def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
     assert migrated.transaction_learning.lifecycle_smdp_horizon == "transaction_exit"
 
     unexpected = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v17"
-    with pytest.raises(ValueError, match="V18 episodic fields"):
+    with pytest.raises(ValueError, match=r"V18 episodic fields"):
+        model_initialization_config_from_mapping(unexpected)
+
+
+def test_v18_option_actor_migration_is_model_init_only() -> None:
+    source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
+    source["version"] = "sts2-relational-curriculum-config-v18"
+
+    with pytest.raises(ValueError, match=r"unsupported training config version"):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    assert migrated.transaction_learning.lifecycle_advantage_policy_weight == 0.0
+    assert migrated.transaction_learning.lifecycle_advantage_start_update == 0
+    assert migrated.transaction_learning.lifecycle_advantage_temperature == pytest.approx(0.25)
+    assert migrated.transaction_learning.lifecycle_advantage_clip == pytest.approx(1.0)
+    assert migrated.transaction_learning.lifecycle_advantage_q_error_gate == pytest.approx(0.25)
+    assert migrated.transaction_learning.lifecycle_advantage_max_policy_lag == 128
+    assert (
+        migrated.transaction_learning.lifecycle_advantage_max_log_probability_shift
+        == pytest.approx(1.0)
+    )
+    assert migrated.transaction_learning.lifecycle_smdp_horizon == (
+        TrainingConfig().transaction_learning.lifecycle_smdp_horizon
+    )
+
+    unexpected = TrainingConfig().to_mapping()
+    unexpected["version"] = "sts2-relational-curriculum-config-v18"
+    with pytest.raises(ValueError, match=r"V19 transaction actor fields"):
         model_initialization_config_from_mapping(unexpected)
 
 
@@ -903,16 +959,16 @@ def test_transaction_exploration_contract_is_versioned_and_fail_closed() -> None
         completion_guidance_probability=0.95,
     )
     assert enabled.operations == ("remove", "upgrade")
-    with pytest.raises(ValueError, match="supports only"):
+    with pytest.raises(ValueError, match=r"supports only"):
         TransactionExplorationConfig(
             enabled=True,
             operations=("smith_specific_card",),
             entry_epsilon_floor=0.20,
             completion_guidance_probability=0.95,
         )
-    with pytest.raises(ValueError, match="non-zero|zero probabilities|requires empty"):
+    with pytest.raises(ValueError, match=r"non-zero|zero probabilities|requires empty"):
         TransactionExplorationConfig(entry_epsilon_floor=0.20)
-    with pytest.raises(ValueError, match="less than 1|0 <"):
+    with pytest.raises(ValueError, match=r"less than 1|0 <"):
         TransactionExplorationConfig(
             enabled=True,
             operations=("upgrade",),
@@ -921,7 +977,7 @@ def test_transaction_exploration_contract_is_versioned_and_fail_closed() -> None
         )
 
     base = load_training_config(profile="preheat")
-    with pytest.raises(ValueError, match="at least curriculum.epsilon_end"):
+    with pytest.raises(ValueError, match=r"at least curriculum.epsilon_end"):
         replace(
             base,
             transaction_exploration=TransactionExplorationConfig(
@@ -941,11 +997,11 @@ def test_transaction_lifecycle_loss_contract_is_bounded_and_opt_in() -> None:
         lifecycle_smdp_q_weight=0.10,
     )
     assert enabled.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
-    with pytest.raises(ValueError, match="strictly between 0 and 0.5"):
+    with pytest.raises(ValueError, match=r"strictly between 0 and 0.5"):
         replace(enabled, lifecycle_entry_support_probability_floor=0.0)
-    with pytest.raises(ValueError, match="strictly between 0 and 0.5"):
+    with pytest.raises(ValueError, match=r"strictly between 0 and 0.5"):
         replace(enabled, lifecycle_entry_support_probability_floor=0.5)
-    with pytest.raises(ValueError, match="require transaction_learning.enabled"):
+    with pytest.raises(ValueError, match=r"require transaction_learning.enabled"):
         TransactionLearningConfig(
             enabled=False,
             lifecycle_entry_support_weight=0.25,
@@ -955,7 +1011,7 @@ def test_transaction_lifecycle_loss_contract_is_bounded_and_opt_in() -> None:
 def test_unknown_replay_section_is_rejected() -> None:
     payload = TrainingConfig().to_mapping()
     payload["replay"] = {"capacity": 100_000}
-    with pytest.raises(ValueError, match="unknown training config sections"):
+    with pytest.raises(ValueError, match=r"unknown training config sections"):
         training_config_from_mapping(payload)
 
 
@@ -965,34 +1021,34 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
     assert config.sample_sequences * config.learn_steps == 64
     assert config.fresh_policy_sequences == 0
     assert config.policy_gradient_max_lag == 128
-    with pytest.raises(TypeError, match="enabled must be a boolean"):
+    with pytest.raises(TypeError, match=r"enabled must be a boolean"):
         EpisodicLearningConfig(enabled=1)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="per_episode_capacity_bytes"):
+    with pytest.raises(ValueError, match=r"per_episode_capacity_bytes"):
         EpisodicLearningConfig(
             replay_capacity_bytes=1024,
             per_episode_capacity_bytes=2048,
         )
-    with pytest.raises(ValueError, match="secondary_advantage_fraction"):
+    with pytest.raises(ValueError, match=r"secondary_advantage_fraction"):
         EpisodicLearningConfig(secondary_advantage_fraction=1.01)
-    with pytest.raises(ValueError, match="primary_success_tie_tolerance"):
+    with pytest.raises(ValueError, match=r"primary_success_tie_tolerance"):
         EpisodicLearningConfig(primary_success_tie_tolerance=0.51)
-    with pytest.raises(ValueError, match="importance_ratio_clip"):
+    with pytest.raises(ValueError, match=r"importance_ratio_clip"):
         EpisodicLearningConfig(importance_ratio_clip=0.0)
-    with pytest.raises(ValueError, match="task_value_weight"):
+    with pytest.raises(ValueError, match=r"task_value_weight"):
         EpisodicLearningConfig(task_value_weight=float("nan"))
-    with pytest.raises(TypeError, match="macro_sample_fraction"):
+    with pytest.raises(TypeError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=True)
-    with pytest.raises(ValueError, match="macro_sample_fraction"):
+    with pytest.raises(ValueError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=-0.01)
-    with pytest.raises(ValueError, match="macro_sample_fraction"):
+    with pytest.raises(ValueError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=1.01)
-    with pytest.raises(ValueError, match="macro_sample_fraction"):
+    with pytest.raises(ValueError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=float("nan"))
-    with pytest.raises(TypeError, match="fresh_policy_sequences"):
+    with pytest.raises(TypeError, match=r"fresh_policy_sequences"):
         EpisodicLearningConfig(fresh_policy_sequences=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="fresh_policy_sequences"):
+    with pytest.raises(ValueError, match=r"fresh_policy_sequences"):
         EpisodicLearningConfig(fresh_policy_sequences=-1)
-    with pytest.raises(ValueError, match="cannot exceed sample_sequences"):
+    with pytest.raises(ValueError, match=r"cannot exceed sample_sequences"):
         EpisodicLearningConfig(
             sample_sequences=2,
             fresh_policy_sequences=3,

@@ -7,25 +7,30 @@ from typing import Any
 
 import pytest
 
-from sts2_baseline import REVIVAL_EFFICIENCY_REWARD_SPEC
 from sts2_rl.training import CONFIG_VERSION, load_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v41_budget64_reward_v7_model_init.py"
+SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v46_macro_option_actor_model_init.py"
 CONFIG = (
     PACKAGE_ROOT
     / "config"
     / "experiments"
-    / "full_run_revival_v41_budget64_reward_v7_model_init.toml"
+    / "full_run_revival_v46_macro_option_actor_model_init.toml"
 )
-V40_CONFIG = (
+V44_CONFIG = (
     PACKAGE_ROOT
     / "config"
     / "experiments"
-    / "full_run_revival_v40_budget64_recovery_model_init.toml"
+    / "full_run_revival_v44_budget40_identification_model_init.toml"
+)
+V45_CONFIG = (
+    PACKAGE_ROOT
+    / "config"
+    / "experiments"
+    / "full_run_revival_v45_deck_macro_bootstrap_model_init.toml"
 )
 SPEC = importlib.util.spec_from_file_location(
-    "v41_budget64_reward_v7_launcher",
+    "v46_macro_option_actor_launcher",
     SCRIPT,
 )
 assert SPEC is not None and SPEC.loader is not None
@@ -69,36 +74,87 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v41_changes_reward_identity_and_runtime_paths_from_v40() -> None:
+def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
+    from dataclasses import replace
+
     config = load_training_config(profile="preheat", config_path=CONFIG)
-    v40 = load_training_config(profile="preheat", config_path=V40_CONFIG)
+    v44 = load_training_config(profile="preheat", config_path=V44_CONFIG)
+    v45 = load_training_config(profile="preheat", config_path=V45_CONFIG)
 
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
-    assert config.optimization == v40.optimization
-    assert config.rollout == v40.rollout
-    assert config.transaction_learning == v40.transaction_learning
-    assert config.transaction_exploration == v40.transaction_exploration
-    assert config.failure_credit == v40.failure_credit
-    assert config.episodic_learning == v40.episodic_learning
-    assert config.model == v40.model
-    assert config.environment == v40.environment
-    assert config.curriculum == v40.curriculum
-    assert config.curriculum.revival_budget == 64
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
-    assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == (
-        "sts2-run-survival-efficiency-v7"
+    assert config.optimization == v45.optimization == v44.optimization
+    assert config.rollout == v45.rollout == v44.rollout
+    assert v44.transaction_learning.transaction_q_weight == 0.0
+    assert config.transaction_learning.transaction_q_weight == (
+        v45.transaction_learning.transaction_q_weight
+    ) == 0.05
+    assert config.transaction_learning.lifecycle_advantage_policy_weight == 0.05
+    assert config.transaction_learning.lifecycle_advantage_start_update == 256
+    assert config.transaction_learning.lifecycle_advantage_temperature == 0.25
+    assert config.transaction_learning.lifecycle_advantage_clip == 1.0
+    assert config.transaction_learning.lifecycle_advantage_q_error_gate == 0.25
+    assert config.transaction_learning.lifecycle_advantage_max_policy_lag == 128
+    assert (
+        config.transaction_learning.lifecycle_advantage_max_log_probability_shift
+        == 1.0
     )
-    assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget == 64
+    assert replace(
+        config.transaction_learning,
+        lifecycle_advantage_policy_weight=(
+            v45.transaction_learning.lifecycle_advantage_policy_weight
+        ),
+        lifecycle_advantage_start_update=(
+            v45.transaction_learning.lifecycle_advantage_start_update
+        ),
+        lifecycle_advantage_temperature=(
+            v45.transaction_learning.lifecycle_advantage_temperature
+        ),
+        lifecycle_advantage_clip=(
+            v45.transaction_learning.lifecycle_advantage_clip
+        ),
+        lifecycle_advantage_q_error_gate=(
+            v45.transaction_learning.lifecycle_advantage_q_error_gate
+        ),
+        lifecycle_advantage_max_policy_lag=(
+            v45.transaction_learning.lifecycle_advantage_max_policy_lag
+        ),
+        lifecycle_advantage_max_log_probability_shift=(
+            v45.transaction_learning.lifecycle_advantage_max_log_probability_shift
+        ),
+    ) == v45.transaction_learning
+    assert v45.transaction_learning.lifecycle_advantage_policy_weight == 0.0
+    assert v44.transaction_exploration.enabled is False
+    assert config.transaction_exploration == v45.transaction_exploration
+    assert config.transaction_exploration.enabled is True
+    assert config.transaction_exploration.operations == (
+        "relic_purchase",
+        "reward_skip",
+    )
+    assert config.transaction_exploration.entry_epsilon_floor == 0.15
+    assert config.transaction_exploration.completion_guidance_probability == 0.0
+    assert config.failure_credit == v45.failure_credit == v44.failure_credit
+    assert config.episodic_learning == v45.episodic_learning == v44.episodic_learning
+    assert config.model == v45.model == v44.model
+    assert config.environment == v45.environment == v44.environment
+
+    assert v44.curriculum.revival_budget == 40
+    assert config.curriculum == v45.curriculum
+    assert config.curriculum.revival_budget == 40
+    assert config.curriculum.epsilon_start == v44.curriculum.epsilon_start
+    assert config.curriculum.epsilon_end == v44.curriculum.epsilon_end
+    assert config.curriculum.epsilon_decay_steps == v44.curriculum.epsilon_decay_steps
+    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
 
     assert config.runtime.model_initialization_schedule_mode == "inherit"
-    assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"
+    assert config.runtime.model_initialization_liveness_schedule_mode == "reset"
     assert config.runtime.total_environment_steps == 250_000
-    assert config.runtime.seed == v40.runtime.seed == 6_300_000
+    assert config.runtime.seed == v44.runtime.seed == 6_300_000
     assert config.runtime.evaluation_guard_failure_action == "stop"
     assert config.runtime.evaluation_guard_max_rollbacks == 0
+    assert config.runtime.evaluation_guard_enforcement_start_steps == 10_000
 
 
-def test_v41_is_pinned_model_initialization_from_v39_healthy_gate(
+def test_v46_is_pinned_model_initialization_from_v44_healthy_gate(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
@@ -109,31 +165,23 @@ def test_v41_is_pinned_model_initialization_from_v39_healthy_gate(
         launcher.source_checkpoint_path(paths)
     )
     assert "--resume" not in command
-    assert command.count("--model-initialization-attestation") == 1
-    assert command[
-        command.index("--model-initialization-attestation") + 1
-    ] == str(launcher.source_attestation_path(paths))
-    assert command.count("--model-initialization-attestation-sha256") == 1
-    assert command[
-        command.index("--model-initialization-attestation-sha256") + 1
-    ] == launcher.SOURCE_ATTESTATION_SHA256
-    assert launcher.SOURCE_RUN_ID == "e331ab97-94a6-4f0d-bde9-407261e509b9"
-    assert launcher.SOURCE_ENVIRONMENT_STEPS == 50_261
+    assert launcher.SOURCE_RUN_ID == "ade6ab3a-2eda-4b5b-8fe4-3710858f9a65"
+    assert launcher.SOURCE_ENVIRONMENT_STEPS == 100_478
     assert launcher.SOURCE_TOTAL_ENVIRONMENT_STEPS == 250_000
     assert launcher.TARGET_ENVIRONMENT_STEPS == 250_000
-    assert launcher.SOURCE_POLICY_VERSION == 824
-    assert launcher.SOURCE_LEARNER_UPDATES == 824
+    assert launcher.SOURCE_POLICY_VERSION == 1_646
+    assert launcher.SOURCE_LEARNER_UPDATES == 1_646
     assert launcher.SOURCE_CHECKPOINT_ID == (
-        "968d0302-b712-4b04-a2df-50554722500c"
+        "d44625a7-2e50-4449-9f5c-4f7b62f3c5f3"
     )
     assert launcher.SOURCE_MANIFEST_SHA256 == (
-        "4c7c36e528f98be5d450319f151d457190c3c751e4c1f27499a8bbd01ea86442"
+        "77dc76e3009c0fb084c1dafd8f23acfbca3e4473d8c5d14126de62fc35e631b8"
     )
     assert launcher.SOURCE_METADATA_SHA256 == (
-        "c9460511144b05f2bc97028288fdc4ca2a0bae707b8e875687e6950de9eecbf0"
+        "f87f4368749a36db97733fc3f208a822375a79271aaa37510ff9d0cede8049cb"
     )
     assert launcher.source_checkpoint_path(paths).name == (
-        "healthy-validation-step-000050261"
+        "healthy-validation-step-000100478"
     )
     assert launcher._validate_checkpoint_summary(
         _checkpoint_summary(paths),
@@ -146,7 +194,7 @@ def test_v41_is_pinned_model_initialization_from_v39_healthy_gate(
         )
 
 
-def test_v41_checkpoint_pin_rejects_every_identity_mismatch(
+def test_v46_checkpoint_pin_rejects_every_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
@@ -170,11 +218,11 @@ def test_v41_checkpoint_pin_rejects_every_identity_mismatch(
             )
 
 
-def test_v41_supervisor_reenters_adapter_and_keeps_pins(
+def test_v46_supervisor_reenters_adapter_and_keeps_pins(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
-    manifest = tmp_path / "v41.launch.json"
+    manifest = tmp_path / "v46.launch.json"
     command = launcher.build_supervisor_command(paths, manifest_path=manifest)
 
     assert Path(command[1]).name == SCRIPT.name
@@ -185,4 +233,4 @@ def test_v41_supervisor_reenters_adapter_and_keeps_pins(
         paths.launcher_dir / f"{launcher.RUN_NAME}.state.json"
     )
     assert launcher._core.RESUME_RUN_ID == launcher.SOURCE_RUN_ID
-    assert launcher._core.RESUME_STEP == 50_261
+    assert launcher._core.RESUME_STEP == 100_478

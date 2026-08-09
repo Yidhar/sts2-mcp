@@ -242,11 +242,20 @@ def _translate_legal_actions(
             if card is not None:
                 membership = "selected" if selection_operation == "deselect" else "selectable"
                 default_pile = "Hand" if "hand_card" in sim_kind else None
-                action["card"] = _translate_card(
+                translated_card = _translate_card(
                     card,
                     pile=default_pile,
                     selection_membership=membership,
                 )
+                action["card"] = translated_card
+                # Candidate-local roots are intentionally flat.  Lift the
+                # exact native alternative card state while retaining it on
+                # the translated card for world-selection projection.
+                upgrade_preview = translated_card.get("upgrade_preview")
+                if isinstance(upgrade_preview, Mapping):
+                    action["upgrade_preview"] = deepcopy(
+                        dict(upgrade_preview)
+                    )
         elif sim_kind in {"claim_treasure", "claim_treasure_relic", "claim_relic"}:
             relic = _find_index(treasure.get("relics"), raw_action.get("index"))
             if relic is not None:

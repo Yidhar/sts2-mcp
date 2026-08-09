@@ -47,6 +47,7 @@ def _translate_card(
     *,
     pile: str | None = None,
     selection_membership: str | None = None,
+    _allow_upgrade_preview: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(sim_card, Mapping):
         raise TypeError("simulator card must be a mapping")
@@ -95,6 +96,41 @@ def _translate_card(
             raise ValueError(f"invalid card selection membership: {selection_membership!r}")
         card["selection_membership"] = membership
         card["is_selected"] = membership == "selected"
+    # HeadlessSim owns the native alternative factual state as a nested card
+    # DTO.  Translate it recursively so its definition ID and modifier facts
+    # use the exact same contract as the source card.  A preview-of-preview is
+    # rejected rather than silently growing an unbounded recursive payload.
+    if "upgrade_preview" in sim_card:
+        raw_preview = sim_card.get("upgrade_preview")
+        if raw_preview is None:
+            card.pop("upgrade_preview", None)
+        elif not isinstance(raw_preview, Mapping):
+            raise TypeError("simulator card upgrade_preview must be a mapping or null")
+        elif not _allow_upgrade_preview:
+            raise ValueError("simulator upgrade_preview cannot contain another upgrade_preview")
+        else:
+            preview = _translate_card(
+                raw_preview,
+                pile=(str(resolved_pile) if resolved_pile is not None else None),
+                selection_membership=selection_membership,
+                _allow_upgrade_preview=False,
+            )
+            # The preview is an alternative state of the exact source card,
+            # not a second physical card instance.  Bind both projections to
+            # the source relation even if the detached simulator clone owns a
+            # different internal UUID.
+            source_instance = card.get("instance_id")
+            if source_instance:
+                preview["instance_id"] = source_instance
+            if resolved_pile is not None and str(resolved_pile).strip():
+                # Native detached clones report source_pile=None.  That is a
+                # property of the clone container, not of the physical card
+                # whose alternative state is being compared.  Preserve the
+                # source card's real relation so candidate-local and world
+                # preview tokens cannot masquerade as an unrelated zone.
+                preview["pile"] = str(resolved_pile)
+                preview["source_pile"] = str(resolved_pile)
+            card["upgrade_preview"] = preview
     return card
 
 

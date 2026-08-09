@@ -247,6 +247,73 @@ class _ShopRemovalSuccessBackend(TerminalWithoutObservationFlagsBackend):
         return super().step(request)
 
 
+class _RestHealSuccessBackend(TerminalWithoutObservationFlagsBackend):
+    """Heal once at a rest site and end with an authoritative receipt."""
+
+    def __init__(self) -> None:
+        super().__init__(terminal_step=1)
+        self.step_requests: list[StepRequest] = []
+
+    def step(self, request: StepRequest):  # type: ignore[no-untyped-def]
+        self.step_requests.append(request)
+        return super().step(request)
+
+    def _actions(self) -> tuple[dict[str, object], ...]:
+        return (
+            {
+                "action_handle": "rest-heal",
+                "action": "choose_rest_option",
+                "kind": "choose_rest_option",
+                "model_action_kind": "rest_site",
+                "model_action_variant": "rest",
+                "option": {"type": "rest", "id": "REST"},
+            },
+            {
+                "action_handle": "rest-forge",
+                "action": "choose_rest_option",
+                "kind": "choose_rest_option",
+                "model_action_kind": "rest_site",
+                "model_action_variant": "forge",
+                "option": {"type": "forge", "id": "FORGE"},
+            },
+        )
+
+    def _observation(self, *, terminal: bool = False) -> dict[str, object]:
+        return {
+            "phase": "map" if terminal else "rest_site",
+            "decision_domain": "map" if terminal else "resource",
+            "state_type": "map" if terminal else "rest_site",
+            "screen": "MAP" if terminal else "REST_SITE",
+            "player": {
+                "character": "IRONCLAD",
+                "hp": 50 if terminal else 20,
+                "max_hp": 80,
+                "gold": 50,
+                "deck": [],
+                "relics": [],
+                "potions": [],
+            },
+            "combat": {"in_progress": False, "enemies": []},
+            "run": {
+                "active": not terminal,
+                "act": 1,
+                "floor": 8,
+                "room_type": "map" if terminal else "rest_site",
+                "room_model_id": "MAP" if terminal else "REST_SITE",
+            },
+            **(
+                {}
+                if terminal
+                else {
+                    "rest_site": {
+                        "is_open": True,
+                        "options": [action["option"] for action in self._actions()],
+                    }
+                }
+            ),
+        }
+
+
 def test_transaction_entry_explorer_removes_shop_candidate_cardinality_bias() -> None:
     actions = (
         {
@@ -329,6 +396,81 @@ def test_card_removal_commit_requires_exact_authoritative_deck_decrease() -> Non
         before,
         observation("CARD.DEFEND", "CARD.NEW"),
     )
+
+
+def test_successful_rest_emits_symmetric_factual_lifecycle_and_q_label() -> None:
+    config = _lifecycle_learning_config(max_steps=2)
+    config = replace(
+        config,
+        transaction_learning=replace(
+            config.transaction_learning,
+            lifecycle_smdp_horizon="next_rest_or_act",
+        ),
+    )
+    backend = _RestHealSuccessBackend()
+    resources = build_training_resources(
+        config,
+        backend=backend,
+    )
+    try:
+        resources.collector.bind_failure_credit_run_id("lifecycle-rest-success")
+        with torch.no_grad():
+            for parameter in resources.model.parameters():
+                parameter.zero_()
+        preview = resources.collector.encoder.encode(
+            backend._observation(),
+            backend._actions(),
+            device="cpu",
+        )
+        rest_candidate_index = next(
+            index
+            for index, reference in enumerate(preview.actions)
+            if reference.handle == "rest-heal"
+        )
+        resources.collector._rng = _ScriptedChoiceRng(  # type: ignore[assignment]
+            (rest_candidate_index,)
+        )
+        episode = resources.collector.collect_episode(
+            deterministic=False,
+            record=True,
+        )
+        rest_traces = tuple(
+            trace
+            for trace in episode.transaction_traces
+            if trace.lifecycle is not None and trace.lifecycle.operation == "rest"
+        )
+        assert len(rest_traces) == 1, backend.step_requests
+        trace = rest_traces[0]
+        assert trace.lifecycle is not None
+        assert trace.lifecycle.outcome is TransactionLifecycleOutcome.COMMITTED
+        assert trace.lifecycle.effect_verified
+        assert trace.lifecycle.post_terminal
+        assert trace.lifecycle.option_target_observed
+        assert trace.lifecycle.option_boundary == "run_terminal"
+        entry_model_probability = trace.steps[
+            trace.lifecycle.entry_step_index
+        ].model_probability
+        assert 0.0 < entry_model_probability < 1.0
+        assert trace.lifecycle.entry_model_probability == pytest.approx(
+            entry_model_probability
+        )
+
+        losses = resources.learner._transaction_losses(
+            rest_traces,
+            current_policy_version=0,
+            schedule_learner_update=0,
+        )
+        assert losses.smdp_q_labels == 1
+        assert losses.rest_entry_support_labels == 1
+        assert losses.upgrade_entry_support_labels == 0
+        assert losses.remove_entry_support_labels == 0
+
+        assert resources.transaction_replay is not None
+        assert resources.transaction_replay.put(trace)
+        metrics = resources.transaction_replay.metrics()
+        assert metrics["committed_rest_lifecycle_size"] == 1
+    finally:
+        resources.close()
 
 
 def test_guided_forge_completes_and_keeps_verified_positive_credit() -> None:

@@ -72,7 +72,7 @@ def test_v43_changes_only_budget_and_schedule_replay_from_v42() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v42 = load_training_config(profile="preheat", config_path=V42_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     assert config.optimization == v42.optimization
     assert config.rollout == v42.rollout
     assert config.transaction_learning == v42.transaction_learning

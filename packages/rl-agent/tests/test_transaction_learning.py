@@ -11,7 +11,9 @@ import pytest
 import torch
 
 from sts2_baseline import RolloutStep, SequenceUnroll
+from sts2_env._sim_translate_actions import _translate_legal_actions
 from sts2_env._sim_translate_decisions import _translate_card_sel_block
+from sts2_env._sim_translate_entities import _translate_card
 from sts2_rl.checkpoints import ValidatedResumeCheckpoint
 from sts2_rl.contracts import EnvironmentBackend
 from sts2_rl.encoding import (
@@ -62,6 +64,71 @@ from sts2_rl.training.trajectory import (
 class _NoopBackend:
     def close(self) -> None:
         pass
+
+
+def test_native_upgrade_preview_translation_is_exact_and_relation_bound() -> None:
+    native_card = {
+        "id": "ANGER",
+        "instance_id": "source-card-instance",
+        "source_pile": "Deck",
+        "upgrade_level": 0,
+        "enchantments": [{"id": "ENCHANT.TEST", "amount": 2}],
+        "dynamic_vars": [{"name": "damage", "current_value": 6}],
+        "upgrade_preview": {
+            "id": "ANGER",
+            # A detached native clone may own a different UUID. Translation
+            # must bind the alternative state to the physical source card.
+            "instance_id": "detached-preview-instance",
+            # Detached native card clones are not in a physical pile.  The
+            # translator must rebind this alternative state to its source.
+            "source_pile": "None",
+            "upgrade_level": 1,
+            "enchantments": [{"id": "ENCHANT.TEST", "amount": 2}],
+            "dynamic_vars": [{"name": "damage", "current_value": 9}],
+        },
+    }
+
+    translated = _translate_card(native_card, selection_membership="selectable")
+    preview = translated["upgrade_preview"]
+    assert translated["id"] == preview["id"] == "CARD.ANGER"
+    assert translated["instance_id"] == preview["instance_id"] == (
+        "source-card-instance"
+    )
+    assert translated["source_pile"] == preview["source_pile"] == "Deck"
+    assert translated["pile"] == preview["pile"] == "Deck"
+    assert preview["upgrade_level"] == 1
+    assert preview["enchantments"] == native_card["upgrade_preview"]["enchantments"]
+    assert preview["dynamic_vars"] == native_card["upgrade_preview"]["dynamic_vars"]
+
+    translated_actions = _translate_legal_actions(
+        ({"action": "select_card", "index": 0},),
+        sim_player={},
+        battle={},
+        map_state={},
+        event={},
+        rest_site={},
+        shop={},
+        rewards={},
+        card_reward={},
+        card_select={"cards": [native_card]},
+        treasure={},
+        relic_select={},
+    )
+    assert translated_actions[0]["upgrade_preview"] == preview
+    assert translated_actions[0]["card"]["upgrade_preview"] == preview
+    assert translated_actions[0]["upgrade_preview"] is not (
+        translated_actions[0]["card"]["upgrade_preview"]
+    )
+
+    recursive = {
+        **native_card,
+        "upgrade_preview": {
+            **native_card["upgrade_preview"],
+            "upgrade_preview": {"id": "ANGER"},
+        },
+    }
+    with pytest.raises(ValueError, match="cannot contain another"):
+        _translate_card(recursive)
 
 
 def test_strict_group_surface_removes_physical_selection_instance_noise() -> None:
@@ -1664,12 +1731,15 @@ def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -
         )
     assert replay.put(lifecycle_trace("upgrade"))
     assert replay.put(lifecycle_trace("remove"))
-    assert replay.metrics()["committed_lifecycle_size"] == 2
+    assert replay.put(lifecycle_trace("rest"))
+    assert replay.metrics()["committed_lifecycle_size"] == 3
     assert replay.metrics()["committed_upgrade_lifecycle_size"] == 1
     assert replay.metrics()["committed_remove_lifecycle_size"] == 1
-    assert {trace.lifecycle.operation for trace in replay.sample(2) if trace.lifecycle} == {
+    assert replay.metrics()["committed_rest_lifecycle_size"] == 1
+    assert {trace.lifecycle.operation for trace in replay.sample(3) if trace.lifecycle} == {
         "upgrade",
         "remove",
+        "rest",
     }
 
     restored = BoundedTransactionReplay(
@@ -1681,9 +1751,9 @@ def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -
     assert restored.metrics() == replay.metrics()
     assert {
         trace.lifecycle.operation
-        for trace in restored.sample(2)
+        for trace in restored.sample(3)
         if trace.lifecycle is not None
-    } == {"upgrade", "remove"}
+    } == {"upgrade", "remove", "rest"}
 
 
 def test_replay_samples_all_available_selection_structure_strata_after_restore() -> None:
@@ -1970,6 +2040,279 @@ def test_extended_lifecycle_option_uses_factual_next_macro_boundary_without_boot
     )
     assert censored_before_boundary.lifecycle is not None
     assert not censored_before_boundary.lifecycle.option_target_observed
+
+
+def test_selection_option_targets_start_at_each_selected_card_not_macro_entry() -> None:
+    encoding = GroundedEncodingConfig.from_model_config(
+        _model_config(),
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    trace = _sequence_trace(
+        snapshot,
+        trace_id="selection-origin-option",
+        outcome=TransactionOutcome.COMPLETED,
+        steps=(
+            ("rest-entry", "grid-empty", "smith", 0, TransactionEffect.MOVE),
+            ("grid-empty", "grid-a", "select:a", 0, TransactionEffect.MOVE),
+            ("grid-a", "grid-empty", "deselect:a", 1, TransactionEffect.REVISIT),
+            ("grid-empty", "grid-b", "select:b", 1, TransactionEffect.MOVE),
+            ("grid-b", "exit", "confirm", 0, TransactionEffect.EXIT),
+        ),
+    )
+    trace = replace(
+        trace,
+        steps=tuple(
+            replace(
+                step,
+                selected_count_delta=(1 if index in {1, 3} else -1 if index == 2 else 0),
+                behavior_log_probability=math.log(0.5),
+                model_probability=0.5,
+            )
+            for index, step in enumerate(trace.steps)
+        ),
+        lifecycle=TransactionLifecycleEvidence(
+            operation="upgrade",
+            entry_step_index=0,
+            exit_step_index=4,
+            entry_behavior_log_probability=math.log(0.5),
+            entry_model_probability=0.5,
+            entry_policy_version=0,
+            entry_action_fingerprint="smith",
+            outcome=TransactionLifecycleOutcome.COMMITTED,
+            effect_verified=True,
+            post_snapshot=snapshot,
+        ),
+    )
+    rewards = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+    discounts = (1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+
+    credited = backfill_factual_monte_carlo_returns(
+        trace,
+        episode_rewards=rewards,
+        episode_discounts=discounts,
+        authoritative_outcome=True,
+        option_horizon_end=5,
+        option_horizon_boundary="next_rest_site",
+        require_extended_option_horizon=True,
+    )
+
+    assert credited.lifecycle is not None
+    assert credited.lifecycle.option_return == pytest.approx(63.0)
+    assert credited.lifecycle.option_steps == 6
+    first_selection = credited.steps[1]
+    second_selection = credited.steps[3]
+    assert first_selection.option_return == pytest.approx(62.0)
+    assert first_selection.option_steps == 5
+    assert second_selection.option_return == pytest.approx(56.0)
+    assert second_selection.option_steps == 3
+    assert first_selection.option_return != credited.lifecycle.option_return
+    assert second_selection.option_return != first_selection.option_return
+    assert credited.steps[0].option_return is None
+    assert credited.steps[2].option_return is None
+    assert credited.steps[4].option_return is None
+
+
+def test_option_advantage_bridge_moves_saturated_actor_in_both_directions() -> None:
+    class CandidateVectorHead(torch.nn.Module):
+        def __init__(self, values: tuple[float, float]) -> None:
+            super().__init__()
+            self.values = torch.nn.Parameter(torch.tensor(values, dtype=torch.float32))
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            batch, candidates, _ = features.shape
+            return self.values[:candidates].view(1, candidates, 1).expand(
+                batch,
+                candidates,
+                1,
+            )
+
+    model_config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+
+    def actor_gradient(
+        *,
+        policy_logits: tuple[float, float],
+        q_values: tuple[float, float],
+        target: float,
+        collection_model_log_probability: float | None = None,
+        provenance_policy_version: int = 7,
+        current_policy_version: int = 7,
+        schedule_learner_update: int = 10,
+        start_update: int = 0,
+        max_policy_lag: int = 128,
+        q_error_gate: float = 0.01,
+        max_log_probability_shift: float = 0.1,
+    ) -> tuple[torch.Tensor, object]:
+        model = RecurrentCandidateModel(
+            model_config,
+            enable_transaction_heads=True,
+        )
+        policy_head = CandidateVectorHead(policy_logits)
+        q_head = CandidateVectorHead(q_values)
+        model.policy_head = policy_head
+        model.transaction_q_head = q_head
+        selected_probability = float(
+            torch.softmax(torch.tensor(policy_logits), dim=0)[0].item()
+        )
+        selected_log_probability = float(
+            torch.log_softmax(torch.tensor(policy_logits), dim=0)[0].item()
+        )
+        recorded_model_probability = (
+            selected_probability
+            if collection_model_log_probability is None
+            else float(math.exp(collection_model_log_probability))
+        )
+        recorded_model_log_probability = (
+            selected_log_probability
+            if collection_model_log_probability is None
+            else collection_model_log_probability
+        )
+        trace = _sequence_trace(
+            snapshot,
+            trace_id=f"option-actor-{policy_logits}-{q_values}",
+            outcome=TransactionOutcome.COMPLETED,
+            steps=(("entry", "exit", "rest", 0, TransactionEffect.EXIT),),
+        )
+        trace = replace(
+            trace,
+            policy_version=provenance_policy_version,
+            steps=(
+                replace(
+                    trace.steps[0],
+                    transaction_return=target,
+                    return_steps=1,
+                    behavior_log_probability=math.log(0.5),
+                    model_log_probability=recorded_model_log_probability,
+                    model_probability=recorded_model_probability,
+                ),
+            ),
+            lifecycle=TransactionLifecycleEvidence(
+                operation="rest",
+                entry_step_index=0,
+                exit_step_index=0,
+                entry_behavior_log_probability=math.log(0.5),
+                entry_model_probability=recorded_model_probability,
+                entry_policy_version=provenance_policy_version,
+                entry_action_fingerprint="rest",
+                outcome=TransactionLifecycleOutcome.COMMITTED,
+                effect_verified=True,
+                post_terminal=True,
+                option_return=target,
+                option_discount=0.0,
+                option_steps=1,
+                option_boundary="next_rest_site",
+            ),
+        )
+        learner = VTraceLearner(
+            model=model,
+            encoder=GroundedObservationEncoder(encoding),
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+            config=TrainingConfig().optimization,
+            maximum_unroll_length=4,
+            maximum_policy_lag=128,
+            transaction_config=TransactionLearningConfig(
+                enabled=True,
+                replay_byte_capacity=10_000_000,
+                burn_in_steps=0,
+                lifecycle_smdp_q_weight=0.1,
+                lifecycle_advantage_policy_weight=0.1,
+                lifecycle_advantage_start_update=start_update,
+                lifecycle_advantage_temperature=0.25,
+                lifecycle_advantage_clip=1.0,
+                lifecycle_advantage_q_error_gate=q_error_gate,
+                lifecycle_advantage_max_policy_lag=max_policy_lag,
+                lifecycle_advantage_max_log_probability_shift=(
+                    max_log_probability_shift
+                ),
+            ),
+        )
+        losses = learner._transaction_losses(
+            (trace,),
+            current_policy_version=current_policy_version,
+            schedule_learner_update=schedule_learner_update,
+        )
+        learner.optimizer.zero_grad(set_to_none=True)
+        losses.advantage_policy_loss.backward()
+        gradient = policy_head.values.grad
+        return (
+            gradient.detach().clone()
+            if gradient is not None
+            else torch.zeros_like(policy_head.values)
+        ), losses
+
+    # P(rest) underflows to literal float32 zero. The directly recorded model
+    # log-probability remains -120, so the provenance gate still admits the
+    # factual bounded CE and its derivative remains ~= -1.
+    positive_gradient, positive = actor_gradient(
+        policy_logits=(-120.0, 0.0),
+        q_values=(1.0, 0.0),
+        target=1.0,
+    )
+    assert positive.advantage_policy_labels == 1
+    assert positive.advantage_policy_positive_labels == 1
+    assert positive_gradient[0].item() < -0.99
+    assert positive_gradient[1].item() > 0.99
+
+    negative_gradient, negative = actor_gradient(
+        # The inverse absorbing state must also be escapable: an incumbent
+        # bad action at P ~= 1 is compared only with counterfactual legal
+        # alternatives, never with a baseline dominated by itself.
+        policy_logits=(30.0, 0.0),
+        q_values=(0.0, 1.0),
+        target=0.0,
+    )
+    assert negative.advantage_policy_labels == 1
+    assert negative.advantage_policy_negative_labels == 1
+    assert negative_gradient[0].item() > 0.99
+    assert negative_gradient[1].item() < -0.99
+
+    _, phase_suppressed = actor_gradient(
+        policy_logits=(-2.0, 0.0),
+        q_values=(1.0, 0.0),
+        target=1.0,
+        start_update=11,
+    )
+    assert phase_suppressed.advantage_policy_labels == 0
+    assert phase_suppressed.advantage_policy_phase_suppressed_labels == 1
+
+    _, lag_suppressed = actor_gradient(
+        policy_logits=(-2.0, 0.0),
+        q_values=(1.0, 0.0),
+        target=1.0,
+        provenance_policy_version=1,
+        current_policy_version=7,
+        max_policy_lag=2,
+    )
+    assert lag_suppressed.advantage_policy_labels == 0
+    assert lag_suppressed.advantage_policy_lag_suppressed_labels == 1
+
+    _, q_error_suppressed = actor_gradient(
+        policy_logits=(-2.0, 0.0),
+        q_values=(0.0, 1.0),
+        target=1.0,
+        q_error_gate=0.1,
+    )
+    assert q_error_suppressed.advantage_policy_labels == 0
+    assert q_error_suppressed.advantage_policy_q_error_suppressed_labels == 1
+
+    _, drift_suppressed = actor_gradient(
+        policy_logits=(-2.0, 0.0),
+        q_values=(1.0, 0.0),
+        target=1.0,
+        collection_model_log_probability=math.log(0.9),
+        max_log_probability_shift=0.1,
+    )
+    assert drift_suppressed.advantage_policy_labels == 0
+    assert drift_suppressed.advantage_policy_drift_suppressed_labels == 1
 
 
 def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() -> None:

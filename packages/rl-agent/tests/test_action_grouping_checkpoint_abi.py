@@ -80,6 +80,12 @@ _V14_ENCODING = {
     "feature_abi_end": 215,
     "fingerprint_sha256": ("6a169803fdcd399272357dfe351a8b7375f16a1cb9e7cfccdc3b047f13f746ce"),
 }
+_V15_ENCODING = {
+    "version": "grounded-relational-runtime-encoding-v15",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": ("d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee"),
+}
 
 
 class _CombatBackend:
@@ -312,19 +318,19 @@ def _rewrite_checkpoint_encoding_contract(
     "archived_encoding",
     [_V8_ENCODING, _V9_ENCODING, _V10_ENCODING, _V11_ENCODING],
 )
-def test_pre_v12_model_initialization_cannot_jump_to_v14(
+def test_pre_v12_model_initialization_cannot_jump_to_v15(
     tmp_path: Path,
     archived_encoding: dict[str, Any],
 ) -> None:
     config = _config()
-    assert grounding_encoding_identity() == _V14_ENCODING
+    assert grounding_encoding_identity() == _V15_ENCODING
     archived = _validated_metadata(
         tmp_path,
         config=config,
         encoding=archived_encoding,
     )
 
-    with pytest.raises(ValueError, match="encoding contract does not match"):
+    with pytest.raises(ValueError, match=r"encoding contract does not match"):
         checkpointing_module._validate_metadata(
             archived,
             config=config,
@@ -332,7 +338,7 @@ def test_pre_v12_model_initialization_cannot_jump_to_v14(
             resolved_collector_device=None,
             model_only=False,
         )
-    with pytest.raises(ValueError, match="no reviewed.*initialization migration"):
+    with pytest.raises(ValueError, match=r"no reviewed.*initialization migration"):
         checkpointing_module._validate_metadata(
             archived,
             config=config,
@@ -346,7 +352,7 @@ def test_pre_v12_model_initialization_cannot_jump_to_v14(
         config=config,
         encoding={**_V9_ENCODING, "fingerprint_sha256": "f" * 64},
     )
-    with pytest.raises(ValueError, match="no reviewed.*initialization migration"):
+    with pytest.raises(ValueError, match=r"no reviewed.*initialization migration"):
         checkpointing_module._validate_metadata(
             unknown_shape_compatible,
             config=config,
@@ -356,17 +362,17 @@ def test_pre_v12_model_initialization_cannot_jump_to_v14(
         )
 
 
-def test_reviewed_v13_to_v14_is_model_only_and_fails_closed_on_tampering(
+def test_reviewed_v14_to_v15_is_model_only_and_fails_closed_on_tampering(
     tmp_path: Path,
 ) -> None:
     config = _config()
     archived = _validated_metadata(
         tmp_path,
         config=config,
-        encoding=_V13_ENCODING,
+        encoding=_V14_ENCODING,
     )
 
-    with pytest.raises(ValueError, match="encoding contract does not match"):
+    with pytest.raises(ValueError, match=r"encoding contract does not match"):
         checkpointing_module._validate_metadata(
             archived,
             config=config,
@@ -385,9 +391,9 @@ def test_reviewed_v13_to_v14_is_model_only_and_fails_closed_on_tampering(
     tampered = _validated_metadata(
         tmp_path,
         config=config,
-        encoding={**_V13_ENCODING, "fingerprint_sha256": "f" * 64},
+        encoding={**_V14_ENCODING, "fingerprint_sha256": "f" * 64},
     )
-    with pytest.raises(ValueError, match="no reviewed.*initialization migration"):
+    with pytest.raises(ValueError, match=r"no reviewed.*initialization migration"):
         checkpointing_module._validate_metadata(
             tampered,
             config=config,
@@ -399,10 +405,10 @@ def test_reviewed_v13_to_v14_is_model_only_and_fails_closed_on_tampering(
 
 @pytest.mark.parametrize(
     "source_encoding",
-    (_V12_ENCODING, _V13_ENCODING),
-    ids=("reviewed-v12-chain", "reviewed-v13-direct"),
+    (_V12_ENCODING, _V13_ENCODING, _V14_ENCODING),
+    ids=("reviewed-v12-chain", "reviewed-v13-chain", "reviewed-v14-direct"),
 )
-def test_reviewed_pre_v14_initialization_inherits_only_model_parameters(
+def test_reviewed_pre_v15_initialization_inherits_only_model_parameters(
     tmp_path: Path,
     source_encoding: dict[str, Any],
 ) -> None:
@@ -454,7 +460,7 @@ def test_reviewed_pre_v14_initialization_inherits_only_model_parameters(
         checkpoint,
         encoding_contract=source_encoding,
     )
-    with pytest.raises(ValueError, match="encoding contract does not match"):
+    with pytest.raises(ValueError, match=r"encoding contract does not match"):
         preflight_training_checkpoint(
             checkpoint,
             config=config,
@@ -506,6 +512,7 @@ def test_reviewed_pre_v14_initialization_inherits_only_model_parameters(
             "committed_lifecycle_size": 0,
             "committed_upgrade_lifecycle_size": 0,
             "committed_remove_lifecycle_size": 0,
+            "committed_rest_lifecycle_size": 0,
         }
         assert target.transaction_replay.state_dict()["rng_state"] == (initial_replay["rng_state"])
         for key, expected in source_state.items():
@@ -523,7 +530,7 @@ def test_reviewed_pre_v14_initialization_inherits_only_model_parameters(
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["encoding_contract"] == _V14_ENCODING
+        assert metadata["encoding_contract"] == _V15_ENCODING
         assert metadata["training_state"] == asdict(TrainingState())
         provenance = metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"

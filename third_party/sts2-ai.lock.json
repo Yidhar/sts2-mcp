@@ -61,8 +61,8 @@
     },
     {
       "path": "third_party/patches/sts2-ai/0002-selectable-card-upgrade-preview.patch",
-      "sha256": "934d62967f2374cca78dcab9306db60a761618b95e1c41ec083a55a4f2c6c20a",
-      "purpose": "Emit upgrade_preview on every upgradable selectable card: a detached factual snapshot of the same card at upgrade level +1 built through the canonical UpgradeInternal path. Closes the trainer-side blind-upgrade gap (grounded encoder v14 exemption was ready; the sim never sent the field)."
+      "sha256": "16bae925f44e804acc2b15d8f67c867a3857625abc0ff3a0383118d689765bf2",
+      "purpose": "Emit an exact instance-preserving upgrade_preview for every upgradable selectable card, with observable native diagnostics; the trainer lifts it into reviewed grounded encoding v15."
     }
   ],
   "migration_notes": [
@@ -70,5 +70,5 @@
     "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",
     "Obsolete STS2AI/ENV/Sim/Overlay mirror hunks were intentionally removed: that tree was deleted upstream before this base and is not the canonical project."
   ],
-  "patched_tree": "7e94172c9cb453f46d824e0d2701fe0c4c0aa200"
+  "patched_tree": "c2998ca7b6fba66f0d2116f1a331d255419f48d2"
 }

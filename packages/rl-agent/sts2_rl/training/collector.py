@@ -76,6 +76,11 @@ from .transaction import (
     backfill_factual_monte_carlo_returns,
     factual_transaction_policy_targets,
 )
+from .transaction_operations import (
+    TRANSACTION_EXPLORATION_OPERATIONS,
+    TRANSACTION_GUIDANCE_OPERATIONS,
+    canonical_transaction_operation,
+)
 
 
 class CollectionProtocolError(RuntimeError):
@@ -305,6 +310,7 @@ class _ActionChoice:
     action_references: tuple[ActionReference, ...]
     semantic_actions: tuple[Mapping[str, object], ...]
     behavior_log_probability: float
+    model_log_probability: float
     valid_count: int
     snapshot: EncodedDecisionSnapshot
     recurrent_state: torch.Tensor
@@ -1017,6 +1023,22 @@ def _player_hp_ratio(observation: Mapping[str, object]) -> float:
     return min(1.0, hp / maximum)
 
 
+def _player_hp(observation: Mapping[str, object]) -> float:
+    """Return the authoritative visible player HP for factual effect checks."""
+
+    raw_player = observation.get("player")
+    player = raw_player if isinstance(raw_player, Mapping) else {}
+    for key in ("hp", "current_hp"):
+        value = player.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            normalized = float(value)
+            if math.isfinite(normalized) and normalized >= 0.0:
+                return normalized
+    raise CollectionProtocolError(
+        "authoritative transaction effect receipt has no finite player HP"
+    )
+
+
 def _act_exit_hp_ratio(
     *,
     before_observation: Mapping[str, object],
@@ -1223,30 +1245,10 @@ def _uses_targeted_selection_exploration(
     )
 
 
-_TRANSACTION_EXPLORATION_OPERATIONS = frozenset(
-    {"upgrade", "remove", "reward_skip", "relic_purchase"}
-)
-
-
 def _canonical_transaction_operation(value: object) -> str:
-    """Map reviewed transport/selection aliases to one strategy-free family."""
+    """Compatibility wrapper around the shared reviewed operation registry."""
 
-    normalized = "_".join(str(value or "").strip().lower().replace("-", " ").split())
-    if normalized in {
-        "forge",
-        "open_upgrade_selection",
-        "smith",
-        "upgrade",
-    }:
-        return "upgrade"
-    if normalized in {
-        "card_removal",
-        "purchase_card_removal",
-        "remove",
-        "remove_card",
-    }:
-        return "remove"
-    return ""
+    return canonical_transaction_operation(value)
 
 
 def _selection_transaction_operation(
@@ -1341,7 +1343,7 @@ def _transaction_entry_exploration_branch_ids(
         raise CollectionProtocolError("transaction entry branch IDs and semantic actions have different shapes")
     if not enabled_operations:
         return policy_branch_ids, False
-    unknown = enabled_operations - _TRANSACTION_EXPLORATION_OPERATIONS
+    unknown = enabled_operations - TRANSACTION_EXPLORATION_OPERATIONS
     if unknown:
         raise ValueError("unsupported transaction exploration operations: " + ", ".join(sorted(unknown)))
     operations = tuple(_transaction_entry_operation(action) for action in semantic_actions)
@@ -1437,7 +1439,7 @@ def _transaction_completion_guided_behavior(
     than a hidden action override.
     """
 
-    if operation not in _TRANSACTION_EXPLORATION_OPERATIONS:
+    if operation not in TRANSACTION_GUIDANCE_OPERATIONS:
         return base_behavior, frozenset(), False
     if policy.shape != valid.shape or base_behavior.shape != valid.shape:
         raise CollectionProtocolError("transaction guidance inputs have different shapes")
@@ -3136,7 +3138,7 @@ class GroundedCollector:
             transaction_exploration_operations
         ):
             raise ValueError("transaction_exploration_operations must contain unique reviewed operations")
-        if normalized_transaction_operations - _TRANSACTION_EXPLORATION_OPERATIONS:
+        if normalized_transaction_operations - TRANSACTION_EXPLORATION_OPERATIONS:
             raise ValueError("transaction_exploration_operations contains an unsupported operation")
         for name, value in (
             ("transaction_entry_epsilon_floor", transaction_entry_epsilon_floor),
@@ -3157,8 +3159,21 @@ class GroundedCollector:
         if normalized_transaction_operations:
             if transaction_entry_epsilon_floor <= 0.0:
                 raise ValueError("transaction exploration operations require a positive entry epsilon floor")
-            if transaction_completion_guidance_probability <= 0.0:
-                raise ValueError("transaction exploration operations require positive completion guidance")
+            guidance_operations = (
+                normalized_transaction_operations
+                & TRANSACTION_GUIDANCE_OPERATIONS
+            )
+            if guidance_operations and transaction_completion_guidance_probability <= 0.0:
+                raise ValueError(
+                    "selection transaction exploration operations require positive completion guidance"
+                )
+            if (
+                not guidance_operations
+                and transaction_completion_guidance_probability != 0.0
+            ):
+                raise ValueError(
+                    "single-decision transaction exploration requires zero completion guidance"
+                )
         elif transaction_entry_epsilon_floor != 0.0 or transaction_completion_guidance_probability != 0.0:
             raise ValueError("transaction exploration probabilities require reviewed operations")
         if isinstance(combat_net_progress_window, bool) or not isinstance(combat_net_progress_window, int):
@@ -3508,6 +3523,9 @@ class GroundedCollector:
                     validate=False,
                 )
                 policy = output.policy_probabilities()[0].float().cpu().numpy()
+                model_log_probabilities = (
+                    output.policy_log_probabilities()[0].float().cpu().numpy()
+                )
                 policy_branch_ids = output.policy_branch_ids[0].long().cpu().numpy()
                 greedy_selected = int(output.greedy_action_indices()[0].item())
                 valid = output.action_mask[0].cpu().numpy().astype(bool)
@@ -3547,6 +3565,7 @@ class GroundedCollector:
                 # V-trace/episodic importance weighting instead of pretending
                 # that it sampled from the model distribution.
                 behavior_log_probability=0.0,
+                model_log_probability=float(model_log_probabilities[selected]),
                 valid_count=valid_count,
                 snapshot=encoded.snapshot,
                 recurrent_state=next_recurrent_state,
@@ -3623,6 +3642,10 @@ class GroundedCollector:
             action_references=encoded.actions,
             semantic_actions=semantic_actions,
             behavior_log_probability=float(math.log(max(float(behavior[selected]), 1e-30))),
+            # Keep the model log-probability directly. Converting through a
+            # float32 probability destroys exact provenance precisely in the
+            # saturated-zero regime that the option actor bridge recovers.
+            model_log_probability=float(model_log_probabilities[selected]),
             valid_count=valid_count,
             snapshot=encoded.snapshot,
             recurrent_state=next_recurrent_state,
@@ -4692,11 +4715,119 @@ class GroundedCollector:
                     selected_count_delta=selected_count_delta,
                     transaction_return=None,
                     return_steps=None,
+                    behavior_log_probability=choice.behavior_log_probability,
+                    model_log_probability=choice.model_log_probability,
+                    model_probability=float(
+                        choice.policy[choice.candidate_index]
+                    ),
                     policy_node_key=current_transaction_policy_node,
                     policy_action_fingerprint=(
                         transaction_action_fingerprint if current_transaction_policy_node is not None else None
                     ),
                 )
+                # Rest is a one-step resource transaction rather than a card
+                # selection surface.  Give a *factual successful heal* the
+                # same next-rest/Act option horizon as forge so the learner can
+                # compare rest and forge symmetrically from their shared legal
+                # candidate state.  Merely clicking a rest-labelled option is
+                # insufficient: HP must actually increase in the authoritative
+                # post-state receipt.
+                selected_transaction_operation = _transaction_entry_operation(
+                    selected_action
+                )
+                if (
+                    selected_transaction_operation == "rest"
+                    and current_transaction_surface is None
+                    and _is_rest_site_decision_surface(
+                        state.observation,
+                        choice.semantic_actions,
+                    )
+                    and _player_hp(next_state.observation)
+                    > _player_hp(state.observation)
+                ):
+                    rest_post_terminal = bool(
+                        result_terminal
+                        or breakdown.task_terminal
+                        or breakdown.discount == 0.0
+                    )
+                    rest_post_snapshot: EncodedDecisionSnapshot | None = None
+                    if not rest_post_terminal:
+                        if not next_state.legal_actions:
+                            raise RuntimeError(
+                                "successful rest lifecycle has no post-state legal actions"
+                            )
+                        rest_encoding_started_ns = time.perf_counter_ns()
+                        rest_post_snapshot = self.encoder.encode(
+                            next_state.observation,
+                            next_state.legal_actions,
+                            device=self.device,
+                        ).snapshot
+                        timings.record(
+                            "transaction_post_encoding",
+                            rest_encoding_started_ns,
+                        )
+                    rest_burn_in = self.transaction_burn_in_steps or 0
+                    rest_context = (
+                        tuple(transaction_context)[-rest_burn_in:]
+                        if rest_burn_in
+                        else ()
+                    )
+                    rest_steps = (
+                        *(item[1] for item in rest_context),
+                        factual_transaction_step,
+                    )
+                    rest_entry_index = len(rest_context)
+                    rest_start_step = (
+                        rest_context[0][0]
+                        if rest_context
+                        else step_offset
+                    )
+                    transaction_traces_pending.append(
+                        TransactionTrace(
+                            trace_id=(
+                                f"seed-{reset_seed}:{state.episode_id}:"
+                                f"{rest_start_step}:{step_offset}:rest-resource"
+                            ),
+                            episode_id=f"seed-{reset_seed}:{state.episode_id}",
+                            surface_key=semantic_fingerprint(
+                                {
+                                    "kind": "single_step_resource_transaction",
+                                    "operation": "rest",
+                                    "entry_node": current_transaction_node,
+                                }
+                            ),
+                            start_step=rest_start_step,
+                            policy_version=segment_policy_version,
+                            initial_recurrent_state=np.zeros(
+                                self.model.config.recurrent_hidden_dim,
+                                dtype=np.float32,
+                            ),
+                            steps=rest_steps,
+                            burn_in_steps=rest_entry_index,
+                            outcome=TransactionOutcome.COMPLETED,
+                            lifecycle=TransactionLifecycleEvidence(
+                                operation="rest",
+                                entry_step_index=rest_entry_index,
+                                exit_step_index=rest_entry_index,
+                                entry_behavior_log_probability=(
+                                    choice.behavior_log_probability
+                                ),
+                                entry_model_probability=float(
+                                    choice.policy[choice.candidate_index]
+                                ),
+                                entry_policy_version=segment_policy_version,
+                                entry_action_fingerprint=(
+                                    transaction_action_fingerprint
+                                ),
+                                outcome=(
+                                    TransactionLifecycleOutcome.COMMITTED
+                                ),
+                                effect_verified=True,
+                                post_snapshot=rest_post_snapshot,
+                                post_terminal=rest_post_terminal,
+                            ),
+                        )
+                    )
                 if choice.valid_count > 1:
                     prefix_burn_in = self.transaction_burn_in_steps or 0
                     prefix_context = tuple(transaction_context)[-prefix_burn_in:] if prefix_burn_in else ()

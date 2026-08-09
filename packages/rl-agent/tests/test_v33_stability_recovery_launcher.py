@@ -57,7 +57,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     assert not config.transaction_exploration.enabled
     assert config.curriculum.revival_budget == 64
     assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)

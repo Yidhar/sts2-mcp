@@ -216,6 +216,15 @@ _V14_ENCODING_IDENTITY = {
     # silently bless any future unreviewed semantic change.
     "fingerprint_sha256": "6a169803fdcd399272357dfe351a8b7375f16a1cb9e7cfccdc3b047f13f746ce",
 }
+_V15_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v15",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    # V15 transports the native nested upgrade preview into both the world
+    # relation set and candidate-local alternative root. Tensor shapes are
+    # unchanged, but exact resume cannot reinterpret queued/replay snapshots.
+    "fingerprint_sha256": "d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V12_ENCODING_IDENTITY,
@@ -224,6 +233,10 @@ _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V13_ENCODING_IDENTITY,
         _V14_ENCODING_IDENTITY,
+    ),
+    (
+        _V14_ENCODING_IDENTITY,
+        _V15_ENCODING_IDENTITY,
     ),
 )
 

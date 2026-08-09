@@ -1,8 +1,10 @@
 # v45 deck & macro competence package (design v1)
 
-Status: PROPOSED. Target lineage: v45 (from a v44 healthy anchor, budget stays
-40). Config identity bump (config-v19). No reward change; reward stays
-sts2-run-survival-efficiency-v7.
+Status: SUPERSEDED WITHOUT A TRAINING RUN. The data-bootstrap recipe is folded
+into the reviewed v46 package; see
+`docs/architecture/v46-macro-option-actor-v1.md`. Target lineage was v45 (from
+a v44 healthy anchor, budget stays 40). Config identity bump (config-v19). No
+reward change; reward stays sts2-run-survival-efficiency-v7.
 
 ## 1. Measured problems this package answers
 

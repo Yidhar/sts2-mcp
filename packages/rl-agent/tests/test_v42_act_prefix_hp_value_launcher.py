@@ -73,7 +73,7 @@ def test_v42_enables_act_prefix_hp_value_and_extended_smdp_without_scaffolding()
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v40 = load_training_config(profile="preheat", config_path=V40_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
     assert config.optimization == v40.optimization
     assert config.rollout == v40.rollout
     assert config.transaction_learning.lifecycle_smdp_horizon == (

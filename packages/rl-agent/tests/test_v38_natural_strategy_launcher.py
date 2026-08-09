@@ -62,7 +62,7 @@ def test_v38_withdraws_only_behavior_scaffolding() -> None:
     config = load_training_config(profile="preheat", config_path=CONFIG)
     v37 = load_training_config(profile="preheat", config_path=V37_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v18"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
 
     # The factual learning corridor and the liveness stability plane survive
     # the transition unchanged.

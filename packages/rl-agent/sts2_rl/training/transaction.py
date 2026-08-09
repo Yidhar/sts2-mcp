@@ -35,9 +35,14 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v5"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v5"
-TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v2"
+from .transaction_operations import (
+    TRANSACTION_LIFECYCLE_OPERATIONS,
+    canonical_transaction_operation,
+)
+
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v6"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v6"
+TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v3"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -110,9 +115,11 @@ class TransactionLifecycleEvidence:
     version: str = TRANSACTION_LIFECYCLE_VERSION
 
     def __post_init__(self) -> None:
-        operation = str(self.operation).strip().lower()
-        if operation not in {"upgrade", "remove"}:
-            raise ValueError("transaction lifecycle operation must be upgrade or remove")
+        operation = canonical_transaction_operation(self.operation)
+        if operation not in TRANSACTION_LIFECYCLE_OPERATIONS:
+            raise ValueError(
+                "transaction lifecycle operation must be upgrade, remove or rest"
+            )
         object.__setattr__(self, "operation", operation)
         for label, value in (
             ("entry_step_index", self.entry_step_index),
@@ -284,6 +291,21 @@ class TransactionStep:
     selected_count_delta: int
     transaction_return: float | None
     return_steps: int | None
+    # Collection-policy facts are retained on every learnable step so the
+    # guarded option-advantage actor bridge can update a saturated actor
+    # without pretending the behavior policy was on-policy.  These values are
+    # descriptive only; they never alter the factual return target.
+    behavior_log_probability: float = 0.0
+    model_log_probability: float = 0.0
+    model_probability: float = 1.0
+    # A verified selection step inside a committed lifecycle owns a return
+    # measured from *that selection*, not from the earlier macro entry.  The
+    # previous lifecycle-wide target included the entry prefix and therefore
+    # gave every card choice an identical label.
+    option_return: float | None = None
+    option_discount: float | None = None
+    option_steps: int | None = None
+    option_boundary: str | None = None
     # ``node_key`` remains the exact reward/Q identity.  Liveness policy
     # credit sometimes needs a deliberately coarser identity: for example an
     # event page can repeat while HP, max HP and training-revival telemetry keep
@@ -324,10 +346,60 @@ class TransactionStep:
             _finite(self.transaction_return, label="transaction_return")
             if isinstance(self.return_steps, bool) or not isinstance(self.return_steps, int) or self.return_steps <= 0:
                 raise ValueError("observed transaction return requires positive return_steps")
+        behavior_log_probability = _finite(
+            self.behavior_log_probability,
+            label="behavior_log_probability",
+        )
+        if behavior_log_probability > 1.0e-7:
+            raise ValueError("transaction behavior log probability must be <= 0")
+        model_log_probability = _finite(
+            self.model_log_probability,
+            label="model_log_probability",
+        )
+        if model_log_probability > 1.0e-7:
+            raise ValueError("transaction model log probability must be <= 0")
+        model_probability = _finite(
+            self.model_probability,
+            label="model_probability",
+        )
+        if not 0.0 <= model_probability <= 1.0:
+            raise ValueError("transaction model probability must be in [0, 1]")
+        option_values = (
+            self.option_return,
+            self.option_discount,
+            self.option_steps,
+            self.option_boundary,
+        )
+        if any(value is not None for value in option_values) and not all(
+            value is not None for value in option_values
+        ):
+            raise ValueError("transaction step option target must be all present or all absent")
+        if self.option_return is not None:
+            _finite(self.option_return, label="option_return")
+            option_discount = _finite(self.option_discount, label="option_discount")
+            if not 0.0 <= option_discount <= 1.0:
+                raise ValueError("transaction step option_discount must be in [0, 1]")
+            if (
+                isinstance(self.option_steps, bool)
+                or not isinstance(self.option_steps, int)
+                or self.option_steps <= 0
+            ):
+                raise ValueError("transaction step option_steps must be positive")
+            if self.option_boundary not in {
+                "transaction_exit",
+                "next_rest_site",
+                "act_boundary",
+                "run_terminal",
+            }:
+                raise ValueError("transaction step option boundary is invalid")
 
     @property
     def q_observed(self) -> bool:
         return self.transaction_return is not None
+
+    @property
+    def option_target_observed(self) -> bool:
+        return self.option_return is not None
 
     @property
     def effective_policy_node_key(self) -> str:
@@ -349,7 +421,7 @@ class TransactionStep:
             + (len(self.policy_node_key.encode("utf-8")) if self.policy_node_key is not None else 0)
             + len(self.action_fingerprint.encode("utf-8"))
             + (len(self.policy_action_fingerprint.encode("utf-8")) if self.policy_action_fingerprint is not None else 0)
-            + 64
+            + 120
         )
 
 
@@ -680,6 +752,7 @@ def backfill_factual_monte_carlo_returns(
         raise ValueError("authoritative episode outcome must end with zero discount")
 
     lifecycle = trace.lifecycle
+    step_option_targets: dict[int, tuple[float, float, int, str]] = {}
     if lifecycle is not None and lifecycle.support_eligible:
         entry_absolute = trace.start_step + lifecycle.entry_step_index
         exit_absolute = trace.start_step + lifecycle.exit_step_index
@@ -721,11 +794,44 @@ def backfill_factual_monte_carlo_returns(
                 option_steps=endpoint - entry_absolute + 1,
                 option_boundary=boundary,
             )
+            # Selection-origin targets exclude the earlier entry and any
+            # deselect/cancel churn.  Every positively selected card receives
+            # only the factual reward sequence from its own action through the
+            # exact same reviewed option boundary.
+            for step_index, step in enumerate(trace.steps):
+                if not (
+                    lifecycle.entry_step_index < step_index <= lifecycle.exit_step_index
+                    and step.selected_count_delta > 0
+                ):
+                    continue
+                step_absolute = trace.start_step + step_index
+                step_return = 0.0
+                step_discount = 1.0
+                for index in range(step_absolute, endpoint + 1):
+                    step_return += step_discount * rewards[index]
+                    step_discount *= discounts[index]
+                step_option_targets[step_index] = (
+                    step_return,
+                    0.0 if require_extended_option_horizon else step_discount,
+                    endpoint - step_absolute + 1,
+                    boundary,
+                )
 
     if not authoritative_outcome:
         return replace(
             trace,
-            steps=tuple(replace(step, transaction_return=None, return_steps=None) for step in trace.steps),
+            steps=tuple(
+                replace(
+                    step,
+                    transaction_return=None,
+                    return_steps=None,
+                    option_return=(step_option_targets[index][0] if index in step_option_targets else None),
+                    option_discount=(step_option_targets[index][1] if index in step_option_targets else None),
+                    option_steps=(step_option_targets[index][2] if index in step_option_targets else None),
+                    option_boundary=(step_option_targets[index][3] if index in step_option_targets else None),
+                )
+                for index, step in enumerate(trace.steps)
+            ),
             lifecycle=lifecycle,
         )
 
@@ -745,6 +851,10 @@ def backfill_factual_monte_carlo_returns(
                 step,
                 transaction_return=returns[trace.start_step + offset],
                 return_steps=horizons[trace.start_step + offset],
+                option_return=(step_option_targets[offset][0] if offset in step_option_targets else None),
+                option_discount=(step_option_targets[offset][1] if offset in step_option_targets else None),
+                option_steps=(step_option_targets[offset][2] if offset in step_option_targets else None),
+                option_boundary=(step_option_targets[offset][3] if offset in step_option_targets else None),
             )
             for offset, step in enumerate(trace.steps)
         ),
@@ -808,8 +918,8 @@ class BoundedTransactionReplay:
             "corrective_completion": set(),
         }
         self._committed_lifecycle_trace_ids: dict[str, set[str]] = {
-            "upgrade": set(),
-            "remove": set(),
+            operation: set()
+            for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
         }
         self._storage_nbytes = 0
         self._put_count = 0
@@ -922,7 +1032,7 @@ class BoundedTransactionReplay:
             # A verified rare transaction completion is the only source of
             # entry-support and SMDP labels. Reserve one slot before broad
             # sampling so abundant ordinary/event traces cannot starve it.
-            for operation in ("upgrade", "remove"):
+            for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS):
                 lifecycle_indices = np.asarray(
                     [
                         index
@@ -1070,6 +1180,9 @@ class BoundedTransactionReplay:
                 "committed_remove_lifecycle_size": len(
                     self._committed_lifecycle_trace_ids["remove"]
                 ),
+                "committed_rest_lifecycle_size": len(
+                    self._committed_lifecycle_trace_ids["rest"]
+                ),
             }
 
     def state_dict(self) -> dict[str, Any]:
@@ -1132,8 +1245,8 @@ class BoundedTransactionReplay:
             raise ValueError("transaction replay RNG checkpoint is invalid") from exc
         actionable_avoid_trace_ids = {item.trace_id for item in items if _has_factual_avoid_target(item)}
         committed_lifecycle_trace_ids: dict[str, set[str]] = {
-            "upgrade": set(),
-            "remove": set(),
+            operation: set()
+            for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
         }
         for item in items:
             if item.lifecycle is not None and item.lifecycle.support_eligible:

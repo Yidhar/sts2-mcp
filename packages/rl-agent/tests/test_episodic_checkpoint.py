@@ -199,7 +199,7 @@ def test_transaction_lifecycle_abi_is_persisted_and_required_for_exact_resume(
     metadata_path = checkpoint / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["transaction_lifecycle_abi"] == (
-        "sts2-transaction-lifecycle-evidence-v2"
+        "sts2-transaction-lifecycle-evidence-v3"
     )
     metadata.pop("transaction_lifecycle_abi")
     metadata_path.write_text(
@@ -208,7 +208,7 @@ def test_transaction_lifecycle_abi_is_persisted_and_required_for_exact_resume(
     )
     _update_manifest_entry(checkpoint, "metadata.json")
 
-    with pytest.raises(ValueError, match="lifecycle-evidence ABI"):
+    with pytest.raises(ValueError, match=r"lifecycle-evidence ABI"):
         preflight_training_checkpoint(
             checkpoint,
             config=config,
@@ -368,7 +368,7 @@ def test_episodic_target_abi_is_exact_resume_only(
 
     with pytest.raises(
         ValueError,
-        match="exact-resume checkpoint has no episodic target ABI marker",
+        match=r"exact-resume checkpoint has no episodic target ABI marker",
     ):
         preflight_training_checkpoint(
             checkpoint,
@@ -460,7 +460,7 @@ def test_invalid_hashed_episodic_payload_is_probed_before_any_live_mutation(
         collector_before = target.collector.state_dict()
         torch_before = torch.get_rng_state().clone()
 
-        with pytest.raises(ValueError, match="episodic replay"):
+        with pytest.raises(ValueError, match=r"episodic replay"):
             load_training_checkpoint(checkpoint, config=config, resources=target)
 
         for key, expected in model_before.items():
@@ -766,7 +766,7 @@ def test_queue_restore_precondition_fails_before_any_live_resource_mutation(
         numpy_before = np.random.get_state()
         torch_before = torch.get_rng_state().clone()
 
-        with pytest.raises(RuntimeError, match="rollout queue|closed"):
+        with pytest.raises(RuntimeError, match=r"rollout queue|closed"):
             load_training_checkpoint(checkpoint, config=config, resources=target)
 
         _assert_models_equal(target.model.state_dict(), model_before)
@@ -864,7 +864,7 @@ def test_v3_is_model_initialization_only_and_six_heads_migrate_all_or_none(
         resolved_collector_device=None,
         model_only=True,
     )
-    with pytest.raises(ValueError, match="unsupported exact-resume checkpoint format"):
+    with pytest.raises(ValueError, match=r"unsupported exact-resume checkpoint format"):
         checkpointing_module._validate_metadata(
             validated,
             config=config,
@@ -888,7 +888,7 @@ def test_v3_is_model_initialization_only_and_six_heads_migrate_all_or_none(
 
     partial = dict(target)
     partial.pop(next(iter(fresh_heads)))
-    with pytest.raises(ValueError, match="all or none.*six long-horizon"):
+    with pytest.raises(ValueError, match=r"all or none.*six long-horizon"):
         checkpointing_module._model_parameter_initialization_state(
             partial,
             target_state=target,
@@ -922,7 +922,7 @@ def test_v3_parameter_initialization_starts_fresh_optimizer_replays_rng_and_line
         source.close()
 
     target_config = _episodic_config()
-    with pytest.raises(ValueError, match="unsupported exact-resume checkpoint format"):
+    with pytest.raises(ValueError, match=r"unsupported exact-resume checkpoint format"):
         preflight_training_checkpoint(
             checkpoint,
             config=target_config,

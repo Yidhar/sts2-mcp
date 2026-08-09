@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v18"
+version = "sts2-relational-curriculum-config-v19"
 profile = "combat"
 
 [model]

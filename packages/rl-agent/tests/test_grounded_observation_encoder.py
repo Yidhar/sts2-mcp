@@ -669,7 +669,7 @@ def test_compressed_orderless_card_multiplicity_matches_expanded_multiset() -> N
         label="status pile",
     ) == 50_000
 
-    with pytest.raises(ValueError, match="quantity"):
+    with pytest.raises(ValueError, match=r"quantity"):
         _aggregate_orderless_card_multiset([{**card, "quantity": 0}])
 
 def test_compressed_pile_multiplicity_is_end_to_end_tensor_equivalent() -> None:
@@ -1105,12 +1105,12 @@ def test_live_and_headless_world_projection_use_same_observable_intersection() -
 
 def test_encoder_requires_registered_canonical_model_action_kind() -> None:
     encoder = _encoder()
-    with pytest.raises(ValueError, match="missing non-empty model_action_kind"):
+    with pytest.raises(ValueError, match=r"missing non-empty model_action_kind"):
         encoder.encode(
             _observation(),
             [{"action_handle": "missing", "kind": "play_card"}],
         )
-    with pytest.raises(ValueError, match="unregistered model_action_kind"):
+    with pytest.raises(ValueError, match=r"unregistered model_action_kind"):
         encoder.encode(
             _observation(),
             [
@@ -1154,7 +1154,7 @@ def test_encoder_fails_closed_on_cooccurring_policy_branch_hash_collision() -> N
 
     with pytest.raises(
         ValueError,
-        match="co-occurring semantic action branches collide",
+        match=r"co-occurring semantic action branches collide",
     ):
         encoder.encode(_observation(), actions)
 
@@ -1227,7 +1227,7 @@ def test_nonfinite_raw_facts_fail_closed_before_tensor_materialization() -> None
         "decision_domain": "combat",
         "player": {"hp": float("nan"), "max_hp": 80},
     }
-    with pytest.raises(ValueError, match="must be finite"):
+    with pytest.raises(ValueError, match=r"must be finite"):
         encoder.encode(observation, _actions())
 
 
@@ -1253,7 +1253,7 @@ def test_reviewed_numeric_facts_have_collision_free_feature_slots() -> None:
 
 
 def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
-    with pytest.raises(ValueError, match="at least 224"):
+    with pytest.raises(ValueError, match=r"at least 224"):
         GroundedEncodingConfig(feature_dim=223)
 
 
@@ -1261,11 +1261,11 @@ def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
     assert identity == {
-        "version": "grounded-relational-runtime-encoding-v14",
+        "version": "grounded-relational-runtime-encoding-v15",
         "min_token_feature_dim": 224,
         "feature_abi_end": 215,
         "fingerprint_sha256": (
-            "6a169803fdcd399272357dfe351a8b7375f16a1cb9e7cfccdc3b047f13f746ce"
+            "d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee"
         ),
     }
     assert identity["version"] == GROUNDING_ENCODING_VERSION
@@ -1767,7 +1767,7 @@ def test_encoder_stack_pads_only_to_active_batch_capacity() -> None:
     assert batch.candidates.features.shape[1] < encoder.config.max_candidates
     assert batch.domain_ids.tolist() == [1, 3]
 
-    with pytest.raises(ValueError, match="different encoding contracts"):
+    with pytest.raises(ValueError, match=r"different encoding contracts"):
         encoder.stack(
             [
                 first,
@@ -1864,7 +1864,7 @@ def test_encoder_never_silently_truncates_legal_candidates() -> None:
         {"action_handle": f"candidate:{index}", "kind": "choose"} for index in range(encoder.config.max_candidates + 1)
     ]
 
-    with pytest.raises(ValueError, match="silently hide dispatchable candidates"):
+    with pytest.raises(ValueError, match=r"silently hide dispatchable candidates"):
         encoder.encode(_observation(), actions)
 
 
@@ -2294,7 +2294,10 @@ def test_encoder_fails_closed_on_world_or_candidate_local_overflow() -> None:
     }
     with pytest.raises(
         ValueError,
-        match=("candidate-local observation exceeds.*" "capacity=1 required_tokens=3 action_kind='event_option'"),
+        match=(
+            r"candidate-local observation exceeds.*"
+            r"capacity=1 required_tokens=3 action_kind='event_option'"
+        ),
     ):
         local_limited.encode(_observation(), [action])
 

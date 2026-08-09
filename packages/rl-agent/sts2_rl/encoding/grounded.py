@@ -695,14 +695,17 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V14 makes the native shop-item alias contract part of the encoding identity.
+# V15 makes the nested native upgrade-preview transport/lift contract part of
+# the encoding identity.  V14 knew how to encode an already root-level preview
+# but HeadlessSim emits it under each selectable card; without the reviewed
+# lift the live tensor remained byte-identical to a blind-upgrade encoder.
 # V13 and the first implementation of merchant card removal shared a digest
 # even though a category-only native item changed from ``purchase_item`` / Run
 # to ``purchase_card_removal`` / Selection. Tensor shapes and feature slots
 # remain stable, but candidate transaction semantics differ. Exact resume must
 # therefore fail closed; explicitly reviewed model-parameter initialization
 # from the pinned V13 identity remains shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v14"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v15"
 
 # This table is executable encoder semantics, not parser convenience. Keep it
 # immutable and include it verbatim in the grounding identity payload so any
@@ -781,6 +784,9 @@ def _grounding_encoding_contract() -> dict[str, Any]:
             [key, list(aliases)]
             for key, aliases in _CANONICAL_ITEM_ALIAS_TABLE
         ],
+        "upgrade_preview_transport": (
+            "native-card-nested-recursive-translation-root-lift-and-world-selection-v1"
+        ),
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
 
@@ -2435,11 +2441,33 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
             sort_as_set=True,
             preserve_quantity=True,
         )
+        # HeadlessSim emits upgrade_preview inside cards/selectable_cards and
+        # selected_cards.  Project those alternatives into their own world
+        # relation tokens before the orderless source-card multiset is
+        # aggregated.  Live/legacy option wrappers remain supported below.
+        upgrade_previews: list[dict[str, Any]] = []
+        for field in ("cards", "selectable_cards", "selected_cards"):
+            raw_cards = _first_present(raw_selection, field)
+            if raw_cards is None:
+                continue
+            for raw_card in _as_mapping_list(
+                raw_cards,
+                label=f"selection.{field}",
+            ):
+                raw_preview = _first_present(raw_card, "upgrade_preview")
+                if not isinstance(raw_preview, Mapping):
+                    continue
+                preview = _canonical_card(raw_preview)
+                source = _canonical_card(raw_card)
+                source_instance = source.get("instance_id")
+                if source_instance:
+                    preview["instance_id"] = source_instance
+                if preview:
+                    upgrade_previews.append(preview)
         raw_options = _first_present(raw_selection, "options")
         if raw_options is not None:
             option_selectable: list[dict[str, Any]] = []
             option_selected: list[dict[str, Any]] = []
-            upgrade_previews: list[dict[str, Any]] = []
             for option in _as_mapping_list(raw_options, label="selection.options"):
                 raw_card = _first_present(option, "card")
                 if raw_card is None:
@@ -2467,8 +2495,16 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
                 selectable = option_selectable
             if selected is None:
                 selected = option_selected
-            if upgrade_previews:
-                selection["upgrade_previews"] = upgrade_previews
+        if upgrade_previews:
+            # A selectable card may be mirrored in more than one compatibility
+            # field.  Deduplicate exact projections without losing relation
+            # identity or factual multiplicity across genuinely distinct cards.
+            selection["upgrade_previews"] = list(
+                {
+                    json.dumps(item, sort_keys=True, separators=(",", ":")): item
+                    for item in upgrade_previews
+                }.values()
+            )
         if selectable is not None:
             # Selection grids are orderless.  Keep selectable and selected
             # membership as separate multisets, but do not spend one world
@@ -2875,6 +2911,15 @@ def _candidate_local_roots(
                 roots[key] = projected
     source_card = roots.get("card")
     upgrade_preview = roots.get("upgrade_preview")
+    if source_card is not None and upgrade_preview is None:
+        raw_source_card = action.get("card")
+        if isinstance(raw_source_card, Mapping):
+            raw_nested_preview = raw_source_card.get("upgrade_preview")
+            if isinstance(raw_nested_preview, Mapping):
+                nested_preview = _canonical_card(raw_nested_preview)
+                if nested_preview:
+                    roots["upgrade_preview"] = nested_preview
+                    upgrade_preview = nested_preview
     if source_card is not None and upgrade_preview is not None:
         source_instance = source_card.get("instance_id")
         if source_instance:
