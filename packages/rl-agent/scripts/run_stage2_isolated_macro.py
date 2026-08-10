@@ -104,8 +104,19 @@ def main() -> int:
             map_location=resources.device,
             weights_only=True,
         )
-        resources.model.load_state_dict(champion_state)
-        resources.collector_model.load_state_dict(champion_state)
+        # The champion lineage trained with liveness heads (failure_credit
+        # learning); stage-2 retires that plane, so its head tensors are the
+        # only tolerated difference. Anything else is a real drift refusal.
+        for target in (resources.model, resources.collector_model):
+            result = target.load_state_dict(champion_state, strict=False)
+            unexpected = [
+                key for key in result.unexpected_keys if "liveness" not in key
+            ]
+            if result.missing_keys or unexpected:
+                raise SystemExit(
+                    "champion checkpoint drift beyond the retired liveness "
+                    f"heads: missing={result.missing_keys} unexpected={unexpected}"
+                )
         for parameter in resources.model.parameters():
             parameter.requires_grad_(False)
 
