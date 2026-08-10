@@ -45,8 +45,10 @@ if [[ ! -f "$SIM_EXE.identity.json" ]]; then
   exit 1
 fi
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+# The venv was relocated after creation, so its activate script exports a
+# stale VIRTUAL_ENV; bind the interpreter by path instead of sourcing it.
+export VIRTUAL_ENV="$VENV_DIR"
+export PATH="$VENV_DIR/bin:$PATH"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
