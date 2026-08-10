@@ -47,10 +47,41 @@ Handoff requires ALL of:
 
 ## 3. Evidence
 
-(To be filled from `stage3-joined-eval.jsonl` and
-`stage3-state-variation.json` after the stage-2 training run completes.)
+### Round 1 — ep200 model (2026-08-11)
+
+Model: `stage2-macro-final-ep200.pt` (200 episodes, 13,246 macro
+transitions, 800 Double-Q updates, loss 0.0054, all 10 branches collected).
+Artifacts: `runs/stage2-isolated-macro-v1/stage3-full-eval.jsonl`,
+`stage3-state-variation.json`.
+
+- **Criterion 1 (liveness): FAILED.** Branch gap Q(smith)-Q(rest) is
+  +0.058..+0.071 and varies with context across floors (~1.2e-2), so the
+  learning path is structurally alive; but the HP sweep (10% vs 90% max HP,
+  field verified to reach the encoder) moves the ranking by only ~1e-6 —
+  five orders below the branch gap. HP does not reach the ranking yet.
+- **Criterion 2 (non-inferiority): FAILED.** Paired n=16 held-out:
+  champion 4 wins / act1 11 / floor_p50 32 / mean 31.7; joined 0 wins /
+  act1 11 / floor_p50 32 / mean 25.4. Per-seed floor deltas mixed
+  (7 down, 3 up, 5 tied — sign test alone not significant), but all four
+  champion wins became joined losses: a material outcome regression, not
+  batch noise.
+- **Criterion 3 (branch diversity): MARGINAL.** Greedy macro is
+  smith-always at rest (0 rest choices) and leave-heavy at shop —
+  per-surface degenerate although cross-surface diverse.
+
+**Mechanism read.** The Q function learned a context-sensitive but HP-blind
+smith preference. Structural contributor identified and fixed in d4efb2e:
+window-tail bootstraps were biased to zero, and n_step=3 left the factual
+(Monte-Carlo) segment of targets too short — bootstrapped values from a
+still-state-blind Q erase exactly the conditioning signals (HP → death
+risk) that only live in realized returns. n_step raised to 8, windows to
+16 with an unbiased extension-step bootstrap.
 
 ## 4. Decision record
 
-(To be filled: handoff yes/no, date, evidence hashes, and the operational
-consequence — which collection entry points switch to authority ownership.)
+**Round 1 decision (2026-08-11): NO HANDOFF.** Criteria 1 and 2 failed on
+the ep200 model. Macro ownership stays with the frozen champion for
+evaluation; isolated branch-balanced collection continues. Remedy running:
+600-episode extension (`stage2-extended2-metrics.jsonl`) under the
+corrected learner, initialized from ep200. Next evidence round repeats the
+probes and the paired 16-seed evaluation against the extended model.
