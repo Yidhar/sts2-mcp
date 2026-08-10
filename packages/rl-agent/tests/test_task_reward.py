@@ -493,9 +493,8 @@ def test_outcome_first_ordering_survives_the_durable_floor_clock() -> None:
     the ACTUAL shipped constants, not assumed from the v7 bundle bound.
     """
 
-    from sts2_rl.semantics import DECISION_CLOCK_BASE
-
     from sts2_baseline.objective import TaskRewardSpec
+    from sts2_rl.semantics import DECISION_CLOCK_BASE
 
     task = TaskRewardSpec()
     terminal_gap = task.success_reward - task.failure_reward
