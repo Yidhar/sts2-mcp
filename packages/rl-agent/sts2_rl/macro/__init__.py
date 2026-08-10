@@ -5,6 +5,10 @@ preference learning exclusively; it never imports the legacy training stack,
 and the legacy stack never imports it.
 """
 
+from .authority import (
+    MACRO_AUTHORITY_VERSION,
+    MacroCollectionAuthority,
+)
 from .learner import (
     MACRO_Q_LEARNER_VERSION,
     MacroQConfig,
@@ -25,9 +29,11 @@ from .transitions import (
 )
 
 __all__ = [
+    "MACRO_AUTHORITY_VERSION",
     "MACRO_Q_LEARNER_VERSION",
     "MACRO_REPLAY_CONTRACT_VERSION",
     "MACRO_TRANSITION_CONTRACT_VERSION",
+    "MacroCollectionAuthority",
     "MacroEpisode",
     "MacroQConfig",
     "MacroQLearner",
