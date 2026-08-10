@@ -994,3 +994,22 @@ def test_selection_step_q_uses_lifecycle_option_return() -> None:
         assert losses.q_loss.detach().item() >= 0.0
     finally:
         resources.close()
+
+
+def test_operation_telemetry_covers_every_registered_lifecycle_operation() -> None:
+    """v47 launch regression: the first committed relic_purchase lifecycle
+    KeyError'd the learner's hardcoded per-operation telemetry dicts. The
+    dicts must be keyed by the canonical registry so a newly reviewed
+    entrance can never crash the learner."""
+
+    import inspect
+
+    from sts2_rl.training import learner as learner_module
+    from sts2_rl.training.transaction_operations import (
+        TRANSACTION_LIFECYCLE_OPERATIONS,
+    )
+
+    source = inspect.getsource(learner_module.VTraceLearner._transaction_losses)
+    assert "for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)" in source
+    assert '"upgrade": []' not in source
+    assert len(TRANSACTION_LIFECYCLE_OPERATIONS) >= 10

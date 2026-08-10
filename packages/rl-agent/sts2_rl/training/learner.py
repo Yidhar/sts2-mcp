@@ -61,6 +61,7 @@ from .transaction import (
     observed_outcome_pairs,
     selection_delta_index,
 )
+from .transaction_operations import TRANSACTION_LIFECYCLE_OPERATIONS
 
 _LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v2"
 _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1 = 8
@@ -3884,15 +3885,15 @@ class VTraceLearner:
         entry_collection_model_probabilities: list[float] = []
         entry_behavior_probabilities: list[float] = []
         entry_log_support_gaps: list[float] = []
+        # Keyed by the canonical lifecycle-operation registry so a newly
+        # reviewed entrance can never KeyError the per-operation telemetry
+        # (v47 launch failure: the first committed relic_purchase lifecycle
+        # hit a hardcoded upgrade/remove/rest dict).
         operation_entry_model_probabilities: dict[str, list[float]] = {
-            "upgrade": [],
-            "remove": [],
-            "rest": [],
+            operation: [] for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
         }
         operation_entry_behavior_probabilities: dict[str, list[float]] = {
-            "upgrade": [],
-            "remove": [],
-            "rest": [],
+            operation: [] for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
         }
         entry_support_satisfied_labels = 0
         entry_support_singleton_suppressed_labels = 0
