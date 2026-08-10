@@ -85,6 +85,13 @@ def main() -> int:
         "native-atomic combat view (default: macro surfaces only)",
     )
     parser.add_argument(
+        "--replay-episodes",
+        type=int,
+        default=512,
+        help="replay capacity in episodes (lower for the combat challenger: "
+        "combat episodes carry ~8x more transitions)",
+    )
+    parser.add_argument(
         "--init-macro",
         default=None,
         help="initialize the trainable macro Q model from a previously "
@@ -158,7 +165,9 @@ def main() -> int:
         def initial_state() -> Any:
             return None
 
-        replay = MacroSequenceReplay(capacity_episodes=512, burn_in=8, window_length=16)
+        replay = MacroSequenceReplay(
+            capacity_episodes=args.replay_episodes, burn_in=8, window_length=16
+        )
         learner = MacroQLearner(
             online_parameters=list(macro_online.parameters()),
             forward_online=forward_online,
