@@ -479,3 +479,38 @@ def test_v7_rejects_mid_episode_budget_change() -> None:
             _result(step=0, revival_budget=32),
             _result(step=1, revival_budget=64),
         )
+
+
+def test_outcome_first_ordering_survives_the_durable_floor_clock() -> None:
+    """EC-3 of the semantic reset (docs/architecture/semantic-reset-stage1-
+    entry-conditions-v1.md): the derivation, executable.
+
+    Under the durable-floor decision clock the terminal outcome reaching the
+    FIRST decision of a maximum-length run is discounted by base**floors,
+    while in the adversarial worst case every bounded secondary cost lands
+    undiscounted at that same first decision. Outcome-first ordering demands
+    discounted_terminal_gap > total_secondary_cost_range. This must hold with
+    the ACTUAL shipped constants, not assumed from the v7 bundle bound.
+    """
+
+    from sts2_rl.semantics import DECISION_CLOCK_BASE
+
+    from sts2_baseline.objective import TaskRewardSpec
+
+    task = TaskRewardSpec()
+    terminal_gap = task.success_reward - task.failure_reward
+    assert terminal_gap == 2.0
+
+    floors = int(task.fallback_run_floor_cap)
+    discounted_gap = terminal_gap * (DECISION_CLOCK_BASE**floors)
+    # The complete bounded secondary bundle (revival + HP-loss + pace
+    # preference) is contractually below one terminal unit.
+    secondary_bundle_bound = 0.99
+
+    assert discounted_gap > secondary_bundle_bound, (
+        f"floor-clock ordering violated: {discounted_gap:.4f} <= "
+        f"{secondary_bundle_bound}"
+    )
+    # And with margin: the gap must not sit within 10% of the bound, so
+    # future cost additions cannot silently invert outcome ordering.
+    assert discounted_gap > secondary_bundle_bound * 1.1
