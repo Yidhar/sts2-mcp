@@ -30,7 +30,11 @@ MACRO_Q_LEARNER_VERSION: Final = "sts2-macro-double-q-v1"
 
 @dataclass(frozen=True, slots=True)
 class MacroQConfig:
-    n_step: int = 3
+    # Deep enough that the factual (Monte-Carlo) segment of the target spans
+    # several combats: bootstrapped values from a state-blind early Q would
+    # otherwise erase slowly-learned conditioning signals (e.g. HP -> death
+    # risk) that only live in realized returns.
+    n_step: int = 8
     learning_rate: float = 1.0e-4
     target_update_interval: int = 200
     huber_delta: float = 1.0
@@ -141,10 +145,31 @@ class MacroQLearner:
             target_values.append(float(q_target[argmax_index].item()))
 
         # Double-Q bootstrap for transition t consumes the NEXT decision's
-        # value; the final transition in the window bootstraps from itself
-        # only through its own clock discount (terminal cuts to zero).
+        # value. When the window ends before the episode does, evaluate one
+        # extension step so the final window transition bootstraps from the
+        # actual successor state instead of a biased zero; a genuine episode
+        # tail keeps zero (its terminal transition cuts via the clock anyway).
+        extension_value = 0.0
+        if end < len(steps):
+            extension_step = steps[end]
+            with torch.no_grad():
+                q_online_ext, _ = self.forward_online(extension_step, hidden)
+                q_target_ext, _ = self.forward_target(extension_step, target_hidden)
+                extension_mask = torch.as_tensor(
+                    extension_step.snapshot.action_mask,
+                    dtype=torch.bool,
+                    device=q_online_ext.device,
+                )
+                extension_argmax = int(
+                    q_online_ext.masked_fill(~extension_mask, float("-inf"))
+                    .argmax()
+                    .item()
+                )
+                extension_value = float(q_target_ext[extension_argmax].item())
         bootstraps = tuple(
-            target_values[index + 1] if index + 1 < len(target_values) else 0.0
+            target_values[index + 1]
+            if index + 1 < len(target_values)
+            else extension_value
             for index in range(len(learn_steps))
         )
         rewards = tuple(step.reward for step in learn_steps)

@@ -194,3 +194,48 @@ def test_double_q_learner_converges_and_reports_ec4_counts() -> None:
     assert metrics["executed_counts"]["reward:skip"] > 0
     assert metrics["target_syncs"] >= 1
     assert metrics["loss"] < 0.1
+
+
+def test_window_tail_bootstraps_from_the_successor_beyond_the_window() -> None:
+    """A window that ends mid-episode must bootstrap its final transition
+    from the actual successor state's Double-Q value, not a biased zero."""
+
+    replay = MacroSequenceReplay(capacity_episodes=4, burn_in=0, window_length=2, seed=5)
+    # Three-step episode, all zero reward, unit discount: with the target
+    # network fixed at Q(candidate 1) = 1, every learn step's exact n-step
+    # target is 1.0 ONLY if the final window transition sees its successor.
+    replay.put(
+        MacroEpisode(
+            episode_id="ep-tail",
+            steps=(
+                _step(action_index=0),
+                _step(action_index=0),
+                _step(action_index=0, terminal=True, discount=0.0),
+            ),
+        )
+    )
+    values = torch.tensor([0.0, 1.0, 0.0])
+
+    def forward(step: object, hidden: object) -> tuple[torch.Tensor, object]:
+        return values.clone().requires_grad_(True), hidden
+
+    dummy = torch.nn.Parameter(torch.zeros(1))
+    learner = MacroQLearner(
+        online_parameters=[dummy],
+        forward_online=forward,
+        forward_target=forward,
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(n_step=1, learning_rate=0.01, sample_windows=8),
+    )
+    # First window covers steps [0, 2): its tail (step 1) is non-terminal
+    # and its successor (step 2) lives beyond the window.
+    windows = [w for w in replay._windows() if w.learn_slice == (0, 2)]
+    assert windows, "expected a window ending mid-episode"
+    _, rewards, discounts, bootstraps, learn_steps = learner._window_values(windows[0])
+    assert len(learn_steps) == 2
+    assert rewards == (0.0, 0.0) and discounts == (1.0, 1.0)
+    # Both transitions bootstrap from a successor whose masked argmax is
+    # candidate 1 with target value 1.0 — including the window tail.
+    assert bootstraps == (1.0, 1.0)

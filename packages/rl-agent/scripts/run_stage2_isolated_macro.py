@@ -158,7 +158,7 @@ def main() -> int:
         def initial_state() -> Any:
             return None
 
-        replay = MacroSequenceReplay(capacity_episodes=512, burn_in=4, window_length=8)
+        replay = MacroSequenceReplay(capacity_episodes=512, burn_in=8, window_length=16)
         learner = MacroQLearner(
             online_parameters=list(macro_online.parameters()),
             forward_online=forward_online,
