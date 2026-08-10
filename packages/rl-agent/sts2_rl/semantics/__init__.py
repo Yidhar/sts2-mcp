@@ -12,6 +12,12 @@ from .clock import (
     clock_tick,
     decision_discount,
 )
+from .compiler import (
+    SEMANTIC_COMPILER_CONTRACT_VERSION,
+    CompiledEvent,
+    CompiledKind,
+    SemanticActionCompiler,
+)
 from .contracts import (
     DecisionSemantics,
     SemanticAction,
@@ -69,9 +75,12 @@ __all__ = [
     "MACRO_EDGE_CONTRACT_VERSION",
     "PROGRESS_RECEIPT_CONTRACT_VERSION",
     "PROGRESS_SCOPE_CONTRACT_VERSION",
+    "SEMANTIC_COMPILER_CONTRACT_VERSION",
     "STRICT_ACTION_GROUPING_CONTRACT_VERSION",
     "SURFACE_REGISTRY_CONTRACT_VERSION",
     "CoarseActionCollisionError",
+    "CompiledEvent",
+    "CompiledKind",
     "DecisionClockTick",
     "DecisionSemantics",
     "DecisionSemanticsKernel",
@@ -85,6 +94,7 @@ __all__ = [
     "ProgressScope",
     "ProgressScopeStack",
     "SemanticAction",
+    "SemanticActionCompiler",
     "SemanticCollisionError",
     "SemanticContractError",
     "SemanticKey",
