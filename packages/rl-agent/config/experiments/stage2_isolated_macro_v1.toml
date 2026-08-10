@@ -1,0 +1,104 @@
+# Stage-2 isolated macro control (semantic decision graph reset, doc §10).
+#
+# This config only shapes resource construction for
+# scripts/run_stage2_isolated_macro.py. The legacy V-trace learner is NEVER
+# invoked: collection runs with record=false, so the FIFO queue and all legacy
+# replay sidecars stay empty, and every legacy objective weight below is inert.
+# The v47 champion (periodic-step-000030000) is loaded frozen via --champion;
+# a trainable clone provides the macro candidate-Q head, trained exclusively
+# by the macro Double-Q learner on authority-recorded transitions under the
+# durable floor clock.
+#
+# transaction_learning.enabled must stay true: it is what constructs the
+# per-candidate transaction Q head the macro learner reads. Its legacy loss
+# weights are unused in stage 2.
+
+[optimization]
+learning_rate = 0.0001
+entropy_weight = 0.006
+entropy_weight_end = 0.004
+entropy_decay_updates = 3000
+entropy_breaker = "policy-collapse-v2"
+
+[rollout]
+queue_capacity = 24
+
+[transaction_learning]
+enabled = true
+replay_capacity = 4096
+replay_byte_capacity = 1073741824
+sample_traces = 4
+burn_in_steps = 32
+effect_weight = 0.05
+transaction_q_weight = 0.05
+completion_policy_weight = 0.15
+pairwise_ranking_weight = 0.0
+lifecycle_entry_support_weight = 0.0
+lifecycle_entry_support_probability_floor = 0.05
+lifecycle_smdp_q_weight = 0.10
+lifecycle_smdp_horizon = "next_resource_opportunity"
+lifecycle_advantage_policy_weight = 0.0
+lifecycle_advantage_start_update = 256
+lifecycle_advantage_temperature = 0.25
+lifecycle_advantage_clip = 1.0
+lifecycle_advantage_q_error_gate = 0.25
+lifecycle_advantage_max_policy_lag = 128
+lifecycle_advantage_max_log_probability_shift = 1.0
+macro_option_value_weight = 0.10
+macro_option_actor_weight = 0.03
+macro_option_actor_temperature = 0.25
+macro_option_actor_log_weight_clip = 2.0
+macro_option_max_policy_lag = 128
+macro_option_max_log_probability_shift = 2.0
+macro_option_group_completion_weight = 0.05
+
+[failure_credit]
+# Stage-2 collection is unrecorded; no failure-credit evidence is gathered.
+mode = "disabled"
+
+[episodic_learning]
+fresh_policy_sequences = 1
+act_segment_imitation_enabled = false
+combat_hp_loss_value_weight = 0.05
+combat_hp_loss_reference = 80.0
+success_policy_trust_region_epsilon = 0.20
+
+[curriculum]
+revival_budget = 40
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 150000
+selection_surface_epsilon_floor = 0.0
+
+[transaction_exploration]
+# The macro authority owns all macro-surface exploration (branch-balanced
+# epsilon-greedy). No collector-side entry floors compete with it.
+enabled = false
+operations = []
+entry_epsilon_floor = 0.0
+completion_guidance_probability = 0.0
+
+[runtime]
+rocm_sdpa_backend = "math"
+total_environment_steps = 30000
+# Fresh seed namespace: stage-2 collection is unrecorded scratch experience,
+# not paired with the v44/v46/v47 held-out evaluation namespace.
+seed = 6400000
+log_dir = "runs/stage2-isolated-macro-v1"
+checkpoint_dir = "checkpoints/stage2-isolated-macro-v1"
+checkpoint_interval_steps = 5000
+evaluation_steps = []
+evaluation_episodes = 16
+early_evaluation_steps = []
+early_evaluation_episodes = 16
+final_audit_steps = []
+final_audit_episodes = 16
+evaluation_liveness_guard_enabled = false
+evaluation_guard_min_liveness_episodes = 16
+evaluation_guard_liveness_baseline_failures = 0
+evaluation_guard_liveness_baseline_episodes = 16
+evaluation_guard_min_liveness_regression_rate = 0.20
+training_deadlock_streak_alert_episodes = 4
+evaluation_guard_enforcement_start_steps = 0
+evaluation_guard_failure_action = "stop"
+evaluation_guard_max_rollbacks = 0

@@ -22,6 +22,7 @@ import argparse
 import copy
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -72,13 +73,25 @@ def main() -> int:
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--updates-per-episode", type=int, default=4)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--backend", default="headless")
-    parser.add_argument("--sim-exe", default=None)
     parser.add_argument("--metrics-out", default="stage2-macro-metrics.jsonl")
+    parser.add_argument("--save-macro", default="stage2-macro-online.pt")
+    parser.add_argument("--save-interval-episodes", type=int, default=25)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--sim-exe", default=None)
     args = parser.parse_args()
 
     config = load_training_config(profile="preheat", config_path=Path(args.config))
+    if args.device is not None:
+        config = replace(config, runtime=replace(config.runtime, device=str(args.device)))
+    if args.sim_exe is not None:
+        config = replace(
+            config,
+            environment=replace(
+                config.environment,
+                backend="headless",
+                sim_exe_path=str(args.sim_exe),
+            ),
+        )
     if not config.transaction_learning.enabled:
         raise SystemExit(
             "stage-2 requires transaction_learning.enabled=true: the macro "
@@ -130,13 +143,21 @@ def main() -> int:
         )
         resources.collector.macro_authority = authority
 
+        def save_macro() -> None:
+            save_path = Path(args.save_macro)
+            temporary = save_path.with_suffix(save_path.suffix + ".tmp")
+            torch.save(macro_online.state_dict(), temporary)
+            temporary.replace(save_path)
+
         metrics_path = Path(args.metrics_out)
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             for episode_index in range(args.episodes):
+                # record=False: legacy FIFO/replay sidecars stay empty; the
+                # macro authority records the only training experience.
                 episode = resources.collector.collect_episode(
                     epsilon=0.0,
                     deterministic=False,
-                    record=True,
+                    record=False,
                 )
                 macro_episode = authority.finish_episode(
                     f"stage2-{episode_index:05d}"
@@ -153,14 +174,17 @@ def main() -> int:
                     "authority": authority.metrics(),
                     "replay": replay.metrics(),
                     "learner": update_metrics,
-                    "collector_episode_steps": (
-                        len(episode.metrics_steps)
-                        if hasattr(episode, "metrics_steps")
-                        else None
-                    ),
+                    "episode_steps": episode.metrics.steps,
+                    "episode_reward_total": episode.metrics.reward_total,
+                    "episode_run_won": episode.metrics.run_won,
+                    "episode_max_act": episode.metrics.max_act,
+                    "episode_max_floor": episode.metrics.max_floor,
                 }
                 metrics_file.write(json.dumps(record) + "\n")
                 metrics_file.flush()
+                if (episode_index + 1) % args.save_interval_episodes == 0:
+                    save_macro()
+        save_macro()
         return 0
     finally:
         resources.close()
