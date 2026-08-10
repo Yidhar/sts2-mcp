@@ -98,6 +98,7 @@ class MacroCollectionAuthority:
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
+        self._auto_counter = 0
 
     # ------------------------------------------------------------------ episode
     def begin_episode(self, episode_id: str) -> None:
@@ -113,8 +114,15 @@ class MacroCollectionAuthority:
         self.mechanical_dispatches = 0
         self.declined = 0
 
+    def _ensure_episode(self) -> None:
+        if self._episode_id is None:
+            self._auto_counter += 1
+            self.begin_episode(f"macro-auto-{self._auto_counter}")
+
     def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
         """Accumulate factual reward between macro decisions."""
+
+        self._ensure_episode()
 
         if self._open is not None and math.isfinite(reward):
             self._open.reward_accumulator += float(reward)
@@ -123,12 +131,13 @@ class MacroCollectionAuthority:
         if terminal:
             self._close_open(terminal=True)
 
-    def finish_episode(self) -> MacroEpisode | None:
+    def finish_episode(self, episode_id: str | None = None) -> MacroEpisode | None:
         self._close_open(terminal=True)
-        if self._episode_id is None or not self._steps:
+        if not self._steps:
+            self._episode_id = None
             return None
         episode = MacroEpisode(
-            episode_id=self._episode_id,
+            episode_id=episode_id or self._episode_id or "macro-episode",
             steps=tuple(self._steps),
         )
         self._episode_id = None
@@ -146,6 +155,15 @@ class MacroCollectionAuthority:
     ) -> int | None:
         """Return a native candidate index to execute, or None to decline."""
 
+        self._ensure_episode()
+        # Collector candidates arrive as strict-group wrappers; the native
+        # action facts live under their ``prototype`` key.
+        semantic_actions = [
+            action["prototype"]
+            if isinstance(action.get("prototype"), Mapping)
+            else action
+            for action in semantic_actions
+        ]
         floor = self._observed_floor(observation)
         if self._await_confirm:
             index = self._match_index(

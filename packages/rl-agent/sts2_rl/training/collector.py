@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -3314,7 +3314,12 @@ class GroundedCollector:
         transaction_exploration_operations: tuple[str, ...] = (),
         transaction_entry_epsilon_floor: float = 0.0,
         transaction_completion_guidance_probability: float = 0.0,
+        macro_authority: Any | None = None,
     ) -> None:
+        # Stage-two isolated collection: an optional macro authority may
+        # override action choice at recognized macro surfaces; None keeps
+        # collection byte-identical to champion-only behavior.
+        self.macro_authority = macro_authority
         if scenario not in {"full-run", "combat"}:
             raise ValueError("scenario must be full-run or combat")
         if objective not in {"combat", "act1", "run"}:
@@ -3798,6 +3803,49 @@ class GroundedCollector:
             raise CollectionProtocolError(
                 f"episode={state.episode_id!r} step={state.step_index} has no enabled legal action"
             )
+        if self.macro_authority is not None and not deterministic:
+            override = self.macro_authority.choose(
+                observation=state.observation,
+                semantic_actions=semantic_actions,
+                snapshot=encoded.snapshot,
+                valid=valid,
+            )
+            if override is not None:
+                if not 0 <= int(override) < len(valid) or not bool(valid[int(override)]):
+                    raise CollectionProtocolError(
+                        "macro authority chose an illegal candidate index"
+                    )
+                reference = encoded.action(int(override))
+                return _ActionChoice(
+                    candidate_index=int(override),
+                    dispatch_position=reference.position,
+                    dispatch_handle=reference.handle,
+                    equivalence_fingerprint=reference.equivalence_fingerprint,
+                    multiplicity=reference.multiplicity,
+                    action_references=encoded.actions,
+                    semantic_actions=semantic_actions,
+                    # The authority is a delta behavior policy for the frozen
+                    # champion stack: log(1)=0, exactly like deterministic
+                    # collection; no legacy learner consumes these episodes.
+                    behavior_log_probability=0.0,
+                    model_log_probability=float(model_log_probabilities[int(override)]),
+                    valid_count=int(valid_indices.size),
+                    snapshot=encoded.snapshot,
+                    recurrent_state=next_recurrent_state,
+                    policy=policy,
+                    value=value,
+                    encoding_ms=encoding_ms,
+                    policy_forward_ms=policy_forward_ms,
+                    definition_hash_collisions=encoded.definition_hash_collisions,
+                    relation_hash_collisions=encoded.relation_hash_collisions,
+                    effective_epsilon=0.0,
+                    targeted_selection_exploration=False,
+                    targeted_transaction_entry_exploration=False,
+                    transaction_completion_guidance=False,
+                    transaction_completion_forward_selected=False,
+                    transaction_completion_guidance_fallback=False,
+                    transaction_operation="",
+                )
         valid_count = int(valid_indices.size)
         valid_policy = policy[valid_indices]
         if not np.all(np.isfinite(valid_policy)) or np.any(valid_policy < 0.0):
@@ -4930,6 +4978,17 @@ class GroundedCollector:
                 elif not pre_action_combat and next_combat_in_progress:
                     active_combat_id = f"combat:{next_combat_identity}"
                     next_combat_identity += 1
+            if self.macro_authority is not None:
+                _macro_run = next_state.observation.get("run")
+                self.macro_authority.observe_step(
+                    reward=float(breakdown.reward),
+                    floor=(
+                        _macro_run.get("floor")
+                        if isinstance(_macro_run, Mapping)
+                        else None
+                    ),
+                    terminal=bool(result_terminal),
+                )
             if record:
                 segment_steps.append(
                     RolloutStep(
