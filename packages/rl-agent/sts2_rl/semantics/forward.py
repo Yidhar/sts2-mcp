@@ -123,7 +123,8 @@ def _rest_candidates(
     deck = deck if isinstance(deck, list) else []
     candidates: list[SemanticCandidate] = []
     for index, action in rest_actions:
-        option = action.get("option") if isinstance(action.get("option"), Mapping) else {}
+        raw_option = action.get("option")
+        option: Mapping[str, Any] = raw_option if isinstance(raw_option, Mapping) else {}
         option_token = _token(
             option.get("type")
             or option.get("id")
@@ -192,7 +193,8 @@ def _shop_candidates(
     deck = deck if isinstance(deck, list) else []
     candidates: list[SemanticCandidate] = []
     for index, action in purchases:
-        item = action.get("item") if isinstance(action.get("item"), Mapping) else {}
+        raw_item = action.get("item")
+        item: Mapping[str, Any] = raw_item if isinstance(raw_item, Mapping) else {}
         category = _token(item.get("category") or item.get("type"))
         facts = {key: item.get(key) for key in _ITEM_FACT_KEYS if item.get(key) is not None}
         if isinstance(item.get("card"), Mapping):
