@@ -291,3 +291,51 @@ def test_stage2_runner_loop_with_real_model_on_synthetic_backend() -> None:
         assert metrics["steps_trained"] >= 1
     finally:
         resources.close()
+
+
+def test_evaluation_ownership_extends_into_deterministic_collection() -> None:
+    """Stage-three joined evaluation: with evaluation_ownership the authority
+    owns macro surfaces even in deterministic held-out collection; without it
+    deterministic collection stays entirely with the champion."""
+
+    import torch as _torch
+
+    from sts2_rl.training import build_training_resources
+    from tests.test_v33_recovery_semantics import (
+        _recovery_config,
+        _RestForgeSelectionSuccessBackend,
+    )
+
+    for ownership, expects_overrides in ((True, True), (False, False)):
+        config = _recovery_config(max_steps=8, repeat_threshold=8)
+        resources = build_training_resources(
+            config,
+            backend=_RestForgeSelectionSuccessBackend(),
+        )
+        try:
+            values = _torch.zeros(64)
+
+            def forward(
+                snapshot: Any, hidden: Any, values: _torch.Tensor = values
+            ) -> tuple[_torch.Tensor, Any]:
+                return values[: len(snapshot.action_mask)], hidden
+
+            authority = MacroCollectionAuthority(
+                forward_q=forward,
+                initial_state=lambda: None,
+                epsilon=0.0,
+                seed=3,
+                evaluation_ownership=ownership,
+            )
+            resources.collector.macro_authority = authority
+            resources.collector.collect_episode(
+                epsilon=0.0,
+                deterministic=True,
+                record=False,
+            )
+            if expects_overrides:
+                assert authority.overrides > 0
+            else:
+                assert authority.overrides == 0
+        finally:
+            resources.close()

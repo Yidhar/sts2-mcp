@@ -80,12 +80,16 @@ class MacroCollectionAuthority:
         initial_state: Callable[[], Any],
         epsilon: float = 0.1,
         seed: int = 0,
+        evaluation_ownership: bool = False,
     ) -> None:
         if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
             raise ValueError("authority epsilon must be in [0, 1]")
         self.forward_q = forward_q
         self.initial_state = initial_state
         self.epsilon = epsilon
+        # Stage-3 joined evaluation: macro ownership extends into
+        # deterministic held-out collection (whole-segment ownership, §10).
+        self.evaluation_ownership = bool(evaluation_ownership)
         self._rng = np.random.default_rng(seed)
         self._hidden: Any = None
         self._episode_id: str | None = None

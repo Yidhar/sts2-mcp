@@ -3803,7 +3803,10 @@ class GroundedCollector:
             raise CollectionProtocolError(
                 f"episode={state.episode_id!r} step={state.step_index} has no enabled legal action"
             )
-        if self.macro_authority is not None and not deterministic:
+        if self.macro_authority is not None and (
+            not deterministic
+            or getattr(self.macro_authority, "evaluation_ownership", False)
+        ):
             override = self.macro_authority.choose(
                 observation=state.observation,
                 semantic_actions=semantic_actions,
