@@ -84,6 +84,13 @@ def main() -> int:
         help="stage-4 combat challenger: the authority also owns the "
         "native-atomic combat view (default: macro surfaces only)",
     )
+    parser.add_argument(
+        "--init-macro",
+        default=None,
+        help="initialize the trainable macro Q model from a previously "
+        "saved state dict (e.g. the stage-2 result) instead of the "
+        "champion weights",
+    )
     args = parser.parse_args()
 
     config = load_training_config(profile="preheat", config_path=Path(args.config))
@@ -127,6 +134,14 @@ def main() -> int:
             parameter.requires_grad_(False)
 
         macro_online = copy.deepcopy(resources.model)
+        if args.init_macro is not None:
+            macro_online.load_state_dict(
+                torch.load(
+                    Path(args.init_macro),
+                    map_location=resources.device,
+                    weights_only=True,
+                )
+            )
         for parameter in macro_online.parameters():
             parameter.requires_grad_(True)
         macro_target = copy.deepcopy(macro_online)
