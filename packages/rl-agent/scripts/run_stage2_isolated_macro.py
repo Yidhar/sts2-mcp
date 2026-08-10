@@ -78,6 +78,12 @@ def main() -> int:
     parser.add_argument("--save-interval-episodes", type=int, default=25)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
+    parser.add_argument(
+        "--own-combat",
+        action="store_true",
+        help="stage-4 combat challenger: the authority also owns the "
+        "native-atomic combat view (default: macro surfaces only)",
+    )
     args = parser.parse_args()
 
     config = load_training_config(profile="preheat", config_path=Path(args.config))
@@ -151,6 +157,7 @@ def main() -> int:
             forward_q=forward_online,
             initial_state=initial_state,
             epsilon=args.epsilon,
+            own_combat=bool(args.own_combat),
         )
         resources.collector.macro_authority = authority
 

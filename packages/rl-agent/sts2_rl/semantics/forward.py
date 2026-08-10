@@ -283,21 +283,71 @@ def _single_step_candidates(
     return tuple(result)
 
 
+def _combat_candidates(
+    legal_actions: Sequence[Mapping[str, Any]],
+) -> tuple[SemanticCandidate, ...] | None:
+    """Native-atomic combat compilation (stage 4: combat challenger view).
+
+    Every legal combat action is one candidate; the branch is its native
+    kind (``play_card``, ``end_turn``, ``use_potion``, selection traffic in
+    combat prompts) and card/potion/entity facts populate the target key.
+    No composite folding and no monotone restriction: combat legality and
+    prompt flow authority stay entirely with the engine.
+    """
+
+    candidates: list[SemanticCandidate] = []
+    for index, action in enumerate(legal_actions):
+        kind = _token(action.get("kind") or action.get("action"))
+        if not kind:
+            return None  # unnameable action: fail closed for the whole surface
+        target: Mapping[str, Any] | None = None
+        if isinstance(action.get("card"), Mapping):
+            target = _card_facts(action["card"])
+        elif isinstance(action.get("potion"), Mapping):
+            target = dict(action["potion"])
+        if isinstance(action.get("target"), Mapping):
+            merged = dict(target or {})
+            merged["combat_target"] = {
+                key: action["target"].get(key)
+                for key in ("id", "instance_id", "index")
+                if action["target"].get(key) is not None
+            }
+            target = merged
+        candidates.append(
+            SemanticCandidate(
+                branch=kind,
+                target_key=_target_key(target) if target else None,
+                target=target,
+                plan=(NativeStep(kind=kind, target=target),),
+                native_index=index,
+            )
+        )
+    return tuple(candidates) if candidates else None
+
+
 def forward_decision(
     observation: Mapping[str, Any],
     legal_actions: Sequence[Mapping[str, Any]],
+    *,
+    include_combat: bool = False,
 ) -> ForwardDecision | None:
     """Compile the current macro surface into atomic semantic candidates.
 
     Returns ``None`` for any surface this module does not recognize — the
     caller then exposes the raw native decision unchanged (fail-closed).
-    Combat surfaces are deliberately not handled here: combat control belongs
-    to the combat domain owner.
+    Combat surfaces are excluded by default: combat control belongs to the
+    combat domain owner. The stage-four combat challenger opts in with
+    ``include_combat=True`` and receives the native-atomic combat view.
     """
 
     combat = observation.get("combat")
     if isinstance(combat, Mapping) and combat.get("in_progress") is True:
-        return None
+        if not include_combat:
+            return None
+        combat_candidates = _combat_candidates(legal_actions)
+        if combat_candidates is None:
+            return None
+        return ForwardDecision(surface="combat", candidates=combat_candidates)
 
     rest = _rest_candidates(observation, legal_actions)
     if rest is not None:

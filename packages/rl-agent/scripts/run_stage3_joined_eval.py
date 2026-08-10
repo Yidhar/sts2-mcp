@@ -148,7 +148,11 @@ def main() -> int:
     parser.add_argument("--champion", required=True)
     parser.add_argument("--macro", required=True)
     parser.add_argument("--episodes", type=int, default=16)
-    parser.add_argument("--arms", choices=("both", "champion", "joined"), default="both")
+    parser.add_argument(
+        "--arms",
+        choices=("both", "champion", "joined", "challenger", "all"),
+        default="both",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
     parser.add_argument("--metrics-out", default="stage3-joined-eval.jsonl")
@@ -188,7 +192,7 @@ def main() -> int:
         summaries: dict[str, Any] = {}
         metrics_path = Path(args.metrics_out)
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
-            if args.arms in ("both", "champion"):
+            if args.arms in ("both", "champion", "all"):
                 rows = _run_arm(
                     resources,
                     arm="champion",
@@ -197,7 +201,7 @@ def main() -> int:
                     metrics_file=metrics_file,
                 )
                 summaries["champion"] = _summarize(rows)
-            if args.arms in ("both", "joined"):
+            if args.arms in ("both", "joined", "all"):
                 authority = MacroCollectionAuthority(
                     forward_q=_forward_factory(
                         macro_model, resources.encoder, resources.device
@@ -214,6 +218,25 @@ def main() -> int:
                     metrics_file=metrics_file,
                 )
                 summaries["joined"] = _summarize(rows)
+            if args.arms in ("challenger", "all"):
+                # Stage 4: the challenger owns combat AND macro surfaces.
+                authority = MacroCollectionAuthority(
+                    forward_q=_forward_factory(
+                        macro_model, resources.encoder, resources.device
+                    ),
+                    initial_state=lambda: None,
+                    epsilon=0.0,
+                    evaluation_ownership=True,
+                    own_combat=True,
+                )
+                rows = _run_arm(
+                    resources,
+                    arm="challenger",
+                    seeds=seeds,
+                    authority=authority,
+                    metrics_file=metrics_file,
+                )
+                summaries["challenger"] = _summarize(rows)
             summary_row = {
                 "event": "stage3_joined_eval_summary",
                 "unix_s": time.time(),

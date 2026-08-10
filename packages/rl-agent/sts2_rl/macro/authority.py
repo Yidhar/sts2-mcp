@@ -81,6 +81,7 @@ class MacroCollectionAuthority:
         epsilon: float = 0.1,
         seed: int = 0,
         evaluation_ownership: bool = False,
+        own_combat: bool = False,
     ) -> None:
         if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
             raise ValueError("authority epsilon must be in [0, 1]")
@@ -90,6 +91,9 @@ class MacroCollectionAuthority:
         # Stage-3 joined evaluation: macro ownership extends into
         # deterministic held-out collection (whole-segment ownership, §10).
         self.evaluation_ownership = bool(evaluation_ownership)
+        # Stage-4 combat challenger: the authority additionally owns the
+        # native-atomic combat view instead of declining it to the champion.
+        self.own_combat = bool(own_combat)
         self._rng = np.random.default_rng(seed)
         self._hidden: Any = None
         self._episode_id: str | None = None
@@ -200,7 +204,9 @@ class MacroCollectionAuthority:
             self.declined += 1
             return None
 
-        decision = forward_decision(observation, semantic_actions)
+        decision = forward_decision(
+            observation, semantic_actions, include_combat=self.own_combat
+        )
         if decision is None:
             self.declined += 1
             return None

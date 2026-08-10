@@ -339,3 +339,84 @@ def test_evaluation_ownership_extends_into_deterministic_collection() -> None:
                 assert authority.overrides == 0
         finally:
             resources.close()
+
+
+_COMBAT_OBSERVATION = {
+    "phase": "combat",
+    "combat": {"in_progress": True},
+    "run": {"floor": 5},
+}
+
+_COMBAT_ACTIONS = [
+    {
+        "kind": "play_card",
+        "card": {"id": "CARD.STRIKE", "instance_id": "CARD.STRIKE-1", "cost": 1},
+        "target": {"id": "MONSTER.CULTIST", "index": 0},
+    },
+    {
+        "kind": "play_card",
+        "card": {"id": "CARD.DEFEND", "instance_id": "CARD.DEFEND-1", "cost": 1},
+    },
+    {"kind": "end_turn"},
+]
+
+
+def test_combat_view_is_declined_by_default_and_owned_with_the_flag() -> None:
+    """Stage-4: forward compilation exposes the native-atomic combat view
+    only when the challenger opts in; the stage-2/3 authority still declines
+    combat to the champion."""
+
+    from sts2_rl.semantics.forward import forward_decision
+
+    assert forward_decision(_COMBAT_OBSERVATION, _COMBAT_ACTIONS) is None
+    decision = forward_decision(
+        _COMBAT_OBSERVATION, _COMBAT_ACTIONS, include_combat=True
+    )
+    assert decision is not None and decision.surface == "combat"
+    assert [c.branch for c in decision.candidates] == [
+        "play_card",
+        "play_card",
+        "end_turn",
+    ]
+    assert decision.candidates[0].native_index == 0
+    assert decision.candidates[0].target_key != decision.candidates[1].target_key
+
+    declining = _authority(q=[0.0, 0.0, 5.0])
+    declining.begin_episode("ep-decline")
+    assert (
+        declining.choose(
+            observation=_COMBAT_OBSERVATION,
+            semantic_actions=_COMBAT_ACTIONS,
+            snapshot=_snapshot(candidate_count=3),
+            valid=np.ones(3, dtype=np.bool_),
+        )
+        is None
+    )
+    assert declining.declined == 1
+
+    values = torch.tensor([0.0, 0.0, 5.0], dtype=torch.float32)
+
+    def forward(snapshot: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        return values[: len(snapshot.action_mask)], hidden
+
+    challenger = MacroCollectionAuthority(
+        forward_q=forward,
+        initial_state=lambda: None,
+        epsilon=0.0,
+        seed=7,
+        own_combat=True,
+    )
+    challenger.begin_episode("ep-challenger")
+    index = challenger.choose(
+        observation=_COMBAT_OBSERVATION,
+        semantic_actions=_COMBAT_ACTIONS,
+        snapshot=_snapshot(candidate_count=3),
+        valid=np.ones(3, dtype=np.bool_),
+    )
+    assert index == 2  # greedy Q picks end_turn
+    challenger.observe_step(reward=0.01, floor=5, terminal=True)
+    episode = challenger.finish_episode()
+    assert episode is not None and len(episode.steps) == 1
+    step = episode.steps[0]
+    assert step.surface == "combat" and step.branch == "end_turn"
+    assert step.terminal is True and step.discount == 0.0
