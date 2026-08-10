@@ -37,6 +37,13 @@ from torch import Tensor, nn
 # disagree about that tensor ABI.
 MIN_TOKEN_FEATURE_DIM: Final = 224
 COMBAT_DOMAIN_ID: Final = 1
+MACRO_ECONOMIC_SURFACE_NONE: Final = 0
+MACRO_ECONOMIC_SURFACE_REST: Final = 1
+MACRO_ECONOMIC_SURFACE_SHOP: Final = 2
+MACRO_ECONOMIC_SURFACE_CARD_REWARD: Final = 3
+MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION: Final = 4
+MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION: Final = 5
+MACRO_ECONOMIC_SURFACE_COUNT: Final = 6
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 _INTEGER_DTYPES = frozenset({torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8})
@@ -479,6 +486,7 @@ class GroundedCandidateBatch:
     world: WorldTokenBatch
     candidates: CandidateTokenBatch
     domain_ids: Tensor  # [B]
+    macro_economic_surface_ids: Tensor  # [B]
 
     def validate(self, config: GroundedCandidateConfig) -> tuple[int, int, int, int]:
         world_batch, world_count = self.world.validate(config)
@@ -489,6 +497,21 @@ class GroundedCandidateBatch:
         _require_shape("domain_ids", self.domain_ids, (world_batch,))
         _require_same_device("domain_ids", self.world.features, self.domain_ids)
         _require_ids("domain_ids", self.domain_ids, config.domain_count)
+        _require_shape(
+            "macro_economic_surface_ids",
+            self.macro_economic_surface_ids,
+            (world_batch,),
+        )
+        _require_same_device(
+            "macro_economic_surface_ids",
+            self.world.features,
+            self.macro_economic_surface_ids,
+        )
+        _require_ids(
+            "macro_economic_surface_ids",
+            self.macro_economic_surface_ids,
+            MACRO_ECONOMIC_SURFACE_COUNT,
+        )
         return world_batch, world_count, action_count, local_count
 
     def permute_candidates(self, permutation: Tensor) -> GroundedCandidateBatch:
@@ -496,6 +519,7 @@ class GroundedCandidateBatch:
             world=self.world,
             candidates=self.candidates.permute_candidates(permutation),
             domain_ids=self.domain_ids,
+            macro_economic_surface_ids=self.macro_economic_surface_ids,
         )
 
 
@@ -585,6 +609,10 @@ class RecurrentCandidateOutput:
     recurrent_state: Tensor  # [B, H]
     candidate_embeddings: Tensor  # [B, A, D]
     policy_logits: Tensor  # [B, A], invalid candidates use dtype minimum
+    # Same macro residual as acting, but with the base policy and shared
+    # representation detached.  Factual AWR therefore cannot displace the
+    # combat/run trunk or the general policy head.
+    macro_policy_logits: Tensor | None  # [B, A]
     # Stable semantic action-branch identity for the two-stage policy.  The
     # grounded encoder's candidate role is ``model_action_kind`` optionally
     # refined by ``model_action_variant``.  Examples are ``play_card``,
@@ -617,6 +645,9 @@ class RecurrentCandidateOutput:
     candidate_effect_logits: Tensor | None = None  # [B, A, 4]
     selection_delta_logits: Tensor | None = None  # [B, A, 3]
     transaction_q_values: Tensor | None = None  # [B, A]
+    # Candidate-independent factual baseline for macro-option AWR.  Its shared
+    # recurrent input is structurally detached in ``forward``.
+    macro_option_value: Tensor | None = None  # [B]
     # Bounded factual liveness-risk estimate for every currently legal
     # candidate.  This is deliberately separate from the task-return Q/value
     # heads: once an ordinary failure baseline has converged to ``-1``, a
@@ -663,6 +694,12 @@ class RecurrentCandidateOutput:
             )
         candidate_shape = (batch_size, action_count)
         _require_shape("output.policy_logits", self.policy_logits, candidate_shape)
+        if self.macro_policy_logits is not None:
+            _require_shape(
+                "output.macro_policy_logits",
+                self.macro_policy_logits,
+                candidate_shape,
+            )
         _require_shape(
             "output.policy_branch_ids",
             self.policy_branch_ids,
@@ -745,6 +782,16 @@ class RecurrentCandidateOutput:
                 candidate_shape,
             ),
             (
+                "macro_policy_logits",
+                self.macro_policy_logits,
+                candidate_shape,
+            ),
+            (
+                "macro_option_value",
+                self.macro_option_value,
+                (batch_size,),
+            ),
+            (
                 "candidate_liveness_cost_values",
                 self.candidate_liveness_cost_values,
                 candidate_shape,
@@ -777,7 +824,10 @@ class RecurrentCandidateOutput:
 
         return batch_size, action_count
 
-    def _policy_components(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _policy_components(
+        self,
+        logits_override: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return hierarchical policy terms without candidate-count bias.
 
         A flat candidate softmax makes one singleton branch compete with every
@@ -802,7 +852,11 @@ class RecurrentCandidateOutput:
         """
 
         mask = self.action_mask.bool()
-        logits = self.policy_logits.float()
+        logits = (
+            self.policy_logits
+            if logits_override is None
+            else logits_override
+        ).float()
         branch_ids = self.policy_branch_ids.long()
         batch_size = int(logits.shape[0])
         branch_shape = (batch_size, self.policy_branch_count)
@@ -888,6 +942,13 @@ class RecurrentCandidateOutput:
         """Return the masked two-stage candidate log distribution."""
 
         return self._policy_components()[0]
+
+    def macro_policy_log_probabilities(self) -> Tensor:
+        """Return the isolated macro-residual policy distribution."""
+
+        if self.macro_policy_logits is None:
+            raise RuntimeError("macro policy logits are disabled")
+        return self._policy_components(self.macro_policy_logits)[0]
 
     def policy_probabilities(self) -> Tensor:
         """Return float32 hierarchical probabilities.
@@ -1298,6 +1359,36 @@ class RecurrentCandidateModel(nn.Module):
                 SELECTION_DELTA_COUNT,
             )
             self.transaction_q_head: nn.Module | None = self._scalar_head(cfg.d_model)
+            self.macro_surface_candidate_embedding: nn.Embedding | None = (
+                nn.Embedding(MACRO_ECONOMIC_SURFACE_COUNT, cfg.d_model)
+            )
+            self.macro_surface_state_embedding: nn.Embedding | None = (
+                nn.Embedding(
+                    MACRO_ECONOMIC_SURFACE_COUNT,
+                    cfg.recurrent_hidden_dim,
+                )
+            )
+            self.macro_policy_head: nn.Module | None = self._scalar_head(
+                cfg.d_model
+            )
+            self.macro_option_value_head: nn.Module | None = self._scalar_head(
+                cfg.recurrent_hidden_dim
+            )
+            # A v46 -> v47 reviewed model-init must begin with exactly the
+            # inherited policy.  Only factual v47 labels may open the residual.
+            macro_final = self.macro_policy_head[-1]
+            if not isinstance(macro_final, nn.Linear):  # pragma: no cover
+                raise RuntimeError("macro policy head lost its final linear")
+            nn.init.zeros_(macro_final.weight)
+            nn.init.zeros_(macro_final.bias)
+            # The factual baseline also starts from a known neutral estimate.
+            # A random new value head would turn the first AWR labels into
+            # arbitrary positive/negative advantages before seeing one fact.
+            macro_value_final = self.macro_option_value_head[-1]
+            if not isinstance(macro_value_final, nn.Linear):  # pragma: no cover
+                raise RuntimeError("macro value head lost its final linear")
+            nn.init.zeros_(macro_value_final.weight)
+            nn.init.zeros_(macro_value_final.bias)
         else:
             # Keeping disabled heads as ``None`` preserves the exact v10 state
             # dict ABI.  Enabling them is therefore an explicit model-parameter
@@ -1305,6 +1396,10 @@ class RecurrentCandidateModel(nn.Module):
             self.candidate_effect_head = None
             self.selection_delta_head = None
             self.transaction_q_head = None
+            self.macro_surface_candidate_embedding = None
+            self.macro_surface_state_embedding = None
+            self.macro_policy_head = None
+            self.macro_option_value_head = None
         self.candidate_liveness_cost_head: nn.Module | None = (
             self._bounded_scalar_head(cfg.d_model) if enable_liveness_head else None
         )
@@ -1685,6 +1780,8 @@ class RecurrentCandidateModel(nn.Module):
         raw_policy_logits = self.policy_head(policy_features).squeeze(-1)
         invalid_logit = torch.finfo(raw_policy_logits.dtype).min
         policy_logits = raw_policy_logits.masked_fill(~mask, invalid_logit)
+        macro_policy_logits = None
+        macro_option_value = None
 
         candidate_effect_logits = None
         selection_delta_logits = None
@@ -1708,6 +1805,44 @@ class RecurrentCandidateModel(nn.Module):
                 0.0,
             )
             transaction_q_values = transaction_q_values.masked_fill(~mask, 0.0)
+            if (
+                self.macro_surface_candidate_embedding is None
+                or self.macro_surface_state_embedding is None
+                or self.macro_policy_head is None
+                or self.macro_option_value_head is None
+            ):  # pragma: no cover - constructor invariant
+                raise RuntimeError("macro option head configuration is inconsistent")
+            macro_surface_ids = batch.macro_economic_surface_ids
+            macro_state_mask = macro_surface_ids.ne(
+                MACRO_ECONOMIC_SURFACE_NONE
+            )
+            macro_candidate_context = self.macro_surface_candidate_embedding(
+                macro_surface_ids
+            ).unsqueeze(1)
+            macro_delta = self.macro_policy_head(
+                policy_features.detach() + macro_candidate_context
+            ).squeeze(-1)
+            macro_delta = macro_delta * macro_state_mask.unsqueeze(-1).to(
+                dtype=macro_delta.dtype
+            )
+            policy_logits = (raw_policy_logits + macro_delta).masked_fill(
+                ~mask,
+                invalid_logit,
+            )
+            # The macro learner sees the live residual over a detached base;
+            # its CE/AWR derivative reaches only this sidecar.
+            macro_policy_logits = (
+                raw_policy_logits.detach() + macro_delta
+            ).masked_fill(~mask, invalid_logit)
+            macro_state_context = self.macro_surface_state_embedding(
+                macro_surface_ids
+            )
+            macro_option_value = self.macro_option_value_head(
+                next_recurrent_state.detach() + macro_state_context
+            ).squeeze(-1)
+            macro_option_value = macro_option_value * macro_state_mask.to(
+                dtype=macro_option_value.dtype
+            )
         candidate_liveness_cost_values = None
         liveness_cost_value = None
         if self.liveness_head_enabled:
@@ -1728,6 +1863,7 @@ class RecurrentCandidateModel(nn.Module):
             recurrent_state=next_recurrent_state,
             candidate_embeddings=policy_features,
             policy_logits=policy_logits,
+            macro_policy_logits=macro_policy_logits,
             policy_branch_ids=batch.candidates.role_ids,
             policy_branch_count=self.config.role_vocab_size,
             value=self.value_head(next_recurrent_state).squeeze(-1),
@@ -1744,6 +1880,7 @@ class RecurrentCandidateModel(nn.Module):
             candidate_effect_logits=candidate_effect_logits,
             selection_delta_logits=selection_delta_logits,
             transaction_q_values=transaction_q_values,
+            macro_option_value=macro_option_value,
             candidate_liveness_cost_values=candidate_liveness_cost_values,
             liveness_cost_value=liveness_cost_value,
         )
@@ -1753,6 +1890,13 @@ class RecurrentCandidateModel(nn.Module):
 
 
 __all__ = [
+    "MACRO_ECONOMIC_SURFACE_CARD_REWARD",
+    "MACRO_ECONOMIC_SURFACE_COUNT",
+    "MACRO_ECONOMIC_SURFACE_NONE",
+    "MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION",
+    "MACRO_ECONOMIC_SURFACE_REST",
+    "MACRO_ECONOMIC_SURFACE_SHOP",
+    "MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION",
     "SELECTION_DELTA_COUNT",
     "TRANSACTION_EFFECT_COUNT",
     "CandidateEncoding",

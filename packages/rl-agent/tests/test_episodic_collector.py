@@ -29,8 +29,10 @@ from sts2_rl.training.collector import (
     _act_exit_hp_ratio,
     _episodic_decision_surface,
     _extended_transaction_option_endpoint,
+    _macro_decision_surface,
     _macro_return_diagnostics,
     _noncombat_durable_projections,
+    _single_step_macro_effect_verified,
 )
 from sts2_rl.training.episode_replay import BoundaryOutcome
 from tests.test_v2_training_pipeline import _config
@@ -93,15 +95,19 @@ def test_missing_player_receipt_on_nonterminal_act_boundary_remains_fail_closed(
         )
 
 
-def test_extended_transaction_endpoint_stops_before_next_rest_choice_or_at_act_boundary() -> None:
-    trace = SimpleNamespace(
-        start_step=0,
-        lifecycle=SimpleNamespace(
-            support_eligible=True,
-            entry_step_index=0,
-            exit_step_index=0,
-        ),
-    )
+def test_extended_transaction_endpoint_stops_before_same_resource_opportunity_or_act_boundary() -> None:
+    def trace(operation: str, surface: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            start_step=0,
+            lifecycle=SimpleNamespace(
+                support_eligible=True,
+                entry_step_index=0,
+                exit_step_index=0,
+                operation=operation,
+                decision_surface=surface,
+            ),
+        )
+
     step = lambda floor, surface, boundary=BoundaryOutcome.NONE: SimpleNamespace(  # noqa: E731
         floor=floor,
         decision_surface=surface,
@@ -109,9 +115,9 @@ def test_extended_transaction_endpoint_stops_before_next_rest_choice_or_at_act_b
     )
 
     next_rest = _extended_transaction_option_endpoint(
-        trace,
+        trace("rest", "rest_site"),
         episodic_steps=(
-            step(4, "shop"),
+            step(4, "rest_site"),
             step(5, "combat"),
             step(6, "card_reward"),
             step(9, "rest_site"),
@@ -120,10 +126,34 @@ def test_extended_transaction_endpoint_stops_before_next_rest_choice_or_at_act_b
     )
     assert next_rest == (2, "next_rest_site")
 
-    next_act = _extended_transaction_option_endpoint(
-        trace,
+    next_shop = _extended_transaction_option_endpoint(
+        trace("shop_leave", "shop"),
         episodic_steps=(
             step(4, "shop"),
+            step(5, "card_reward"),
+            step(6, "combat"),
+            step(8, "shop"),
+        ),
+        authoritative_outcome=False,
+    )
+    assert next_shop == (2, "next_shop")
+
+    next_card_reward = _extended_transaction_option_endpoint(
+        trace("reward_skip", "card_reward"),
+        episodic_steps=(
+            step(4, "card_reward"),
+            step(5, "shop"),
+            step(6, "combat"),
+            step(7, "card_reward_selection"),
+        ),
+        authoritative_outcome=False,
+    )
+    assert next_card_reward == (2, "next_card_reward")
+
+    next_act = _extended_transaction_option_endpoint(
+        trace("rest", "rest_site"),
+        episodic_steps=(
+            step(4, "rest_site"),
             step(5, "combat"),
             step(17, "combat", BoundaryOutcome.SUCCEEDED),
             step(18, "rest_site"),
@@ -131,6 +161,152 @@ def test_extended_transaction_endpoint_stops_before_next_rest_choice_or_at_act_b
         authoritative_outcome=False,
     )
     assert next_act == (2, "act_boundary")
+
+
+def test_single_step_macro_receipts_fail_closed_on_actual_resource_changes() -> None:
+    def observation(
+        *,
+        phase: str,
+        gold: int,
+        deck: list[dict[str, object]],
+        hp: int = 50,
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "phase": phase,
+            "run": {"active": True, "act": 1, "floor": 4},
+            "player": {
+                "hp": hp,
+                "max_hp": 80,
+                "gold": gold,
+                "deck": deck,
+                "relics": [],
+                "potions": [],
+            },
+        }
+        if phase == "shop":
+            value["shop"] = {"visible": True}
+        if phase == "card_reward":
+            value["card_reward_selection"] = {"cards": [{"id": "CARD.NEW"}]}
+        if phase == "rest":
+            value["rest_site"] = {"visible": True}
+        return value
+
+    deck = [{"id": "CARD.STRIKE", "quantity": 1}]
+    reward_before = observation(phase="card_reward", gold=100, deck=deck)
+    reward_after_take = observation(
+        phase="map",
+        gold=100,
+        deck=[*deck, {"id": "CARD.NEW", "quantity": 1}],
+    )
+    reward_after_skip = observation(phase="map", gold=100, deck=deck)
+    reward_actions = ({"model_action_kind": "card_reward"},)
+    assert _single_step_macro_effect_verified(
+        operation="reward_take",
+        before_observation=reward_before,
+        before_actions=reward_actions,
+        after_observation=reward_after_take,
+        after_actions=(),
+    )
+    assert _single_step_macro_effect_verified(
+        operation="reward_skip",
+        before_observation=reward_before,
+        before_actions=reward_actions,
+        after_observation=reward_after_skip,
+        after_actions=(),
+    )
+    assert not _single_step_macro_effect_verified(
+        operation="reward_skip",
+        before_observation=reward_before,
+        before_actions=reward_actions,
+        after_observation=reward_after_take,
+        after_actions=(),
+    )
+
+    shop_before = observation(phase="shop", gold=100, deck=deck)
+    shop_after_leave = observation(phase="map", gold=100, deck=deck)
+    shop_after_card = observation(
+        phase="shop",
+        gold=50,
+        deck=[*deck, {"id": "CARD.NEW", "quantity": 1}],
+    )
+    shop_actions = ({"model_action_kind": "shop"},)
+    assert _single_step_macro_effect_verified(
+        operation="shop_leave",
+        before_observation=shop_before,
+        before_actions=shop_actions,
+        after_observation=shop_after_leave,
+        after_actions=(),
+    )
+    assert _single_step_macro_effect_verified(
+        operation="card_purchase",
+        before_observation=shop_before,
+        before_actions=shop_actions,
+        after_observation=shop_after_card,
+        after_actions=shop_actions,
+    )
+    assert not _single_step_macro_effect_verified(
+        operation="card_purchase",
+        before_observation=shop_before,
+        before_actions=shop_actions,
+        after_observation=shop_after_leave,
+        after_actions=(),
+    )
+
+    rest_before = observation(phase="rest", gold=100, deck=deck, hp=30)
+    rest_after = observation(phase="map", gold=100, deck=deck, hp=50)
+    assert _single_step_macro_effect_verified(
+        operation="rest",
+        before_observation=rest_before,
+        before_actions=({"model_action_kind": "rest_site"},),
+        after_observation=rest_after,
+        after_actions=(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [("upgrade", "upgrade_selection"), ("card_removal", "removal_selection")],
+)
+def test_macro_decision_surface_distinguishes_reviewed_selection_families(
+    operation: str,
+    expected: str,
+) -> None:
+    assert (
+        _macro_decision_surface(
+            {
+                "phase": "selection",
+                "card_selection": {"operation_type": operation},
+            },
+            (
+                {
+                    "model_action_kind": "card_selection",
+                    "kind": "select_card",
+                },
+                {"model_action_kind": "cancel_selection", "kind": "cancel"},
+            ),
+        )
+        == expected
+    )
+
+
+def test_macro_selection_surface_overrides_visible_parent_room() -> None:
+    assert (
+        _macro_decision_surface(
+            {
+                "phase": "rest_site",
+                "rest_site": {"visible": True},
+                "card_selection": {"operation_type": "upgrade"},
+            },
+            (
+                {
+                    "model_action_kind": "card_selection",
+                    "kind": "select_card",
+                },
+                {"model_action_kind": "cancel_selection", "kind": "cancel"},
+            ),
+        )
+        == "upgrade_selection"
+    )
 
 
 def _counter(observation: dict[str, Any], name: str) -> float:

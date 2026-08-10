@@ -93,6 +93,7 @@ from .transaction import (
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
+    factual_transaction_group_policy_steps,
     factual_transaction_policy_targets,
     observed_outcome_pairs,
 )
@@ -160,6 +161,7 @@ __all__ = [
     "evaluate_policy",
     "evaluation_gate_state_from_metadata",
     "exploration_epsilon",
+    "factual_transaction_group_policy_steps",
     "factual_transaction_policy_targets",
     "initialize_model_from_checkpoint",
     "inspect_baseline",

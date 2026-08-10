@@ -76,6 +76,13 @@ TRANSACTION_OPERATION_SPECS: Final[tuple[TransactionOperationSpec, ...]] = (
         requires_completion_guidance=True,
     ),
     TransactionOperationSpec(
+        name="reward_take",
+        aliases=frozenset({"add_card", "reward_take", "take_card_reward"}),
+        exploration_enabled=False,
+        opens_selection_lifecycle=False,
+        requires_completion_guidance=False,
+    ),
+    TransactionOperationSpec(
         name="reward_skip",
         aliases=frozenset(
             {"reward_skip", "skip_card_reward", "skip_reward"}
@@ -85,8 +92,36 @@ TRANSACTION_OPERATION_SPECS: Final[tuple[TransactionOperationSpec, ...]] = (
         requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
+        name="card_purchase",
+        aliases=frozenset({"card_purchase", "purchase_card"}),
+        exploration_enabled=False,
+        opens_selection_lifecycle=False,
+        requires_completion_guidance=False,
+    ),
+    TransactionOperationSpec(
         name="relic_purchase",
         aliases=frozenset({"purchase_relic", "relic_purchase"}),
+        exploration_enabled=True,
+        opens_selection_lifecycle=False,
+        requires_completion_guidance=False,
+    ),
+    TransactionOperationSpec(
+        name="potion_purchase",
+        aliases=frozenset({"potion_purchase", "purchase_potion"}),
+        exploration_enabled=False,
+        opens_selection_lifecycle=False,
+        requires_completion_guidance=False,
+    ),
+    TransactionOperationSpec(
+        name="shop_purchase",
+        aliases=frozenset({"purchase_item", "shop_purchase"}),
+        exploration_enabled=False,
+        opens_selection_lifecycle=False,
+        requires_completion_guidance=False,
+    ),
+    TransactionOperationSpec(
+        name="shop_leave",
+        aliases=frozenset({"leave_shop", "shop_leave", "shop_skip"}),
         exploration_enabled=True,
         opens_selection_lifecycle=False,
         requires_completion_guidance=False,
@@ -128,7 +163,7 @@ TRANSACTION_GUIDANCE_OPERATIONS: Final[frozenset[str]] = frozenset(
     if spec.requires_completion_guidance
 )
 TRANSACTION_LIFECYCLE_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {*TRANSACTION_SELECTION_OPERATIONS, "rest"}
+    spec.name for spec in TRANSACTION_OPERATION_SPECS
 )
 
 

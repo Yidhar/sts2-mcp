@@ -155,6 +155,26 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
             "episodic_policy_active_sequences": 0,
             "episodic_failure_policy_suppressed_labels": 3,
             "episodic_policy_lag_suppressed_labels": 6,
+            "transaction_macro_option_value_loss": 0.25,
+            "transaction_macro_option_actor_loss": 1.5,
+            "transaction_macro_group_completion_loss": 0.75,
+            "transaction_macro_option_value_labels": 8,
+            "transaction_macro_option_actor_labels": 6,
+            "transaction_macro_group_completion_labels": 2,
+            "transaction_macro_option_actor_lag_suppressed_labels": 1,
+            "transaction_macro_option_actor_drift_suppressed_labels": 2,
+            "transaction_macro_option_actor_singleton_suppressed_labels": 3,
+            "transaction_macro_option_advantage_mean": 0.4,
+            "transaction_macro_option_weight_mean": 1.0,
+            "transaction_macro_option_weight_max": 2.5,
+            "transaction_macro_option_value_labels_by_surface": {
+                "rest_site": 3,
+                "shop": 5,
+            },
+            "transaction_macro_option_actor_labels_by_surface": {
+                "rest_site": 2,
+                "shop": 4,
+            },
             "episodic_sampling": {
                 "fresh_policy_quota_requested": 1,
                 "fresh_policy_quota_filled": 0,
@@ -181,6 +201,26 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
     assert projected["episodic_policy_lag_suppressed_labels"] == 6
     assert projected["episodic_policy_active"] is False
     assert projected["episodic_zero_policy_label_update"] is True
+    assert projected["transaction_macro_option_value_loss"] == 0.25
+    assert projected["transaction_macro_option_actor_loss"] == 1.5
+    assert projected["transaction_macro_group_completion_loss"] == 0.75
+    assert projected["transaction_macro_option_value_labels"] == 8
+    assert projected["transaction_macro_option_actor_labels"] == 6
+    assert projected["transaction_macro_group_completion_labels"] == 2
+    assert projected["transaction_macro_option_actor_lag_suppressed_labels"] == 1
+    assert projected["transaction_macro_option_actor_drift_suppressed_labels"] == 2
+    assert projected["transaction_macro_option_actor_singleton_suppressed_labels"] == 3
+    assert projected["transaction_macro_option_advantage_mean"] == 0.4
+    assert projected["transaction_macro_option_weight_mean"] == 1.0
+    assert projected["transaction_macro_option_weight_max"] == 2.5
+    assert projected["transaction_macro_option_value_labels_by_surface"] == {
+        "rest_site": 3,
+        "shop": 5,
+    }
+    assert projected["transaction_macro_option_actor_labels_by_surface"] == {
+        "rest_site": 2,
+        "shop": 4,
+    }
     assert projected["fresh_policy_quota_requested"] == 1
     assert projected["fresh_policy_quota_filled"] == 0
     assert projected["fresh_policy_quota_missed"] == 1

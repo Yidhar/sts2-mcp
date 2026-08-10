@@ -27,6 +27,7 @@ from sts2_rl.training import (
 )
 from sts2_rl.training import checkpointing as checkpointing_module
 from sts2_rl.training.transaction import (
+    TRANSACTION_LIFECYCLE_VERSION,
     TransactionEffect,
     TransactionStep,
     TransactionTrace,
@@ -198,9 +199,7 @@ def test_transaction_lifecycle_abi_is_persisted_and_required_for_exact_resume(
 
     metadata_path = checkpoint / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata["transaction_lifecycle_abi"] == (
-        "sts2-transaction-lifecycle-evidence-v3"
-    )
+    assert metadata["transaction_lifecycle_abi"] == TRANSACTION_LIFECYCLE_VERSION
     metadata.pop("transaction_lifecycle_abi")
     metadata_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",

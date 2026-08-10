@@ -35,7 +35,15 @@ from sts2_rl.encoding.grounded import (
     _pile_count,
     _stable_zone_id,
 )
-from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
+from sts2_rl.models import (
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD,
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
+    MACRO_ECONOMIC_SURFACE_REST,
+    MACRO_ECONOMIC_SURFACE_SHOP,
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
+    GroundedCandidateConfig,
+    RecurrentCandidateModel,
+)
 from sts2_rl.semantics import strict_action_groups
 
 
@@ -143,6 +151,106 @@ def test_encoder_contract_runs_through_grounded_model() -> None:
     assert output.policy_logits.shape == (1, len(_actions()))
     assert output.action_mask[0].tolist() == [True, False]
     assert encoded.action(0).handle == "opaque:one"
+
+
+@pytest.mark.parametrize(
+    ("observation_patch", "action", "expected_surface"),
+    [
+        (
+            {"phase": "rest", "rest_site": {"visible": True}},
+            {
+                "kind": "choose_rest_option",
+                "model_action_kind": "rest_site",
+                "is_enabled": True,
+            },
+            MACRO_ECONOMIC_SURFACE_REST,
+        ),
+        (
+            {"phase": "shop", "shop": {"visible": True}},
+            {
+                "kind": "shop_purchase",
+                "model_action_kind": "shop",
+                "is_enabled": True,
+            },
+            MACRO_ECONOMIC_SURFACE_SHOP,
+        ),
+        (
+            {"phase": "reward"},
+            {
+                "kind": "select_card_reward",
+                "model_action_kind": "card_reward",
+                "is_enabled": True,
+            },
+            MACRO_ECONOMIC_SURFACE_CARD_REWARD,
+        ),
+        (
+            {
+                "phase": "selection",
+                "decision": {"selection": {"operation_type": "upgrade_card"}},
+            },
+            {
+                "kind": "select_card",
+                "model_action_kind": "card_selection",
+                "is_enabled": True,
+            },
+            MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
+        ),
+        (
+            {
+                "phase": "selection",
+                "decision": {"selection": {"operation_type": "card_removal"}},
+            },
+            {
+                "kind": "select_card",
+                "model_action_kind": "card_selection",
+                "is_enabled": True,
+            },
+            MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
+        ),
+    ],
+)
+def test_encoder_routes_only_reviewed_macro_economic_surfaces(
+    observation_patch: dict[str, object],
+    action: dict[str, object],
+    expected_surface: int,
+) -> None:
+    observation = {
+        "decision_domain": "build",
+        "run": {"active": True, "floor": 4, "act": 1},
+        "player": {"hp": 50, "max_hp": 80, "gold": 100, "deck": []},
+        **observation_patch,
+    }
+    encoded = _encoder().encode(observation, [action])
+    assert encoded.snapshot.macro_economic_surface_id == expected_surface
+    assert encoded.batch.macro_economic_surface_ids.tolist() == [expected_surface]
+
+
+def test_shop_proceed_is_encoded_as_clean_leave_not_purchase() -> None:
+    encoded = _encoder().encode(
+        {
+            "phase": "shop",
+            "decision_domain": "build",
+            "run": {"active": True, "floor": 4, "act": 1},
+            "player": {"hp": 50, "max_hp": 80, "gold": 100, "deck": []},
+            "shop": {"visible": True, "items": []},
+        },
+        [
+            {
+                "kind": "proceed",
+                "model_action_kind": "shop",
+                "is_enabled": True,
+            }
+        ],
+    )
+
+    transaction = grounded_encoding._candidate_transaction(
+        {"kind": "proceed", "model_action_kind": "shop"},
+        model_kind="shop",
+        roots={},
+    )
+    assert transaction["operation_type"] == "leave_shop"
+    assert transaction["amount"] == 0
+    assert encoded.snapshot.macro_economic_surface_id == MACRO_ECONOMIC_SURFACE_SHOP
 
 
 def test_candidate_containers_retired_and_private_training_features_cannot_pollute_world() -> None:
@@ -1261,11 +1369,11 @@ def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
     assert identity == {
-        "version": "grounded-relational-runtime-encoding-v15",
+        "version": "grounded-relational-runtime-encoding-v16",
         "min_token_feature_dim": 224,
         "feature_abi_end": 215,
         "fingerprint_sha256": (
-            "d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee"
+            "3cc73fd8910b005702ee4b408116b18b1c08a3d810f7301641c09fa3957ca70a"
         ),
     }
     assert identity["version"] == GROUNDING_ENCODING_VERSION

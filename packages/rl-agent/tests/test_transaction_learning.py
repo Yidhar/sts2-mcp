@@ -38,6 +38,7 @@ from sts2_rl.training import (
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
     build_training_resources,
+    factual_transaction_group_policy_steps,
     factual_transaction_policy_targets,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
@@ -2113,6 +2114,7 @@ def test_selection_option_targets_start_at_each_selected_card_not_macro_entry() 
     assert credited.steps[0].option_return is None
     assert credited.steps[2].option_return is None
     assert credited.steps[4].option_return is None
+    assert factual_transaction_group_policy_steps(credited) == (1, 3)
 
 
 def test_option_advantage_bridge_moves_saturated_actor_in_both_directions() -> None:
@@ -2313,6 +2315,125 @@ def test_option_advantage_bridge_moves_saturated_actor_in_both_directions() -> N
     )
     assert drift_suppressed.advantage_policy_labels == 0
     assert drift_suppressed.advantage_policy_drift_suppressed_labels == 1
+
+
+def test_macro_awr_recovers_zero_probability_without_shared_trunk_gradient() -> None:
+    class CandidateVectorHead(torch.nn.Module):
+        def __init__(self, values: tuple[float, float]) -> None:
+            super().__init__()
+            self.values = torch.nn.Parameter(
+                torch.tensor(values, dtype=torch.float32)
+            )
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            batch, candidates, _ = features.shape
+            return self.values[:candidates].view(1, candidates, 1).expand(
+                batch, candidates, 1
+            )
+
+    class StateScalarHead(torch.nn.Module):
+        def __init__(self, value: float) -> None:
+            super().__init__()
+            self.value = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return self.value.view(1, 1).expand(features.shape[0], 1)
+
+    model_config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        model_config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = replace(_snapshot(encoding), macro_economic_surface_id=1)
+    model = RecurrentCandidateModel(
+        model_config,
+        enable_transaction_heads=True,
+    )
+    base_policy = CandidateVectorHead((-120.0, 0.0))
+    macro_policy = CandidateVectorHead((0.0, 0.0))
+    macro_value = StateScalarHead(0.0)
+    model.policy_head = base_policy
+    model.macro_policy_head = macro_policy
+    model.macro_option_value_head = macro_value
+    trace = _sequence_trace(
+        snapshot,
+        trace_id="v47-zero-probability-rest",
+        outcome=TransactionOutcome.COMPLETED,
+        steps=(("rest", "exit", "rest", 0, TransactionEffect.EXIT),),
+    )
+    trace = replace(
+        trace,
+        policy_version=7,
+        steps=(
+            replace(
+                trace.steps[0],
+                transaction_return=1.0,
+                return_steps=1,
+                behavior_log_probability=math.log(0.5),
+                model_log_probability=-120.0,
+                model_probability=math.exp(-120.0),
+            ),
+        ),
+        lifecycle=TransactionLifecycleEvidence(
+            operation="rest",
+            entry_step_index=0,
+            exit_step_index=0,
+            entry_behavior_log_probability=math.log(0.5),
+            entry_model_probability=math.exp(-120.0),
+            entry_policy_version=7,
+            entry_action_fingerprint="rest",
+            outcome=TransactionLifecycleOutcome.COMMITTED,
+            effect_verified=True,
+            decision_surface="rest_site",
+            economic_alternative_count=1,
+            post_terminal=True,
+            option_return=1.0,
+            option_discount=0.0,
+            option_steps=1,
+            option_boundary="next_rest_site",
+        ),
+    )
+    learner = VTraceLearner(
+        model=model,
+        encoder=GroundedObservationEncoder(encoding),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        config=TrainingConfig().optimization,
+        maximum_unroll_length=4,
+        maximum_policy_lag=128,
+        transaction_config=TransactionLearningConfig(
+            enabled=True,
+            replay_byte_capacity=10_000_000,
+            burn_in_steps=0,
+            lifecycle_smdp_q_weight=0.0,
+            macro_option_value_weight=0.1,
+            macro_option_actor_weight=0.1,
+            macro_option_actor_temperature=0.25,
+            macro_option_max_policy_lag=128,
+            macro_option_max_log_probability_shift=0.1,
+        ),
+    )
+
+    losses = learner._transaction_losses(
+        (trace,),
+        current_policy_version=7,
+    )
+    assert losses.macro_option_value_labels == 1
+    assert losses.macro_option_actor_labels == 1
+    assert losses.macro_option_value_labels_by_surface == {"rest_site": 1}
+    assert losses.macro_option_actor_labels_by_surface == {"rest_site": 1}
+    assert losses.macro_option_weight_mean == pytest.approx(math.exp(2.0))
+    assert losses.macro_option_weight_max == pytest.approx(math.exp(2.0))
+    learner.optimizer.zero_grad(set_to_none=True)
+    losses.macro_option_actor_loss.backward()
+    assert macro_policy.values.grad is not None
+    assert macro_policy.values.grad[0].item() < -0.99
+    assert macro_policy.values.grad[1].item() > 0.99
+    assert base_policy.values.grad is None
+    assert all(
+        parameter.grad is None for parameter in model.world_encoder.parameters()
+    )
 
 
 def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() -> None:
@@ -3312,6 +3433,7 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
         source,
         target_state=target,
         allow_missing_transaction_heads=True,
+        allow_missing_macro_option_heads=True,
     )
     assert set(migrated) == set(target)
     assert all(torch.equal(migrated[key], value) for key, value in source.items())
@@ -3333,6 +3455,7 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
             missing_shared,
             target_state=target,
             allow_missing_transaction_heads=True,
+            allow_missing_macro_option_heads=True,
         )
 
     unexpected = dict(source)
@@ -3342,6 +3465,7 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
             unexpected,
             target_state=target,
             allow_missing_transaction_heads=True,
+            allow_missing_macro_option_heads=True,
         )
 
     wrong_shape = dict(source)
@@ -3351,6 +3475,7 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
             wrong_shape,
             target_state=target,
             allow_missing_transaction_heads=True,
+            allow_missing_macro_option_heads=True,
         )
 
 

@@ -40,9 +40,9 @@ from .transaction_operations import (
     canonical_transaction_operation,
 )
 
-TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v6"
-TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v6"
-TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v3"
+TRANSACTION_TRACE_VERSION: Final = "sts2-transaction-trace-v7"
+TRANSACTION_REPLAY_VERSION: Final = "sts2-transaction-replay-v7"
+TRANSACTION_LIFECYCLE_VERSION: Final = "sts2-transaction-lifecycle-evidence-v4"
 TRANSACTION_EFFECT_COUNT: Final = 4
 SELECTION_DELTA_COUNT: Final = 3
 
@@ -106,6 +106,11 @@ class TransactionLifecycleEvidence:
     entry_action_fingerprint: str
     outcome: TransactionLifecycleOutcome
     effect_verified: bool
+    # Protocol surface and branch cardinality at the economic decision.  They
+    # distinguish a voluntary "say no" from a forced singleton without using
+    # item/card identities or fabricating an unexecuted outcome.
+    decision_surface: str = "unknown"
+    economic_alternative_count: int = 0
     post_snapshot: EncodedDecisionSnapshot | None = None
     post_terminal: bool = False
     option_return: float | None = None
@@ -118,9 +123,27 @@ class TransactionLifecycleEvidence:
         operation = canonical_transaction_operation(self.operation)
         if operation not in TRANSACTION_LIFECYCLE_OPERATIONS:
             raise ValueError(
-                "transaction lifecycle operation must be upgrade, remove or rest"
+                "transaction lifecycle operation is outside the reviewed registry"
             )
         object.__setattr__(self, "operation", operation)
+        decision_surface = "_".join(
+            str(self.decision_surface or "unknown")
+            .strip()
+            .lower()
+            .replace("-", " ")
+            .split()
+        )
+        if not decision_surface:
+            raise ValueError("transaction lifecycle decision_surface is empty")
+        object.__setattr__(self, "decision_surface", decision_surface)
+        if (
+            isinstance(self.economic_alternative_count, bool)
+            or not isinstance(self.economic_alternative_count, int)
+            or self.economic_alternative_count < 0
+        ):
+            raise ValueError(
+                "transaction lifecycle economic_alternative_count must be a non-negative integer"
+            )
         for label, value in (
             ("entry_step_index", self.entry_step_index),
             ("exit_step_index", self.exit_step_index),
@@ -193,6 +216,8 @@ class TransactionLifecycleEvidence:
             if self.option_boundary not in {
                 "transaction_exit",
                 "next_rest_site",
+                "next_shop",
+                "next_card_reward",
                 "act_boundary",
                 "run_terminal",
             }:
@@ -215,6 +240,7 @@ class TransactionLifecycleEvidence:
         return (
             (self.post_snapshot.storage_nbytes() if self.post_snapshot is not None else 0)
             + len(self.operation.encode("utf-8"))
+            + len(self.decision_surface.encode("utf-8"))
             + len(self.entry_action_fingerprint.encode("utf-8"))
             + 128
         )
@@ -388,6 +414,8 @@ class TransactionStep:
             if self.option_boundary not in {
                 "transaction_exit",
                 "next_rest_site",
+                "next_shop",
+                "next_card_reward",
                 "act_boundary",
                 "run_terminal",
             }:
@@ -656,6 +684,37 @@ def factual_transaction_policy_targets(
                 )
             )
     return tuple(labels)
+
+
+def factual_transaction_group_policy_steps(
+    trace: TransactionTrace,
+) -> tuple[int, ...]:
+    """Return committed positive-selection rows for group-only competence.
+
+    The label says only "continue through the Select branch".  All concrete
+    card candidates sharing that semantic branch receive aggregate probability
+    mass; no particular upgrade/removal target is imitated.
+    """
+
+    lifecycle = trace.lifecycle
+    if (
+        lifecycle is None
+        or not lifecycle.support_eligible
+        or lifecycle.operation not in {"upgrade", "remove"}
+    ):
+        return ()
+    return tuple(
+        step_index
+        for step_index in range(
+            lifecycle.entry_step_index + 1,
+            lifecycle.exit_step_index + 1,
+        )
+        if trace.steps[step_index].selected_count_delta > 0
+        and int(
+            np.count_nonzero(trace.steps[step_index].snapshot.action_mask)
+        )
+        > 1
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1293,6 +1352,7 @@ __all__ = [
     "TransactionStep",
     "TransactionTrace",
     "backfill_factual_monte_carlo_returns",
+    "factual_transaction_group_policy_steps",
     "factual_transaction_policy_targets",
     "observed_outcome_pairs",
     "selection_delta_index",

@@ -35,7 +35,14 @@ from sts2_rl.encoding import (
     GroundedObservationEncoder,
     SemanticActionGroup,
 )
-from sts2_rl.models import RecurrentCandidateModel
+from sts2_rl.models import (
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD,
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
+    MACRO_ECONOMIC_SURFACE_REST,
+    MACRO_ECONOMIC_SURFACE_SHOP,
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
+    RecurrentCandidateModel,
+)
 
 from .episode_replay import (
     ActSegmentHealth,
@@ -1143,7 +1150,7 @@ def _extended_transaction_option_endpoint(
     episodic_steps: tuple[EpisodeDecisionStep, ...],
     authoritative_outcome: bool,
 ) -> tuple[int, str] | None:
-    """Locate the first fully observed next-rest/Act/run option boundary."""
+    """Locate the next same-resource opportunity, Act or run boundary."""
 
     lifecycle = trace.lifecycle
     if lifecycle is None or not lifecycle.support_eligible:
@@ -1153,6 +1160,29 @@ def _extended_transaction_option_endpoint(
     if not 0 <= entry <= exit_step < len(episodic_steps):
         raise RuntimeError("transaction lifecycle is not aligned to episodic facts")
     entry_floor = episodic_steps[entry].floor
+    if lifecycle.operation in {"rest", "upgrade"} or lifecycle.decision_surface == "rest_site":
+        target_surfaces = {"rest_site", "restsite", "rest"}
+        boundary_name = "next_rest_site"
+    elif lifecycle.operation in {
+        "card_purchase",
+        "relic_purchase",
+        "potion_purchase",
+        "shop_purchase",
+        "shop_leave",
+    } or lifecycle.decision_surface == "shop":
+        target_surfaces = {"shop"}
+        boundary_name = "next_shop"
+    elif lifecycle.operation in {"reward_take", "reward_skip"} or lifecycle.decision_surface == "card_reward":
+        target_surfaces = {
+            "card_reward",
+            "card_reward_selection",
+        }
+        boundary_name = "next_card_reward"
+    else:
+        # Selection lifecycles opened by events keep the conservative legacy
+        # rest/Act horizon rather than guessing a missing resource family.
+        target_surfaces = {"rest_site", "restsite", "rest"}
+        boundary_name = "next_rest_site"
     for index in range(exit_step + 1, len(episodic_steps)):
         step = episodic_steps[index]
         if step.act_boundary in {
@@ -1160,13 +1190,10 @@ def _extended_transaction_option_endpoint(
             BoundaryOutcome.FAILED,
         }:
             return index, "act_boundary"
-        if (
-            step.decision_surface in {"rest_site", "restsite", "rest"}
-            and step.floor != entry_floor
-        ):
-            # Arrival at the next rest site ends the option before executing
-            # the next rest-vs-forge choice itself.
-            return index - 1, "next_rest_site"
+        if step.decision_surface in target_surfaces and step.floor != entry_floor:
+            # Arrival at the next same-resource opportunity ends the option
+            # before executing that next choice itself.
+            return index - 1, boundary_name
     if authoritative_outcome:
         return len(episodic_steps) - 1, "run_terminal"
     return None
@@ -1233,6 +1260,206 @@ def _is_rest_site_decision_surface(
     return False
 
 
+def _is_shop_decision_surface(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    if _combat_in_progress(observation):
+        return False
+    if isinstance(observation.get("shop"), Mapping):
+        return True
+    return any(
+        str(_semantic_action_prototype(action).get("model_action_kind") or "")
+        .strip()
+        .lower()
+        == "shop"
+        for action in semantic_actions
+    )
+
+
+def _is_card_reward_decision_surface(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    if _combat_in_progress(observation):
+        return False
+    return bool(
+        isinstance(observation.get("card_reward_selection"), Mapping)
+        or any(
+            str(
+                _semantic_action_prototype(action).get("model_action_kind")
+                or ""
+            )
+            .strip()
+            .lower()
+            == "card_reward"
+            for action in semantic_actions
+        )
+    )
+
+
+def _macro_decision_surface(
+    observation: Mapping[str, object],
+    semantic_actions: tuple[Mapping[str, object], ...],
+) -> str:
+    # A card-selection transaction is the active decision surface even when
+    # its parent rest/shop DTO remains visible.  Check it before the enclosing
+    # room so replay diagnostics and per-surface returns agree with the
+    # encoder's reviewed routing ID.
+    selection_operation = _selection_transaction_operation(
+        observation,
+        semantic_actions,
+    )
+    if selection_operation == "upgrade":
+        return "upgrade_selection"
+    if selection_operation == "remove":
+        return "removal_selection"
+    if _is_rest_site_decision_surface(observation, semantic_actions):
+        return "rest_site"
+    if _is_shop_decision_surface(observation, semantic_actions):
+        return "shop"
+    if _is_card_reward_decision_surface(observation, semantic_actions):
+        return "card_reward"
+    return _episodic_decision_surface(
+        observation,
+        combat_in_progress=_combat_in_progress(observation),
+    )
+
+
+_SINGLE_STEP_MACRO_OPERATIONS = frozenset(
+    {
+        "rest",
+        "reward_take",
+        "reward_skip",
+        "card_purchase",
+        "relic_purchase",
+        "potion_purchase",
+        "shop_purchase",
+        "shop_leave",
+    }
+)
+
+_MACRO_SURFACE_NAME_BY_ID = {
+    MACRO_ECONOMIC_SURFACE_REST: "rest_site",
+    MACRO_ECONOMIC_SURFACE_SHOP: "shop",
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD: "card_reward",
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION: "upgrade_selection",
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION: "removal_selection",
+}
+
+
+def _snapshot_macro_surface_name(snapshot: EncodedDecisionSnapshot) -> str:
+    return _MACRO_SURFACE_NAME_BY_ID.get(
+        snapshot.macro_economic_surface_id,
+        "unknown",
+    )
+
+
+def _deck_card_count(
+    signature: tuple[tuple[str, int, int], ...] | None,
+) -> int | None:
+    return None if signature is None else sum(item[1] for item in signature)
+
+
+def _player_gold(observation: Mapping[str, object]) -> float | None:
+    raw_player = observation.get("player")
+    player = raw_player if isinstance(raw_player, Mapping) else {}
+    value = player.get("gold")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _single_step_macro_effect_verified(
+    *,
+    operation: str,
+    before_observation: Mapping[str, object],
+    before_actions: tuple[Mapping[str, object], ...],
+    after_observation: Mapping[str, object],
+    after_actions: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Prove one executed macro mutation from authoritative post-state facts."""
+
+    before_deck = _deck_upgrade_signature(before_observation)
+    after_deck = _deck_upgrade_signature(after_observation)
+    before_count = _deck_card_count(before_deck)
+    after_count = _deck_card_count(after_deck)
+    before_gold = _player_gold(before_observation)
+    after_gold = _player_gold(after_observation)
+    before_locus, before_resources = _noncombat_durable_projections(
+        before_observation
+    )
+    after_locus, after_resources = _noncombat_durable_projections(
+        after_observation
+    )
+    del before_locus, after_locus
+
+    if operation == "rest":
+        return _player_hp(after_observation) > _player_hp(before_observation)
+    if operation == "reward_take":
+        return bool(
+            before_count is not None
+            and after_count is not None
+            and after_count == before_count + 1
+            and not _is_card_reward_decision_surface(
+                after_observation,
+                after_actions,
+            )
+        )
+    if operation == "reward_skip":
+        return bool(
+            before_deck is not None
+            and before_deck == after_deck
+            and not _is_card_reward_decision_surface(
+                after_observation,
+                after_actions,
+            )
+        )
+    if operation == "shop_leave":
+        return bool(
+            _is_shop_decision_surface(before_observation, before_actions)
+            and not _is_shop_decision_surface(after_observation, after_actions)
+            and before_gold is not None
+            and before_gold == after_gold
+            and before_resources == after_resources
+        )
+    if operation in {
+        "card_purchase",
+        "relic_purchase",
+        "potion_purchase",
+        "shop_purchase",
+    }:
+        spent_gold = bool(
+            before_gold is not None
+            and after_gold is not None
+            and after_gold < before_gold
+        )
+        if not spent_gold:
+            return False
+        if operation == "card_purchase":
+            return bool(
+                before_count is not None
+                and after_count is not None
+                and after_count == before_count + 1
+            )
+        before_player = before_resources.get("player")
+        after_player = after_resources.get("player")
+        if not isinstance(before_player, Mapping) or not isinstance(
+            after_player,
+            Mapping,
+        ):
+            return False
+        key = {
+            "relic_purchase": "relics",
+            "potion_purchase": "potions",
+        }.get(operation)
+        if key is not None:
+            return before_player.get(key) != after_player.get(key)
+        return before_resources != after_resources
+    return False
+
+
 def _uses_targeted_selection_exploration(
     observation: Mapping[str, object],
     semantic_actions: tuple[Mapping[str, object], ...],
@@ -1277,18 +1504,37 @@ def _transaction_entry_operation(action: Mapping[str, object]) -> str:
         if operation:
             return operation
 
-    for key in ("model_action_kind", "action", "kind"):
+    normalized_kinds: set[str] = set()
+    for key in ("model_action_kind", "model_action_variant", "action", "kind"):
         normalized_kind = "_".join(
             str(prototype.get(key) or "").strip().lower().replace("-", " ").split()
         )
+        if normalized_kind:
+            normalized_kinds.add(normalized_kind)
         if normalized_kind in {"skip_card_reward", "reward_skip", "skip_reward"}:
             # Declining a combat card reward is a reviewed single-decision
             # entrance: the deck-growth alternative to taking a card. The
             # classification reads only the generic action kind.
             return "reward_skip"
 
+    if normalized_kinds & {
+        "select_card_reward",
+        "take_card_reward",
+    }:
+        return "reward_take"
     model_kind = "_".join(str(prototype.get("model_action_kind") or "").strip().lower().replace("-", " ").split())
     if model_kind == "shop":
+        if normalized_kinds & {
+            "back",
+            "continue",
+            "done",
+            "exit",
+            "leave",
+            "proceed",
+            "skip",
+            "shop_skip",
+        }:
+            return "shop_leave"
         item = prototype.get("item")
         if isinstance(item, Mapping):
             operation = _canonical_transaction_operation(item.get("category", item.get("type")))
@@ -1305,6 +1551,12 @@ def _transaction_entry_operation(action: Mapping[str, object]) -> str:
                 # Purchasing a relic is a reviewed single-decision entrance.
                 # Only the generic item category is read, never a relic ID.
                 return "relic_purchase"
+            if category == "card":
+                return "card_purchase"
+            if category == "potion":
+                return "potion_purchase"
+            if category:
+                return "shop_purchase"
     if model_kind in {"rest_site", "restsite"}:
         option = prototype.get("option")
         if isinstance(option, Mapping):
@@ -3049,7 +3301,9 @@ class GroundedCollector:
         horizon_as_failure: bool = False,
         transaction_burn_in_steps: int | None = None,
         transaction_smdp_horizon: Literal[
-            "transaction_exit", "next_rest_or_act"
+            "transaction_exit",
+            "next_rest_or_act",
+            "next_resource_opportunity",
         ] = "transaction_exit",
         episodic_learning_enabled: bool = False,
         failure_credit_shadow_enabled: bool = False,
@@ -3093,13 +3347,18 @@ class GroundedCollector:
         if transaction_smdp_horizon not in {
             "transaction_exit",
             "next_rest_or_act",
+            "next_resource_opportunity",
         }:
             raise ValueError("unsupported transaction SMDP horizon")
         if not isinstance(episodic_learning_enabled, bool):
             raise TypeError("episodic_learning_enabled must be a boolean")
         if episodic_learning_enabled and (scenario != "full-run" or objective != "run"):
             raise ValueError("episodic learning requires the full-run scenario and run objective")
-        if transaction_smdp_horizon == "next_rest_or_act" and not episodic_learning_enabled:
+        if (
+            transaction_smdp_horizon
+            in {"next_rest_or_act", "next_resource_opportunity"}
+            and not episodic_learning_enabled
+        ):
             raise ValueError(
                 "extended transaction SMDP horizons require episodic factual boundaries"
             )
@@ -4644,9 +4903,9 @@ class GroundedCollector:
                         hp_loss_after=player_hp_lost,
                         combat_boundary=combat_boundary,
                         act_boundary=act_boundary,
-                        decision_surface=_episodic_decision_surface(
+                        decision_surface=_macro_decision_surface(
                             state.observation,
-                            combat_in_progress=pre_action_combat,
+                            choice.semantic_actions,
                         ),
                     )
                 )
@@ -4725,25 +4984,25 @@ class GroundedCollector:
                         transaction_action_fingerprint if current_transaction_policy_node is not None else None
                     ),
                 )
-                # Rest is a one-step resource transaction rather than a card
-                # selection surface.  Give a *factual successful heal* the
-                # same next-rest/Act option horizon as forge so the learner can
-                # compare rest and forge symmetrically from their shared legal
-                # candidate state.  Merely clicking a rest-labelled option is
-                # insufficient: HP must actually increase in the authoritative
-                # post-state receipt.
+                # One-step economic choices use the same lifecycle/option
+                # contract as multi-step upgrade/removal.  Admission requires
+                # an authoritative post-state receipt: a label or click alone
+                # can never claim a purchase, reward take/skip, heal, or clean
+                # shop exit.
                 selected_transaction_operation = _transaction_entry_operation(
                     selected_action
                 )
                 if (
-                    selected_transaction_operation == "rest"
+                    selected_transaction_operation
+                    in _SINGLE_STEP_MACRO_OPERATIONS
                     and current_transaction_surface is None
-                    and _is_rest_site_decision_surface(
-                        state.observation,
-                        choice.semantic_actions,
+                    and _single_step_macro_effect_verified(
+                        operation=selected_transaction_operation,
+                        before_observation=state.observation,
+                        before_actions=choice.semantic_actions,
+                        after_observation=next_state.observation,
+                        after_actions=next_semantic_actions,
                     )
-                    and _player_hp(next_state.observation)
-                    > _player_hp(state.observation)
                 ):
                     rest_post_terminal = bool(
                         result_terminal
@@ -4786,13 +5045,14 @@ class GroundedCollector:
                         TransactionTrace(
                             trace_id=(
                                 f"seed-{reset_seed}:{state.episode_id}:"
-                                f"{rest_start_step}:{step_offset}:rest-resource"
+                                f"{rest_start_step}:{step_offset}:"
+                                f"{selected_transaction_operation}-resource"
                             ),
                             episode_id=f"seed-{reset_seed}:{state.episode_id}",
                             surface_key=semantic_fingerprint(
                                 {
                                     "kind": "single_step_resource_transaction",
-                                    "operation": "rest",
+                                    "operation": selected_transaction_operation,
                                     "entry_node": current_transaction_node,
                                 }
                             ),
@@ -4806,7 +5066,7 @@ class GroundedCollector:
                             burn_in_steps=rest_entry_index,
                             outcome=TransactionOutcome.COMPLETED,
                             lifecycle=TransactionLifecycleEvidence(
-                                operation="rest",
+                                operation=selected_transaction_operation,
                                 entry_step_index=rest_entry_index,
                                 exit_step_index=rest_entry_index,
                                 entry_behavior_log_probability=(
@@ -4823,6 +5083,14 @@ class GroundedCollector:
                                     TransactionLifecycleOutcome.COMMITTED
                                 ),
                                 effect_verified=True,
+                                decision_surface=_macro_decision_surface(
+                                    state.observation,
+                                    choice.semantic_actions,
+                                ),
+                                economic_alternative_count=max(
+                                    0,
+                                    choice.valid_count - 1,
+                                ),
                                 post_snapshot=rest_post_snapshot,
                                 post_terminal=rest_post_terminal,
                             ),
@@ -4945,6 +5213,22 @@ class GroundedCollector:
                                 effect_verified=(
                                     lifecycle_outcome
                                     is TransactionLifecycleOutcome.COMMITTED
+                                ),
+                                decision_surface=_snapshot_macro_surface_name(
+                                    active_transaction_steps[
+                                        active_transaction_entry_step_index
+                                    ].snapshot
+                                ),
+                                economic_alternative_count=max(
+                                    0,
+                                    int(
+                                        np.count_nonzero(
+                                            active_transaction_steps[
+                                                active_transaction_entry_step_index
+                                            ].snapshot.action_mask
+                                        )
+                                    )
+                                    - 1,
                                 ),
                                 post_snapshot=post_snapshot,
                                 post_terminal=post_terminal,
@@ -5333,7 +5617,8 @@ class GroundedCollector:
                         episodic_steps=tuple(episodic_steps),
                         authoritative_outcome=authoritative_outcome,
                     )
-                    if self.transaction_smdp_horizon == "next_rest_or_act"
+                    if self.transaction_smdp_horizon
+                    in {"next_rest_or_act", "next_resource_opportunity"}
                     else None
                 )
                 backfilled_traces.append(
@@ -5353,7 +5638,8 @@ class GroundedCollector:
                             else None
                         ),
                         require_extended_option_horizon=(
-                            self.transaction_smdp_horizon == "next_rest_or_act"
+                            self.transaction_smdp_horizon
+                            in {"next_rest_or_act", "next_resource_opportunity"}
                         ),
                     )
                 )

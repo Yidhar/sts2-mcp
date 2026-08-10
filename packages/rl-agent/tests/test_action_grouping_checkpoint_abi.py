@@ -86,6 +86,12 @@ _V15_ENCODING = {
     "feature_abi_end": 215,
     "fingerprint_sha256": ("d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee"),
 }
+_V16_ENCODING = {
+    "version": "grounded-relational-runtime-encoding-v16",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": ("3cc73fd8910b005702ee4b408116b18b1c08a3d810f7301641c09fa3957ca70a"),
+}
 
 
 class _CombatBackend:
@@ -318,12 +324,12 @@ def _rewrite_checkpoint_encoding_contract(
     "archived_encoding",
     [_V8_ENCODING, _V9_ENCODING, _V10_ENCODING, _V11_ENCODING],
 )
-def test_pre_v12_model_initialization_cannot_jump_to_v15(
+def test_pre_v12_model_initialization_cannot_jump_to_current_encoding(
     tmp_path: Path,
     archived_encoding: dict[str, Any],
 ) -> None:
     config = _config()
-    assert grounding_encoding_identity() == _V15_ENCODING
+    assert grounding_encoding_identity() == _V16_ENCODING
     archived = _validated_metadata(
         tmp_path,
         config=config,
@@ -362,7 +368,7 @@ def test_pre_v12_model_initialization_cannot_jump_to_v15(
         )
 
 
-def test_reviewed_v14_to_v15_is_model_only_and_fails_closed_on_tampering(
+def test_reviewed_v14_to_current_is_model_only_and_fails_closed_on_tampering(
     tmp_path: Path,
 ) -> None:
     config = _config()
@@ -405,10 +411,15 @@ def test_reviewed_v14_to_v15_is_model_only_and_fails_closed_on_tampering(
 
 @pytest.mark.parametrize(
     "source_encoding",
-    (_V12_ENCODING, _V13_ENCODING, _V14_ENCODING),
-    ids=("reviewed-v12-chain", "reviewed-v13-chain", "reviewed-v14-direct"),
+    (_V12_ENCODING, _V13_ENCODING, _V14_ENCODING, _V15_ENCODING),
+    ids=(
+        "reviewed-v12-chain",
+        "reviewed-v13-chain",
+        "reviewed-v14-chain",
+        "reviewed-v15-direct",
+    ),
 )
-def test_reviewed_pre_v15_initialization_inherits_only_model_parameters(
+def test_reviewed_pre_v16_initialization_inherits_only_model_parameters(
     tmp_path: Path,
     source_encoding: dict[str, Any],
 ) -> None:
@@ -530,7 +541,7 @@ def test_reviewed_pre_v15_initialization_inherits_only_model_parameters(
             parent_relation="model_parameter_initialization",
         )
         metadata = json.loads((migrated / "metadata.json").read_text(encoding="utf-8"))
-        assert metadata["encoding_contract"] == _V15_ENCODING
+        assert metadata["encoding_contract"] == _V16_ENCODING
         assert metadata["training_state"] == asdict(TrainingState())
         provenance = metadata["provenance"]
         assert provenance["checkpoint_load_mode"] == "model_initialization"

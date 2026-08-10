@@ -21,6 +21,7 @@ import numpy.typing as npt
 import torch
 
 from sts2_rl.models.grounded_candidate import (
+    MACRO_ECONOMIC_SURFACE_COUNT,
     MIN_TOKEN_FEATURE_DIM,
     CandidateTokenBatch,
     GroundedCandidateBatch,
@@ -28,7 +29,7 @@ from sts2_rl.models.grounded_candidate import (
     WorldTokenBatch,
 )
 
-ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v3"
+ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v4"
 _WORLD_ID_WIDTH: Final = 9
 _CANDIDATE_ID_WIDTH: Final = 13
 _LOCAL_ID_WIDTH: Final = 9
@@ -310,6 +311,7 @@ class EncodedDecisionSnapshot:
     local_offsets: npt.NDArray[np.uint32]
     action_mask: npt.NDArray[np.bool_]
     domain_id: int
+    macro_economic_surface_id: int = 0
     version: str = ENCODED_DECISION_SNAPSHOT_VERSION
 
     def __post_init__(self) -> None:
@@ -438,6 +440,17 @@ class EncodedDecisionSnapshot:
             raise TypeError("encoded decision domain_id must be an integer")
         if not 0 <= self.domain_id < cfg.domain_count:
             raise ValueError("encoded decision domain_id exceeds configured vocabulary")
+        if (
+            isinstance(self.macro_economic_surface_id, bool)
+            or not isinstance(self.macro_economic_surface_id, int)
+        ):
+            raise TypeError(
+                "encoded decision macro_economic_surface_id must be an integer"
+            )
+        if not 0 <= self.macro_economic_surface_id < MACRO_ECONOMIC_SURFACE_COUNT:
+            raise ValueError(
+                "encoded decision macro_economic_surface_id exceeds reviewed vocabulary"
+            )
 
     def storage_nbytes(self) -> int:
         """Exact NumPy payload bytes, excluding small Python/dataclass headers."""
@@ -529,6 +542,7 @@ def collate_encoded_snapshots(
         dtype=np.int64,
     )
     domain_ids = np.zeros((batch_size,), dtype=np.int64)
+    macro_economic_surface_ids = np.zeros((batch_size,), dtype=np.int64)
 
     for batch_index, snapshot in enumerate(snapshots):
         world_count = snapshot.world.token_count
@@ -586,6 +600,9 @@ def collate_encoded_snapshots(
                 snapshot.locals.feature_indices,
             ] = snapshot.locals.feature_values
         domain_ids[batch_index] = snapshot.domain_id
+        macro_economic_surface_ids[batch_index] = (
+            snapshot.macro_economic_surface_id
+        )
 
     dev = torch.device(device) if device is not None else torch.device("cpu")
     world_ids_tensor = _tensor(world_ids, device=dev)
@@ -634,6 +651,10 @@ def collate_encoded_snapshots(
             action_mask=_tensor(action_mask, device=dev),
         ),
         domain_ids=_tensor(domain_ids, device=dev),
+        macro_economic_surface_ids=_tensor(
+            macro_economic_surface_ids,
+            device=dev,
+        ),
     )
 
 

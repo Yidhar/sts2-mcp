@@ -37,6 +37,12 @@ _TRANSACTION_PREFIXES = (
     "selection_delta_head.",
     "transaction_q_head.",
 )
+_MACRO_OPTION_PREFIXES = (
+    "macro_surface_candidate_embedding.",
+    "macro_surface_state_embedding.",
+    "macro_policy_head.",
+    "macro_option_value_head.",
+)
 _COMBAT_HP_LOSS_PREFIX = "combat_hp_loss_value_head."
 
 
@@ -107,6 +113,16 @@ def _transaction_state(
     return {key: value for key, value in state.items() if key.startswith(_TRANSACTION_PREFIXES)}
 
 
+def _macro_option_state(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value
+        for key, value in state.items()
+        if key.startswith(_MACRO_OPTION_PREFIXES)
+    }
+
+
 def test_v4_policy_is_model_initialization_only_and_freshens_liveness_group(
     tmp_path: Path,
 ) -> None:
@@ -174,8 +190,11 @@ def test_v4_policy_is_model_initialization_only_and_freshens_liveness_group(
         assert fresh_liveness
         assert not _liveness_state(source_state)
         dropped_transaction = _transaction_state(source_state)
+        dropped_macro_option = _macro_option_state(source_state)
         assert dropped_transaction
+        assert dropped_macro_option
         assert not _transaction_state(target_before)
+        assert not _macro_option_state(target_before)
         assert target.failure_credit_replay is not None
         python_rng = random.getstate()
         numpy_rng = np.random.get_state()
@@ -192,7 +211,7 @@ def test_v4_policy_is_model_initialization_only_and_freshens_liveness_group(
         assert parent == checkpoint.resolve()
         target_after = target.model.state_dict()
         for key, expected in source_state.items():
-            if key in dropped_transaction:
+            if key in dropped_transaction or key in dropped_macro_option:
                 continue
             assert torch.equal(target_after[key], expected), key
             assert torch.equal(
@@ -338,6 +357,7 @@ def test_combat_hp_loss_head_model_initialization_is_all_or_none() -> None:
             allow_missing_combat_hp_loss_head=True,
         )
 
+
 def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -> None:
     config = _learning_config()
     source = RecurrentCandidateModel(
@@ -349,8 +369,11 @@ def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -
         enable_liveness_head=True,
     ).state_dict()
     transaction = _transaction_state(source)
+    macro_option = _macro_option_state(source)
     assert transaction
+    assert macro_option
     assert not _transaction_state(target)
+    assert not _macro_option_state(target)
 
     migrated = checkpointing_module._model_parameter_initialization_state(
         source,
@@ -361,7 +384,7 @@ def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -
     )
     assert set(migrated) == set(target)
     for key, expected in source.items():
-        if key not in transaction:
+        if key not in transaction and key not in macro_option:
             assert torch.equal(migrated[key], expected), key
 
     partial = dict(source)
@@ -372,6 +395,20 @@ def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -
     ):
         checkpointing_module._model_parameter_initialization_state(
             partial,
+            target_state=target,
+            allow_missing_transaction_heads=False,
+            allow_source_transaction_head_drop=True,
+            allow_missing_liveness_heads=True,
+        )
+
+    partial_macro = dict(source)
+    partial_macro.pop(next(iter(macro_option)))
+    with pytest.raises(
+        ValueError,
+        match="incomplete macro-option-head family",
+    ):
+        checkpointing_module._model_parameter_initialization_state(
+            partial_macro,
             target_state=target,
             allow_missing_transaction_heads=False,
             allow_source_transaction_head_drop=True,

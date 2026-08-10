@@ -18,7 +18,15 @@ from sts2_rl.encoding.snapshot import (
     EncodedDecisionSnapshot,
     collate_encoded_snapshots,
 )
-from sts2_rl.models import RecurrentCandidateModel, RecurrentCandidateOutput
+from sts2_rl.models import (
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD,
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
+    MACRO_ECONOMIC_SURFACE_REST,
+    MACRO_ECONOMIC_SURFACE_SHOP,
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
+    RecurrentCandidateModel,
+    RecurrentCandidateOutput,
+)
 
 from .config import (
     EpisodicLearningConfig,
@@ -48,6 +56,7 @@ from .transaction import (
     TransactionLifecycleOutcome,
     TransactionPolicyTarget,
     TransactionTrace,
+    factual_transaction_group_policy_steps,
     factual_transaction_policy_targets,
     observed_outcome_pairs,
     selection_delta_index,
@@ -73,6 +82,14 @@ _LIVENESS_AUTOGRAD_PACKING_VERSION = 1
 _LIVENESS_AUTOGRAD_MAX_STEPS = 256
 _LIVENESS_AUTOGRAD_MAX_CANDIDATES = 1_024
 _LIVENESS_AUTOGRAD_MAX_SEGMENTS = 16
+
+_MACRO_SURFACE_NAME_BY_ID = {
+    MACRO_ECONOMIC_SURFACE_REST: "rest_site",
+    MACRO_ECONOMIC_SURFACE_SHOP: "shop",
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD: "card_reward",
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION: "upgrade_selection",
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION: "removal_selection",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +142,9 @@ class LearnerMetrics:
     transaction_entry_support_loss: float
     transaction_smdp_q_loss: float
     transaction_advantage_policy_loss: float
+    transaction_macro_option_value_loss: float
+    transaction_macro_option_actor_loss: float
+    transaction_macro_group_completion_loss: float
     transaction_traces: int
     transaction_effect_labels: int
     transaction_q_labels: int
@@ -145,6 +165,17 @@ class LearnerMetrics:
     transaction_advantage_policy_drift_suppressed_labels: int
     transaction_advantage_policy_singleton_suppressed_labels: int
     transaction_advantage_mean: float
+    transaction_macro_option_value_labels: int
+    transaction_macro_option_actor_labels: int
+    transaction_macro_option_actor_lag_suppressed_labels: int
+    transaction_macro_option_actor_drift_suppressed_labels: int
+    transaction_macro_option_actor_singleton_suppressed_labels: int
+    transaction_macro_group_completion_labels: int
+    transaction_macro_option_advantage_mean: float
+    transaction_macro_option_weight_mean: float
+    transaction_macro_option_weight_max: float
+    transaction_macro_option_value_labels_by_surface: dict[str, int]
+    transaction_macro_option_actor_labels_by_surface: dict[str, int]
     transaction_lifecycle_committed: int
     transaction_lifecycle_cancelled: int
     transaction_lifecycle_unresolved: int
@@ -229,8 +260,10 @@ class LearnerMetrics:
     episodic_maximum_policy_lag: int
     timings: LearnerTimings
 
-    def to_mapping(self) -> dict[str, float | int | dict[str, float]]:
-        payload: dict[str, float | int | dict[str, float]] = asdict(self)
+    def to_mapping(
+        self,
+    ) -> dict[str, float | int | dict[str, float | int]]:
+        payload: dict[str, float | int | dict[str, float | int]] = asdict(self)
         payload["batch_environment_steps"] = payload.pop("environment_steps")
         payload["timings"] = self.timings.to_mapping()
         return payload
@@ -246,6 +279,9 @@ class _TransactionLossBatch:
     entry_support_loss: Tensor
     smdp_q_loss: Tensor
     advantage_policy_loss: Tensor
+    macro_option_value_loss: Tensor
+    macro_option_actor_loss: Tensor
+    macro_group_completion_loss: Tensor
     effect_labels: int
     q_labels: int
     pair_count: int
@@ -265,6 +301,17 @@ class _TransactionLossBatch:
     advantage_policy_drift_suppressed_labels: int
     advantage_policy_singleton_suppressed_labels: int
     advantage_mean: float
+    macro_option_value_labels: int
+    macro_option_actor_labels: int
+    macro_option_actor_lag_suppressed_labels: int
+    macro_option_actor_drift_suppressed_labels: int
+    macro_option_actor_singleton_suppressed_labels: int
+    macro_group_completion_labels: int
+    macro_option_advantage_mean: float
+    macro_option_weight_mean: float
+    macro_option_weight_max: float
+    macro_option_value_labels_by_surface: dict[str, int]
+    macro_option_actor_labels_by_surface: dict[str, int]
     lifecycle_committed: int
     lifecycle_cancelled: int
     lifecycle_unresolved: int
@@ -2536,6 +2583,12 @@ class VTraceLearner:
             * transaction_losses.smdp_q_loss
             + self.transaction_config.lifecycle_advantage_policy_weight
             * transaction_losses.advantage_policy_loss
+            + self.transaction_config.macro_option_value_weight
+            * transaction_losses.macro_option_value_loss
+            + self.transaction_config.macro_option_actor_weight
+            * transaction_losses.macro_option_actor_loss
+            + self.transaction_config.macro_option_group_completion_weight
+            * transaction_losses.macro_group_completion_loss
         )
         total_loss = online_objective_loss + transaction_objective_loss
         _require_finite(
@@ -2560,6 +2613,18 @@ class VTraceLearner:
                 (
                     "transaction_advantage_policy_loss",
                     transaction_losses.advantage_policy_loss,
+                ),
+                (
+                    "transaction_macro_option_value_loss",
+                    transaction_losses.macro_option_value_loss,
+                ),
+                (
+                    "transaction_macro_option_actor_loss",
+                    transaction_losses.macro_option_actor_loss,
+                ),
+                (
+                    "transaction_macro_group_completion_loss",
+                    transaction_losses.macro_group_completion_loss,
                 ),
             ),
         )
@@ -2902,6 +2967,15 @@ class VTraceLearner:
             transaction_advantage_policy_loss=float(
                 transaction_losses.advantage_policy_loss.detach().item()
             ),
+            transaction_macro_option_value_loss=float(
+                transaction_losses.macro_option_value_loss.detach().item()
+            ),
+            transaction_macro_option_actor_loss=float(
+                transaction_losses.macro_option_actor_loss.detach().item()
+            ),
+            transaction_macro_group_completion_loss=float(
+                transaction_losses.macro_group_completion_loss.detach().item()
+            ),
             transaction_traces=len(transaction_traces),
             transaction_effect_labels=transaction_losses.effect_labels,
             transaction_q_labels=transaction_losses.q_labels,
@@ -2948,6 +3022,39 @@ class VTraceLearner:
                 transaction_losses.advantage_policy_singleton_suppressed_labels
             ),
             transaction_advantage_mean=transaction_losses.advantage_mean,
+            transaction_macro_option_value_labels=(
+                transaction_losses.macro_option_value_labels
+            ),
+            transaction_macro_option_actor_labels=(
+                transaction_losses.macro_option_actor_labels
+            ),
+            transaction_macro_option_actor_lag_suppressed_labels=(
+                transaction_losses.macro_option_actor_lag_suppressed_labels
+            ),
+            transaction_macro_option_actor_drift_suppressed_labels=(
+                transaction_losses.macro_option_actor_drift_suppressed_labels
+            ),
+            transaction_macro_option_actor_singleton_suppressed_labels=(
+                transaction_losses.macro_option_actor_singleton_suppressed_labels
+            ),
+            transaction_macro_group_completion_labels=(
+                transaction_losses.macro_group_completion_labels
+            ),
+            transaction_macro_option_advantage_mean=(
+                transaction_losses.macro_option_advantage_mean
+            ),
+            transaction_macro_option_weight_mean=(
+                transaction_losses.macro_option_weight_mean
+            ),
+            transaction_macro_option_weight_max=(
+                transaction_losses.macro_option_weight_max
+            ),
+            transaction_macro_option_value_labels_by_surface=(
+                transaction_losses.macro_option_value_labels_by_surface
+            ),
+            transaction_macro_option_actor_labels_by_surface=(
+                transaction_losses.macro_option_actor_labels_by_surface
+            ),
             transaction_lifecycle_committed=(
                 transaction_losses.lifecycle_committed
             ),
@@ -3684,6 +3791,9 @@ class VTraceLearner:
                 entry_support_loss=zero,
                 smdp_q_loss=zero,
                 advantage_policy_loss=zero,
+                macro_option_value_loss=zero,
+                macro_option_actor_loss=zero,
+                macro_group_completion_loss=zero,
                 effect_labels=0,
                 q_labels=0,
                 pair_count=0,
@@ -3703,6 +3813,17 @@ class VTraceLearner:
                 advantage_policy_drift_suppressed_labels=0,
                 advantage_policy_singleton_suppressed_labels=0,
                 advantage_mean=0.0,
+                macro_option_value_labels=0,
+                macro_option_actor_labels=0,
+                macro_option_actor_lag_suppressed_labels=0,
+                macro_option_actor_drift_suppressed_labels=0,
+                macro_option_actor_singleton_suppressed_labels=0,
+                macro_group_completion_labels=0,
+                macro_option_advantage_mean=0.0,
+                macro_option_weight_mean=0.0,
+                macro_option_weight_max=0.0,
+                macro_option_value_labels_by_surface={},
+                macro_option_actor_labels_by_surface={},
                 lifecycle_committed=0,
                 lifecycle_cancelled=0,
                 lifecycle_unresolved=0,
@@ -3744,6 +3865,21 @@ class VTraceLearner:
         advantage_policy_q_error_suppressed_labels = 0
         advantage_policy_drift_suppressed_labels = 0
         advantage_policy_singleton_suppressed_labels = 0
+        macro_option_value_predictions: list[Tensor] = []
+        macro_option_value_targets: list[Tensor] = []
+        # ``surface -> [(selected macro log-probability, factual advantage)]``.
+        # Normalizing within the resource-opportunity surface prevents the much
+        # more frequent card-reward rows from setting the scale for scarce shop
+        # and rest-site decisions.
+        macro_option_actor_rows: dict[str, list[tuple[Tensor, Tensor]]] = {}
+        macro_group_completion_terms: list[Tensor] = []
+        macro_option_actor_lag_suppressed_labels = 0
+        macro_option_actor_drift_suppressed_labels = 0
+        macro_option_actor_singleton_suppressed_labels = 0
+        macro_option_advantages: list[float] = []
+        macro_option_weights: list[float] = []
+        macro_option_value_labels_by_surface: dict[str, int] = {}
+        macro_option_actor_labels_by_surface: dict[str, int] = {}
         entry_model_probabilities: list[float] = []
         entry_collection_model_probabilities: list[float] = []
         entry_behavior_probabilities: list[float] = []
@@ -3879,6 +4015,94 @@ class VTraceLearner:
                 advantage_policy_negative_labels += 1
             advantage_values.append(advantage)
 
+        def add_macro_option_target(
+            *,
+            output: RecurrentCandidateOutput,
+            snapshot: EncodedDecisionSnapshot,
+            action_index: int,
+            target: Tensor,
+            collection_model_log_probability: float,
+            provenance_policy_version: int,
+        ) -> None:
+            """Add one factual macro-value/AWR row without touching the trunk.
+
+            The baseline is a candidate-independent factual value at the same
+            resource-opportunity surface.  It is *not* an estimate for an
+            unexecuted alternative.  ``macro_policy_logits`` and
+            ``macro_option_value`` are structurally detached from the shared
+            state/policy features in the model, so this objective can recover a
+            saturated reject branch without displacing combat or target-choice
+            competence.
+            """
+
+            nonlocal macro_option_actor_lag_suppressed_labels
+            nonlocal macro_option_actor_drift_suppressed_labels
+            nonlocal macro_option_actor_singleton_suppressed_labels
+
+            if (
+                self.transaction_config.macro_option_value_weight <= 0.0
+                and self.transaction_config.macro_option_actor_weight <= 0.0
+            ):
+                return
+            if snapshot.macro_economic_surface_id <= 0:
+                # Old/non-economic rows must not be silently aliased onto a
+                # reviewed macro surface.
+                return
+            if output.macro_option_value is None or output.macro_policy_logits is None:
+                raise RuntimeError(
+                    "macro-option learner received a model without v47 heads"
+                )
+            detached_target = target.detach().float()
+            value_prediction = output.macro_option_value[0].float()
+            macro_option_value_predictions.append(value_prediction)
+            macro_option_value_targets.append(detached_target)
+            surface_name = _MACRO_SURFACE_NAME_BY_ID.get(
+                snapshot.macro_economic_surface_id
+            )
+            if surface_name is None:  # pragma: no cover - reviewed-ID invariant
+                raise RuntimeError("macro option target has an unknown surface ID")
+            macro_option_value_labels_by_surface[surface_name] = (
+                macro_option_value_labels_by_surface.get(surface_name, 0) + 1
+            )
+
+            if self.transaction_config.macro_option_actor_weight <= 0.0:
+                return
+            legal_indices = [
+                index
+                for index, enabled in enumerate(snapshot.action_mask)
+                if bool(enabled)
+            ]
+            if len(legal_indices) <= 1:
+                macro_option_actor_singleton_suppressed_labels += 1
+                return
+            lag = current_policy_version - provenance_policy_version
+            if lag < 0:
+                raise ValueError(
+                    "macro option target comes from a future policy version"
+                )
+            if lag > self.transaction_config.macro_option_max_policy_lag:
+                macro_option_actor_lag_suppressed_labels += 1
+                return
+            macro_log_policy = output.macro_policy_log_probabilities()[0].float()
+            current_log_probability = macro_log_policy[action_index].detach()
+            if (
+                abs(
+                    float(current_log_probability.item())
+                    - float(collection_model_log_probability)
+                )
+                > self.transaction_config.macro_option_max_log_probability_shift
+            ):
+                macro_option_actor_drift_suppressed_labels += 1
+                return
+            advantage = detached_target - value_prediction.detach()
+            macro_option_actor_rows.setdefault(
+                surface_name, []
+            ).append((macro_log_policy[action_index], advantage))
+            macro_option_actor_labels_by_surface[surface_name] = (
+                macro_option_actor_labels_by_surface.get(surface_name, 0) + 1
+            )
+            macro_option_advantages.append(float(advantage.item()))
+
         for trace_index, trace in enumerate(traces):
             configured_burn_in = self.transaction_config.burn_in_steps
             if trace.burn_in_steps > configured_burn_in:
@@ -3892,6 +4116,7 @@ class VTraceLearner:
                 dtype=next(self.model.parameters()).dtype,
             )[None, :]
             policy_targets = {item.step_index: item.target for item in factual_transaction_policy_targets(trace)}
+            group_policy_steps = set(factual_transaction_group_policy_steps(trace))
             trace_policy_losses: list[Tensor] = []
             entry_output: RecurrentCandidateOutput | None = None
             step_outputs: dict[int, RecurrentCandidateOutput] = {}
@@ -3935,6 +4160,32 @@ class VTraceLearner:
                 policy_log_probabilities = output.policy_log_probabilities()
                 selected_policy_log_probability = policy_log_probabilities[0, action_index]
                 selected_policy_log_probabilities[(trace_index, step_index)] = selected_policy_log_probability
+                if (
+                    step_index in group_policy_steps
+                    and self.transaction_config.macro_option_group_completion_weight
+                    > 0.0
+                ):
+                    if output.macro_policy_logits is None:
+                        raise RuntimeError(
+                            "macro group completion requires v47 macro policy logits"
+                        )
+                    macro_log_policy = output.macro_policy_log_probabilities()[0]
+                    selected_branch = output.policy_branch_ids[0, action_index]
+                    in_selected_branch = (
+                        output.policy_branch_ids[0] == selected_branch
+                    ) & output.action_mask[0]
+                    if not bool(in_selected_branch.any().item()):  # pragma: no cover
+                        raise RuntimeError(
+                            "committed transaction lost its selected semantic branch"
+                        )
+                    # This teaches only "continue through Select".  Which card
+                    # to upgrade/remove remains wholly owned by factual AWR/Q.
+                    macro_group_completion_terms.append(
+                        -torch.logsumexp(
+                            macro_log_policy.masked_select(in_selected_branch),
+                            dim=0,
+                        )
+                    )
                 policy_target = policy_targets.get(step_index)
                 if policy_target is TransactionPolicyTarget.PREFER:
                     trace_policy_losses.append(-selected_policy_log_probability)
@@ -4057,7 +4308,10 @@ class VTraceLearner:
                     if not lifecycle.option_target_observed:
                         if (
                             self.transaction_config.lifecycle_smdp_horizon
-                            == "next_rest_or_act"
+                            in {
+                                "next_rest_or_act",
+                                "next_resource_opportunity",
+                            }
                         ):
                             # A committed transaction near a censored episode
                             # end may never observe the requested next macro
@@ -4113,6 +4367,18 @@ class VTraceLearner:
                         ].float()
                     )
                     smdp_q_targets.append(smdp_target.detach())
+                    add_macro_option_target(
+                        output=entry_output,
+                        snapshot=entry_snapshot,
+                        action_index=entry_action_index,
+                        target=smdp_target,
+                        collection_model_log_probability=trace.steps[
+                            lifecycle.entry_step_index
+                        ].model_log_probability,
+                        provenance_policy_version=(
+                            lifecycle.entry_policy_version
+                        ),
+                    )
                     add_advantage_policy_target(
                         output=entry_output,
                         snapshot=entry_snapshot,
@@ -4162,6 +4428,16 @@ class VTraceLearner:
                             ]
                         )
                         q_targets.append(float(step_target.detach().item()))
+                        add_macro_option_target(
+                            output=step_output,
+                            snapshot=step.snapshot,
+                            action_index=step.action_index,
+                            target=step_target,
+                            collection_model_log_probability=(
+                                step.model_log_probability
+                            ),
+                            provenance_policy_version=trace.policy_version,
+                        )
                         add_advantage_policy_target(
                             output=step_output,
                             snapshot=step.snapshot,
@@ -4237,6 +4513,56 @@ class VTraceLearner:
             if advantage_policy_terms
             else zero
         )
+        macro_option_value_loss = (
+            F.smooth_l1_loss(
+                torch.stack(macro_option_value_predictions).float(),
+                torch.stack(macro_option_value_targets).float(),
+            )
+            if macro_option_value_predictions
+            else zero
+        )
+        macro_option_actor_surface_terms: list[Tensor] = []
+        macro_option_actor_label_count = 0
+        for rows in macro_option_actor_rows.values():
+            surface_log_probabilities = torch.stack(
+                [log_probability for log_probability, _ in rows]
+            ).float()
+            surface_advantages = torch.stack(
+                [advantage for _, advantage in rows]
+            ).float()
+            log_weights = (
+                surface_advantages
+                / self.transaction_config.macro_option_actor_temperature
+            ).clamp(
+                min=-self.transaction_config.macro_option_actor_log_weight_clip,
+                max=self.transaction_config.macro_option_actor_log_weight_clip,
+            )
+            weights = torch.exp(log_weights)
+            # Preserve the absolute factual-advantage scale, including for a
+            # surface represented by only one row.  Dividing by the observed
+            # mean would turn every singleton into weight 1 and erase exactly
+            # the state-level signal this AWR bridge exists to provide.
+            # Instead, average rows *within* each reviewed surface and then
+            # average surfaces below.  A busy card-reward stream therefore
+            # cannot overwhelm a scarce rest or shop opportunity by count.
+            macro_option_actor_surface_terms.append(
+                (-weights.detach() * surface_log_probabilities).mean()
+            )
+            macro_option_actor_label_count += len(rows)
+            macro_option_weights.extend(
+                float(item)
+                for item in weights.detach().cpu().tolist()
+            )
+        macro_option_actor_loss = (
+            torch.stack(macro_option_actor_surface_terms).mean()
+            if macro_option_actor_surface_terms
+            else zero
+        )
+        macro_group_completion_loss = (
+            torch.stack(macro_group_completion_terms).mean()
+            if macro_group_completion_terms
+            else zero
+        )
 
         def mean_or_zero(values: list[float]) -> float:
             return float(sum(values) / len(values)) if values else 0.0
@@ -4250,6 +4576,9 @@ class VTraceLearner:
             entry_support_loss=entry_support_loss,
             smdp_q_loss=smdp_q_loss,
             advantage_policy_loss=advantage_policy_loss,
+            macro_option_value_loss=macro_option_value_loss,
+            macro_option_actor_loss=macro_option_actor_loss,
+            macro_group_completion_loss=macro_group_completion_loss,
             effect_labels=len(effect_targets),
             q_labels=len(q_targets),
             pair_count=len(pairs),
@@ -4285,6 +4614,29 @@ class VTraceLearner:
                 advantage_policy_singleton_suppressed_labels
             ),
             advantage_mean=mean_or_zero(advantage_values),
+            macro_option_value_labels=len(macro_option_value_predictions),
+            macro_option_actor_labels=macro_option_actor_label_count,
+            macro_option_actor_lag_suppressed_labels=(
+                macro_option_actor_lag_suppressed_labels
+            ),
+            macro_option_actor_drift_suppressed_labels=(
+                macro_option_actor_drift_suppressed_labels
+            ),
+            macro_option_actor_singleton_suppressed_labels=(
+                macro_option_actor_singleton_suppressed_labels
+            ),
+            macro_group_completion_labels=len(macro_group_completion_terms),
+            macro_option_advantage_mean=mean_or_zero(macro_option_advantages),
+            macro_option_weight_mean=mean_or_zero(macro_option_weights),
+            macro_option_weight_max=(
+                max(macro_option_weights) if macro_option_weights else 0.0
+            ),
+            macro_option_value_labels_by_surface=dict(
+                sorted(macro_option_value_labels_by_surface.items())
+            ),
+            macro_option_actor_labels_by_surface=dict(
+                sorted(macro_option_actor_labels_by_surface.items())
+            ),
             lifecycle_committed=lifecycle_counts[
                 TransactionLifecycleOutcome.COMMITTED
             ],

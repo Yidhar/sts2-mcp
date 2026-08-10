@@ -384,11 +384,16 @@ class TransactionLearningConfig:
     # hand-authored forge/removal bonus.
     lifecycle_smdp_q_weight: float = 0.0
     # The legacy target stops at the transaction exit and bootstraps from the
-    # immediately following state.  ``next_rest_or_act`` instead uses only the
-    # factual reward sequence through the next rest-site arrival, Act boundary,
-    # or authoritative terminal and deliberately sets the bootstrap discount
-    # to zero at that semantic boundary.
-    lifecycle_smdp_horizon: Literal["transaction_exit", "next_rest_or_act"] = (
+    # immediately following state. ``next_rest_or_act`` is the legacy
+    # rest-only extension. ``next_resource_opportunity`` instead uses only the
+    # factual reward sequence through the next opportunity of the same
+    # reviewed resource family, Act boundary, or authoritative terminal and
+    # deliberately sets the bootstrap discount to zero there.
+    lifecycle_smdp_horizon: Literal[
+        "transaction_exit",
+        "next_rest_or_act",
+        "next_resource_opportunity",
+    ] = (
         "transaction_exit"
     )
     # A calibrated factual option-Q target can directly move the shared actor
@@ -403,6 +408,19 @@ class TransactionLearningConfig:
     lifecycle_advantage_q_error_gate: float = 0.25
     lifecycle_advantage_max_policy_lag: int = 128
     lifecycle_advantage_max_log_probability_shift: float = 1.0
+    # V47 macro economy path.  The factual state baseline replaces v46's
+    # unexecuted-alternative Q baseline.  AWR uses the observed option return
+    # and a detached candidate-independent value; both actor and value heads
+    # are isolated from the shared tactical trunk by model construction.
+    macro_option_value_weight: float = 0.0
+    macro_option_actor_weight: float = 0.0
+    macro_option_actor_temperature: float = 0.25
+    macro_option_actor_log_weight_clip: float = 2.0
+    macro_option_max_policy_lag: int = 128
+    macro_option_max_log_probability_shift: float = 2.0
+    # Completed select/confirm paths teach only the forward semantic branch as
+    # a group.  Target-card preference remains owned by factual AWR/Q.
+    macro_option_group_completion_weight: float = 0.0
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -434,6 +452,7 @@ class TransactionLearningConfig:
         for name in (
             "lifecycle_advantage_start_update",
             "lifecycle_advantage_max_policy_lag",
+            "macro_option_max_policy_lag",
         ):
             _require_int(
                 getattr(self, name),
@@ -452,6 +471,12 @@ class TransactionLearningConfig:
             "lifecycle_advantage_clip",
             "lifecycle_advantage_q_error_gate",
             "lifecycle_advantage_max_log_probability_shift",
+            "macro_option_value_weight",
+            "macro_option_actor_weight",
+            "macro_option_actor_temperature",
+            "macro_option_actor_log_weight_clip",
+            "macro_option_max_log_probability_shift",
+            "macro_option_group_completion_weight",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",
@@ -469,10 +494,11 @@ class TransactionLearningConfig:
         if self.lifecycle_smdp_horizon not in {
             "transaction_exit",
             "next_rest_or_act",
+            "next_resource_opportunity",
         }:
             raise ValueError(
                 "transaction_learning.lifecycle_smdp_horizon must be "
-                "transaction_exit or next_rest_or_act"
+                "transaction_exit, next_rest_or_act or next_resource_opportunity"
             )
         if self.lifecycle_advantage_temperature <= 0.0:
             raise ValueError(
@@ -482,10 +508,21 @@ class TransactionLearningConfig:
             raise ValueError(
                 "transaction_learning.lifecycle_advantage_clip must be positive"
             )
+        if self.macro_option_actor_temperature <= 0.0:
+            raise ValueError(
+                "transaction_learning.macro_option_actor_temperature must be positive"
+            )
+        if self.macro_option_actor_log_weight_clip <= 0.0:
+            raise ValueError(
+                "transaction_learning.macro_option_actor_log_weight_clip must be positive"
+            )
         if not self.enabled and (
             self.lifecycle_entry_support_weight > 0.0
             or self.lifecycle_smdp_q_weight > 0.0
             or self.lifecycle_advantage_policy_weight > 0.0
+            or self.macro_option_value_weight > 0.0
+            or self.macro_option_actor_weight > 0.0
+            or self.macro_option_group_completion_weight > 0.0
         ):
             raise ValueError(
                 "transaction lifecycle losses require transaction_learning.enabled"
@@ -1049,9 +1086,8 @@ class TransactionExplorationConfig:
             operation = canonical_transaction_operation(raw_operation)
             if operation not in TRANSACTION_EXPLORATION_OPERATIONS:
                 raise ValueError(
-                    "transaction_exploration.operations supports only the reviewed "
-                    "'upgrade', 'remove', 'reward_skip' and 'relic_purchase' "
-                    "operation families"
+                    "transaction_exploration.operations supports only the "
+                    "reviewed exploration registry"
                 )
             if operation in normalized_operations:
                 raise ValueError(f"transaction_exploration.operations contains duplicate operation {operation!r}")
@@ -1079,8 +1115,8 @@ class TransactionExplorationConfig:
                 raise ValueError("enabled transaction exploration requires a positive entry_epsilon_floor")
             # Completion guidance only has meaning for operations that open a
             # multi-step selection transaction. Single-decision entrances
-            # (reward_skip, relic_purchase) resolve at the entry action, so a
-            # pure single-decision roster keeps guidance at exactly zero.
+            # (for example reward_skip or shop_leave) resolve at the entry
+            # action, so a pure single-decision roster keeps guidance at zero.
             selection_operations = TRANSACTION_GUIDANCE_OPERATIONS & set(
                 self.operations
             )

@@ -32,6 +32,12 @@ import numpy as np
 import torch
 
 from sts2_rl.models.grounded_candidate import (
+    MACRO_ECONOMIC_SURFACE_CARD_REWARD,
+    MACRO_ECONOMIC_SURFACE_NONE,
+    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
+    MACRO_ECONOMIC_SURFACE_REST,
+    MACRO_ECONOMIC_SURFACE_SHOP,
+    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
     MIN_TOKEN_FEATURE_DIM,
     GroundedCandidateBatch,
 )
@@ -705,7 +711,7 @@ _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
 # remain stable, but candidate transaction semantics differ. Exact resume must
 # therefore fail closed; explicitly reviewed model-parameter initialization
 # from the pinned V13 identity remains shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v15"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v16"
 
 # This table is executable encoder semantics, not parser convenience. Keep it
 # immutable and include it verbatim in the grounding identity payload so any
@@ -786,6 +792,12 @@ def _grounding_encoding_contract() -> dict[str, Any]:
         ],
         "upgrade_preview_transport": (
             "native-card-nested-recursive-translation-root-lift-and-world-selection-v1"
+        ),
+        "candidate_transaction_contract": (
+            "shop-proceed-is-clean-leave-and-reviewed-resource-families-v1"
+        ),
+        "macro_economic_surface_contract": (
+            "none-rest-shop-card-reward-upgrade-selection-removal-selection-v1"
         ),
         "snapshot_version": ENCODED_DECISION_SNAPSHOT_VERSION,
     }
@@ -2366,7 +2378,23 @@ def _canonical_model_observation(observation: Mapping[str, Any]) -> dict[str, An
         raw_selection.setdefault("operation_type", "upgrade")
         raw_selection.setdefault("source_zone", "Deck")
         raw_selection.setdefault("destination_zone", "Deck")
-    raw_selection.update(raw_decision)
+    # ``decision`` is direct selection state in the compact/live DTO, while
+    # canonical journals and a few simulator paths wrap it as
+    # ``decision.selection``.  Accept both spellings, but never let the
+    # wrapper object hide the operation type used by reviewed macro-surface
+    # routing.
+    nested_decision_selection = raw_decision.get("selection")
+    if isinstance(nested_decision_selection, Mapping):
+        raw_selection.update(nested_decision_selection)
+        raw_selection.update(
+            {
+                key: value
+                for key, value in raw_decision.items()
+                if key != "selection"
+            }
+        )
+    else:
+        raw_selection.update(raw_decision)
     # Card/hand prompts can occur inside combat while the top-level phase stays
     # ``combat``.  Presence of the explicit selection DTO, rather than the
     # screen phase, determines whether selection state is model-visible.
@@ -2714,7 +2742,16 @@ def _candidate_transaction(
     transaction: dict[str, Any] = {"type": "transaction"}
 
     if model_kind == "shop":
-        if normalized_variant in {"back", "leave", "skip", "shop_skip"}:
+        if normalized_variant in {
+            "back",
+            "continue",
+            "done",
+            "exit",
+            "leave",
+            "proceed",
+            "skip",
+            "shop_skip",
+        }:
             transaction.update(
                 operation_type="leave_shop",
                 resource="gold",
@@ -3102,12 +3139,17 @@ class GroundedObservationEncoder:
             references.append(group.reference)
         bindings = self._entity_binding_allocation(world_tokens, candidates)
         domain_id = self._domain_id(model_observation)
+        macro_economic_surface_id = self._macro_economic_surface_id(
+            model_observation,
+            action_groups,
+        )
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         snapshot = self._snapshot(
             world_tokens,
             candidates,
             bindings=bindings,
             domain_id=domain_id,
+            macro_economic_surface_id=macro_economic_surface_id,
             encoding_fingerprint=fingerprint,
         )
         batch = self.collate_snapshots((snapshot,), device=device)
@@ -3268,6 +3310,7 @@ class GroundedObservationEncoder:
         *,
         bindings: _EntityBindingAllocation,
         domain_id: int,
+        macro_economic_surface_id: int,
         encoding_fingerprint: str,
     ) -> EncodedDecisionSnapshot:
         def definition_binding(value: str) -> int:
@@ -3368,7 +3411,55 @@ class GroundedObservationEncoder:
                 dtype=np.bool_,
             ),
             domain_id=domain_id,
+            macro_economic_surface_id=macro_economic_surface_id,
         )
+
+    @staticmethod
+    def _macro_economic_surface_id(
+        observation: Mapping[str, Any],
+        action_groups: Sequence[Any],
+    ) -> int:
+        """Classify only the reviewed economic protocol surface.
+
+        This ID is an architectural routing fact for the isolated residual
+        head.  It contains no item/card identity, HP threshold, price rule or
+        action preference.
+        """
+
+        raw_decision = observation.get("decision")
+        decision = raw_decision if isinstance(raw_decision, Mapping) else {}
+        raw_selection = decision.get("selection")
+        selection = (
+            raw_selection if isinstance(raw_selection, Mapping) else {}
+        )
+        selection_operation = _normalize_key(
+            selection.get("operation_type", "")
+        )
+        if any(
+            fragment in selection_operation
+            for fragment in ("upgrade", "forge", "smith")
+        ):
+            return MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION
+        if any(
+            fragment in selection_operation
+            for fragment in ("remove", "card_removal")
+        ):
+            return MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION
+        if isinstance(observation.get("shop"), Mapping):
+            return MACRO_ECONOMIC_SURFACE_SHOP
+        if isinstance(observation.get("rest_site"), Mapping):
+            return MACRO_ECONOMIC_SURFACE_REST
+
+        action_kinds = {
+            _normalize_key(
+                group.prototype.get("model_action_kind", "")
+            )
+            for group in action_groups
+            if isinstance(group.prototype, Mapping)
+        }
+        if "card_reward" in action_kinds:
+            return MACRO_ECONOMIC_SURFACE_CARD_REWARD
+        return MACRO_ECONOMIC_SURFACE_NONE
 
     def _domain_id(self, observation: Mapping[str, Any]) -> int:
         if bool(observation.get("terminated", False)):

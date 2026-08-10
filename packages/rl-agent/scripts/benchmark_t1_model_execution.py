@@ -150,6 +150,9 @@ def _synthetic_batch(
         world=world,
         candidates=candidates,
         domain_ids=_ids((batch_size,), cfg.domain_count, device=device),
+        macro_economic_surface_ids=torch.zeros(
+            (batch_size,), dtype=torch.long, device=device
+        ),
     )
 
 

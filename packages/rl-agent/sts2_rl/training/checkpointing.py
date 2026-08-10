@@ -79,6 +79,7 @@ _LONG_HORIZON_VALUE_HEAD_ABI = "sts2-long-horizon-value-heads-v1"
 _EPISODIC_TARGET_ABI = "sts2-episodic-task-targets-one-terminal-unit-v2"
 _LIVENESS_COST_HEAD_ABI = "sts2-liveness-cost-heads-v1"
 _COMBAT_HP_LOSS_HEAD_ABI = "sts2-combat-hp-loss-value-head-v1"
+_MACRO_OPTION_HEAD_ABI = "sts2-macro-option-value-residual-policy-heads-v1"
 _CHECKPOINT_ROLES = frozenset(
     {
         "ordinary",
@@ -105,6 +106,12 @@ _TRANSACTION_HEAD_PREFIXES = (
     "candidate_effect_head.",
     "selection_delta_head.",
     "transaction_q_head.",
+)
+_MACRO_OPTION_HEAD_PREFIXES = (
+    "macro_surface_candidate_embedding.",
+    "macro_surface_state_embedding.",
+    "macro_policy_head.",
+    "macro_option_value_head.",
 )
 _TRANSACTION_HEAD_SUFFIXES = frozenset(
     {
@@ -225,6 +232,14 @@ _V15_ENCODING_IDENTITY = {
     # unchanged, but exact resume cannot reinterpret queued/replay snapshots.
     "fingerprint_sha256": "d5f84bc31014e7e043934af0fc6b0f1f40092fc14a96478845d38fa08bbc9aee",
 }
+_V16_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v16",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    # V16 adds a decision-row macro-economic surface ID.  Learned tensor
+    # dimensions stay fixed, but replay/snapshot semantics do not.
+    "fingerprint_sha256": "3cc73fd8910b005702ee4b408116b18b1c08a3d810f7301641c09fa3957ca70a",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V12_ENCODING_IDENTITY,
@@ -237,6 +252,10 @@ _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V14_ENCODING_IDENTITY,
         _V15_ENCODING_IDENTITY,
+    ),
+    (
+        _V15_ENCODING_IDENTITY,
+        _V16_ENCODING_IDENTITY,
     ),
 )
 
@@ -1113,6 +1132,29 @@ def _validate_metadata(
             raise ValueError(
                 "checkpoint contains liveness heads while failure-credit " f"learning is disabled in {state_spec_name}"
             )
+        macro_state_keys = {
+            key
+            for key in raw_state_spec
+            if isinstance(key, str) and key.startswith(_MACRO_OPTION_HEAD_PREFIXES)
+        }
+        macro_prefixes_present = {
+            prefix
+            for prefix in _MACRO_OPTION_HEAD_PREFIXES
+            if any(key.startswith(prefix) for key in macro_state_keys)
+        }
+        if (
+            config.transaction_learning.enabled
+            and macro_prefixes_present != set(_MACRO_OPTION_HEAD_PREFIXES)
+        ):
+            raise ValueError(
+                "exact-resume checkpoint has an incomplete macro-option-head "
+                f"family in {state_spec_name}"
+            )
+        if not config.transaction_learning.enabled and macro_state_keys:
+            raise ValueError(
+                "checkpoint contains macro-option heads while transaction "
+                f"learning is disabled in {state_spec_name}"
+            )
     if liveness_enabled:
         if metadata.get("failure_credit_replay_enabled") is not True:
             raise ValueError("failure-credit learning checkpoint has no replay-v5 marker")
@@ -1139,6 +1181,10 @@ def _validate_metadata(
             raise ValueError("transaction-enabled checkpoint has no lifecycle-evidence ABI marker")
         if not isinstance(metadata.get("transaction_replay_spec"), dict):
             raise ValueError("transaction-enabled checkpoint has no replay specification")
+        if metadata.get("macro_option_head_abi") != _MACRO_OPTION_HEAD_ABI:
+            raise ValueError(
+                "transaction-enabled checkpoint has no v47 macro-option head ABI"
+            )
     else:
         if metadata.get("transaction_lifecycle_abi") not in (None,):
             raise ValueError("non-transaction checkpoint cannot contain a lifecycle-evidence ABI marker")
@@ -1436,6 +1482,11 @@ def save_training_checkpoint(
             "sdpa_backend": recorded_sdpa,
             "execution_provenance": checkpoint_execution_provenance,
             "transaction_heads_enabled": config.transaction_learning.enabled,
+            "macro_option_head_abi": (
+                _MACRO_OPTION_HEAD_ABI
+                if config.transaction_learning.enabled
+                else None
+            ),
             "transaction_lifecycle_abi": (
                 TRANSACTION_LIFECYCLE_VERSION if config.transaction_learning.enabled else None
             ),
@@ -1662,6 +1713,7 @@ def initialize_model_from_checkpoint(
         state,
         target_state=target_state,
         allow_missing_transaction_heads=config.transaction_learning.enabled,
+        allow_missing_macro_option_heads=config.transaction_learning.enabled,
         allow_source_transaction_head_drop=(not config.transaction_learning.enabled),
         allow_missing_long_horizon_heads=(validated.metadata.get("format") in _LONG_HORIZON_MISSING_FORMATS),
         allow_missing_liveness_heads=config.failure_credit.learning_enabled,
@@ -1685,6 +1737,7 @@ def _model_parameter_initialization_state(
     *,
     target_state: dict[str, Any],
     allow_missing_transaction_heads: bool,
+    allow_missing_macro_option_heads: bool = False,
     allow_source_transaction_head_drop: bool = False,
     allow_missing_long_horizon_heads: bool = False,
     allow_missing_liveness_heads: bool = False,
@@ -1712,6 +1765,12 @@ def _model_parameter_initialization_state(
         raise TypeError("model initialization source must contain named tensors")
     source_transaction_heads = {key for key in source_state if key.startswith(_TRANSACTION_HEAD_PREFIXES)}
     target_transaction_heads = {key for key in target_state if key.startswith(_TRANSACTION_HEAD_PREFIXES)}
+    source_macro_option_heads = {
+        key for key in source_state if key.startswith(_MACRO_OPTION_HEAD_PREFIXES)
+    }
+    target_macro_option_heads = {
+        key for key in target_state if key.startswith(_MACRO_OPTION_HEAD_PREFIXES)
+    }
     if target_transaction_heads:
         target_transaction_suffixes = {
             prefix: {key.removeprefix(prefix) for key in target_transaction_heads if key.startswith(prefix)}
@@ -1734,6 +1793,35 @@ def _model_parameter_initialization_state(
                 "of the source-only transaction-head tensors"
             )
         permitted_source_only.update(source_transaction_heads)
+    target_macro_prefixes = {
+        prefix
+        for prefix in _MACRO_OPTION_HEAD_PREFIXES
+        if any(key.startswith(prefix) for key in target_macro_option_heads)
+    }
+    if target_macro_option_heads and target_macro_prefixes != set(
+        _MACRO_OPTION_HEAD_PREFIXES
+    ):
+        raise ValueError(
+            "model initialization target has an incomplete macro-option-head family"
+        )
+    source_macro_prefixes = {
+        prefix
+        for prefix in _MACRO_OPTION_HEAD_PREFIXES
+        if any(key.startswith(prefix) for key in source_macro_option_heads)
+    }
+    if source_macro_option_heads and source_macro_prefixes != set(
+        _MACRO_OPTION_HEAD_PREFIXES
+    ):
+        raise ValueError(
+            "model initialization source has an incomplete macro-option-head family"
+        )
+    if source_macro_option_heads and not target_macro_option_heads:
+        if not allow_source_transaction_head_drop:
+            raise ValueError(
+                "model initialization source contains macro-option heads while "
+                "the target transaction learner is disabled"
+            )
+        permitted_source_only.update(source_macro_option_heads)
 
     unexpected = sorted(set(source_state) - set(target_state) - permitted_source_only)
     if unexpected:
@@ -1767,6 +1855,18 @@ def _model_parameter_initialization_state(
                 "model initialization source must contain either all or none " "of the transaction-head tensors"
             )
         permitted_missing.update(target_transaction_heads)
+
+    missing_macro_option = missing & target_macro_option_heads
+    if missing_macro_option:
+        if (
+            not allow_missing_macro_option_heads
+            or missing_macro_option != target_macro_option_heads
+        ):
+            raise ValueError(
+                "model initialization source must contain either all or none "
+                "of the macro-option-head tensors"
+            )
+        permitted_missing.update(target_macro_option_heads)
 
     missing_long_horizon = missing & target_long_horizon_heads
     if missing_long_horizon:

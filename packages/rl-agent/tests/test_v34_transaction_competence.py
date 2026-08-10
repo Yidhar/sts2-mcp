@@ -879,7 +879,7 @@ def test_completion_ce_excludes_card_target_steps_in_verified_lifecycles(
         resources.close()
 
 
-def test_entry_classifier_recognizes_single_decision_entrances() -> None:
+def test_entry_classifier_recognizes_reviewed_macro_economy_operations() -> None:
     from sts2_rl.training.collector import _transaction_entry_operation
 
     assert _transaction_entry_operation({"kind": "skip_card_reward"}) == "reward_skip"
@@ -904,15 +904,30 @@ def test_entry_classifier_recognizes_single_decision_entrances() -> None:
         _transaction_entry_operation(
             {"model_action_kind": "shop", "item": {"category": "card"}}
         )
-        == ""
+        == "card_purchase"
     )
     assert (
         _transaction_entry_operation(
             {"model_action_kind": "shop", "item": {"category": "potion"}}
         )
-        == ""
+        == "potion_purchase"
     )
-    assert _transaction_entry_operation({"kind": "select_card_reward"}) == ""
+    assert (
+        _transaction_entry_operation(
+            {"model_action_kind": "shop", "kind": "proceed"}
+        )
+        == "shop_leave"
+    )
+    assert (
+        _transaction_entry_operation({"kind": "select_card_reward"})
+        == "reward_take"
+    )
+    assert (
+        _transaction_entry_operation(
+            {"transaction": {"operation_type": "purchase_item"}}
+        )
+        == "shop_purchase"
+    )
 
 
 def test_exploration_config_accepts_single_decision_operations() -> None:
