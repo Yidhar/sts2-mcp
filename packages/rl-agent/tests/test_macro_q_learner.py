@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+
+from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
+from sts2_rl.encoding.snapshot import sparse_token_table
+from sts2_rl.macro import (
+    MacroEpisode,
+    MacroQConfig,
+    MacroQLearner,
+    MacroSequenceReplay,
+    MacroStep,
+    n_step_targets,
+    summarize_counts,
+)
+
+
+def _snapshot(*, candidate_count: int = 3) -> EncodedDecisionSnapshot:
+    config = GroundedEncodingConfig(
+        max_world_tokens=4,
+        max_candidates=4,
+        max_candidate_local_tokens=2,
+    )
+    feature_dim = config.feature_dim
+    world = tuple([1.0] + [0.0] * (feature_dim - 1))
+    candidate_features = tuple(
+        tuple([0.0] * (index + 1) + [1.0] + [0.0] * (feature_dim - index - 2))
+        for index in range(candidate_count)
+    )
+    candidate_ids = tuple(
+        (2 + index, 2, 2, 3, 3, 3, 3, 2, 2, 4, 4, 4, 4) for index in range(candidate_count)
+    )
+    return EncodedDecisionSnapshot(
+        config=config,
+        encoding_fingerprint="0" * 64,
+        world=sparse_token_table(
+            features=(world,),
+            ids=((2, 2, 2, 2, 2, 2, 2, 2, 0),),
+            feature_dim=feature_dim,
+            id_width=9,
+        ),
+        candidates=sparse_token_table(
+            features=candidate_features,
+            ids=candidate_ids,
+            feature_dim=feature_dim,
+            id_width=13,
+        ),
+        locals=sparse_token_table(
+            features=(),
+            ids=(),
+            feature_dim=feature_dim,
+            id_width=9,
+        ),
+        local_offsets=np.zeros(candidate_count + 1, dtype=np.uint32),
+        action_mask=np.ones(candidate_count, dtype=np.bool_),
+        domain_id=1,
+    )
+
+
+def _step(
+    *,
+    action_index: int = 0,
+    reward: float = 0.0,
+    discount: float = 1.0,
+    terminal: bool = False,
+    surface: str = "rest",
+    branch: str = "rest",
+) -> MacroStep:
+    return MacroStep(
+        snapshot=_snapshot(),
+        action_index=action_index,
+        reward=reward,
+        discount=discount,
+        terminal=terminal,
+        surface=surface,
+        branch=branch,
+    )
+
+
+def test_transition_contract_rejects_illegal_and_terminal_bootstrap() -> None:
+    with pytest.raises(ValueError, match="outside its candidate set"):
+        _step(action_index=7)
+    with pytest.raises(ValueError, match="never bootstrap"):
+        MacroStep(
+            snapshot=_snapshot(),
+            action_index=0,
+            reward=0.0,
+            discount=0.5,
+            terminal=True,
+            surface="rest",
+            branch="rest",
+        )
+    episode = MacroEpisode(
+        episode_id="ep-1",
+        steps=(_step(branch="smith"), _step(terminal=True, discount=0.0)),
+    )
+    counts = summarize_counts((episode,))
+    assert counts["executed_counts"] == {"rest:rest": 1, "rest:smith": 1}
+
+
+def test_n_step_targets_respect_clock_and_terminal_cut() -> None:
+    rewards = (1.0, 2.0, 4.0)
+    discounts = (0.5, 0.0, 1.0)
+    bootstraps = (10.0, 20.0, 30.0)
+    targets = n_step_targets(rewards, discounts, bootstraps, n_step=3)
+    # t=0: 1.0 + 0.5*2.0, then discount hits 0.0 at t=1 -> terminal cut.
+    assert targets[0] == pytest.approx(2.0)
+    # t=1: terminal transition -> reward only.
+    assert targets[1] == pytest.approx(2.0)
+    # t=2: last transition bootstraps through its own discount.
+    assert targets[2] == pytest.approx(4.0 + 30.0)
+
+
+def test_replay_bounds_priorities_and_eviction() -> None:
+    replay = MacroSequenceReplay(capacity_episodes=2, burn_in=1, window_length=4, seed=7)
+    for index in range(3):
+        replay.put(
+            MacroEpisode(
+                episode_id=f"ep-{index}",
+                steps=tuple(_step() for _ in range(6)),
+            )
+        )
+    assert len(replay) == 2  # oldest evicted
+    windows = replay.sample(4)
+    assert windows
+    replay.update_priority(windows[0].window_id, 3.0)
+    metrics = replay.metrics()
+    assert metrics["episodes"] == 2
+    assert metrics["prioritized_windows"] == 1
+    with pytest.raises(ValueError, match="already stored"):
+        replay.put(MacroEpisode(episode_id="ep-2", steps=(_step(),)))
+
+
+class _FakeQ:
+    """Minimal candidate-Q pair: online trainable, target snapshot."""
+
+    def __init__(self) -> None:
+        self.online = torch.nn.Parameter(torch.zeros(4))
+        self.target = torch.zeros(4)
+
+    def forward_online(self, step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(step.snapshot.action_mask)
+        return self.online[:count], hidden
+
+    def forward_target(self, step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(step.snapshot.action_mask)
+        return self.target[:count], hidden
+
+    def sync(self) -> None:
+        self.target = self.online.detach().clone()
+
+
+def test_double_q_learner_converges_and_reports_ec4_counts() -> None:
+    replay = MacroSequenceReplay(capacity_episodes=8, burn_in=0, window_length=2, seed=3)
+    # One-decision episodes: action 1 pays +1 and terminates.
+    for index in range(4):
+        replay.put(
+            MacroEpisode(
+                episode_id=f"ep-{index}",
+                steps=(
+                    _step(
+                        action_index=1,
+                        reward=1.0,
+                        discount=0.0,
+                        terminal=True,
+                        surface="reward",
+                        branch="skip",
+                    ),
+                ),
+            )
+        )
+    fake = _FakeQ()
+    learner = MacroQLearner(
+        online_parameters=[fake.online],
+        forward_online=fake.forward_online,
+        forward_target=fake.forward_target,
+        sync_target=fake.sync,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(
+            n_step=3,
+            learning_rate=0.2,
+            target_update_interval=5,
+            sample_windows=2,
+        ),
+    )
+    for _ in range(60):
+        metrics = learner.update()
+    assert float(fake.online[1].item()) == pytest.approx(1.0, abs=0.05)
+    # The executed action got its gradient even though it was never greedy
+    # at initialization — the anti-absorption property, by construction.
+    assert metrics["executed_counts"]["reward:skip"] > 0
+    assert metrics["target_syncs"] >= 1
+    assert metrics["loss"] < 0.1
