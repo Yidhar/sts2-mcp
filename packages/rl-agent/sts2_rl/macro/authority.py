@@ -94,6 +94,11 @@ class MacroCollectionAuthority:
         # Stage-4 combat challenger: the authority additionally owns the
         # native-atomic combat view instead of declining it to the champion.
         self.own_combat = bool(own_combat)
+        # Diagnostic-only decision log (never a training input): one row per
+        # owned decision with the observation facts needed to inspect
+        # state-conditioning behaviorally (reset doc §11 items 2/4).
+        self.record_decisions = False
+        self.decision_log: list[dict[str, Any]] = []
         self._rng = np.random.default_rng(seed)
         self._hidden: Any = None
         self._episode_id: str | None = None
@@ -215,6 +220,20 @@ class MacroCollectionAuthority:
             self.declined += 1
             return None
         native_index, candidate = chosen_candidate
+        if self.record_decisions:
+            player = observation.get("player")
+            player = player if isinstance(player, Mapping) else {}
+            self.decision_log.append(
+                {
+                    "surface": decision.surface,
+                    "branch": candidate.branch,
+                    "floor": floor,
+                    "hp": player.get("hp"),
+                    "max_hp": player.get("max_hp"),
+                    "gold": player.get("gold"),
+                    "branches_offered": list(decision.branches),
+                }
+            )
         self._close_open(terminal=False, floor=floor)
         self._open_transition(
             snapshot=snapshot,

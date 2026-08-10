@@ -88,6 +88,8 @@ def _run_arm(
     for seed in seeds:
         if authority is not None:
             authority.begin_episode(f"stage3-{arm}-{seed}")
+            authority.record_decisions = True
+            authority.decision_log = []
         episode = resources.collector.collect_episode(
             epsilon=0.0,
             deterministic=True,
@@ -107,6 +109,7 @@ def _run_arm(
                 "declined": authority.declined,
                 "mechanical_dispatches": authority.mechanical_dispatches,
                 "decision_counts": surface_counts,
+                "decision_log": list(authority.decision_log),
             }
         row = {
             "event": "stage3_joined_eval_episode",
