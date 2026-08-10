@@ -5,6 +5,13 @@ code.  It defines factual identities and transition evidence; training policy
 is layered on top by later integration.
 """
 
+from .clock import (
+    DECISION_CLOCK_BASE,
+    DECISION_CLOCK_CONTRACT_VERSION,
+    DecisionClockTick,
+    clock_tick,
+    decision_discount,
+)
 from .contracts import (
     DecisionSemantics,
     SemanticAction,
@@ -56,6 +63,8 @@ from .scopes import (
 )
 
 __all__ = [
+    "DECISION_CLOCK_BASE",
+    "DECISION_CLOCK_CONTRACT_VERSION",
     "DECISION_IDENTITY_CONTRACT_VERSION",
     "MACRO_EDGE_CONTRACT_VERSION",
     "PROGRESS_RECEIPT_CONTRACT_VERSION",
@@ -63,6 +72,7 @@ __all__ = [
     "STRICT_ACTION_GROUPING_CONTRACT_VERSION",
     "SURFACE_REGISTRY_CONTRACT_VERSION",
     "CoarseActionCollisionError",
+    "DecisionClockTick",
     "DecisionSemantics",
     "DecisionSemanticsKernel",
     "ForcedTransition",
@@ -86,6 +96,8 @@ __all__ = [
     "SurfaceSpec",
     "canonical_payload_bytes",
     "card_selection_operation",
+    "clock_tick",
+    "decision_discount",
     "default_surface_registry",
     "strict_action_grouping_contract",
     "strict_action_groups",

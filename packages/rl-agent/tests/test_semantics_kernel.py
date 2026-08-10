@@ -387,3 +387,40 @@ def test_registry_manifest_is_independent_of_registration_order() -> None:
 
     assert first.manifest_payload() == second.manifest_payload()
     assert first.manifest_key(key_index) == second.manifest_key(key_index)
+
+
+def test_durable_floor_decision_clock_contract() -> None:
+    import pytest
+
+    from sts2_rl.semantics import (
+        DECISION_CLOCK_BASE,
+        DecisionClockTick,
+        clock_tick,
+        decision_discount,
+    )
+
+    # Same floor / same room: no discount.
+    assert decision_discount(floor_before=7, floor_after=7, terminal=False) == 1.0
+    # One durable floor: exactly one application of the base.
+    assert decision_discount(floor_before=7, floor_after=8, terminal=False) == (
+        DECISION_CLOCK_BASE
+    )
+    # Multi-floor jumps compound; interface length never appears.
+    assert decision_discount(floor_before=7, floor_after=10, terminal=False) == (
+        pytest.approx(DECISION_CLOCK_BASE**3)
+    )
+    # Terminal transitions never bootstrap.
+    assert decision_discount(floor_before=45, floor_after=46, terminal=True) == 0.0
+    # Malformed floor regressions clamp instead of manufacturing Gamma > 1.
+    assert decision_discount(floor_before=9, floor_after=7, terminal=False) == 1.0
+    # Outcome-first ordering survives a complete run.
+    assert DECISION_CLOCK_BASE**59 > 0.83
+    tick = clock_tick(floor_before=1, floor_after=2, terminal=False)
+    assert tick.discount == DECISION_CLOCK_BASE
+    with pytest.raises(ValueError, match="durable-floor contract"):
+        DecisionClockTick(
+            floor_before=1,
+            floor_after=2,
+            terminal=False,
+            discount=0.5,
+        )
