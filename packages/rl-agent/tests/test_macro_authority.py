@@ -894,3 +894,41 @@ def test_combat_view_is_declined_by_default_and_owned_with_the_flag() -> None:
     step = episode.steps[0]
     assert step.surface == "combat" and step.branch == "end_turn"
     assert step.terminal is True and step.discount == 0.0
+
+
+def test_card_matching_is_container_invariant() -> None:
+    """Deck aggregates and picker cards render different views of the same
+    card (measured on real journals: deck carries quantity/description/
+    rarity, pickers carry upgrade_preview); executor binding must match on
+    the mutually rendered keys and still separate distinct cards."""
+
+    from sts2_rl.macro.authority import _card_matches
+
+    deck_view = {
+        "id": "CARD.DEFEND_IRONCLAD",
+        "cost": 1,
+        "is_upgraded": True,
+        "quantity": 2,
+        "description": "DEFEND_IRONCLAD.description",
+        "rarity": "Basic",
+        "upgrade_preview": None,
+        "tags": ["Defend"],
+    }
+    picker_same = {
+        "id": "CARD.DEFEND_IRONCLAD",
+        "cost": 1,
+        "is_upgraded": True,
+        "quantity": None,
+        "description": None,
+        "rarity": None,
+        "upgrade_preview": {"cost": 1, "is_upgraded": True},
+        "tags": ["Defend"],
+    }
+    picker_unupgraded = {**picker_same, "is_upgraded": False}
+    picker_other = {**picker_same, "id": "CARD.BASH"}
+
+    assert _card_matches({"card": picker_same}, deck_view)
+    assert not _card_matches({"card": picker_unupgraded}, deck_view)
+    assert not _card_matches({"card": picker_other}, deck_view)
+    assert not _card_matches({"card": None}, deck_view)
+    assert _card_matches({"card": picker_same}, None)

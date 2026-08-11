@@ -67,15 +67,39 @@ def _kind_for_step(step: NativeStep) -> str:
 
 
 def _card_matches(action: Mapping[str, Any], target: Mapping[str, Any] | None) -> bool:
+    """Container-invariant card identity for executor binding.
+
+    Different containers render different views of the SAME card: deck
+    aggregates carry quantity/description/rarity, selection pickers carry
+    upgrade previews instead (measured on real journals — full-projection
+    equality can never bind a deck-compiled target to a picker action).
+    A field a container does not render cannot disagree, so identity is
+    exact equality over the keys BOTH projections present; id and upgrade
+    state are always present on both sides, keeping distinct cards apart.
+    """
+
     if target is None:
         return True
     card = action.get("card")
     if not isinstance(card, Mapping):
         return False
     try:
-        return semantic_card_projection(card) == semantic_card_projection(target)
+        action_view = {
+            key: value
+            for key, value in semantic_card_projection(card).items()
+            if value is not None
+        }
+        target_view = {
+            key: value
+            for key, value in semantic_card_projection(target).items()
+            if value is not None
+        }
     except SemanticContractError:
         return False
+    shared = action_view.keys() & target_view.keys()
+    if "id" not in shared:
+        return False
+    return all(action_view[key] == target_view[key] for key in shared)
 
 
 @dataclass(slots=True)
