@@ -136,6 +136,7 @@ class MacroCollectionAuthority:
         self._pending_plan: _PendingPlan | None = None
         self._episode_replay_invalid = False
         self._executor_failures = 0
+        self.last_executor_failure: dict[str, Any] | None = None
         self._last_floor = 0
         self._combat_active = False
         self.overrides = 0
@@ -274,6 +275,12 @@ class MacroCollectionAuthority:
             self._steps = []
             self._episode_replay_invalid = True
             self._executor_failures += 1
+            self.last_executor_failure = {
+                "step_kind": _kind_for_step(step),
+                "step_target": dict(step.target) if step.target else None,
+                "surface_kinds": sorted({_kind(action) for action in semantic_actions})[:12],
+                "floor": floor,
+            }
             self.declined += 1
             return None
 

@@ -276,6 +276,9 @@ def main() -> int:
                             "semantic_executor_failures": int(
                                 authority_metrics["executor_failures"]
                             ),
+                            "semantic_executor_last_failure": (
+                                authority.last_executor_failure
+                            ),
                         }
                     )
                     + "\n"
