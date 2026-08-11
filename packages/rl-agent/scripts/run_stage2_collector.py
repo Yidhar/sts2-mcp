@@ -17,9 +17,17 @@ from typing import Any
 
 import torch
 
+from sts2_env.headless_sim_bridge_client import HeadlessSimError
+from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.macro import MacroCollectionAuthority, load_trunk_state
 from sts2_rl.training import build_training_resources, load_training_config
+
+# Sim-side faults the legacy runtime survives with a backend restart; the
+# producer recovers the same way instead of failing its whole pipeline
+# segment (protocol/contract violations on OUR side still fail fast).
+_RECOVERABLE_BACKEND_ERRORS = (HeadlessRecoverableProtocolError, HeadlessSimError)
+_MAX_BACKEND_RESTARTS = 20
 
 SPOOL_ENVELOPE_FORMAT = "sts2-stage2-spool-envelope-v1"
 
@@ -159,16 +167,21 @@ def main() -> int:
 
         spool = Path(args.spool)
         spool.mkdir(parents=True, exist_ok=True)
-        resources = build_training_resources(config)
-        champion_state = torch.load(
-            Path(args.champion) / "network.pt",
-            map_location=resources.device,
-            weights_only=True,
-        )
-        for target in (resources.model, resources.collector_model):
-            load_trunk_state(target, dict(champion_state))
-        for parameter in resources.model.parameters():
-            parameter.requires_grad_(False)
+
+        def build_resources() -> Any:
+            built = build_training_resources(config)
+            champion_state = torch.load(
+                Path(args.champion) / "network.pt",
+                map_location=built.device,
+                weights_only=True,
+            )
+            for target in (built.model, built.collector_model):
+                load_trunk_state(target, dict(champion_state))
+            for parameter in built.model.parameters():
+                parameter.requires_grad_(False)
+            return built
+
+        resources = build_resources()
 
         macro_model = copy.deepcopy(resources.model)
         if init_path is not None:
@@ -214,14 +227,44 @@ def main() -> int:
                 + "\n"
             )
             metrics_file.flush()
+            backend_restarts = 0
             for episode_index in range(args.episodes):
                 if episode_index % max(args.model_reload_episodes, 1) == 0:
                     maybe_reload()
-                episode = resources.collector.collect_episode(
-                    epsilon=0.0,
-                    deterministic=False,
-                    record=False,
-                )
+                try:
+                    episode = resources.collector.collect_episode(
+                        epsilon=0.0,
+                        deterministic=False,
+                        record=False,
+                    )
+                except _RECOVERABLE_BACKEND_ERRORS as error:
+                    backend_restarts += 1
+                    if backend_restarts > _MAX_BACKEND_RESTARTS:
+                        raise
+                    metrics_file.write(
+                        json.dumps(
+                            {
+                                "event": "collector_backend_restart",
+                                **base_status,
+                                "unix_s": time.time(),
+                                "attempt": backend_restarts,
+                                "episode_index": episode_index,
+                                "error": f"{type(error).__name__}: {error}"[:400],
+                            }
+                        )
+                        + "\n"
+                    )
+                    metrics_file.flush()
+                    # The interrupted episode's macro view is unusable; the
+                    # authority state resets with a discarded finish.
+                    authority.finish_episode()
+                    try:
+                        resources.close()
+                    except Exception:
+                        pass
+                    resources = build_resources()
+                    resources.collector.macro_authority = authority
+                    continue
                 macro_episode = authority.finish_episode(
                     f"spool-{args.pipeline_id}-{args.producer_id}-{run_nonce}-{episode_index:05d}"
                 )
