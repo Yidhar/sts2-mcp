@@ -53,6 +53,11 @@ def main() -> int:
     parser.add_argument("--champion", required=True)
     parser.add_argument("--spool", required=True)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--init-macro",
+        default=None,
+        help="behavior weights until the trainer's first publication",
+    )
     parser.add_argument("--episodes", type=int, default=400)
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument("--own-combat", action="store_true")
@@ -94,6 +99,17 @@ def main() -> int:
             parameter.requires_grad_(False)
 
         macro_model = copy.deepcopy(resources.model)
+        if args.init_macro is not None and Path(args.init_macro).exists():
+            load_trunk_state(
+                macro_model,
+                dict(
+                    torch.load(
+                        Path(args.init_macro),
+                        map_location=resources.device,
+                        weights_only=True,
+                    )
+                ),
+            )
         macro_model.eval()
         model_path = Path(args.model_path)
         model_mtime = 0.0

@@ -20,14 +20,17 @@ VENV_DIR="${VENV_DIR:-$ARTIFACT_ROOT/environments/wsl-rocm}"
 DEFAULT_SIM_EXE="$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"
 SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$DEFAULT_SIM_EXE}"
 CHAMPION="${STS2_STAGE2_CHAMPION:?[stage2-par] set STS2_STAGE2_CHAMPION}"
-COLLECTORS="${STS2_STAGE2_COLLECTORS:-3}"
+COLLECTORS="${STS2_STAGE2_COLLECTORS:-2}"
 RUN_DIR="${STS2_STAGE2_RUN_DIR:-$ARTIFACT_ROOT/runs/stage2-isolated-macro-v1/parallel}"
 [[ -f "$CHAMPION/network.pt" ]] || { echo "[stage2-par] champion missing network.pt" >&2; exit 1; }
 [[ -f "$SIM_EXE" && -f "$SIM_EXE.identity.json" ]] || { echo "[stage2-par] pinned sim or identity missing" >&2; exit 1; }
 
 export VIRTUAL_ENV="$VENV_DIR"
 export PATH="$VENV_DIR/bin:$PATH"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# 8 WSL vCPUs total: 1 OMP thread per python process leaves headroom for
+# the C# sims; oversubscription measurably serializes the decision loops.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 python - <<'PY'
 import torch
@@ -67,6 +70,7 @@ for index in $(seq 1 "$COLLECTORS"); do
     --model-path "$MODEL" \
     --episodes "${STS2_STAGE2_COLLECTOR_EPISODES:-1000}" \
     --epsilon "${STS2_STAGE2_EPSILON:-0.15}" \
+    ${STS2_STAGE2_INIT_MACRO:+--init-macro "$STS2_STAGE2_INIT_MACRO"} \
     ${STS2_STAGE2_OWN_COMBAT:+--own-combat} \
     --seed $((6500000 + index * 10000)) \
     --metrics-out "$RUN_DIR/collector-$index-metrics.jsonl" \
