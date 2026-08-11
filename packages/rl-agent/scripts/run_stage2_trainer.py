@@ -260,6 +260,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--status-out", required=True)
     parser.add_argument("--stop-after-episodes", type=int, default=1200)
     parser.add_argument("--updates-per-episode", type=int, default=8)
+    parser.add_argument(
+        "--ingest-batch-episodes",
+        type=int,
+        default=4,
+        help="episodes accepted per ingest cycle; keeps update bursts, "
+        "publications, and metrics latency bounded",
+    )
+    parser.add_argument(
+        "--max-updates-per-cycle",
+        type=int,
+        default=32,
+        help="hard cap on learner updates per ingest cycle",
+    )
     parser.add_argument("--sample-windows", type=int, default=16)
     parser.add_argument("--replay-episodes", type=int, default=128)
     parser.add_argument("--save-interval-episodes", type=int, default=20)
@@ -472,7 +485,7 @@ def main() -> int:
                     path
                     for path in sorted(spool.glob("*.pkl"))
                     if path not in pending_path_set
-                ][: min(32, remaining)]
+                ][: min(args.ingest_batch_episodes, remaining)]
                 if not batch:
                     if states and all(state == "complete" for state in states.values()):
                         raise RuntimeError("all producers completed before the trainer reached its episode target")
@@ -522,7 +535,10 @@ def main() -> int:
                 last_progress = time.monotonic()
                 ingested += fresh
                 environment_steps += fresh_environment_steps
-                for _ in range(args.updates_per_episode * fresh):
+                update_budget = min(
+                    args.updates_per_episode * fresh, args.max_updates_per_cycle
+                )
+                for _ in range(update_budget):
                     last_update_metrics = learner.update()
                 if _checkpoint_due(
                     ingested=ingested,
