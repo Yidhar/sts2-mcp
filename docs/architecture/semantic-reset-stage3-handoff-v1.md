@@ -85,3 +85,28 @@ evaluation; isolated branch-balanced collection continues. Remedy running:
 600-episode extension (`stage2-extended2-metrics.jsonl`) under the
 corrected learner, initialized from ep200. Next evidence round repeats the
 probes and the paired 16-seed evaluation against the extended model.
+
+### Round 2 — corrected-learner extension, stopped at ~ep330 (2026-08-11)
+
+Evidence (`stage3-probe-ext-ep{50,150,200,300}.json`,
+`stage3-behavioral-ep300.jsonl`):
+
+- The corrected learner qualitatively moved the ranking: the branch gap
+  Q(smith)-Q(rest) flipped from +0.06 (smith-always) to −0.01 on
+  champion-distribution probe states, and narrowed toward the genuinely
+  close call the decision is. Context-conditioning is real.
+- Instantaneous-HP sensitivity oscillated at noise level
+  (1e-6 → 6e-5 → 5e-6 → 1.4e-5 → 2e-6) across 6x data growth — no trend.
+- Behavioral check with REAL recurrent state (12 live joined episodes,
+  per-decision log): P(smith)=1.0 in every HP bucket on the model's own
+  state distribution; 0 wins; floor profile unchanged. Memory-mediated
+  conditioning is absent too.
+
+**Round 2 decision: NO HANDOFF; escalate to the dense-credit path.**
+Macro-only experience (~66 decisions/episode) accumulates the HP→outcome
+association too slowly; the architecture's own next stage supplies the
+dense signal. Stage-4 combat-challenger training (authority owns the
+native-atomic combat view, ~500 decisions/episode through the SAME shared
+trunk and Q head) was launched from the extended model
+(`stage4-challenger-metrics.jsonl`). The macro handoff question will be
+re-posed against the challenger-trained model: criteria unchanged.
