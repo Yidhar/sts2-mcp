@@ -171,6 +171,11 @@ def main() -> int:
                             "steps": episode.metrics.steps,
                             "run_won": episode.metrics.run_won,
                             "max_floor": episode.metrics.max_floor,
+                            "max_act": episode.metrics.max_act,
+                            "act1_cleared": episode.metrics.act1_cleared,
+                            "revivals_used": episode.metrics.revivals_used,
+                            "reward_total": episode.metrics.reward_total,
+                            "terminal_reason": episode.metrics.terminal_reason,
                             "macro_steps": (
                                 len(macro_episode.steps) if macro_episode else 0
                             ),

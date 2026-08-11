@@ -94,11 +94,18 @@ def main() -> int:
                                 "reset_seed": row.get("seed"),
                                 "steps": row.get("steps"),
                                 "max_floor": row.get("max_floor"),
+                                "max_act": row.get("max_act"),
+                                "act1_cleared": row.get("act1_cleared"),
+                                "revivals_used": row.get("revivals_used"),
+                                "reward_total": row.get("reward_total"),
                                 "run_won": row.get("run_won"),
                                 "terminal_reason": (
-                                    "run_victory"
-                                    if row.get("run_won")
-                                    else "run_defeat"
+                                    row.get("terminal_reason")
+                                    or (
+                                        "run_victory"
+                                        if row.get("run_won")
+                                        else "run_defeat"
+                                    )
                                 ),
                             }
                         )
