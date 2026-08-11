@@ -54,6 +54,13 @@ The bridge moved combat capability materially (act-1 clears 4 -> 9,
 floor mean +8.6) — the state-starvation diagnosis was load-bearing.
 The champion still leads decisively: **retained**, gate unchanged.
 
+**Round-2 final (ep300 completed model):** wins 0/16, act1 clears
+**11/16 — act-1 parity with the champion**, floor_p50 30, floor_mean
+26.9. Challenger trajectory across rounds: 4/14 -> 9/20 -> 11/30
+(act1/floor_p50). The remaining gap is deep-run (act-2+ bosses, run
+wins 0 vs 4). Champion retained; the slope suggests the gate is a
+compute question, not a design question.
+
 Macro behavior note (decision log, 59 rest decisions with both branches
 offered): the rest/smith pole flipped — P(smith) 1.0 -> 0.0 in every HP
 bucket. The aggregate gap crossed zero; per-HP differentiation has still

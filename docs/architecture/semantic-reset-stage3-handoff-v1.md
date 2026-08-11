@@ -102,6 +102,18 @@ Evidence (`stage3-probe-ext-ep{50,150,200,300}.json`,
   state distribution; 0 wins; floor profile unchanged. Memory-mediated
   conditioning is absent too.
 
+**Round 3 addendum (bridged head, stage-4 round-2 final, 2026-08-11):**
+combat capability converged sharply under the state-bridged Q head
+(act-1 parity with the champion at ep300; see the stage-4 comparison
+record), and the rest/smith pole flipped from smith-always to rest-always
+— the aggregate gap is genuinely near zero and context-movable. Per-HP
+differentiation has still not emerged behaviorally (P(smith)=0.0 in all
+HP buckets, n=76). Handoff remains NO. The open question is scale:
+per-candidate×state interaction inside the bridged head needs either
+bulk experience (parallel collection, thousands of episodes) or a
+generic encoder-level state-summary channel (encoding version bump) —
+both are resourcing decisions above this record.
+
 **Round 2 decision: NO HANDOFF; escalate to the dense-credit path.**
 Macro-only experience (~66 decisions/episode) accumulates the HP→outcome
 association too slowly; the architecture's own next stage supplies the
