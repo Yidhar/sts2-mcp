@@ -182,12 +182,13 @@ def main() -> int:
             return built
 
         resources = build_resources()
+        device = resources.device
 
         macro_model = copy.deepcopy(resources.model)
         if init_path is not None:
             load_trunk_state(
                 macro_model,
-                dict(torch.load(init_path, map_location=resources.device, weights_only=True)),
+                dict(torch.load(init_path, map_location=device, weights_only=True)),
             )
         macro_model.eval()
         model_mtime = 0.0
@@ -199,7 +200,7 @@ def main() -> int:
             mtime = model_path.stat().st_mtime_ns
             if mtime <= model_mtime:
                 return
-            _load_published_model_state(macro_model, model_path, resources.device)
+            _load_published_model_state(macro_model, model_path, device)
             macro_model.eval()
             model_mtime = mtime
 
