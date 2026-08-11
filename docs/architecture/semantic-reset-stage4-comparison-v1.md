@@ -41,3 +41,24 @@ macro behavior. The candidate-Q head now reads
 [policy_features || next_recurrent_state] directly. Round 2 trains the
 challenger on the bridged head (trunk inherited, Q head fresh) — the
 retirement gate is unchanged.
+
+## Round 2 — bridged head (2026-08-11, eval at ~ep191/300)
+
+| arm | wins | act1 clears | floor p50 | floor mean |
+|---|---|---|---|---|
+| champion (baseline, same seeds) | 4/16 | 11/16 | 32 | 31.7 |
+| challenger round 1 | 0/16 | 4/16 | 14 | 13.1 |
+| challenger round 2 (bridged) | 0/16 | 9/16 | 20 | 21.7 |
+
+The bridge moved combat capability materially (act-1 clears 4 -> 9,
+floor mean +8.6) — the state-starvation diagnosis was load-bearing.
+The champion still leads decisively: **retained**, gate unchanged.
+
+Macro behavior note (decision log, 59 rest decisions with both branches
+offered): the rest/smith pole flipped — P(smith) 1.0 -> 0.0 in every HP
+bucket. The aggregate gap crossed zero; per-HP differentiation has still
+not emerged behaviorally. Probe-methodology caveat recorded: zero-hidden
+probes under-measure the bridged pathway because single-observation HP is
+pooling-diluted in the state embedding (generic log1p numeric transform is
+not the cause); HP accumulates through run-scale memory, so behavioral
+evaluation with real recurrent state is the authoritative instrument.
