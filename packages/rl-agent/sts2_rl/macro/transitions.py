@@ -18,7 +18,7 @@ from typing import Any, Final, Literal
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v3"
+MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +88,8 @@ class MacroEpisode:
         for step in self.steps[:-1]:
             if step.terminal:
                 raise ValueError("terminal macro step must be the final step")
+        if not self.steps[-1].terminal:
+            raise ValueError("complete macro episode must end with a terminal step")
         domains = {step.control_domain for step in self.steps}
         if len(domains) != 1:
             raise ValueError("one replay episode may contain only one control domain")

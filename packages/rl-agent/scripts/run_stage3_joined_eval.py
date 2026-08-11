@@ -208,7 +208,7 @@ def main() -> int:
             map_location=resources.device,
             weights_only=True,
         )
-        load_trunk_state(macro_model, dict(macro_state))
+        macro_model.load_state_dict(macro_state, strict=True)
         for parameter in macro_model.parameters():
             parameter.requires_grad_(False)
         macro_model.eval()
@@ -223,7 +223,7 @@ def main() -> int:
                 map_location=resources.device,
                 weights_only=True,
             )
-            load_trunk_state(combat_model, dict(combat_state))
+            combat_model.load_state_dict(combat_state, strict=True)
             for parameter in combat_model.parameters():
                 parameter.requires_grad_(False)
             combat_model.eval()

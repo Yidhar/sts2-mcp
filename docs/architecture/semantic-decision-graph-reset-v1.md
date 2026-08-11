@@ -196,11 +196,14 @@ Thus a macro action can bootstrap into a combat entry value, and the final
 combat action can bootstrap into the following macro value. Neither controller
 treats the other controller's changing policy as an opaque environment option.
 
-The combat V-trace champion uses the same graph through a state-value bridge
-during migration. The bridge reads the frozen champion's existing value output
-or its corresponding target snapshot. It owns no learner head, supervision,
-replay or preference objective; it only adapts the boundary bootstrap to the
-next meaningful state.
+That is the target joined graph, not a capability claimed by the first Stage-2
+production pipeline. Stage 2 owns macro decisions only. While the combat
+champion is frozen, a macro transition may remain open across its combat and
+consume the realized combat reward before the next macro decision. This is a
+valid temporary environment option precisely because the combat policy cannot
+change under the macro learner. Production Stage-2 entry points reject combat
+candidate-Q training until an explicit encounter-terminal or cross-domain
+bootstrap boundary exists.
 
 ## 6. Decision clock and primary objective
 
@@ -289,16 +292,21 @@ The initial macro learner uses:
 - recurrent candidate scoring over the complete legal candidate set;
 - n-step Double-Q targets;
 - a slowly updated target network;
-- sequence replay with burn-in;
-- sequence priority based on TD error;
+- sequence replay whose no-gradient prefix starts at the latest factual
+  recurrent reset at or before the learning boundary (or at episode start when
+  no reset exists), reconstructing the exact current recurrent state;
+- uniform window sampling. Prioritized replay is intentionally deferred until
+  it carries sampling probabilities and importance correction instead of
+  silently changing the optimization objective;
 - branch-balanced epsilon-greedy collection. Combat and macro may have one
   domain-level epsilon schedule each because a random macro commitment has a
   much longer consequence than a random card play; there are no per-operation
   floors.
 
 Macro trajectories are compact enough to sample long contiguous sequences. A
-sample contains all encountered macro decision types in that trajectory; combat
-decisions remain in the combat view and connect through the cross-domain target.
+sample contains all encountered macro decision types in that trajectory. In the
+first production stage, frozen-combat consequences enter as factual return
+between macro decisions; they are not presented as trainable combat Q nodes.
 There is no fixed per-operation slot order.
 
 The strongest alternative is recurrent IQL/AWAC. It avoids a max over weakly
@@ -307,12 +315,13 @@ cross-entropy gradient. It is the predefined fallback if Double-Q develops
 persistent unsupported value peaks. It is not trained concurrently and does not
 become an additional loss on the same head.
 
-### 8.3 Combat learner
+### 8.3 Combat learner (deferred challenger)
 
 The existing combat V-trace policy remains the champion because paired combat
 evaluation has not shown it to be worse than the one-step greedy baseline. A
-combat R2D2 challenger is trained from combat sequence view with the same legal
-candidate encoding.
+combat R2D2 challenger is not trained by the Stage-2 production scripts. It can
+start only after the factual encounter boundary or cross-domain bootstrap is
+implemented, then use the same legal candidate encoding and reset-aware replay.
 
 V-trace is retired only if the challenger preserves tactical win rate and HP
 efficiency while improving stability or sample efficiency. Architectural
@@ -359,6 +368,14 @@ Freeze the combat champion. Train a new macro candidate-Q model from the macro
 view and collect new branch-balanced experience. The old policy heads and old
 transaction/failure policy sidecars are not part of the new optimizer.
 
+Each continuation segment restores the complete learner state (online and
+target networks, optimizer, replay, counters and random state), but starts new
+producer processes with a fresh seed stream and an empty spool. Episodes become
+visible as training progress only after the trainer checkpoint that contains
+them is durable; collector logs remain diagnostic rather than authoritative.
+Semantic executor mismatches invalidate that episode's derived replay instead
+of retaining a recurrently inconsistent suffix.
+
 The legacy macro controller is not surgically simplified during isolated
 training. It remains a frozen champion outside the isolated semantic collector;
 completion CE and macro AWR belong only to that sealed legacy controller and
@@ -366,10 +383,11 @@ never supervise candidate-Q.
 
 ### Stage 3: joined live graph
 
-Run macro Q with the frozen combat champion through the explicit domain bridge.
-Inspect whether rest/forge, take/skip, buy/leave and target selection vary with
-state and whether held-out run outcomes improve. Do not automatically replace a
-new segment with an old one because of a small evaluation batch.
+Run macro Q with the frozen combat champion through whole-run macro ownership,
+using the temporary realized-return boundary described above. Inspect whether
+rest/forge, take/skip, buy/leave and target selection vary with state and
+whether held-out run outcomes improve. Do not automatically replace a new
+segment with an old one because of a small evaluation batch.
 
 Joined-live execution is a canary, not deletion or per-state controller mixing.
 Macro ownership is assigned for a whole run segment. After an explicit macro
@@ -378,9 +396,10 @@ untouched.
 
 ### Stage 4: combat challenger
 
-Train candidate-Q combat control from the combat view. Keep the V-trace champion
-available for direct comparisons. Retire it only after the challenger wins on
-actual combat outcomes.
+First implement and test the explicit encounter/cross-domain boundary. Only
+then train candidate-Q combat control from the combat view. Keep the V-trace
+champion available for direct comparisons and retire it only after the
+challenger wins on actual combat outcomes.
 
 ### Stage 5: deletion
 

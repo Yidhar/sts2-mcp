@@ -5,10 +5,11 @@ import io
 import json
 import random
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from sts2_rl.macro import MacroQConfig, MacroQLearner, MacroSequenceReplay
@@ -72,6 +73,8 @@ def test_parallel_training_state_restores_models_learner_replay_and_rng(
         ingested=41,
         environment_steps=12345,
     )
+    persisted = torch.load(state_path, map_location="cpu", weights_only=False)
+    assert persisted["policy_version"] == 17
     expected_rng = (random.random(), float(np.random.random()), float(torch.rand(())))
 
     with torch.no_grad():
@@ -119,19 +122,7 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
         "producer_ids": ["collector-1", "collector-2"],
     }
     (pipeline / "pipeline.json").write_text(json.dumps(manifest), encoding="utf-8")
-    _append(
-        pipeline / "collector-1-metrics.jsonl",
-        {
-            "event": "collector_episode",
-            "unix_s": 20.0,
-            "producer_id": "collector-1",
-            "run_nonce": "restart-b",
-            "episode_index": 0,
-            "seed": 1,
-            "steps": 20,
-            "run_won": False,
-        },
-    )
+    # Collector rows are not durable acknowledgements and must not be shown.
     _append(
         pipeline / "collector-2-metrics.jsonl",
         {
@@ -140,7 +131,7 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
             "producer_id": "collector-2",
             "run_nonce": "restart-a",
             "episode_index": 0,
-            "seed": 2,
+            "reset_seed": 999,
             "steps": 10,
             "run_won": True,
         },
@@ -151,13 +142,34 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
             "event": "trainer_start",
             "unix_s": 5.0,
             "environment_steps": 700,
-            "ingested_total": 0,
+            "ingested_total": 40,
         },
         {
             "event": "trainer_ingest",
             "unix_s": 30.0,
             "environment_steps": 777,
-            "ingested_total": 2,
+            "ingested_total": 42,
+            "policy_version": 9,
+            "acknowledged_episodes": [
+                {
+                    "episode_id": "ack-1",
+                    "unix_s": 20.0,
+                    "reset_seed": 2,
+                    "steps": 10,
+                    "run_won": True,
+                    "ingested_total": 41,
+                    "environment_steps": 710,
+                },
+                {
+                    "episode_id": "ack-2",
+                    "unix_s": 25.0,
+                    "reset_seed": 1,
+                    "steps": 20,
+                    "run_won": False,
+                    "ingested_total": 42,
+                    "environment_steps": 730,
+                },
+            ],
             "learner": {"loss": 0.25, "td_error_mean": 0.5, "updates": 9},
         },
     )
@@ -175,9 +187,11 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
     episodes = [row for row in rows if row["event"] == "train_episode"]
     assert [row["reset_seed"] for row in episodes] == [2, 1]
     assert [row["environment_steps"] for row in episodes] == [710, 730]
-    assert episodes[0]["episode_id"] == "collector-2:restart-a:0"
+    assert state["episodes"] == 42
+    assert episodes[0]["episode_id"] == "ack-1"
     update = next(row for row in rows if row["event"] == "learner_update")
     assert update["environment_steps"] == 777
+    assert update["policy_version"] == 9
 
     dashboard._atomic_json(pipeline / "dashboard-state.json", state)
     same_metrics, restored, created = dashboard._load_or_create_state(
@@ -194,7 +208,8 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
             "event": "trainer_complete",
             "unix_s": 40.0,
             "environment_steps": 888,
-            "ingested_total": 3,
+            "ingested_total": 43,
+            "policy_version": 12,
             "learner": {"updates": 12},
         },
     )
@@ -203,6 +218,7 @@ def test_dashboard_restart_uses_persisted_offsets_and_trainer_progress(
     second_rows = [json.loads(line) for line in second.getvalue().splitlines()]
     assert [row["event"] for row in second_rows] == ["run_complete"]
     assert second_rows[0]["environment_steps"] == 888
+    assert second_rows[0]["policy_version"] == 12
 
 
 def test_producer_status_summary_distinguishes_pending_complete_and_failed(
@@ -216,3 +232,133 @@ def test_producer_status_summary_distinguishes_pending_complete_and_failed(
         "collector-2": "failed",
         "collector-3": "pending",
     }
+    with pytest.raises(RuntimeError, match="collector-2"):
+        trainer._require_producers_not_failed(
+            tmp_path, ("collector-1", "collector-2", "collector-3")
+        )
+
+
+def test_spool_item_is_deleted_only_after_checkpoint_succeeds(tmp_path: Path) -> None:
+    trainer = _script("run_stage2_trainer.py")
+    spool_item = tmp_path / "episode.pkl"
+    spool_item.write_bytes(b"episode")
+
+    def fail_save() -> None:
+        raise OSError("checkpoint unavailable")
+
+    published: list[str] = []
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        trainer._save_then_acknowledge(
+            fail_save, lambda: published.append("ack"), [spool_item]
+        )
+    assert spool_item.is_file()
+    assert published == []
+
+    def publish() -> None:
+        assert spool_item.is_file()
+        published.append("ack")
+
+    trainer._save_then_acknowledge(lambda: None, publish, [spool_item])
+    assert not spool_item.exists()
+    assert published == ["ack"]
+
+
+def test_durable_acknowledgement_is_buffered_until_interval_or_final_target() -> None:
+    trainer = _script("run_stage2_trainer.py")
+
+    assert not trainer._checkpoint_due(
+        ingested=41,
+        last_saved_at=40,
+        interval=20,
+        target=100,
+    )
+    assert trainer._checkpoint_due(
+        ingested=60,
+        last_saved_at=40,
+        interval=20,
+        target=100,
+    )
+    assert trainer._checkpoint_due(
+        ingested=100,
+        last_saved_at=95,
+        interval=20,
+        target=100,
+    )
+
+
+def test_collector_publication_load_is_strict(tmp_path: Path) -> None:
+    collector = _script("run_stage2_collector.py")
+    model = torch.nn.Linear(3, 2)
+    incomplete = {"weight": model.weight.detach().clone()}
+    path = tmp_path / "publication.pt"
+    torch.save(incomplete, path)
+
+    with pytest.raises(RuntimeError, match="Missing key"):
+        collector._load_published_model_state(model, path, torch.device("cpu"))
+
+
+def test_collector_summary_uses_episode_reset_seed() -> None:
+    collector = _script("run_stage2_collector.py")
+    episode = SimpleNamespace(
+        metrics=SimpleNamespace(
+            episode_id="episode-1",
+            reset_seed=123456,
+            steps=17,
+            run_won=False,
+            max_floor=8,
+            max_act=1,
+            act1_cleared=False,
+            revivals_used=2,
+            player_hp_lost=31.0,
+            reward_total=-0.5,
+            terminal_reason="run_defeat",
+        )
+    )
+    summary = collector._episode_summary(
+        episode,
+        producer_id="collector-1",
+        run_nonce="nonce",
+        episode_index=3,
+        collected_at=42.0,
+    )
+    assert summary["reset_seed"] == 123456
+    assert summary["episode_id"] == "collector-1:nonce:3"
+    assert summary["source_episode_id"] == "episode-1"
+
+
+def test_dashboard_publishes_trainer_failure_before_startup_completed(
+    tmp_path: Path,
+) -> None:
+    dashboard = _script("publish_stage_dashboard.py")
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir()
+    manifest = {
+        "format": dashboard.PIPELINE_FORMAT,
+        "pipeline_id": "pipeline-startup-failure",
+        "lineage_id": "lineage-a",
+        "control_domain": "macro",
+        "producer_ids": ["collector-1"],
+    }
+    _append(
+        pipeline / "trainer-metrics.jsonl",
+        {
+            "event": "trainer_failed",
+            "unix_s": 5.0,
+            "error": "FileNotFoundError: missing model-init",
+        },
+    )
+    _, state, _ = dashboard._load_or_create_state(
+        pipeline,
+        tmp_path / "runs",
+        lineage="lineage-a",
+        manifest=manifest,
+    )
+    output = io.StringIO()
+    assert dashboard._publish_available(pipeline, manifest, state, output) is True
+    assert json.loads(output.getvalue()) == {
+        "event": "run_failed",
+        "unix_s": 5.0,
+        "environment_steps": 0,
+        "error": "FileNotFoundError: missing model-init",
+    }
+    assert state["terminal"] is True

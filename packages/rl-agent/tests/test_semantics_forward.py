@@ -80,17 +80,21 @@ def test_rest_surface_expands_smith_targets_from_deck_facts() -> None:
 
 def test_rest_surface_merges_only_exact_equal_smith_targets() -> None:
     exact = _card("CARD.BASH", copy=1)
-    # The duplicate has every visible copy fact equal.  A copy with a distinct
-    # instance/index remains an independently scoreable Smith target.
-    deck = [dict(exact), dict(exact), _card("CARD.BASH", copy=2)]
+    physical_copy = _card("CARD.BASH", copy=2)
+    distinct = _card("CARD.BASH", copy=3)
+    distinct["floor_added_to_deck"] = 7
+    # Physical instance/index fields do not split one strategic action.  A
+    # permanent visible card fact still does.
+    deck = [dict(exact), dict(exact), physical_copy, distinct]
     decision = forward_decision(_rest_observation(deck), _rest_actions())
     assert decision is not None
     smith = [candidate for candidate in decision.candidates if candidate.branch == "smith"]
     assert len(smith) == 2
     assert len({candidate.target_key for candidate in smith}) == 2
-    assert {candidate.target["instance_id"] for candidate in smith if candidate.target} == {
-        "CARD.BASH-1",
-        "CARD.BASH-2",
+    assert all("instance_id" not in candidate.target for candidate in smith if candidate.target)
+    assert {candidate.target.get("floor_added_to_deck") for candidate in smith if candidate.target} == {
+        None,
+        7,
     }
 
 
@@ -143,10 +147,13 @@ def test_shop_surface_buy_remove_leave_branches() -> None:
 
 def test_shop_surface_merges_only_exact_equal_remove_targets() -> None:
     exact = _card("CARD.STRIKE", copy=1)
+    physical_copy = _card("CARD.STRIKE", copy=2)
+    distinct = _card("CARD.STRIKE", copy=3)
+    distinct["floor_added_to_deck"] = 9
     observation = {
         "phase": "shop",
         "combat": {"in_progress": False},
-        "player": {"deck": [dict(exact), dict(exact), _card("CARD.STRIKE", copy=2)]},
+        "player": {"deck": [dict(exact), dict(exact), physical_copy, distinct]},
         "shop": {"is_open": True},
     }
     actions = [
@@ -162,9 +169,10 @@ def test_shop_surface_merges_only_exact_equal_remove_targets() -> None:
     assert decision is not None
     removes = [candidate for candidate in decision.candidates if candidate.branch == "remove"]
     assert len(removes) == 2
-    assert {candidate.target["instance_id"] for candidate in removes if candidate.target} == {
-        "CARD.STRIKE-1",
-        "CARD.STRIKE-2",
+    assert all("instance_id" not in candidate.target for candidate in removes if candidate.target)
+    assert {candidate.target.get("floor_added_to_deck") for candidate in removes if candidate.target} == {
+        None,
+        9,
     }
 
 

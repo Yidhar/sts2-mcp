@@ -1,10 +1,10 @@
 """Bounded, uniform sequence replay for the macro candidate-Q learner.
 
-Every learning window starts from an explicit learning index, while its
-history slice starts at the beginning of the episode.  Replaying that history
+Every learning window starts from an explicit learning index.  Its history
+slice starts at the latest factual recurrent reset at or before that boundary,
+or at the beginning of the episode when no reset exists.  Replaying that slice
 without gradients reconstructs the current network's exact recurrent state at
-the learning boundary.  Macro episodes are compact enough that this initially
-favours correct recurrence over a bounded-but-inexact hidden-state shortcut.
+the learning boundary without redundantly replaying prior combat encounters.
 
 Sampling is uniform.  The previous implementation sampled by TD priority but
 optimized an uncorrected, equally-weighted loss, which silently changed the
@@ -23,7 +23,7 @@ import numpy as np
 
 from .transitions import MacroEpisode
 
-MACRO_REPLAY_CONTRACT_VERSION: Final = "sts2-macro-replay-v3"
+MACRO_REPLAY_CONTRACT_VERSION: Final = "sts2-macro-replay-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,14 +82,29 @@ class MacroSequenceReplay:
         stride = max(self.window_length // 2, 1)
         for episode in self._episodes:
             steps = len(episode.steps)
+            reset_indices = tuple(
+                index
+                for index, step in enumerate(episode.steps)
+                if step.recurrent_reset
+            )
+            reset_cursor = 0
+            recurrent_start = 0
             learn_start = 0
             while True:
+                while (
+                    reset_cursor < len(reset_indices)
+                    and reset_indices[reset_cursor] <= learn_start
+                ):
+                    recurrent_start = reset_indices[reset_cursor]
+                    reset_cursor += 1
                 window = MacroWindow(
                     episode=episode,
-                    # Exact-history mode: replay the factual episode prefix
-                    # under no-grad before every later learning suffix.
-                    start=0,
-                    burn_in=learn_start,
+                    # A factual reset makes the earlier prefix causally
+                    # irrelevant.  Starting there is exactly equivalent to
+                    # replaying from episode zero, not a truncated-state
+                    # approximation.
+                    start=recurrent_start,
+                    burn_in=learn_start - recurrent_start,
                     length=self.window_length,
                     window_id=f"{episode.episode_id}#{learn_start}",
                 )

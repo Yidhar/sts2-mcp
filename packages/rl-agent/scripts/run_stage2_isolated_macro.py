@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Isolated semantic-domain training: frozen fallback + candidate Double-Q.
+"""Isolated macro training: frozen combat fallback + candidate Double-Q.
 
 Implements reset doc §10 stage 2. The v47 combat champion is loaded FROZEN
 (model initialization semantics; its parameters receive no gradient and the
 legacy learner is never invoked). A second model instance provides the
-candidate-Q function; exactly one requested domain trains in that instance.
-Every other decision remains owned by the frozen champion.  Macro and combat
-experiments write separate model files and never share a trainable trunk.
+macro candidate-Q function. Every non-macro decision remains owned by the
+frozen champion. Combat candidate-Q training is intentionally unavailable
+until the explicit encounter/cross-domain target boundary exists.
 
 Usage (WSL ROCm venv, from the package root):
     python scripts/run_stage2_isolated_macro.py \
@@ -118,16 +118,15 @@ def main() -> int:
     parser.add_argument("--sim-exe", default=None)
     parser.add_argument(
         "--control-domain",
-        choices=("macro", "combat"),
+        choices=("macro",),
         default="macro",
-        help="train exactly one independently parameterized control domain",
+        help="train the independently parameterized macro control domain",
     )
     parser.add_argument(
         "--replay-episodes",
         type=int,
         default=512,
-        help="replay capacity in episodes (lower for the combat challenger: "
-        "combat episodes carry ~8x more transitions)",
+        help="macro replay capacity in complete episodes",
     )
     parser.add_argument(
         "--init-macro",

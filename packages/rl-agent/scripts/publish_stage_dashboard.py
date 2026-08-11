@@ -75,17 +75,22 @@ def _load_or_create_state(
     run_directory = runs_root / lineage / f"run-{run_id}"
     run_directory.mkdir(parents=True, exist_ok=False)
     metrics_path = run_directory / "metrics.jsonl"
-    source_names = [f"{producer_id}-metrics.jsonl" for producer_id in manifest["producer_ids"]]
-    source_names.append("trainer-metrics.jsonl")
+    trainer_rows, _ = _read_new_lines(pipeline / "trainer-metrics.jsonl", 0)
+    trainer_start = next(
+        (row for row in trainer_rows if row.get("event") == "trainer_start"),
+        None,
+    )
     state = {
         "format": DASHBOARD_STATE_FORMAT,
         "pipeline_id": manifest["pipeline_id"],
         "run_id": run_id,
         "metrics_path": str(metrics_path.resolve()),
-        "environment_steps": 0,
-        "episodes": 0,
-        "trainer_base_initialized": False,
-        "offsets": {name: 0 for name in source_names},
+        "environment_steps": int((trainer_start or {}).get("environment_steps") or 0),
+        "episodes": int((trainer_start or {}).get("ingested_total") or 0),
+        "trainer_base_initialized": trainer_start is not None,
+        # Collector logs are diagnostic tails. Only trainer acknowledgements
+        # have crossed the durable checkpoint boundary.
+        "offsets": {"trainer-metrics.jsonl": 0},
         "terminal": False,
     }
     _atomic_json(state_path, state)
@@ -106,48 +111,70 @@ def _publish_available(
     for row in trainer_rows:
         if row.get("event") == "trainer_start" and not state.get("trainer_base_initialized"):
             state["environment_steps"] = int(row.get("environment_steps") or 0)
+            state["episodes"] = int(row.get("ingested_total") or 0)
             state["trainer_base_initialized"] = True
 
-    # Establish the cumulative base before publishing producer episodes. This
-    # keeps exact-continuation plots in the same coordinate system.
+    # Establish the cumulative base before publishing acknowledged episodes.
+    # This keeps exact-continuation plots in the same coordinate system.
     if not state.get("trainer_base_initialized"):
-        return False
-
-    collected: list[dict[str, Any]] = []
-    for producer_id in manifest["producer_ids"]:
-        name = f"{producer_id}-metrics.jsonl"
-        rows, offsets[name] = _read_new_lines(pipeline / name, int(offsets.get(name, 0)))
-        collected.extend(row for row in rows if row.get("event") == "collector_episode")
-
-    for row in sorted(collected, key=lambda item: float(item.get("unix_s") or 0.0)):
-        state["episodes"] = int(state["episodes"]) + 1
-        state["environment_steps"] = int(state["environment_steps"]) + int(row.get("steps") or 0)
-        out.write(
-            json.dumps(
-                {
-                    "event": "train_episode",
-                    "unix_s": row.get("unix_s"),
-                    "environment_steps": state["environment_steps"],
-                    "episode_id": (f"{row.get('producer_id')}:{row.get('run_nonce')}:{row.get('episode_index')}"),
-                    "reset_seed": row.get("seed"),
-                    "steps": row.get("steps"),
-                    "max_floor": row.get("max_floor"),
-                    "max_act": row.get("max_act"),
-                    "act1_cleared": row.get("act1_cleared"),
-                    "revivals_used": row.get("revivals_used"),
-                    "reward_total": row.get("reward_total"),
-                    "run_won": row.get("run_won"),
-                    "terminal_reason": row.get("terminal_reason")
-                    or ("run_victory" if row.get("run_won") else "run_defeat"),
-                }
-            )
-            + "\n"
+        startup_failure = next(
+            (row for row in trainer_rows if row.get("event") == "trainer_failed"),
+            None,
         )
+        if startup_failure is not None:
+            out.write(
+                json.dumps(
+                    {
+                        "event": "run_failed",
+                        "unix_s": startup_failure.get("unix_s"),
+                        "environment_steps": startup_failure.get("environment_steps", 0),
+                        "error": startup_failure.get("error"),
+                    }
+                )
+                + "\n"
+            )
+            state["terminal"] = True
+            return True
+        return False
 
     terminal = False
     for row in trainer_rows:
         event = row.get("event")
         if event == "trainer_ingest":
+            for episode in row.get("acknowledged_episodes") or ():
+                state["episodes"] = int(episode["ingested_total"])
+                state["environment_steps"] = int(episode["environment_steps"])
+                out.write(
+                    json.dumps(
+                        {
+                            "event": "train_episode",
+                            "unix_s": episode.get("unix_s"),
+                            "environment_steps": state["environment_steps"],
+                            "episode_id": episode.get("episode_id"),
+                            "source_episode_id": episode.get("source_episode_id"),
+                            "reset_seed": episode.get("reset_seed"),
+                            "steps": episode.get("steps"),
+                            "max_floor": episode.get("max_floor"),
+                            "max_act": episode.get("max_act"),
+                            "act1_cleared": episode.get("act1_cleared"),
+                            "revivals_used": episode.get("revivals_used"),
+                            "player_hp_lost": episode.get("player_hp_lost"),
+                            "reward_total": episode.get("reward_total"),
+                            "run_won": episode.get("run_won"),
+                            "terminal_reason": episode.get("terminal_reason")
+                            or (
+                                "run_victory"
+                                if episode.get("run_won")
+                                else "run_defeat"
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+            state["episodes"] = int(row.get("ingested_total") or state["episodes"])
+            state["environment_steps"] = int(
+                row.get("environment_steps") or state["environment_steps"]
+            )
             learner = row.get("learner") or {}
             out.write(
                 json.dumps(
@@ -161,6 +188,7 @@ def _publish_available(
                         "loss": learner.get("loss"),
                         "td_error_mean": learner.get("td_error_mean"),
                         "updates": learner.get("updates"),
+                        "policy_version": row.get("policy_version", learner.get("updates")),
                     }
                 )
                 + "\n"
@@ -174,6 +202,9 @@ def _publish_available(
                         "environment_steps": row.get("environment_steps"),
                         "episodes": row.get("ingested_total"),
                         "learner_updates": (row.get("learner") or {}).get("updates"),
+                        "policy_version": row.get(
+                            "policy_version", (row.get("learner") or {}).get("updates")
+                        ),
                         "completion_status": "horizon_complete",
                     }
                 )
@@ -229,8 +260,11 @@ def main() -> int:
                         "lineage": lineage,
                         "pipeline_id": manifest["pipeline_id"],
                         "control_domain": manifest["control_domain"],
-                        "note": "stage-2/4 isolated pipeline sidecar view",
-                        "state": {"environment_steps": 0, "episodes": 0},
+                        "note": "stage-2 macro pipeline sidecar view",
+                        "state": {
+                            "environment_steps": state["environment_steps"],
+                            "episodes": state["episodes"],
+                        },
                     }
                 )
                 + "\n"

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Stage-2/4 spool trainer with explicit fresh/model-init/resume semantics.
+"""Stage-2 macro spool trainer with explicit fresh/model-init/resume semantics.
 
 The online weight file is a lightweight publication for collectors.  The
 training-state file is the resumable artifact: it contains both networks,
-optimizer, replay, learner counters, and random state.  A missing requested
-initialization or resume path is an error; it never becomes a fresh run.
+optimizer, replay, learner counters, and random state.  Exact continuation
+restores that learner state into a new segment whose producer processes and
+spool are intentionally fresh.  A missing requested initialization or resume
+path is an error; it never becomes a fresh run.
 """
 
 from __future__ import annotations
@@ -151,6 +153,7 @@ def _save_training_state(
         "replay": _replay_state(replay),
         "ingested": ingested,
         "environment_steps": environment_steps,
+        "policy_version": learner.metrics.updates,
         "rng": _rng_state(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +202,40 @@ def _producer_states(status_dir: Path, producer_ids: tuple[str, ...]) -> dict[st
     return states
 
 
+def _require_producers_not_failed(
+    status_dir: Path,
+    producer_ids: tuple[str, ...],
+) -> dict[str, str]:
+    states = _producer_states(status_dir, producer_ids)
+    failed = [producer_id for producer_id, state in states.items() if state == "failed"]
+    if failed:
+        raise RuntimeError(f"producer failed: {', '.join(failed)}")
+    return states
+
+
+def _save_then_acknowledge(
+    save_all: Any,
+    publish_acknowledgement: Any,
+    spool_paths: list[Path],
+) -> None:
+    """Make the accepted learner state durable before deleting source items."""
+
+    save_all()
+    publish_acknowledgement()
+    for path in spool_paths:
+        path.unlink()
+
+
+def _checkpoint_due(
+    *,
+    ingested: int,
+    last_saved_at: int,
+    interval: int,
+    target: int,
+) -> bool:
+    return ingested >= target or ingested - last_saved_at >= interval
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -213,13 +250,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lineage-id", default="stage2-isolated-macro-v1")
     parser.add_argument(
         "--control-domain",
-        choices=("macro", "combat"),
+        choices=("macro",),
         default="macro",
-        help="the one semantic domain optimized by this trainer",
+        help="Stage 2 optimizes macro decisions only",
     )
     parser.add_argument("--producer-status-dir", required=True)
     parser.add_argument("--producer-id", action="append", dest="producer_ids", required=True)
-    parser.add_argument("--idle-timeout-seconds", type=float, default=600.0)
+    parser.add_argument("--idle-timeout-seconds", type=float, default=1200.0)
     parser.add_argument("--status-out", required=True)
     parser.add_argument("--stop-after-episodes", type=int, default=1200)
     parser.add_argument("--updates-per-episode", type=int, default=8)
@@ -244,6 +281,11 @@ def main() -> int:
         {"pipeline_id": args.pipeline_id, "state": "running", "unix_s": time.time()},
     )
     resources = None
+    ingested = 0
+    environment_steps = 0
+    durable_ingested = 0
+    durable_environment_steps = 0
+    learner: MacroQLearner | None = None
     try:
         if init_path is not None and not init_path.is_file():
             raise FileNotFoundError(f"model initialization does not exist: {init_path}")
@@ -263,6 +305,8 @@ def main() -> int:
             )
         if not config.transaction_learning.enabled:
             raise RuntimeError("trainer requires transaction_learning.enabled=true")
+        if args.save_interval_episodes <= 0:
+            raise ValueError("save interval must be a positive episode count")
 
         spool = Path(args.spool)
         spool.mkdir(parents=True, exist_ok=True)
@@ -315,8 +359,6 @@ def main() -> int:
             target_evaluation_context=lambda: _evaluation_mode(macro_target),
         )
 
-        ingested = 0
-        environment_steps = 0
         if resume_path is not None:
             ingested, environment_steps = _load_training_state(
                 resume_path,
@@ -339,7 +381,6 @@ def main() -> int:
             temporary.replace(path)
 
         def save_all() -> None:
-            save_publication()
             _save_training_state(
                 Path(args.checkpoint_out),
                 online=macro_online,
@@ -351,12 +392,21 @@ def main() -> int:
                 ingested=ingested,
                 environment_steps=environment_steps,
             )
+            # Collectors only see a policy version after the resumable learner
+            # state containing that version is durable.
+            save_publication()
 
         # Publish the restored/initialized behavior before producers start.
         save_all()
+        durable_ingested = ingested
+        durable_environment_steps = environment_steps
         last_saved_at = ingested
         last_progress = time.monotonic()
         producer_ids = tuple(args.producer_ids)
+        pending_paths: list[Path] = []
+        pending_path_set: set[Path] = set()
+        pending_summaries: list[dict[str, Any]] = []
+        last_update_metrics: dict[str, Any] = learner.metrics.as_mapping()
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(
                 json.dumps(
@@ -370,20 +420,60 @@ def main() -> int:
                         else ("model_init" if init_path is not None else "fresh"),
                         "ingested_total": ingested,
                         "environment_steps": environment_steps,
+                        "policy_version": learner.metrics.updates,
                         "learner": learner.metrics.as_mapping(),
                     }
                 )
                 + "\n"
             )
             metrics_file.flush()
+
+            def flush_pending() -> None:
+                """Checkpoint one buffered ingest group, then acknowledge it."""
+
+                nonlocal last_saved_at, durable_ingested, durable_environment_steps
+                if not pending_paths:
+                    return
+                ingest_row = {
+                    "event": "trainer_ingest",
+                    "unix_s": time.time(),
+                    "pipeline_id": args.pipeline_id,
+                    "ingested_total": ingested,
+                    "fresh": len(pending_summaries),
+                    "environment_steps": environment_steps,
+                    "policy_version": learner.metrics.updates,
+                    "acknowledged_episodes": list(pending_summaries),
+                    "replay": replay.metrics(),
+                    "learner": last_update_metrics,
+                }
+
+                def publish_acknowledgement() -> None:
+                    metrics_file.write(json.dumps(ingest_row) + "\n")
+                    metrics_file.flush()
+
+                _save_then_acknowledge(
+                    save_all,
+                    publish_acknowledgement,
+                    pending_paths,
+                )
+                pending_paths.clear()
+                pending_path_set.clear()
+                pending_summaries.clear()
+                last_saved_at = ingested
+                durable_ingested = ingested
+                durable_environment_steps = environment_steps
+
             while ingested < args.stop_after_episodes:
+                states = _require_producers_not_failed(
+                    Path(args.producer_status_dir), producer_ids
+                )
                 remaining = args.stop_after_episodes - ingested
-                batch = sorted(spool.glob("*.pkl"))[: min(32, remaining)]
+                batch = [
+                    path
+                    for path in sorted(spool.glob("*.pkl"))
+                    if path not in pending_path_set
+                ][: min(32, remaining)]
                 if not batch:
-                    states = _producer_states(Path(args.producer_status_dir), producer_ids)
-                    failed = [name for name, state in states.items() if state == "failed"]
-                    if failed:
-                        raise RuntimeError(f"producer failed: {', '.join(failed)}")
                     if states and all(state == "complete" for state in states.values()):
                         raise RuntimeError("all producers completed before the trainer reached its episode target")
                     if time.monotonic() - last_progress > args.idle_timeout_seconds:
@@ -410,48 +500,47 @@ def main() -> int:
                     episode = envelope.get("episode")
                     if not isinstance(episode, MacroEpisode):
                         raise RuntimeError(f"spool item contains no MacroEpisode: {path}")
-                    # A spool item is acknowledged only after replay accepts
-                    # it.  Validation/domain errors therefore remain visible
-                    # instead of silently consuming the only factual copy.
+                    summary = envelope.get("episode_summary")
+                    if not isinstance(summary, Mapping):
+                        raise RuntimeError(f"spool item contains no episode summary: {path}")
                     replay.put(episode)
-                    path.unlink()
+                    episode_environment_steps = int(envelope.get("environment_steps") or 0)
                     fresh += 1
-                    fresh_environment_steps += int(envelope.get("environment_steps") or 0)
+                    fresh_environment_steps += episode_environment_steps
+                    pending_paths.append(path)
+                    pending_path_set.add(path)
+                    pending_summaries.append(
+                        {
+                            **dict(summary),
+                            "ingested_total": ingested + fresh,
+                            "environment_steps": environment_steps
+                            + fresh_environment_steps,
+                        }
+                    )
                 if not fresh:
                     continue
                 last_progress = time.monotonic()
                 ingested += fresh
                 environment_steps += fresh_environment_steps
-                update_metrics: dict[str, Any] = learner.metrics.as_mapping()
                 for _ in range(args.updates_per_episode * fresh):
-                    update_metrics = learner.update()
-                if ingested - last_saved_at >= args.save_interval_episodes:
-                    save_all()
-                    last_saved_at = ingested
-                metrics_file.write(
-                    json.dumps(
-                        {
-                            "event": "trainer_ingest",
-                            "unix_s": time.time(),
-                            "pipeline_id": args.pipeline_id,
-                            "ingested_total": ingested,
-                            "fresh": fresh,
-                            "environment_steps": environment_steps,
-                            "replay": replay.metrics(),
-                            "learner": update_metrics,
-                        }
-                    )
-                    + "\n"
-                )
-                metrics_file.flush()
+                    last_update_metrics = learner.update()
+                if _checkpoint_due(
+                    ingested=ingested,
+                    last_saved_at=last_saved_at,
+                    interval=args.save_interval_episodes,
+                    target=args.stop_after_episodes,
+                ):
+                    flush_pending()
 
-            save_all()
+            flush_pending()
+            _require_producers_not_failed(Path(args.producer_status_dir), producer_ids)
             complete = {
                 "event": "trainer_complete",
                 "unix_s": time.time(),
                 "pipeline_id": args.pipeline_id,
                 "ingested_total": ingested,
                 "environment_steps": environment_steps,
+                "policy_version": learner.metrics.updates,
                 "learner": learner.metrics.as_mapping(),
             }
             metrics_file.write(json.dumps(complete) + "\n")
@@ -465,6 +554,12 @@ def main() -> int:
             "pipeline_id": args.pipeline_id,
             "state": "failed",
             "error": f"{type(exc).__name__}: {exc}",
+            "environment_steps": durable_environment_steps,
+            "ingested_total": durable_ingested,
+            "pending_environment_steps": environment_steps
+            - durable_environment_steps,
+            "pending_episodes": ingested - durable_ingested,
+            "policy_version": learner.metrics.updates if learner is not None else 0,
         }
         _atomic_json(status_path, failure_status)
         with metrics_path.open("a", encoding="utf-8") as metrics_file:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage-2/4 producer for one explicitly identified pipeline segment."""
+"""Stage-2 macro producer for one explicitly identified pipeline segment."""
 
 from __future__ import annotations
 
@@ -50,6 +50,44 @@ def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
     return forward
 
 
+def _load_published_model_state(model: Any, path: Path, device: torch.device) -> None:
+    """Load a trainer publication as the complete model state it claims to be."""
+
+    state = torch.load(path, map_location=device, weights_only=True)
+    model.load_state_dict(state, strict=True)
+
+
+def _episode_summary(
+    episode: Any,
+    *,
+    producer_id: str,
+    run_nonce: str,
+    episode_index: int,
+    collected_at: float,
+) -> dict[str, Any]:
+    metrics = episode.metrics
+    return {
+        # Environment episode ids are only process-local.  Replay and
+        # dashboard identity must remain unique across parallel collectors.
+        "episode_id": f"{producer_id}:{run_nonce}:{episode_index}",
+        "source_episode_id": metrics.episode_id,
+        "producer_id": producer_id,
+        "run_nonce": run_nonce,
+        "episode_index": episode_index,
+        "unix_s": collected_at,
+        "reset_seed": metrics.reset_seed,
+        "steps": metrics.steps,
+        "run_won": metrics.run_won,
+        "max_floor": metrics.max_floor,
+        "max_act": metrics.max_act,
+        "act1_cleared": metrics.act1_cleared,
+        "revivals_used": metrics.revivals_used,
+        "player_hp_lost": metrics.player_hp_lost,
+        "reward_total": metrics.reward_total,
+        "terminal_reason": metrics.terminal_reason,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -69,9 +107,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument(
         "--control-domain",
-        choices=("macro", "combat"),
+        choices=("macro",),
         default="macro",
-        help="the one semantic domain owned by this producer",
+        help="Stage 2 owns macro decisions; combat remains with the frozen champion",
     )
     parser.add_argument("--model-reload-episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, required=True)
@@ -148,8 +186,7 @@ def main() -> int:
             mtime = model_path.stat().st_mtime_ns
             if mtime <= model_mtime:
                 return
-            state = torch.load(model_path, map_location=resources.device, weights_only=True)
-            load_trunk_state(macro_model, dict(state))
+            _load_published_model_state(macro_model, model_path, resources.device)
             macro_model.eval()
             model_mtime = mtime
 
@@ -188,6 +225,15 @@ def main() -> int:
                 macro_episode = authority.finish_episode(
                     f"spool-{args.pipeline_id}-{args.producer_id}-{run_nonce}-{episode_index:05d}"
                 )
+                authority_metrics = authority.metrics()
+                collected_at = time.time()
+                summary = _episode_summary(
+                    episode,
+                    producer_id=args.producer_id,
+                    run_nonce=run_nonce,
+                    episode_index=episode_index,
+                    collected_at=collected_at,
+                )
                 if macro_episode is not None:
                     envelope = {
                         "format": SPOOL_ENVELOPE_FORMAT,
@@ -198,6 +244,7 @@ def main() -> int:
                         "control_domain": args.control_domain,
                         "environment_steps": episode.metrics.steps,
                         "episode": macro_episode,
+                        "episode_summary": summary,
                     }
                     temporary = spool / f".tmp-{uuid.uuid4().hex}"
                     with temporary.open("wb") as handle:
@@ -211,9 +258,9 @@ def main() -> int:
                             "pipeline_id": args.pipeline_id,
                             "producer_id": args.producer_id,
                             "run_nonce": run_nonce,
-                            "seed": args.seed,
+                            "reset_seed": episode.metrics.reset_seed,
                             "episode_index": episode_index,
-                            "unix_s": time.time(),
+                            "unix_s": collected_at,
                             "steps": episode.metrics.steps,
                             "run_won": episode.metrics.run_won,
                             "max_floor": episode.metrics.max_floor,
@@ -223,6 +270,12 @@ def main() -> int:
                             "reward_total": episode.metrics.reward_total,
                             "terminal_reason": episode.metrics.terminal_reason,
                             "macro_steps": len(macro_episode.steps) if macro_episode else 0,
+                            "semantic_executor_failed": bool(
+                                authority_metrics["episode_replay_invalid"]
+                            ),
+                            "semantic_executor_failures": int(
+                                authority_metrics["executor_failures"]
+                            ),
                         }
                     )
                     + "\n"

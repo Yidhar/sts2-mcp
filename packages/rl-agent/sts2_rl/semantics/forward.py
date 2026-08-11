@@ -24,38 +24,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
+from .grouping import semantic_card_projection
 from .identity import canonical_payload_bytes
 
-FORWARD_COMPILER_CONTRACT_VERSION: Final = "sts2-forward-compiler-v2"
+FORWARD_COMPILER_CONTRACT_VERSION: Final = "sts2-forward-compiler-v3"
 
-_CARD_FACT_KEYS: Final[tuple[str, ...]] = (
-    "id",
-    "card_id",
-    "card_instance_id",
-    "instance_id",
-    "instance_uuid",
-    "uuid",
-    "uid",
-    "card_ref",
-    "ref",
-    "index",
-    "card_index",
-    "floor_added_to_deck",
-    "cost",
-    "base_cost",
-    "is_upgraded",
-    "upgrade_level",
-    "is_upgradable",
-    "is_removable",
-    "type",
-    "rarity",
-    "source_zone",
-    "source_pile",
-    "zone",
-    "enchantments",
-    "afflictions",
-    "upgrade_preview",
-)
 _ITEM_FACT_KEYS: Final[tuple[str, ...]] = (
     "category",
     "cost",
@@ -96,7 +69,7 @@ def _token(value: Any) -> str:
 
 
 def _card_facts(card: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: card.get(key) for key in _CARD_FACT_KEYS if card.get(key) is not None}
+    return semantic_card_projection(card)
 
 
 def _target_key(payload: Mapping[str, Any]) -> str:

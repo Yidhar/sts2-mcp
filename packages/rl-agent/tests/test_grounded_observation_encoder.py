@@ -1368,17 +1368,10 @@ def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
 def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
-    assert identity == {
-        "version": "grounded-relational-runtime-encoding-v16",
-        "min_token_feature_dim": 224,
-        "feature_abi_end": 215,
-        "fingerprint_sha256": (
-            "3cc73fd8910b005702ee4b408116b18b1c08a3d810f7301641c09fa3957ca70a"
-        ),
-    }
+    assert identity["version"] == "grounded-relational-runtime-encoding-v17"
     assert identity["version"] == GROUNDING_ENCODING_VERSION
     assert identity["min_token_feature_dim"] == 224
-    assert identity["feature_abi_end"] <= 224
+    assert identity["feature_abi_end"] == 215
     assert len(identity["fingerprint_sha256"]) == 64
     assert set(identity["fingerprint_sha256"]) <= set("0123456789abcdef")
     assert grounding_encoding_identity() == identity
@@ -2267,7 +2260,7 @@ def test_2068_strictly_equal_card_selection_instances_form_16_semantic_groups() 
     }
 
 
-def test_strict_card_selection_grouping_keeps_unknown_and_relation_differences() -> None:
+def test_strict_card_selection_grouping_merges_runtime_refs_but_keeps_semantics() -> None:
     encoder = GroundedObservationEncoder(
         GroundedEncodingConfig.from_model_config(
             _small_model_config(),
@@ -2308,8 +2301,8 @@ def test_strict_card_selection_grouping_keeps_unknown_and_relation_differences()
     actions = [
         action(0),
         action(1),
-        # These runtime relationship fields are not mere dispatcher identity;
-        # differences must remain singleton semantic actions.
+        # ``ref`` is another physical runtime identity alias.  It must not
+        # split otherwise equivalent choices.
         action(2, card_extra={"ref": "relation-a"}),
         action(3, card_extra={"ref": "relation-b"}),
         action(4, card_extra={"clone_of": "origin-a", "deck_version": 3}),
@@ -2323,13 +2316,15 @@ def test_strict_card_selection_grouping_keeps_unknown_and_relation_differences()
     groups = encoder.semantic_action_groups(actions)
     encoded = encoder.encode(_observation(), actions)
 
-    assert encoded.snapshot.candidate_count == 9
-    assert [group.multiplicity for group in groups] == [2, *([1] * 8)]
-    assert groups[0].reference.member_positions == (0, 1)
-    assert groups[1].prototype["card"]["ref"] == "relation-a"
-    assert groups[2].prototype["card"]["ref"] == "relation-b"
-    assert groups[5].prototype["target"]["combat_id"] == "enemy-a"
-    assert groups[6].prototype["target"]["combat_id"] == "enemy-b"
+    assert encoded.snapshot.candidate_count == 7
+    assert [group.multiplicity for group in groups] == [4, *([1] * 6)]
+    assert groups[0].reference.member_positions == (0, 1, 2, 3)
+    assert groups[1].prototype["card"]["clone_of"] == "origin-a"
+    assert groups[2].prototype["card"]["clone_of"] == "origin-b"
+    assert groups[3].prototype["target"]["combat_id"] == "enemy-a"
+    assert groups[4].prototype["target"]["combat_id"] == "enemy-b"
+    assert groups[5].prototype["card"]["future_unknown"] == {"value": "a"}
+    assert groups[6].prototype["card"]["future_unknown"] == {"value": "b"}
 
 
 def test_257_strictly_unique_semantic_card_selections_still_fail_closed() -> None:

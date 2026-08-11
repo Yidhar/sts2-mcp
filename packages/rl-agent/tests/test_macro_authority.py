@@ -5,6 +5,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from sts2_env._sim_translate_actions import _translate_legal_actions
+from sts2_env._sim_translate_entities import _translate_card
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.macro.authority import MacroCollectionAuthority
 from sts2_rl.semantics.clock import DECISION_CLOCK_BASE
@@ -94,7 +96,13 @@ _PICKER_ACTIONS = [
         "kind": "select_card",
         "model_action_kind": "card_selection",
         "selection_operation": "select",
-        "card": {"id": "CARD.BASH", "instance_id": "CARD.BASH-1"},
+        "card": {
+            "id": "CARD.BASH",
+            "instance_id": "CARD.BASH-1",
+            "index": 0,
+            "is_upgradable": True,
+            "is_removable": True,
+        },
     },
     {
         "kind": "confirm_selection",
@@ -155,6 +163,101 @@ def test_smith_is_one_semantic_q_decision_with_mechanical_suffix() -> None:
     assert step.surface == "rest" and step.branch == "smith"
     assert step.terminal is True and step.discount == 0.0
     assert step.reward == 0.05
+
+
+def test_real_nested_upgrade_preview_smith_target_executes_atomically() -> None:
+    native_card = _native_card_with_upgrade_preview()
+    deck_card = _translate_card(native_card, pile="Deck")
+    picker_actions = _translated_picker_actions(native_card)
+    picker_surface = _grouped_surface(picker_actions)
+    authority = _authority(q=[0.0, 5.0, 0.0])
+    authority.begin_episode("ep-real-preview-smith")
+
+    entry = authority.choose(
+        observation=_rest_observation(deck=[deck_card]),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    assert entry == 1
+    assert authority.choose(
+        observation={"phase": "card_selection", "run": {"floor": 7}},
+        semantic_actions=picker_surface,
+        snapshot=_snapshot(candidate_count=len(picker_surface)),
+        valid=np.ones(len(picker_surface), dtype=np.bool_),
+    ) == 0
+    assert authority.choose(
+        observation={"phase": "card_selection", "run": {"floor": 7}},
+        semantic_actions=picker_surface,
+        snapshot=_snapshot(candidate_count=len(picker_surface)),
+        valid=np.ones(len(picker_surface), dtype=np.bool_),
+    ) == 1
+
+    authority.observe_step(reward=0.1, floor=7, terminal=True)
+    episode = authority.finish_episode()
+    assert episode is not None and len(episode.steps) == 1
+    assert episode.steps[0].branch == "smith"
+    assert authority.mechanical_dispatches == 2
+
+
+def test_real_nested_upgrade_preview_remove_target_executes_atomically() -> None:
+    native_card = _native_card_with_upgrade_preview()
+    deck_card = _translate_card(native_card, pile="Deck")
+    picker_actions = _translated_picker_actions(native_card)
+    picker_surface = _grouped_surface(picker_actions)
+    shop_actions = [
+        {
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "model_action_variant": "purchase",
+            "idx": 0,
+            "item": {
+                "category": "card_removal",
+                "cost": 75,
+                "can_afford": True,
+            },
+        },
+        {
+            "kind": "proceed",
+            "model_action_kind": "shop",
+            "model_action_variant": "leave",
+            "idx": 1,
+        },
+    ]
+    observation = {
+        "phase": "shop",
+        "combat": {"in_progress": False},
+        "run": {"floor": 8},
+        "player": {"deck": [deck_card]},
+        "shop": {"is_open": True},
+    }
+    authority = _authority(q=[5.0, 0.0, 0.0])
+    authority.begin_episode("ep-real-preview-remove")
+
+    assert authority.choose(
+        observation=observation,
+        semantic_actions=shop_actions,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    ) == 0
+    assert authority.choose(
+        observation={"phase": "card_selection", "run": {"floor": 8}},
+        semantic_actions=picker_surface,
+        snapshot=_snapshot(candidate_count=len(picker_surface)),
+        valid=np.ones(len(picker_surface), dtype=np.bool_),
+    ) == 0
+    assert authority.choose(
+        observation={"phase": "card_selection", "run": {"floor": 8}},
+        semantic_actions=picker_surface,
+        snapshot=_snapshot(candidate_count=len(picker_surface)),
+        valid=np.ones(len(picker_surface), dtype=np.bool_),
+    ) == 1
+
+    authority.observe_step(reward=0.1, floor=8, terminal=True)
+    episode = authority.finish_episode()
+    assert episode is not None and len(episode.steps) == 1
+    assert episode.steps[0].branch == "remove"
+    assert authority.mechanical_dispatches == 2
 
 
 def test_semantic_snapshot_scores_smith_targets_and_replay_uses_that_index() -> None:
@@ -242,7 +345,13 @@ def test_picker_target_mismatch_never_selects_an_arbitrary_copy() -> None:
             "model_action_kind": "card_selection",
             "model_action_variant": "select",
             "selection_operation": "select",
-            "card": {"id": "CARD.BASH", "instance_id": "CARD.BASH-OTHER", "index": 9},
+            "card": {
+                "id": "CARD.ANGER",
+                "instance_id": "CARD.ANGER-OTHER",
+                "index": 9,
+                "is_upgradable": True,
+                "is_removable": True,
+            },
         }
     ]
     assert (
@@ -254,6 +363,71 @@ def test_picker_target_mismatch_never_selects_an_arbitrary_copy() -> None:
         )
         is None
     )
+    assert authority.finish_episode() is None
+
+
+def test_composite_executor_mismatch_invalidates_the_whole_replay_episode() -> None:
+    forward_calls = 0
+
+    def forward(snapshot: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        nonlocal forward_calls
+        forward_calls += 1
+        values = [5.0, 0.0] if forward_calls == 1 else [0.0, 5.0]
+        return torch.tensor(values[: len(snapshot.action_mask)]), hidden
+
+    authority = MacroCollectionAuthority(
+        forward_q=forward,
+        initial_state=lambda: None,
+        epsilon=0.0,
+        seed=4,
+    )
+    authority.begin_episode("ep-invalid-composite")
+    assert authority.choose(
+        observation=_rest_observation(floor=6),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    ) == 0
+    authority.observe_step(reward=0.2, floor=7, terminal=False)
+    assert authority.choose(
+        observation=_rest_observation(floor=7),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    ) == 1
+
+    wrong_picker = [
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": {
+                "id": "CARD.ANGER",
+                "is_upgradable": True,
+                "is_removable": True,
+            },
+        }
+    ]
+    assert authority.choose(
+        observation={"phase": "card_selection", "run": {"floor": 7}},
+        semantic_actions=wrong_picker,
+        snapshot=_snapshot(candidate_count=1),
+        valid=np.ones(1, dtype=np.bool_),
+    ) is None
+    # The earlier valid Rest step cannot be replayed after the behavior hidden
+    # state consumed a Smith action whose mechanical suffix never completed.
+    assert authority.metrics()["episode_replay_invalid"] is True
+    assert authority.metrics()["executor_failures"] == 1
+    assert authority.metrics()["recorded_steps"] == 0
+    assert authority.choose(
+        observation=_rest_observation(floor=8),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    ) is None
+    assert forward_calls == 2
+    authority.observe_step(reward=1.0, floor=8, terminal=True)
     assert authority.finish_episode() is None
 
 
@@ -282,7 +456,11 @@ def test_picker_uses_stable_member_of_one_strict_equal_action_group() -> None:
             "model_action_variant": "select",
             "selection_operation": "select",
             "action_handle": f"copy-{index}",
-            "card": {"id": "CARD.BASH", "cost": 2},
+            "card": {
+                **target,
+                "instance_id": f"copy-{index}",
+                "index": index,
+            },
         }
         for index in range(2)
     ]
@@ -604,6 +782,57 @@ _COMBAT_ACTIONS = [
     },
     {"kind": "end_turn", "model_action_kind": "end_turn"},
 ]
+
+
+def _native_card_with_upgrade_preview() -> dict[str, Any]:
+    return {
+        "id": "ANGER",
+        "instance_id": "source-card-instance",
+        "index": 0,
+        "source_pile": "Deck",
+        "upgrade_level": 0,
+        "is_upgradable": True,
+        "is_removable": True,
+        "enchantments": [{"id": "ENCHANT.TEST", "amount": 2}],
+        "dynamic_vars": [{"name": "damage", "current_value": 6}],
+        "upgrade_preview": {
+            "id": "ANGER",
+            "instance_id": "detached-preview-instance",
+            "index": 0,
+            "source_pile": "None",
+            "upgrade_level": 1,
+            "enchantments": [{"id": "ENCHANT.TEST", "amount": 2}],
+            "dynamic_vars": [{"name": "damage", "current_value": 9}],
+        },
+    }
+
+
+def _translated_picker_actions(native_card: dict[str, Any]) -> list[dict[str, Any]]:
+    return _translate_legal_actions(
+        (
+            {"action": "select_card", "index": 0},
+            {"action": "confirm_selection"},
+            {"action": "cancel_selection"},
+        ),
+        sim_player={},
+        battle={},
+        map_state={},
+        event={},
+        rest_site={},
+        shop={},
+        rewards={},
+        card_reward={},
+        card_select={"cards": [native_card]},
+        treasure={},
+        relic_select={},
+    )
+
+
+def _grouped_surface(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"prototype": group.prototype}
+        for group in GroundedObservationEncoder().semantic_action_groups(actions)
+    ]
 
 
 def test_combat_view_is_declined_by_default_and_owned_with_the_flag() -> None:

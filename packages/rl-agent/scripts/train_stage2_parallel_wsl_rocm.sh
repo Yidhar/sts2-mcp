@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Parallel Stage-2/4 pipeline. Every invocation is one new pipeline segment
+# Parallel Stage-2 macro pipeline. Every invocation is one new pipeline segment
 # with an empty spool. A resume points at a full trainer state from an older
 # segment; it never reuses that segment's spool or logs.
 
@@ -21,6 +21,7 @@ COLLECTORS="${STS2_STAGE2_COLLECTORS:-2}"
 LINEAGE_ID="${STS2_STAGE2_LINEAGE_ID:-stage2-isolated-macro-v1}"
 CONTROL_DOMAIN="${STS2_STAGE2_CONTROL_DOMAIN:-macro}"
 PIPELINE_ID="${STS2_STAGE2_PIPELINE_ID:-$("$VENV_DIR/bin/python" -c 'import uuid; print(uuid.uuid4())')}"
+SEED_BASE="${STS2_STAGE2_SEED_BASE:-$("$VENV_DIR/bin/python" -c 'import secrets; print(100000000 + secrets.randbelow(800000000))')}"
 RUN_DIR="${STS2_STAGE2_RUN_DIR:-$ARTIFACT_ROOT/runs/$LINEAGE_ID/run-$PIPELINE_ID}"
 RESUME="${STS2_STAGE2_RESUME:-}"
 INIT_MACRO="${STS2_STAGE2_INIT_MACRO:-}"
@@ -30,8 +31,9 @@ INIT_MACRO="${STS2_STAGE2_INIT_MACRO:-}"
 [[ -z "$RESUME" || -z "$INIT_MACRO" ]] || { echo "[stage2-par] resume and model-init are mutually exclusive" >&2; exit 2; }
 [[ -z "$RESUME" || -f "$RESUME" ]] || { echo "[stage2-par] resume state missing: $RESUME" >&2; exit 1; }
 [[ -z "$INIT_MACRO" || -f "$INIT_MACRO" ]] || { echo "[stage2-par] model initialization missing: $INIT_MACRO" >&2; exit 1; }
-[[ "$CONTROL_DOMAIN" == "macro" || "$CONTROL_DOMAIN" == "combat" ]] || {
-  echo "[stage2-par] STS2_STAGE2_CONTROL_DOMAIN must be macro or combat" >&2; exit 2;
+[[ "$CONTROL_DOMAIN" == "macro" ]] || {
+  echo "[stage2-par] production Stage-2 currently owns macro decisions only; combat training requires an explicit cross-domain bridge" >&2
+  exit 2
 }
 if [[ -e "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "[stage2-par] run directory must be new and empty: $RUN_DIR" >&2
@@ -63,7 +65,7 @@ mkdir -p "$SPOOL" "$STATUS_DIR" "$LOG_DIR"
 
 PRODUCER_IDS=()
 for index in $(seq 1 "$COLLECTORS"); do PRODUCER_IDS+=("collector-$index"); done
-export PIPELINE_ID LINEAGE_ID CONTROL_DOMAIN COLLECTORS RUN_DIR
+export PIPELINE_ID LINEAGE_ID CONTROL_DOMAIN COLLECTORS RUN_DIR SEED_BASE RESUME INIT_MACRO
 python - <<'PY'
 import json, os
 from pathlib import Path
@@ -74,6 +76,9 @@ payload = {
     "lineage_id": os.environ["LINEAGE_ID"],
     "control_domain": os.environ["CONTROL_DOMAIN"],
     "producer_ids": [f"collector-{i}" for i in range(1, int(os.environ["COLLECTORS"]) + 1)],
+    "seed_base": int(os.environ["SEED_BASE"]),
+    "learner_load_mode": "resume" if os.environ["RESUME"] else ("model_init" if os.environ["INIT_MACRO"] else "fresh"),
+    "producer_state": "fresh",
 }
 (run / "pipeline.json").write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 PY
@@ -106,6 +111,8 @@ python scripts/run_stage2_trainer.py \
   --stop-after-episodes "${STS2_STAGE2_EPISODES:-1200}" \
   --updates-per-episode "${STS2_STAGE2_UPDATES:-8}" \
   --sample-windows "${STS2_STAGE2_SAMPLE_WINDOWS:-16}" \
+  --replay-episodes "${STS2_STAGE2_REPLAY_EPISODES:-128}" \
+  --idle-timeout-seconds "${STS2_STAGE2_IDLE_TIMEOUT_SECONDS:-1200}" \
   --metrics-out "$RUN_DIR/trainer-metrics.jsonl" \
   --device cuda --sim-exe "$SIM_EXE" \
   > "$LOG_DIR/trainer.log" 2>&1 &
@@ -113,6 +120,8 @@ TRAINER_PID=$!
 PIDS+=("$TRAINER_PID")
 
 # The trainer publishes initialized/restored behavior before accepting data.
+# A resume continues the learner exactly while these producer processes and
+# their random seed streams are intentionally new for this segment.
 for _ in $(seq 1 120); do
   [[ -f "$MODEL" ]] && break
   kill -0 "$TRAINER_PID" 2>/dev/null || {
@@ -136,7 +145,7 @@ for index in $(seq 1 "$COLLECTORS"); do
     --episodes "${STS2_STAGE2_COLLECTOR_EPISODES:-1000}" \
     --epsilon "${STS2_STAGE2_EPSILON:-0.15}" \
     "${DOMAIN_ARGS[@]}" \
-    --seed $((6500000 + index * 10000)) \
+    --seed $((SEED_BASE + index * 10000)) \
     --metrics-out "$RUN_DIR/$producer_id-metrics.jsonl" \
     --device cuda --sim-exe "$SIM_EXE" \
     > "$LOG_DIR/$producer_id.log" 2>&1 &
@@ -148,5 +157,52 @@ set +e
 wait "$TRAINER_PID"
 STATUS=$?
 set -e
+SYNTHESIZED="$(
+  TRAINER_EXIT="$STATUS" TRAINER_STATUS="$TRAINER_STATUS" \
+  TRAINER_METRICS="$RUN_DIR/trainer-metrics.jsonl" PIPELINE_ID="$PIPELINE_ID" \
+  python - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+metrics = Path(os.environ["TRAINER_METRICS"])
+rows = []
+if metrics.is_file():
+    for line in metrics.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+
+if any(row.get("event") in {"trainer_complete", "trainer_failed"} for row in rows):
+    print("0")
+else:
+    latest = rows[-1] if rows else {}
+    failure = {
+        "event": "trainer_failed",
+        "state": "failed",
+        "unix_s": time.time(),
+        "pipeline_id": os.environ["PIPELINE_ID"],
+        "environment_steps": int(latest.get("environment_steps") or 0),
+        "ingested_total": int(latest.get("ingested_total") or 0),
+        "policy_version": int(latest.get("policy_version") or 0),
+        "error": "trainer process exited with status "
+        + os.environ["TRAINER_EXIT"]
+        + " without terminal metrics",
+    }
+    metrics.parent.mkdir(parents=True, exist_ok=True)
+    with metrics.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(failure) + "\n")
+    status = Path(os.environ["TRAINER_STATUS"])
+    temporary = status.with_suffix(status.suffix + ".tmp")
+    temporary.write_text(json.dumps(failure, sort_keys=True), encoding="utf-8")
+    temporary.replace(status)
+    print("1")
+PY
+)"
+if [[ "$SYNTHESIZED" == "1" && "$STATUS" -eq 0 ]]; then STATUS=1; fi
 echo "[stage2-par] trainer exited with $STATUS; stopping producers"
 exit "$STATUS"

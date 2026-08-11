@@ -701,17 +701,13 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
 _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V15 makes the nested native upgrade-preview transport/lift contract part of
-# the encoding identity.  V14 knew how to encode an already root-level preview
-# but HeadlessSim emits it under each selectable card; without the reviewed
-# lift the live tensor remained byte-identical to a blind-upgrade encoder.
-# V13 and the first implementation of merchant card removal shared a digest
-# even though a category-only native item changed from ``purchase_item`` / Run
-# to ``purchase_card_removal`` / Selection. Tensor shapes and feature slots
-# remain stable, but candidate transaction semantics differ. Exact resume must
-# therefore fail closed; explicitly reviewed model-parameter initialization
-# from the pinned V13 identity remains shape compatible.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v16"
+# V17 makes the shared strategic-card projection part of the active decision
+# ABI.  Physical card instance/position fields and transient picker membership
+# no longer split otherwise identical semantic candidates, while every visible
+# strategic fact (including nested upgrade previews and enchantments) remains
+# represented.  Tensor shapes are unchanged, but candidate identities and
+# replay action indices are not compatible with earlier encoders.
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v17"
 
 # This table is executable encoder semantics, not parser convenience. Keep it
 # immutable and include it verbatim in the grounding identity payload so any

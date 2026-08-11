@@ -28,11 +28,12 @@ from torch import Tensor
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.semantics.clock import decision_discount
 from sts2_rl.semantics.forward import ForwardDecision, NativeStep, SemanticCandidate, forward_decision
-from sts2_rl.semantics.grouping import strict_action_groups
+from sts2_rl.semantics.grouping import semantic_card_projection, strict_action_groups
+from sts2_rl.semantics.identity import SemanticContractError
 
 from .transitions import MacroEpisode, MacroStep
 
-MACRO_AUTHORITY_VERSION: Final = "sts2-macro-authority-v3"
+MACRO_AUTHORITY_VERSION: Final = "sts2-macro-authority-v4"
 
 _PICKER_SELECT_KINDS: Final[frozenset[str]] = frozenset(
     {"select_card", "select_card_option", "select_hand_card", "combat_select_card"}
@@ -48,29 +49,6 @@ _PICKER_REVERSE_KINDS: Final[frozenset[str]] = frozenset(
         "deselect_hand_card",
         "combat_deselect_card",
     }
-)
-_CARD_INSTANCE_KEYS: Final[tuple[str, ...]] = (
-    "card_instance_id",
-    "instance_uuid",
-    "instance_id",
-    "uuid",
-    "uid",
-    "card_ref",
-    "ref",
-)
-_CARD_POSITION_KEYS: Final[tuple[str, ...]] = ("index", "card_index")
-_CARD_DEFINITION_KEYS: Final[tuple[str, ...]] = ("id", "card_id", "model_id")
-_CARD_STABLE_FACT_KEYS: Final[tuple[str, ...]] = (
-    "floor_added_to_deck",
-    "is_upgraded",
-    "upgrade_level",
-    "cost",
-    "base_cost",
-    "type",
-    "rarity",
-    "enchantments",
-    "afflictions",
-    "upgrade_preview",
 )
 
 
@@ -88,56 +66,16 @@ def _kind_for_step(step: NativeStep) -> str:
     return _kind({"kind": step.kind})
 
 
-def _first_fact(card: Mapping[str, Any], keys: Sequence[str]) -> Any:
-    for key in keys:
-        value = card.get(key)
-        if value is not None and str(value).strip():
-            return value
-    return None
-
-
-def _card_copy_projection(card: Mapping[str, Any]) -> dict[str, Any]:
-    projection = {
-        key: card.get(key)
-        for key in _CARD_STABLE_FACT_KEYS
-        if card.get(key) is not None
-    }
-    definition = _first_fact(card, _CARD_DEFINITION_KEYS)
-    if definition is not None:
-        projection["definition_id"] = definition
-    source = _first_fact(card, ("source_zone", "source_pile", "zone"))
-    if source is not None:
-        projection["source_zone"] = source
-    return projection
-
-
 def _card_matches(action: Mapping[str, Any], target: Mapping[str, Any] | None) -> bool:
     if target is None:
         return True
     card = action.get("card")
     if not isinstance(card, Mapping):
         return False
-    expected_instance = _first_fact(target, _CARD_INSTANCE_KEYS)
-    actual_instance = _first_fact(card, _CARD_INSTANCE_KEYS)
-    if expected_instance is not None and actual_instance is not None:
-        return str(expected_instance) == str(actual_instance)
-
-    expected_position = _first_fact(target, _CARD_POSITION_KEYS)
-    actual_position = _first_fact(card, _CARD_POSITION_KEYS)
-    if expected_position is not None and actual_position is not None:
-        expected_definition = _first_fact(target, _CARD_DEFINITION_KEYS)
-        actual_definition = _first_fact(card, _CARD_DEFINITION_KEYS)
-        return (
-            expected_position == actual_position
-            and expected_definition is not None
-            and actual_definition is not None
-            and str(expected_definition) == str(actual_definition)
-        )
-
-    # A bridge without a stable instance/position identity may still expose a
-    # complete immutable card projection.  Equality is exact; sharing only a
-    # card definition ID is deliberately insufficient for duplicate copies.
-    return _card_copy_projection(card) == _card_copy_projection(target)
+    try:
+        return semantic_card_projection(card) == semantic_card_projection(target)
+    except SemanticContractError:
+        return False
 
 
 @dataclass(slots=True)
@@ -196,6 +134,8 @@ class MacroCollectionAuthority:
         self._steps: list[MacroStep] = []
         self._open: _OpenTransition | None = None
         self._pending_plan: _PendingPlan | None = None
+        self._episode_replay_invalid = False
+        self._executor_failures = 0
         self._last_floor = 0
         self._combat_active = False
         self.overrides = 0
@@ -210,6 +150,8 @@ class MacroCollectionAuthority:
         self._steps = []
         self._open = None
         self._pending_plan = None
+        self._episode_replay_invalid = False
+        self._executor_failures = 0
         self._last_floor = 0
         self._combat_active = False
         self.overrides = 0
@@ -251,6 +193,12 @@ class MacroCollectionAuthority:
             self._combat_active = False
 
     def finish_episode(self, episode_id: str | None = None) -> MacroEpisode | None:
+        if self._episode_replay_invalid:
+            self._episode_id = None
+            self._steps = []
+            self._open = None
+            self._pending_plan = None
+            return None
         self._close_open(terminal=True)
         if not self._steps:
             self._episode_id = None
@@ -275,6 +223,13 @@ class MacroCollectionAuthority:
         """Return a native candidate index to execute, or None to decline."""
 
         self._ensure_episode()
+        if self._episode_replay_invalid:
+            # A composite action changed recurrent state before its native
+            # suffix failed.  No later transition in this episode can be
+            # replayed against the behavior recurrent chain, so the authority
+            # cedes the remainder of the episode.
+            self.declined += 1
+            return None
         # Collector candidates arrive as strict-group wrappers; the native
         # action facts live under their ``prototype`` key.
         semantic_actions = [
@@ -310,11 +265,15 @@ class MacroCollectionAuthority:
                 self._pending_plan = _PendingPlan(remaining) if remaining else None
                 continue
 
-            # The executor cannot realize the learned semantic action.  Do not
-            # turn a different card into its target and do not train on a
-            # transition whose declared action never completed.
+            # The executor cannot realize the learned semantic action.  The Q
+            # recurrent state already consumed that action, so dropping only
+            # its transition would also corrupt every later replay state.  The
+            # whole domain episode is therefore ineligible for replay.
             self._pending_plan = None
             self._open = None
+            self._steps = []
+            self._episode_replay_invalid = True
+            self._executor_failures += 1
             self.declined += 1
             return None
 
@@ -543,6 +502,8 @@ class MacroCollectionAuthority:
             "mechanical_dispatches": self.mechanical_dispatches,
             "declined": self.declined,
             "recorded_steps": len(self._steps),
+            "episode_replay_invalid": self._episode_replay_invalid,
+            "executor_failures": self._executor_failures,
             "epsilon": self.epsilon,
             "control_domain": self.control_domain,
         }

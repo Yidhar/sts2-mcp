@@ -12,7 +12,7 @@ from typing import Any, Final
 from .identity import SemanticContractError, canonical_payload_bytes
 
 STRICT_ACTION_GROUPING_CONTRACT_VERSION: Final = (
-    "sts2-strict-action-grouping-contract-v1"
+    "sts2-strict-action-grouping-contract-v2"
 )
 _SELECTION_OPERATIONS: Final[frozenset[str]] = frozenset({"select", "deselect"})
 _SELECTION_KIND_ALIASES: Final[dict[str, str]] = {
@@ -42,12 +42,22 @@ _CARD_INSTANCE_KEYS: Final[frozenset[str]] = frozenset(
         "card_instance_id",
         "instance_id",
         "instance_uuid",
+        "uuid",
+        "uid",
+        "card_ref",
+        "ref",
     }
 )
 _CARD_CONTAINERS: Final[frozenset[str]] = frozenset(
     {
         "card",
         "upgrade_preview",
+    }
+)
+_CARD_SELECTION_STATE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "is_selected",
+        "selection_membership",
     }
 )
 
@@ -102,7 +112,11 @@ def _strict_selection_value(
             if inside_raw and len(path) == 1 and key in _ROOT_DISPATCH_KEYS:
                 continue
             if parent in _CARD_CONTAINERS:
-                if key in _CARD_INSTANCE_KEYS or key in _ROOT_DISPATCH_KEYS:
+                if (
+                    key in _CARD_INSTANCE_KEYS
+                    or key in _ROOT_DISPATCH_KEYS
+                    or key in _CARD_SELECTION_STATE_KEYS
+                ):
                     continue
             projected[raw_key] = _strict_selection_value(
                 child,
@@ -117,6 +131,22 @@ def _strict_selection_value(
     raise SemanticContractError(
         f"strict action equivalence supports only JSON-compatible values, got {type(value).__name__} at {location}"
     )
+
+
+def semantic_card_projection(card: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the shared strategic identity of one visible card.
+
+    Physical instance/position fields and current picker membership are
+    executor bindings, not strategic card semantics.  Every other visible JSON
+    field is retained recursively, including upgrade previews, enchantments,
+    dynamic values, and future DTO additions.  Forward compilation, strict
+    picker grouping, and the atomic executor all use this one projection.
+    """
+
+    projected = _strict_selection_value(card, path=("card",))
+    if not isinstance(projected, dict):
+        raise SemanticContractError("semantic card projection must remain a mapping")
+    return projected
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +235,7 @@ def _strict_action_grouping_contract_json() -> str:
         "root_dispatch_keys": sorted(_ROOT_DISPATCH_KEYS),
         "card_instance_keys": sorted(_CARD_INSTANCE_KEYS),
         "card_containers": sorted(_CARD_CONTAINERS),
+        "card_selection_state_keys": sorted(_CARD_SELECTION_STATE_KEYS),
         "canonicalization": "canonical_payload_bytes",
         "unknown_field_policy": "retain-or-singleton-fail-closed",
     }
@@ -233,6 +264,7 @@ __all__ = [
     "STRICT_ACTION_GROUPING_CONTRACT_VERSION",
     "StrictActionGroup",
     "card_selection_operation",
+    "semantic_card_projection",
     "strict_action_grouping_contract",
     "strict_action_groups",
 ]

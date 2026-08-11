@@ -1,5 +1,11 @@
 # Stage-4 combat challenger — comparison record
 
+Status: historical experiment record. The current production Stage-2 runners
+do not expose combat candidate-Q training. The experiment may be repeated only
+after an explicit encounter-terminal or cross-domain bootstrap boundary is
+implemented; realized-return folding is valid only while the combat champion
+is frozen.
+
 Companion to `semantic-decision-graph-reset-v1.md` §10 stage 4 and the
 stage-3 handoff record. All numbers from paired deterministic held-out
 seeds (fixed odd prefix, n=16, seed namespace 6400000).

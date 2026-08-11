@@ -15,6 +15,7 @@ from sts2_rl.macro import (
     MacroQLearner,
     MacroSequenceReplay,
     MacroStep,
+    MacroWindow,
     n_step_targets,
     summarize_counts,
 )
@@ -100,6 +101,8 @@ def test_transition_contract_rejects_illegal_and_terminal_bootstrap() -> None:
             branch="rest",
             control_domain="macro",
         )
+    with pytest.raises(ValueError, match="must end with a terminal step"):
+        MacroEpisode(episode_id="unfinished", steps=(_step(),))
     episode = MacroEpisode(
         episode_id="ep-1",
         steps=(_step(branch="smith"), _step(terminal=True, discount=0.0)),
@@ -127,7 +130,13 @@ def test_replay_covers_episode_from_step_zero_and_evicts_uniformly() -> None:
         replay.put(
             MacroEpisode(
                 episode_id=f"ep-{index}",
-                steps=tuple(_step() for _ in range(6)),
+                steps=tuple(
+                    _step(
+                        terminal=step_index == 5,
+                        discount=0.0 if step_index == 5 else 1.0,
+                    )
+                    for step_index in range(6)
+                ),
             )
         )
     assert len(replay) == 2  # oldest evicted
@@ -148,12 +157,132 @@ def test_replay_covers_episode_from_step_zero_and_evicts_uniformly() -> None:
         }
         assert covered == set(range(len(episode.steps)))
         for window in episode_windows[1:]:
-            # Exact-history mode replays the real episode prefix, rather than
-            # treating a bounded suffix as if it began from the zero state.
+            # Without a factual reset, exact-history mode still replays the
+            # real episode prefix rather than fabricating a zero state.
             assert window.start == 0
             assert window.burn_in == window.learn_slice[0]
     with pytest.raises(ValueError, match="already stored"):
-        replay.put(MacroEpisode(episode_id="ep-2", steps=(_step(),)))
+        replay.put(
+            MacroEpisode(
+                episode_id="ep-2",
+                steps=(_step(terminal=True, discount=0.0),),
+            )
+        )
+
+
+def test_long_combat_replay_starts_each_window_at_latest_recurrent_reset() -> None:
+    replay = MacroSequenceReplay(
+        capacity_episodes=1,
+        window_length=16,
+        seed=9,
+        control_domain="combat",
+    )
+    reset_indices = (0, 63, 128, 207, 401, 520)
+    step_count = 540
+    replay.put(
+        MacroEpisode(
+            episode_id="long-combat",
+            steps=tuple(
+                _step(
+                    reward=float((index % 7) + 1) / 10.0,
+                    discount=0.0 if index == step_count - 1 else 1.0,
+                    terminal=index == step_count - 1,
+                    surface="combat",
+                    branch="play_card",
+                    control_domain="combat",
+                    recurrent_reset=index in reset_indices,
+                )
+                for index in range(step_count)
+            ),
+        )
+    )
+
+    windows = replay._windows()
+    covered = {
+        index
+        for window in windows
+        for index in range(*window.learn_slice)
+    }
+    assert covered == set(range(step_count))
+    for window in windows:
+        learn_start, _ = window.learn_slice
+        expected_start = max(
+            (index for index in reset_indices if index <= learn_start),
+            default=0,
+        )
+        assert window.start == expected_start
+        assert window.burn_in == learn_start - expected_start
+
+    last_window = windows[-1]
+    assert last_window.learn_slice == (528, 540)
+    assert last_window.start == 520
+    assert last_window.burn_in == 8
+
+
+def test_reset_aware_burn_in_is_exactly_equivalent_to_full_episode_prefix() -> None:
+    replay = MacroSequenceReplay(
+        capacity_episodes=1,
+        window_length=16,
+        seed=13,
+        control_domain="combat",
+    )
+    step_count = 540
+    reset_indices = {0, 63, 128, 207, 401, 520}
+    replay.put(
+        MacroEpisode(
+            episode_id="reset-equivalence",
+            steps=tuple(
+                _step(
+                    reward=float((index % 7) + 1) / 10.0,
+                    discount=0.0 if index == step_count - 1 else 1.0,
+                    terminal=index == step_count - 1,
+                    surface="combat",
+                    branch="play_card",
+                    control_domain="combat",
+                    recurrent_reset=index in reset_indices,
+                )
+                for index in range(step_count)
+            ),
+        )
+    )
+    reset_window = replay._windows()[-1]
+    learn_start, _ = reset_window.learn_slice
+    full_prefix_window = MacroWindow(
+        episode=reset_window.episode,
+        start=0,
+        burn_in=learn_start,
+        length=reset_window.length,
+        window_id="full-prefix-reference",
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.25))
+
+    def online(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        state = parameter.new_zeros(()) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        q_values = torch.stack((state + parameter, state - parameter, state * 0.5))
+        return q_values, state + parameter * 0.1 + step.reward
+
+    def target(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        state = torch.tensor(0.0) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        q_values = torch.stack((state + 0.5, state - 0.5, state * 0.5))
+        return q_values, state + 0.025 + step.reward
+
+    learner = MacroQLearner(
+        online_parameters=[parameter],
+        forward_online=online,
+        forward_target=target,
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(n_step=3, sample_windows=1),
+    )
+
+    full_values = learner._window_values(full_prefix_window)
+    reset_values = learner._window_values(reset_window)
+    torch.testing.assert_close(full_values[0], reset_values[0])
+    assert full_values[1:4] == reset_values[1:4]
+    assert full_values[4] == reset_values[4]
 
 
 class _FakeQ:
@@ -418,7 +547,12 @@ def test_replay_refuses_cross_domain_episodes() -> None:
         control_domain="combat",
     )
     with pytest.raises(ValueError, match="another domain"):
-        replay.put(MacroEpisode(episode_id="macro", steps=(_step(),)))
+        replay.put(
+            MacroEpisode(
+                episode_id="macro",
+                steps=(_step(terminal=True, discount=0.0),),
+            )
+        )
     replay.put(
         MacroEpisode(
             episode_id="combat",
@@ -428,6 +562,8 @@ def test_replay_refuses_cross_domain_episodes() -> None:
                     branch="end_turn",
                     control_domain="combat",
                     recurrent_reset=True,
+                    terminal=True,
+                    discount=0.0,
                 ),
             ),
         )

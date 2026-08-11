@@ -28,6 +28,7 @@ from .grouping import (
     STRICT_ACTION_GROUPING_CONTRACT_VERSION,
     StrictActionGroup,
     card_selection_operation,
+    semantic_card_projection,
     strict_action_grouping_contract,
     strict_action_groups,
 )
@@ -109,6 +110,7 @@ __all__ = [
     "clock_tick",
     "decision_discount",
     "default_surface_registry",
+    "semantic_card_projection",
     "strict_action_grouping_contract",
     "strict_action_groups",
 ]
