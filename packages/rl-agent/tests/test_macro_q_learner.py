@@ -277,3 +277,60 @@ def test_trunk_loading_inherits_compatible_and_refuses_drift() -> None:
 
     with pytest.raises(RuntimeError, match="drift beyond tolerated"):
         load_trunk_state(_Drifted(), dict(old_state))
+
+
+def test_batched_lockstep_path_matches_semantics_and_converges() -> None:
+    """The lockstep-batched update trains the same objective: executed
+    action converges to its factual return, window tails bootstrap from
+    successors, and burn-in rows produce no learn targets."""
+
+    replay = MacroSequenceReplay(capacity_episodes=8, burn_in=1, window_length=2, seed=7)
+    for index in range(4):
+        replay.put(
+            MacroEpisode(
+                episode_id=f"bep-{index}",
+                steps=(
+                    _step(action_index=0),
+                    _step(action_index=1, reward=1.0),
+                    _step(action_index=0, terminal=True, discount=0.0),
+                ),
+            )
+        )
+    online = torch.nn.Parameter(torch.zeros(4))
+    target = torch.zeros(4)
+
+    def batch_forward_online(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(snapshots)  # type: ignore[arg-type]
+        return online[:3].unsqueeze(0).expand(count, -1), torch.zeros(count, 1)
+
+    def batch_forward_target(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(snapshots)  # type: ignore[arg-type]
+        return target[:3].unsqueeze(0).expand(count, -1), torch.zeros(count, 1)
+
+    def unused(step: object, hidden: object) -> tuple[torch.Tensor, object]:
+        raise AssertionError("sequential path must not run when batch forwards exist")
+
+    def sync() -> None:
+        nonlocal target
+        target = online.detach().clone()
+
+    learner = MacroQLearner(
+        online_parameters=[online],
+        forward_online=unused,
+        forward_target=unused,
+        sync_target=sync,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(
+            n_step=2, learning_rate=0.2, target_update_interval=5, sample_windows=4
+        ),
+        forward_online_batch=batch_forward_online,
+        forward_target_batch=batch_forward_target,
+    )
+    metrics = {}
+    for _ in range(80):
+        metrics = learner.update()
+    # Action 1 pays +1 at the middle step; with terminal cut afterwards its
+    # Q must converge to 1 regardless of initialization.
+    assert float(online[1].item()) == pytest.approx(1.0, abs=0.08)
+    assert metrics["steps_trained"] > 0

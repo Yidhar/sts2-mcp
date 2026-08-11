@@ -98,6 +98,12 @@ class MacroQLearner:
         initial_state: Callable[[], Any],
         replay: MacroSequenceReplay,
         config: MacroQConfig | None = None,
+        forward_online_batch: (
+            Callable[[Sequence[Any], Any], tuple[Tensor, Any]] | None
+        ) = None,
+        forward_target_batch: (
+            Callable[[Sequence[Any], Any], tuple[Tensor, Any]] | None
+        ) = None,
     ) -> None:
         self.config = config or MacroQConfig()
         self.forward_online = forward_online
@@ -105,6 +111,12 @@ class MacroQLearner:
         self.sync_target = sync_target
         self.initial_state = initial_state
         self.replay = replay
+        # Optional lockstep-batched forwards: (snapshots, hidden[B]) ->
+        # (q_values[B, A_max], next_hidden[B]).  When provided, update()
+        # trains all sampled windows in parallel across the batch dimension
+        # (time stays sequential for the recurrent chain).
+        self.forward_online_batch = forward_online_batch
+        self.forward_target_batch = forward_target_batch
         parameters = list(online_parameters)
         if not parameters:
             raise ValueError("macro Q learner requires trainable parameters")
@@ -182,6 +194,119 @@ class MacroQLearner:
             learn_steps,
         )
 
+    def _batched_window_values(
+        self,
+        windows: Sequence[MacroWindow],
+    ) -> list[tuple[Tensor, tuple[float, ...], tuple[float, ...], tuple[float, ...], list[MacroStep]]]:
+        """Lockstep-batched equivalent of ``_window_values`` for all windows.
+
+        Time stays sequential (recurrent chain); the batch dimension carries
+        one row per window. The online stream keeps gradient through burn-in
+        (stored-state BPTT); the target stream runs fully detached. Window
+        tails bootstrap from their extension step exactly like the
+        sequential path.
+        """
+
+        assert self.forward_online_batch is not None
+        assert self.forward_target_batch is not None
+        infos: list[dict[str, Any]] = []
+        for window in windows:
+            begin, end = window.learn_slice
+            steps = window.episode.steps
+            sequence = list(steps[window.start : end])
+            extension = steps[end] if end < len(steps) else None
+            infos.append(
+                {
+                    "window": window,
+                    "steps": sequence,
+                    "burn": begin - window.start,
+                    "extension": extension,
+                    "executed_q": [],
+                    "target_values": [],
+                    "extension_value": 0.0,
+                }
+            )
+        total_lengths = [
+            len(info["steps"]) + (1 if info["extension"] is not None else 0)
+            for info in infos
+        ]
+        hiddens: list[Tensor | None] = [None] * len(infos)
+        target_hiddens: list[Tensor | None] = [None] * len(infos)
+        for offset in range(max(total_lengths)):
+            rows = [row for row, total in enumerate(total_lengths) if offset < total]
+            snapshots = []
+            for row in rows:
+                info = infos[row]
+                step = (
+                    info["steps"][offset]
+                    if offset < len(info["steps"])
+                    else info["extension"]
+                )
+                snapshots.append(step.snapshot)
+            online_hidden = (
+                None
+                if hiddens[rows[0]] is None
+                else torch.cat([hiddens[row] for row in rows], dim=0)  # type: ignore[misc]
+            )
+            target_hidden = (
+                None
+                if target_hiddens[rows[0]] is None
+                else torch.cat([target_hiddens[row] for row in rows], dim=0)  # type: ignore[misc]
+            )
+            q_online, next_online = self.forward_online_batch(snapshots, online_hidden)
+            with torch.no_grad():
+                q_target, next_target = self.forward_target_batch(
+                    snapshots, target_hidden
+                )
+            for index, row in enumerate(rows):
+                info = infos[row]
+                hiddens[row] = next_online[index : index + 1]
+                target_hiddens[row] = next_target[index : index + 1]
+                if offset < info["burn"]:
+                    continue
+                step = (
+                    info["steps"][offset]
+                    if offset < len(info["steps"])
+                    else info["extension"]
+                )
+                mask = torch.zeros(
+                    q_online.shape[-1], dtype=torch.bool, device=q_online.device
+                )
+                count = len(step.snapshot.action_mask)
+                mask[:count] = torch.as_tensor(
+                    step.snapshot.action_mask,
+                    dtype=torch.bool,
+                    device=q_online.device,
+                )
+                masked = q_online[index].masked_fill(~mask, float("-inf"))
+                argmax_index = int(masked.detach().argmax().item())
+                value = float(q_target[index][argmax_index].item())
+                if offset < len(info["steps"]):
+                    info["executed_q"].append(q_online[index][step.action_index])
+                    info["target_values"].append(value)
+                else:
+                    info["extension_value"] = value
+        results = []
+        for info in infos:
+            learn_steps = info["steps"][info["burn"] :]
+            target_values = info["target_values"]
+            bootstraps = tuple(
+                target_values[index + 1]
+                if index + 1 < len(target_values)
+                else float(info["extension_value"])
+                for index in range(len(learn_steps))
+            )
+            results.append(
+                (
+                    torch.stack(info["executed_q"]),
+                    tuple(step.reward for step in learn_steps),
+                    tuple(step.discount for step in learn_steps),
+                    bootstraps,
+                    learn_steps,
+                )
+            )
+        return results
+
     def update(self) -> dict[str, Any]:
         windows = self.replay.sample(self.config.sample_windows)
         if not windows:
@@ -189,10 +314,13 @@ class MacroQLearner:
         losses: list[Tensor] = []
         td_abs: list[float] = []
         steps_trained = 0
-        for window in windows:
-            executed_q, rewards, discounts, bootstraps, learn_steps = (
-                self._window_values(window)
-            )
+        if self.forward_online_batch is not None and self.forward_target_batch is not None:
+            window_values = self._batched_window_values(windows)
+        else:
+            window_values = [self._window_values(window) for window in windows]
+        for window, (executed_q, rewards, discounts, bootstraps, learn_steps) in zip(
+            windows, window_values, strict=True
+        ):
             targets = torch.as_tensor(
                 n_step_targets(
                     rewards,

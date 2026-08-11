@@ -53,6 +53,28 @@ def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
     return forward
 
 
+def _batched_forward_factory(
+    model: Any, encoder: Any, device: torch.device, *, detach_hidden: bool
+) -> Any:
+    def forward(snapshots: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        encoded = collate_encoded_snapshots(
+            tuple(snapshots),
+            expected_config=encoder.config,
+            expected_fingerprint=snapshots[0].encoding_fingerprint,
+            device=device,
+        )
+        if hidden is None:
+            hidden = model.initial_state(len(snapshots), device=device)
+        output = model(encoded, hidden, validate=False)
+        q_values = output.transaction_q_values
+        if q_values is None:
+            raise RuntimeError("macro Q model produced no candidate Q values")
+        recurrent = output.recurrent_state
+        return q_values, recurrent.detach() if detach_hidden else recurrent
+
+    return forward
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -62,6 +84,7 @@ def main() -> int:
     parser.add_argument("--init-macro", default=None)
     parser.add_argument("--stop-after-episodes", type=int, default=1200)
     parser.add_argument("--updates-per-episode", type=int, default=8)
+    parser.add_argument("--sample-windows", type=int, default=16)
     parser.add_argument("--replay-episodes", type=int, default=128)
     parser.add_argument("--save-interval-episodes", type=int, default=20)
     parser.add_argument("--metrics-out", required=True)
@@ -128,7 +151,13 @@ def main() -> int:
             sync_target=lambda: macro_target.load_state_dict(macro_online.state_dict()),
             initial_state=lambda: None,
             replay=replay,
-            config=MacroQConfig(),
+            config=MacroQConfig(sample_windows=args.sample_windows),
+            forward_online_batch=_batched_forward_factory(
+                macro_online, resources.encoder, device, detach_hidden=False
+            ),
+            forward_target_batch=_batched_forward_factory(
+                macro_target, resources.encoder, device, detach_hidden=True
+            ),
         )
 
         def save_macro() -> None:
