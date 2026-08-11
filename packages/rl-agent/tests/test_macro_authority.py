@@ -5,15 +5,37 @@ from typing import Any
 import numpy as np
 import torch
 
+from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.macro.authority import MacroCollectionAuthority
 from sts2_rl.semantics.clock import DECISION_CLOCK_BASE
-from tests.test_macro_q_learner import _snapshot
 
 
-def _authority(*, epsilon: float = 0.0, q: list[float] | None = None) -> MacroCollectionAuthority:
+def _snapshot(*, candidate_count: int = 3) -> Any:
+    return GroundedObservationEncoder().encode(
+        {"phase": "combat", "combat": {"in_progress": True}},
+        [
+            {
+                "kind": "end_turn",
+                "model_action_kind": "end_turn",
+                "action_handle": f"test-{index}",
+            }
+            for index in range(candidate_count)
+        ],
+    ).snapshot
+
+
+def _authority(
+    *,
+    epsilon: float = 0.0,
+    q: list[float] | None = None,
+    control_domain: str = "macro",
+    forward_calls: list[int] | None = None,
+) -> MacroCollectionAuthority:
     values = torch.tensor(q or [0.0, 1.0, 0.0], dtype=torch.float32)
 
     def forward(snapshot: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        if forward_calls is not None:
+            forward_calls.append(len(snapshot.action_mask))
         return values[: len(snapshot.action_mask)], hidden
 
     return MacroCollectionAuthority(
@@ -21,17 +43,29 @@ def _authority(*, epsilon: float = 0.0, q: list[float] | None = None) -> MacroCo
         initial_state=lambda: None,
         epsilon=epsilon,
         seed=11,
+        control_domain=control_domain,  # type: ignore[arg-type]
     )
 
 
-def _rest_observation(floor: int = 7) -> dict[str, Any]:
+def _rest_observation(
+    floor: int = 7,
+    *,
+    deck: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "phase": "rest",
         "combat": {"in_progress": False},
         "run": {"floor": floor},
         "player": {
-            "deck": [
-                {"id": "CARD.BASH", "is_upgradable": True, "is_removable": True},
+            "deck": deck
+            or [
+                {
+                    "id": "CARD.BASH",
+                    "instance_id": "CARD.BASH-1",
+                    "index": 0,
+                    "is_upgradable": True,
+                    "is_removable": True,
+                },
             ]
         },
         "rest_site": {"options": []},
@@ -39,8 +73,20 @@ def _rest_observation(floor: int = 7) -> dict[str, Any]:
 
 
 _REST_ACTIONS = [
-    {"kind": "choose_rest_option", "idx": 0, "option": {"type": "heal"}},
-    {"kind": "choose_rest_option", "idx": 1, "option": {"type": "smith"}},
+    {
+        "kind": "choose_rest_option",
+        "model_action_kind": "rest_site",
+        "model_action_variant": "rest",
+        "idx": 0,
+        "option": {"type": "heal"},
+    },
+    {
+        "kind": "choose_rest_option",
+        "model_action_kind": "rest_site",
+        "model_action_variant": "forge",
+        "idx": 1,
+        "option": {"type": "smith"},
+    },
 ]
 
 _PICKER_ACTIONS = [
@@ -63,8 +109,9 @@ _PICKER_ACTIONS = [
 ]
 
 
-def test_smith_flow_decomposes_into_two_q_decisions_and_mechanical_confirm() -> None:
-    authority = _authority(q=[0.0, 5.0, 0.0])  # greedy prefers smith entry
+def test_smith_is_one_semantic_q_decision_with_mechanical_suffix() -> None:
+    forward_calls: list[int] = []
+    authority = _authority(q=[0.0, 5.0, 0.0], forward_calls=forward_calls)
     authority.begin_episode("ep-smith")
     snapshot = _snapshot(candidate_count=2)
     valid = np.ones(2, dtype=np.bool_)
@@ -75,17 +122,19 @@ def test_smith_flow_decomposes_into_two_q_decisions_and_mechanical_confirm() -> 
         snapshot=snapshot,
         valid=valid,
     )
-    assert entry == 1  # smith entry chosen by Q
+    assert entry == 1  # native forge entry chosen by semantic Q
 
     picker_snapshot = _snapshot(candidate_count=3)
     picker_valid = np.ones(3, dtype=np.bool_)
+    picker_groups = GroundedObservationEncoder().semantic_action_groups(_PICKER_ACTIONS)
+    picker_surface = [{"prototype": group.prototype} for group in picker_groups]
     target = authority.choose(
         observation={"phase": "card_selection", "run": {"floor": 7}},
-        semantic_actions=_PICKER_ACTIONS,
+        semantic_actions=picker_surface,
         snapshot=picker_snapshot,
         valid=picker_valid,
     )
-    assert target == 0  # the matching select_card, never cancel/deselect
+    assert target == 0  # matching target, dispatched mechanically
 
     confirm = authority.choose(
         observation={"phase": "card_selection", "run": {"floor": 7}},
@@ -94,20 +143,211 @@ def test_smith_flow_decomposes_into_two_q_decisions_and_mechanical_confirm() -> 
         valid=picker_valid,
     )
     assert confirm == 1  # mechanical confirm dispatch
-    assert authority.mechanical_dispatches == 1
+    assert authority.mechanical_dispatches == 2
+    assert forward_calls == [2]  # picker and confirm never run Q
 
     authority.observe_step(reward=0.05, floor=8, terminal=False)
     authority.observe_step(reward=0.0, floor=8, terminal=True)
     episode = authority.finish_episode()
     assert episode is not None
-    assert len(episode.steps) == 2  # entry decision + target decision
-    entry_step, target_step = episode.steps
-    assert entry_step.surface == "rest" and entry_step.branch == "smith"
-    # Entry -> picker happens on the same floor: Gamma = 1.
-    assert entry_step.discount == 1.0
-    assert target_step.surface == "picker"
-    assert target_step.terminal is True and target_step.discount == 0.0
-    assert target_step.reward == 0.05
+    assert len(episode.steps) == 1
+    step = episode.steps[0]
+    assert step.surface == "rest" and step.branch == "smith"
+    assert step.terminal is True and step.discount == 0.0
+    assert step.reward == 0.05
+
+
+def test_semantic_snapshot_scores_smith_targets_and_replay_uses_that_index() -> None:
+    deck = [
+        {
+            "id": "CARD.BASH",
+            "instance_id": "bash-copy",
+            "index": 0,
+            "is_upgradable": True,
+            "is_removable": True,
+        },
+        {
+            "id": "CARD.ANGER",
+            "instance_id": "anger-copy",
+            "index": 1,
+            "is_upgradable": True,
+            "is_removable": True,
+        },
+    ]
+    authority = _authority(q=[0.0, 1.0, 9.0])
+    authority.begin_episode("ep-target-q")
+    native = authority.choose(
+        observation=_rest_observation(deck=deck),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    # Both semantic targets enter native action 1; Q selected Anger at semantic
+    # index 2 rather than aliasing both cards to the parent action index.
+    assert native == 1
+    picker = [
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": deck[0],
+        },
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": deck[1],
+        },
+        {
+            "kind": "confirm_selection",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "confirm",
+        },
+    ]
+    assert (
+        authority.choose(
+            observation={"phase": "card_selection", "run": {"floor": 7}},
+            semantic_actions=picker,
+            snapshot=_snapshot(candidate_count=3),
+            valid=np.ones(3, dtype=np.bool_),
+        )
+        == 1
+    )
+    authority.observe_step(reward=0.0, floor=7, terminal=True)
+    episode = authority.finish_episode()
+    assert episode is not None and len(episode.steps) == 1
+    step = episode.steps[0]
+    assert len(step.snapshot.action_mask) == 3
+    assert step.snapshot.action_mask.tolist() == [True, True, True]
+    assert step.action_index == 2
+
+
+def test_picker_target_mismatch_never_selects_an_arbitrary_copy() -> None:
+    authority = _authority(q=[0.0, 5.0])
+    authority.begin_episode("ep-target-mismatch")
+    assert (
+        authority.choose(
+            observation=_rest_observation(),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 1
+    )
+    wrong_copy = [
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "card": {"id": "CARD.BASH", "instance_id": "CARD.BASH-OTHER", "index": 9},
+        }
+    ]
+    assert (
+        authority.choose(
+            observation={"phase": "card_selection", "run": {"floor": 7}},
+            semantic_actions=wrong_copy,
+            snapshot=_snapshot(candidate_count=1),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        is None
+    )
+    assert authority.finish_episode() is None
+
+
+def test_picker_uses_stable_member_of_one_strict_equal_action_group() -> None:
+    target = {
+        "id": "CARD.BASH",
+        "cost": 2,
+        "is_upgradable": True,
+        "is_removable": True,
+    }
+    authority = _authority(q=[0.0, 5.0])
+    authority.begin_episode("ep-equal-picker-copies")
+    assert (
+        authority.choose(
+            observation=_rest_observation(deck=[dict(target), dict(target)]),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 1
+    )
+    equal_picker_actions = [
+        {
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "model_action_variant": "select",
+            "selection_operation": "select",
+            "action_handle": f"copy-{index}",
+            "card": {"id": "CARD.BASH", "cost": 2},
+        }
+        for index in range(2)
+    ]
+    assert (
+        authority.choose(
+            observation={"phase": "card_selection", "run": {"floor": 7}},
+            semantic_actions=equal_picker_actions,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 0
+    )
+    assert authority.mechanical_dispatches == 1
+
+
+def test_auto_confirm_processes_the_current_new_macro_decision() -> None:
+    calls = 0
+
+    def forward(snapshot: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        nonlocal calls
+        calls += 1
+        values = [0.0, 5.0] if calls == 1 else [5.0, 0.0]
+        return torch.tensor(values[: len(snapshot.action_mask)]), hidden
+
+    authority = MacroCollectionAuthority(
+        forward_q=forward,
+        initial_state=lambda: None,
+        epsilon=0.0,
+        seed=4,
+    )
+    authority.begin_episode("ep-auto-confirm")
+    assert (
+        authority.choose(
+            observation=_rest_observation(floor=7),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 1
+    )
+    assert (
+        authority.choose(
+            observation={"phase": "card_selection", "run": {"floor": 7}},
+            semantic_actions=_PICKER_ACTIONS,
+            snapshot=_snapshot(candidate_count=3),
+            valid=np.ones(3, dtype=np.bool_),
+        )
+        == 0
+    )
+    # The engine auto-confirms and immediately publishes the next rest-site
+    # decision.  The same choose() call consumes the absent confirm and owns
+    # that next decision; it is not silently ceded to the champion.
+    assert (
+        authority.choose(
+            observation=_rest_observation(floor=8),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 0
+    )
+    assert calls == 2
+    authority.observe_step(reward=0.0, floor=8, terminal=True)
+    episode = authority.finish_episode()
+    assert episode is not None and len(episode.steps) == 2
 
 
 def test_non_macro_surfaces_are_declined_to_the_champion() -> None:
@@ -242,12 +482,15 @@ def test_stage2_runner_loop_with_real_model_on_synthetic_backend() -> None:
             parameter.requires_grad_(False)
         device = resources.device
         forward_online = runner._forward_factory(
-            macro_online, resources.encoder, device
+            macro_online, resources.encoder, device, detach_hidden=False
         )
         forward_target = runner._forward_factory(
-            macro_target, resources.encoder, device
+            macro_target, resources.encoder, device, detach_hidden=True
         )
-        replay = MacroSequenceReplay(capacity_episodes=8, burn_in=0, window_length=4)
+        forward_behavior = runner._forward_factory(
+            macro_online, resources.encoder, device, detach_hidden=True
+        )
+        replay = MacroSequenceReplay(capacity_episodes=8, window_length=4)
         learner = MacroQLearner(
             online_parameters=[
                 parameter
@@ -264,7 +507,7 @@ def test_stage2_runner_loop_with_real_model_on_synthetic_backend() -> None:
             config=MacroQConfig(sample_windows=2, target_update_interval=2),
         )
         authority = MacroCollectionAuthority(
-            forward_q=forward_online,
+            forward_q=forward_behavior,
             initial_state=lambda: None,
             epsilon=0.5,
             seed=9,
@@ -350,14 +593,16 @@ _COMBAT_OBSERVATION = {
 _COMBAT_ACTIONS = [
     {
         "kind": "play_card",
+        "model_action_kind": "play_card",
         "card": {"id": "CARD.STRIKE", "instance_id": "CARD.STRIKE-1", "cost": 1},
         "target": {"id": "MONSTER.CULTIST", "index": 0},
     },
     {
         "kind": "play_card",
+        "model_action_kind": "play_card",
         "card": {"id": "CARD.DEFEND", "instance_id": "CARD.DEFEND-1", "cost": 1},
     },
-    {"kind": "end_turn"},
+    {"kind": "end_turn", "model_action_kind": "end_turn"},
 ]
 
 
@@ -370,7 +615,7 @@ def test_combat_view_is_declined_by_default_and_owned_with_the_flag() -> None:
 
     assert forward_decision(_COMBAT_OBSERVATION, _COMBAT_ACTIONS) is None
     decision = forward_decision(
-        _COMBAT_OBSERVATION, _COMBAT_ACTIONS, include_combat=True
+        _COMBAT_OBSERVATION, _COMBAT_ACTIONS, control_domain="combat"
     )
     assert decision is not None and decision.surface == "combat"
     assert [c.branch for c in decision.candidates] == [
@@ -404,7 +649,7 @@ def test_combat_view_is_declined_by_default_and_owned_with_the_flag() -> None:
         initial_state=lambda: None,
         epsilon=0.0,
         seed=7,
-        own_combat=True,
+        control_domain="combat",
     )
     challenger.begin_episode("ep-challenger")
     index = challenger.choose(

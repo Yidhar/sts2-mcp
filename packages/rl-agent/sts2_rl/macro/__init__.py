@@ -1,8 +1,8 @@
-"""Isolated macro-domain control: semantic transitions, replay, Double-Q.
+"""Domain-owned semantic control: transitions, replay, and Double-Q.
 
-Stage two of the semantic decision graph reset.  This package owns macro
-preference learning exclusively; it never imports the legacy training stack,
-and the legacy stack never imports it.
+The macro and combat challengers use the same factual contracts but separate
+model/recurrent/optimizer instances.  Joined evaluation composes those owners
+through a parameter-free router.
 """
 
 from .authority import (
@@ -25,6 +25,10 @@ from .replay import (
     MacroSequenceReplay,
     MacroWindow,
 )
+from .router import (
+    JOINED_AUTHORITY_ROUTER_VERSION,
+    JoinedCollectionAuthority,
+)
 from .transitions import (
     MACRO_TRANSITION_CONTRACT_VERSION,
     MacroEpisode,
@@ -34,12 +38,14 @@ from .transitions import (
 )
 
 __all__ = [
+    "JOINED_AUTHORITY_ROUTER_VERSION",
     "MACRO_AUTHORITY_VERSION",
     "MACRO_LOADING_CONTRACT_VERSION",
     "MACRO_Q_LEARNER_VERSION",
     "MACRO_REPLAY_CONTRACT_VERSION",
     "MACRO_TRANSITION_CONTRACT_VERSION",
     "TOLERATED_HEAD_GROUPS",
+    "JoinedCollectionAuthority",
     "MacroCollectionAuthority",
     "MacroEpisode",
     "MacroQConfig",

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Stage-three joined-live held-out evaluation (reset doc §10 stage 3).
 
-Runs paired held-out seeds through two arms:
+Runs paired held-out seeds through up to three arms:
   champion : the frozen combat champion owns every decision (legacy macro
              behavior included) — the baseline.
   joined   : the same frozen champion owns combat while the trained macro
              candidate-Q model greedily owns every macro surface through the
              collection authority (whole-segment ownership).
+  challenger: independently trained macro and combat candidate-Q models own
+              their respective domains through the joined authority router.
 
 Both arms are deterministic on the identical fixed odd held-out seed prefix,
 so differences are attributable to macro ownership. The harness only reports;
@@ -18,6 +20,9 @@ Usage (WSL ROCm venv, from the package root):
         --champion <champion checkpoint dir> \
         --macro <stage2-macro-online.pt> \
         --episodes 16 --arms both
+
+For the stage-4 challenger arm also pass ``--combat <combat-online.pt>``;
+the macro and combat files are loaded into separate model instances.
 """
 
 from __future__ import annotations
@@ -33,7 +38,11 @@ from typing import Any
 import torch
 
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.macro import MacroCollectionAuthority, load_trunk_state
+from sts2_rl.macro import (
+    JoinedCollectionAuthority,
+    MacroCollectionAuthority,
+    load_trunk_state,
+)
 from sts2_rl.training import build_training_resources, load_training_config
 from sts2_rl.training.seeding import held_out_evaluation_seeds
 
@@ -74,7 +83,7 @@ def _run_arm(
     *,
     arm: str,
     seeds: tuple[int, ...],
-    authority: MacroCollectionAuthority | None,
+    authority: MacroCollectionAuthority | JoinedCollectionAuthority | None,
     metrics_file: Any,
 ) -> list[dict[str, Any]]:
     resources.collector.macro_authority = authority
@@ -92,17 +101,30 @@ def _run_arm(
         )
         macro_summary: dict[str, Any] | None = None
         if authority is not None:
-            macro_episode = authority.finish_episode(f"stage3-{arm}-{seed}")
+            if isinstance(authority, JoinedCollectionAuthority):
+                domain_episodes = authority.finish_episodes(f"stage3-{arm}-{seed}")
+            else:
+                domain_episodes = {
+                    authority.control_domain: authority.finish_episode(
+                        f"stage3-{arm}-{seed}"
+                    )
+                }
             surface_counts: dict[str, int] = {}
-            if macro_episode is not None:
-                for step in macro_episode.steps:
-                    key = f"{step.surface}:{step.branch}"
-                    surface_counts[key] = surface_counts.get(key, 0) + 1
+            domain_counts: dict[str, dict[str, int]] = {}
+            for control_domain, domain_episode in domain_episodes.items():
+                current: dict[str, int] = {}
+                if domain_episode is not None:
+                    for step in domain_episode.steps:
+                        key = f"{step.surface}:{step.branch}"
+                        current[key] = current.get(key, 0) + 1
+                        surface_counts[key] = surface_counts.get(key, 0) + 1
+                domain_counts[control_domain] = current
             macro_summary = {
                 "overrides": authority.overrides,
                 "declined": authority.declined,
                 "mechanical_dispatches": authority.mechanical_dispatches,
                 "decision_counts": surface_counts,
+                "domain_decision_counts": domain_counts,
                 "decision_log": list(authority.decision_log),
             }
         row = {
@@ -144,6 +166,12 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--champion", required=True)
     parser.add_argument("--macro", required=True)
+    parser.add_argument(
+        "--combat",
+        default=None,
+        help="independently trained combat candidate-Q model; required for "
+        "challenger/all",
+    )
     parser.add_argument("--episodes", type=int, default=16)
     parser.add_argument(
         "--arms",
@@ -185,6 +213,21 @@ def main() -> int:
             parameter.requires_grad_(False)
         macro_model.eval()
 
+        combat_model = None
+        if args.arms in ("challenger", "all"):
+            if args.combat is None:
+                raise SystemExit("--combat is required for challenger/all evaluation")
+            combat_model = copy.deepcopy(resources.model)
+            combat_state = torch.load(
+                Path(args.combat),
+                map_location=resources.device,
+                weights_only=True,
+            )
+            load_trunk_state(combat_model, dict(combat_state))
+            for parameter in combat_model.parameters():
+                parameter.requires_grad_(False)
+            combat_model.eval()
+
         seeds = held_out_evaluation_seeds(config.runtime.seed, args.episodes)
         summaries: dict[str, Any] = {}
         metrics_path = Path(args.metrics_out)
@@ -200,9 +243,7 @@ def main() -> int:
                 summaries["champion"] = _summarize(rows)
             if args.arms in ("both", "joined", "all"):
                 authority = MacroCollectionAuthority(
-                    forward_q=_forward_factory(
-                        macro_model, resources.encoder, resources.device
-                    ),
+                    forward_q=_forward_factory(macro_model, resources.encoder, resources.device),
                     initial_state=lambda: None,
                     epsilon=0.0,
                     evaluation_ownership=True,
@@ -216,15 +257,28 @@ def main() -> int:
                 )
                 summaries["joined"] = _summarize(rows)
             if args.arms in ("challenger", "all"):
-                # Stage 4: the challenger owns combat AND macro surfaces.
-                authority = MacroCollectionAuthority(
-                    forward_q=_forward_factory(
-                        macro_model, resources.encoder, resources.device
+                assert combat_model is not None
+                # Each domain keeps its own model and recurrent state; the
+                # router owns no parameters and is used only for joined play.
+                authority = JoinedCollectionAuthority(
+                    macro=MacroCollectionAuthority(
+                        forward_q=_forward_factory(
+                            macro_model, resources.encoder, resources.device
+                        ),
+                        initial_state=lambda: None,
+                        epsilon=0.0,
+                        evaluation_ownership=True,
+                        control_domain="macro",
                     ),
-                    initial_state=lambda: None,
-                    epsilon=0.0,
-                    evaluation_ownership=True,
-                    own_combat=True,
+                    combat=MacroCollectionAuthority(
+                        forward_q=_forward_factory(
+                            combat_model, resources.encoder, resources.device
+                        ),
+                        initial_state=lambda: None,
+                        epsilon=0.0,
+                        evaluation_ownership=True,
+                        control_domain="combat",
+                    ),
                 )
                 rows = _run_arm(
                     resources,

@@ -1,12 +1,12 @@
-"""Macro collection authority: isolated stage-two action ownership.
+"""Semantic collection authority with one recurrent state per domain.
 
 During stage-two collection the frozen combat champion drives every decision
 the authority declines.  At recognized macro surfaces the authority owns the
-choice: branch-balanced epsilon-greedy over the macro candidate-Q values,
-with composite flows decomposed into two native decisions — the branch entry
-at the parent surface and the target at the picker — linked by the durable
-floor clock (Gamma = 1 within a floor), while confirm traffic is dispatched
-mechanically and deselect/cancel are never emitted (monotone contract).
+choice: branch-balanced epsilon-greedy over atomic semantic candidates.  A
+composite candidate such as ``Smith(card)`` is learned once at its parent
+surface and then executed as a native entry/select/confirm plan.  Picker and
+confirm traffic are mechanical executor suffixes, never second learning
+transitions.
 
 The authority records macro transitions as it acts; the legacy learner never
 sees them and the macro learner never sees anything else.  Every override it
@@ -19,30 +19,96 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from sts2_rl.encoding import EncodedDecisionSnapshot
+from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.semantics.clock import decision_discount
-from sts2_rl.semantics.forward import ForwardDecision, forward_decision
+from sts2_rl.semantics.forward import ForwardDecision, NativeStep, SemanticCandidate, forward_decision
+from sts2_rl.semantics.grouping import strict_action_groups
 
 from .transitions import MacroEpisode, MacroStep
 
-MACRO_AUTHORITY_VERSION: Final = "sts2-macro-authority-v1"
+MACRO_AUTHORITY_VERSION: Final = "sts2-macro-authority-v3"
 
 _PICKER_SELECT_KINDS: Final[frozenset[str]] = frozenset(
-    {"select_card", "select_card_option"}
+    {"select_card", "select_card_option", "select_hand_card", "combat_select_card"}
 )
 _PICKER_CONFIRM_KINDS: Final[frozenset[str]] = frozenset(
-    {"confirm_selection"}
+    {"confirm_selection", "combat_confirm_selection"}
+)
+_PICKER_REVERSE_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        "cancel_selection",
+        "deselect_card",
+        "deselect_card_option",
+        "deselect_hand_card",
+        "combat_deselect_card",
+    }
+)
+_CARD_INSTANCE_KEYS: Final[tuple[str, ...]] = (
+    "card_instance_id",
+    "instance_uuid",
+    "instance_id",
+    "uuid",
+    "uid",
+    "card_ref",
+    "ref",
+)
+_CARD_POSITION_KEYS: Final[tuple[str, ...]] = ("index", "card_index")
+_CARD_DEFINITION_KEYS: Final[tuple[str, ...]] = ("id", "card_id", "model_id")
+_CARD_STABLE_FACT_KEYS: Final[tuple[str, ...]] = (
+    "floor_added_to_deck",
+    "is_upgraded",
+    "upgrade_level",
+    "cost",
+    "base_cost",
+    "type",
+    "rarity",
+    "enchantments",
+    "afflictions",
+    "upgrade_preview",
 )
 
 
 def _kind(action: Mapping[str, Any]) -> str:
-    return str(action.get("kind") or action.get("action") or "").strip().lower()
+    return (
+        str(action.get("kind") or action.get("action") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def _kind_for_step(step: NativeStep) -> str:
+    return _kind({"kind": step.kind})
+
+
+def _first_fact(card: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        value = card.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _card_copy_projection(card: Mapping[str, Any]) -> dict[str, Any]:
+    projection = {
+        key: card.get(key)
+        for key in _CARD_STABLE_FACT_KEYS
+        if card.get(key) is not None
+    }
+    definition = _first_fact(card, _CARD_DEFINITION_KEYS)
+    if definition is not None:
+        projection["definition_id"] = definition
+    source = _first_fact(card, ("source_zone", "source_pile", "zone"))
+    if source is not None:
+        projection["source_zone"] = source
+    return projection
 
 
 def _card_matches(action: Mapping[str, Any], target: Mapping[str, Any] | None) -> bool:
@@ -51,11 +117,27 @@ def _card_matches(action: Mapping[str, Any], target: Mapping[str, Any] | None) -
     card = action.get("card")
     if not isinstance(card, Mapping):
         return False
-    for key in ("id", "instance_id"):
-        expected = target.get(key)
-        if expected is not None and card.get(key) != expected:
-            return False
-    return True
+    expected_instance = _first_fact(target, _CARD_INSTANCE_KEYS)
+    actual_instance = _first_fact(card, _CARD_INSTANCE_KEYS)
+    if expected_instance is not None and actual_instance is not None:
+        return str(expected_instance) == str(actual_instance)
+
+    expected_position = _first_fact(target, _CARD_POSITION_KEYS)
+    actual_position = _first_fact(card, _CARD_POSITION_KEYS)
+    if expected_position is not None and actual_position is not None:
+        expected_definition = _first_fact(target, _CARD_DEFINITION_KEYS)
+        actual_definition = _first_fact(card, _CARD_DEFINITION_KEYS)
+        return (
+            expected_position == actual_position
+            and expected_definition is not None
+            and actual_definition is not None
+            and str(expected_definition) == str(actual_definition)
+        )
+
+    # A bridge without a stable instance/position identity may still expose a
+    # complete immutable card projection.  Equality is exact; sharing only a
+    # card definition ID is deliberately insufficient for duplicate copies.
+    return _card_copy_projection(card) == _card_copy_projection(target)
 
 
 @dataclass(slots=True)
@@ -67,7 +149,13 @@ class _OpenTransition:
     target_key: str | None
     floor: int
     behavior_epsilon: float
+    recurrent_reset: bool
     reward_accumulator: float = 0.0
+
+
+@dataclass(slots=True)
+class _PendingPlan:
+    steps: tuple[NativeStep, ...]
 
 
 class MacroCollectionAuthority:
@@ -81,7 +169,7 @@ class MacroCollectionAuthority:
         epsilon: float = 0.1,
         seed: int = 0,
         evaluation_ownership: bool = False,
-        own_combat: bool = False,
+        control_domain: Literal["macro", "combat"] = "macro",
     ) -> None:
         if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
             raise ValueError("authority epsilon must be in [0, 1]")
@@ -91,9 +179,12 @@ class MacroCollectionAuthority:
         # Stage-3 joined evaluation: macro ownership extends into
         # deterministic held-out collection (whole-segment ownership, §10).
         self.evaluation_ownership = bool(evaluation_ownership)
-        # Stage-4 combat challenger: the authority additionally owns the
-        # native-atomic combat view instead of declining it to the champion.
-        self.own_combat = bool(own_combat)
+        if control_domain not in {"macro", "combat"}:
+            raise ValueError("control_domain must be 'macro' or 'combat'")
+        # One recurrent authority owns exactly one domain.  Joined control is
+        # routed through two instances so combat history cannot leak into the
+        # macro recurrent state (or vice versa).
+        self.control_domain = control_domain
         # Diagnostic-only decision log (never a training input): one row per
         # owned decision with the observation facts needed to inspect
         # state-conditioning behaviorally (reset doc §11 items 2/4).
@@ -104,10 +195,9 @@ class MacroCollectionAuthority:
         self._episode_id: str | None = None
         self._steps: list[MacroStep] = []
         self._open: _OpenTransition | None = None
-        self._pending_target: Mapping[str, Any] | None = None
-        self._await_picker = False
-        self._await_confirm = False
+        self._pending_plan: _PendingPlan | None = None
         self._last_floor = 0
+        self._combat_active = False
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
@@ -119,10 +209,9 @@ class MacroCollectionAuthority:
         self._hidden = self.initial_state()
         self._steps = []
         self._open = None
-        self._pending_target = None
-        self._await_picker = False
-        self._await_confirm = False
+        self._pending_plan = None
         self._last_floor = 0
+        self._combat_active = False
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
@@ -143,6 +232,23 @@ class MacroCollectionAuthority:
             self._last_floor = int(floor)
         if terminal:
             self._close_open(terminal=True)
+            self._pending_plan = None
+
+    def observe_observation(self, observation: Mapping[str, Any]) -> None:
+        """Track domain boundaries even when another authority owns the turn.
+
+        An isolated collector calls :meth:`choose` at every decision, so a
+        combat authority naturally observes the intervening macro surface.
+        The joined router delegates directly to one authority; this explicit
+        observation hook keeps the combat recurrent reset identical in both
+        execution modes without invoking a second policy on the same turn.
+        """
+
+        if self.control_domain != "combat":
+            return
+        combat = observation.get("combat")
+        if not (isinstance(combat, Mapping) and combat.get("in_progress") is True):
+            self._combat_active = False
 
     def finish_episode(self, episode_id: str | None = None) -> MacroEpisode | None:
         self._close_open(terminal=True)
@@ -178,48 +284,73 @@ class MacroCollectionAuthority:
             for action in semantic_actions
         ]
         floor = self._observed_floor(observation)
-        if self._await_confirm:
-            index = self._match_index(
-                semantic_actions, valid, kinds=_PICKER_CONFIRM_KINDS, target=None
+        self.observe_observation(observation)
+
+        # Complete the native suffix of a previously learned semantic action.
+        # Auto-confirm may move directly to a new meaningful decision; in that
+        # case we consume the absent confirm and keep processing this same
+        # observation rather than ceding it to another policy.
+        while self._pending_plan is not None:
+            step = self._pending_plan.steps[0]
+            matches = self._step_indices(step, semantic_actions, valid)
+            dispatch_index = self._equivalent_dispatch_index(
+                matches,
+                semantic_actions,
             )
-            if index is not None:
-                self._await_confirm = False
+            if dispatch_index is not None:
+                remaining = self._pending_plan.steps[1:]
+                self._pending_plan = _PendingPlan(remaining) if remaining else None
                 self.mechanical_dispatches += 1
-                return index
-            self._await_confirm = False  # surface changed: fail closed to champion
-            self.declined += 1
-            return None
-        if self._await_picker:
-            self._await_picker = False
-            picker = self._picker_indices(semantic_actions, valid)
-            if picker:
-                self._close_open(terminal=False, floor=floor)
-                chosen = self._q_choice(snapshot, picker)
-                self._open_transition(
-                    snapshot=snapshot,
-                    action_index=chosen,
-                    surface="picker",
-                    branch="target",
-                    target_key=None,
-                    floor=floor,
-                )
-                self._await_confirm = True
-                self.overrides += 1
-                return chosen
+                return dispatch_index
+            if (
+                _kind_for_step(step) in _PICKER_CONFIRM_KINDS
+                and not self._is_selection_surface(semantic_actions, valid)
+            ):
+                remaining = self._pending_plan.steps[1:]
+                self._pending_plan = _PendingPlan(remaining) if remaining else None
+                continue
+
+            # The executor cannot realize the learned semantic action.  Do not
+            # turn a different card into its target and do not train on a
+            # transition whose declared action never completed.
+            self._pending_plan = None
+            self._open = None
             self.declined += 1
             return None
 
         decision = forward_decision(
-            observation, semantic_actions, include_combat=self.own_combat
+            observation,
+            semantic_actions,
+            control_domain=self.control_domain,
         )
         if decision is None:
             self.declined += 1
             return None
-        chosen_candidate = self._epsilon_greedy(decision, snapshot, valid)
-        if chosen_candidate is None:
+        executable = self._executable_candidates(decision, valid)
+        if not executable:
             self.declined += 1
             return None
-        native_index, candidate = chosen_candidate
+        recurrent_reset = False
+        if self.control_domain == "combat" and not self._combat_active:
+            # Tactical memory begins at the encounter boundary.  The replay
+            # records this reset so behavior and learner recurrence agree.
+            self._hidden = self.initial_state()
+            self._combat_active = True
+            recurrent_reset = True
+        semantic_snapshot = GroundedObservationEncoder(snapshot.config).encode(
+            observation,
+            [candidate.semantic_action for candidate in executable],
+        ).snapshot
+        if semantic_snapshot.candidate_count != len(executable):
+            raise RuntimeError("semantic candidate encoding changed the candidate set")
+        semantic_index = self._semantic_choice(
+            candidates=executable,
+            snapshot=semantic_snapshot,
+        )
+        candidate = executable[semantic_index]
+        if candidate.native_index is None:  # excluded above; keeps typing exact
+            raise RuntimeError("executable semantic candidate has no native index")
+        native_index = int(candidate.native_index)
         if self.record_decisions:
             player = observation.get("player")
             player = player if isinstance(player, Mapping) else {}
@@ -236,16 +367,16 @@ class MacroCollectionAuthority:
             )
         self._close_open(terminal=False, floor=floor)
         self._open_transition(
-            snapshot=snapshot,
-            action_index=native_index,
+            snapshot=semantic_snapshot,
+            action_index=semantic_index,
             surface=decision.surface,
             branch=candidate.branch,
             target_key=candidate.target_key,
             floor=floor,
+            recurrent_reset=recurrent_reset,
         )
         if len(candidate.plan) > 1:
-            self._pending_target = candidate.target
-            self._await_picker = True
+            self._pending_plan = _PendingPlan(candidate.plan[1:])
         self.overrides += 1
         return native_index
 
@@ -257,89 +388,105 @@ class MacroCollectionAuthority:
             self._last_floor = floor
         return self._last_floor
 
-    def _match_index(
+    def _step_indices(
         self,
-        semantic_actions: Sequence[Mapping[str, Any]],
-        valid: np.typing.NDArray[np.bool_],
-        *,
-        kinds: frozenset[str],
-        target: Mapping[str, Any] | None,
-    ) -> int | None:
-        for index, action in enumerate(semantic_actions):
-            if (
-                index < len(valid)
-                and bool(valid[index])
-                and _kind(action) in kinds
-                and _card_matches(action, target)
-            ):
-                return index
-        return None
-
-    def _picker_indices(
-        self,
+        step: NativeStep,
         semantic_actions: Sequence[Mapping[str, Any]],
         valid: np.typing.NDArray[np.bool_],
     ) -> list[int]:
-        indices = [
+        expected_kind = _kind_for_step(step)
+        accepted_kinds = (
+            _PICKER_SELECT_KINDS
+            if expected_kind == "select_card"
+            else _PICKER_CONFIRM_KINDS
+            if expected_kind == "confirm_selection"
+            else frozenset({expected_kind})
+        )
+        return [
             index
             for index, action in enumerate(semantic_actions)
             if index < len(valid)
             and bool(valid[index])
-            and _kind(action) in _PICKER_SELECT_KINDS
-            and _card_matches(action, self._pending_target)
+            and _kind(action) in accepted_kinds
+            and _card_matches(action, step.target)
         ]
-        if not indices and self._pending_target is not None:
-            # Target vanished (fail closed): fall back to any legal select.
-            indices = [
-                index
-                for index, action in enumerate(semantic_actions)
-                if index < len(valid)
-                and bool(valid[index])
-                and _kind(action) in _PICKER_SELECT_KINDS
-            ]
-        self._pending_target = None
-        return indices
+
+    @staticmethod
+    def _equivalent_dispatch_index(
+        matches: Sequence[int],
+        semantic_actions: Sequence[Mapping[str, Any]],
+    ) -> int | None:
+        """Return a stable representative only for one strict action class.
+
+        An exact duplicate card may appear through more than one native
+        picker row.  Dispatching the first member is sound only when the
+        shared strict grouping projection proves those rows equivalent.  A
+        set containing genuinely different copies remains ambiguous and is
+        declined rather than silently targeting the wrong card.
+        """
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return int(matches[0])
+        projected = [semantic_actions[index] for index in matches]
+        groups = strict_action_groups(projected)
+        if len(groups) != 1 or groups[0].multiplicity != len(matches):
+            return None
+        return int(matches[groups[0].member_positions[0]])
+
+    @staticmethod
+    def _is_selection_surface(
+        semantic_actions: Sequence[Mapping[str, Any]],
+        valid: np.typing.NDArray[np.bool_],
+    ) -> bool:
+        selection_kinds = (
+            _PICKER_SELECT_KINDS | _PICKER_CONFIRM_KINDS | _PICKER_REVERSE_KINDS
+        )
+        return any(
+            index < len(valid)
+            and bool(valid[index])
+            and _kind(action) in selection_kinds
+            for index, action in enumerate(semantic_actions)
+        )
 
     def _q_values(self, snapshot: EncodedDecisionSnapshot) -> Tensor:
         with torch.no_grad():
             values, self._hidden = self.forward_q(snapshot, self._hidden)
         return values
 
-    def _q_choice(self, snapshot: EncodedDecisionSnapshot, indices: list[int]) -> int:
-        if len(indices) == 1 or self._rng.random() < self.epsilon:
-            return int(self._rng.choice(indices))
-        values = self._q_values(snapshot)
-        best = max(indices, key=lambda index: float(values[index].item()))
-        return best
-
-    def _epsilon_greedy(
-        self,
+    @staticmethod
+    def _executable_candidates(
         decision: ForwardDecision,
-        snapshot: EncodedDecisionSnapshot,
         valid: np.typing.NDArray[np.bool_],
-    ) -> tuple[int, Any] | None:
-        executable = [
+    ) -> list[SemanticCandidate]:
+        return [
             candidate
             for candidate in decision.candidates
             if candidate.native_index is not None
             and candidate.native_index < len(valid)
             and bool(valid[candidate.native_index])
         ]
-        if not executable:
-            return None
+
+    def _semantic_choice(
+        self,
+        *,
+        candidates: Sequence[SemanticCandidate],
+        snapshot: EncodedDecisionSnapshot,
+    ) -> int:
+        # Advance recurrent state on every meaningful decision, including a
+        # singleton or epsilon-explored one.  Replay sees the same sequence.
+        values = self._q_values(snapshot)
         if self._rng.random() < self.epsilon:
             # Branch-balanced: uniform branch, then uniform candidate inside.
-            branches = sorted({candidate.branch for candidate in executable})
+            branches = sorted({candidate.branch for candidate in candidates})
             branch = branches[int(self._rng.integers(len(branches)))]
-            pool = [c for c in executable if c.branch == branch]
-            candidate = pool[int(self._rng.integers(len(pool)))]
-            return int(candidate.native_index), candidate  # type: ignore[arg-type]
-        values = self._q_values(snapshot)
-        candidate = max(
-            executable,
-            key=lambda item: float(values[int(item.native_index)].item()),  # type: ignore[arg-type]
+            pool = [index for index, item in enumerate(candidates) if item.branch == branch]
+            return int(pool[int(self._rng.integers(len(pool)))])
+        return max(
+            range(len(candidates)),
+            key=lambda index: float(values[index].item()),
         )
-        return int(candidate.native_index), candidate  # type: ignore[arg-type]
 
     def _open_transition(
         self,
@@ -350,6 +497,7 @@ class MacroCollectionAuthority:
         branch: str,
         target_key: str | None,
         floor: int,
+        recurrent_reset: bool,
     ) -> None:
         self._open = _OpenTransition(
             snapshot=snapshot,
@@ -359,6 +507,7 @@ class MacroCollectionAuthority:
             target_key=target_key,
             floor=floor,
             behavior_epsilon=self.epsilon,
+            recurrent_reset=recurrent_reset,
         )
 
     def _close_open(self, *, terminal: bool, floor: int | None = None) -> None:
@@ -379,6 +528,8 @@ class MacroCollectionAuthority:
                 terminal=terminal,
                 surface=self._open.surface,
                 branch=self._open.branch,
+                control_domain=self.control_domain,
+                recurrent_reset=self._open.recurrent_reset,
                 target_key=self._open.target_key,
                 behavior_epsilon=self._open.behavior_epsilon,
             )
@@ -393,6 +544,7 @@ class MacroCollectionAuthority:
             "declined": self.declined,
             "recorded_steps": len(self._steps),
             "epsilon": self.epsilon,
+            "control_domain": self.control_domain,
         }
 
 

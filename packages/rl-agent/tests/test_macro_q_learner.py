@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+
 import numpy as np
 import pytest
 import torch
@@ -67,6 +70,8 @@ def _step(
     terminal: bool = False,
     surface: str = "rest",
     branch: str = "rest",
+    control_domain: str = "macro",
+    recurrent_reset: bool = False,
 ) -> MacroStep:
     return MacroStep(
         snapshot=_snapshot(),
@@ -76,6 +81,8 @@ def _step(
         terminal=terminal,
         surface=surface,
         branch=branch,
+        control_domain=control_domain,  # type: ignore[arg-type]
+        recurrent_reset=recurrent_reset,
     )
 
 
@@ -91,6 +98,7 @@ def test_transition_contract_rejects_illegal_and_terminal_bootstrap() -> None:
             terminal=True,
             surface="rest",
             branch="rest",
+            control_domain="macro",
         )
     episode = MacroEpisode(
         episode_id="ep-1",
@@ -113,8 +121,8 @@ def test_n_step_targets_respect_clock_and_terminal_cut() -> None:
     assert targets[2] == pytest.approx(4.0 + 30.0)
 
 
-def test_replay_bounds_priorities_and_eviction() -> None:
-    replay = MacroSequenceReplay(capacity_episodes=2, burn_in=1, window_length=4, seed=7)
+def test_replay_covers_episode_from_step_zero_and_evicts_uniformly() -> None:
+    replay = MacroSequenceReplay(capacity_episodes=2, window_length=4, seed=7)
     for index in range(3):
         replay.put(
             MacroEpisode(
@@ -125,10 +133,25 @@ def test_replay_bounds_priorities_and_eviction() -> None:
     assert len(replay) == 2  # oldest evicted
     windows = replay.sample(4)
     assert windows
-    replay.update_priority(windows[0].window_id, 3.0)
     metrics = replay.metrics()
     assert metrics["episodes"] == 2
-    assert metrics["prioritized_windows"] == 1
+    assert metrics["sampling"] == "uniform"
+    for episode in replay._episodes:
+        episode_windows = [
+            window for window in replay._windows() if window.episode is episode
+        ]
+        assert episode_windows[0].learn_slice[0] == 0
+        covered = {
+            index
+            for window in episode_windows
+            for index in range(*window.learn_slice)
+        }
+        assert covered == set(range(len(episode.steps)))
+        for window in episode_windows[1:]:
+            # Exact-history mode replays the real episode prefix, rather than
+            # treating a bounded suffix as if it began from the zero state.
+            assert window.start == 0
+            assert window.burn_in == window.learn_slice[0]
     with pytest.raises(ValueError, match="already stored"):
         replay.put(MacroEpisode(episode_id="ep-2", steps=(_step(),)))
 
@@ -153,7 +176,7 @@ class _FakeQ:
 
 
 def test_double_q_learner_converges_and_reports_ec4_counts() -> None:
-    replay = MacroSequenceReplay(capacity_episodes=8, burn_in=0, window_length=2, seed=3)
+    replay = MacroSequenceReplay(capacity_episodes=8, window_length=2, seed=3)
     # One-decision episodes: action 1 pays +1 and terminates.
     for index in range(4):
         replay.put(
@@ -178,6 +201,7 @@ def test_double_q_learner_converges_and_reports_ec4_counts() -> None:
         forward_target=fake.forward_target,
         sync_target=fake.sync,
         initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
         replay=replay,
         config=MacroQConfig(
             n_step=3,
@@ -200,7 +224,7 @@ def test_window_tail_bootstraps_from_the_successor_beyond_the_window() -> None:
     """A window that ends mid-episode must bootstrap its final transition
     from the actual successor state's Double-Q value, not a biased zero."""
 
-    replay = MacroSequenceReplay(capacity_episodes=4, burn_in=0, window_length=2, seed=5)
+    replay = MacroSequenceReplay(capacity_episodes=4, window_length=2, seed=5)
     # Three-step episode, all zero reward, unit discount: with the target
     # network fixed at Q(candidate 1) = 1, every learn step's exact n-step
     # target is 1.0 ONLY if the final window transition sees its successor.
@@ -226,6 +250,7 @@ def test_window_tail_bootstraps_from_the_successor_beyond_the_window() -> None:
         forward_target=forward,
         sync_target=lambda: None,
         initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
         replay=replay,
         config=MacroQConfig(n_step=1, learning_rate=0.01, sample_windows=8),
     )
@@ -239,6 +264,293 @@ def test_window_tail_bootstraps_from_the_successor_beyond_the_window() -> None:
     # Both transitions bootstrap from a successor whose masked argmax is
     # candidate 1 with target value 1.0 — including the window tail.
     assert bootstraps == (1.0, 1.0)
+
+
+def test_exact_history_burn_in_and_learning_suffix_bptt() -> None:
+    """A later window reconstructs the complete prefix under no-grad, then a
+    later TD loss can train a recurrent write made earlier in its suffix."""
+
+    replay = MacroSequenceReplay(capacity_episodes=2, window_length=2, seed=11)
+    replay.put(
+        MacroEpisode(
+            episode_id="history",
+            steps=(
+                _step(reward=1.0),
+                _step(reward=2.0),
+                _step(reward=3.0),
+                _step(reward=4.0, terminal=True, discount=0.0),
+            ),
+        )
+    )
+    window = next(window for window in replay._windows() if window.learn_slice == (2, 4))
+    write = torch.nn.Parameter(torch.tensor(1.0))
+    seen_online: list[tuple[float, bool]] = []
+    target_context_active = False
+
+    @contextmanager
+    def target_evaluation() -> Iterator[None]:
+        nonlocal target_context_active
+        target_context_active = True
+        try:
+            yield
+        finally:
+            target_context_active = False
+
+    def online(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        seen_online.append((step.reward, torch.is_grad_enabled()))
+        state = write.new_zeros(()) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        q_values = torch.stack((state, state * 0.0, state * 0.0))
+        return q_values, state + write * step.reward
+
+    def target(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        assert target_context_active
+        assert not torch.is_grad_enabled()
+        state = torch.tensor(0.0) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        return torch.zeros(3), state + step.reward
+
+    learner = MacroQLearner(
+        online_parameters=[write],
+        forward_online=online,
+        forward_target=target,
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(n_step=1, sample_windows=1),
+        target_evaluation_context=target_evaluation,
+    )
+    executed_q, _, _, _, _ = learner._window_values(window)
+    # The exact prefix is steps 0 and 1; only steps 2 and 3 are trainable.
+    assert seen_online == [
+        (1.0, False),
+        (2.0, False),
+        (3.0, True),
+        (4.0, True),
+    ]
+    executed_q[-1].backward()
+    # Q at step 3 depends on the write made while processing step 2. If the
+    # callback or learner detached every step, this gradient would be zero.
+    assert write.grad is not None
+    assert float(write.grad.item()) == pytest.approx(3.0)
+
+
+def test_learner_rejects_detached_state_inside_learning_suffix() -> None:
+    replay = MacroSequenceReplay(capacity_episodes=1, window_length=2, seed=13)
+    replay.put(
+        MacroEpisode(
+            episode_id="detached",
+            steps=(_step(), _step(terminal=True, discount=0.0)),
+        )
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+
+    def detached_online(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        return parameter.expand(3), torch.zeros(1)
+
+    learner = MacroQLearner(
+        online_parameters=[parameter],
+        forward_online=detached_online,
+        forward_target=lambda step, hidden: (torch.zeros(3), torch.zeros(1)),
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
+        replay=replay,
+        config=MacroQConfig(n_step=1, sample_windows=1),
+    )
+    with pytest.raises(RuntimeError, match="detached the recurrent state"):
+        learner._window_values(replay._windows()[0])
+
+
+def test_replay_and_learner_state_round_trip() -> None:
+    replay = MacroSequenceReplay(capacity_episodes=4, window_length=2, seed=17)
+    for index in range(3):
+        replay.put(
+            MacroEpisode(
+                episode_id=f"resume-{index}",
+                steps=(_step(), _step(terminal=True, discount=0.0)),
+            )
+        )
+    replay.sample(1)  # advance the replay RNG before publication
+    replay_state = replay.state_dict()
+    expected_next = tuple(window.window_id for window in replay.sample(2))
+    restored_replay = MacroSequenceReplay(
+        capacity_episodes=4, window_length=2, seed=999
+    )
+    restored_replay.load_state_dict(replay_state)
+    assert tuple(window.window_id for window in restored_replay.sample(2)) == expected_next
+    assert restored_replay.metrics() == replay.metrics()
+
+    fake = _FakeQ()
+    config = MacroQConfig(n_step=1, learning_rate=0.1, sample_windows=2)
+    learner = MacroQLearner(
+        online_parameters=[fake.online],
+        forward_online=fake.forward_online,
+        forward_target=fake.forward_target,
+        sync_target=fake.sync,
+        initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
+        replay=replay,
+        config=config,
+    )
+    learner.update()
+    learner_state = learner.state_dict()
+    restored_fake = _FakeQ()
+    restored_learner = MacroQLearner(
+        online_parameters=[restored_fake.online],
+        forward_online=restored_fake.forward_online,
+        forward_target=restored_fake.forward_target,
+        sync_target=restored_fake.sync,
+        initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
+        replay=restored_replay,
+        config=config,
+    )
+    restored_learner.load_state_dict(learner_state)
+    assert restored_learner.metrics.as_mapping() == learner.metrics.as_mapping()
+    assert restored_learner.optimizer.state_dict()["state"]
+
+
+def test_replay_refuses_cross_domain_episodes() -> None:
+    replay = MacroSequenceReplay(
+        capacity_episodes=2,
+        window_length=2,
+        control_domain="combat",
+    )
+    with pytest.raises(ValueError, match="another domain"):
+        replay.put(MacroEpisode(episode_id="macro", steps=(_step(),)))
+    replay.put(
+        MacroEpisode(
+            episode_id="combat",
+            steps=(
+                _step(
+                    surface="combat",
+                    branch="end_turn",
+                    control_domain="combat",
+                    recurrent_reset=True,
+                ),
+            ),
+        )
+    )
+    assert replay.metrics()["control_domain"] == "combat"
+
+
+def test_recurrent_state_resets_at_each_combat_boundary() -> None:
+    replay = MacroSequenceReplay(
+        capacity_episodes=2,
+        window_length=3,
+        control_domain="combat",
+    )
+    replay.put(
+        MacroEpisode(
+            episode_id="two-combats",
+            steps=(
+                _step(control_domain="combat", recurrent_reset=True),
+                _step(control_domain="combat"),
+                _step(
+                    control_domain="combat",
+                    recurrent_reset=True,
+                    terminal=True,
+                    discount=0.0,
+                ),
+            ),
+        )
+    )
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    seen: list[float] = []
+
+    def online(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        state = parameter * 0.0 if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        seen.append(float(state.detach().item()))
+        return parameter.expand(3), state + 1.0
+
+    def target(step: MacroStep, hidden: object) -> tuple[torch.Tensor, object]:
+        state = torch.tensor(0.0) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        return torch.zeros(3), state + 1.0
+
+    learner = MacroQLearner(
+        online_parameters=[parameter],
+        forward_online=online,
+        forward_target=target,
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(n_step=1, sample_windows=1),
+    )
+    learner._window_values(replay._windows()[0])
+    assert seen == [0.0, 1.0, 0.0]
+
+
+def test_batched_recurrence_handles_partial_combat_resets() -> None:
+    replay = MacroSequenceReplay(
+        capacity_episodes=2,
+        window_length=3,
+        control_domain="combat",
+    )
+    replay.put(
+        MacroEpisode(
+            episode_id="reset-at-two",
+            steps=(
+                _step(control_domain="combat", recurrent_reset=True),
+                _step(control_domain="combat"),
+                _step(
+                    control_domain="combat",
+                    recurrent_reset=True,
+                    terminal=True,
+                    discount=0.0,
+                ),
+            ),
+        )
+    )
+    replay.put(
+        MacroEpisode(
+            episode_id="one-combat",
+            steps=(
+                _step(control_domain="combat", recurrent_reset=True),
+                _step(control_domain="combat"),
+                _step(
+                    control_domain="combat",
+                    terminal=True,
+                    discount=0.0,
+                ),
+            ),
+        )
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+
+    def batch_online(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(snapshots)  # type: ignore[arg-type]
+        state = (
+            parameter.new_zeros((count, 1))
+            if hidden is None
+            else hidden
+        )
+        assert isinstance(state, torch.Tensor)
+        q = parameter.expand(count, 3)
+        return q, state + parameter * 0.0 + 1.0
+
+    def batch_target(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
+        count = len(snapshots)  # type: ignore[arg-type]
+        state = torch.zeros(count, 1) if hidden is None else hidden
+        assert isinstance(state, torch.Tensor)
+        return torch.zeros(count, 3), state + 1.0
+
+    learner = MacroQLearner(
+        online_parameters=[parameter],
+        forward_online=lambda step, hidden: (parameter.expand(3), hidden),
+        forward_target=lambda step, hidden: (torch.zeros(3), hidden),
+        sync_target=lambda: None,
+        initial_state=lambda: None,
+        replay=replay,
+        config=MacroQConfig(n_step=1, sample_windows=2),
+        forward_online_batch=batch_online,
+        forward_target_batch=batch_target,
+    )
+    values = learner._batched_window_values(replay._windows())
+    assert len(values) == 2
+    assert all(len(result[-1]) == 3 for result in values)
 
 
 def test_trunk_loading_inherits_compatible_and_refuses_drift() -> None:
@@ -284,14 +596,19 @@ def test_batched_lockstep_path_matches_semantics_and_converges() -> None:
     action converges to its factual return, window tails bootstrap from
     successors, and burn-in rows produce no learn targets."""
 
-    replay = MacroSequenceReplay(capacity_episodes=8, burn_in=1, window_length=2, seed=7)
+    replay = MacroSequenceReplay(capacity_episodes=8, window_length=2, seed=7)
     for index in range(4):
         replay.put(
             MacroEpisode(
                 episode_id=f"bep-{index}",
                 steps=(
                     _step(action_index=0),
-                    _step(action_index=1, reward=1.0),
+                    # Cut this synthetic transition's bootstrap. The fake Q
+                    # below is intentionally state-independent, so allowing it
+                    # to bootstrap from an unexecuted action at the successor
+                    # would create an unsupported self-target unrelated to the
+                    # lockstep batching behavior under test.
+                    _step(action_index=1, reward=1.0, discount=0.0),
                     _step(action_index=0, terminal=True, discount=0.0),
                 ),
             )
@@ -301,7 +618,8 @@ def test_batched_lockstep_path_matches_semantics_and_converges() -> None:
 
     def batch_forward_online(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
         count = len(snapshots)  # type: ignore[arg-type]
-        return online[:3].unsqueeze(0).expand(count, -1), torch.zeros(count, 1)
+        attached_hidden = online[0].reshape(1, 1).expand(count, -1) * 0.0
+        return online[:3].unsqueeze(0).expand(count, -1), attached_hidden
 
     def batch_forward_target(snapshots: object, hidden: object) -> tuple[torch.Tensor, object]:
         count = len(snapshots)  # type: ignore[arg-type]
@@ -320,6 +638,7 @@ def test_batched_lockstep_path_matches_semantics_and_converges() -> None:
         forward_target=unused,
         sync_target=sync,
         initial_state=lambda: None,
+        target_evaluation_context=nullcontext,
         replay=replay,
         config=MacroQConfig(
             n_step=2, learning_rate=0.2, target_update_interval=5, sample_windows=4

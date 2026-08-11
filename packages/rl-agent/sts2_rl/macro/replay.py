@@ -1,24 +1,29 @@
-"""Bounded sequence replay for the macro candidate-Q learner.
+"""Bounded, uniform sequence replay for the macro candidate-Q learner.
 
-Stores complete macro episodes and samples contiguous windows (burn-in +
-learn segment) with TD-error priorities.  Priorities start uniform, are
-updated only by the learner, and never fabricate ordering between unseen
-windows.  Bounded by episode count and per-sample quota, mirroring the
-project's replay discipline; training-partition data only (enforced by the
-episode DTO).
+Every learning window starts from an explicit learning index, while its
+history slice starts at the beginning of the episode.  Replaying that history
+without gradients reconstructs the current network's exact recurrent state at
+the learning boundary.  Macro episodes are compact enough that this initially
+favours correct recurrence over a bounded-but-inexact hidden-state shortcut.
+
+Sampling is uniform.  The previous implementation sampled by TD priority but
+optimized an uncorrected, equally-weighted loss, which silently changed the
+training objective.  A future prioritized implementation must return sampling
+probabilities together with bounded importance weights; until then the stable
+contract is deliberately simple.
 """
 
 from __future__ import annotations
 
-import math
+import copy
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final, Literal
 
 import numpy as np
 
 from .transitions import MacroEpisode
 
-MACRO_REPLAY_CONTRACT_VERSION: Final = "sts2-macro-replay-v1"
+MACRO_REPLAY_CONTRACT_VERSION: Final = "sts2-macro-replay-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,21 +45,18 @@ class MacroSequenceReplay:
         self,
         *,
         capacity_episodes: int = 512,
-        burn_in: int = 8,
         window_length: int = 16,
-        priority_exponent: float = 0.6,
         seed: int = 0,
+        control_domain: Literal["macro", "combat"] = "macro",
     ) -> None:
-        if capacity_episodes <= 0 or burn_in < 0 or window_length <= 0:
+        if capacity_episodes <= 0 or window_length <= 0:
             raise ValueError("macro replay bounds must be positive")
-        if not 0.0 <= priority_exponent <= 1.0:
-            raise ValueError("priority exponent must be in [0, 1]")
         self.capacity_episodes = capacity_episodes
-        self.burn_in = burn_in
         self.window_length = window_length
-        self.priority_exponent = priority_exponent
+        if control_domain not in {"macro", "combat"}:
+            raise ValueError("replay control_domain must be macro or combat")
+        self.control_domain = control_domain
         self._episodes: list[MacroEpisode] = []
-        self._priorities: dict[str, float] = {}
         self._rng = np.random.default_rng(seed)
         self._put_count = 0
 
@@ -66,35 +68,37 @@ class MacroSequenceReplay:
         return sum(len(episode.steps) for episode in self._episodes)
 
     def put(self, episode: MacroEpisode) -> None:
+        if episode.control_domain != self.control_domain:
+            raise ValueError("macro replay refuses an episode from another domain")
         if any(existing.episode_id == episode.episode_id for existing in self._episodes):
             raise ValueError(f"macro episode {episode.episode_id!r} already stored")
         self._episodes.append(episode)
         self._put_count += 1
         while len(self._episodes) > self.capacity_episodes:
-            evicted = self._episodes.pop(0)
-            for key in [k for k in self._priorities if k.startswith(f"{evicted.episode_id}#")]:
-                del self._priorities[key]
+            self._episodes.pop(0)
 
     def _windows(self) -> list[MacroWindow]:
         windows: list[MacroWindow] = []
         stride = max(self.window_length // 2, 1)
         for episode in self._episodes:
             steps = len(episode.steps)
-            start = 0
+            learn_start = 0
             while True:
                 window = MacroWindow(
                     episode=episode,
-                    start=start,
-                    burn_in=min(self.burn_in, max(steps - start - 1, 0)),
+                    # Exact-history mode: replay the factual episode prefix
+                    # under no-grad before every later learning suffix.
+                    start=0,
+                    burn_in=learn_start,
                     length=self.window_length,
-                    window_id=f"{episode.episode_id}#{start}",
+                    window_id=f"{episode.episode_id}#{learn_start}",
                 )
                 begin, end = window.learn_slice
                 if begin < end:
                     windows.append(window)
-                if start + stride >= steps or end >= steps:
+                if end >= steps:
                     break
-                start += stride
+                learn_start += stride
         return windows
 
     def sample(self, count: int) -> tuple[MacroWindow, ...]:
@@ -103,27 +107,53 @@ class MacroSequenceReplay:
         windows = self._windows()
         if not windows:
             return ()
-        raw = np.asarray(
-            [
-                max(self._priorities.get(window.window_id, 1.0), 1e-6)
-                ** self.priority_exponent
-                for window in windows
-            ],
-            dtype=np.float64,
-        )
-        probabilities = raw / raw.sum()
         chosen = self._rng.choice(
             len(windows),
             size=min(count, len(windows)),
             replace=False,
-            p=probabilities,
         )
         return tuple(windows[int(index)] for index in chosen)
 
-    def update_priority(self, window_id: str, td_error: float) -> None:
-        if not math.isfinite(td_error):
-            raise ValueError("priority update requires a finite TD error")
-        self._priorities[window_id] = abs(td_error)
+    def state_dict(self) -> dict[str, Any]:
+        """Return the complete bounded replay state needed for continuation."""
+
+        return {
+            "version": MACRO_REPLAY_CONTRACT_VERSION,
+            "capacity_episodes": self.capacity_episodes,
+            "window_length": self.window_length,
+            "control_domain": self.control_domain,
+            "episodes": tuple(self._episodes),
+            "rng_state": copy.deepcopy(self._rng.bit_generator.state),
+            "put_count": self._put_count,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a replay produced by :meth:`state_dict`."""
+
+        if state.get("version") != MACRO_REPLAY_CONTRACT_VERSION:
+            raise ValueError("macro replay state version differs")
+        if int(state.get("capacity_episodes", -1)) != self.capacity_episodes:
+            raise ValueError("macro replay capacity differs")
+        if int(state.get("window_length", -1)) != self.window_length:
+            raise ValueError("macro replay window length differs")
+        if state.get("control_domain") != self.control_domain:
+            raise ValueError("macro replay control domain differs")
+        episodes = tuple(state.get("episodes", ()))
+        if len(episodes) > self.capacity_episodes or not all(
+            isinstance(episode, MacroEpisode) for episode in episodes
+        ):
+            raise ValueError("macro replay episodes are invalid")
+        if any(episode.control_domain != self.control_domain for episode in episodes):
+            raise ValueError("macro replay state contains another control domain")
+        episode_ids = [episode.episode_id for episode in episodes]
+        if len(set(episode_ids)) != len(episode_ids):
+            raise ValueError("macro replay episode ids are not unique")
+        put_count = int(state.get("put_count", -1))
+        if put_count < len(episodes):
+            raise ValueError("macro replay put count is invalid")
+        self._episodes = list(episodes)
+        self._put_count = put_count
+        self._rng.bit_generator.state = copy.deepcopy(state["rng_state"])
 
     def metrics(self) -> dict[str, float | int | str]:
         return {
@@ -132,7 +162,8 @@ class MacroSequenceReplay:
             "steps": self.total_steps,
             "windows": len(self._windows()),
             "put_count": self._put_count,
-            "prioritized_windows": len(self._priorities),
+            "sampling": "uniform",
+            "control_domain": self.control_domain,
         }
 
 

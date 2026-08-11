@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Stage-two isolated macro training: frozen champion + macro Double-Q.
+"""Isolated semantic-domain training: frozen fallback + candidate Double-Q.
 
 Implements reset doc §10 stage 2. The v47 combat champion is loaded FROZEN
 (model initialization semantics; its parameters receive no gradient and the
-legacy learner is never invoked). A second model instance — initialized from
-the same champion weights — provides the macro candidate-Q function via its
-transaction_q_values head; only that instance trains, exclusively through the
-macro Double-Q learner. The collection authority owns macro surfaces with
-branch-balanced epsilon-greedy; every other decision is the champion's.
+legacy learner is never invoked). A second model instance provides the
+candidate-Q function; exactly one requested domain trains in that instance.
+Every other decision remains owned by the frozen champion.  Macro and combat
+experiments write separate model files and never share a trainable trunk.
 
 Usage (WSL ROCm venv, from the package root):
     python scripts/run_stage2_isolated_macro.py \
@@ -22,6 +21,7 @@ import argparse
 import copy
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,7 +40,23 @@ from sts2_rl.macro import (
 from sts2_rl.training import build_training_resources, load_training_config
 
 
-def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
+@contextmanager
+def _evaluation_mode(model: Any) -> Any:
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        yield
+    finally:
+        model.train(was_training)
+
+
+def _forward_factory(
+    model: Any,
+    encoder: Any,
+    device: torch.device,
+    *,
+    detach_hidden: bool,
+) -> Any:
     fingerprint = None
 
     def forward(step: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
@@ -62,7 +78,28 @@ def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
         q_values = output.transaction_q_values
         if q_values is None:
             raise RuntimeError("macro Q model produced no candidate Q values")
-        return q_values[0], output.recurrent_state.detach()
+        recurrent = output.recurrent_state
+        return q_values[0], recurrent.detach() if detach_hidden else recurrent
+
+    return forward
+
+
+def _batched_forward_factory(model: Any, encoder: Any, device: torch.device, *, detach_hidden: bool) -> Any:
+    def forward(snapshots: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
+        encoded = collate_encoded_snapshots(
+            tuple(snapshots),
+            expected_config=encoder.config,
+            expected_fingerprint=snapshots[0].encoding_fingerprint,
+            device=device,
+        )
+        if hidden is None:
+            hidden = model.initial_state(len(snapshots), device=device)
+        output = model(encoded, hidden, validate=False)
+        q_values = output.transaction_q_values
+        if q_values is None:
+            raise RuntimeError("macro Q model produced no candidate Q values")
+        recurrent = output.recurrent_state
+        return q_values, recurrent.detach() if detach_hidden else recurrent
 
     return forward
 
@@ -80,10 +117,10 @@ def main() -> int:
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
     parser.add_argument(
-        "--own-combat",
-        action="store_true",
-        help="stage-4 combat challenger: the authority also owns the "
-        "native-atomic combat view (default: macro surfaces only)",
+        "--control-domain",
+        choices=("macro", "combat"),
+        default="macro",
+        help="train exactly one independently parameterized control domain",
     )
     parser.add_argument(
         "--replay-episodes",
@@ -151,13 +188,18 @@ def main() -> int:
                 )
         for parameter in macro_online.parameters():
             parameter.requires_grad_(True)
+        # Candidate Q is the baseline; stochastic regularizers make both the
+        # target and behavior values depend on an unrelated dropout draw.
+        macro_online.eval()
         macro_target = copy.deepcopy(macro_online)
+        macro_target.eval()
         for parameter in macro_target.parameters():
             parameter.requires_grad_(False)
 
         device = resources.device
-        forward_online = _forward_factory(macro_online, resources.encoder, device)
-        forward_target = _forward_factory(macro_target, resources.encoder, device)
+        forward_online = _forward_factory(macro_online, resources.encoder, device, detach_hidden=False)
+        forward_target = _forward_factory(macro_target, resources.encoder, device, detach_hidden=True)
+        forward_behavior = _forward_factory(macro_online, resources.encoder, device, detach_hidden=True)
 
         def sync_target() -> None:
             macro_target.load_state_dict(macro_online.state_dict())
@@ -166,7 +208,9 @@ def main() -> int:
             return None
 
         replay = MacroSequenceReplay(
-            capacity_episodes=args.replay_episodes, burn_in=8, window_length=16
+            capacity_episodes=args.replay_episodes,
+            window_length=16,
+            control_domain=args.control_domain,
         )
         learner = MacroQLearner(
             online_parameters=list(macro_online.parameters()),
@@ -176,12 +220,15 @@ def main() -> int:
             initial_state=initial_state,
             replay=replay,
             config=MacroQConfig(),
+            forward_online_batch=_batched_forward_factory(macro_online, resources.encoder, device, detach_hidden=False),
+            forward_target_batch=_batched_forward_factory(macro_target, resources.encoder, device, detach_hidden=True),
+            target_evaluation_context=lambda: _evaluation_mode(macro_target),
         )
         authority = MacroCollectionAuthority(
-            forward_q=forward_online,
+            forward_q=forward_behavior,
             initial_state=initial_state,
             epsilon=args.epsilon,
-            own_combat=bool(args.own_combat),
+            control_domain=args.control_domain,
         )
         resources.collector.macro_authority = authority
 
@@ -201,9 +248,7 @@ def main() -> int:
                     deterministic=False,
                     record=False,
                 )
-                macro_episode = authority.finish_episode(
-                    f"stage2-{episode_index:05d}"
-                )
+                macro_episode = authority.finish_episode(f"stage2-{episode_index:05d}")
                 if macro_episode is not None:
                     replay.put(macro_episode)
                 update_metrics: dict[str, Any] = {}

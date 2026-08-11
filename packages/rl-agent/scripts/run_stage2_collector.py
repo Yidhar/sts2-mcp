@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Stage-2/4 spool collector: one sim, authority-owned collection to disk.
-
-Actor half of the file-decoupled actor/learner split. Collects episodes
-with the frozen champion driving declined decisions and the macro
-candidate-Q model (reloaded periodically from --model-path as the trainer
-publishes it) driving owned surfaces with branch-balanced epsilon-greedy.
-Each MacroEpisode is pickled atomically into --spool for the trainer.
-"""
+"""Stage-2/4 producer for one explicitly identified pipeline segment."""
 
 from __future__ import annotations
 
@@ -17,6 +10,7 @@ import os
 import pickle
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -26,6 +20,15 @@ import torch
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.macro import MacroCollectionAuthority, load_trunk_state
 from sts2_rl.training import build_training_resources, load_training_config
+
+SPOOL_ENVELOPE_FORMAT = "sts2-stage2-spool-envelope-v1"
+
+
+def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(dict(payload), sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
@@ -47,7 +50,7 @@ def _forward_factory(model: Any, encoder: Any, device: torch.device) -> Any:
     return forward
 
 
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--champion", required=True)
@@ -56,38 +59,69 @@ def main() -> int:
     parser.add_argument(
         "--init-macro",
         default=None,
-        help="behavior weights until the trainer's first publication",
+        help="explicit model-only fallback before the trainer publication exists",
     )
+    parser.add_argument("--pipeline-id", required=True)
+    parser.add_argument("--lineage-id", default="stage2-isolated-macro-v1")
+    parser.add_argument("--producer-id", required=True)
+    parser.add_argument("--status-out", required=True)
     parser.add_argument("--episodes", type=int, default=400)
     parser.add_argument("--epsilon", type=float, default=0.15)
-    parser.add_argument("--own-combat", action="store_true")
+    parser.add_argument(
+        "--control-domain",
+        choices=("macro", "combat"),
+        default="macro",
+        help="the one semantic domain owned by this producer",
+    )
     parser.add_argument("--model-reload-episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    config = load_training_config(profile="preheat", config_path=Path(args.config))
-    config = replace(config, runtime=replace(config.runtime, seed=int(args.seed)))
-    if args.device is not None:
-        config = replace(config, runtime=replace(config.runtime, device=str(args.device)))
-    if args.sim_exe is not None:
-        config = replace(
-            config,
-            environment=replace(
-                config.environment,
-                backend="headless",
-                sim_exe_path=str(args.sim_exe),
-            ),
-        )
-    if not config.transaction_learning.enabled:
-        raise SystemExit("collector requires transaction_learning.enabled=true")
 
-    spool = Path(args.spool)
-    spool.mkdir(parents=True, exist_ok=True)
-    resources = build_training_resources(config)
+def main() -> int:
+    args = _parse_args()
+    model_path = Path(args.model_path)
+    init_path = Path(args.init_macro) if args.init_macro is not None else None
+    status_path = Path(args.status_out)
+    metrics_path = Path(args.metrics_out)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    run_nonce = uuid.uuid4().hex[:12]
+    base_status = {
+        "pipeline_id": args.pipeline_id,
+        "producer_id": args.producer_id,
+        "run_nonce": run_nonce,
+    }
+    _atomic_json(status_path, {**base_status, "state": "running", "unix_s": time.time()})
+    resources = None
     try:
+        if init_path is not None and not init_path.is_file():
+            raise FileNotFoundError(f"collector initialization does not exist: {init_path}")
+        if not model_path.is_file() and init_path is None:
+            raise FileNotFoundError(
+                "collector has neither a trainer publication nor explicit " f"initialization: {model_path}"
+            )
+        config = load_training_config(profile="preheat", config_path=Path(args.config))
+        config = replace(config, runtime=replace(config.runtime, seed=int(args.seed)))
+        if args.device is not None:
+            config = replace(config, runtime=replace(config.runtime, device=str(args.device)))
+        if args.sim_exe is not None:
+            config = replace(
+                config,
+                environment=replace(
+                    config.environment,
+                    backend="headless",
+                    sim_exe_path=str(args.sim_exe),
+                ),
+            )
+        if not config.transaction_learning.enabled:
+            raise RuntimeError("collector requires transaction_learning.enabled=true")
+
+        spool = Path(args.spool)
+        spool.mkdir(parents=True, exist_ok=True)
+        resources = build_training_resources(config)
         champion_state = torch.load(
             Path(args.champion) / "network.pt",
             map_location=resources.device,
@@ -99,52 +133,50 @@ def main() -> int:
             parameter.requires_grad_(False)
 
         macro_model = copy.deepcopy(resources.model)
-        if args.init_macro is not None and Path(args.init_macro).exists():
+        if init_path is not None:
             load_trunk_state(
                 macro_model,
-                dict(
-                    torch.load(
-                        Path(args.init_macro),
-                        map_location=resources.device,
-                        weights_only=True,
-                    )
-                ),
+                dict(torch.load(init_path, map_location=resources.device, weights_only=True)),
             )
         macro_model.eval()
-        model_path = Path(args.model_path)
         model_mtime = 0.0
 
         def maybe_reload() -> None:
             nonlocal model_mtime
-            if not model_path.exists():
+            if not model_path.is_file():
                 return
-            mtime = model_path.stat().st_mtime
+            mtime = model_path.stat().st_mtime_ns
             if mtime <= model_mtime:
                 return
-            try:
-                state = torch.load(
-                    model_path, map_location=resources.device, weights_only=True
-                )
-                load_trunk_state(macro_model, dict(state))
-                macro_model.eval()
-                model_mtime = mtime
-            except (RuntimeError, EOFError, pickle.UnpicklingError):
-                pass  # mid-write read: retry on the next reload tick
+            state = torch.load(model_path, map_location=resources.device, weights_only=True)
+            load_trunk_state(macro_model, dict(state))
+            macro_model.eval()
+            model_mtime = mtime
 
         maybe_reload()
-        # Episode ids must be unique across collector restarts sharing one
-        # spool: the replay contract refuses duplicate ids.
-        run_nonce = uuid.uuid4().hex[:8]
         authority = MacroCollectionAuthority(
             forward_q=_forward_factory(macro_model, resources.encoder, resources.device),
             initial_state=lambda: None,
             epsilon=args.epsilon,
             seed=int(args.seed),
-            own_combat=bool(args.own_combat),
+            control_domain=args.control_domain,
         )
         resources.collector.macro_authority = authority
 
-        with Path(args.metrics_out).open("a", encoding="utf-8") as metrics_file:
+        produced = 0
+        with metrics_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(
+                json.dumps(
+                    {
+                        "event": "collector_start",
+                        "unix_s": time.time(),
+                        **base_status,
+                        "seed": args.seed,
+                    }
+                )
+                + "\n"
+            )
+            metrics_file.flush()
             for episode_index in range(args.episodes):
                 if episode_index % max(args.model_reload_episodes, 1) == 0:
                     maybe_reload()
@@ -154,17 +186,31 @@ def main() -> int:
                     record=False,
                 )
                 macro_episode = authority.finish_episode(
-                    f"spool-{args.seed}-{run_nonce}-{episode_index:05d}"
+                    f"spool-{args.pipeline_id}-{args.producer_id}-{run_nonce}-{episode_index:05d}"
                 )
                 if macro_episode is not None:
+                    envelope = {
+                        "format": SPOOL_ENVELOPE_FORMAT,
+                        "pipeline_id": args.pipeline_id,
+                        "lineage_id": args.lineage_id,
+                        "producer_id": args.producer_id,
+                        "run_nonce": run_nonce,
+                        "control_domain": args.control_domain,
+                        "environment_steps": episode.metrics.steps,
+                        "episode": macro_episode,
+                    }
                     temporary = spool / f".tmp-{uuid.uuid4().hex}"
                     with temporary.open("wb") as handle:
-                        pickle.dump(macro_episode, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                        pickle.dump(envelope, handle, protocol=pickle.HIGHEST_PROTOCOL)
                     os.replace(temporary, spool / f"{uuid.uuid4().hex}.pkl")
+                    produced += 1
                 metrics_file.write(
                     json.dumps(
                         {
                             "event": "collector_episode",
+                            "pipeline_id": args.pipeline_id,
+                            "producer_id": args.producer_id,
+                            "run_nonce": run_nonce,
                             "seed": args.seed,
                             "episode_index": episode_index,
                             "unix_s": time.time(),
@@ -176,17 +222,37 @@ def main() -> int:
                             "revivals_used": episode.metrics.revivals_used,
                             "reward_total": episode.metrics.reward_total,
                             "terminal_reason": episode.metrics.terminal_reason,
-                            "macro_steps": (
-                                len(macro_episode.steps) if macro_episode else 0
-                            ),
+                            "macro_steps": len(macro_episode.steps) if macro_episode else 0,
                         }
                     )
                     + "\n"
                 )
                 metrics_file.flush()
+        _atomic_json(
+            status_path,
+            {
+                **base_status,
+                "state": "complete",
+                "unix_s": time.time(),
+                "episodes": args.episodes,
+                "produced": produced,
+            },
+        )
         return 0
+    except BaseException as exc:
+        failed = {
+            **base_status,
+            "state": "failed",
+            "unix_s": time.time(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        _atomic_json(status_path, failed)
+        with metrics_path.open("a", encoding="utf-8") as metrics_file:
+            metrics_file.write(json.dumps({"event": "collector_failed", **failed}) + "\n")
+        raise
     finally:
-        resources.close()
+        if resources is not None:
+            resources.close()
 
 
 if __name__ == "__main__":

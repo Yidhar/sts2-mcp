@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import asdict, dataclass, field
 from typing import Any, Final
 
 import torch
@@ -25,7 +26,7 @@ from torch import Tensor
 from .replay import MacroSequenceReplay, MacroWindow
 from .transitions import MacroStep, n_step_targets
 
-MACRO_Q_LEARNER_VERSION: Final = "sts2-macro-double-q-v1"
+MACRO_Q_LEARNER_VERSION: Final = "sts2-macro-double-q-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,10 +83,14 @@ class MacroQMetrics:
 class MacroQLearner:
     """n-step Double-Q over replayed macro windows.
 
-    ``forward`` must run one collated snapshot through a model and return
-    ``(q_values_1d, next_recurrent_state)``; ``initial_state`` returns the
-    domain's initial recurrent state.  Injecting these keeps the learner
-    independent from any concrete model class (§7 ownership).
+    ``forward_online`` is the *training* forward contract: during the learning
+    suffix it must return an attached recurrent state so later TD losses can
+    train earlier memory writes.  Collector/inference callbacks may detach,
+    but must not be reused here. ``forward_target`` is an inference contract
+    and must be deterministic (for example, a module in eval mode); the
+    caller can enforce that with ``target_evaluation_context``. ``initial_state``
+    returns the domain's initial recurrent state. Injecting these keeps the
+    learner independent from any concrete model class (§7 ownership).
     """
 
     def __init__(
@@ -104,6 +109,7 @@ class MacroQLearner:
         forward_target_batch: (
             Callable[[Sequence[Any], Any], tuple[Tensor, Any]] | None
         ) = None,
+        target_evaluation_context: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         self.config = config or MacroQConfig()
         self.forward_online = forward_online
@@ -117,12 +123,29 @@ class MacroQLearner:
         # (time stays sequential for the recurrent chain).
         self.forward_online_batch = forward_online_batch
         self.forward_target_batch = forward_target_batch
+        self.target_evaluation_context = target_evaluation_context
         parameters = list(online_parameters)
         if not parameters:
             raise ValueError("macro Q learner requires trainable parameters")
         self.optimizer = torch.optim.Adam(parameters, lr=self.config.learning_rate)
         self._parameters = parameters
         self.metrics = MacroQMetrics()
+
+    @staticmethod
+    def _require_attached_recurrent_state(state: Any) -> None:
+        """Reject an inference callback accidentally wired into the learner.
+
+        The production recurrent state is a Tensor. Non-tensor state is left
+        to lightweight test doubles, but a Tensor learning state must retain
+        autograd history across the suffix.
+        """
+
+        if isinstance(state, Tensor) and not state.requires_grad:
+            raise RuntimeError(
+                "forward_online detached the recurrent state inside the learning "
+                "suffix; use a training forward callback and detach only at the "
+                "burn-in boundary"
+            )
 
     def _window_values(
         self,
@@ -134,18 +157,29 @@ class MacroQLearner:
         target_hidden = self.initial_state()
         with torch.no_grad():
             for step in steps[window.start : begin]:
+                if step.recurrent_reset:
+                    hidden = self.initial_state()
                 _, hidden = self.forward_online(step, hidden)
+        with torch.no_grad(), self.target_evaluation_context():
+            for step in steps[window.start : begin]:
+                if step.recurrent_reset:
+                    target_hidden = self.initial_state()
                 _, target_hidden = self.forward_target(step, target_hidden)
 
         executed_q: list[Tensor] = []
         online_argmax: list[int] = []
         target_values: list[float] = []
         learn_steps = list(steps[begin:end])
-        for step in learn_steps:
+        for index, step in enumerate(learn_steps):
+            if step.recurrent_reset:
+                hidden = self.initial_state()
+                target_hidden = self.initial_state()
             q_online, hidden = self.forward_online(step, hidden)
-            with torch.no_grad():
+            if index + 1 < len(learn_steps):
+                self._require_attached_recurrent_state(hidden)
+            with torch.no_grad(), self.target_evaluation_context():
                 q_target, target_hidden = self.forward_target(step, target_hidden)
-            mask = torch.as_tensor(
+            mask = torch.tensor(
                 step.snapshot.action_mask,
                 dtype=torch.bool,
                 device=q_online.device,
@@ -164,10 +198,14 @@ class MacroQLearner:
         extension_value = 0.0
         if end < len(steps):
             extension_step = steps[end]
+            if extension_step.recurrent_reset:
+                hidden = self.initial_state()
+                target_hidden = self.initial_state()
             with torch.no_grad():
                 q_online_ext, _ = self.forward_online(extension_step, hidden)
+            with torch.no_grad(), self.target_evaluation_context():
                 q_target_ext, _ = self.forward_target(extension_step, target_hidden)
-                extension_mask = torch.as_tensor(
+                extension_mask = torch.tensor(
                     extension_step.snapshot.action_mask,
                     dtype=torch.bool,
                     device=q_online_ext.device,
@@ -201,10 +239,11 @@ class MacroQLearner:
         """Lockstep-batched equivalent of ``_window_values`` for all windows.
 
         Time stays sequential (recurrent chain); the batch dimension carries
-        one row per window. The online stream keeps gradient through burn-in
-        (stored-state BPTT); the target stream runs fully detached. Window
-        tails bootstrap from their extension step exactly like the
-        sequential path.
+        one row per window. Episode-prefix burn-in reconstructs state without
+        gradients, then the complete online learning suffix keeps BPTT. The
+        target stream runs under no-grad and its deterministic-evaluation
+        context. Window tails bootstrap from their extension step exactly like
+        the sequential path.
         """
 
         assert self.forward_online_batch is not None
@@ -232,60 +271,91 @@ class MacroQLearner:
         ]
         hiddens: list[Tensor | None] = [None] * len(infos)
         target_hiddens: list[Tensor | None] = [None] * len(infos)
+
+        def step_at(row: int, offset: int) -> MacroStep:
+            info = infos[row]
+            step = (
+                info["steps"][offset]
+                if offset < len(info["steps"])
+                else info["extension"]
+            )
+            if not isinstance(step, MacroStep):
+                raise RuntimeError("macro replay window has no extension step")
+            return step
+
         for offset in range(max(total_lengths)):
             rows = [row for row, total in enumerate(total_lengths) if offset < total]
-            snapshots = []
             for row in rows:
-                info = infos[row]
-                step = (
-                    info["steps"][offset]
-                    if offset < len(info["steps"])
-                    else info["extension"]
+                if step_at(row, offset).recurrent_reset:
+                    hiddens[row] = self.initial_state()
+                    target_hiddens[row] = self.initial_state()
+
+            # A lockstep batch can straddle an encounter boundary for only a
+            # subset of rows.  Split solely on initial-vs-materialized state;
+            # this preserves batching without fabricating a shared memory.
+            groups: dict[tuple[bool, bool], list[int]] = {}
+            for row in rows:
+                key = (hiddens[row] is None, target_hiddens[row] is None)
+                groups.setdefault(key, []).append(row)
+
+            for (online_is_none, target_is_none), group_rows in groups.items():
+                snapshots = [step_at(row, offset).snapshot for row in group_rows]
+                online_hidden = (
+                    None
+                    if online_is_none
+                    else torch.cat(
+                        [hiddens[row] for row in group_rows], dim=0  # type: ignore[misc]
+                    )
                 )
-                snapshots.append(step.snapshot)
-            online_hidden = (
-                None
-                if hiddens[rows[0]] is None
-                else torch.cat([hiddens[row] for row in rows], dim=0)  # type: ignore[misc]
-            )
-            target_hidden = (
-                None
-                if target_hiddens[rows[0]] is None
-                else torch.cat([target_hiddens[row] for row in rows], dim=0)  # type: ignore[misc]
-            )
-            q_online, next_online = self.forward_online_batch(snapshots, online_hidden)
-            with torch.no_grad():
-                q_target, next_target = self.forward_target_batch(
-                    snapshots, target_hidden
+                target_hidden = (
+                    None
+                    if target_is_none
+                    else torch.cat(
+                        [target_hiddens[row] for row in group_rows], dim=0  # type: ignore[misc]
+                    )
                 )
-            for index, row in enumerate(rows):
-                info = infos[row]
-                hiddens[row] = next_online[index : index + 1]
-                target_hiddens[row] = next_target[index : index + 1]
-                if offset < info["burn"]:
-                    continue
-                step = (
-                    info["steps"][offset]
-                    if offset < len(info["steps"])
-                    else info["extension"]
+                q_online, next_online = self.forward_online_batch(
+                    snapshots, online_hidden
                 )
-                mask = torch.zeros(
-                    q_online.shape[-1], dtype=torch.bool, device=q_online.device
-                )
-                count = len(step.snapshot.action_mask)
-                mask[:count] = torch.as_tensor(
-                    step.snapshot.action_mask,
-                    dtype=torch.bool,
-                    device=q_online.device,
-                )
-                masked = q_online[index].masked_fill(~mask, float("-inf"))
-                argmax_index = int(masked.detach().argmax().item())
-                value = float(q_target[index][argmax_index].item())
-                if offset < len(info["steps"]):
-                    info["executed_q"].append(q_online[index][step.action_index])
-                    info["target_values"].append(value)
-                else:
-                    info["extension_value"] = value
+                with torch.no_grad(), self.target_evaluation_context():
+                    q_target, next_target = self.forward_target_batch(
+                        snapshots, target_hidden
+                    )
+                for index, row in enumerate(group_rows):
+                    info = infos[row]
+                    next_online_row = next_online[index : index + 1]
+                    if offset < info["burn"]:
+                        # Prefix reconstruction is outside the BPTT suffix.
+                        hiddens[row] = next_online_row.detach()
+                    else:
+                        learn_offset = offset - info["burn"]
+                        learn_count = len(info["steps"]) - info["burn"]
+                        if 0 <= learn_offset < learn_count - 1:
+                            self._require_attached_recurrent_state(next_online_row)
+                        hiddens[row] = next_online_row
+                    target_hiddens[row] = next_target[index : index + 1]
+                    if offset < info["burn"]:
+                        continue
+                    step = step_at(row, offset)
+                    mask = torch.zeros(
+                        q_online.shape[-1],
+                        dtype=torch.bool,
+                        device=q_online.device,
+                    )
+                    count = len(step.snapshot.action_mask)
+                    mask[:count] = torch.tensor(
+                        step.snapshot.action_mask,
+                        dtype=torch.bool,
+                        device=q_online.device,
+                    )
+                    masked = q_online[index].masked_fill(~mask, float("-inf"))
+                    argmax_index = int(masked.detach().argmax().item())
+                    value = float(q_target[index][argmax_index].item())
+                    if offset < len(info["steps"]):
+                        info["executed_q"].append(q_online[index][step.action_index])
+                        info["target_values"].append(value)
+                    else:
+                        info["extension_value"] = value
         results = []
         for info in infos:
             learn_steps = info["steps"][info["burn"] :]
@@ -307,6 +377,45 @@ class MacroQLearner:
             )
         return results
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return optimizer and schedule/metric state for exact continuation.
+
+        Online and target network tensors remain owned by the entry point; this
+        payload is the learner-owned complement to those model states.
+        """
+
+        return {
+            "version": MACRO_Q_LEARNER_VERSION,
+            "config": asdict(self.config),
+            "optimizer": self.optimizer.state_dict(),
+            "metrics": self.metrics.as_mapping(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a learner state produced by :meth:`state_dict`."""
+
+        if state.get("version") != MACRO_Q_LEARNER_VERSION:
+            raise ValueError("macro learner state version differs")
+        if state.get("config") != asdict(self.config):
+            raise ValueError("macro learner config differs")
+        metrics = state.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError("macro learner metrics are missing")
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.metrics = MacroQMetrics(
+            updates=int(metrics.get("updates", 0)),
+            windows_trained=int(metrics.get("windows_trained", 0)),
+            steps_trained=int(metrics.get("steps_trained", 0)),
+            loss=float(metrics.get("loss", 0.0)),
+            td_error_mean=float(metrics.get("td_error_mean", 0.0)),
+            td_error_max=float(metrics.get("td_error_max", 0.0)),
+            target_syncs=int(metrics.get("target_syncs", 0)),
+            executed_counts={
+                str(key): int(value)
+                for key, value in dict(metrics.get("executed_counts", {})).items()
+            },
+        )
+
     def update(self) -> dict[str, Any]:
         windows = self.replay.sample(self.config.sample_windows)
         if not windows:
@@ -318,9 +427,7 @@ class MacroQLearner:
             window_values = self._batched_window_values(windows)
         else:
             window_values = [self._window_values(window) for window in windows]
-        for window, (executed_q, rewards, discounts, bootstraps, learn_steps) in zip(
-            windows, window_values, strict=True
-        ):
+        for executed_q, rewards, discounts, bootstraps, learn_steps in window_values:
             targets = torch.as_tensor(
                 n_step_targets(
                     rewards,
@@ -341,7 +448,6 @@ class MacroQLearner:
             )
             window_td = float(td.detach().abs().mean().item())
             td_abs.append(window_td)
-            self.replay.update_priority(window.window_id, window_td)
             steps_trained += len(learn_steps)
             for step in learn_steps:
                 key = f"{step.surface}:{step.branch}"

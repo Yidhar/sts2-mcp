@@ -1,7 +1,7 @@
 """Macro-domain semantic transitions for the isolated candidate-Q learner.
 
 One :class:`MacroStep` is one meaningful macro decision under the semantic
-decision graph: the encoded decision snapshot, the executed candidate index,
+decision graph: the semantic-candidate snapshot, the executed semantic index,
 the factual reward accumulated until the NEXT macro decision (executor suffix
 and any combat segment folded in, per the stage-2 bridge rule: realized
 returns, no learned bridge), and the durable-floor clock discount linking the
@@ -14,15 +14,23 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v1"
+MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v3"
 
 
 @dataclass(frozen=True, slots=True)
 class MacroStep:
+    """One transition on exactly the candidate surface scored by authority.
+
+    ``snapshot.action_mask`` is the semantic surface (for example
+    ``Rest``, ``Smith(A)``, ``Smith(B)``), not the native parent/picker union.
+    Consequently collection, replay bootstrap and learner gather all index
+    the same action set.
+    """
+
     snapshot: EncodedDecisionSnapshot
     action_index: int
     reward: float
@@ -30,6 +38,8 @@ class MacroStep:
     terminal: bool
     surface: str
     branch: str
+    control_domain: Literal["macro", "combat"]
+    recurrent_reset: bool = False
     target_key: str | None = None
     behavior_epsilon: float = 0.0
     version: str = MACRO_TRANSITION_CONTRACT_VERSION
@@ -54,6 +64,10 @@ class MacroStep:
             raise ValueError("terminal macro steps never bootstrap")
         if not self.surface or not self.branch:
             raise ValueError("macro step requires surface and branch labels")
+        if self.control_domain not in {"macro", "combat"}:
+            raise ValueError("macro step control_domain must be macro or combat")
+        if not isinstance(self.recurrent_reset, bool):
+            raise TypeError("macro step recurrent_reset must be a boolean")
         if not math.isfinite(self.behavior_epsilon) or not 0.0 <= self.behavior_epsilon <= 1.0:
             raise ValueError("macro step behavior_epsilon must be in [0, 1]")
 
@@ -74,6 +88,13 @@ class MacroEpisode:
         for step in self.steps[:-1]:
             if step.terminal:
                 raise ValueError("terminal macro step must be the final step")
+        domains = {step.control_domain for step in self.steps}
+        if len(domains) != 1:
+            raise ValueError("one replay episode may contain only one control domain")
+
+    @property
+    def control_domain(self) -> Literal["macro", "combat"]:
+        return self.steps[0].control_domain
 
     @property
     def executed_counts(self) -> dict[tuple[str, str], int]:
