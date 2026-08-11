@@ -154,7 +154,10 @@ def main() -> int:
                         continue  # partial write: retry next scan
                     path.unlink(missing_ok=True)
                     if isinstance(episode, MacroEpisode):
-                        replay.put(episode)
+                        try:
+                            replay.put(episode)
+                        except ValueError:
+                            continue  # duplicate id from a stale spool file
                         fresh += 1
                 if not fresh:
                     continue

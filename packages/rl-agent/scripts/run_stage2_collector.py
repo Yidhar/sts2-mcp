@@ -132,6 +132,9 @@ def main() -> int:
                 pass  # mid-write read: retry on the next reload tick
 
         maybe_reload()
+        # Episode ids must be unique across collector restarts sharing one
+        # spool: the replay contract refuses duplicate ids.
+        run_nonce = uuid.uuid4().hex[:8]
         authority = MacroCollectionAuthority(
             forward_q=_forward_factory(macro_model, resources.encoder, resources.device),
             initial_state=lambda: None,
@@ -151,7 +154,7 @@ def main() -> int:
                     record=False,
                 )
                 macro_episode = authority.finish_episode(
-                    f"spool-{args.seed}-{episode_index:05d}"
+                    f"spool-{args.seed}-{run_nonce}-{episode_index:05d}"
                 )
                 if macro_episode is not None:
                     temporary = spool / f".tmp-{uuid.uuid4().hex}"
