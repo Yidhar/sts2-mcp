@@ -33,7 +33,7 @@ from typing import Any
 import torch
 
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.macro import MacroCollectionAuthority
+from sts2_rl.macro import MacroCollectionAuthority, load_trunk_state
 from sts2_rl.training import build_training_resources, load_training_config
 from sts2_rl.training.seeding import held_out_evaluation_seeds
 
@@ -64,13 +64,7 @@ def _load_champion(resources: Any, champion_dir: Path) -> None:
         weights_only=True,
     )
     for target in (resources.model, resources.collector_model):
-        result = target.load_state_dict(champion_state, strict=False)
-        unexpected = [key for key in result.unexpected_keys if "liveness" not in key]
-        if result.missing_keys or unexpected:
-            raise SystemExit(
-                "champion checkpoint drift beyond the retired liveness heads: "
-                f"missing={result.missing_keys} unexpected={unexpected}"
-            )
+        load_trunk_state(target, dict(champion_state))
     for parameter in resources.model.parameters():
         parameter.requires_grad_(False)
 
@@ -186,7 +180,7 @@ def main() -> int:
             map_location=resources.device,
             weights_only=True,
         )
-        macro_model.load_state_dict(macro_state)
+        load_trunk_state(macro_model, dict(macro_state))
         for parameter in macro_model.parameters():
             parameter.requires_grad_(False)
         macro_model.eval()

@@ -32,6 +32,7 @@ from typing import Any
 
 import torch
 
+from sts2_rl.macro import load_trunk_state
 from sts2_rl.semantics.forward import forward_decision
 from sts2_rl.training import build_training_resources, load_training_config
 
@@ -111,14 +112,16 @@ def main() -> int:
             map_location=resources.device,
             weights_only=True,
         )
-        result = resources.model.load_state_dict(champion_state, strict=False)
-        unexpected = [key for key in result.unexpected_keys if "liveness" not in key]
-        if result.missing_keys or unexpected:
-            raise SystemExit("champion checkpoint drift")
+        load_trunk_state(resources.model, dict(champion_state))
 
         macro_model = copy.deepcopy(resources.model)
-        macro_model.load_state_dict(
-            torch.load(Path(args.macro), map_location=resources.device, weights_only=True)
+        load_trunk_state(
+            macro_model,
+            dict(
+                torch.load(
+                    Path(args.macro), map_location=resources.device, weights_only=True
+                )
+            ),
         )
         macro_model.eval()
         device = resources.device

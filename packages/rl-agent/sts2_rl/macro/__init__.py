@@ -15,6 +15,11 @@ from .learner import (
     MacroQLearner,
     MacroQMetrics,
 )
+from .loading import (
+    MACRO_LOADING_CONTRACT_VERSION,
+    TOLERATED_HEAD_GROUPS,
+    load_trunk_state,
+)
 from .replay import (
     MACRO_REPLAY_CONTRACT_VERSION,
     MacroSequenceReplay,
@@ -30,9 +35,11 @@ from .transitions import (
 
 __all__ = [
     "MACRO_AUTHORITY_VERSION",
+    "MACRO_LOADING_CONTRACT_VERSION",
     "MACRO_Q_LEARNER_VERSION",
     "MACRO_REPLAY_CONTRACT_VERSION",
     "MACRO_TRANSITION_CONTRACT_VERSION",
+    "TOLERATED_HEAD_GROUPS",
     "MacroCollectionAuthority",
     "MacroEpisode",
     "MacroQConfig",
@@ -41,6 +48,7 @@ __all__ = [
     "MacroSequenceReplay",
     "MacroStep",
     "MacroWindow",
+    "load_trunk_state",
     "n_step_targets",
     "summarize_counts",
 ]

@@ -1358,7 +1358,15 @@ class RecurrentCandidateModel(nn.Module):
                 cfg.d_model,
                 SELECTION_DELTA_COUNT,
             )
-            self.transaction_q_head: nn.Module | None = self._scalar_head(cfg.d_model)
+            # The candidate-Q head reads the per-candidate features TOGETHER
+            # with the same state features the value heads read. The additive
+            # memory_to_candidate fusion alone attenuates slow numeric state
+            # channels (measured: HP moves policy_features by ~4e-5 of their
+            # scale while the value pathway learns HP richly), and Q(s, a)
+            # must be able to condition on s directly.
+            self.transaction_q_head: nn.Module | None = self._scalar_head(
+                cfg.d_model + cfg.recurrent_hidden_dim
+            )
             self.macro_surface_candidate_embedding: nn.Embedding | None = (
                 nn.Embedding(MACRO_ECONOMIC_SURFACE_COUNT, cfg.d_model)
             )
@@ -1795,7 +1803,12 @@ class RecurrentCandidateModel(nn.Module):
                 raise RuntimeError("transaction head configuration is inconsistent")
             candidate_effect_logits = self.candidate_effect_head(policy_features)
             selection_delta_logits = self.selection_delta_head(policy_features)
-            transaction_q_values = self.transaction_q_head(policy_features).squeeze(-1)
+            transaction_q_state = next_recurrent_state.unsqueeze(1).expand(
+                -1, policy_features.shape[1], -1
+            )
+            transaction_q_values = self.transaction_q_head(
+                torch.cat([policy_features, transaction_q_state], dim=-1)
+            ).squeeze(-1)
             candidate_effect_logits = candidate_effect_logits.masked_fill(
                 ~mask.unsqueeze(-1),
                 0.0,

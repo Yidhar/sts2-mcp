@@ -239,3 +239,41 @@ def test_window_tail_bootstraps_from_the_successor_beyond_the_window() -> None:
     # Both transitions bootstrap from a successor whose masked argmax is
     # candidate 1 with target value 1.0 — including the window tail.
     assert bootstraps == (1.0, 1.0)
+
+
+def test_trunk_loading_inherits_compatible_and_refuses_drift() -> None:
+    """load_trunk_state inherits shape-compatible tensors, restarts tolerated
+    head groups on shape change, and refuses trunk drift."""
+
+    from sts2_rl.macro import load_trunk_state
+
+    trunk = torch.nn.Linear(4, 4)
+    head_old = torch.nn.Linear(4, 1)
+    head_new = torch.nn.Linear(6, 1)
+
+    class _Old(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trunk = trunk
+            self.transaction_q_head = head_old
+
+    class _New(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trunk = torch.nn.Linear(4, 4)
+            self.transaction_q_head = head_new
+
+    old_state = _Old().state_dict()
+    new_model = _New()
+    report = load_trunk_state(new_model, dict(old_state))
+    assert any("transaction_q_head" in key for key in report["dropped"])
+    assert torch.equal(new_model.trunk.weight, trunk.weight)
+
+    class _Drifted(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trunk = torch.nn.Linear(5, 5)  # trunk shape drift: refuse
+            self.transaction_q_head = torch.nn.Linear(6, 1)
+
+    with pytest.raises(RuntimeError, match="drift beyond tolerated"):
+        load_trunk_state(_Drifted(), dict(old_state))
