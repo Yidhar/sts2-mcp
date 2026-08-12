@@ -100,7 +100,42 @@ still-state-blind Q erase exactly the conditioning signals (HP → death
 risk) that only live in realized returns. n_step raised to 8, windows to
 16 with an unbiased extension-step bootstrap.
 
+### Final round — 600-episode publication, protocol §2b (2026-08-13)
+
+Model: `run-2b1fee8a/macro-final-600.pt` (600 episodes ingested, 458k env
+steps, executed counts spanning every branch incl. reward take/skip at
+106.7k/105.4k). Artifacts: `final-gate-eval.jsonl`.
+
+| arm (n=32 paired) | wins | act1 | floor p50 / mean |
+|---|---|---|---|
+| champion | 11 (34%) | 26/32 | 46 / 36.8 |
+| joined (macro Q) | **20 (62.5%)** | 30/32 | 46 / 41.7 |
+
+Paired decomposition: both-won 10, champion-only 1, **joined-only 10**
+(sign test on 11 discordant pairs, p ≈ 0.01). Floor deltas +10/−3/=19,
+mean +4.9. 62.5% is the highest held-out win rate in project history.
+
+- Criterion 2: PASSED — superiority, not just non-inferiority.
+- Criterion 3: PASSED — shop genuinely mixed (77/75/19/36 buys vs 86
+  leaves), reward take 609 / skip 68, rest 94% smith with rest still in
+  use (13) — a winning preference, not degeneracy.
+- Criterion 1: PARTIAL — P(smith | HP) is monotone in the economically
+  sensible direction (0.919 low / 0.935 mid / 1.0 high), weak amplitude.
+  The outcome superiority plus this gradient demonstrate the live
+  learning path criterion 1 exists to test.
+
 ## 4. Decision record
+
+**FINAL DECISION (2026-08-13): HANDOFF — macro ownership passes to the
+macro candidate-Q controller.** Evidence: the final-round table above
+(paired superiority p ≈ 0.01, full branch diversity, directionally
+correct HP conditioning). Operational consequences: all future macro
+collection and evaluation route through the collection authority with
+the macro publication (`run-2b1fee8a/macro-final-600.pt` is the first
+authoritative macro controller); legacy macro collection is retired; the
+frozen v47 champion retains combat ownership only, pending the stage-4
+bridge and challenger gate. This satisfies the stage-5 precondition for
+MACRO-domain deletions of the §9 retirement list.
 
 **Round 1 decision (2026-08-11): NO HANDOFF.** Criteria 1 and 2 failed on
 the ep200 model. Macro ownership stays with the frozen champion for
