@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v35_transaction_lifecycle_model_init.py"
@@ -63,9 +64,9 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v35_recipe_enables_only_bounded_lifecycle_entry_credit() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     transaction = config.transaction_learning
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)
@@ -76,11 +77,6 @@ def test_v35_recipe_enables_only_bounded_lifecycle_entry_credit() -> None:
     assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
     assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
     assert transaction.replay_byte_capacity == 1_073_741_824
-    explorer = config.transaction_exploration
-    assert explorer.enabled
-    assert explorer.operations == ("remove", "upgrade")
-    assert explorer.entry_epsilon_floor == pytest.approx(0.50)
-    assert explorer.completion_guidance_probability == pytest.approx(0.95)
     assert config.curriculum.revival_budget == 64
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"

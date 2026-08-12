@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v33_stability_recovery_model_init.py"
@@ -55,12 +56,10 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
-    assert not config.transaction_exploration.enabled
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.curriculum.revival_budget == 64
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)
     assert config.optimization.entropy_weight_end == pytest.approx(0.004)
     assert config.optimization.entropy_breaker == "one-hot-v1"
     assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)

@@ -10,7 +10,6 @@ import torch
 from sts2_rl.contracts import StepRequest
 from sts2_rl.training import (
     FailureCreditConfig,
-    TransactionExplorationConfig,
     TransactionLearningConfig,
     TransactionLifecycleOutcome,
     TransactionPolicyTarget,
@@ -20,12 +19,7 @@ from sts2_rl.training import (
     summarize_evaluation,
     two_sided_policy_support_loss,
 )
-from sts2_rl.training.collector import (
-    _branch_balanced_epsilon_behavior,
-    _deck_card_removal_committed,
-    _transaction_completion_guided_behavior,
-    _transaction_entry_exploration_branch_ids,
-)
+from sts2_rl.training.collector import _deck_card_removal_committed
 from sts2_rl.training.failure_credit import (
     DirectPolicyTarget,
     FailureOutcome,
@@ -39,7 +33,7 @@ from tests.test_v33_recovery_semantics import (
 )
 
 
-def _exploration_config(*, max_steps: int):
+def _shadow_credit_config(*, max_steps: int):
     base = _recovery_config(max_steps=max_steps, repeat_threshold=8)
     return replace(
         base,
@@ -48,17 +42,11 @@ def _exploration_config(*, max_steps: int):
             burn_in_steps=1,
             maximum_context_steps=16,
         ),
-        transaction_exploration=TransactionExplorationConfig(
-            enabled=True,
-            operations=("upgrade", "remove"),
-            entry_epsilon_floor=0.50,
-            completion_guidance_probability=0.95,
-        ),
     )
 
 
 def _lifecycle_learning_config(*, max_steps: int):
-    base = _exploration_config(max_steps=max_steps)
+    base = _shadow_credit_config(max_steps=max_steps)
     return replace(
         base,
         transaction_learning=TransactionLearningConfig(
@@ -314,61 +302,6 @@ class _RestHealSuccessBackend(TerminalWithoutObservationFlagsBackend):
         }
 
 
-def test_transaction_entry_explorer_removes_shop_candidate_cardinality_bias() -> None:
-    actions = (
-        {
-            "model_action_kind": "shop",
-            "item": {"category": "card", "index": 0},
-        },
-        {
-            "model_action_kind": "shop",
-            "item": {"category": "card_removal", "index": 1},
-        },
-        {
-            "model_action_kind": "shop",
-            "model_action_variant": "leave",
-        },
-    )
-    branch_ids, targeted = _transaction_entry_exploration_branch_ids(
-        policy_branch_ids=np.asarray([7, 7, 7], dtype=np.int64),
-        semantic_actions=actions,
-        enabled_operations=frozenset({"remove"}),
-    )
-    assert targeted
-    assert branch_ids.tolist() == [7, 8, 7]
-    behavior = _branch_balanced_epsilon_behavior(
-        policy=np.asarray([1 / 3, 1 / 3, 1 / 3], dtype=np.float32),
-        valid=np.asarray([True, True, True], dtype=np.bool_),
-        policy_branch_ids=branch_ids,
-        epsilon=1.0,
-    )
-    assert behavior[1] == pytest.approx(0.5)
-    assert behavior[[0, 2]].sum() == pytest.approx(0.5)
-
-
-def test_completion_guidance_preserves_support_and_learned_card_ranking() -> None:
-    actions = (
-        {"model_action_kind": "card_selection", "selection_operation": "select"},
-        {"model_action_kind": "card_selection", "selection_operation": "select"},
-        {"model_action_kind": "card_selection", "selection_operation": "cancel_prompt"},
-    )
-    policy = np.asarray([0.2, 0.6, 0.2], dtype=np.float32)
-    base = np.asarray([0.3, 0.3, 0.4], dtype=np.float64)
-    behavior, forward, fallback = _transaction_completion_guided_behavior(
-        policy=policy,
-        valid=np.asarray([True, True, True], dtype=np.bool_),
-        semantic_actions=actions,
-        base_behavior=base,
-        operation="remove",
-        guidance_probability=0.90,
-    )
-    assert not fallback
-    assert forward == frozenset({0, 1})
-    assert behavior[2] > 0.0  # Cancel remains in behavior support for V-trace.
-    guided_component = (behavior[:2] - 0.10 * base[:2]) / 0.90
-    assert guided_component[1] / guided_component[0] == pytest.approx(3.0)
-
-
 def test_card_removal_commit_requires_exact_authoritative_deck_decrease() -> None:
     before = (("CARD.DEFEND", 1, 0), ("CARD.STRIKE", 1, 0))
 
@@ -473,14 +406,14 @@ def test_successful_rest_emits_symmetric_factual_lifecycle_and_q_label() -> None
         resources.close()
 
 
-def test_guided_forge_completes_and_keeps_verified_positive_credit() -> None:
-    config = _exploration_config(max_steps=8)
+def test_forge_completes_and_keeps_verified_positive_credit() -> None:
+    config = _shadow_credit_config(max_steps=8)
     resources = build_training_resources(
         config,
         backend=_RestForgeSelectionSuccessBackend(),
     )
     try:
-        resources.collector.bind_failure_credit_run_id("v34-guided-forge")
+        resources.collector.bind_failure_credit_run_id("v34-forge")
         resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
         with torch.no_grad():
             for parameter in resources.model.parameters():
@@ -495,10 +428,6 @@ def test_guided_forge_completes_and_keeps_verified_positive_credit() -> None:
 
     assert episode.metrics.run_won
     assert episode.metrics.forge_selection_transactions_completed == 1
-    assert episode.metrics.targeted_transaction_entry_exploration_decisions == 1
-    assert episode.metrics.transaction_completion_guidance_decisions == 2
-    assert episode.metrics.transaction_completion_forward_decisions == 2
-    assert episode.metrics.transaction_completion_guidance_fallbacks == 0
     assert any(
         target.target is DirectPolicyTarget.PREFER
         for record in episode.failure_credit_records
@@ -507,12 +436,12 @@ def test_guided_forge_completes_and_keeps_verified_positive_credit() -> None:
     )
 
 
-def test_guided_shop_removal_requires_real_deck_mutation_and_reports_it() -> None:
-    config = _exploration_config(max_steps=8)
+def test_shop_removal_requires_real_deck_mutation_and_reports_it() -> None:
+    config = _shadow_credit_config(max_steps=8)
     backend = _ShopRemovalSuccessBackend()
     resources = build_training_resources(config, backend=backend)
     try:
-        resources.collector.bind_failure_credit_run_id("v34-guided-shop-removal")
+        resources.collector.bind_failure_credit_run_id("v34-shop-removal")
         resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
         with torch.no_grad():
             for parameter in resources.model.parameters():
@@ -536,35 +465,11 @@ def test_guided_shop_removal_requires_real_deck_mutation_and_reports_it() -> Non
     assert episode.metrics.shop_card_removal_transactions_completed == 1
     assert episode.metrics.shop_card_removal_transactions_cancelled == 0
     assert episode.metrics.shop_card_removal_transactions_unresolved == 0
-    assert episode.metrics.targeted_transaction_entry_exploration_decisions == 1
-    assert episode.metrics.transaction_completion_guidance_decisions == 2
-    assert episode.metrics.transaction_completion_forward_decisions == 2
 
     summary = summarize_evaluation([episode.metrics], objective="run")
     assert summary["shop_card_removal_transactions_started"] == 1
     assert summary["shop_card_removal_transactions_committed"] == 1
     assert summary["shop_card_removal_transaction_completion_rate"] == pytest.approx(1.0)
-
-
-def test_transaction_exploration_never_changes_deterministic_evaluation() -> None:
-    config = _exploration_config(max_steps=8)
-    resources = build_training_resources(config, backend=_ShopRemovalSuccessBackend())
-    try:
-        with torch.no_grad():
-            for parameter in resources.model.parameters():
-                parameter.zero_()
-        episode = resources.collector.collect_episode(
-            epsilon=1.0,
-            deterministic=True,
-            record=False,
-            maximum_steps=1,
-        )
-    finally:
-        resources.close()
-
-    assert episode.metrics.targeted_transaction_entry_exploration_decisions == 0
-    assert episode.metrics.transaction_completion_guidance_decisions == 0
-    assert episode.metrics.transaction_completion_forward_decisions == 0
 
 
 def test_one_sided_entry_support_recovers_from_softmax_absorption_and_stops_at_floor() -> None:
@@ -928,23 +833,6 @@ def test_entry_classifier_recognizes_reviewed_macro_economy_operations() -> None
         )
         == "shop_purchase"
     )
-
-
-def test_exploration_config_accepts_single_decision_operations() -> None:
-    config = TransactionExplorationConfig(
-        enabled=True,
-        operations=("reward_skip", "relic_purchase"),
-        entry_epsilon_floor=0.15,
-        completion_guidance_probability=0.0,
-    )
-    assert config.operations == ("relic_purchase", "reward_skip")
-    with pytest.raises(ValueError, match="reviewed"):
-        TransactionExplorationConfig(
-            enabled=True,
-            operations=("buy_everything",),
-            entry_epsilon_floor=0.15,
-            completion_guidance_probability=0.0,
-        )
 
 
 def test_selection_step_q_uses_lifecycle_option_return() -> None:

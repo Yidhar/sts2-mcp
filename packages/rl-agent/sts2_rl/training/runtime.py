@@ -286,10 +286,6 @@ def summarize_evaluation(
             "shop_card_removal_transactions_cancelled": 0,
             "shop_card_removal_transactions_unresolved": 0,
             "shop_card_removal_transaction_completion_rate": 0.0,
-            "targeted_transaction_entry_exploration_decisions": 0,
-            "transaction_completion_guidance_decisions": 0,
-            "transaction_completion_forward_decisions": 0,
-            "transaction_completion_guidance_fallbacks": 0,
             "mean_policy_top1_top2_logit_margin": 0.0,
             "maximum_policy_top1_top2_logit_margin": 0.0,
             "mean_shaping_reward_per_max_floor": 0.0,
@@ -474,18 +470,6 @@ def summarize_evaluation(
             removal_transactions_completed / removal_transactions_started
             if removal_transactions_started
             else 0.0
-        ),
-        "targeted_transaction_entry_exploration_decisions": sum(
-            item.targeted_transaction_entry_exploration_decisions for item in episodes
-        ),
-        "transaction_completion_guidance_decisions": sum(
-            item.transaction_completion_guidance_decisions for item in episodes
-        ),
-        "transaction_completion_forward_decisions": sum(
-            item.transaction_completion_forward_decisions for item in episodes
-        ),
-        "transaction_completion_guidance_fallbacks": sum(
-            item.transaction_completion_guidance_fallbacks for item in episodes
         ),
         "mean_policy_top1_top2_logit_margin": statistics.fmean(
             item.policy_top1_top2_logit_margin_mean for item in episodes
@@ -782,15 +766,6 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
                 config.transaction_learning.lifecycle_smdp_horizon
             ),
             "pairwise_ranking_weight": (config.transaction_learning.pairwise_ranking_weight),
-        },
-        "transaction_exploration": {
-            "enabled": config.transaction_exploration.enabled,
-            "operations": list(config.transaction_exploration.operations),
-            "entry_epsilon_floor": (config.transaction_exploration.entry_epsilon_floor),
-            "completion_guidance_probability": (
-                config.transaction_exploration.completion_guidance_probability
-            ),
-            "deterministic_evaluation": "unassisted",
         },
         "failure_credit": {
             "mode": config.failure_credit.mode,

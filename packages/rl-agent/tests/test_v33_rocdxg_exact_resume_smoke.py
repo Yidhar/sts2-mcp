@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts/launch_v33_rocdxg_exact_resume_smoke.py"
@@ -37,8 +37,8 @@ def _paths(tmp_path: Path) -> Any:
 
 
 def test_smoke_changes_only_mutable_runtime_configuration() -> None:
-    source = load_training_config(profile="preheat", config_path=SOURCE_CONFIG)
-    smoke = load_training_config(profile="preheat", config_path=SMOKE_CONFIG)
+    source = load_archived_training_config(profile="preheat", config_path=SOURCE_CONFIG)
+    smoke = load_archived_training_config(profile="preheat", config_path=SMOKE_CONFIG)
 
     assert smoke.lineage_mapping() == source.lineage_mapping()
     assert smoke.runtime.total_environment_steps == launcher.TARGET_ENVIRONMENT_STEPS

@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v44_budget40_identification_model_init.py"
@@ -69,14 +70,13 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v44_changes_only_budget_and_schedule_replay_from_v43() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
-    v43 = load_training_config(profile="preheat", config_path=V43_CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
+    v43 = load_archived_training_config(profile="preheat", config_path=V43_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.optimization == v43.optimization
     assert config.rollout == v43.rollout
     assert config.transaction_learning == v43.transaction_learning
-    assert config.transaction_exploration == v43.transaction_exploration
     assert config.failure_credit == v43.failure_credit
     assert config.episodic_learning == v43.episodic_learning
     assert config.model == v43.model
@@ -87,7 +87,6 @@ def test_v44_changes_only_budget_and_schedule_replay_from_v43() -> None:
     assert config.curriculum.epsilon_start == v43.curriculum.epsilon_start
     assert config.curriculum.epsilon_end == v43.curriculum.epsilon_end
     assert config.curriculum.epsilon_decay_steps == v43.curriculum.epsilon_decay_steps
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
 
     assert v43.runtime.model_initialization_schedule_mode == "reset"
     assert config.runtime.model_initialization_schedule_mode == "inherit"

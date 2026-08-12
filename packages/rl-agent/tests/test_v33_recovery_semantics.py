@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,7 +25,6 @@ from sts2_rl.training.runtime import (
     _guard_rollback_checkpoint_prefix,
     _is_healthy_rollback_checkpoint,
 )
-from sts2_rl.training.trajectory import TrajectoryJournal
 from tests.test_v2_training_pipeline import (
     FakeCombatBackend,
     StaticEventLoopBackend,
@@ -371,49 +369,10 @@ def _recovery_config(*, max_steps: int, repeat_threshold: int):
             base.curriculum,
             epsilon_start=0.15,
             epsilon_end=0.05,
-            selection_surface_epsilon_floor=0.25,
         ),
         transaction_learning=TransactionLearningConfig(enabled=False),
         episodic_learning=replace(base.episodic_learning, enabled=True),
     )
-
-
-def test_selection_epsilon_floor_is_targeted_and_behavior_is_journaled(
-    tmp_path: Path,
-) -> None:
-    config = _recovery_config(max_steps=4, repeat_threshold=8)
-    resources = build_training_resources(
-        config,
-        backend=_RestForgeSelectionCycleBackend(),
-    )
-    journal_path = tmp_path / "selection-floor.jsonl"
-    try:
-        with torch.no_grad():
-            for parameter in resources.model.parameters():
-                parameter.zero_()
-        with TrajectoryJournal(journal_path) as journal:
-            episode = resources.collector.collect_episode(
-                epsilon=0.05,
-                deterministic=False,
-                record=False,
-                trajectory_journal=journal,
-            )
-    finally:
-        resources.close()
-
-    assert episode.metrics.targeted_selection_exploration_decisions == 4
-    assert episode.metrics.maximum_effective_collection_epsilon == pytest.approx(
-        0.25
-    )
-    decisions = [
-        json.loads(line)
-        for line in journal_path.read_text(encoding="utf-8").splitlines()
-        if json.loads(line).get("event") == "decision"
-    ]
-    assert len(decisions) == 4
-    assert all(item["targeted_selection_exploration"] is True for item in decisions)
-    assert all(item["effective_collection_epsilon"] == pytest.approx(0.25) for item in decisions)
-    assert all(math.isfinite(float(item["behavior_log_probability"])) for item in decisions)
 
 
 def test_selection_cycle_exempts_entrance_policy_without_legacy_transaction_replay() -> None:

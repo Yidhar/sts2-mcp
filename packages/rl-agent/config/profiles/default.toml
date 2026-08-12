@@ -1,4 +1,4 @@
-version = "sts2-relational-curriculum-config-v19"
+version = "sts2-relational-curriculum-config-v20"
 profile = "default"
 
 [model]
@@ -124,12 +124,6 @@ reward_objective = "run"
 epsilon_start = 0.30
 epsilon_end = 0.05
 epsilon_decay_steps = 250000
-
-[transaction_exploration]
-enabled = false
-operations = []
-entry_epsilon_floor = 0.0
-completion_guidance_probability = 0.0
 
 [runtime]
 device = "auto"

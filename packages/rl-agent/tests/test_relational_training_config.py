@@ -16,7 +16,6 @@ from sts2_rl.training import (
     RolloutConfig,
     RuntimeConfig,
     TrainingConfig,
-    TransactionExplorationConfig,
     TransactionLearningConfig,
     engine_revival_identity,
     load_training_config,
@@ -87,16 +86,13 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     default = load_training_config(profile="default")
     combat = load_training_config(profile="combat")
     preheat = load_training_config(profile="preheat")
-    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert default.model.architecture == "relational_candidate_v3"
     assert default.curriculum.reward_objective == "run"
     assert combat.curriculum.reward_objective == "combat"
     assert preheat.curriculum.mode == "native-revival-preheat"
     assert preheat.curriculum.revival_mechanism == ENGINE_REVIVAL_MECHANISM
     assert preheat.curriculum.revival_budget == -1
-    assert not default.transaction_exploration.enabled
-    assert not combat.transaction_exploration.enabled
-    assert not preheat.transaction_exploration.enabled
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
     assert preheat.transaction_learning.completion_policy_weight == 0.25
@@ -746,7 +742,6 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
-    source.pop("transaction_exploration")
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]
@@ -781,7 +776,6 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
-    source.pop("transaction_exploration")
 
     with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
@@ -791,7 +785,7 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     assert not migrated.failure_credit.shadow_enabled
 
 
-def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
+def test_v13_config_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v13"
@@ -799,15 +793,12 @@ def test_v13_transaction_exploration_migration_is_model_init_only() -> None:
     _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
-    source.pop("transaction_exploration")
 
     with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert not migrated.transaction_exploration.enabled
-    assert migrated.transaction_exploration.operations == ()
 
     transaction_learning = source["transaction_learning"]
     assert isinstance(transaction_learning, dict)
@@ -832,7 +823,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     assert migrated.version == CONFIG_VERSION
     assert migrated.transaction_learning.lifecycle_entry_support_weight == 0.0
     assert migrated.transaction_learning.lifecycle_smdp_q_weight == 0.0
-    assert migrated.transaction_exploration == TrainingConfig().transaction_exploration
 
     unexpected = TrainingConfig().to_mapping()
     _remove_v19_transaction_actor_fields(unexpected)
@@ -951,42 +941,53 @@ def test_v18_option_actor_migration_is_model_init_only() -> None:
         model_initialization_config_from_mapping(unexpected)
 
 
-def test_transaction_exploration_contract_is_versioned_and_fail_closed() -> None:
-    enabled = TransactionExplorationConfig(
-        enabled=True,
-        operations=("remove", "upgrade"),
-        entry_epsilon_floor=0.20,
-        completion_guidance_probability=0.95,
-    )
-    assert enabled.operations == ("remove", "upgrade")
-    with pytest.raises(ValueError, match=r"supports only"):
-        TransactionExplorationConfig(
-            enabled=True,
-            operations=("smith_specific_card",),
-            entry_epsilon_floor=0.20,
-            completion_guidance_probability=0.95,
-        )
-    with pytest.raises(ValueError, match=r"non-zero|zero probabilities|requires empty"):
-        TransactionExplorationConfig(entry_epsilon_floor=0.20)
-    with pytest.raises(ValueError, match=r"less than 1|0 <"):
-        TransactionExplorationConfig(
-            enabled=True,
-            operations=("upgrade",),
-            entry_epsilon_floor=0.20,
-            completion_guidance_probability=1.0,
-        )
+def test_v19_exploration_retirement_migration_is_model_init_only() -> None:
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v19"
+    # A real v19 payload carried the retired training-only exploration
+    # contract; the reviewed migration must strip it rather than reinterpret
+    # or preserve it.
+    source["transaction_exploration"] = {
+        "enabled": True,
+        "operations": ["remove", "upgrade"],
+        "entry_epsilon_floor": 0.50,
+        "completion_guidance_probability": 0.95,
+    }
+    curriculum = source["curriculum"]
+    assert isinstance(curriculum, dict)
+    curriculum["selection_surface_epsilon_floor"] = 0.25
 
-    base = load_training_config(profile="preheat")
-    with pytest.raises(ValueError, match=r"at least curriculum.epsilon_end"):
-        replace(
-            base,
-            transaction_exploration=TransactionExplorationConfig(
-                enabled=True,
-                operations=("upgrade",),
-                entry_epsilon_floor=0.05,
-                completion_guidance_probability=0.95,
-            ),
-        )
+    # Exact resume must reject a v19 payload outright (the retired table is
+    # an unknown section before the version even gets compared).
+    with pytest.raises(
+        ValueError,
+        match=r"unknown training config sections|unsupported training config version",
+    ):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    migrated_payload = migrated.to_mapping()
+    assert "transaction_exploration" not in migrated_payload
+    assert "selection_surface_epsilon_floor" not in migrated_payload["curriculum"]
+
+    # A v20 payload that still contains the retired table/key is corrupt and
+    # must fail closed on both parsing paths instead of being migrated.
+    stale_table = TrainingConfig().to_mapping()
+    stale_table["transaction_exploration"] = {"enabled": False}
+    with pytest.raises(ValueError, match=r"unknown training config sections"):
+        training_config_from_mapping(stale_table)
+    with pytest.raises(ValueError, match=r"unknown training config sections"):
+        model_initialization_config_from_mapping(stale_table)
+
+    stale_floor = TrainingConfig().to_mapping()
+    stale_curriculum = stale_floor["curriculum"]
+    assert isinstance(stale_curriculum, dict)
+    stale_curriculum["selection_surface_epsilon_floor"] = 0.25
+    with pytest.raises(ValueError, match=r"unknown curriculum config keys"):
+        training_config_from_mapping(stale_floor)
+    with pytest.raises(ValueError, match=r"unknown curriculum config keys"):
+        model_initialization_config_from_mapping(stale_floor)
 
 
 def test_transaction_lifecycle_loss_contract_is_bounded_and_opt_in() -> None:

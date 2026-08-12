@@ -68,15 +68,6 @@ revival_budget = 40
 epsilon_start = 0.15
 epsilon_end = 0.05
 epsilon_decay_steps = 150000
-selection_surface_epsilon_floor = 0.0
-
-[transaction_exploration]
-# The macro authority owns all macro-surface exploration (branch-balanced
-# epsilon-greedy). No collector-side entry floors compete with it.
-enabled = false
-operations = []
-entry_epsilon_floor = 0.0
-completion_guidance_probability = 0.0
 
 [runtime]
 rocm_sdpa_backend = "math"

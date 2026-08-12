@@ -16,13 +16,8 @@ from sts2_rl.encoding import GroundedEncodingConfig
 from sts2_rl.models import GroundedCandidateConfig
 
 from .seeding import validate_seed_budget
-from .transaction_operations import (
-    TRANSACTION_EXPLORATION_OPERATIONS,
-    TRANSACTION_GUIDANCE_OPERATIONS,
-    canonical_transaction_operation,
-)
 
-CONFIG_VERSION = "sts2-relational-curriculum-config-v19"
+CONFIG_VERSION = "sts2-relational-curriculum-config-v20"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V10 = "sts2-relational-curriculum-config-v10"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V11 = "sts2-relational-curriculum-config-v11"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V12 = "sts2-relational-curriculum-config-v12"
@@ -32,6 +27,7 @@ _MODEL_INITIALIZATION_SOURCE_CONFIG_V15 = "sts2-relational-curriculum-config-v15
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V16 = "sts2-relational-curriculum-config-v16"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V17 = "sts2-relational-curriculum-config-v17"
 _MODEL_INITIALIZATION_SOURCE_CONFIG_V18 = "sts2-relational-curriculum-config-v18"
+_MODEL_INITIALIZATION_SOURCE_CONFIG_V19 = "sts2-relational-curriculum-config-v19"
 ENGINE_REVIVAL_MECHANISM = "engine-bailout-v1"
 PROFILE_DIR = Path(__file__).resolve().parents[2] / "config" / "profiles"
 T = TypeVar("T")
@@ -994,10 +990,6 @@ class CurriculumConfig:
     epsilon_start: float = 0.30
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 250_000
-    # Generic exploration floor for multi-step selection surfaces.  It is
-    # keyed only by decision-surface semantics (card selection/rest site), not
-    # by any card, relic, event, encounter or option identifier.
-    selection_surface_epsilon_floor: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in {"standard", "native-revival-preheat"}:
@@ -1039,102 +1031,6 @@ class CurriculumConfig:
             label="curriculum.epsilon_decay_steps",
             minimum=1,
         )
-        selection_surface_epsilon_floor = _require_finite_number(
-            self.selection_surface_epsilon_floor,
-            label="curriculum.selection_surface_epsilon_floor",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        if selection_surface_epsilon_floor < epsilon_end:
-            # A lower floor is legal but operationally indistinguishable from
-            # the ordinary schedule.  Keep zero as the explicit disabled
-            # value; positive values must actually define a floor.
-            if selection_surface_epsilon_floor != 0.0:
-                raise ValueError("curriculum.selection_surface_epsilon_floor must be zero or at least epsilon_end")
-
-
-@dataclass(frozen=True, slots=True)
-class TransactionExplorationConfig:
-    """Training-only exploration of reviewed multi-step transaction grammar.
-
-    The explorer never names a card, assigns an intrinsic reward, or changes
-    deterministic evaluation.  It only makes rare transaction entrances
-    visible and mixes the ordinary behavior policy with a forward-only
-    Select/Confirm proposal while an authoritative selection operation is
-    active.  The exact mixed behavior probability remains available to
-    V-trace, so this is data collection rather than an untracked action rewrite.
-    """
-
-    enabled: bool = False
-    operations: tuple[str, ...] = ()
-    entry_epsilon_floor: float = 0.0
-    completion_guidance_probability: float = 0.0
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.enabled, bool):
-            raise TypeError("transaction_exploration.enabled must be a boolean")
-        raw_operations = self.operations
-        if not isinstance(raw_operations, tuple):
-            if not isinstance(raw_operations, Sequence) or isinstance(raw_operations, str | bytes):
-                raise TypeError("transaction_exploration.operations must be an array")
-            raw_operations = tuple(raw_operations)
-            object.__setattr__(self, "operations", raw_operations)
-        normalized_operations: list[str] = []
-        for raw_operation in raw_operations:
-            if not isinstance(raw_operation, str) or not raw_operation.strip():
-                raise TypeError("transaction_exploration.operations entries must be non-empty strings")
-            operation = canonical_transaction_operation(raw_operation)
-            if operation not in TRANSACTION_EXPLORATION_OPERATIONS:
-                raise ValueError(
-                    "transaction_exploration.operations supports only the "
-                    "reviewed exploration registry"
-                )
-            if operation in normalized_operations:
-                raise ValueError(f"transaction_exploration.operations contains duplicate operation {operation!r}")
-            normalized_operations.append(operation)
-        normalized_tuple = tuple(sorted(normalized_operations))
-        if normalized_tuple != self.operations:
-            object.__setattr__(self, "operations", normalized_tuple)
-
-        entry_floor = _require_finite_number(
-            self.entry_epsilon_floor,
-            label="transaction_exploration.entry_epsilon_floor",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        guidance_probability = _require_finite_number(
-            self.completion_guidance_probability,
-            label="transaction_exploration.completion_guidance_probability",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        if self.enabled:
-            if not self.operations:
-                raise ValueError("enabled transaction exploration requires at least one operation")
-            if entry_floor <= 0.0:
-                raise ValueError("enabled transaction exploration requires a positive entry_epsilon_floor")
-            # Completion guidance only has meaning for operations that open a
-            # multi-step selection transaction. Single-decision entrances
-            # (for example reward_skip or shop_leave) resolve at the entry
-            # action, so a pure single-decision roster keeps guidance at zero.
-            selection_operations = TRANSACTION_GUIDANCE_OPERATIONS & set(
-                self.operations
-            )
-            if selection_operations:
-                # A probability of exactly one would erase behavior support for
-                # Cancel/Deselect and invalidate off-policy importance correction.
-                if not 0.0 < guidance_probability < 1.0:
-                    raise ValueError(
-                        "enabled selection-transaction exploration requires "
-                        "0 < completion_guidance_probability < 1"
-                    )
-            elif guidance_probability != 0.0:
-                raise ValueError(
-                    "single-decision transaction exploration requires "
-                    "completion_guidance_probability == 0"
-                )
-        elif self.operations or entry_floor != 0.0 or guidance_probability != 0.0:
-            raise ValueError("disabled transaction exploration requires empty operations and zero probabilities")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1404,7 +1300,6 @@ class TrainingConfig:
     episodic_learning: EpisodicLearningConfig = field(default_factory=EpisodicLearningConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
-    transaction_exploration: TransactionExplorationConfig = field(default_factory=TransactionExplorationConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
@@ -1424,7 +1319,6 @@ class TrainingConfig:
             ("episodic_learning", EpisodicLearningConfig),
             ("environment", EnvironmentConfig),
             ("curriculum", CurriculumConfig),
-            ("transaction_exploration", TransactionExplorationConfig),
             ("runtime", RuntimeConfig),
             ("diagnostics", DiagnosticsConfig),
         ):
@@ -1471,11 +1365,6 @@ class TrainingConfig:
         if self.curriculum.mode == "native-revival-preheat":
             if self.environment.backend != "headless":
                 raise ValueError("engine-bailout preheat requires the headless backend")
-        if (
-            self.transaction_exploration.enabled
-            and self.transaction_exploration.entry_epsilon_floor < self.curriculum.epsilon_end
-        ):
-            raise ValueError("transaction_exploration.entry_epsilon_floor must be at least " "curriculum.epsilon_end")
         expected_discount = 1.0 if self.curriculum.mode == "native-revival-preheat" else TASK_REWARD_SPEC.discount
         if self.optimization.discount != expected_discount:
             raise ValueError(
@@ -1519,10 +1408,6 @@ class TrainingConfig:
         # new lineage schedule before comparison so a checkpoint written from
         # this exact config can resume without a tuple/list false mismatch.
         rollout["deterministic_probe_environment_steps"] = list(self.rollout.deterministic_probe_environment_steps)
-        transaction_exploration = payload["transaction_exploration"]
-        if not isinstance(transaction_exploration, dict):  # pragma: no cover - asdict invariant
-            raise TypeError("serialized transaction exploration config must be an object")
-        transaction_exploration["operations"] = list(self.transaction_exploration.operations)
         episodic_learning = payload["episodic_learning"]
         if not isinstance(episodic_learning, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized episodic learning config must be an object")
@@ -1656,11 +1541,6 @@ def training_config_from_mapping(payload: Mapping[str, Any]) -> TrainingConfig:
         ),
         environment=_construct(EnvironmentConfig, _table(payload, "environment"), label="environment"),
         curriculum=_construct(CurriculumConfig, _table(payload, "curriculum"), label="curriculum"),
-        transaction_exploration=_construct(
-            TransactionExplorationConfig,
-            _table(payload, "transaction_exploration"),
-            label="transaction_exploration",
-        ),
         runtime=_construct(RuntimeConfig, _table(payload, "runtime"), label="runtime"),
         diagnostics=_construct(DiagnosticsConfig, _table(payload, "diagnostics"), label="diagnostics"),
     )
@@ -1685,7 +1565,11 @@ def model_initialization_config_from_mapping(
     head, and the extended factual transaction option horizon. V19 adds a
     guarded factual option-advantage actor bridge; all of its new controls
     migrate disabled so an older policy is never reinterpreted as supervised
-    actor data. These are training/data/model semantics, so V18 checkpoints are accepted only for
+    actor data. V20 retires the operation-specific entry/selection exploration
+    floors and completion guidance entirely: the ``transaction_exploration``
+    table and the curriculum ``selection_surface_epsilon_floor`` key are
+    stripped from every older payload, and a V20 payload that still contains
+    them fails the strict parser. These are training/data/model semantics, so V19 checkpoints are accepted only for
     model-parameter initialization; optimizer/replay/RNG state cannot cross
     the boundary.
     V11 checkpoints
@@ -1713,6 +1597,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         raise ValueError(
             "model-parameter initialization has no reviewed config migration "
@@ -1746,16 +1631,23 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         if "transaction_exploration" in payload:
             raise ValueError(
                 "pre-V14 model-initialization config unexpectedly contains a "
                 "transaction_exploration table"
             )
-        # The reviewed migration is behavior preserving. Enabling the new
-        # explorer belongs to the successor config, never to checkpoint
-        # interpretation.
-        migrated["transaction_exploration"] = {"enabled": False}
+    # V20 retired the operation-specific entry/selection exploration floors
+    # and completion guidance. The reviewed migration strips the retired
+    # table/key from every older payload before construction; a V20 payload
+    # that still contains them fails the strict parser instead.
+    migrated.pop("transaction_exploration", None)
+    raw_curriculum = migrated.get("curriculum")
+    if isinstance(raw_curriculum, Mapping):
+        curriculum_table = dict(raw_curriculum)
+        curriculum_table.pop("selection_surface_epsilon_floor", None)
+        migrated["curriculum"] = curriculum_table
     transaction_learning = payload.get("transaction_learning")
     if not isinstance(transaction_learning, Mapping):
         raise ValueError(
@@ -1772,6 +1664,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         unexpected_lifecycle_fields = lifecycle_fields.intersection(
             transaction_learning
@@ -1791,6 +1684,7 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V16,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         if "evaluation_guard_enforcement_start_steps" not in runtime:
             raise ValueError(
@@ -1819,6 +1713,7 @@ def model_initialization_config_from_mapping(
     if source_version in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         if "liveness_risk_actor_min_selected_probability" not in raw_failure:
             raise ValueError(
@@ -1845,6 +1740,7 @@ def model_initialization_config_from_mapping(
     if source_version in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
         if "success_imitation_exempt_surfaces" not in raw_episodic:
             raise ValueError(
@@ -1869,7 +1765,10 @@ def model_initialization_config_from_mapping(
         "combat_hp_loss_value_weight": 0.0,
         "combat_hp_loss_reference": 80.0,
     }
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18:
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
+    }:
         missing_v18 = set(v18_fields) - set(raw_episodic)
         if missing_v18:
             raise ValueError(
@@ -1893,7 +1792,10 @@ def model_initialization_config_from_mapping(
     raw_transaction = migrated.get("transaction_learning")
     if not isinstance(raw_transaction, Mapping):  # pragma: no cover - checked above
         raise ValueError("model-initialization config lost transaction_learning")
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18:
+    if source_version in {
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
+    }:
         if "lifecycle_smdp_horizon" not in raw_transaction:
             raise ValueError(
                 "V18 model-initialization config is missing its transaction option horizon"
@@ -1912,21 +1814,37 @@ def model_initialization_config_from_mapping(
         "lifecycle_advantage_max_policy_lag": 128,
         "lifecycle_advantage_max_log_probability_shift": 1.0,
     }
-    unexpected_v19 = set(v19_transaction_fields).intersection(raw_transaction)
-    if unexpected_v19:
-        raise ValueError(
-            f"{source_version} model-initialization config unexpectedly "
-            "contains V19 transaction actor fields: "
-            + ", ".join(sorted(unexpected_v19))
-        )
+    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V19:
+        missing_v19 = set(v19_transaction_fields) - set(raw_transaction)
+        if missing_v19:
+            raise ValueError(
+                "V19 model-initialization config is missing transaction "
+                "actor fields: " + ", ".join(sorted(missing_v19))
+            )
+    else:
+        unexpected_v19 = set(v19_transaction_fields).intersection(raw_transaction)
+        if unexpected_v19:
+            raise ValueError(
+                f"{source_version} model-initialization config unexpectedly "
+                "contains V19 transaction actor fields: "
+                + ", ".join(sorted(unexpected_v19))
+            )
     migrated["transaction_learning"] = {
         **dict(raw_transaction),
         **(
             {}
-            if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V18
+            if source_version
+            in {
+                _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
+                _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
+            }
             else {"lifecycle_smdp_horizon": "transaction_exit"}
         ),
-        **v19_transaction_fields,
+        **(
+            {}
+            if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V19
+            else v19_transaction_fields
+        ),
     }
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
@@ -1977,7 +1895,6 @@ __all__ = [
     "RolloutConfig",
     "RuntimeConfig",
     "TrainingConfig",
-    "TransactionExplorationConfig",
     "TransactionLearningConfig",
     "engine_revival_identity",
     "load_training_config",

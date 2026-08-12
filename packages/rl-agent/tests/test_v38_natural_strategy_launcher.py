@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v38_natural_strategy_model_init.py"
@@ -59,10 +60,10 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v38_withdraws_only_behavior_scaffolding() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
-    v37 = load_training_config(profile="preheat", config_path=V37_CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
+    v37 = load_archived_training_config(profile="preheat", config_path=V37_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
 
     # The factual learning corridor and the liveness stability plane survive
     # the transition unchanged.
@@ -76,14 +77,6 @@ def test_v38_withdraws_only_behavior_scaffolding() -> None:
     assert config.curriculum.epsilon_end == v37.curriculum.epsilon_end
     assert config.curriculum.epsilon_decay_steps == v37.curriculum.epsilon_decay_steps
 
-    # These are the complete behavior-side scaffold withdrawal surface.
-    assert v37.curriculum.selection_surface_epsilon_floor == pytest.approx(0.25)
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
-    assert v37.transaction_exploration.enabled
-    assert not config.transaction_exploration.enabled
-    assert config.transaction_exploration.operations == ()
-    assert config.transaction_exploration.entry_epsilon_floor == pytest.approx(0.0)
-    assert config.transaction_exploration.completion_guidance_probability == pytest.approx(0.0)
 
     # No rollback gate can replace a newly learned strategy with an old one.
     assert config.runtime.model_initialization_schedule_mode == "inherit"

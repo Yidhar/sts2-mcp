@@ -399,7 +399,6 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
-    del source["transaction_exploration"]
     episodic = source["episodic_learning"]
     rollout = source["rollout"]
     assert isinstance(episodic, dict)
@@ -437,7 +436,6 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
-    del source["transaction_exploration"]
     optimization = source["optimization"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
@@ -489,7 +487,6 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
-    del source["transaction_exploration"]
     rollout = source["rollout"]
     episodic = source["episodic_learning"]
     assert isinstance(rollout, dict)
@@ -523,7 +520,6 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
-    del source["transaction_exploration"]
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
     del episodic["fresh_policy_sequences"]

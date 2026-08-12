@@ -12,11 +12,9 @@ from sts2_rl.training.config import CONFIG_VERSION, TrainingConfig
 def _v10_payload() -> dict[str, Any]:
     payload = TrainingConfig().to_mapping()
     payload["version"] = "sts2-relational-curriculum-config-v10"
-    # V10 predates the failure-credit and transaction-exploration tables.
-    # Reconstruct the historical payload instead of only relabeling the
-    # current V18 mapping.
+    # V10 predates the failure-credit table.  Reconstruct the historical
+    # payload instead of only relabeling the current mapping.
     del payload["failure_credit"]
-    del payload["transaction_exploration"]
     transaction_learning = payload["transaction_learning"]
     assert isinstance(transaction_learning, dict)
     for key in (

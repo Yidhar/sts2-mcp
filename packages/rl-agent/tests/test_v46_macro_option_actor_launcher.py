@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v46_macro_option_actor_model_init.py"
@@ -77,11 +78,11 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
     from dataclasses import replace
 
-    config = load_training_config(profile="preheat", config_path=CONFIG)
-    v44 = load_training_config(profile="preheat", config_path=V44_CONFIG)
-    v45 = load_training_config(profile="preheat", config_path=V45_CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
+    v44 = load_archived_training_config(profile="preheat", config_path=V44_CONFIG)
+    v45 = load_archived_training_config(profile="preheat", config_path=V45_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.optimization == v45.optimization == v44.optimization
     assert config.rollout == v45.rollout == v44.rollout
     assert v44.transaction_learning.transaction_q_weight == 0.0
@@ -123,15 +124,6 @@ def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
         ),
     ) == v45.transaction_learning
     assert v45.transaction_learning.lifecycle_advantage_policy_weight == 0.0
-    assert v44.transaction_exploration.enabled is False
-    assert config.transaction_exploration == v45.transaction_exploration
-    assert config.transaction_exploration.enabled is True
-    assert config.transaction_exploration.operations == (
-        "relic_purchase",
-        "reward_skip",
-    )
-    assert config.transaction_exploration.entry_epsilon_floor == 0.15
-    assert config.transaction_exploration.completion_guidance_probability == 0.0
     assert config.failure_credit == v45.failure_credit == v44.failure_credit
     assert config.episodic_learning == v45.episodic_learning == v44.episodic_learning
     assert config.model == v45.model == v44.model
@@ -143,7 +135,6 @@ def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
     assert config.curriculum.epsilon_start == v44.curriculum.epsilon_start
     assert config.curriculum.epsilon_end == v44.curriculum.epsilon_end
     assert config.curriculum.epsilon_decay_steps == v44.curriculum.epsilon_decay_steps
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
 
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "reset"

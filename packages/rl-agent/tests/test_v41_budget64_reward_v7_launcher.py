@@ -8,7 +8,8 @@ from typing import Any
 import pytest
 
 from sts2_baseline import REVIVAL_EFFICIENCY_REWARD_SPEC
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v41_budget64_reward_v7_model_init.py"
@@ -70,21 +71,19 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v41_changes_reward_identity_and_runtime_paths_from_v40() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
-    v40 = load_training_config(profile="preheat", config_path=V40_CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
+    v40 = load_archived_training_config(profile="preheat", config_path=V40_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.optimization == v40.optimization
     assert config.rollout == v40.rollout
     assert config.transaction_learning == v40.transaction_learning
-    assert config.transaction_exploration == v40.transaction_exploration
     assert config.failure_credit == v40.failure_credit
     assert config.episodic_learning == v40.episodic_learning
     assert config.model == v40.model
     assert config.environment == v40.environment
     assert config.curriculum == v40.curriculum
     assert config.curriculum.revival_budget == 64
-    assert config.curriculum.selection_surface_epsilon_floor == pytest.approx(0.0)
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == (
         "sts2-run-survival-efficiency-v7"
     )

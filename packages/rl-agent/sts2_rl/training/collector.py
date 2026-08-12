@@ -83,11 +83,7 @@ from .transaction import (
     backfill_factual_monte_carlo_returns,
     factual_transaction_policy_targets,
 )
-from .transaction_operations import (
-    TRANSACTION_EXPLORATION_OPERATIONS,
-    TRANSACTION_GUIDANCE_OPERATIONS,
-    canonical_transaction_operation,
-)
+from .transaction_operations import canonical_transaction_operation
 
 
 class CollectionProtocolError(RuntimeError):
@@ -175,11 +171,6 @@ class EpisodeMetrics:
     maximum_relation_hash_collisions_per_decision: int = 0
     definition_hash_collisions_total: int = 0
     relation_hash_collisions_total: int = 0
-    targeted_selection_exploration_decisions: int = 0
-    targeted_transaction_entry_exploration_decisions: int = 0
-    transaction_completion_guidance_decisions: int = 0
-    transaction_completion_forward_decisions: int = 0
-    transaction_completion_guidance_fallbacks: int = 0
     maximum_effective_collection_epsilon: float = 0.0
     policy_top1_top2_logit_margin_mean: float = 0.0
     policy_top1_top2_logit_margin_max: float = 0.0
@@ -328,12 +319,6 @@ class _ActionChoice:
     definition_hash_collisions: int
     relation_hash_collisions: int
     effective_epsilon: float
-    targeted_selection_exploration: bool
-    targeted_transaction_entry_exploration: bool
-    transaction_completion_guidance: bool
-    transaction_completion_forward_selected: bool
-    transaction_completion_guidance_fallback: bool
-    transaction_operation: str
 
 
 @dataclass(slots=True)
@@ -1460,18 +1445,6 @@ def _single_step_macro_effect_verified(
     return False
 
 
-def _uses_targeted_selection_exploration(
-    observation: Mapping[str, object],
-    semantic_actions: tuple[Mapping[str, object], ...],
-) -> bool:
-    """Return whether this generic decision surface owns the v33 ε floor."""
-
-    return bool(
-        _transaction_selection_context(observation, semantic_actions) is not None
-        or _is_rest_site_decision_surface(observation, semantic_actions)
-    )
-
-
 def _canonical_transaction_operation(value: object) -> str:
     """Compatibility wrapper around the shared reviewed operation registry."""
 
@@ -1583,34 +1556,6 @@ def _is_shop_card_removal_entry(action: Mapping[str, object]) -> bool:
     return bool(model_kind == "shop" and _transaction_entry_operation(prototype) == "remove")
 
 
-def _transaction_entry_exploration_branch_ids(
-    *,
-    policy_branch_ids: NDArray[np.int64],
-    semantic_actions: tuple[Mapping[str, object], ...],
-    enabled_operations: frozenset[str],
-) -> tuple[NDArray[np.int64], bool]:
-    """Give each reviewed entrance a cardinality-independent explorer branch."""
-
-    if policy_branch_ids.ndim != 1 or len(semantic_actions) != len(policy_branch_ids):
-        raise CollectionProtocolError("transaction entry branch IDs and semantic actions have different shapes")
-    if not enabled_operations:
-        return policy_branch_ids, False
-    unknown = enabled_operations - TRANSACTION_EXPLORATION_OPERATIONS
-    if unknown:
-        raise ValueError("unsupported transaction exploration operations: " + ", ".join(sorted(unknown)))
-    operations = tuple(_transaction_entry_operation(action) for action in semantic_actions)
-    present = tuple(sorted({item for item in operations if item in enabled_operations}))
-    if not present:
-        return policy_branch_ids, False
-    remapped = policy_branch_ids.astype(np.int64, copy=True)
-    next_branch_id = int(remapped.max(initial=-1)) + 1
-    for offset, operation in enumerate(present):
-        for index, candidate_operation in enumerate(operations):
-            if candidate_operation == operation:
-                remapped[index] = next_branch_id + offset
-    return remapped, True
-
-
 def _is_forge_selection_surface(
     observation: Mapping[str, object],
     semantic_actions: tuple[Mapping[str, object], ...],
@@ -1671,69 +1616,6 @@ def _normalized_selection_action_operation(action: Mapping[str, object]) -> str:
         "",
     )
     return "_".join(str(raw).strip().lower().replace("-", " ").split())
-
-
-def _transaction_completion_guided_behavior(
-    *,
-    policy: NDArray[np.float32],
-    valid: NDArray[np.bool_],
-    semantic_actions: tuple[Mapping[str, object], ...],
-    base_behavior: NDArray[np.float64],
-    operation: str,
-    guidance_probability: float,
-) -> tuple[NDArray[np.float64], frozenset[int], bool]:
-    """Mix exact behavior with a forward Select/Confirm transaction proposal.
-
-    Confirm dominates Select once it is legal.  Before that point, all legal
-    Select candidates retain their learned relative policy mass.  Cancel and
-    Deselect keep non-zero support through ``base_behavior``; consequently the
-    returned distribution is a valid, fully auditable behavior policy rather
-    than a hidden action override.
-    """
-
-    if operation not in TRANSACTION_GUIDANCE_OPERATIONS:
-        return base_behavior, frozenset(), False
-    if policy.shape != valid.shape or base_behavior.shape != valid.shape:
-        raise CollectionProtocolError("transaction guidance inputs have different shapes")
-    if len(semantic_actions) != len(valid):
-        raise CollectionProtocolError("transaction guidance lost semantic candidate alignment")
-    probability = float(guidance_probability)
-    if not math.isfinite(probability) or not 0.0 <= probability < 1.0:
-        raise ValueError("transaction completion guidance probability must be in [0, 1)")
-    if probability == 0.0:
-        return base_behavior, frozenset(), False
-
-    confirm_indices: list[int] = []
-    select_indices: list[int] = []
-    for index, action in enumerate(semantic_actions):
-        if not bool(valid[index]):
-            continue
-        normalized = _normalized_selection_action_operation(action)
-        if normalized in {"confirm", "confirm_selection"}:
-            confirm_indices.append(index)
-        elif normalized in {"select", "select_card"}:
-            select_indices.append(index)
-    forward_indices = confirm_indices or select_indices
-    if not forward_indices:
-        return base_behavior, frozenset(), True
-
-    guided = np.zeros(policy.shape, dtype=np.float64)
-    forward_policy = policy[forward_indices].astype(np.float64, copy=False)
-    if not np.all(np.isfinite(forward_policy)) or np.any(forward_policy < 0.0):
-        raise CollectionProtocolError("model produced invalid transaction forward policy mass")
-    forward_mass = float(forward_policy.sum())
-    if math.isfinite(forward_mass) and forward_mass > 0.0:
-        guided[forward_indices] = forward_policy / forward_mass
-    else:  # pragma: no cover - the full legal policy is validated by caller
-        guided[forward_indices] = 1.0 / len(forward_indices)
-    behavior = (1.0 - probability) * base_behavior + probability * guided
-    behavior_mass = float(behavior.sum())
-    if not math.isfinite(behavior_mass) or behavior_mass <= 0.0:
-        raise CollectionProtocolError("transaction guidance produced invalid behavior mass")
-    behavior /= behavior_mass
-    if not np.all(np.isfinite(behavior)) or np.any(behavior < 0.0) or np.any(behavior[~valid] != 0.0):
-        raise CollectionProtocolError("transaction guidance produced an invalid behavior policy")
-    return behavior, frozenset(forward_indices), False
 
 
 def _card_upgrade_level(card: Mapping[str, object]) -> int:
@@ -3310,10 +3192,6 @@ class GroundedCollector:
         failure_credit_learning_enabled: bool = False,
         failure_credit_run_id: str | None = None,
         failure_credit_pipeline_config: FailureCreditPipelineConfig | None = None,
-        selection_surface_epsilon_floor: float = 0.0,
-        transaction_exploration_operations: tuple[str, ...] = (),
-        transaction_entry_epsilon_floor: float = 0.0,
-        transaction_completion_guidance_probability: float = 0.0,
         macro_authority: Any | None = None,
     ) -> None:
         # Stage-two isolated collection: an optional macro authority may
@@ -3386,60 +3264,6 @@ class GroundedCollector:
             raise TypeError("journal_policy_topk must be an integer")
         if journal_policy_topk <= 0:
             raise ValueError("journal_policy_topk must be positive")
-        if (
-            isinstance(selection_surface_epsilon_floor, bool)
-            or not isinstance(selection_surface_epsilon_floor, int | float)
-            or not math.isfinite(float(selection_surface_epsilon_floor))
-            or not 0.0 <= float(selection_surface_epsilon_floor) <= 1.0
-        ):
-            raise ValueError("selection_surface_epsilon_floor must be finite and in [0, 1]")
-        if not isinstance(transaction_exploration_operations, tuple):
-            raise TypeError("transaction_exploration_operations must be a tuple")
-        normalized_transaction_operations = frozenset(
-            _canonical_transaction_operation(operation) for operation in transaction_exploration_operations
-        )
-        if "" in normalized_transaction_operations or len(normalized_transaction_operations) != len(
-            transaction_exploration_operations
-        ):
-            raise ValueError("transaction_exploration_operations must contain unique reviewed operations")
-        if normalized_transaction_operations - TRANSACTION_EXPLORATION_OPERATIONS:
-            raise ValueError("transaction_exploration_operations contains an unsupported operation")
-        for name, value in (
-            ("transaction_entry_epsilon_floor", transaction_entry_epsilon_floor),
-            (
-                "transaction_completion_guidance_probability",
-                transaction_completion_guidance_probability,
-            ),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(float(value))
-                or not 0.0 <= float(value) <= 1.0
-            ):
-                raise ValueError(f"{name} must be finite and in [0, 1]")
-        if transaction_completion_guidance_probability >= 1.0:
-            raise ValueError("transaction_completion_guidance_probability must be less than 1")
-        if normalized_transaction_operations:
-            if transaction_entry_epsilon_floor <= 0.0:
-                raise ValueError("transaction exploration operations require a positive entry epsilon floor")
-            guidance_operations = (
-                normalized_transaction_operations
-                & TRANSACTION_GUIDANCE_OPERATIONS
-            )
-            if guidance_operations and transaction_completion_guidance_probability <= 0.0:
-                raise ValueError(
-                    "selection transaction exploration operations require positive completion guidance"
-                )
-            if (
-                not guidance_operations
-                and transaction_completion_guidance_probability != 0.0
-            ):
-                raise ValueError(
-                    "single-decision transaction exploration requires zero completion guidance"
-                )
-        elif transaction_entry_epsilon_floor != 0.0 or transaction_completion_guidance_probability != 0.0:
-            raise ValueError("transaction exploration probabilities require reviewed operations")
         if isinstance(combat_net_progress_window, bool) or not isinstance(combat_net_progress_window, int):
             raise TypeError("combat_net_progress_window must be an integer")
         if combat_net_progress_window <= 0:
@@ -3489,10 +3313,6 @@ class GroundedCollector:
         self.episodic_learning_enabled = episodic_learning_enabled
         self.failure_credit_shadow_enabled = failure_credit_shadow_enabled
         self.failure_credit_learning_enabled = failure_credit_learning_enabled
-        self.selection_surface_epsilon_floor = float(selection_surface_epsilon_floor)
-        self.transaction_exploration_operations = normalized_transaction_operations
-        self.transaction_entry_epsilon_floor = float(transaction_entry_epsilon_floor)
-        self.transaction_completion_guidance_probability = float(transaction_completion_guidance_probability)
         self.failure_credit_pipeline_config = failure_credit_pipeline_config or FailureCreditPipelineConfig(
             detector_window_steps=deadlock_window,
             context_burn_in_steps=transaction_burn_in_steps or 0,
@@ -3842,12 +3662,6 @@ class GroundedCollector:
                     definition_hash_collisions=encoded.definition_hash_collisions,
                     relation_hash_collisions=encoded.relation_hash_collisions,
                     effective_epsilon=0.0,
-                    targeted_selection_exploration=False,
-                    targeted_transaction_entry_exploration=False,
-                    transaction_completion_guidance=False,
-                    transaction_completion_forward_selected=False,
-                    transaction_completion_guidance_fallback=False,
-                    transaction_operation="",
                 )
         valid_count = int(valid_indices.size)
         valid_policy = policy[valid_indices]
@@ -3886,61 +3700,14 @@ class GroundedCollector:
                 definition_hash_collisions=(encoded.definition_hash_collisions),
                 relation_hash_collisions=encoded.relation_hash_collisions,
                 effective_epsilon=0.0,
-                targeted_selection_exploration=False,
-                targeted_transaction_entry_exploration=False,
-                transaction_completion_guidance=False,
-                transaction_completion_forward_selected=False,
-                transaction_completion_guidance_fallback=False,
-                transaction_operation=_selection_transaction_operation(
-                    state.observation,
-                    semantic_actions,
-                ),
             )
 
-        targeted_surface = _uses_targeted_selection_exploration(
-            state.observation,
-            semantic_actions,
-        )
-        exploration_branch_ids, targeted_transaction_entry_surface = _transaction_entry_exploration_branch_ids(
-            policy_branch_ids=policy_branch_ids,
-            semantic_actions=semantic_actions,
-            enabled_operations=self.transaction_exploration_operations,
-        )
-        effective_epsilon = normalized_epsilon
-        if targeted_surface:
-            effective_epsilon = max(
-                effective_epsilon,
-                self.selection_surface_epsilon_floor,
-            )
-        if targeted_transaction_entry_surface:
-            effective_epsilon = max(
-                effective_epsilon,
-                self.transaction_entry_epsilon_floor,
-            )
-        base_behavior = _branch_balanced_epsilon_behavior(
+        behavior = _branch_balanced_epsilon_behavior(
             policy=policy,
             valid=valid,
-            policy_branch_ids=exploration_branch_ids,
-            epsilon=effective_epsilon,
+            policy_branch_ids=policy_branch_ids,
+            epsilon=normalized_epsilon,
         )
-        transaction_operation = _selection_transaction_operation(
-            state.observation,
-            semantic_actions,
-        )
-        guidance_eligible = bool(transaction_operation in self.transaction_exploration_operations)
-        if guidance_eligible:
-            behavior, forward_indices, guidance_fallback = _transaction_completion_guided_behavior(
-                policy=policy,
-                valid=valid,
-                semantic_actions=semantic_actions,
-                base_behavior=base_behavior,
-                operation=transaction_operation,
-                guidance_probability=(self.transaction_completion_guidance_probability),
-            )
-        else:
-            behavior = base_behavior
-            forward_indices = frozenset()
-            guidance_fallback = False
         selected = int(self._rng.choice(len(behavior), p=behavior))
         reference = encoded.action(selected)
         return _ActionChoice(
@@ -3965,13 +3732,7 @@ class GroundedCollector:
             policy_forward_ms=policy_forward_ms,
             definition_hash_collisions=encoded.definition_hash_collisions,
             relation_hash_collisions=encoded.relation_hash_collisions,
-            effective_epsilon=effective_epsilon,
-            targeted_selection_exploration=bool(targeted_surface and effective_epsilon > normalized_epsilon),
-            targeted_transaction_entry_exploration=bool(targeted_transaction_entry_surface and effective_epsilon > 0.0),
-            transaction_completion_guidance=bool(guidance_eligible and not guidance_fallback),
-            transaction_completion_forward_selected=bool(guidance_eligible and selected in forward_indices),
-            transaction_completion_guidance_fallback=bool(guidance_fallback),
-            transaction_operation=transaction_operation,
+            effective_epsilon=normalized_epsilon,
         )
 
     def _step(
@@ -4095,11 +3856,6 @@ class GroundedCollector:
         maximum_relation_hash_collisions_per_decision = 0
         definition_hash_collisions_total = 0
         relation_hash_collisions_total = 0
-        targeted_selection_exploration_decisions = 0
-        targeted_transaction_entry_exploration_decisions = 0
-        transaction_completion_guidance_decisions = 0
-        transaction_completion_forward_decisions = 0
-        transaction_completion_guidance_fallbacks = 0
         maximum_effective_collection_epsilon = 0.0
         policy_logit_margin_total = 0.0
         policy_logit_margin_count = 0
@@ -4304,11 +4060,6 @@ class GroundedCollector:
             )
             definition_hash_collisions_total += choice.definition_hash_collisions
             relation_hash_collisions_total += choice.relation_hash_collisions
-            targeted_selection_exploration_decisions += int(choice.targeted_selection_exploration)
-            targeted_transaction_entry_exploration_decisions += int(choice.targeted_transaction_entry_exploration)
-            transaction_completion_guidance_decisions += int(choice.transaction_completion_guidance)
-            transaction_completion_forward_decisions += int(choice.transaction_completion_forward_selected)
-            transaction_completion_guidance_fallbacks += int(choice.transaction_completion_guidance_fallback)
             maximum_effective_collection_epsilon = max(
                 maximum_effective_collection_epsilon,
                 choice.effective_epsilon,
@@ -5510,12 +5261,6 @@ class GroundedCollector:
                     "value": choice.value,
                     "behavior_log_probability": choice.behavior_log_probability,
                     "effective_collection_epsilon": choice.effective_epsilon,
-                    "targeted_selection_exploration": (choice.targeted_selection_exploration),
-                    "targeted_transaction_entry_exploration": (choice.targeted_transaction_entry_exploration),
-                    "transaction_completion_guidance": (choice.transaction_completion_guidance),
-                    "transaction_completion_forward_selected": (choice.transaction_completion_forward_selected),
-                    "transaction_completion_guidance_fallback": (choice.transaction_completion_guidance_fallback),
-                    "transaction_operation": choice.transaction_operation or None,
                     "reward": breakdown.reward,
                     "terminal_reward": breakdown.terminal_reward,
                     "potential_reward": breakdown.potential_reward,
@@ -5828,11 +5573,6 @@ class GroundedCollector:
                 maximum_relation_hash_collisions_per_decision=(maximum_relation_hash_collisions_per_decision),
                 definition_hash_collisions_total=(definition_hash_collisions_total),
                 relation_hash_collisions_total=(relation_hash_collisions_total),
-                targeted_selection_exploration_decisions=(targeted_selection_exploration_decisions),
-                targeted_transaction_entry_exploration_decisions=(targeted_transaction_entry_exploration_decisions),
-                transaction_completion_guidance_decisions=(transaction_completion_guidance_decisions),
-                transaction_completion_forward_decisions=(transaction_completion_forward_decisions),
-                transaction_completion_guidance_fallbacks=(transaction_completion_guidance_fallbacks),
                 maximum_effective_collection_epsilon=(maximum_effective_collection_epsilon),
                 policy_top1_top2_logit_margin_mean=(
                     policy_logit_margin_total / policy_logit_margin_count if policy_logit_margin_count else 0.0

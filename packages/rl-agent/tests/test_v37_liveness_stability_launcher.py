@@ -8,7 +8,8 @@ from typing import Any
 import pytest
 
 from sts2_baseline import REVIVAL_EFFICIENCY_REWARD_SPEC
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v37_liveness_stability_model_init.py"
@@ -60,10 +61,10 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v37_keeps_v36_transaction_corridor_and_repairs_liveness_plane() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
-    v36 = load_training_config(profile="preheat", config_path=V36_CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
+    v36 = load_archived_training_config(profile="preheat", config_path=V36_CONFIG)
 
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     transaction = config.transaction_learning
     assert transaction == v36.transaction_learning
     assert transaction.enabled
@@ -75,12 +76,6 @@ def test_v37_keeps_v36_transaction_corridor_and_repairs_liveness_plane() -> None
     assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
     assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
     assert transaction.replay_byte_capacity == 1_073_741_824
-    explorer = config.transaction_exploration
-    assert explorer == v36.transaction_exploration
-    assert explorer.enabled
-    assert explorer.operations == ("remove", "upgrade")
-    assert explorer.entry_epsilon_floor == pytest.approx(0.50)
-    assert explorer.completion_guidance_probability == pytest.approx(0.95)
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == "sts2-run-survival-efficiency-v7"
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget == 64
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap == pytest.approx(0.40)

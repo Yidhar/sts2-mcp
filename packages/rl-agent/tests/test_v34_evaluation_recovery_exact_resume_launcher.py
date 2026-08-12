@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts/launch_v34_evaluation_recovery_exact_resume.py"
@@ -63,7 +63,7 @@ def _summary(paths: Any) -> dict[str, Any]:
 def test_v34_recovery_restores_the_same_recipe_to_original_horizon(
     tmp_path: Path,
 ) -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
     paths = _paths(tmp_path)
     command = launcher.build_resume_trainer_command(paths)
 

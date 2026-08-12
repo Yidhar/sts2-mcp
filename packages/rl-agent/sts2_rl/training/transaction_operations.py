@@ -28,9 +28,7 @@ class TransactionOperationSpec:
 
     name: str
     aliases: frozenset[str]
-    exploration_enabled: bool
     opens_selection_lifecycle: bool
-    requires_completion_guidance: bool
 
     def __post_init__(self) -> None:
         normalized_name = _normalize_operation_text(self.name)
@@ -45,10 +43,6 @@ class TransactionOperationSpec:
             raise ValueError(
                 "transaction operation aliases must be normalized and include the name"
             )
-        if self.requires_completion_guidance and not self.opens_selection_lifecycle:
-            raise ValueError(
-                "completion guidance is valid only for selection lifecycles"
-            )
 
 
 TRANSACTION_OPERATION_SPECS: Final[tuple[TransactionOperationSpec, ...]] = (
@@ -57,9 +51,7 @@ TRANSACTION_OPERATION_SPECS: Final[tuple[TransactionOperationSpec, ...]] = (
         aliases=frozenset(
             {"forge", "open_upgrade_selection", "smith", "upgrade"}
         ),
-        exploration_enabled=True,
         opens_selection_lifecycle=True,
-        requires_completion_guidance=True,
     ),
     TransactionOperationSpec(
         name="remove",
@@ -71,69 +63,51 @@ TRANSACTION_OPERATION_SPECS: Final[tuple[TransactionOperationSpec, ...]] = (
                 "remove_card",
             }
         ),
-        exploration_enabled=True,
         opens_selection_lifecycle=True,
-        requires_completion_guidance=True,
     ),
     TransactionOperationSpec(
         name="reward_take",
         aliases=frozenset({"add_card", "reward_take", "take_card_reward"}),
-        exploration_enabled=False,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="reward_skip",
         aliases=frozenset(
             {"reward_skip", "skip_card_reward", "skip_reward"}
         ),
-        exploration_enabled=True,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="card_purchase",
         aliases=frozenset({"card_purchase", "purchase_card"}),
-        exploration_enabled=False,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="relic_purchase",
         aliases=frozenset({"purchase_relic", "relic_purchase"}),
-        exploration_enabled=True,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="potion_purchase",
         aliases=frozenset({"potion_purchase", "purchase_potion"}),
-        exploration_enabled=False,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="shop_purchase",
         aliases=frozenset({"purchase_item", "shop_purchase"}),
-        exploration_enabled=False,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     TransactionOperationSpec(
         name="shop_leave",
         aliases=frozenset({"leave_shop", "shop_leave", "shop_skip"}),
-        exploration_enabled=True,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
     # Rest/heal is not behavior-side scaffolding.  It is registered so replay
     # can give it the same factual next-rest/Act option-Q contract as forge.
     TransactionOperationSpec(
         name="rest",
         aliases=frozenset({"heal", "rest", "sleep"}),
-        exploration_enabled=False,
         opens_selection_lifecycle=False,
-        requires_completion_guidance=False,
     ),
 )
 
@@ -149,18 +123,10 @@ for _spec in TRANSACTION_OPERATION_SPECS:
                 f"transaction operation alias {_alias!r} is ambiguous"
             )
 
-TRANSACTION_EXPLORATION_OPERATIONS: Final[frozenset[str]] = frozenset(
-    spec.name for spec in TRANSACTION_OPERATION_SPECS if spec.exploration_enabled
-)
 TRANSACTION_SELECTION_OPERATIONS: Final[frozenset[str]] = frozenset(
     spec.name
     for spec in TRANSACTION_OPERATION_SPECS
     if spec.opens_selection_lifecycle
-)
-TRANSACTION_GUIDANCE_OPERATIONS: Final[frozenset[str]] = frozenset(
-    spec.name
-    for spec in TRANSACTION_OPERATION_SPECS
-    if spec.requires_completion_guidance
 )
 TRANSACTION_LIFECYCLE_OPERATIONS: Final[frozenset[str]] = frozenset(
     spec.name for spec in TRANSACTION_OPERATION_SPECS
@@ -182,8 +148,6 @@ def transaction_operation_spec(value: object) -> TransactionOperationSpec | None
 
 
 __all__ = [
-    "TRANSACTION_EXPLORATION_OPERATIONS",
-    "TRANSACTION_GUIDANCE_OPERATIONS",
     "TRANSACTION_LIFECYCLE_OPERATIONS",
     "TRANSACTION_OPERATION_SPECS",
     "TRANSACTION_SELECTION_OPERATIONS",

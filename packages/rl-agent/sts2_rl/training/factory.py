@@ -256,24 +256,6 @@ def build_training_resources(
             episodic_learning_enabled=config.episodic_learning.enabled,
             failure_credit_shadow_enabled=(config.failure_credit.mode == "shadow"),
             failure_credit_learning_enabled=(config.failure_credit.learning_enabled),
-            selection_surface_epsilon_floor=(
-                config.curriculum.selection_surface_epsilon_floor
-            ),
-            transaction_exploration_operations=(
-                config.transaction_exploration.operations
-                if config.transaction_exploration.enabled
-                else ()
-            ),
-            transaction_entry_epsilon_floor=(
-                config.transaction_exploration.entry_epsilon_floor
-                if config.transaction_exploration.enabled
-                else 0.0
-            ),
-            transaction_completion_guidance_probability=(
-                config.transaction_exploration.completion_guidance_probability
-                if config.transaction_exploration.enabled
-                else 0.0
-            ),
             failure_credit_pipeline_config=FailureCreditPipelineConfig(
                 detector_window_steps=max(
                     config.diagnostics.deadlock_window,

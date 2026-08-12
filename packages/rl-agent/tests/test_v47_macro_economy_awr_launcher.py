@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import CONFIG_VERSION, load_training_config
+from sts2_rl.training import CONFIG_VERSION
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v47_macro_economy_awr_model_init.py"
@@ -55,9 +56,9 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v47_recipe_is_factual_isolated_macro_awr() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
     tx = config.transaction_learning
-    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v19"
+    assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert tx.enabled is True
     assert tx.lifecycle_smdp_horizon == "next_resource_opportunity"
     assert tx.lifecycle_advantage_policy_weight == 0.0
@@ -66,9 +67,6 @@ def test_v47_recipe_is_factual_isolated_macro_awr() -> None:
     assert tx.macro_option_actor_weight == pytest.approx(0.03)
     assert tx.macro_option_group_completion_weight == pytest.approx(0.05)
     assert tx.macro_option_actor_temperature == pytest.approx(0.25)
-    assert config.transaction_exploration.operations == ("reward_skip", "shop_leave")
-    assert config.transaction_exploration.entry_epsilon_floor == pytest.approx(0.10)
-    assert config.transaction_exploration.completion_guidance_probability == 0.0
     assert set(config.episodic_learning.success_imitation_exempt_surfaces) == {
         "rest_site",
         "shop",
