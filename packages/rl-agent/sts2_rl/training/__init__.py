@@ -69,8 +69,6 @@ from .learner import (
     VTraceLearner,
     compile_liveness_label_manifest,
     liveness_credit_losses,
-    one_sided_policy_support_loss,
-    two_sided_policy_support_loss,
 )
 from .pipeline import ActorLearnerPipeline
 from .runtime import (
@@ -82,18 +80,14 @@ from .runtime import (
 )
 from .transaction import (
     BoundedTransactionReplay,
-    FactualTransactionPolicyTarget,
     ObservedTransactionPair,
     TransactionEffect,
     TransactionLifecycleEvidence,
     TransactionLifecycleOutcome,
     TransactionOutcome,
-    TransactionPolicyTarget,
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
-    factual_transaction_group_policy_steps,
-    factual_transaction_policy_targets,
     observed_outcome_pairs,
 )
 
@@ -119,7 +113,6 @@ __all__ = [
     "EpisodicReplaySample",
     "EpisodicReplaySampleDiagnostics",
     "EvaluationGateState",
-    "FactualTransactionPolicyTarget",
     "FailureCreditConfig",
     "GroundedCollector",
     "HorizonTargets",
@@ -144,7 +137,6 @@ __all__ = [
     "TransactionLifecycleEvidence",
     "TransactionLifecycleOutcome",
     "TransactionOutcome",
-    "TransactionPolicyTarget",
     "TransactionStep",
     "TransactionTrace",
     "VTraceLearner",
@@ -159,15 +151,12 @@ __all__ = [
     "evaluate_policy",
     "evaluation_gate_state_from_metadata",
     "exploration_epsilon",
-    "factual_transaction_group_policy_steps",
-    "factual_transaction_policy_targets",
     "initialize_model_from_checkpoint",
     "inspect_baseline",
     "liveness_credit_losses",
     "load_training_checkpoint",
     "load_training_config",
     "observed_outcome_pairs",
-    "one_sided_policy_support_loss",
     "preflight_model_initialization",
     "preflight_training_checkpoint",
     "resolve_device",
@@ -177,5 +166,4 @@ __all__ = [
     "summarize_evaluation",
     "training_config_from_mapping",
     "training_schedule_state_from_metadata",
-    "two_sided_policy_support_loss",
 ]

@@ -33,13 +33,10 @@ from sts2_rl.training import (
     TransactionLifecycleEvidence,
     TransactionLifecycleOutcome,
     TransactionOutcome,
-    TransactionPolicyTarget,
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
     build_training_resources,
-    factual_transaction_group_policy_steps,
-    factual_transaction_policy_targets,
     initialize_model_from_checkpoint,
     load_training_checkpoint,
     observed_outcome_pairs,
@@ -1097,131 +1094,7 @@ def test_transaction_liveness_policy_identity_is_an_atomic_pair(
         )
 
 
-@pytest.mark.parametrize(
-    ("surface", "steps"),
-    (
-        (
-            "fixed-multiselect-auto-submit",
-            (
-                ("empty", "one", "select:first", 0, TransactionEffect.MOVE),
-                ("one", "exit", "select:second", 1, TransactionEffect.EXIT),
-            ),
-        ),
-        (
-            "manual-confirm-discard",
-            (
-                ("empty", "one", "select:discard", 0, TransactionEffect.MOVE),
-                ("one", "exit", "confirm", 1, TransactionEffect.EXIT),
-            ),
-        ),
-        (
-            "optional-cancel-transform",
-            (("empty", "exit", "cancel_prompt", 1, TransactionEffect.EXIT),),
-        ),
-        (
-            "manual-confirm-remove-duplicate-card",
-            (
-                ("empty", "one", "select:duplicate-copy", 0, TransactionEffect.MOVE),
-                ("one", "exit", "confirm", 1, TransactionEffect.EXIT),
-            ),
-        ),
-    ),
-)
-def test_completed_transaction_paths_prefer_factual_actions_generically(
-    surface: str,
-    steps: tuple[tuple[str, str, str, int, TransactionEffect], ...],
-) -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    trace = _sequence_trace(
-        _snapshot(encoding),
-        trace_id=surface,
-        outcome=TransactionOutcome.COMPLETED,
-        steps=steps,
-    )
-
-    labels = factual_transaction_policy_targets(trace)
-
-    assert [label.step_index for label in labels] == list(range(len(steps)))
-    assert all(label.target is TransactionPolicyTarget.PREFER for label in labels)
-
-
-def test_exact_transaction_cycle_is_avoided_but_corrective_deselect_is_preferred() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    snapshot = _snapshot(encoding)
-    cycle = _sequence_trace(
-        snapshot,
-        trace_id="select-deselect-cycle",
-        outcome=TransactionOutcome.DEADLOCK,
-        steps=(
-            ("empty", "selected", "select:a", 0, TransactionEffect.MOVE),
-            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-            ("empty", "selected", "select:a", 0, TransactionEffect.REVISIT),
-            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-        ),
-    )
-    corrected = _sequence_trace(
-        snapshot,
-        trace_id="corrected-selection",
-        outcome=TransactionOutcome.COMPLETED,
-        steps=(
-            ("empty", "wrong", "select:wrong", 0, TransactionEffect.MOVE),
-            ("wrong", "empty", "deselect:wrong", 1, TransactionEffect.REVISIT),
-            ("empty", "right", "select:right", 1, TransactionEffect.MOVE),
-            ("right", "exit", "confirm", 0, TransactionEffect.EXIT),
-        ),
-    )
-
-    cycle_labels = factual_transaction_policy_targets(cycle)
-    corrected_labels = factual_transaction_policy_targets(corrected)
-
-    assert len(cycle_labels) == 4
-    assert all(label.target is TransactionPolicyTarget.AVOID for label in cycle_labels)
-    assert {label.step_index: label.target for label in corrected_labels} == {
-        0: TransactionPolicyTarget.AVOID,
-        1: TransactionPolicyTarget.PREFER,
-        2: TransactionPolicyTarget.PREFER,
-        3: TransactionPolicyTarget.PREFER,
-    }
-
-
-def test_unique_moving_deadlock_has_no_invented_last_action_policy_blame() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    trace = _sequence_trace(
-        _snapshot(encoding),
-        trace_id="combat-no-net-progress",
-        outcome=TransactionOutcome.DEADLOCK,
-        steps=(
-            ("combat-1", "combat-2", "play:a", 0, TransactionEffect.MOVE),
-            ("combat-2", "combat-3", "end-turn", 1, TransactionEffect.MOVE),
-            ("combat-3", "combat-4", "end-turn", 1, TransactionEffect.MOVE),
-        ),
-    )
-
-    # The window proves that the trajectory failed, but all transitions are
-    # unique moves. The final action merely crossed a delayed threshold and is
-    # not factual evidence that this particular action caused the failure.
-    assert factual_transaction_policy_targets(trace) == ()
-
-
-def test_forced_recurrent_deadlock_keeps_value_credit_without_policy_blame() -> None:
+def test_forced_recurrent_deadlock_keeps_value_credit() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(
         config,
@@ -1249,102 +1122,9 @@ def test_forced_recurrent_deadlock_keeps_value_credit_without_policy_blame() -> 
         episode_discounts=(1.0, 0.0),
         authoritative_outcome=True,
     )
-    # The failure remains a factual return/Q target, but an AVOID label would
-    # be undefined because the actor had no alternative legal candidate.
+    # The failure remains a factual return/Q target even though the actor had
+    # no alternative legal candidate.
     assert all(step.q_observed for step in credited.steps)
-    assert factual_transaction_policy_targets(credited) == ()
-
-
-def test_transaction_liveness_targets_directly_update_policy_head() -> None:
-    model_config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        model_config,
-        max_world_tokens=8,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    snapshot = _snapshot(encoding)
-
-    def optimize_probability(*, completed: bool) -> tuple[float, float]:
-        torch.manual_seed(9)
-        model = RecurrentCandidateModel(
-            model_config,
-            enable_transaction_heads=True,
-        )
-        learner = VTraceLearner(
-            model=model,
-            encoder=GroundedObservationEncoder(encoding),
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.05),
-            config=TrainingConfig().optimization,
-            maximum_unroll_length=4,
-            maximum_policy_lag=10,
-            transaction_config=TransactionLearningConfig(
-                enabled=True,
-                replay_byte_capacity=10_000_000,
-                burn_in_steps=0,
-                pairwise_ranking_weight=0.0,
-            ),
-        )
-        if completed:
-            trace = _sequence_trace(
-                snapshot,
-                trace_id="completed-policy",
-                outcome=TransactionOutcome.COMPLETED,
-                steps=(("node", "exit", "confirm", 0, TransactionEffect.EXIT),),
-            )
-        else:
-            trace = _sequence_trace(
-                snapshot,
-                trace_id="cycle-policy",
-                outcome=TransactionOutcome.DEADLOCK,
-                steps=(
-                    ("node", "next", "deselect", 0, TransactionEffect.REVISIT),
-                    ("node", "next", "deselect", 0, TransactionEffect.REVISIT),
-                ),
-            )
-
-        def probability() -> float:
-            encoded = learner.encoder.collate_snapshots((snapshot,))
-            with torch.no_grad():
-                logits = model(encoded).policy_logits
-            return float(torch.softmax(logits, dim=-1)[0, 0].item())
-
-        before = probability()
-        losses = learner._transaction_losses((trace,))
-        learner.optimizer.zero_grad(set_to_none=True)
-        losses.completion_policy_loss.backward()
-        policy_gradients = [
-            parameter.grad
-            for name, parameter in model.named_parameters()
-            if name.startswith("policy_head.") and parameter.grad is not None
-        ]
-        assert policy_gradients
-        assert any(bool(torch.count_nonzero(gradient)) for gradient in policy_gradients)
-        learner.optimizer.step()
-        return before, probability()
-
-    completed_before, completed_after = optimize_probability(completed=True)
-    cycle_before, cycle_after = optimize_probability(completed=False)
-
-    assert completed_after > completed_before
-    assert cycle_after < cycle_before
-
-
-def test_censored_transaction_has_no_liveness_policy_target() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    trace = _sequence_trace(
-        _snapshot(encoding),
-        trace_id="censored",
-        outcome=TransactionOutcome.CENSORED,
-        steps=(("node", "next", "select", 0, TransactionEffect.MOVE),),
-    )
-    assert factual_transaction_policy_targets(trace) == ()
 
 
 def test_transaction_heads_are_opt_in_and_candidate_equivariant() -> None:
@@ -1505,176 +1285,6 @@ def test_replay_retains_and_samples_sparse_deadlock_traces_first() -> None:
         assert "deadlock" in sampled_ids
 
 
-def test_replay_retains_and_always_samples_sparse_factual_avoid_trace() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=8,
-        max_candidate_local_tokens=4,
-    )
-    snapshot = _snapshot(encoding)
-    actionable_cycle = _sequence_trace(
-        snapshot,
-        trace_id="actionable-cycle",
-        outcome=TransactionOutcome.DEADLOCK,
-        steps=(
-            ("empty", "selected", "select:a", 0, TransactionEffect.MOVE),
-            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-            ("empty", "selected", "select:a", 0, TransactionEffect.REVISIT),
-            ("selected", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-        ),
-    )
-    label_free_deadlocks = tuple(
-        _sequence_trace(
-            snapshot,
-            trace_id=f"unique-moving-deadlock-{index}",
-            outcome=TransactionOutcome.DEADLOCK,
-            steps=(
-                (
-                    f"unique-{index}-before",
-                    f"unique-{index}-after",
-                    f"move:{index}",
-                    index % 2,
-                    TransactionEffect.MOVE,
-                ),
-            ),
-        )
-        for index in range(8)
-    )
-    assert any(
-        label.target is TransactionPolicyTarget.AVOID for label in factual_transaction_policy_targets(actionable_cycle)
-    )
-    assert all(factual_transaction_policy_targets(trace) == () for trace in label_free_deadlocks)
-
-    replay = BoundedTransactionReplay(
-        capacity=4,
-        byte_capacity=10_000_000,
-        seed=23,
-    )
-    assert replay.put(actionable_cycle)
-    assert all(replay.put(trace) for trace in label_free_deadlocks)
-
-    # Once every retained item is a deadlock, ordinary deadlock stratification
-    # alone would evict and then almost never sample the one trace that can
-    # actually update the policy.  The derived factual-AVOID stratum preserves
-    # it without inspecting select/deselect action names.
-    assert "actionable-cycle" in {trace.trace_id for trace in replay.snapshot()}
-    assert replay.sample(1)[0].trace_id == "actionable-cycle"
-    for _ in range(16):
-        sampled = replay.sample(2)
-        assert any(
-            label.target is TransactionPolicyTarget.AVOID
-            for trace in sampled
-            for label in factual_transaction_policy_targets(trace)
-        )
-
-    restored = BoundedTransactionReplay(
-        capacity=replay.capacity,
-        byte_capacity=replay.byte_capacity,
-        seed=999,
-    )
-    restored.load_state_dict(replay.state_dict())
-    assert restored.sample(1)[0].trace_id == "actionable-cycle"
-
-
-def test_coarse_policy_keys_credit_repeated_event_action_without_merging_q_nodes() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=8,
-        max_candidate_local_tokens=4,
-    )
-    snapshot = _snapshot(encoding)
-    trace = TransactionTrace(
-        trace_id="vitality-event-cycle",
-        episode_id="episode-vitality-event-cycle",
-        surface_key="event-liveness",
-        start_step=0,
-        policy_version=0,
-        initial_recurrent_state=np.zeros(32, dtype=np.float32),
-        steps=tuple(
-            TransactionStep(
-                snapshot=snapshot,
-                action_index=0,
-                node_key=f"exact-q-node-{index}",
-                next_node_key=f"exact-q-node-{index + 1}",
-                action_fingerprint=f"exact-action-with-preview-{index}",
-                effect=TransactionEffect.MOVE,
-                selected_count_delta=0,
-                transaction_return=-1.0,
-                return_steps=4 - index,
-                policy_node_key=f"page-{index % 2}",
-                policy_action_fingerprint="event-option-zero",
-            )
-            for index in range(4)
-        ),
-        outcome=TransactionOutcome.DEADLOCK,
-    )
-
-    assert len({step.node_key for step in trace.steps}) == 4
-    labels = factual_transaction_policy_targets(trace)
-    assert len(labels) == 4
-    assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
-    assert all(trace.steps[label.step_index].action_index == 0 for label in labels)
-
-
-def test_event_deadlock_avoids_only_repeated_pair_not_one_off_corrective_revisit() -> None:
-    config = _model_config()
-    encoding = GroundedEncodingConfig.from_model_config(
-        config,
-        max_world_tokens=8,
-        max_candidates=8,
-        max_candidate_local_tokens=4,
-    )
-    snapshot = _snapshot(encoding)
-    corrective = TransactionStep(
-        snapshot=snapshot,
-        action_index=1,
-        node_key="selection-wrong-card",
-        next_node_key="selection-empty",
-        action_fingerprint="deselect:wrong-card",
-        effect=TransactionEffect.REVISIT,
-        selected_count_delta=-1,
-        transaction_return=-1.0,
-        return_steps=4,
-    )
-    repeated = tuple(
-        TransactionStep(
-            snapshot=snapshot,
-            action_index=0,
-            node_key=f"exact-event-q-node-{index}",
-            next_node_key=f"exact-event-q-node-{index + 1}",
-            action_fingerprint=f"exact-event-option-{index}",
-            effect=TransactionEffect.MOVE,
-            selected_count_delta=0,
-            transaction_return=-1.0,
-            return_steps=3 - index,
-            policy_node_key="event-page-linger",
-            policy_action_fingerprint="event-option:linger",
-        )
-        for index in range(3)
-    )
-    trace = TransactionTrace(
-        trace_id="corrective-before-event-cycle",
-        episode_id="episode-corrective-before-event-cycle",
-        surface_key="global-event-liveness",
-        start_step=0,
-        policy_version=0,
-        initial_recurrent_state=np.zeros(32, dtype=np.float32),
-        steps=(corrective, *repeated),
-        outcome=TransactionOutcome.DEADLOCK,
-    )
-
-    labels = factual_transaction_policy_targets(trace)
-    assert {label.step_index for label in labels} == {1, 2, 3}
-    assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
-    assert all(
-        trace.steps[label.step_index].effective_policy_action_fingerprint == "event-option:linger" for label in labels
-    )
-
-
 def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(
@@ -1757,7 +1367,7 @@ def test_replay_reserves_one_committed_lifecycle_per_operation_after_restore() -
     } == {"upgrade", "remove", "rest"}
 
 
-def test_replay_samples_all_available_selection_structure_strata_after_restore() -> None:
+def test_replay_restore_preserves_exact_sampling_stream_after_churn() -> None:
     config = _model_config()
     encoding = GroundedEncodingConfig.from_model_config(
         config,
@@ -1766,115 +1376,27 @@ def test_replay_samples_all_available_selection_structure_strata_after_restore()
         max_candidate_local_tokens=4,
     )
     snapshot = _snapshot(encoding)
-
-    def with_deltas(
-        trace: TransactionTrace,
-        deltas: tuple[int, ...],
-    ) -> TransactionTrace:
-        assert len(trace.steps) == len(deltas)
-        return replace(
-            trace,
-            steps=tuple(
-                replace(step, selected_count_delta=delta) for step, delta in zip(trace.steps, deltas, strict=True)
+    templates = tuple(
+        _sequence_trace(
+            snapshot,
+            trace_id=f"template-{index}",
+            outcome=(TransactionOutcome.DEADLOCK if index == 0 else TransactionOutcome.COMPLETED),
+            steps=(
+                ("empty", "one", f"select:{index}", 0, TransactionEffect.MOVE),
+                ("one", "exit", "confirm", 1, TransactionEffect.EXIT),
             ),
         )
+        for index in range(3)
+    )
 
-    cycle = with_deltas(
-        _sequence_trace(
-            snapshot,
-            trace_id="selection-cycle",
-            outcome=TransactionOutcome.DEADLOCK,
-            steps=(
-                ("empty", "one", "select:a", 0, TransactionEffect.MOVE),
-                ("one", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-                ("empty", "one", "select:a", 0, TransactionEffect.REVISIT),
-                ("one", "empty", "deselect:a", 1, TransactionEffect.REVISIT),
-            ),
-        ),
-        (1, -1, 1, -1),
-    )
-    monotonic = with_deltas(
-        _sequence_trace(
-            snapshot,
-            trace_id="selection-monotonic",
-            outcome=TransactionOutcome.COMPLETED,
-            steps=(
-                ("empty-m", "one-m", "select:m1", 0, TransactionEffect.MOVE),
-                ("one-m", "exit-m", "select:m2", 1, TransactionEffect.EXIT),
-            ),
-        ),
-        (1, 1),
-    )
-    corrective = with_deltas(
-        _sequence_trace(
-            snapshot,
-            trace_id="selection-corrective",
-            outcome=TransactionOutcome.COMPLETED,
-            steps=(
-                ("empty-c", "wrong-c", "select:wrong", 0, TransactionEffect.MOVE),
-                ("wrong-c", "empty-c", "deselect:wrong", 1, TransactionEffect.REVISIT),
-                ("empty-c", "right-c", "select:right1", 0, TransactionEffect.MOVE),
-                ("right-c", "exit-c", "select:right2", 1, TransactionEffect.EXIT),
-            ),
-        ),
-        (1, -1, 1, 1),
-    )
-    ordinary = tuple(
-        _trace(
-            snapshot,
-            trace_id=f"ordinary-{index}",
-            action_index=index % 2,
-            action_fingerprint=f"ordinary:{index}",
-            effect=TransactionEffect.EXIT,
-            transaction_return=1.0,
-            outcome=TransactionOutcome.COMPLETED,
-        )
-        for index in range(12)
-    )
-    replay = BoundedTransactionReplay(
-        capacity=32,
-        byte_capacity=50_000_000,
-        seed=29,
-    )
-    for trace in (*ordinary, cycle, monotonic, corrective):
-        assert replay.put(trace)
-
-    metrics = replay.metrics()
-    assert metrics["selection_cycle_size"] == 1
-    assert metrics["selection_monotonic_completion_size"] == 1
-    assert metrics["selection_corrective_completion_size"] == 1
-    for _ in range(8):
-        sampled_ids = {trace.trace_id for trace in replay.sample(6)}
-        assert {
-            "selection-cycle",
-            "selection-monotonic",
-            "selection-corrective",
-        } <= sampled_ids
-
-    restored = BoundedTransactionReplay(
-        capacity=replay.capacity,
-        byte_capacity=replay.byte_capacity,
-        seed=999,
-    )
-    restored.load_state_dict(replay.state_dict())
-    assert restored.metrics() == replay.metrics()
-    restored_ids = {trace.trace_id for trace in restored.sample(6)}
-    assert {
-        "selection-cycle",
-        "selection-monotonic",
-        "selection-corrective",
-    } <= restored_ids
-
-    # Reconstructing derived stratum sets after eviction must not change the
-    # mapping from checkpointed RNG indices to replay items.  Iterating a set
-    # here would make exact resume diverge because the live set has deletion/
-    # resize history while the restored set is freshly allocated.
+    # Reconstructing derived committed-lifecycle sets after eviction must not
+    # change the mapping from checkpointed RNG indices to replay items, so a
+    # restored replay must reproduce the exact sampling stream.
     churned = BoundedTransactionReplay(
         capacity=16,
         byte_capacity=50_000_000,
         seed=31,
     )
-    templates = (cycle, monotonic, corrective)
     for index in range(100):
         template = templates[index % len(templates)]
         assert churned.put(
@@ -1896,6 +1418,54 @@ def test_replay_samples_all_available_selection_structure_strata_after_restore()
         expected_ids = tuple(trace.trace_id for trace in churned.sample(8))
         restored_ids = tuple(trace.trace_id for trace in churned_restored.sample(8))
         assert restored_ids == expected_ids
+
+
+def test_replay_load_refuses_retired_v7_protection_counter_payload() -> None:
+    config = _model_config()
+    encoding = GroundedEncodingConfig.from_model_config(
+        config,
+        max_world_tokens=8,
+        max_candidates=8,
+        max_candidate_local_tokens=4,
+    )
+    snapshot = _snapshot(encoding)
+    replay = BoundedTransactionReplay(
+        capacity=4,
+        byte_capacity=10_000_000,
+        seed=7,
+    )
+    assert replay.put(
+        _trace(
+            snapshot,
+            trace_id="live",
+            action_index=0,
+            action_fingerprint="confirm",
+            effect=TransactionEffect.EXIT,
+            transaction_return=1.0,
+            outcome=TransactionOutcome.COMPLETED,
+        )
+    )
+    payload = replay.state_dict()
+    assert payload["version"] == "sts2-transaction-replay-v8"
+
+    target = BoundedTransactionReplay(
+        capacity=replay.capacity,
+        byte_capacity=replay.byte_capacity,
+        seed=99,
+    )
+    # A pre-v8 payload carries the retired replay version string; it must
+    # fail closed rather than be reinterpreted under the new protection
+    # semantics.
+    legacy_version = {**payload, "version": "sts2-transaction-replay-v7"}
+    with pytest.raises(ValueError, match="unsupported transaction replay checkpoint schema"):
+        target.load_state_dict(legacy_version)
+    # Extra retired counter keys change the payload shape and must also fail
+    # closed instead of being silently ignored.
+    legacy_shape = {**payload, "actionable_avoid_trace_ids": ("live",)}
+    with pytest.raises(ValueError, match="unsupported transaction replay checkpoint schema"):
+        target.load_state_dict(legacy_shape)
+    target.load_state_dict(payload)
+    assert {trace.trace_id for trace in target.snapshot()} == {"live"}
 
 
 def test_pairwise_labels_require_same_node_distinct_factual_actions() -> None:
@@ -2114,7 +1684,6 @@ def test_selection_option_targets_start_at_each_selected_card_not_macro_entry() 
     assert credited.steps[0].option_return is None
     assert credited.steps[2].option_return is None
     assert credited.steps[4].option_return is None
-    assert factual_transaction_group_policy_steps(credited) == (1, 3)
 
 
 def test_option_advantage_bridge_moves_saturated_actor_in_both_directions() -> None:
@@ -2513,7 +2082,7 @@ def test_transaction_burn_in_recomputes_context_and_excludes_it_from_labels() ->
         )
 
 
-def test_learner_uses_factual_heads_pairwise_and_direct_policy_targets() -> None:
+def test_learner_uses_factual_heads_and_pairwise_targets() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
         model_config,
@@ -2602,10 +2171,6 @@ def test_learner_uses_factual_heads_pairwise_and_direct_policy_targets() -> None
     assert metrics.transaction_delta_loss > 0.0
     assert metrics.transaction_q_loss > 0.0
     assert metrics.transaction_pairwise_ranking_loss > 0.0
-    assert metrics.transaction_completion_policy_loss > 0.0
-    assert metrics.transaction_policy_labels == 1
-    assert metrics.transaction_policy_preferred_labels == 1
-    assert metrics.transaction_policy_avoided_labels == 0
 
 
 def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> None:
@@ -2640,7 +2205,6 @@ def test_training_collector_emits_factual_trace_but_evaluation_does_not() -> Non
         assert trace.burn_in_steps == 0
         assert trace.outcome is TransactionOutcome.CENSORED
         assert all(not step.q_observed for step in trace.learn_steps)
-        assert factual_transaction_policy_targets(trace) == ()
 
         evaluation_episode = resources.collector.collect_episode(
             record=False,
@@ -2717,11 +2281,9 @@ def test_training_only_greedy_liveness_probe_records_delta_behavior_without_fals
         assert rollout_steps[-1].discount == 0.0
         assert rollout_steps[-1].policy_decision is False
         # A training probe still records the bounded diagnostic trace, but a
-        # unique MOVE-only window supplies neither factual Q authority nor
-        # action-level blame.
+        # unique MOVE-only window supplies no factual Q authority.
         assert all(step.effect is TransactionEffect.MOVE for step in trace.learn_steps)
         assert all(not step.q_observed for step in trace.learn_steps)
-        assert factual_transaction_policy_targets(trace) == ()
 
         with pytest.raises(ValueError, match="recorded training"):
             resources.collector.collect_episode(
@@ -2790,11 +2352,9 @@ def test_unique_liveness_trace_keeps_value_prefix_without_invented_policy_blame(
         assert trace.burn_in_steps == 0
         assert len(trace.steps) == 1
         assert np.count_nonzero(trace.steps[0].snapshot.action_mask) == 2
-        # This preserves the last learnable prefix for value/Q reconstruction,
-        # but MOVE-only delayed-window evidence cannot identify that action as
-        # the cause of the later stall.
+        # This preserves the last learnable prefix for value/Q reconstruction;
+        # MOVE-only delayed-window evidence carries no factual Q authority.
         assert all(not step.q_observed for step in trace.learn_steps)
-        assert factual_transaction_policy_targets(trace) == ()
     finally:
         resources.close()
 
@@ -2849,10 +2409,8 @@ def test_long_selection_failure_trace_is_bounded_to_burn_in_plus_learning_tail()
         assert trace.burn_in_steps <= 4
         assert len(trace.learn_steps) <= 32
         assert len(trace.steps) <= 36
-        # The bounded trace is still retained, but this preview sequence has no
-        # exact repeated node/action evidence and therefore no AVOID label.
+        # The bounded trace is still retained without factual Q authority.
         assert all(not step.q_observed for step in trace.learn_steps)
-        assert factual_transaction_policy_targets(trace) == ()
     finally:
         resources.close()
 
@@ -2985,137 +2543,6 @@ def test_external_policy_burn_in_does_not_make_forced_selection_cycle_authoritat
         assert all(np.count_nonzero(step.snapshot.action_mask) == 1 for step in trace.learn_steps)
         assert trace.outcome is TransactionOutcome.CENSORED
         assert all(not step.q_observed for step in trace.steps)
-        assert factual_transaction_policy_targets(trace) == ()
-    finally:
-        resources.close()
-
-
-def test_event_reopen_cycle_censors_local_completion_and_avoids_bad_confirm() -> None:
-    from tests.test_v2_training_pipeline import (  # local import avoids fixture coupling
-        DynamicPreviewLoopBackend,
-        _event_loop_config,
-    )
-
-    class ConfirmThenForcedReopenBackend(DynamicPreviewLoopBackend):
-        """A bad confirm locally exits, then a forced page reopens the prompt."""
-
-        @staticmethod
-        def _card() -> dict[str, object]:
-            return {
-                "id": "CARD.STRIKE",
-                "instance_id": "selected-strike",
-                "source_pile": "Discard",
-            }
-
-        def _actions(self) -> tuple[dict[str, object], ...]:
-            if self._step % 2:
-                return (
-                    {
-                        "action_handle": f"forced-reopen:{self._step}",
-                        "action": "choose_event_option",
-                        "kind": "choose_event_option",
-                        "model_action_kind": "event_option",
-                        "transport_kind": "event_option",
-                        "index": 0,
-                    },
-                )
-            return (
-                {
-                    "action_handle": f"bad-confirm:{self._step}",
-                    "action": "confirm_selection",
-                    "kind": "confirm_selection",
-                    "model_action_kind": "card_selection",
-                    "model_action_variant": "confirm",
-                    "selection_operation": "confirm",
-                },
-                {
-                    "action_handle": f"cancel:{self._step}",
-                    "action": "cancel_selection",
-                    "kind": "cancel_selection",
-                    "model_action_kind": "card_selection",
-                    "model_action_variant": "cancel_prompt",
-                    "selection_operation": "cancel_prompt",
-                },
-            )
-
-        def _observation(self, *, terminal: bool = False) -> dict[str, object]:
-            observation = super()._observation(terminal=terminal)
-            observation["phase"] = "selection" if self._step % 2 == 0 else "event"
-            observation["state_type"] = "card_select" if self._step % 2 == 0 else "event"
-            observation["screen"] = "SELECTION" if self._step % 2 == 0 else "EVENT"
-            event = observation["event"]
-            assert isinstance(event, dict)
-            event["event_id"] = "EVENT.REOPEN_SELECTION"
-            event["description_key"] = "EVENT.REOPEN_SELECTION.pages.LOOP"
-            event["dynamic_vars"] = []
-            if self._step % 2:
-                observation.pop("card_selection", None)
-                return observation
-            card = self._card()
-            observation["card_selection"] = {
-                "mode": "SimpleGrid",
-                "prompt_id": "event.REOPEN_SELECTION.confirm",
-                "operation_type": "select",
-                "source_zone": "Discard",
-                "min_select": 1,
-                "max_select": 1,
-                "cards": [],
-                "selected_cards": [card],
-                "selected_count": 1,
-                "remaining_picks": 0,
-                "requires_manual_confirmation": True,
-                "can_confirm": True,
-            }
-            return observation
-
-    base = _event_loop_config(durable_window=40)
-    config = replace(
-        base,
-        environment=replace(base.environment, max_episode_steps=40),
-        diagnostics=replace(
-            base.diagnostics,
-            deadlock_window=8,
-            deadlock_repeat_threshold=3,
-            noncombat_durable_progress_window=40,
-        ),
-        transaction_learning=TransactionLearningConfig(
-            enabled=True,
-            replay_capacity=16,
-            replay_byte_capacity=20_000_000,
-            sample_traces=4,
-            burn_in_steps=2,
-        ),
-        episodic_learning=replace(base.episodic_learning, enabled=True),
-    )
-    resources = build_training_resources(
-        config,
-        backend=ConfirmThenForcedReopenBackend(),
-    )
-    try:
-        with torch.no_grad():
-            for parameter in resources.model.parameters():
-                parameter.zero_()
-        episode = resources.collector.collect_episode(record=True, deterministic=True)
-
-        assert episode.metrics.terminal_reason == "noncombat_event_action_cycle"
-        assert episode.metrics.noncombat_event_cycle
-        assert episode.metrics.trusted_policy_failure
-        assert episode.completed_episode is not None
-        assert episode.completed_episode.completion.authoritative
-        assert episode.completed_episode.won is False
-
-        traces = episode.transaction_traces
-        assert any(trace.outcome is TransactionOutcome.CENSORED for trace in traces)
-        assert any(trace.outcome is TransactionOutcome.DEADLOCK for trace in traces)
-        labels = tuple((trace, label) for trace in traces for label in factual_transaction_policy_targets(trace))
-        assert labels
-        assert all(label.target is not TransactionPolicyTarget.PREFER for _, label in labels)
-        avoided = tuple(
-            trace.steps[label.step_index] for trace, label in labels if label.target is TransactionPolicyTarget.AVOID
-        )
-        assert avoided
-        assert all(step.policy_node_key is not None for step in avoided)
-        assert len({step.policy_action_fingerprint for step in avoided}) == 1
     finally:
         resources.close()
 
@@ -3479,7 +2906,7 @@ def test_parameter_initialization_overlay_is_strict_except_for_new_heads() -> No
         )
 
 
-def test_completion_policy_abi_requires_new_lineage_but_keeps_model_initialization_compatible(
+def test_legacy_lineage_version_requires_new_lineage_but_keeps_model_initialization_compatible(
     tmp_path: Path,
 ) -> None:
     config = TrainingConfig()
@@ -3489,9 +2916,6 @@ def test_completion_policy_abi_requires_new_lineage_but_keeps_model_initializati
     )
     legacy_lineage = enabled.lineage_mapping()
     legacy_lineage["version"] = "sts2-relational-curriculum-config-v3"
-    legacy_transaction = dict(legacy_lineage["transaction_learning"])
-    legacy_transaction.pop("completion_policy_weight")
-    legacy_lineage["transaction_learning"] = legacy_transaction
     validated = ValidatedResumeCheckpoint(
         root=tmp_path,
         manifest={},

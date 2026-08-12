@@ -18,7 +18,6 @@ learning_rate = 0.0001
 entropy_weight = 0.006
 entropy_weight_end = 0.004
 entropy_decay_updates = 3000
-entropy_breaker = "policy-collapse-v2"
 
 [rollout]
 queue_capacity = 24
@@ -31,10 +30,7 @@ sample_traces = 4
 burn_in_steps = 32
 effect_weight = 0.05
 transaction_q_weight = 0.05
-completion_policy_weight = 0.15
 pairwise_ranking_weight = 0.0
-lifecycle_entry_support_weight = 0.0
-lifecycle_entry_support_probability_floor = 0.05
 lifecycle_smdp_q_weight = 0.10
 lifecycle_smdp_horizon = "next_resource_opportunity"
 lifecycle_advantage_policy_weight = 0.0
@@ -50,7 +46,6 @@ macro_option_actor_temperature = 0.25
 macro_option_actor_log_weight_clip = 2.0
 macro_option_max_policy_lag = 128
 macro_option_max_log_probability_shift = 2.0
-macro_option_group_completion_weight = 0.05
 
 [failure_credit]
 # Stage-2 collection is unrecorded; no failure-credit evidence is gathered.

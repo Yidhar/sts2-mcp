@@ -64,141 +64,36 @@ def test_entropy_weight_anneals_to_explicit_nonzero_floor() -> None:
     ) == pytest.approx(0.004)
 
 
-def test_one_hot_entropy_breaker_triggers_after_eight_batches_and_resumes_exactly() -> None:
+def test_learner_dynamics_v3_round_trips_and_refuses_retired_breaker_payloads() -> None:
     learner, _ = _learner()
-    learner.config = OptimizationConfig(
-        entropy_weight=0.006,
-        entropy_weight_end=0.004,
-        entropy_decay_updates=3_000,
-        entropy_breaker="one-hot-v1",
-    )
-    ratios = torch.ones(5)
-    clipped = torch.zeros(5)
-    for expected_streak in range(1, 8):
-        weight, active, condition, soft_condition = learner._entropy_weight_for_batch(
-            base_weight=0.004,
-            active_ratios=ratios,
-            clipped=clipped,
-        )
-        assert condition is True
-        assert soft_condition is False
-        assert active is False
-        assert weight == pytest.approx(0.004)
-        assert learner.dynamics_state_dict()["collapse_batch_streak"] == expected_streak
-
-    weight, active, condition, soft_condition = learner._entropy_weight_for_batch(
-        base_weight=0.004,
-        active_ratios=ratios,
-        clipped=clipped,
-    )
-    assert condition is True
-    assert soft_condition is False
-    assert active is True
-    assert weight == pytest.approx(0.012)
     state = learner.dynamics_state_dict()
-    assert state == {
+    assert state == {"version": "sts2-vtrace-learner-dynamics-v3"}
+    assert VTraceLearner.validate_dynamics_state_dict(state) == state
+
+    restored, _ = _learner()
+    restored.load_dynamics_state_dict(state)
+    assert restored.dynamics_state_dict() == state
+
+    # A v2 payload still carries the retired entropy-breaker counters. Exact
+    # resume must refuse it outright rather than silently dropping state.
+    legacy = {
         "version": "sts2-vtrace-learner-dynamics-v2",
         "collapse_batch_streak": 0,
         "entropy_breaker_remaining_updates": 7,
         "entropy_breaker_triggers": 1,
     }
-
-    restored, _ = _learner()
-    restored.config = learner.config
-    restored.load_dynamics_state_dict(state)
-    weight, active, condition, soft_condition = restored._entropy_weight_for_batch(
-        base_weight=0.004,
-        active_ratios=torch.tensor([0.8, 0.9]),
-        clipped=torch.zeros(2),
-    )
-    assert condition is False
-    assert soft_condition is False
-    assert active is True
-    assert weight == pytest.approx(0.012)
-    assert restored.dynamics_state_dict()["entropy_breaker_remaining_updates"] == 6
-
-
-def test_policy_collapse_v2_breaker_detects_soft_entropy_collapse() -> None:
-    learner, _ = _learner()
-    learner.config = OptimizationConfig(
-        entropy_weight=0.006,
-        entropy_weight_end=0.004,
-        entropy_decay_updates=3_000,
-        entropy_breaker="policy-collapse-v2",
-    )
-    ratios = torch.full((32,), 0.8)
-    clipped = torch.zeros(32)
-    collapsed_entropies = torch.full((32,), 0.05)
-    for expected_streak in range(1, 8):
-        weight, active, one_hot, soft = learner._entropy_weight_for_batch(
-            base_weight=0.004,
-            active_ratios=ratios,
-            clipped=clipped,
-            active_normalized_entropies=collapsed_entropies,
+    with pytest.raises(ValueError, match="learner dynamics state keys mismatch"):
+        restored.load_dynamics_state_dict(legacy)
+    # Even a key-stripped v2 payload fails on its version string.
+    with pytest.raises(ValueError, match="unsupported learner dynamics state"):
+        restored.load_dynamics_state_dict(
+            {"version": "sts2-vtrace-learner-dynamics-v2"}
         )
-        assert one_hot is False
-        assert soft is True
-        assert active is False
-        assert weight == pytest.approx(0.004)
-        assert learner.dynamics_state_dict()["collapse_batch_streak"] == expected_streak
-
-    weight, active, one_hot, soft = learner._entropy_weight_for_batch(
-        base_weight=0.004,
-        active_ratios=ratios,
-        clipped=clipped,
-        active_normalized_entropies=collapsed_entropies,
-    )
-    assert one_hot is False
-    assert soft is True
-    assert active is True
-    assert weight == pytest.approx(0.012)
-    assert learner.dynamics_state_dict() == {
-        "version": "sts2-vtrace-learner-dynamics-v2",
-        "collapse_batch_streak": 0,
-        "entropy_breaker_remaining_updates": 15,
-        "entropy_breaker_triggers": 1,
-    }
-
-    # A small set of naturally decisive states cannot trip the batch-level
-    # breaker, and a healthy normalized-entropy batch resets the streak.
-    weight, active, one_hot, soft = learner._entropy_weight_for_batch(
-        base_weight=0.004,
-        active_ratios=torch.full((8,), 0.8),
-        clipped=torch.zeros(8),
-        active_normalized_entropies=torch.full((8,), 0.01),
-    )
-    assert one_hot is False
-    assert soft is False
-    assert active is True
-    assert weight == pytest.approx(0.012)
-
-
-def test_policy_collapse_v2_does_not_treat_fresh_on_policy_ratios_as_collapse() -> None:
-    learner, _ = _learner()
-    learner.config = OptimizationConfig(
-        entropy_weight=0.006,
-        entropy_weight_end=0.004,
-        entropy_decay_updates=3_000,
-        entropy_breaker="policy-collapse-v2",
-    )
-    for _ in range(16):
-        weight, active, one_hot, soft = learner._entropy_weight_for_batch(
-            base_weight=0.004,
-            active_ratios=torch.ones(32),
-            clipped=torch.zeros(32),
-            active_normalized_entropies=torch.full((32,), 0.65),
-        )
-        assert one_hot is True  # retained legacy diagnostic only
-        assert soft is False
-        assert active is False
-        assert weight == pytest.approx(0.004)
-
-    assert learner.dynamics_state_dict() == {
-        "version": "sts2-vtrace-learner-dynamics-v2",
-        "collapse_batch_streak": 0,
-        "entropy_breaker_remaining_updates": 0,
-        "entropy_breaker_triggers": 0,
-    }
+    # Extra keys on a v3 payload fail closed as well.
+    with pytest.raises(ValueError, match="learner dynamics state keys mismatch"):
+        restored.load_dynamics_state_dict({**state, "entropy_breaker_triggers": 0})
+    with pytest.raises(TypeError, match="learner dynamics state must be an object"):
+        restored.load_dynamics_state_dict(None)
 
 
 def _model_config(*, dropout: float = 0.0) -> GroundedCandidateConfig:

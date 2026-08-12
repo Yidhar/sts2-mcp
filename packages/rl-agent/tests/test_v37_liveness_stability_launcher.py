@@ -60,7 +60,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v37_keeps_v36_transaction_corridor_and_repairs_liveness_plane() -> None:
+def test_v37_keeps_v36_transaction_recipe_and_repairs_liveness_plane() -> None:
     config = load_archived_training_config(profile="preheat", config_path=CONFIG)
     v36 = load_archived_training_config(profile="preheat", config_path=V36_CONFIG)
 
@@ -70,16 +70,12 @@ def test_v37_keeps_v36_transaction_corridor_and_repairs_liveness_plane() -> None
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)
     assert transaction.transaction_q_weight == pytest.approx(0.0)
-    assert transaction.completion_policy_weight == pytest.approx(0.15)
     assert transaction.pairwise_ranking_weight == pytest.approx(0.0)
-    assert transaction.lifecycle_entry_support_weight == pytest.approx(0.05)
-    assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
     assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
     assert transaction.replay_byte_capacity == 1_073_741_824
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == "sts2-run-survival-efficiency-v7"
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget == 64
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap == pytest.approx(0.40)
-    assert config.optimization.entropy_breaker == "policy-collapse-v2"
     assert config.failure_credit.liveness_risk_actor_min_selected_probability == pytest.approx(0.01)
     assert config.episodic_learning.success_imitation_exempt_surfaces == (
         "rest_site",

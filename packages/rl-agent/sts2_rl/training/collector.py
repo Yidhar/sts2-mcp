@@ -81,7 +81,6 @@ from .transaction import (
     TransactionStep,
     TransactionTrace,
     backfill_factual_monte_carlo_returns,
-    factual_transaction_policy_targets,
 )
 from .transaction_operations import canonical_transaction_operation
 
@@ -5152,36 +5151,6 @@ class GroundedCollector:
                             TransactionOutcome.DEADLOCK if trusted_policy_failure else TransactionOutcome.CENSORED
                         ),
                     )
-                    if trusted_policy_failure:
-                        failed_policy_pairs = {
-                            (
-                                liveness_trace.steps[target.step_index].effective_policy_node_key,
-                                liveness_trace.steps[target.step_index].effective_policy_action_fingerprint,
-                            )
-                            for target in factual_transaction_policy_targets(liveness_trace)
-                        }
-                        if failed_policy_pairs:
-                            # Before the global loop became provable, its action
-                            # may have locally completed/reopened one or more
-                            # selection prompts. Censor only COMPLETED traces
-                            # containing a now-grounded AVOID pair so the same
-                            # actor action cannot receive contradictory PREFER
-                            # and AVOID labels. Q/effect facts remain intact.
-                            for trace_index, pending_trace in enumerate(transaction_traces_pending):
-                                if pending_trace.outcome is not TransactionOutcome.COMPLETED:
-                                    continue
-                                if any(
-                                    (
-                                        step.effective_policy_node_key,
-                                        step.effective_policy_action_fingerprint,
-                                    )
-                                    in failed_policy_pairs
-                                    for step in pending_trace.learn_steps
-                                ):
-                                    transaction_traces_pending[trace_index] = replace(
-                                        pending_trace,
-                                        outcome=TransactionOutcome.CENSORED,
-                                    )
                     transaction_traces_pending.append(liveness_trace)
                 transaction_context.append((step_offset, factual_transaction_step))
             if trajectory_journal is not None:

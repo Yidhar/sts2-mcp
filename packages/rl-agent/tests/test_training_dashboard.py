@@ -157,10 +157,8 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
             "episodic_policy_lag_suppressed_labels": 6,
             "transaction_macro_option_value_loss": 0.25,
             "transaction_macro_option_actor_loss": 1.5,
-            "transaction_macro_group_completion_loss": 0.75,
             "transaction_macro_option_value_labels": 8,
             "transaction_macro_option_actor_labels": 6,
-            "transaction_macro_group_completion_labels": 2,
             "transaction_macro_option_actor_lag_suppressed_labels": 1,
             "transaction_macro_option_actor_drift_suppressed_labels": 2,
             "transaction_macro_option_actor_singleton_suppressed_labels": 3,
@@ -203,10 +201,8 @@ def test_learner_projection_surfaces_fresh_policy_signal_diagnostics(tmp_path: P
     assert projected["episodic_zero_policy_label_update"] is True
     assert projected["transaction_macro_option_value_loss"] == 0.25
     assert projected["transaction_macro_option_actor_loss"] == 1.5
-    assert projected["transaction_macro_group_completion_loss"] == 0.75
     assert projected["transaction_macro_option_value_labels"] == 8
     assert projected["transaction_macro_option_actor_labels"] == 6
-    assert projected["transaction_macro_group_completion_labels"] == 2
     assert projected["transaction_macro_option_actor_lag_suppressed_labels"] == 1
     assert projected["transaction_macro_option_actor_drift_suppressed_labels"] == 2
     assert projected["transaction_macro_option_actor_singleton_suppressed_labels"] == 3

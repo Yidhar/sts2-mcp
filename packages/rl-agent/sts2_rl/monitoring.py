@@ -335,7 +335,6 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "queue_depth": queue.get("size"),
         "queue_capacity": queue.get("capacity"),
         "total_ms": timings.get("total_ms"),
-        "transaction_entry_support_loss": event.get("transaction_entry_support_loss"),
         "transaction_smdp_q_loss": event.get("transaction_smdp_q_loss"),
         "transaction_macro_option_value_loss": event.get(
             "transaction_macro_option_value_loss"
@@ -343,22 +342,12 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "transaction_macro_option_actor_loss": event.get(
             "transaction_macro_option_actor_loss"
         ),
-        "transaction_macro_group_completion_loss": event.get(
-            "transaction_macro_group_completion_loss"
-        ),
-        "transaction_entry_support_labels": event.get("transaction_entry_support_labels"),
-        "transaction_entry_support_satisfied_labels": event.get(
-            "transaction_entry_support_satisfied_labels"
-        ),
         "transaction_smdp_q_labels": event.get("transaction_smdp_q_labels"),
         "transaction_macro_option_value_labels": event.get(
             "transaction_macro_option_value_labels"
         ),
         "transaction_macro_option_actor_labels": event.get(
             "transaction_macro_option_actor_labels"
-        ),
-        "transaction_macro_group_completion_labels": event.get(
-            "transaction_macro_group_completion_labels"
         ),
         "transaction_macro_option_actor_lag_suppressed_labels": event.get(
             "transaction_macro_option_actor_lag_suppressed_labels"
@@ -388,36 +377,6 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "transaction_lifecycle_cancelled": event.get("transaction_lifecycle_cancelled"),
         "transaction_lifecycle_unresolved": event.get("transaction_lifecycle_unresolved"),
         "transaction_lifecycle_deadlock": event.get("transaction_lifecycle_deadlock"),
-        "transaction_entry_model_probability_mean": event.get(
-            "transaction_entry_model_probability_mean"
-        ),
-        "transaction_entry_collection_model_probability_mean": event.get(
-            "transaction_entry_collection_model_probability_mean"
-        ),
-        "transaction_entry_behavior_probability_mean": event.get(
-            "transaction_entry_behavior_probability_mean"
-        ),
-        "transaction_entry_log_support_gap_mean": event.get(
-            "transaction_entry_log_support_gap_mean"
-        ),
-        "transaction_upgrade_entry_support_labels": event.get(
-            "transaction_upgrade_entry_support_labels"
-        ),
-        "transaction_remove_entry_support_labels": event.get(
-            "transaction_remove_entry_support_labels"
-        ),
-        "transaction_upgrade_entry_model_probability_mean": event.get(
-            "transaction_upgrade_entry_model_probability_mean"
-        ),
-        "transaction_remove_entry_model_probability_mean": event.get(
-            "transaction_remove_entry_model_probability_mean"
-        ),
-        "transaction_upgrade_entry_behavior_probability_mean": event.get(
-            "transaction_upgrade_entry_behavior_probability_mean"
-        ),
-        "transaction_remove_entry_behavior_probability_mean": event.get(
-            "transaction_remove_entry_behavior_probability_mean"
-        ),
     }
     latest = {
         **point,

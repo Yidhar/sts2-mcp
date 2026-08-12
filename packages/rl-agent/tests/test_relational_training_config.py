@@ -30,9 +30,21 @@ from sts2_rl.training.config import (
 def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None:
     transaction_learning = payload["transaction_learning"]
     assert isinstance(transaction_learning, dict)
-    transaction_learning.pop("lifecycle_entry_support_weight")
-    transaction_learning.pop("lifecycle_entry_support_probability_floor")
     transaction_learning.pop("lifecycle_smdp_q_weight")
+
+
+def _add_retired_v20_policy_fields(payload: dict[str, object]) -> None:
+    """Reproduce a real pre-v20 payload: it still spelled out the retired
+    entropy breaker, completion/selection-group CE and entry-support corridor
+    keys that config v20 deleted."""
+
+    optimization = payload["optimization"]
+    transaction_learning = payload["transaction_learning"]
+    assert isinstance(optimization, dict)
+    assert isinstance(transaction_learning, dict)
+    optimization["entropy_breaker"] = "policy-collapse-v2"
+    transaction_learning["completion_policy_weight"] = 0.15
+    transaction_learning["macro_option_group_completion_weight"] = 0.05
 
 
 def _remove_v16_guard_field(payload: dict[str, object]) -> None:
@@ -95,7 +107,6 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.curriculum.revival_budget == -1
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
-    assert preheat.transaction_learning.completion_policy_weight == 0.25
     # Failure-credit v4 generic completions are zero-cost critic controls.
     # They are not causal PREFER evidence for the final action.
     assert default.failure_credit.liveness_completion_policy_weight == 0.0
@@ -821,7 +832,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert migrated.transaction_learning.lifecycle_entry_support_weight == 0.0
     assert migrated.transaction_learning.lifecycle_smdp_q_weight == 0.0
 
     unexpected = TrainingConfig().to_mapping()
@@ -840,17 +850,26 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     _remove_v18_act_prefix_fields(source)
     _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
+    # A real v15 payload legitimately carried the retired entry-support
+    # corridor keys; the reviewed migration must strip them.
+    transaction_learning = source["transaction_learning"]
+    assert isinstance(transaction_learning, dict)
+    transaction_learning["lifecycle_entry_support_weight"] = 0.25
+    transaction_learning["lifecycle_entry_support_probability_floor"] = 0.05
 
-    with pytest.raises(ValueError, match=r"unsupported training config version"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown transaction_learning config keys|unsupported training config version",
+    ):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
     assert migrated.runtime.evaluation_guard_enforcement_start_steps == 0
-    assert (
-        migrated.transaction_learning.lifecycle_entry_support_probability_floor
-        == TrainingConfig().transaction_learning.lifecycle_entry_support_probability_floor
-    )
+    migrated_transaction = migrated.to_mapping()["transaction_learning"]
+    assert isinstance(migrated_transaction, dict)
+    assert "lifecycle_entry_support_weight" not in migrated_transaction
+    assert "lifecycle_entry_support_probability_floor" not in migrated_transaction
 
     unexpected = TrainingConfig().to_mapping()
     _remove_v19_transaction_actor_fields(unexpected)
@@ -956,6 +975,13 @@ def test_v19_exploration_retirement_migration_is_model_init_only() -> None:
     curriculum = source["curriculum"]
     assert isinstance(curriculum, dict)
     curriculum["selection_surface_epsilon_floor"] = 0.25
+    # A real v19 payload also carried the retired entropy breaker, the
+    # completion/selection-group CE weights and the entry-support corridor.
+    _add_retired_v20_policy_fields(source)
+    source_transaction = source["transaction_learning"]
+    assert isinstance(source_transaction, dict)
+    source_transaction["lifecycle_entry_support_weight"] = 0.05
+    source_transaction["lifecycle_entry_support_probability_floor"] = 0.05
 
     # Exact resume must reject a v19 payload outright (the retired table is
     # an unknown section before the version even gets compared).
@@ -970,6 +996,15 @@ def test_v19_exploration_retirement_migration_is_model_init_only() -> None:
     migrated_payload = migrated.to_mapping()
     assert "transaction_exploration" not in migrated_payload
     assert "selection_surface_epsilon_floor" not in migrated_payload["curriculum"]
+    migrated_optimization = migrated_payload["optimization"]
+    migrated_transaction = migrated_payload["transaction_learning"]
+    assert isinstance(migrated_optimization, dict)
+    assert isinstance(migrated_transaction, dict)
+    assert "entropy_breaker" not in migrated_optimization
+    assert "completion_policy_weight" not in migrated_transaction
+    assert "macro_option_group_completion_weight" not in migrated_transaction
+    assert "lifecycle_entry_support_weight" not in migrated_transaction
+    assert "lifecycle_entry_support_probability_floor" not in migrated_transaction
 
     # A v20 payload that still contains the retired table/key is corrupt and
     # must fail closed on both parsing paths instead of being migrated.
@@ -989,23 +1024,35 @@ def test_v19_exploration_retirement_migration_is_model_init_only() -> None:
     with pytest.raises(ValueError, match=r"unknown curriculum config keys"):
         model_initialization_config_from_mapping(stale_floor)
 
+    stale_breaker = TrainingConfig().to_mapping()
+    stale_optimization = stale_breaker["optimization"]
+    assert isinstance(stale_optimization, dict)
+    stale_optimization["entropy_breaker"] = "policy-collapse-v2"
+    with pytest.raises(ValueError, match=r"unknown optimization config keys"):
+        training_config_from_mapping(stale_breaker)
+    with pytest.raises(ValueError, match=r"unknown optimization config keys"):
+        model_initialization_config_from_mapping(stale_breaker)
+
+    stale_policy = TrainingConfig().to_mapping()
+    stale_policy_transaction = stale_policy["transaction_learning"]
+    assert isinstance(stale_policy_transaction, dict)
+    stale_policy_transaction["completion_policy_weight"] = 0.15
+    with pytest.raises(ValueError, match=r"unknown transaction_learning config keys"):
+        training_config_from_mapping(stale_policy)
+    with pytest.raises(ValueError, match=r"unknown transaction_learning config keys"):
+        model_initialization_config_from_mapping(stale_policy)
+
 
 def test_transaction_lifecycle_loss_contract_is_bounded_and_opt_in() -> None:
     enabled = TransactionLearningConfig(
         enabled=True,
-        lifecycle_entry_support_weight=0.25,
-        lifecycle_entry_support_probability_floor=0.05,
         lifecycle_smdp_q_weight=0.10,
     )
-    assert enabled.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
-    with pytest.raises(ValueError, match=r"strictly between 0 and 0.5"):
-        replace(enabled, lifecycle_entry_support_probability_floor=0.0)
-    with pytest.raises(ValueError, match=r"strictly between 0 and 0.5"):
-        replace(enabled, lifecycle_entry_support_probability_floor=0.5)
+    assert enabled.lifecycle_smdp_q_weight == pytest.approx(0.10)
     with pytest.raises(ValueError, match=r"require transaction_learning.enabled"):
         TransactionLearningConfig(
             enabled=False,
-            lifecycle_entry_support_weight=0.25,
+            lifecycle_smdp_q_weight=0.10,
         )
 
 

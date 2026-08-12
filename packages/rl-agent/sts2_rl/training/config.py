@@ -205,14 +205,6 @@ class OptimizationConfig:
     # policy margins to emerge as factual liveness supervision accumulates.
     entropy_weight_end: float = 0.01
     entropy_decay_updates: int = 2_000
-    # Source-versioned v33 circuit breaker.  Its thresholds and temporary
-    # weight are code constants rather than launch-time knobs, so an operator
-    # cannot silently change the learning recipe with a CLI override.
-    entropy_breaker: Literal[
-        "disabled",
-        "one-hot-v1",
-        "policy-collapse-v2",
-    ] = "disabled"
 
     def __post_init__(self) -> None:
         learning_rate = _require_finite_number(
@@ -268,15 +260,6 @@ class OptimizationConfig:
                 raise ValueError(f"{name} must be non-negative")
         if self.entropy_weight_end > self.entropy_weight:
             raise ValueError("entropy_weight_end cannot exceed entropy_weight")
-        if self.entropy_breaker not in {
-            "disabled",
-            "one-hot-v1",
-            "policy-collapse-v2",
-        }:
-            raise ValueError(
-                "optimization.entropy_breaker must be 'disabled', "
-                "'one-hot-v1', or 'policy-collapse-v2'"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,17 +347,6 @@ class TransactionLearningConfig:
     burn_in_steps: int = 24
     effect_weight: float = 0.10
     transaction_q_weight: float = 0.25
-    # Factual completed paths and exact repeated node/action cycles supervise the
-    # shared legal-candidate policy directly. This is not a reward, action mask,
-    # action rewrite, or card/prompt-specific rule.
-    completion_policy_weight: float = 0.25
-    # A verified upgrade/removal lifecycle receives a two-sided support
-    # corridor at the action that opened the transaction: both the entry and
-    # the aggregate of its legal alternatives retain a minimum probability.
-    # The loss is exactly zero inside the corridor, so it cannot decide when to
-    # upgrade/remove; factual long-horizon return learning owns that preference.
-    lifecycle_entry_support_weight: float = 0.0
-    lifecycle_entry_support_probability_floor: float = 0.05
     # Semi-Markov entry-Q target: factual reward over the whole transaction,
     # followed by a detached post-transaction value bootstrap. This is not a
     # hand-authored forge/removal bonus.
@@ -414,9 +386,6 @@ class TransactionLearningConfig:
     macro_option_actor_log_weight_clip: float = 2.0
     macro_option_max_policy_lag: int = 128
     macro_option_max_log_probability_shift: float = 2.0
-    # Completed select/confirm paths teach only the forward semantic branch as
-    # a group.  Target-card preference remains owned by factual AWR/Q.
-    macro_option_group_completion_weight: float = 0.0
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -458,9 +427,6 @@ class TransactionLearningConfig:
         for name in (
             "effect_weight",
             "transaction_q_weight",
-            "completion_policy_weight",
-            "lifecycle_entry_support_weight",
-            "lifecycle_entry_support_probability_floor",
             "lifecycle_smdp_q_weight",
             "lifecycle_advantage_policy_weight",
             "lifecycle_advantage_temperature",
@@ -472,7 +438,6 @@ class TransactionLearningConfig:
             "macro_option_actor_temperature",
             "macro_option_actor_log_weight_clip",
             "macro_option_max_log_probability_shift",
-            "macro_option_group_completion_weight",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",
@@ -481,11 +446,6 @@ class TransactionLearningConfig:
                 getattr(self, name),
                 label=f"transaction_learning.{name}",
                 minimum=0.0,
-            )
-        if not 0.0 < self.lifecycle_entry_support_probability_floor < 0.5:
-            raise ValueError(
-                "transaction_learning.lifecycle_entry_support_probability_floor "
-                "must be strictly between 0 and 0.5"
             )
         if self.lifecycle_smdp_horizon not in {
             "transaction_exit",
@@ -513,12 +473,10 @@ class TransactionLearningConfig:
                 "transaction_learning.macro_option_actor_log_weight_clip must be positive"
             )
         if not self.enabled and (
-            self.lifecycle_entry_support_weight > 0.0
-            or self.lifecycle_smdp_q_weight > 0.0
+            self.lifecycle_smdp_q_weight > 0.0
             or self.lifecycle_advantage_policy_weight > 0.0
             or self.macro_option_value_weight > 0.0
             or self.macro_option_actor_weight > 0.0
-            or self.macro_option_group_completion_weight > 0.0
         ):
             raise ValueError(
                 "transaction lifecycle losses require transaction_learning.enabled"
@@ -1569,7 +1527,15 @@ def model_initialization_config_from_mapping(
     floors and completion guidance entirely: the ``transaction_exploration``
     table and the curriculum ``selection_surface_epsilon_floor`` key are
     stripped from every older payload, and a V20 payload that still contains
-    them fails the strict parser. These are training/data/model semantics, so V19 checkpoints are accepted only for
+    them fails the strict parser. V20 likewise retires the macro entropy
+    collapse breaker (``optimization.entropy_breaker``), the transaction
+    completion/selection-group CE objectives and the two-sided entry support
+    corridor; the reviewed migration strips
+    ``optimization.entropy_breaker``, ``completion_policy_weight``,
+    ``lifecycle_entry_support_weight``,
+    ``lifecycle_entry_support_probability_floor`` and
+    ``macro_option_group_completion_weight`` from every older payload before
+    construction. These are training/data/model semantics, so V19 checkpoints are accepted only for
     model-parameter initialization; optimizer/replay/RNG state cannot cross
     the boundary.
     V11 checkpoints
@@ -1638,16 +1604,22 @@ def model_initialization_config_from_mapping(
                 "pre-V14 model-initialization config unexpectedly contains a "
                 "transaction_exploration table"
             )
-    # V20 retired the operation-specific entry/selection exploration floors
-    # and completion guidance. The reviewed migration strips the retired
-    # table/key from every older payload before construction; a V20 payload
-    # that still contains them fails the strict parser instead.
+    # V20 retired the operation-specific entry/selection exploration floors,
+    # completion guidance, and the macro entropy collapse breaker. The
+    # reviewed migration strips the retired tables/keys from every older
+    # payload before construction; a V20 payload that still contains them
+    # fails the strict parser instead.
     migrated.pop("transaction_exploration", None)
     raw_curriculum = migrated.get("curriculum")
     if isinstance(raw_curriculum, Mapping):
         curriculum_table = dict(raw_curriculum)
         curriculum_table.pop("selection_surface_epsilon_floor", None)
         migrated["curriculum"] = curriculum_table
+    raw_optimization = migrated.get("optimization")
+    if isinstance(raw_optimization, Mapping):
+        optimization_table = dict(raw_optimization)
+        optimization_table.pop("entropy_breaker", None)
+        migrated["optimization"] = optimization_table
     transaction_learning = payload.get("transaction_learning")
     if not isinstance(transaction_learning, Mapping):
         raise ValueError(
@@ -1829,7 +1801,7 @@ def model_initialization_config_from_mapping(
                 "contains V19 transaction actor fields: "
                 + ", ".join(sorted(unexpected_v19))
             )
-    migrated["transaction_learning"] = {
+    migrated_transaction = {
         **dict(raw_transaction),
         **(
             {}
@@ -1846,6 +1818,17 @@ def model_initialization_config_from_mapping(
             else v19_transaction_fields
         ),
     }
+    # V20 retired the transaction completion/selection-group CE objectives and
+    # the two-sided entry support corridor. Strip the retired keys from every
+    # older payload; a V20 payload containing them fails the strict parser.
+    for retired_transaction_field in (
+        "completion_policy_weight",
+        "lifecycle_entry_support_weight",
+        "lifecycle_entry_support_probability_floor",
+        "macro_option_group_completion_weight",
+    ):
+        migrated_transaction.pop(retired_transaction_field, None)
+    migrated["transaction_learning"] = migrated_transaction
     migrated["version"] = CONFIG_VERSION
     return training_config_from_mapping(migrated)
 

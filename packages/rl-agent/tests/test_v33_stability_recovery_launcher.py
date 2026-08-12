@@ -61,7 +61,6 @@ def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.curriculum.revival_budget == 64
     assert config.optimization.entropy_weight_end == pytest.approx(0.004)
-    assert config.optimization.entropy_breaker == "one-hot-v1"
     assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)
     assert config.failure_credit.liveness_gradient_clip_norm == pytest.approx(0.50)
     assert config.failure_credit.sample_records == 4

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 
 import numpy as np
@@ -12,12 +11,8 @@ from sts2_rl.training import (
     FailureCreditConfig,
     TransactionLearningConfig,
     TransactionLifecycleOutcome,
-    TransactionPolicyTarget,
     build_training_resources,
-    factual_transaction_policy_targets,
-    one_sided_policy_support_loss,
     summarize_evaluation,
-    two_sided_policy_support_loss,
 )
 from sts2_rl.training.collector import _deck_card_removal_committed
 from sts2_rl.training.failure_credit import (
@@ -57,9 +52,6 @@ def _lifecycle_learning_config(*, max_steps: int):
             burn_in_steps=1,
             effect_weight=0.0,
             transaction_q_weight=0.0,
-            completion_policy_weight=0.0,
-            lifecycle_entry_support_weight=0.25,
-            lifecycle_entry_support_probability_floor=0.05,
             lifecycle_smdp_q_weight=0.25,
             pairwise_ranking_weight=0.0,
         ),
@@ -394,9 +386,6 @@ def test_successful_rest_emits_symmetric_factual_lifecycle_and_q_label() -> None
             schedule_learner_update=0,
         )
         assert losses.smdp_q_labels == 1
-        assert losses.rest_entry_support_labels == 1
-        assert losses.upgrade_entry_support_labels == 0
-        assert losses.remove_entry_support_labels == 0
 
         assert resources.transaction_replay is not None
         assert resources.transaction_replay.put(trace)
@@ -472,75 +461,6 @@ def test_shop_removal_requires_real_deck_mutation_and_reports_it() -> None:
     assert summary["shop_card_removal_transaction_completion_rate"] == pytest.approx(1.0)
 
 
-def test_one_sided_entry_support_recovers_from_softmax_absorption_and_stops_at_floor() -> None:
-    saturated_logits = torch.tensor([80.0, -80.0], requires_grad=True)
-    saturated_log_probability = torch.log_softmax(saturated_logits, dim=0)[1]
-    saturated_loss, saturated_gap = one_sided_policy_support_loss(
-        saturated_log_probability,
-        probability_floor=0.05,
-    )
-    saturated_loss.backward()
-
-    assert saturated_loss.detach().item() > 100.0
-    assert saturated_gap.detach().item() > 100.0
-    assert saturated_logits.grad is not None
-    assert saturated_logits.grad.tolist() == pytest.approx([1.0, -1.0])
-
-    supported_logits = torch.tensor([0.0, math.log(0.1 / 0.9)], requires_grad=True)
-    supported_log_probability = torch.log_softmax(supported_logits, dim=0)[1]
-    supported_loss, supported_gap = one_sided_policy_support_loss(
-        supported_log_probability,
-        probability_floor=0.05,
-    )
-    supported_loss.backward()
-
-    assert supported_loss.detach().item() == pytest.approx(0.0)
-    assert supported_gap.detach().item() == pytest.approx(0.0)
-    assert supported_logits.grad is not None
-    assert supported_logits.grad.tolist() == pytest.approx([0.0, 0.0])
-
-
-@pytest.mark.parametrize(
-    ("logits", "selected_index", "expected_gradient"),
-    (
-        ([80.0, -80.0], 1, [1.0, -1.0]),
-        ([80.0, -80.0], 0, [1.0, -1.0]),
-    ),
-)
-def test_two_sided_entry_support_recovers_either_absorbed_branch(
-    logits: list[float],
-    selected_index: int,
-    expected_gradient: list[float],
-) -> None:
-    values = torch.tensor(logits, requires_grad=True)
-    log_probabilities = torch.log_softmax(values, dim=0)
-    alternative_index = 1 - selected_index
-    loss, gap = two_sided_policy_support_loss(
-        log_probabilities[selected_index],
-        log_probabilities[alternative_index],
-        probability_floor=0.05,
-    )
-    loss.backward()
-
-    assert loss.detach().item() > 100.0
-    assert gap.detach().item() > 100.0
-    assert values.grad is not None
-    assert values.grad.tolist() == pytest.approx(expected_gradient)
-
-    supported = torch.tensor([0.0, 0.0], requires_grad=True)
-    supported_log_probabilities = torch.log_softmax(supported, dim=0)
-    supported_loss, supported_gap = two_sided_policy_support_loss(
-        supported_log_probabilities[0],
-        supported_log_probabilities[1],
-        probability_floor=0.05,
-    )
-    supported_loss.backward()
-    assert supported_loss.detach().item() == pytest.approx(0.0)
-    assert supported_gap.detach().item() == pytest.approx(0.0)
-    assert supported.grad is not None
-    assert supported.grad.tolist() == pytest.approx([0.0, 0.0])
-
-
 @pytest.mark.parametrize(
     ("backend", "choices", "operation"),
     (
@@ -586,24 +506,10 @@ def test_verified_transaction_lifecycle_links_entry_to_terminal_commit(
         assert lifecycle.option_target_observed
         assert lifecycle.option_discount == pytest.approx(0.0)
         assert lifecycle.option_steps == len(trace.steps)
-        assert all(
-            target.step_index != lifecycle.entry_step_index
-            for target in factual_transaction_policy_targets(trace)
-        )
 
         losses = resources.learner._transaction_losses((trace,))
-        assert losses.entry_support_labels == 1
         assert losses.smdp_q_labels == 1
-        assert losses.entry_support_satisfied_labels == 1
-        assert losses.entry_support_loss.detach().item() == pytest.approx(0.0)
-        assert losses.entry_model_probability_mean >= 0.05
         assert losses.smdp_q_loss.detach().item() > 0.0
-        if operation == "upgrade":
-            assert losses.upgrade_entry_support_labels == 1
-            assert losses.remove_entry_support_labels == 0
-        else:
-            assert losses.upgrade_entry_support_labels == 0
-            assert losses.remove_entry_support_labels == 1
         resources.learner.optimizer.zero_grad(set_to_none=True)
         losses.smdp_q_loss.backward()
         q_gradients = tuple(
@@ -662,17 +568,14 @@ def test_cancelled_transaction_lifecycle_never_creates_positive_entry_credit() -
         losses = resources.learner._transaction_losses(lifecycle_traces)
         assert losses.lifecycle_cancelled == 1
         assert losses.lifecycle_committed == 1
-        assert losses.entry_support_labels == 1
         assert losses.smdp_q_labels == 1
     finally:
         resources.close()
 
 
-def test_forced_singleton_lifecycle_entry_suppresses_support_corridor() -> None:
+def test_forced_singleton_lifecycle_entry_keeps_smdp_value_labels() -> None:
     """A committed lifecycle whose entry was a forced singleton must not
-    produce a two-sided support label (there is no legal alternative to keep
-    inside the corridor), must not crash the learner, and must keep its
-    factual SMDP entry value labels."""
+    crash the learner and must keep its factual SMDP entry value labels."""
 
     config = _lifecycle_learning_config(max_steps=8)
     resources = build_training_resources(
@@ -718,68 +621,12 @@ def test_forced_singleton_lifecycle_entry_suppresses_support_corridor() -> None:
         )
 
         losses = resources.learner._transaction_losses((singleton_trace,))
-        assert losses.entry_support_singleton_suppressed_labels == 1
-        assert losses.entry_support_labels == 0
-        assert losses.upgrade_entry_support_labels == 0
-        assert losses.entry_support_loss.detach().item() == pytest.approx(0.0)
         assert losses.smdp_q_labels == 1
         assert losses.lifecycle_committed == 1
 
         baseline = resources.learner._transaction_losses((trace,))
-        assert baseline.entry_support_singleton_suppressed_labels == 0
-        assert baseline.entry_support_labels == 1
-    finally:
-        resources.close()
-
-
-@pytest.mark.parametrize(
-    ("backend", "choices"),
-    (
-        (_RestForgeSelectionSuccessBackend, (0, 0, 1)),
-        (_ShopRemovalSuccessBackend, (0, 0, 1)),
-    ),
-)
-def test_completion_ce_excludes_card_target_steps_in_verified_lifecycles(
-    backend: type[TerminalWithoutObservationFlagsBackend],
-    choices: tuple[int, ...],
-) -> None:
-    """Inside a verified upgrade/removal lifecycle the card-target select
-    steps receive neither PREFER nor AVOID from the completed-path CE; the
-    forward (confirm/proceed) steps keep their PREFER labels."""
-
-    config = _lifecycle_learning_config(max_steps=8)
-    resources = build_training_resources(config, backend=backend())
-    try:
-        resources.collector.bind_failure_credit_run_id("target-ce-exclusion")
-        resources.collector._rng = _ScriptedChoiceRng(choices)  # type: ignore[assignment]
-        with torch.no_grad():
-            for parameter in resources.model.parameters():
-                parameter.zero_()
-            for parameter in resources.collector_model.parameters():
-                parameter.zero_()
-        episode = resources.collector.collect_episode(
-            epsilon=0.05,
-            deterministic=False,
-            record=True,
-        )
-        trace = next(
-            trace
-            for trace in episode.transaction_traces
-            if trace.lifecycle is not None
-        )
-        assert trace.lifecycle is not None and trace.lifecycle.support_eligible
-
-        labels = factual_transaction_policy_targets(trace)
-        target_steps = {
-            index
-            for index, step in enumerate(trace.steps)
-            if step.selected_count_delta > 0
-        }
-        assert target_steps, "fixture must contain a card-target select step"
-        assert all(label.step_index not in target_steps for label in labels)
-        assert any(
-            label.target is TransactionPolicyTarget.PREFER for label in labels
-        ), "forward completion steps must keep PREFER labels"
+        assert baseline.smdp_q_labels == 1
+        assert baseline.lifecycle_committed == 1
     finally:
         resources.close()
 
@@ -884,20 +731,23 @@ def test_selection_step_q_uses_lifecycle_option_return() -> None:
         resources.close()
 
 
-def test_operation_telemetry_covers_every_registered_lifecycle_operation() -> None:
-    """v47 launch regression: the first committed relic_purchase lifecycle
-    KeyError'd the learner's hardcoded per-operation telemetry dicts. The
-    dicts must be keyed by the canonical registry so a newly reviewed
-    entrance can never crash the learner."""
+def test_replay_lifecycle_reservation_covers_every_registered_operation() -> None:
+    """v47 launch regression class: per-operation structures must be keyed by
+    the canonical lifecycle-operation registry, never a hardcoded
+    upgrade/remove/rest dict, so a newly reviewed entrance cannot KeyError."""
 
     import inspect
 
-    from sts2_rl.training import learner as learner_module
+    from sts2_rl.training import transaction as transaction_module
     from sts2_rl.training.transaction_operations import (
         TRANSACTION_LIFECYCLE_OPERATIONS,
     )
 
-    source = inspect.getsource(learner_module.VTraceLearner._transaction_losses)
-    assert "for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)" in source
-    assert '"upgrade": []' not in source
+    for source in (
+        inspect.getsource(transaction_module.BoundedTransactionReplay.__init__),
+        inspect.getsource(transaction_module.BoundedTransactionReplay.sample),
+        inspect.getsource(transaction_module.BoundedTransactionReplay.load_state_dict),
+    ):
+        assert "sorted(TRANSACTION_LIFECYCLE_OPERATIONS)" in source
+        assert '"upgrade": []' not in source
     assert len(TRANSACTION_LIFECYCLE_OPERATIONS) >= 10

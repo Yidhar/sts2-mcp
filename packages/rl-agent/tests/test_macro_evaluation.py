@@ -27,12 +27,7 @@ from sts2_rl.training.config import CONFIG_VERSION, load_training_config
 def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None:
     transaction_learning = payload["transaction_learning"]
     assert isinstance(transaction_learning, dict)
-    for key in (
-        "lifecycle_entry_support_weight",
-        "lifecycle_entry_support_probability_floor",
-        "lifecycle_smdp_q_weight",
-    ):
-        del transaction_learning[key]
+    del transaction_learning["lifecycle_smdp_q_weight"]
 
 
 def _remove_v16_guard_field(payload: dict[str, object]) -> None:

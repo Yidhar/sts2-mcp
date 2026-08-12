@@ -71,10 +71,7 @@ def test_v35_recipe_enables_only_bounded_lifecycle_entry_credit() -> None:
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)
     assert transaction.transaction_q_weight == pytest.approx(0.0)
-    assert transaction.completion_policy_weight == pytest.approx(0.0)
     assert transaction.pairwise_ranking_weight == pytest.approx(0.0)
-    assert transaction.lifecycle_entry_support_weight == pytest.approx(0.25)
-    assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
     assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
     assert transaction.replay_byte_capacity == 1_073_741_824
     assert config.curriculum.revival_budget == 64

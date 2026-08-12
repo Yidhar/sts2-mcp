@@ -18,8 +18,6 @@ def _v10_payload() -> dict[str, Any]:
     transaction_learning = payload["transaction_learning"]
     assert isinstance(transaction_learning, dict)
     for key in (
-        "lifecycle_entry_support_weight",
-        "lifecycle_entry_support_probability_floor",
         "lifecycle_smdp_q_weight",
         "lifecycle_smdp_horizon",
         "lifecycle_advantage_policy_weight",

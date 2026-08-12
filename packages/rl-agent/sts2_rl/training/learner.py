@@ -54,26 +54,16 @@ from .failure_credit.contracts import (
 )
 from .transaction import (
     TransactionLifecycleOutcome,
-    TransactionPolicyTarget,
     TransactionTrace,
-    factual_transaction_group_policy_steps,
-    factual_transaction_policy_targets,
     observed_outcome_pairs,
     selection_delta_index,
 )
-from .transaction_operations import TRANSACTION_LIFECYCLE_OPERATIONS
 
-_LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v2"
-_ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1 = 8
-_ONE_HOT_BREAKER_DURATION_UPDATES_V1 = 8
-_ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1 = 0.012
-_ONE_HOT_BREAKER_RATIO_TOLERANCE_V1 = 1.0e-6
-_POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2 = 8
-_POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2 = 16
-_POLICY_COLLAPSE_BREAKER_ENTROPY_WEIGHT_V2 = 0.012
-_POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2 = 0.10
-_POLICY_COLLAPSE_BREAKER_LOW_ENTROPY_FRACTION_V2 = 0.75
-_POLICY_COLLAPSE_BREAKER_MINIMUM_DECISIONS_V2 = 16
+# The v3 payload is intentionally empty apart from its version: the v33 macro
+# entropy collapse breaker and its counters were retired.  The versioned
+# container remains so exact resume keeps failing closed on any older payload
+# instead of silently reinterpreting retired breaker state.
+_LEARNER_DYNAMICS_STATE_VERSION = "sts2-vtrace-learner-dynamics-v3"
 
 # Execution-only liveness graph bounds. They do not change sampled records,
 # labels, loss weights or the equal-record objective, so exact resume may adopt
@@ -119,12 +109,6 @@ class LearnerMetrics:
     entropy: float
     normalized_entropy: float
     entropy_weight: float
-    entropy_breaker_active: int
-    entropy_breaker_one_hot_condition: int
-    entropy_breaker_soft_collapse_condition: int
-    entropy_breaker_consecutive_batches: int
-    entropy_breaker_remaining_updates: int
-    entropy_breaker_triggers: int
     advantage_mean: float
     value_target_mean: float
     importance_ratio_mean: float
@@ -139,23 +123,14 @@ class LearnerMetrics:
     transaction_delta_loss: float
     transaction_q_loss: float
     transaction_pairwise_ranking_loss: float
-    transaction_completion_policy_loss: float
-    transaction_entry_support_loss: float
     transaction_smdp_q_loss: float
     transaction_advantage_policy_loss: float
     transaction_macro_option_value_loss: float
     transaction_macro_option_actor_loss: float
-    transaction_macro_group_completion_loss: float
     transaction_traces: int
     transaction_effect_labels: int
     transaction_q_labels: int
     transaction_pairs: int
-    transaction_policy_labels: int
-    transaction_policy_preferred_labels: int
-    transaction_policy_avoided_labels: int
-    transaction_entry_support_labels: int
-    transaction_entry_support_satisfied_labels: int
-    transaction_entry_support_singleton_suppressed_labels: int
     transaction_smdp_q_labels: int
     transaction_advantage_policy_labels: int
     transaction_advantage_policy_positive_labels: int
@@ -171,7 +146,6 @@ class LearnerMetrics:
     transaction_macro_option_actor_lag_suppressed_labels: int
     transaction_macro_option_actor_drift_suppressed_labels: int
     transaction_macro_option_actor_singleton_suppressed_labels: int
-    transaction_macro_group_completion_labels: int
     transaction_macro_option_advantage_mean: float
     transaction_macro_option_weight_mean: float
     transaction_macro_option_weight_max: float
@@ -181,19 +155,6 @@ class LearnerMetrics:
     transaction_lifecycle_cancelled: int
     transaction_lifecycle_unresolved: int
     transaction_lifecycle_deadlock: int
-    transaction_entry_model_probability_mean: float
-    transaction_entry_collection_model_probability_mean: float
-    transaction_entry_behavior_probability_mean: float
-    transaction_entry_log_support_gap_mean: float
-    transaction_upgrade_entry_support_labels: int
-    transaction_remove_entry_support_labels: int
-    transaction_rest_entry_support_labels: int
-    transaction_upgrade_entry_model_probability_mean: float
-    transaction_remove_entry_model_probability_mean: float
-    transaction_rest_entry_model_probability_mean: float
-    transaction_upgrade_entry_behavior_probability_mean: float
-    transaction_remove_entry_behavior_probability_mean: float
-    transaction_rest_entry_behavior_probability_mean: float
     liveness_credit_loss: float
     liveness_cost_critic_loss: float
     liveness_value_critic_loss: float
@@ -276,22 +237,13 @@ class _TransactionLossBatch:
     delta_loss: Tensor
     q_loss: Tensor
     pairwise_loss: Tensor
-    completion_policy_loss: Tensor
-    entry_support_loss: Tensor
     smdp_q_loss: Tensor
     advantage_policy_loss: Tensor
     macro_option_value_loss: Tensor
     macro_option_actor_loss: Tensor
-    macro_group_completion_loss: Tensor
     effect_labels: int
     q_labels: int
     pair_count: int
-    policy_labels: int
-    policy_preferred_labels: int
-    policy_avoided_labels: int
-    entry_support_labels: int
-    entry_support_satisfied_labels: int
-    entry_support_singleton_suppressed_labels: int
     smdp_q_labels: int
     advantage_policy_labels: int
     advantage_policy_positive_labels: int
@@ -307,7 +259,6 @@ class _TransactionLossBatch:
     macro_option_actor_lag_suppressed_labels: int
     macro_option_actor_drift_suppressed_labels: int
     macro_option_actor_singleton_suppressed_labels: int
-    macro_group_completion_labels: int
     macro_option_advantage_mean: float
     macro_option_weight_mean: float
     macro_option_weight_max: float
@@ -317,19 +268,6 @@ class _TransactionLossBatch:
     lifecycle_cancelled: int
     lifecycle_unresolved: int
     lifecycle_deadlock: int
-    entry_model_probability_mean: float
-    entry_collection_model_probability_mean: float
-    entry_behavior_probability_mean: float
-    entry_log_support_gap_mean: float
-    upgrade_entry_support_labels: int
-    remove_entry_support_labels: int
-    rest_entry_support_labels: int
-    upgrade_entry_model_probability_mean: float
-    remove_entry_model_probability_mean: float
-    rest_entry_model_probability_mean: float
-    upgrade_entry_behavior_probability_mean: float
-    remove_entry_behavior_probability_mean: float
-    rest_entry_behavior_probability_mean: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1239,71 +1177,6 @@ def _require_finite(stage: str, values: tuple[tuple[str, Tensor], ...]) -> None:
         raise FloatingPointError(f"non-finite learner {stage}: {', '.join(invalid)}")
 
 
-def one_sided_policy_support_loss(
-    selected_log_probability: Tensor,
-    *,
-    probability_floor: float,
-) -> tuple[Tensor, Tensor]:
-    """Recover finite policy support without creating permanent imitation.
-
-    Working in log-probability space preserves the ordinary ``1 - pi(a|s)``
-    logit gradient even after the selected softmax probability underflows.
-    The loss becomes identically zero once the configured support floor is
-    reached; factual return learning remains responsible for every preference
-    above that floor.  The second result is the unreduced log-support gap used
-    by telemetry and threshold tests.
-    """
-
-    if not isinstance(selected_log_probability, Tensor):
-        raise TypeError("selected_log_probability must be a tensor")
-    if not math.isfinite(probability_floor) or not 0.0 < probability_floor < 1.0:
-        raise ValueError("probability_floor must be finite and strictly between 0 and 1")
-    log_probability = selected_log_probability.float()
-    if not bool(torch.isfinite(log_probability).all().item()):
-        raise FloatingPointError("selected policy log probability is non-finite")
-    log_floor = log_probability.new_tensor(math.log(probability_floor))
-    log_gap = torch.relu(log_floor - log_probability)
-    loss = F.smooth_l1_loss(
-        log_gap,
-        torch.zeros_like(log_gap),
-        reduction="mean",
-    )
-    return loss, log_gap
-
-
-def two_sided_policy_support_loss(
-    selected_log_probability: Tensor,
-    alternative_log_probability: Tensor,
-    *,
-    probability_floor: float,
-) -> tuple[Tensor, Tensor]:
-    """Keep both an action and its legal complement out of absorption.
-
-    This loss is preference-free: it is zero whenever the selected action and
-    the aggregate probability of every other legal action are both at least
-    ``probability_floor``. Outside that interval it restores only missing
-    numerical support; factual return learning decides which side should be
-    larger in a given state.
-    """
-
-    if not math.isfinite(probability_floor) or not 0.0 < probability_floor < 0.5:
-        raise ValueError(
-            "two-sided probability_floor must be finite and strictly between 0 and 0.5"
-        )
-    selected_loss, selected_gap = one_sided_policy_support_loss(
-        selected_log_probability,
-        probability_floor=probability_floor,
-    )
-    alternative_loss, alternative_gap = one_sided_policy_support_loss(
-        alternative_log_probability,
-        probability_floor=probability_floor,
-    )
-    return selected_loss + alternative_loss, torch.maximum(
-        selected_gap,
-        alternative_gap,
-    )
-
-
 def _annealed_entropy_weight(
     config: OptimizationConfig,
     *,
@@ -1594,9 +1467,6 @@ class VTraceLearner:
             raise ValueError("transaction learner config and model-head configuration differ")
         if self.failure_credit_config.learning_enabled != self.model.liveness_head_enabled:
             raise ValueError("liveness-credit config and model-head configuration differ")
-        self._collapse_batch_streak = 0
-        self._entropy_breaker_remaining_updates = 0
-        self._entropy_breaker_triggers = 0
 
     @property
     def device(self) -> torch.device:
@@ -1607,146 +1477,22 @@ class VTraceLearner:
 
         return {
             "version": _LEARNER_DYNAMICS_STATE_VERSION,
-            "collapse_batch_streak": self._collapse_batch_streak,
-            "entropy_breaker_remaining_updates": self._entropy_breaker_remaining_updates,
-            "entropy_breaker_triggers": self._entropy_breaker_triggers,
         }
 
     @staticmethod
     def validate_dynamics_state_dict(payload: object) -> dict[str, int | str]:
         if not isinstance(payload, dict):
             raise TypeError("learner dynamics state must be an object")
-        expected = {
-            "version",
-            "collapse_batch_streak",
-            "entropy_breaker_remaining_updates",
-            "entropy_breaker_triggers",
-        }
-        if set(payload) != expected:
+        if set(payload) != {"version"}:
             raise ValueError("learner dynamics state keys mismatch")
         if payload["version"] != _LEARNER_DYNAMICS_STATE_VERSION:
             raise ValueError("unsupported learner dynamics state")
-        values: dict[str, int] = {}
-        for key in expected - {"version"}:
-            value = payload[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"learner dynamics {key} must be a non-negative integer")
-            values[key] = value
-        if values["collapse_batch_streak"] >= max(
-            _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1,
-            _POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2,
-        ):
-            raise ValueError("learner collapse streak must be below its trigger threshold")
-        if values["entropy_breaker_remaining_updates"] > max(
-            _ONE_HOT_BREAKER_DURATION_UPDATES_V1,
-            _POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2,
-        ):
-            raise ValueError("learner entropy-breaker duration exceeds the source contract")
         return {
             "version": _LEARNER_DYNAMICS_STATE_VERSION,
-            **values,
         }
 
     def load_dynamics_state_dict(self, payload: object) -> None:
-        validated = self.validate_dynamics_state_dict(payload)
-        self._collapse_batch_streak = int(validated["collapse_batch_streak"])
-        self._entropy_breaker_remaining_updates = int(validated["entropy_breaker_remaining_updates"])
-        self._entropy_breaker_triggers = int(validated["entropy_breaker_triggers"])
-
-    def _entropy_weight_for_batch(
-        self,
-        *,
-        base_weight: float,
-        active_ratios: Tensor,
-        clipped: Tensor,
-        active_normalized_entropies: Tensor | None = None,
-    ) -> tuple[float, bool, bool, bool]:
-        """Apply the selected source-versioned policy-collapse breaker."""
-
-        if self.config.entropy_breaker == "disabled":
-            self._collapse_batch_streak = 0
-            self._entropy_breaker_remaining_updates = 0
-            return base_weight, False, False, False
-        if active_ratios.ndim != 1 or clipped.shape != active_ratios.shape:
-            raise ValueError("entropy breaker ratios and clip mask must be aligned vectors")
-        if active_normalized_entropies is not None:
-            if (
-                active_normalized_entropies.ndim != 1
-                or active_normalized_entropies.shape != active_ratios.shape
-                or not bool(torch.isfinite(active_normalized_entropies).all().item())
-                or bool(
-                    (
-                        (active_normalized_entropies < 0.0)
-                        | (active_normalized_entropies > 1.0 + 1.0e-6)
-                    ).any().item()
-                )
-            ):
-                raise ValueError(
-                    "entropy breaker normalized entropies must be finite aligned values in [0, 1]"
-                )
-        maximum_ratio = float(active_ratios.detach().max().item()) if active_ratios.numel() else 0.0
-        clip_fraction = float(clipped.detach().mean().item()) if clipped.numel() else 0.0
-        one_hot_condition = bool(
-            active_ratios.numel()
-            and math.isclose(
-                maximum_ratio,
-                1.0,
-                rel_tol=0.0,
-                abs_tol=_ONE_HOT_BREAKER_RATIO_TOLERANCE_V1,
-            )
-            and clip_fraction == 0.0
-        )
-        soft_collapse_condition = False
-        if self.config.entropy_breaker == "policy-collapse-v2":
-            if active_normalized_entropies is None:
-                raise ValueError(
-                    "policy-collapse-v2 requires normalized policy entropy"
-                )
-            normalized = active_normalized_entropies.detach()
-            soft_collapse_condition = bool(
-                normalized.numel()
-                >= _POLICY_COLLAPSE_BREAKER_MINIMUM_DECISIONS_V2
-                and float(normalized.mean().item())
-                <= _POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2
-                and float(
-                    (
-                        normalized
-                        <= _POLICY_COLLAPSE_BREAKER_NORMALIZED_ENTROPY_V2
-                    )
-                    .float()
-                    .mean()
-                    .item()
-                )
-                >= _POLICY_COLLAPSE_BREAKER_LOW_ENTROPY_FRACTION_V2
-            )
-            # V2 intentionally keys the breaker to policy entropy rather than
-            # the legacy importance-ratio heuristic.  Fresh on-policy batches
-            # commonly have rho == 1 with no clipping even when their action
-            # distribution is healthy, so OR-ing that condition into V2 would
-            # turn the circuit breaker on during ordinary learning.  Keep the
-            # legacy observation as telemetry, but only entropy collapse may
-            # trigger the V2 intervention.
-            condition = soft_collapse_condition
-            consecutive_batches = _POLICY_COLLAPSE_BREAKER_CONSECUTIVE_BATCHES_V2
-            duration_updates = _POLICY_COLLAPSE_BREAKER_DURATION_UPDATES_V2
-            breaker_weight = _POLICY_COLLAPSE_BREAKER_ENTROPY_WEIGHT_V2
-        elif self.config.entropy_breaker == "one-hot-v1":
-            condition = one_hot_condition
-            consecutive_batches = _ONE_HOT_BREAKER_CONSECUTIVE_BATCHES_V1
-            duration_updates = _ONE_HOT_BREAKER_DURATION_UPDATES_V1
-            breaker_weight = _ONE_HOT_BREAKER_ENTROPY_WEIGHT_V1
-        else:  # pragma: no cover - config validates
-            raise RuntimeError("unsupported entropy breaker")
-        self._collapse_batch_streak = self._collapse_batch_streak + 1 if condition else 0
-        if self._collapse_batch_streak >= consecutive_batches:
-            self._collapse_batch_streak = 0
-            self._entropy_breaker_remaining_updates = duration_updates
-            self._entropy_breaker_triggers += 1
-        active = self._entropy_breaker_remaining_updates > 0
-        effective = max(base_weight, breaker_weight) if active else base_weight
-        if active:
-            self._entropy_breaker_remaining_updates -= 1
-        return effective, active, one_hot_condition, soft_collapse_condition
+        self.validate_dynamics_state_dict(payload)
 
     def credit_plan_liveness_losses(
         self,
@@ -2537,26 +2283,16 @@ class VTraceLearner:
             * valid_float
         ).sum() / value_denominator
         entropy = (entropies * policy_float).sum() / policy_denominator
-        # Policy-health/importance telemetry excludes singleton forced steps.
-        # Their ratio is mechanically one and would otherwise manufacture the
-        # exact pattern used by the one-hot breaker.
+        # Policy-health/importance telemetry excludes singleton forced steps;
+        # their importance ratio is mechanically one.
         active_ratios = ratios[policy_decisions]
         clipped = (active_ratios > self.config.vtrace_rho_clip).float()
         active_normalized_entropies = normalized_entropies[policy_decisions]
-        scheduled_entropy_weight = _annealed_entropy_weight(
+        # The explicit annealing schedule is the only entropy control; the v33
+        # macro entropy collapse breaker was retired.
+        entropy_weight = _annealed_entropy_weight(
             self.config,
             policy_version=schedule_policy_version,
-        )
-        (
-            entropy_weight,
-            entropy_breaker_active,
-            entropy_breaker_one_hot_condition,
-            entropy_breaker_soft_collapse_condition,
-        ) = self._entropy_weight_for_batch(
-            base_weight=scheduled_entropy_weight,
-            active_ratios=active_ratios,
-            clipped=clipped,
-            active_normalized_entropies=active_normalized_entropies,
         )
         online_objective_loss = (
             self.config.policy_weight * policy_loss + self.config.value_weight * value_loss - entropy_weight * entropy
@@ -2570,16 +2306,10 @@ class VTraceLearner:
         transaction_delta_loss = transaction_losses.delta_loss
         transaction_q_loss = transaction_losses.q_loss
         transaction_pairwise_loss = transaction_losses.pairwise_loss
-        transaction_completion_policy_loss = (
-            transaction_losses.completion_policy_loss
-        )
         transaction_objective_loss = (
             self.transaction_config.effect_weight * (transaction_effect_loss + transaction_delta_loss)
             + self.transaction_config.transaction_q_weight * transaction_q_loss
             + self.transaction_config.pairwise_ranking_weight * transaction_pairwise_loss
-            + self.transaction_config.completion_policy_weight * transaction_completion_policy_loss
-            + self.transaction_config.lifecycle_entry_support_weight
-            * transaction_losses.entry_support_loss
             + self.transaction_config.lifecycle_smdp_q_weight
             * transaction_losses.smdp_q_loss
             + self.transaction_config.lifecycle_advantage_policy_weight
@@ -2588,8 +2318,6 @@ class VTraceLearner:
             * transaction_losses.macro_option_value_loss
             + self.transaction_config.macro_option_actor_weight
             * transaction_losses.macro_option_actor_loss
-            + self.transaction_config.macro_option_group_completion_weight
-            * transaction_losses.macro_group_completion_loss
         )
         total_loss = online_objective_loss + transaction_objective_loss
         _require_finite(
@@ -2602,14 +2330,6 @@ class VTraceLearner:
                 ("transaction_delta_loss", transaction_delta_loss),
                 ("transaction_q_loss", transaction_q_loss),
                 ("transaction_pairwise_loss", transaction_pairwise_loss),
-                (
-                    "transaction_completion_policy_loss",
-                    transaction_completion_policy_loss,
-                ),
-                (
-                    "transaction_entry_support_loss",
-                    transaction_losses.entry_support_loss,
-                ),
                 ("transaction_smdp_q_loss", transaction_losses.smdp_q_loss),
                 (
                     "transaction_advantage_policy_loss",
@@ -2622,10 +2342,6 @@ class VTraceLearner:
                 (
                     "transaction_macro_option_actor_loss",
                     transaction_losses.macro_option_actor_loss,
-                ),
-                (
-                    "transaction_macro_group_completion_loss",
-                    transaction_losses.macro_group_completion_loss,
                 ),
             ),
         )
@@ -2936,14 +2652,6 @@ class VTraceLearner:
                 else 0.0
             ),
             entropy_weight=entropy_weight,
-            entropy_breaker_active=int(entropy_breaker_active),
-            entropy_breaker_one_hot_condition=int(entropy_breaker_one_hot_condition),
-            entropy_breaker_soft_collapse_condition=int(
-                entropy_breaker_soft_collapse_condition
-            ),
-            entropy_breaker_consecutive_batches=self._collapse_batch_streak,
-            entropy_breaker_remaining_updates=(self._entropy_breaker_remaining_updates),
-            entropy_breaker_triggers=self._entropy_breaker_triggers,
             advantage_mean=(float(active_advantages.detach().mean().item()) if active_advantages.numel() else 0.0),
             value_target_mean=float(active_targets.detach().mean().item()),
             importance_ratio_mean=(float(active_ratios.detach().mean().item()) if active_ratios.numel() else 0.0),
@@ -2958,10 +2666,6 @@ class VTraceLearner:
             transaction_delta_loss=float(transaction_delta_loss.detach().item()),
             transaction_q_loss=float(transaction_q_loss.detach().item()),
             transaction_pairwise_ranking_loss=float(transaction_pairwise_loss.detach().item()),
-            transaction_completion_policy_loss=float(transaction_completion_policy_loss.detach().item()),
-            transaction_entry_support_loss=float(
-                transaction_losses.entry_support_loss.detach().item()
-            ),
             transaction_smdp_q_loss=float(
                 transaction_losses.smdp_q_loss.detach().item()
             ),
@@ -2974,29 +2678,10 @@ class VTraceLearner:
             transaction_macro_option_actor_loss=float(
                 transaction_losses.macro_option_actor_loss.detach().item()
             ),
-            transaction_macro_group_completion_loss=float(
-                transaction_losses.macro_group_completion_loss.detach().item()
-            ),
             transaction_traces=len(transaction_traces),
             transaction_effect_labels=transaction_losses.effect_labels,
             transaction_q_labels=transaction_losses.q_labels,
             transaction_pairs=transaction_losses.pair_count,
-            transaction_policy_labels=transaction_losses.policy_labels,
-            transaction_policy_preferred_labels=(
-                transaction_losses.policy_preferred_labels
-            ),
-            transaction_policy_avoided_labels=(
-                transaction_losses.policy_avoided_labels
-            ),
-            transaction_entry_support_labels=(
-                transaction_losses.entry_support_labels
-            ),
-            transaction_entry_support_satisfied_labels=(
-                transaction_losses.entry_support_satisfied_labels
-            ),
-            transaction_entry_support_singleton_suppressed_labels=(
-                transaction_losses.entry_support_singleton_suppressed_labels
-            ),
             transaction_smdp_q_labels=transaction_losses.smdp_q_labels,
             transaction_advantage_policy_labels=(
                 transaction_losses.advantage_policy_labels
@@ -3038,9 +2723,6 @@ class VTraceLearner:
             transaction_macro_option_actor_singleton_suppressed_labels=(
                 transaction_losses.macro_option_actor_singleton_suppressed_labels
             ),
-            transaction_macro_group_completion_labels=(
-                transaction_losses.macro_group_completion_labels
-            ),
             transaction_macro_option_advantage_mean=(
                 transaction_losses.macro_option_advantage_mean
             ),
@@ -3067,45 +2749,6 @@ class VTraceLearner:
             ),
             transaction_lifecycle_deadlock=(
                 transaction_losses.lifecycle_deadlock
-            ),
-            transaction_entry_model_probability_mean=(
-                transaction_losses.entry_model_probability_mean
-            ),
-            transaction_entry_collection_model_probability_mean=(
-                transaction_losses.entry_collection_model_probability_mean
-            ),
-            transaction_entry_behavior_probability_mean=(
-                transaction_losses.entry_behavior_probability_mean
-            ),
-            transaction_entry_log_support_gap_mean=(
-                transaction_losses.entry_log_support_gap_mean
-            ),
-            transaction_upgrade_entry_support_labels=(
-                transaction_losses.upgrade_entry_support_labels
-            ),
-            transaction_remove_entry_support_labels=(
-                transaction_losses.remove_entry_support_labels
-            ),
-            transaction_rest_entry_support_labels=(
-                transaction_losses.rest_entry_support_labels
-            ),
-            transaction_upgrade_entry_model_probability_mean=(
-                transaction_losses.upgrade_entry_model_probability_mean
-            ),
-            transaction_remove_entry_model_probability_mean=(
-                transaction_losses.remove_entry_model_probability_mean
-            ),
-            transaction_rest_entry_model_probability_mean=(
-                transaction_losses.rest_entry_model_probability_mean
-            ),
-            transaction_upgrade_entry_behavior_probability_mean=(
-                transaction_losses.upgrade_entry_behavior_probability_mean
-            ),
-            transaction_remove_entry_behavior_probability_mean=(
-                transaction_losses.remove_entry_behavior_probability_mean
-            ),
-            transaction_rest_entry_behavior_probability_mean=(
-                transaction_losses.rest_entry_behavior_probability_mean
             ),
             liveness_credit_loss=float(liveness_credit_loss.detach().item()),
             liveness_cost_critic_loss=float(
@@ -3773,7 +3416,7 @@ class VTraceLearner:
         current_policy_version: int = 0,
         schedule_learner_update: int = 0,
     ) -> _TransactionLossBatch:
-        """Compute factual transaction, entry-support and SMDP losses."""
+        """Compute factual transaction effect/Q and SMDP option losses."""
 
         for label, value in (
             ("current_policy_version", current_policy_version),
@@ -3788,22 +3431,13 @@ class VTraceLearner:
                 delta_loss=zero,
                 q_loss=zero,
                 pairwise_loss=zero,
-                completion_policy_loss=zero,
-                entry_support_loss=zero,
                 smdp_q_loss=zero,
                 advantage_policy_loss=zero,
                 macro_option_value_loss=zero,
                 macro_option_actor_loss=zero,
-                macro_group_completion_loss=zero,
                 effect_labels=0,
                 q_labels=0,
                 pair_count=0,
-                policy_labels=0,
-                policy_preferred_labels=0,
-                policy_avoided_labels=0,
-                entry_support_labels=0,
-                entry_support_satisfied_labels=0,
-                entry_support_singleton_suppressed_labels=0,
                 smdp_q_labels=0,
                 advantage_policy_labels=0,
                 advantage_policy_positive_labels=0,
@@ -3819,7 +3453,6 @@ class VTraceLearner:
                 macro_option_actor_lag_suppressed_labels=0,
                 macro_option_actor_drift_suppressed_labels=0,
                 macro_option_actor_singleton_suppressed_labels=0,
-                macro_group_completion_labels=0,
                 macro_option_advantage_mean=0.0,
                 macro_option_weight_mean=0.0,
                 macro_option_weight_max=0.0,
@@ -3829,19 +3462,6 @@ class VTraceLearner:
                 lifecycle_cancelled=0,
                 lifecycle_unresolved=0,
                 lifecycle_deadlock=0,
-                entry_model_probability_mean=0.0,
-                entry_collection_model_probability_mean=0.0,
-                entry_behavior_probability_mean=0.0,
-                entry_log_support_gap_mean=0.0,
-                upgrade_entry_support_labels=0,
-                remove_entry_support_labels=0,
-                rest_entry_support_labels=0,
-                upgrade_entry_model_probability_mean=0.0,
-                remove_entry_model_probability_mean=0.0,
-                rest_entry_model_probability_mean=0.0,
-                upgrade_entry_behavior_probability_mean=0.0,
-                remove_entry_behavior_probability_mean=0.0,
-                rest_entry_behavior_probability_mean=0.0,
             )
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         effect_logits: list[Tensor] = []
@@ -3851,10 +3471,6 @@ class VTraceLearner:
         q_values: list[Tensor] = []
         q_targets: list[float] = []
         selected_policy_log_probabilities: dict[tuple[int, int], Tensor] = {}
-        completion_policy_trace_losses: list[Tensor] = []
-        completion_policy_preferred_labels = 0
-        completion_policy_avoided_labels = 0
-        entry_support_terms: list[Tensor] = []
         smdp_q_predictions: list[Tensor] = []
         smdp_q_targets: list[Tensor] = []
         advantage_policy_terms: list[Tensor] = []
@@ -3873,7 +3489,6 @@ class VTraceLearner:
         # more frequent card-reward rows from setting the scale for scarce shop
         # and rest-site decisions.
         macro_option_actor_rows: dict[str, list[tuple[Tensor, Tensor]]] = {}
-        macro_group_completion_terms: list[Tensor] = []
         macro_option_actor_lag_suppressed_labels = 0
         macro_option_actor_drift_suppressed_labels = 0
         macro_option_actor_singleton_suppressed_labels = 0
@@ -3881,22 +3496,6 @@ class VTraceLearner:
         macro_option_weights: list[float] = []
         macro_option_value_labels_by_surface: dict[str, int] = {}
         macro_option_actor_labels_by_surface: dict[str, int] = {}
-        entry_model_probabilities: list[float] = []
-        entry_collection_model_probabilities: list[float] = []
-        entry_behavior_probabilities: list[float] = []
-        entry_log_support_gaps: list[float] = []
-        # Keyed by the canonical lifecycle-operation registry so a newly
-        # reviewed entrance can never KeyError the per-operation telemetry
-        # (v47 launch failure: the first committed relic_purchase lifecycle
-        # hit a hardcoded upgrade/remove/rest dict).
-        operation_entry_model_probabilities: dict[str, list[float]] = {
-            operation: [] for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
-        }
-        operation_entry_behavior_probabilities: dict[str, list[float]] = {
-            operation: [] for operation in sorted(TRANSACTION_LIFECYCLE_OPERATIONS)
-        }
-        entry_support_satisfied_labels = 0
-        entry_support_singleton_suppressed_labels = 0
         lifecycle_counts = {
             TransactionLifecycleOutcome.COMMITTED: 0,
             TransactionLifecycleOutcome.CANCELLED: 0,
@@ -4116,9 +3715,6 @@ class VTraceLearner:
                 device=self.device,
                 dtype=next(self.model.parameters()).dtype,
             )[None, :]
-            policy_targets = {item.step_index: item.target for item in factual_transaction_policy_targets(trace)}
-            group_policy_steps = set(factual_transaction_group_policy_steps(trace))
-            trace_policy_losses: list[Tensor] = []
             entry_output: RecurrentCandidateOutput | None = None
             step_outputs: dict[int, RecurrentCandidateOutput] = {}
             for step_index, step in enumerate(trace.steps):
@@ -4161,56 +3757,6 @@ class VTraceLearner:
                 policy_log_probabilities = output.policy_log_probabilities()
                 selected_policy_log_probability = policy_log_probabilities[0, action_index]
                 selected_policy_log_probabilities[(trace_index, step_index)] = selected_policy_log_probability
-                if (
-                    step_index in group_policy_steps
-                    and self.transaction_config.macro_option_group_completion_weight
-                    > 0.0
-                ):
-                    if output.macro_policy_logits is None:
-                        raise RuntimeError(
-                            "macro group completion requires v47 macro policy logits"
-                        )
-                    macro_log_policy = output.macro_policy_log_probabilities()[0]
-                    selected_branch = output.policy_branch_ids[0, action_index]
-                    in_selected_branch = (
-                        output.policy_branch_ids[0] == selected_branch
-                    ) & output.action_mask[0]
-                    if not bool(in_selected_branch.any().item()):  # pragma: no cover
-                        raise RuntimeError(
-                            "committed transaction lost its selected semantic branch"
-                        )
-                    # This teaches only "continue through Select".  Which card
-                    # to upgrade/remove remains wholly owned by factual AWR/Q.
-                    macro_group_completion_terms.append(
-                        -torch.logsumexp(
-                            macro_log_policy.masked_select(in_selected_branch),
-                            dim=0,
-                        )
-                    )
-                policy_target = policy_targets.get(step_index)
-                if policy_target is TransactionPolicyTarget.PREFER:
-                    trace_policy_losses.append(-selected_policy_log_probability)
-                    completion_policy_preferred_labels += 1
-                elif policy_target is TransactionPolicyTarget.AVOID:
-                    other_action_indices = [
-                        index
-                        for index, enabled in enumerate(step.snapshot.action_mask)
-                        if bool(enabled) and index != action_index
-                    ]
-                    if not other_action_indices:  # pragma: no cover - target invariant
-                        raise RuntimeError("transaction avoid target has no legal alternative")
-                    other_indices = torch.tensor(
-                        other_action_indices,
-                        device=self.device,
-                        dtype=torch.long,
-                    )
-                    trace_policy_losses.append(
-                        -torch.logsumexp(
-                            policy_log_probabilities[0, other_indices],
-                            dim=0,
-                        )
-                    )
-                    completion_policy_avoided_labels += 1
                 lifecycle_owns_entry_q = bool(
                     trace.lifecycle is not None
                     and trace.lifecycle.support_eligible
@@ -4225,10 +3771,6 @@ class VTraceLearner:
                     if not step.option_target_observed:
                         q_values.append(output.transaction_q_values[0, action_index])
                         q_targets.append(step.transaction_return)
-            if trace_policy_losses:
-                # Equal trace weight prevents a long repeated cycle from
-                # overwhelming many short, factual completion paths.
-                completion_policy_trace_losses.append(torch.stack(trace_policy_losses).mean())
 
             lifecycle = trace.lifecycle
             if lifecycle is not None:
@@ -4245,66 +3787,9 @@ class VTraceLearner:
                     entry_action_index = trace.steps[
                         lifecycle.entry_step_index
                     ].action_index
-                    entry_policy_log_probabilities = (
-                        entry_output.policy_log_probabilities()[0].float()
-                    )
-                    entry_log_probability = entry_policy_log_probabilities[
-                        entry_action_index
-                    ]
                     entry_snapshot = trace.steps[
                         lifecycle.entry_step_index
                     ].snapshot
-                    alternative_action_indices = [
-                        index
-                        for index, enabled in enumerate(entry_snapshot.action_mask)
-                        if bool(enabled) and index != entry_action_index
-                    ]
-                    if not alternative_action_indices:
-                        # A committed lifecycle may factually begin at a forced
-                        # singleton decision (for example an event that opens
-                        # the upgrade selection with no other legal action).
-                        # The two-sided corridor is undefined without a legal
-                        # alternative, and forced singleton actions never
-                        # generate a policy target.  Emit no support-corridor
-                        # label; the factual SMDP entry value labels below
-                        # remain valid value supervision.
-                        entry_support_singleton_suppressed_labels += 1
-                    else:
-                        alternative_indices = torch.tensor(
-                            alternative_action_indices,
-                            device=self.device,
-                            dtype=torch.long,
-                        )
-                        alternative_log_probability = torch.logsumexp(
-                            entry_policy_log_probabilities[alternative_indices],
-                            dim=0,
-                        )
-                        support_loss, log_gap = two_sided_policy_support_loss(
-                            entry_log_probability,
-                            alternative_log_probability,
-                            probability_floor=(
-                                self.transaction_config.lifecycle_entry_support_probability_floor
-                            ),
-                        )
-                        entry_support_terms.append(support_loss)
-                        detached_gap = float(log_gap.detach().item())
-                        entry_support_satisfied_labels += int(detached_gap <= 1.0e-7)
-                        entry_log_support_gaps.append(detached_gap)
-                        entry_model_probabilities.append(
-                            float(torch.exp(entry_log_probability.detach()).item())
-                        )
-                        entry_collection_model_probabilities.append(
-                            lifecycle.entry_model_probability
-                        )
-                        entry_behavior_probabilities.append(
-                            math.exp(lifecycle.entry_behavior_log_probability)
-                        )
-                        operation_entry_model_probabilities[lifecycle.operation].append(
-                            entry_model_probabilities[-1]
-                        )
-                        operation_entry_behavior_probabilities[lifecycle.operation].append(
-                            entry_behavior_probabilities[-1]
-                        )
 
                     if not lifecycle.option_target_observed:
                         if (
@@ -4316,8 +3801,7 @@ class VTraceLearner:
                         ):
                             # A committed transaction near a censored episode
                             # end may never observe the requested next macro
-                            # boundary.  Keep its factual support-corridor
-                            # label, but do not fabricate or bootstrap an
+                            # boundary.  Do not fabricate or bootstrap an
                             # option-Q target.
                             continue
                         raise RuntimeError(
@@ -4492,15 +3976,6 @@ class VTraceLearner:
             pairwise_loss = F.softplus(self.transaction_config.pairwise_margin - (better - worse)).mean()
         else:
             pairwise_loss = zero
-        completion_policy_loss = (
-            torch.stack(completion_policy_trace_losses).mean() if completion_policy_trace_losses else zero
-        )
-        completion_policy_labels = completion_policy_preferred_labels + completion_policy_avoided_labels
-        entry_support_loss = (
-            torch.stack(entry_support_terms).mean()
-            if entry_support_terms
-            else zero
-        )
         smdp_q_loss = (
             F.smooth_l1_loss(
                 torch.stack(smdp_q_predictions),
@@ -4559,11 +4034,6 @@ class VTraceLearner:
             if macro_option_actor_surface_terms
             else zero
         )
-        macro_group_completion_loss = (
-            torch.stack(macro_group_completion_terms).mean()
-            if macro_group_completion_terms
-            else zero
-        )
 
         def mean_or_zero(values: list[float]) -> float:
             return float(sum(values) / len(values)) if values else 0.0
@@ -4573,24 +4043,13 @@ class VTraceLearner:
             delta_loss=delta_loss,
             q_loss=q_loss,
             pairwise_loss=pairwise_loss,
-            completion_policy_loss=completion_policy_loss,
-            entry_support_loss=entry_support_loss,
             smdp_q_loss=smdp_q_loss,
             advantage_policy_loss=advantage_policy_loss,
             macro_option_value_loss=macro_option_value_loss,
             macro_option_actor_loss=macro_option_actor_loss,
-            macro_group_completion_loss=macro_group_completion_loss,
             effect_labels=len(effect_targets),
             q_labels=len(q_targets),
             pair_count=len(pairs),
-            policy_labels=completion_policy_labels,
-            policy_preferred_labels=completion_policy_preferred_labels,
-            policy_avoided_labels=completion_policy_avoided_labels,
-            entry_support_labels=len(entry_support_terms),
-            entry_support_satisfied_labels=entry_support_satisfied_labels,
-            entry_support_singleton_suppressed_labels=(
-                entry_support_singleton_suppressed_labels
-            ),
             smdp_q_labels=len(smdp_q_predictions),
             advantage_policy_labels=len(advantage_policy_terms),
             advantage_policy_positive_labels=(
@@ -4626,7 +4085,6 @@ class VTraceLearner:
             macro_option_actor_singleton_suppressed_labels=(
                 macro_option_actor_singleton_suppressed_labels
             ),
-            macro_group_completion_labels=len(macro_group_completion_terms),
             macro_option_advantage_mean=mean_or_zero(macro_option_advantages),
             macro_option_weight_mean=mean_or_zero(macro_option_weights),
             macro_option_weight_max=(
@@ -4650,45 +4108,6 @@ class VTraceLearner:
             lifecycle_deadlock=lifecycle_counts[
                 TransactionLifecycleOutcome.DEADLOCK
             ],
-            entry_model_probability_mean=mean_or_zero(
-                entry_model_probabilities
-            ),
-            entry_collection_model_probability_mean=mean_or_zero(
-                entry_collection_model_probabilities
-            ),
-            entry_behavior_probability_mean=mean_or_zero(
-                entry_behavior_probabilities
-            ),
-            entry_log_support_gap_mean=mean_or_zero(
-                entry_log_support_gaps
-            ),
-            upgrade_entry_support_labels=len(
-                operation_entry_model_probabilities["upgrade"]
-            ),
-            remove_entry_support_labels=len(
-                operation_entry_model_probabilities["remove"]
-            ),
-            rest_entry_support_labels=len(
-                operation_entry_model_probabilities["rest"]
-            ),
-            upgrade_entry_model_probability_mean=mean_or_zero(
-                operation_entry_model_probabilities["upgrade"]
-            ),
-            remove_entry_model_probability_mean=mean_or_zero(
-                operation_entry_model_probabilities["remove"]
-            ),
-            rest_entry_model_probability_mean=mean_or_zero(
-                operation_entry_model_probabilities["rest"]
-            ),
-            upgrade_entry_behavior_probability_mean=mean_or_zero(
-                operation_entry_behavior_probabilities["upgrade"]
-            ),
-            remove_entry_behavior_probability_mean=mean_or_zero(
-                operation_entry_behavior_probabilities["remove"]
-            ),
-            rest_entry_behavior_probability_mean=mean_or_zero(
-                operation_entry_behavior_probabilities["rest"]
-            ),
         )
 
 
@@ -4703,6 +4122,4 @@ __all__ = [
     "VTraceLearner",
     "compile_liveness_label_manifest",
     "liveness_credit_losses",
-    "one_sided_policy_support_loss",
-    "two_sided_policy_support_loss",
 ]

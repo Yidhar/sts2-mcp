@@ -752,13 +752,6 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "burn_in_steps": config.transaction_learning.burn_in_steps,
             "effect_weight": config.transaction_learning.effect_weight,
             "transaction_q_weight": config.transaction_learning.transaction_q_weight,
-            "completion_policy_weight": (config.transaction_learning.completion_policy_weight),
-            "lifecycle_entry_support_weight": (
-                config.transaction_learning.lifecycle_entry_support_weight
-            ),
-            "lifecycle_entry_support_probability_floor": (
-                config.transaction_learning.lifecycle_entry_support_probability_floor
-            ),
             "lifecycle_smdp_q_weight": (
                 config.transaction_learning.lifecycle_smdp_q_weight
             ),

@@ -59,7 +59,6 @@ sample_traces = 8
 burn_in_steps = 24
 effect_weight = 0.10
 transaction_q_weight = 0.25
-completion_policy_weight = 0.25
 pairwise_ranking_weight = 0.10
 pairwise_margin = 0.10
 minimum_return_gap = 0.0

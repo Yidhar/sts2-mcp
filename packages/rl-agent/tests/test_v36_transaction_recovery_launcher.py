@@ -58,7 +58,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
     }
 
 
-def test_v36_recipe_uses_two_sided_support_and_non_destructive_guard() -> None:
+def test_v36_recipe_uses_bounded_lifecycle_credit_and_non_destructive_guard() -> None:
     config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
@@ -66,10 +66,7 @@ def test_v36_recipe_uses_two_sided_support_and_non_destructive_guard() -> None:
     assert transaction.enabled
     assert transaction.effect_weight == pytest.approx(0.05)
     assert transaction.transaction_q_weight == pytest.approx(0.0)
-    assert transaction.completion_policy_weight == pytest.approx(0.15)
     assert transaction.pairwise_ranking_weight == pytest.approx(0.0)
-    assert transaction.lifecycle_entry_support_weight == pytest.approx(0.05)
-    assert transaction.lifecycle_entry_support_probability_floor == pytest.approx(0.05)
     assert transaction.lifecycle_smdp_q_weight == pytest.approx(0.10)
     assert transaction.replay_byte_capacity == 1_073_741_824
     assert config.curriculum.revival_budget == 64

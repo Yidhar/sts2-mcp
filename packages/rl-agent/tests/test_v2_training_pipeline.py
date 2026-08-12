@@ -39,10 +39,8 @@ from sts2_rl.training import (
     TrainingConfig,
     TransactionLearningConfig,
     TransactionOutcome,
-    TransactionPolicyTarget,
     build_training_resources,
     evaluate_policy,
-    factual_transaction_policy_targets,
     initialize_model_from_checkpoint,
     inspect_baseline,
     load_training_checkpoint,
@@ -1845,10 +1843,6 @@ def test_event_page_cycle_ignores_vitality_revival_churn_and_credits_action() ->
         trace = episode.transaction_traces[0]
         assert all(step.policy_node_key is not None for step in trace.steps)
         assert all(step.policy_action_fingerprint is not None for step in trace.steps)
-        labels = factual_transaction_policy_targets(trace)
-        assert labels
-        assert all(label.target is TransactionPolicyTarget.AVOID for label in labels)
-        assert {trace.steps[label.step_index].action_index for label in labels} == {trace.steps[0].action_index}
         assert all(np.count_nonzero(step.snapshot.action_mask) == 2 for step in trace.steps)
     finally:
         resources.close()
@@ -1935,7 +1929,6 @@ def test_event_cycle_policy_node_preserves_strict_group_multiplicity() -> None:
         assert episode.completed_episode is not None
         assert not episode.completed_episode.completion.authoritative
         assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
-        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
     finally:
         resources.close()
 
@@ -1975,7 +1968,6 @@ def test_event_cycle_does_not_blame_one_enabled_choice_beside_locked_option() ->
         assert episode.completed_episode is not None
         assert not episode.completed_episode.completion.authoritative
         assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
-        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
     finally:
         resources.close()
 
@@ -2089,7 +2081,6 @@ def test_sparse_event_repeat_outside_learnable_tail_is_not_authoritative() -> No
         assert episode.completed_episode is not None
         assert not episode.completed_episode.completion.authoritative
         assert all(trace.outcome is TransactionOutcome.CENSORED for trace in episode.transaction_traces)
-        assert not any(factual_transaction_policy_targets(trace) for trace in episode.transaction_traces)
     finally:
         resources.close()
 

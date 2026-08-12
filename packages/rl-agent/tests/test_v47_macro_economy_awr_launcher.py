@@ -62,10 +62,8 @@ def test_v47_recipe_is_factual_isolated_macro_awr() -> None:
     assert tx.enabled is True
     assert tx.lifecycle_smdp_horizon == "next_resource_opportunity"
     assert tx.lifecycle_advantage_policy_weight == 0.0
-    assert tx.lifecycle_entry_support_weight == 0.0
     assert tx.macro_option_value_weight == pytest.approx(0.10)
     assert tx.macro_option_actor_weight == pytest.approx(0.03)
-    assert tx.macro_option_group_completion_weight == pytest.approx(0.05)
     assert tx.macro_option_actor_temperature == pytest.approx(0.25)
     assert set(config.episodic_learning.success_imitation_exempt_surfaces) == {
         "rest_site",
