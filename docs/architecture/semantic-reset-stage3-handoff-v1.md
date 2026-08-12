@@ -45,6 +45,29 @@ Handoff requires ALL of:
    single-branch collapse everywhere) — mode collapse to one branch on
    every surface would indicate a broken Q scale, not a preference.
 
+## 2b. Final-round evaluation protocol (fixed 2026-08-12, before the
+600-episode segment completes)
+
+The deciding round evaluates the completed macro publication with:
+
+1. **Paired 2x2 attribution matrix** on the fixed odd held-out prefix,
+   n=32 seeds per arm, deterministic:
+   {champion combat, challenger combat} x {champion macro, macro Q}.
+   The macro-effect contrast (champion combat row) decides criterion 2;
+   the combat column stays informational until the stage-4 bridge lands
+   (challenger-combat arms use the round-2 archive model).
+2. **State probes** (criterion 1): the HP/gold mutation probe plus the
+   behavioral decision log P(branch | HP bucket) from the joined arms —
+   the behavioral log with real recurrent state is authoritative; the
+   zero-hidden probe is the conservative lower bound.
+3. **Branch diversity** (criterion 3): per-surface decision distributions
+   from the joined-arm logs; degenerate means a single branch monopolizes
+   EVERY surface, not a strong preference on one surface.
+
+Decision rule unchanged from §2. n=32 exists to cut the binomial noise
+that made earlier 16-seed rounds ambiguous (a 3-vs-4 win gap at n=16 is
+within one seed's noise).
+
 ## 3. Evidence
 
 ### Round 1 — ep200 model (2026-08-11)
