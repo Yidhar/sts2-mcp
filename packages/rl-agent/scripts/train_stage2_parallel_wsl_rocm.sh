@@ -44,6 +44,9 @@ export VIRTUAL_ENV="$VENV_DIR"
 export PATH="$VENV_DIR/bin:$PATH"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+# The trainer's lockstep collation is CPU-bound; give it its own thread
+# budget while collectors stay at one thread beside their sims.
+TRAINER_OMP="${STS2_STAGE2_TRAINER_OMP:-1}"
 
 python - <<'PY'
 import torch
@@ -95,6 +98,7 @@ DOMAIN_ARGS=(--control-domain "$CONTROL_DOMAIN")
 PRODUCER_ARGS=()
 for producer_id in "${PRODUCER_IDS[@]}"; do PRODUCER_ARGS+=(--producer-id "$producer_id"); done
 
+OMP_NUM_THREADS="$TRAINER_OMP" MKL_NUM_THREADS="$TRAINER_OMP" \
 python scripts/run_stage2_trainer.py \
   --config config/experiments/stage2_isolated_macro_v1.toml \
   --champion "$CHAMPION" \
