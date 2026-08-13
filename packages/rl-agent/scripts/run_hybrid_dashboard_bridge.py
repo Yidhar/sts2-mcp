@@ -143,6 +143,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         for row in _read_jsonl(path)
     ]
     collector_rows.sort(key=lambda row: float(row.get("unix_s", 0.0) or 0.0))
+    evaluation_rows = _read_jsonl(run_root / "metrics" / "evaluation.jsonl")
     trainer_status = _read_json(run_root / "status" / "trainer.json")
     collector_statuses = [
         _read_json(path) for path in sorted((run_root / "status").glob("collector-*.json"))
@@ -268,6 +269,52 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                         int(item_replay.get("macro_steps", 0) or 0)
                         + int(item_replay.get("combat_steps", 0) or 0)
                     ),
+                },
+            }
+        )
+    evaluation_summary = next(
+        (
+            row
+            for row in reversed(evaluation_rows)
+            if row.get("event") == "hybrid_evaluation_summary"
+        ),
+        None,
+    )
+    if evaluation_summary is not None:
+        evaluation_count = int(evaluation_summary.get("episodes", 0) or 0)
+        evaluation_wins = int(evaluation_summary.get("wins", 0) or 0)
+        evaluation_act1 = int(evaluation_summary.get("act1_clears", 0) or 0)
+        events.append(
+            {
+                "event": "evaluation",
+                "unix_s": evaluation_summary.get("unix_s"),
+                "evaluation_gate": evaluation_summary.get("policy_version"),
+                "environment_steps": environment_steps,
+                "policy_version": evaluation_summary.get("policy_version"),
+                "episodes": evaluation_count,
+                "successful_run_count": evaluation_wins,
+                "run_win_rate": (
+                    evaluation_wins / evaluation_count if evaluation_count else 0.0
+                ),
+                "act1_reach_count": evaluation_act1,
+                "act1_clear_rate": (
+                    evaluation_act1 / evaluation_count if evaluation_count else 0.0
+                ),
+                "mean_max_floor": evaluation_summary.get("floor_mean"),
+                "maximum_floor": max(
+                    (
+                        int(row.get("max_floor", 0) or 0)
+                        for row in evaluation_rows
+                        if row.get("event") == "hybrid_evaluation_episode"
+                    ),
+                    default=0,
+                ),
+                "mean_revivals_used": evaluation_summary.get("mean_revivals"),
+                "evaluation_context": {
+                    "policy_version": evaluation_summary.get("policy_version"),
+                    "data_partition": "validation",
+                    "epsilon": 0.0,
+                    "deterministic": True,
                 },
             }
         )

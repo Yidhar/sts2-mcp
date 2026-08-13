@@ -20,14 +20,15 @@ from torch import Tensor, nn
 from .replay import DomainView, HybridRunReplay
 from .transitions import HybridRun, HybridStep, next_domain_index
 
-HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v1"
+HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v2"
+_PREVIOUS_HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v1"
 
 
 @dataclass(frozen=True, slots=True)
 class HybridQConfig:
     learning_rate: float = 1.0e-4
     shared_learning_rate_scale: float = 0.5
-    target_update_interval: int = 200
+    target_update_interval: int = 25
     huber_delta: float = 1.0
     gradient_clip_norm: float = 1.0
     run_batch_size: int = 4
@@ -70,6 +71,7 @@ class HybridQMetrics:
     mean_policy_lag: float = 0.0
     maximum_policy_lag: int = 0
     target_syncs: int = 0
+    last_target_sync_update: int = 0
     domain_surface_counts: dict[str, int] = field(default_factory=dict)
 
     def as_mapping(self) -> dict[str, Any]:
@@ -425,20 +427,19 @@ class HybridQLearner:
                     self.metrics.domain_surface_counts[key] = (
                         self.metrics.domain_surface_counts.get(key, 0) + 1
                     )
-        if self.metrics.updates % self.config.target_update_interval == 0:
+        if (
+            self.metrics.updates - self.metrics.last_target_sync_update
+            >= self.config.target_update_interval
+        ):
             self.sync_target()
         return self.metrics.as_mapping()
 
     def sync_target(self) -> None:
-        """Copy online weights to the target and account for the sync.
-
-        The normal clock is learner updates. A runner that deliberately
-        changes the update-to-fresh-run ratio can additionally call this on
-        its factual run clock, preserving the same target-data cadence.
-        """
+        """Copy online weights to the target on the learner-update clock."""
 
         self.target_model.load_state_dict(self.online_model.state_dict(), strict=True)
         self.metrics.target_syncs += 1
+        self.metrics.last_target_sync_update = self.metrics.updates
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -448,14 +449,35 @@ class HybridQLearner:
             "metrics": self.metrics.as_mapping(),
         }
 
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state.get("version") != HYBRID_Q_LEARNER_VERSION:
+    def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        migrate_target_schedule: bool = False,
+    ) -> None:
+        version = state.get("version")
+        accepted_versions = {HYBRID_Q_LEARNER_VERSION}
+        if migrate_target_schedule:
+            accepted_versions.add(_PREVIOUS_HYBRID_Q_LEARNER_VERSION)
+        if version not in accepted_versions:
             raise ValueError("hybrid learner state version differs")
-        if state.get("config") != asdict(self.config):
+        source_config = dict(state.get("config", {}))
+        destination_config = asdict(self.config)
+        if migrate_target_schedule:
+            source_without_schedule = dict(source_config)
+            destination_without_schedule = dict(destination_config)
+            source_without_schedule.pop("target_update_interval", None)
+            destination_without_schedule.pop("target_update_interval", None)
+            if source_without_schedule != destination_without_schedule:
+                raise ValueError(
+                    "hybrid learner config differs beyond target schedule"
+                )
+        elif source_config != destination_config:
             raise ValueError("hybrid learner config differs")
         self.optimizer.load_state_dict(state["optimizer"])
         metrics = dict(state["metrics"])
         metrics.pop("version", None)
+        metrics.setdefault("last_target_sync_update", 0)
         self.metrics = HybridQMetrics(**metrics)
 
 

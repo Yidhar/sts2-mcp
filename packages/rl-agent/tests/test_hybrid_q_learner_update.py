@@ -110,3 +110,67 @@ def test_explicit_target_sync_updates_weights_and_metric() -> None:
     learner.sync_target()
     assert torch.equal(online.bias, target.bias)
     assert learner.metrics.target_syncs == 1
+    assert learner.metrics.last_target_sync_update == learner.metrics.updates
+
+
+def test_target_sync_uses_elapsed_learner_updates_from_last_sync() -> None:
+    online = _TinyQ()
+    target = copy.deepcopy(online)
+    replay = HybridRunReplay(capacity_runs=4, macro_unroll=2, combat_unroll=2)
+    replay.put(_run())
+    learner = HybridQLearner(
+        online_model=online,
+        target_model=target,
+        replay=replay,
+        forward_online=_forward(online),
+        forward_target=_forward(target),
+        initial_state=lambda: torch.zeros((1, 2)),
+        config=HybridQConfig(
+            run_batch_size=1,
+            combat_n_step=2,
+            target_update_interval=2,
+        ),
+    )
+    learner.metrics.updates = 5
+    learner.sync_target()
+    learner.update()
+    assert learner.metrics.target_syncs == 1
+    learner.update()
+    assert learner.metrics.target_syncs == 2
+    assert learner.metrics.last_target_sync_update == 7
+
+
+def test_reviewed_target_schedule_migration_preserves_optimizer_and_updates() -> None:
+    online = _TinyQ()
+    target = copy.deepcopy(online)
+    replay = HybridRunReplay(capacity_runs=4, macro_unroll=2, combat_unroll=2)
+    source = HybridQLearner(
+        online_model=online,
+        target_model=target,
+        replay=replay,
+        forward_online=_forward(online),
+        forward_target=_forward(target),
+        initial_state=lambda: torch.zeros((1, 2)),
+        config=HybridQConfig(target_update_interval=200),
+    )
+    state = source.state_dict()
+    state["version"] = "sts2-hybrid-double-q-v1"
+    state["metrics"].pop("last_target_sync_update", None)
+
+    migrated_online = copy.deepcopy(online)
+    migrated_target = copy.deepcopy(target)
+    migrated = HybridQLearner(
+        online_model=migrated_online,
+        target_model=migrated_target,
+        replay=replay,
+        forward_online=_forward(migrated_online),
+        forward_target=_forward(migrated_target),
+        initial_state=lambda: torch.zeros((1, 2)),
+        config=HybridQConfig(target_update_interval=25),
+    )
+    migrated.load_state_dict(state, migrate_target_schedule=True)
+    assert migrated.metrics.updates == source.metrics.updates
+    assert migrated.config.target_update_interval == 25
+
+    with pytest.raises(ValueError):
+        migrated.load_state_dict(state)

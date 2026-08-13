@@ -124,11 +124,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval-runs", type=int, default=10)
     parser.add_argument("--publication-interval-runs", type=int, default=1)
     parser.add_argument("--maximum-pending-runs", type=int, default=2)
+    parser.add_argument("--target-update-interval", type=int, default=25)
     parser.add_argument(
-        "--target-sync-every-runs",
-        type=int,
-        default=0,
-        help="optional factual-run target clock; useful when updates/run changes",
+        "--migrate-target-schedule",
+        action="store_true",
+        help="resume once from the former target schedule and refresh target now",
     )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
@@ -181,11 +181,13 @@ def main() -> int:
             config=HybridQConfig(
                 learning_rate=config.optimization.learning_rate,
                 run_batch_size=args.run_batch_size,
+                target_update_interval=args.target_update_interval,
             ),
         )
         ingested = 0
         environment_steps = 0
         domain_decisions = {"macro": 0, "combat": 0}
+        schedule_migration: dict[str, Any] | None = None
         source = (
             Path(args.initialize_from)
             if args.initialize_from
@@ -202,7 +204,29 @@ def main() -> int:
             online.load_state_dict(payload["online"], strict=True)
             target.load_state_dict(payload["target"], strict=True)
             replay.load_state_dict(payload["replay"])
-            learner.load_state_dict(payload["learner"])
+            source_target_interval = int(
+                payload["learner"].get("config", {}).get(
+                    "target_update_interval", args.target_update_interval
+                )
+            )
+            learner.load_state_dict(
+                payload["learner"],
+                migrate_target_schedule=args.migrate_target_schedule,
+            )
+            if (
+                args.migrate_target_schedule
+                and source_target_interval != args.target_update_interval
+            ):
+                learner.sync_target()
+                schedule_migration = {
+                    "event": "target_schedule_migration",
+                    "unix_s": time.time(),
+                    "source_target_update_interval": source_target_interval,
+                    "target_update_interval": args.target_update_interval,
+                    "learner_updates": learner.metrics.updates,
+                    "target_syncs": learner.metrics.target_syncs,
+                    "last_target_sync_update": learner.metrics.last_target_sync_update,
+                }
             ingested = int(payload["ingested"])
             environment_steps = int(payload["environment_steps"])
             domain_decisions = {
@@ -211,6 +235,8 @@ def main() -> int:
             }
             _restore_rng(payload["rng"])
         else:
+            if args.migrate_target_schedule:
+                raise ValueError("target schedule migration requires --resume")
             source_file = source / "network.pt" if source.is_dir() else source
             state = torch.load(source_file, map_location=device, weights_only=True)
             source_state = (
@@ -283,8 +309,10 @@ def main() -> int:
         last_save = ingested
         last_publication = ingested
         with metrics_path.open("a", encoding="utf-8") as metrics:
+            if schedule_migration is not None:
+                metrics.write(json.dumps(schedule_migration) + "\n")
+                metrics.flush()
             while ingested < args.stop_after_runs:
-                previous_ingested = ingested
                 files = sorted(
                     spool.glob("*.pkl"),
                     key=lambda item: item.stat().st_mtime_ns,
@@ -322,13 +350,6 @@ def main() -> int:
                 update_started = time.monotonic()
                 for _ in range(args.updates_per_run * len(accepted)):
                     update_metrics = learner.update()
-                if (
-                    args.target_sync_every_runs > 0
-                    and previous_ingested // args.target_sync_every_runs
-                    < ingested // args.target_sync_every_runs
-                ):
-                    learner.sync_target()
-                    update_metrics = learner.metrics.as_mapping()
                 update_seconds = time.monotonic() - update_started
                 rows: list[dict[str, Any]] = []
                 first_ingested = ingested - len(accepted) + 1

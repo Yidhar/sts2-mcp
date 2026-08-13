@@ -51,6 +51,10 @@ PRODUCER_ARGS=()
 for index in $(seq 0 $((COLLECTORS - 1))); do
   PRODUCER_ARGS+=(--producer-id "collector-$index")
 done
+MIGRATION_ARGS=()
+if [[ "${STS2_HYBRID_MIGRATE_TARGET_SCHEDULE:-0}" == "1" ]]; then
+  MIGRATION_ARGS+=(--migrate-target-schedule)
+fi
 
 PIDS=()
 COLLECTOR_PIDS=()
@@ -82,7 +86,8 @@ python scripts/run_hybrid_trainer.py \
   --combat-unroll "${STS2_HYBRID_COMBAT_UNROLL:-32}" \
   --maximum-view-reuse "${STS2_HYBRID_MAXIMUM_VIEW_REUSE:-8}" \
   --maximum-pending-runs "$MAXIMUM_PENDING" \
-  --target-sync-every-runs "${STS2_HYBRID_TARGET_SYNC_RUNS:-100}" \
+  --target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}" \
+  "${MIGRATION_ARGS[@]}" \
   --save-interval-runs "${STS2_HYBRID_SAVE_INTERVAL_RUNS:-5}" \
   --publication-interval-runs 1 \
   --device cuda >"$LOGS/trainer.log" 2>&1 &

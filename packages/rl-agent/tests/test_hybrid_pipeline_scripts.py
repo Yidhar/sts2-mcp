@@ -164,7 +164,9 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert 'COLLECTORS="${STS2_HYBRID_COLLECTORS:-2}"' in script
     assert '--updates-per-run "${STS2_HYBRID_UPDATES_PER_RUN:-1}"' in script
     assert '--ingest-batch-runs "${STS2_HYBRID_INGEST_BATCH_RUNS:-2}"' in script
-    assert '--target-sync-every-runs "${STS2_HYBRID_TARGET_SYNC_RUNS:-100}"' in script
+    assert '--target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}"' in script
+    assert "target-sync-every-runs" not in script
+    assert 'MIGRATION_ARGS+=(--migrate-target-schedule)' in script
     assert 'COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"' in script
     assert 'COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"' in script
     assert "--producer-id \"collector-$index\"" in script
@@ -230,6 +232,14 @@ def test_trainer_discards_uncheckpointed_metric_tail_before_resume() -> None:
     assert "_discard_metrics_beyond_checkpoint(metrics_path, ingested=ingested)" in source
 
 
+def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_evaluation.py").read_text(encoding="utf-8")
+    assert "evaluation_ownership=True" in source
+    assert "deterministic=True" in source
+    assert "held_out_evaluation_seeds" in source
+    assert "--spool" not in source
+
+
 def test_dashboard_replaces_abandoned_tail_after_in_place_resume() -> None:
     bridge = _script("run_hybrid_dashboard_bridge.py")
     rows = [
@@ -238,6 +248,14 @@ def test_dashboard_replaces_abandoned_tail_after_in_place_resume() -> None:
     ]
     canonical = bridge._canonical_trainer_rows(rows)
     assert [row["ingested_runs"] for row in canonical] == [44, 45, 46, 47, 48]
+
+
+def test_dashboard_reads_hybrid_evaluation_summary() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_dashboard_bridge.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'run_root / "metrics" / "evaluation.jsonl"' in source
+    assert '"event": "evaluation"' in source
 
 
 def test_dashboard_tail_replacement_preserves_non_update_rows() -> None:
