@@ -2175,6 +2175,10 @@
           badge.textContent = "无限隐藏引擎续命预热 · 非标准胜率";
           note.textContent =
             "当前是无限隐藏引擎续命预热（revival_budget = -1）。通过覆盖用于验证完整流程与策略成长，不能当作标准零复活胜率。";
+        } else if (context.mode === "hybrid-completion-preheat") {
+          badge.textContent = context.label || "有限复活完成预热 · 非标准胜率";
+          note.textContent =
+            `当前用 revival_budget = ${int(budget)} 为新 Candidate-Q 提供通关终局样本；这是有限复活课程，不是标准零复活胜率。`;
         } else if (standard) {
           badge.textContent = context.label || "标准游戏评估";
           note.textContent = "当前上下文标记为标准游戏；成功率仍应结合固定种子样本数与复活统计解释。";

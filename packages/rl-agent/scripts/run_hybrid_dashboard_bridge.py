@@ -22,6 +22,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--collector-episode-capacity", type=int, required=True)
     parser.add_argument("--maximum-pending-runs", type=int, required=True)
     parser.add_argument("--revival-budget", type=int, required=True)
+    parser.add_argument("--curriculum-mode", default="hybrid-candidate-q")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     return parser.parse_args()
 
@@ -105,7 +106,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
             "config": {
                 "profile": "hybrid-candidate-q-v1",
                 "curriculum": {
-                    "mode": "hybrid-candidate-q",
+                    "mode": args.curriculum_mode,
                     "revival_budget": args.revival_budget,
                 },
                 "runtime": {

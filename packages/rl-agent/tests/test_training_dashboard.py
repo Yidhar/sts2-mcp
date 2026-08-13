@@ -819,6 +819,31 @@ def test_episode_collection_limits_are_exposed_separately(tmp_path: Path) -> Non
     assert progress["percent"] == pytest.approx(0.25)
 
 
+def test_hybrid_completion_preheat_is_not_reported_as_standard_game(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    start = _run_start(RUN_A, 100.0)
+    curriculum = start["config"]["curriculum"]
+    assert isinstance(curriculum, dict)
+    curriculum["mode"] = "hybrid-completion-preheat"
+    curriculum["revival_budget"] = 64
+    metrics.write_text(
+        json.dumps(start, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    context = DashboardStore(root, now=lambda: 102.0).snapshot()["context"]
+
+    assert context == {
+        "mode": "hybrid-completion-preheat",
+        "revival_budget": 64,
+        "standard_game": False,
+        "label": "有限复活完成预热 · 非标准胜率",
+    }
+
+
 def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     _, parent_metrics = _create_run(root, RUN_A, unix_s=100.0)

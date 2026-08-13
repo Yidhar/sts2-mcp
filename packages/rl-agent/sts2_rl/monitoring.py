@@ -2024,8 +2024,14 @@ class DashboardStore:
             revival_budget = int(revival_number) if revival_number is not None else None
             mode = _string(curriculum.get("mode"))
             unlimited_revival = revival_budget == -1
+            preheat_mode = mode in {
+                "native-revival-preheat",
+                "hybrid-completion-preheat",
+            }
             standard_game = (
-                revival_budget is not None and not unlimited_revival and mode not in {"native-revival-preheat"}
+                revival_budget is not None
+                and not unlimited_revival
+                and not preheat_mode
             )
             parsed_rows = sum(aggregate.parsed_rows for _, aggregate in aggregates)
             checkpoint_load = _mapping(selected.start_event.get("checkpoint_load"))
@@ -2063,6 +2069,8 @@ class DashboardStore:
                     "label": (
                         "无限隐藏引擎续命预热 · 非标准胜率"
                         if unlimited_revival
+                        else "有限复活完成预热 · 非标准胜率"
+                        if mode == "hybrid-completion-preheat"
                         else "标准游戏评估"
                         if standard_game
                         else mode or "训练上下文未标注"
