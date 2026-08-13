@@ -28,6 +28,8 @@ SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV
 
 export VIRTUAL_ENV="$VENV_DIR"
 export PATH="$VENV_DIR/bin:$PATH"
+# WSL2 ROCm/ROCDXG needs explicit DXG discovery in non-login detached shells.
+export HSA_ENABLE_DXG_DETECTION="${HSA_ENABLE_DXG_DETECTION:-1}"
 export OMP_NUM_THREADS="${STS2_HYBRID_COLLECTOR_OMP:-1}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
