@@ -112,6 +112,7 @@ class _OpenTransition:
     floor: int
     behavior_epsilon: float
     recurrent_reset: bool
+    control_domain: Literal["macro", "combat"]
     reward_accumulator: float = 0.0
 
 
@@ -131,7 +132,7 @@ class MacroCollectionAuthority:
         epsilon: float = 0.1,
         seed: int = 0,
         evaluation_ownership: bool = False,
-        control_domain: Literal["macro", "combat"] = "macro",
+        control_domain: Literal["macro", "combat", "joint"] = "macro",
     ) -> None:
         if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
             raise ValueError("authority epsilon must be in [0, 1]")
@@ -141,11 +142,11 @@ class MacroCollectionAuthority:
         # Stage-3 joined evaluation: macro ownership extends into
         # deterministic held-out collection (whole-segment ownership, §10).
         self.evaluation_ownership = bool(evaluation_ownership)
-        if control_domain not in {"macro", "combat"}:
-            raise ValueError("control_domain must be 'macro' or 'combat'")
-        # One recurrent authority owns exactly one domain.  Joined control is
-        # routed through two instances so combat history cannot leak into the
-        # macro recurrent state (or vice versa).
+        if control_domain not in {"macro", "combat", "joint"}:
+            raise ValueError("control_domain must be 'macro', 'combat', or 'joint'")
+        # Isolated stage-2 authorities own one domain.  The hybrid lineage
+        # selects ``joint`` and supplies split run/combat recurrence in one
+        # model; the semantic executor below remains shared by both modes.
         self.control_domain = control_domain
         # Diagnostic-only decision log (never a training input): one row per
         # owned decision with the observation facts needed to inspect
@@ -162,6 +163,11 @@ class MacroCollectionAuthority:
         # dispatches leave it ``None``.  The joined router reads-and-clears
         # it to close a pending combat bridge at collection time.
         self.last_decision_value: float | None = None
+        self.last_q_values: np.typing.NDArray[np.float32] | None = None
+        # The semantic compiler can collapse/reorder native candidates.  This
+        # companion view maps the most recent semantic Q values back onto the
+        # collector's native candidate indexes for diagnostics only.
+        self.last_native_q_values: np.typing.NDArray[np.float32] | None = None
         self._hidden: Any = None
         self._episode_id: str | None = None
         self._steps: list[MacroStep] = []
@@ -169,6 +175,7 @@ class MacroCollectionAuthority:
         self._pending_plan: _PendingPlan | None = None
         self._episode_replay_invalid = False
         self._executor_failures = 0
+        self.semantic_encode_collisions = 0
         self.last_executor_failure: dict[str, Any] | None = None
         self._last_floor = 0
         self._combat_active = False
@@ -183,12 +190,15 @@ class MacroCollectionAuthority:
     def begin_episode(self, episode_id: str) -> None:
         self._episode_id = episode_id
         self.last_decision_value = None
+        self.last_q_values = None
+        self.last_native_q_values = None
         self._hidden = self.initial_state()
         self._steps = []
         self._open = None
         self._pending_plan = None
         self._episode_replay_invalid = False
         self._executor_failures = 0
+        self.semantic_encode_collisions = 0
         self._last_floor = 0
         self._combat_active = False
         self._awaiting_bridge = False
@@ -310,6 +320,9 @@ class MacroCollectionAuthority:
         # Every path that does not OWN a semantic decision below (declines,
         # mechanical executor dispatches, failures) leaves it ``None``.
         self.last_decision_value = None
+        self.last_q_values = None
+        self.last_native_q_values = None
+        self._activate_domain_epsilon(observation)
         if self._episode_replay_invalid:
             # A composite action changed recurrent state before its native
             # suffix failed.  No later transition in this episode can be
@@ -342,6 +355,15 @@ class MacroCollectionAuthority:
             if dispatch_index is not None:
                 remaining = self._pending_plan.steps[1:]
                 self._pending_plan = _PendingPlan(remaining) if remaining else None
+                # This native action is the mechanical suffix of the prior
+                # semantic decision, not a second learned preference.  Give
+                # the generic collector a deterministic native diagnostic
+                # view without running either control network again.
+                native_q: np.typing.NDArray[np.float32] = np.full(
+                    len(valid), -np.inf, dtype=np.float32
+                )
+                native_q[dispatch_index] = 0.0
+                self.last_native_q_values = native_q
                 self.mechanical_dispatches += 1
                 return dispatch_index
             if (
@@ -371,12 +393,39 @@ class MacroCollectionAuthority:
             self.declined += 1
             return None
 
+        decision_domain: Literal["macro", "combat"] = (
+            "combat"
+            if self.control_domain == "joint"
+            and isinstance(observation.get("combat"), Mapping)
+            and observation["combat"].get("in_progress") is True
+            else "macro"
+            if self.control_domain == "joint"
+            else self.control_domain
+        )
         decision = forward_decision(
             observation,
             semantic_actions,
-            control_domain=self.control_domain,
+            control_domain=decision_domain,
         )
         if decision is None:
+            if self.control_domain == "joint" and int(np.count_nonzero(valid)) > 1:
+                # A joint controller may pass through forced/mechanical
+                # singletons, but it must not hide an uncompiled strategic
+                # choice inside the previous transition.
+                self._pending_plan = None
+                self._open = None
+                self._steps = []
+                self._episode_replay_invalid = True
+                self.last_executor_failure = {
+                    "reason": "uncompiled_strategic_surface",
+                    "control_domain": decision_domain,
+                    "phase": str(observation.get("phase") or ""),
+                    "surface_kinds": sorted(
+                        {_kind(action) for action in semantic_actions}
+                    )[:12],
+                    "valid_candidates": int(np.count_nonzero(valid)),
+                    "floor": floor,
+                }
             self.declined += 1
             return None
         executable = self._executable_candidates(decision, valid)
@@ -404,16 +453,44 @@ class MacroCollectionAuthority:
             self._hidden = self.initial_state()
             self._combat_active = True
             recurrent_reset = True
-        semantic_snapshot = GroundedObservationEncoder(snapshot.config).encode(
-            observation,
-            [candidate.semantic_action for candidate in executable],
-        ).snapshot
+        try:
+            semantic_snapshot = GroundedObservationEncoder(snapshot.config).encode(
+                observation,
+                [candidate.semantic_action for candidate in executable],
+            ).snapshot
+        except ValueError:
+            # The configured role vocabulary cannot represent this candidate
+            # set distinctly (e.g. co-occurring reward-claim branches hashing
+            # to one role). The vocabulary is encoding ABI shared with the
+            # frozen champion, so the authority fails closed instead: this
+            # decision returns to the champion and is counted, never learned.
+            if self.control_domain == "combat" and recurrent_reset:
+                self._combat_active = False
+                self._hidden = self.initial_state()
+            self.semantic_encode_collisions += 1
+            self.declined += 1
+            return None
         if semantic_snapshot.candidate_count != len(executable):
             raise RuntimeError("semantic candidate encoding changed the candidate set")
         semantic_index = self._semantic_choice(
             candidates=executable,
             snapshot=semantic_snapshot,
         )
+        semantic_q = self.last_q_values
+        if semantic_q is None or semantic_q.shape != (len(executable),):
+            raise RuntimeError("semantic Q publication does not match candidates")
+        mapped_native_q: np.typing.NDArray[np.float32] = np.full(
+            len(valid), -np.inf, dtype=np.float32
+        )
+        for index, executable_candidate in enumerate(executable):
+            executable_native = executable_candidate.native_index
+            if executable_native is None:
+                continue
+            mapped_native_q[executable_native] = max(
+                float(mapped_native_q[executable_native]),
+                float(semantic_q[index]),
+            )
+        self.last_native_q_values = mapped_native_q
         candidate = executable[semantic_index]
         if candidate.native_index is None:  # excluded above; keeps typing exact
             raise RuntimeError("executable semantic candidate has no native index")
@@ -441,6 +518,7 @@ class MacroCollectionAuthority:
             target_key=candidate.target_key,
             floor=floor,
             recurrent_reset=recurrent_reset,
+            control_domain=decision_domain,
         )
         if len(candidate.plan) > 1:
             self._pending_plan = _PendingPlan(candidate.plan[1:])
@@ -454,6 +532,11 @@ class MacroCollectionAuthority:
         if isinstance(floor, int) and floor >= 0:
             self._last_floor = floor
         return self._last_floor
+
+    def _activate_domain_epsilon(self, observation: Mapping[str, Any]) -> None:
+        """Hook for a joint authority with independent domain clocks."""
+
+        del observation
 
     def _step_indices(
         self,
@@ -544,6 +627,7 @@ class MacroCollectionAuthority:
         # Advance recurrent state on every meaningful decision, including a
         # singleton or epsilon-explored one.  Replay sees the same sequence.
         values = self._q_values(snapshot)
+        self.last_q_values = values.detach().float().cpu().numpy().copy()
         # Publish the greedy legal value of this OWNED decision — the max over
         # the executable candidates' Q under the live recurrent state — no
         # matter which action the epsilon draw below actually executes.
@@ -571,7 +655,15 @@ class MacroCollectionAuthority:
         target_key: str | None,
         floor: int,
         recurrent_reset: bool,
+        control_domain: Literal["macro", "combat"] | None = None,
     ) -> None:
+        resolved_domain: Literal["macro", "combat"]
+        if control_domain is not None:
+            resolved_domain = control_domain
+        elif self.control_domain == "joint":
+            raise RuntimeError("joint authority must provide the active control domain")
+        else:
+            resolved_domain = self.control_domain
         self._open = _OpenTransition(
             snapshot=snapshot,
             action_index=action_index,
@@ -581,6 +673,7 @@ class MacroCollectionAuthority:
             floor=floor,
             behavior_epsilon=self.epsilon,
             recurrent_reset=recurrent_reset,
+            control_domain=resolved_domain,
         )
 
     def _close_open(
@@ -609,7 +702,7 @@ class MacroCollectionAuthority:
                 terminal=terminal,
                 surface=self._open.surface,
                 branch=self._open.branch,
-                control_domain=self.control_domain,
+                control_domain=self._open.control_domain,
                 recurrent_reset=self._open.recurrent_reset,
                 target_key=self._open.target_key,
                 behavior_epsilon=self._open.behavior_epsilon,
@@ -629,6 +722,7 @@ class MacroCollectionAuthority:
             "recorded_steps": len(self._steps),
             "episode_replay_invalid": self._episode_replay_invalid,
             "executor_failures": self._executor_failures,
+            "semantic_encode_collisions": self.semantic_encode_collisions,
             "bridge_misses": self._bridge_misses,
             "pending_bridge": self.has_pending_bridge,
             "epsilon": self.epsilon,

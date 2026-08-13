@@ -932,3 +932,31 @@ def test_card_matching_is_container_invariant() -> None:
     assert not _card_matches({"card": picker_other}, deck_view)
     assert not _card_matches({"card": None}, deck_view)
     assert _card_matches({"card": picker_same}, None)
+
+
+def test_role_vocabulary_collision_fails_closed_to_the_champion() -> None:
+    """A candidate set the configured role vocabulary cannot represent
+    distinctly (measured live: co-occurring reward-claim branches hashing to
+    one role) must decline to the champion and count, never crash."""
+
+    from unittest.mock import patch
+
+    authority = _authority(q=[0.0, 1.0])
+    authority.begin_episode("ep-collision")
+    with patch(
+        "sts2_rl.macro.authority.GroundedObservationEncoder"
+    ) as encoder_class:
+        encoder_class.return_value.encode.side_effect = ValueError(
+            "co-occurring semantic action branches collide in the configured "
+            "role vocabulary"
+        )
+        index = authority.choose(
+            observation=_rest_observation(floor=7),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+    assert index is None
+    assert authority.declined == 1
+    assert authority.semantic_encode_collisions == 1
+    assert authority.last_decision_value is None
