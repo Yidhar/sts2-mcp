@@ -40,6 +40,31 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _discard_metrics_beyond_checkpoint(path: Path, *, ingested: int) -> None:
+    """Remove an uncheckpointed telemetry tail before exact continuation."""
+
+    if not path.is_file():
+        return
+    retained: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        row_ingested = row.get("ingested_runs") if isinstance(row, Mapping) else None
+        if (
+            isinstance(row_ingested, int)
+            and not isinstance(row_ingested, bool)
+            and row_ingested > ingested
+        ):
+            continue
+        retained.append(line)
+    payload = "".join(f"{line}\n" for line in retained)
+    temporary = path.with_suffix(path.suffix + ".resume.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def _forward(model: HybridDomainCandidateQModel, encoder: Any, device: torch.device) -> Any:
     def call(step: Any, hidden: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         encoded = collate_encoded_snapshots(
@@ -253,6 +278,8 @@ def main() -> int:
         spool.mkdir(parents=True, exist_ok=True)
         metrics_path = Path(args.metrics_out)
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.resume:
+            _discard_metrics_beyond_checkpoint(metrics_path, ingested=ingested)
         last_save = ingested
         last_publication = ingested
         with metrics_path.open("a", encoding="utf-8") as metrics:

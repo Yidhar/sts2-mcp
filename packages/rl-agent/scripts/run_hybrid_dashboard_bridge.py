@@ -53,6 +53,30 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return result
 
 
+def _canonical_trainer_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace an uncheckpointed tail when a trainer resumes in-place."""
+
+    canonical: list[dict[str, Any]] = []
+    for row in rows:
+        ingested = row.get("ingested_runs")
+        if (
+            row.get("event") == "hybrid_update"
+            and isinstance(ingested, int)
+            and not isinstance(ingested, bool)
+        ):
+            canonical = [
+                previous
+                for previous in canonical
+                if not (
+                    previous.get("event") == "hybrid_update"
+                    and isinstance(previous.get("ingested_runs"), int)
+                    and int(previous["ingested_runs"]) >= ingested
+                )
+            ]
+        canonical.append(row)
+    return canonical
+
+
 def _start_time(manifest: dict[str, Any], trainer_rows: list[dict[str, Any]]) -> float:
     created = manifest.get("created_at")
     if isinstance(created, str):
@@ -110,7 +134,9 @@ def _acknowledged_episodes(
 def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     run_root = Path(args.run_root)
     manifest = _read_json(run_root / "launcher" / "launch.json")
-    trainer_rows = _read_jsonl(run_root / "metrics" / "trainer.jsonl")
+    trainer_rows = _canonical_trainer_rows(
+        _read_jsonl(run_root / "metrics" / "trainer.jsonl")
+    )
     collector_rows = [
         row
         for path in sorted((run_root / "metrics").glob("collector-*.jsonl"))

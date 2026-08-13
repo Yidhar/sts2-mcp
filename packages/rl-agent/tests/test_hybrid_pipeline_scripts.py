@@ -169,6 +169,8 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert 'COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"' in script
     assert "--producer-id \"collector-$index\"" in script
     assert '--start-episode-index "$COLLECTOR_START_EPISODE"' in script
+    assert 'COLLECTOR_PIDS+=("$!")' in script
+    assert "exited while learner was running" in script
 
 
 def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
@@ -219,3 +221,36 @@ def test_trainer_publication_uses_unique_atomic_replacement() -> None:
     source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
     assert "uuid.uuid4().hex" in source
     assert "os.replace(publication_temporary, publication)" in source
+
+
+def test_trainer_discards_uncheckpointed_metric_tail_before_resume() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "def _discard_metrics_beyond_checkpoint" in source
+    assert "row_ingested > ingested" in source
+    assert "_discard_metrics_beyond_checkpoint(metrics_path, ingested=ingested)" in source
+
+
+def test_dashboard_replaces_abandoned_tail_after_in_place_resume() -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    rows = [
+        {"event": "hybrid_update", "ingested_runs": value}
+        for value in (44, 45, 46, 47, 46, 47, 48)
+    ]
+    canonical = bridge._canonical_trainer_rows(rows)
+    assert [row["ingested_runs"] for row in canonical] == [44, 45, 46, 47, 48]
+
+
+def test_dashboard_tail_replacement_preserves_non_update_rows() -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    rows = [
+        {"event": "run_start"},
+        {"event": "hybrid_update", "ingested_runs": 45},
+        {"event": "hybrid_update", "ingested_runs": 46},
+        {"event": "hybrid_update", "ingested_runs": 46},
+    ]
+    canonical = bridge._canonical_trainer_rows(rows)
+    assert canonical == [
+        {"event": "run_start"},
+        {"event": "hybrid_update", "ingested_runs": 45},
+        {"event": "hybrid_update", "ingested_runs": 46},
+    ]

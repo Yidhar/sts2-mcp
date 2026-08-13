@@ -53,6 +53,7 @@ for index in $(seq 0 $((COLLECTORS - 1))); do
 done
 
 PIDS=()
+COLLECTOR_PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
 }
@@ -117,9 +118,21 @@ for index in $(seq 0 $((COLLECTORS - 1))); do
     --device "$COLLECTOR_DEVICE" \
     --sim-exe "$SIM_EXE" >"$LOGS/$producer.log" 2>&1 &
   PIDS+=("$!")
+  COLLECTOR_PIDS+=("$!")
 done
 
 echo "[hybrid-par] pipeline=$PIPELINE_ID learner=$TRAINER_PID collectors=$COLLECTORS"
+while kill -0 "$TRAINER_PID" 2>/dev/null; do
+  for collector_pid in "${COLLECTOR_PIDS[@]}"; do
+    if ! kill -0 "$collector_pid" 2>/dev/null; then
+      echo "[hybrid-par] collector=$collector_pid exited while learner was running" >&2
+      kill -TERM "$TRAINER_PID" 2>/dev/null || true
+      wait "$TRAINER_PID" 2>/dev/null || true
+      exit 1
+    fi
+  done
+  sleep 2
+done
 set +e
 wait "$TRAINER_PID"
 status=$?
